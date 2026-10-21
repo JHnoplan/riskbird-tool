@@ -96,7 +96,7 @@ def download_and_install_chrome(callback=None) -> bool:
 # ─────────────────────────────────────────────
 class RiskBirdCrawler:
     BASE_URL = "https://www.riskbird.com"
-    SEARCH_URL = f"{BASE_URL}/search"
+    SEARCH_URL = f"{BASE_URL}/search/company"
     LOGIN_URL = f"{BASE_URL}/login"
 
     def __init__(self, gui_callback=None):
@@ -385,75 +385,20 @@ class RiskBirdCrawler:
             "状态": "", "法定代表人": "", "注册资本": "",
             "成立日期": "", "统一社会信用代码": "",
             "电话": "", "邮箱": "", "官网": "", "地址": "",
-            "搜索结果URL": "",
+            "搜索结果 URL": "",
         }
         try:
             # 确保浏览器已启动
             if self.driver is None:
                 self.start_browser(headed=True)
+    
+            # 使用正确的搜索 URL
+            import urllib.parse
+            search_url = f"{self.SEARCH_URL}?keyword={urllib.parse.quote(name)}&timestamp={int(time.time() * 1000)}"
+            self.driver.get(search_url)
+            time.sleep(3)
 
-            self.driver.get(self.SEARCH_URL)
-            time.sleep(2)
-
-            # 输入公司名 - 多种选择器尝试
-            search_input = None
-            selectors = [
-                "//input[@placeholder[contains(.,'企业') or contains(.,'公司') or contains(.,'搜索') or contains(.,'请输入') or contains(.,'人名')]]",
-                "//input[contains(@class,'search')]",
-                "//input[contains(@class,'input')]",
-                "//div[contains(@class,'search')]//input",
-                "//header//input",
-            ]
-            for sel in selectors:
-                try:
-                    search_input = self.driver.find_element(By.XPATH, sel)
-                    if search_input.is_displayed():
-                        break
-                    search_input = None
-                except NoSuchElementException:
-                    continue
-
-            if search_input is None:
-                # 最后尝试：找到第一个可见的 input
-                inputs = self.driver.find_elements(By.TAG_NAME, "input")
-                for inp in inputs:
-                    if inp.is_displayed() and inp.get_attribute("type") != "hidden":
-                        search_input = inp
-                        break
-
-            if search_input is None:
-                self._log(f"   未找到搜索输入框")
-                result["状态"] = "页面异常"
-                return result
-
-            search_input.clear()
-            search_input.send_keys(name)
-            time.sleep(0.8)
-
-            # 点击搜索 - 多种选择器尝试
-            search_btn = None
-            btn_selectors = [
-                "//button[contains(text(),'搜索') or contains(text(),'查询')]",
-                "//a[contains(text(),'搜索') or contains(text(),'查询')]",
-                "//button[contains(@class,'search')]",
-                "//div[contains(@class,'search')]//button",
-                "//header//button",
-            ]
-            for sel in btn_selectors:
-                try:
-                    search_btn = self.driver.find_element(By.XPATH, sel)
-                    if search_btn.is_displayed():
-                        break
-                    search_btn = None
-                except NoSuchElementException:
-                    continue
-
-            if search_btn:
-                self.driver.execute_script("arguments[0].click();", search_btn)
-            else:
-                # 尝试回车
-                search_input.submit()
-
+            # 等待搜索结果加载
             time.sleep(3)
 
             # 获取第一条结果 - 多种选择器尝试
