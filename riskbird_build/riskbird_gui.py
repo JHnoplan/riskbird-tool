@@ -440,12 +440,19 @@ class MainWindow(QMainWindow):
     def _open_website(self):
         """打开 riskbird.com 网站"""
         try:
+            self.open_web_btn.setEnabled(False)
+            self.open_web_btn.setText("加载中...")
+            QApplication.processEvents()
+            
             if self.crawler.driver is None:
                 self.crawler.start_browser(headed=True)
             self.crawler.driver.get(self.crawler.BASE_URL)
             self._append_log("已打开 riskbird.com 网站")
         except Exception as e:
             self._append_log(f"打开网站失败: {e}")
+        finally:
+            self.open_web_btn.setEnabled(True)
+            self.open_web_btn.setText("打开网页")
 
     def _on_login_status(self, success: bool, msg: str):
         if success:
