@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
         # 延迟设置
         delay_layout = QHBoxLayout()
         delay_layout.addWidget(QLabel("请求间隔(秒):"))
-        self.delay_spin = QLineEdit("3")
+        self.delay_spin = QLineEdit("0.5")
         self.delay_spin.setFixedWidth(50)
         delay_layout.addWidget(self.delay_spin)
         ctrl_layout.addLayout(delay_layout)

@@ -124,7 +124,7 @@ class RiskBirdCrawler:
         self._cookie_file = self._data_dir / "cookies.json"
 
         # 速率控制
-        self.delay_between = 3       # 每次请求间隔（秒）
+        self.delay_between = 0.5     # 每次请求间隔（秒）
         self.max_retries = 2
 
     # ─ 日志 ──────────────────────────────────
@@ -396,7 +396,7 @@ class RiskBirdCrawler:
             import urllib.parse
             search_url = f"{self.SEARCH_URL}?keyword={urllib.parse.quote(name)}&timestamp={int(time.time() * 1000)}"
             self.driver.get(search_url)
-            time.sleep(2)
+            time.sleep(0.5)
 
             # 获取第一条结果 - 多种选择器尝试
             cards = []
