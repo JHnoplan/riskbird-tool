@@ -20,6 +20,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 
 from riskbird_crawler import RiskBirdCrawler, is_chrome_installed, download_and_install_chrome
+from qizhidao_crawler import QiZhiDaoCrawler
 
 try:
     import openpyxl
@@ -206,18 +207,26 @@ class LoginDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.crawler = RiskBirdCrawler()
-        self.crawler.signals.log_signal.connect(self._append_log)
-        self.crawler.signals.progress_signal.connect(self._update_progress)
-        self.crawler.signals.login_status_signal.connect(self._on_login_status)
-        self.crawler.signals.manual_check_signal.connect(self._on_manual_check)
-        self.crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
+        # 初始化两个爬虫
+        self.riskbird_crawler = RiskBirdCrawler()
+        self.qizhidao_crawler = QiZhiDaoCrawler()
+        self.crawler = self.riskbird_crawler  # 默认使用风鸟
+        
+        # 连接信号
+        for crawler in [self.riskbird_crawler, self.qizhidao_crawler]:
+            crawler.signals.log_signal.connect(self._append_log)
+            crawler.signals.progress_signal.connect(self._update_progress)
+            crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
+        # 风鸟特有的信号
+        self.riskbird_crawler.signals.login_status_signal.connect(self._on_login_status)
+        self.riskbird_crawler.signals.manual_check_signal.connect(self._on_manual_check)
 
         self._companies = []
         self._excel_path = ""
         self._crawl_thread = None
+        self._current_source = 0  # 0=风鸟，1=企知道
 
-        self.setWindowTitle("美亚风鸟企业数据采集工具 v1.0")
+        self.setWindowTitle("企业数据采集工具 v1.0")
         self.setMinimumSize(900, 700)
         self.resize(1000, 750)
         self._init_ui()
@@ -238,6 +247,20 @@ class MainWindow(QMainWindow):
         title_label.setStyleSheet("color: #1a3c6e;")
         title_bar.addWidget(title_label)
         title_bar.addStretch()
+
+        # 数据来源选择
+        source_lbl = QLabel("数据来源:")
+        source_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 10))
+        title_bar.addWidget(source_lbl)
+        
+        from PyQt5.QtWidgets import QComboBox
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("风鸟 (riskbird.com)")
+        self.source_combo.addItem("企知道 (qizhidao.com)")
+        self.source_combo.setMinimumWidth(180)
+        self.source_combo.setMinimumHeight(30)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        title_bar.addWidget(self.source_combo)
 
         # 登录状态
         self.login_status_lbl = QLabel("未登录")
@@ -447,23 +470,34 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(ready)
 
     # ─ 登录 ───────────────────────────────────
+    def _on_source_changed(self, index):
+        """切换数据来源"""
+        self._current_source = index
+        if index == 0:
+            self.crawler = self.riskbird_crawler
+            self._append_log("已切换到：风鸟 (riskbird.com)")
+        else:
+            self.crawler = self.qizhidao_crawler
+            self._append_log("已切换到：企知道 (qizhidao.com)")
+        
     def _show_login(self):
         dlg = LoginDialog(self.crawler, self)
         dlg.exec_()
-
+    
     def _open_website(self):
-        """打开 riskbird.com 网站"""
+        """打开当前选择的网站"""
         try:
             self.open_web_btn.setEnabled(False)
             self.open_web_btn.setText("加载中...")
             QApplication.processEvents()
-            
+                
             if self.crawler.driver is None:
                 self.crawler.start_browser(headed=True)
             self.crawler.driver.get(self.crawler.BASE_URL)
-            self._append_log("已打开 riskbird.com 网站")
+            site_name = "riskbird.com" if self._current_source == 0 else "qizhidao.com"
+            self._append_log(f"已打开 {site_name} 网站")
         except Exception as e:
-            self._append_log(f"打开网站失败: {e}")
+            self._append_log(f"打开网站失败：{e}")
         finally:
             self.open_web_btn.setEnabled(True)
             self.open_web_btn.setText("打开网页")
