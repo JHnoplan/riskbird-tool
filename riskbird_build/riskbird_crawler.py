@@ -163,23 +163,34 @@ class RiskBirdCrawler:
         return False
 
     def _check_login_status(self) -> bool:
-        """通过检测页面元素判断是否已登录"""
+        """通过 Cookie 和页面元素判断是否已登录"""
         try:
             self.driver.get(self.BASE_URL)
             time.sleep(2)
-            # 已登录时右上角显示用户头像/手机号/SVIP
+            
+            # 方法1：检查登录相关的 Cookie
+            cookies = self.driver.get_cookies()
+            cookie_names = [c['name'] for c in cookies]
+            # 常见的登录 Cookie 名称
+            login_cookie_keywords = ['token', 'session', 'login', 'auth', 'user', 'uid', 'sid']
+            for kw in login_cookie_keywords:
+                for name in cookie_names:
+                    if kw in name.lower():
+                        self._log(f"  检测到登录 Cookie: {name}")
+                        return True
+            
+            # 方法2：检查页面元素
             indicators = [
                 "//div[contains(@class,'user')]",
                 "//a[contains(@class,'user')]",
                 "//span[contains(@class,'phone')]",
                 "//div[contains(@class,'avatar')]",
-                "//a[contains(text(),'SVIP')]",
-                "//span[contains(text(),'SVIP')]",
                 "//*[contains(text(),'SVIP')]",
-                # 匹配手机号格式 1XX****XXXX
                 "//*[contains(text(),'****')]",
                 "//span[contains(text(),'****')]",
                 "//a[contains(text(),'****')]",
+                "//*[contains(@class,'nickname')]",
+                "//*[contains(@class,'username')]",
             ]
             for xpath in indicators:
                 try:
@@ -189,7 +200,17 @@ class RiskBirdCrawler:
                         return True
                 except NoSuchElementException:
                     continue
-            # 备用：检查是否没有"登录"按钮（已登录时登录按钮会消失）
+            
+            # 方法3：用 JavaScript 检查页面中是否有用户信息
+            js_check = """
+                var body = document.body.innerText;
+                return body.includes('SVIP') || /1[3-9]\\d{1}\\*{4}\\d{4}/.test(body);
+            """
+            if self.driver.execute_script(js_check):
+                self._log("  JavaScript 检测到登录状态")
+                return True
+            
+            # 方法4：检查是否没有"登录"按钮
             try:
                 login_btn = self.driver.find_element(
                     By.XPATH, "//a[contains(text(),'登录') or contains(text(),'登 录')]"
