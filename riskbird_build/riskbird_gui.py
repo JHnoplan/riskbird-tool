@@ -161,16 +161,20 @@ class LoginDialog(QDialog):
                 # 添加"我已登录"按钮
                 from PyQt5.QtCore import QTimer
                 def _add_verify_btn():
-                    if not hasattr(self, 'verify_btn'):
-                        self.verify_btn = QPushButton("✅ 我已登录")
-                        self.verify_btn.setMinimumHeight(40)
-                        self.verify_btn.setStyleSheet(
-                            "QPushButton { background-color: #28a745; color: white; border-radius: 5px; font-size: 14px; font-weight: bold; }"
-                            "QPushButton:hover { background-color: #218838; }"
-                        )
-                        self.verify_btn.clicked.connect(self._do_verify)
-                        self.layout().insertWidget(self.layout().count() - 1, self.verify_btn)
-                QTimer.singleShot(0, _add_verify_btn)
+                    # 如果按钮已存在，先删除
+                    if hasattr(self, 'verify_btn'):
+                        self.verify_btn.deleteLater()
+                    # 创建新按钮
+                    self.verify_btn = QPushButton("✅ 我已登录")
+                    self.verify_btn.setMinimumHeight(45)
+                    self.verify_btn.setStyleSheet(
+                        "QPushButton { background-color: #28a745; color: white; border-radius: 5px; font-size: 15px; font-weight: bold; padding: 10px; }"
+                        "QPushButton:hover { background-color: #218838; }"
+                    )
+                    self.verify_btn.clicked.connect(self._do_verify)
+                    # 直接添加到布局
+                    self.layout().addWidget(self.verify_btn)
+                QTimer.singleShot(100, _add_verify_btn)
             except Exception as e:
                 import traceback
                 err_detail = traceback.format_exc()
