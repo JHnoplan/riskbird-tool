@@ -756,28 +756,34 @@ class RiskBirdCrawler:
             pass
 
     # ── 批量采集 ──────────────────────────────
-    def crawl(self, companies: list):
-        """批量采集公司数据"""
+    def crawl(self, companies: list, start_index: int = 0):
+        """批量采集公司数据，支持从指定位置恢复"""
         self._crawling = True
         self._stop_requested = False
-        self.results = []
+        self._pause_requested = False
         total = len(companies)
     
-        self._log(f"🚀 开始采集，共 {total} 家公司")
+        self._log(f"🚀 开始采集，共 {total} 家公司，从第 {start_index + 1} 条开始")
     
-        for idx, name in enumerate(companies, 1):
+        for idx in range(start_index, total):
             if self._stop_requested:
-                self._log("⏹ 用户停止采集")
+                self._log(f" 用户停止采集，已采集 {len(self.results)} 条")
                 break
+            
+            # 暂停检查
+            while self._pause_requested:
+                time.sleep(0.5)
+                if self._stop_requested:
+                    break
     
-            name = str(name).strip()
+            name = str(companies[idx]).strip()
             if not name:
                 continue
     
-            self._log(f"[{idx}/{total}] 正在查询: {name}")
+            self._log(f"[{idx + 1}/{total}] 正在查询: {name}")
     
             if self.signals:
-                self.signals.progress_signal.emit(idx, total)
+                self.signals.progress_signal.emit(idx + 1, total)
     
             # 搜索（只采集列表页数据，不进入详情页）
             result = self.search_company(name)
@@ -792,6 +798,16 @@ class RiskBirdCrawler:
     def stop_crawl(self):
         self._stop_requested = True
         self._log("⏳ 正在停止...")
+    
+    def pause_crawl(self):
+        """暂停采集"""
+        self._pause_requested = True
+        self._log(" 采集已暂停")
+    
+    def resume_crawl(self):
+        """恢复采集"""
+        self._pause_requested = False
+        self._log("▶ 采集已恢复")
 
     # ── 导出 Excel ────────────────────────────
     def export_excel(self, filepath: str):

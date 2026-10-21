@@ -296,21 +296,35 @@ class MainWindow(QMainWindow):
 
         self.start_btn = QPushButton("开始采集")
         self.start_btn.setMinimumHeight(42)
-        self.start_btn.setMinimumWidth(120)
+        self.start_btn.setMinimumWidth(100)
         self.start_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._start_crawl)
         ctrl_layout.addWidget(self.start_btn)
 
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.setMinimumHeight(42)
+        self.pause_btn.setMinimumWidth(80)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._pause_crawl)
+        ctrl_layout.addWidget(self.pause_btn)
+
+        self.resume_btn = QPushButton("恢复")
+        self.resume_btn.setMinimumHeight(42)
+        self.resume_btn.setMinimumWidth(80)
+        self.resume_btn.setEnabled(False)
+        self.resume_btn.clicked.connect(self._resume_crawl)
+        ctrl_layout.addWidget(self.resume_btn)
+
         self.stop_btn = QPushButton("停止采集")
         self.stop_btn.setMinimumHeight(42)
-        self.stop_btn.setMinimumWidth(120)
+        self.stop_btn.setMinimumWidth(100)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_crawl)
         ctrl_layout.addWidget(self.stop_btn)
 
         self.export_btn = QPushButton("导出 Excel")
         self.export_btn.setMinimumHeight(42)
-        self.export_btn.setMinimumWidth(120)
+        self.export_btn.setMinimumWidth(100)
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_excel)
         ctrl_layout.addWidget(self.export_btn)
@@ -477,26 +491,48 @@ class MainWindow(QMainWindow):
 
         # 设置延迟
         try:
-            delay = int(self.delay_spin.text())
-            self.crawler.delay_between = max(1, delay)
+            delay = float(self.delay_spin.text())
+            self.crawler.delay_between = max(0.1, delay)
         except ValueError:
-            self.crawler.delay_between = 3
+            self.crawler.delay_between = 0.5
+
+        # 如果是恢复采集，从上次停止的位置继续
+        start_index = len(self.crawler.results) if self.crawler.results else 0
 
         self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.select_file_btn.setEnabled(False)
+        self.export_btn.setEnabled(True)  # 采集中也可以导出
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("采集中... 0%")
 
-        self._crawl_thread = CrawlWorker(self.crawler, self._companies)
+        self._crawl_thread = CrawlWorker(self.crawler, self._companies, start_index)
         self._crawl_thread.finished.connect(self._on_crawl_finished)
         self._crawl_thread.start()
 
         self.statusBar().showMessage("采集中...")
 
+    def _pause_crawl(self):
+        self.crawler.pause_crawl()
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(True)
+        self.statusBar().showMessage("已暂停")
+
+    def _resume_crawl(self):
+        self.crawler.resume_crawl()
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self.statusBar().showMessage("采集中...")
+
     def _stop_crawl(self):
         self.crawler.stop_crawl()
         self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.start_btn.setEnabled(True)  # 允许重新开始
+        self.export_btn.setEnabled(True)  # 允许导出
 
     def _on_crawl_finished(self):
         self.start_btn.setEnabled(True)
@@ -545,13 +581,14 @@ class MainWindow(QMainWindow):
 class CrawlWorker(QThread):
     finished = pyqtSignal()
 
-    def __init__(self, crawler: RiskBirdCrawler, companies: list):
+    def __init__(self, crawler: RiskBirdCrawler, companies: list, start_index: int = 0):
         super().__init__()
         self.crawler = crawler
         self.companies = companies
+        self.start_index = start_index
 
     def run(self):
-        self.crawler.crawl(self.companies)
+        self.crawler.crawl(self.companies, self.start_index)
         self.finished.emit()
 
 
