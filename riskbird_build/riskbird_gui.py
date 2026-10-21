@@ -20,7 +20,6 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 
 from riskbird_crawler import RiskBirdCrawler, is_chrome_installed, download_and_install_chrome
-from qcc_crawler import QCCCrawler
 from aiqicha_crawler import AiQiChaCrawler
 
 try:
@@ -208,14 +207,13 @@ class LoginDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # 初始化三个爬虫
+        # 初始化两个爬虫
         self.riskbird_crawler = RiskBirdCrawler()
-        self.qcc_crawler = QCCCrawler()
         self.aiqicha_crawler = AiQiChaCrawler()
         self.crawler = self.riskbird_crawler  # 默认使用风鸟
         
         # 连接信号
-        for crawler in [self.riskbird_crawler, self.qcc_crawler, self.aiqicha_crawler]:
+        for crawler in [self.riskbird_crawler, self.aiqicha_crawler]:
             crawler.signals.log_signal.connect(self._append_log)
             crawler.signals.progress_signal.connect(self._update_progress)
             crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
@@ -226,7 +224,7 @@ class MainWindow(QMainWindow):
         self._companies = []
         self._excel_path = ""
         self._crawl_thread = None
-        self._current_source = 0  # 0=风鸟，1=企查查，2=爱企查
+        self._current_source = 0  # 0=风鸟，1=爱企查
 
         self.setWindowTitle("企业数据采集工具 v1.0")
         self.setMinimumSize(900, 700)
@@ -258,7 +256,6 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QComboBox
         self.source_combo = QComboBox()
         self.source_combo.addItem("风鸟 (riskbird.com)")
-        self.source_combo.addItem("企查查 (qcc.com)")
         self.source_combo.addItem("爱企查 (aiqicha.baidu.com)")
         self.source_combo.setMinimumWidth(200)
         self.source_combo.setMinimumHeight(30)
@@ -479,9 +476,6 @@ class MainWindow(QMainWindow):
         if index == 0:
             self.crawler = self.riskbird_crawler
             self._append_log("已切换到：风鸟 (riskbird.com)")
-        elif index == 1:
-            self.crawler = self.qcc_crawler
-            self._append_log("已切换到：企查查 (qcc.com)")
         else:
             self.crawler = self.aiqicha_crawler
             self._append_log("已切换到：爱企查 (aiqicha.baidu.com)")
@@ -500,7 +494,7 @@ class MainWindow(QMainWindow):
             if self.crawler.driver is None:
                 self.crawler.start_browser(headed=True)
             self.crawler.driver.get(self.crawler.BASE_URL)
-            site_names = ["riskbird.com", "qcc.com", "aiqicha.baidu.com"]
+            site_names = ["riskbird.com", "aiqicha.baidu.com"]
             site_name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
             self._append_log(f"已打开 {site_name} 网站")
         except Exception as e:
