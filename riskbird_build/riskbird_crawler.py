@@ -468,12 +468,18 @@ class RiskBirdCrawler:
             # 电话
             m = re.search(r"电话[：:\s]*([\d\-]+)", card_text)
             if m:
-                result["电话"] = m.group(1).strip()
+                phone = m.group(1).strip()
+                # 清洗：移除"更多"等后缀
+                phone = re.sub(r'[更多\s]+$', '', phone)
+                result["电话"] = phone
 
             # 邮箱
             m = re.search(r"邮箱[：:\s]*([\w.+-]+@[\w.-]+)", card_text)
             if m:
-                result["邮箱"] = m.group(1).strip()
+                email = m.group(1).strip()
+                # 清洗：移除"更多"等后缀
+                email = re.sub(r'[更多\s]+$', '', email)
+                result["邮箱"] = email
 
             # 官网
             m = re.search(r"官网[：:\s]*(https?://\S+)", card_text)
@@ -759,50 +765,28 @@ class RiskBirdCrawler:
         self._stop_requested = False
         self.results = []
         total = len(companies)
-
-        if not self._logged_in:
-            self._log("❌ 未登录，请先登录")
-            if self.signals:
-                self.signals.log_signal.emit("❌ 未登录，请先登录")
-            return
-
+    
         self._log(f"🚀 开始采集，共 {total} 家公司")
-
+    
         for idx, name in enumerate(companies, 1):
             if self._stop_requested:
                 self._log("⏹ 用户停止采集")
                 break
-
+    
             name = str(name).strip()
             if not name:
                 continue
-
+    
             self._log(f"[{idx}/{total}] 正在查询: {name}")
-
+    
             if self.signals:
                 self.signals.progress_signal.emit(idx, total)
-
-            # 检查登录是否过期
-            if idx % 20 == 0:
-                if not self._check_login_status():
-                    self._logged_in = False
-                    self._log("⚠️ 登录已过期，请重新登录！")
-                    if self.signals:
-                        self.signals.login_status_signal.emit(False, "登录已过期")
-                        self.signals.manual_check_signal.emit("登录已过期，请重新登录")
-                    break
-
-            # 搜索
+    
+            # 搜索（只采集列表页数据，不进入详情页）
             result = self.search_company(name)
-
-            # 详情
-            if result.get("搜索结果URL"):
-                time.sleep(self.delay_between)
-                result = self.fetch_detail(result)
-
             self.results.append(result)
             time.sleep(self.delay_between)
-
+    
         self._crawling = False
         self._log(f" 采集完成！共 {len(self.results)} 条数据")
         if self.signals:

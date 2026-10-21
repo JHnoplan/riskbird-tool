@@ -247,13 +247,21 @@ class MainWindow(QMainWindow):
         )
         title_bar.addWidget(self.login_status_lbl)
 
-        self.login_btn = QPushButton("登录")
-        self.login_btn.setMinimumHeight(34)
-        self.login_btn.setMinimumWidth(80)
-        self.login_btn.clicked.connect(self._show_login)
-        title_bar.addWidget(self.login_btn)
+        # 打开网页按钮
+        self.open_web_btn = QPushButton("打开网页")
+        self.open_web_btn.setMinimumHeight(34)
+        self.open_web_btn.setMinimumWidth(80)
+        self.open_web_btn.clicked.connect(self._open_website)
+        title_bar.addWidget(self.open_web_btn)
 
         main_layout.addLayout(title_bar)
+
+        # 提示
+        hint_lbl = QLabel("提示：如未登录请先登录后再操作其他功能")
+        hint_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 9))
+        hint_lbl.setStyleSheet("color: #999; padding: 2px 0;")
+        hint_lbl.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(hint_lbl)
 
         # ── 文件选择区 ──
         file_group = QGroupBox("  数据文件")
@@ -421,13 +429,23 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, f"公司列表预览（前20条）", preview)
 
     def _check_ready(self):
-        ready = bool(self._companies) and self.crawler._logged_in
+        ready = bool(self._companies)
         self.start_btn.setEnabled(ready)
 
-    # ── 登录 ───────────────────────────────────
+    # ─ 登录 ───────────────────────────────────
     def _show_login(self):
         dlg = LoginDialog(self.crawler, self)
         dlg.exec_()
+
+    def _open_website(self):
+        """打开 riskbird.com 网站"""
+        try:
+            if self.crawler.driver is None:
+                self.crawler.start_browser(headed=True)
+            self.crawler.driver.get(self.crawler.BASE_URL)
+            self._append_log("已打开 riskbird.com 网站")
+        except Exception as e:
+            self._append_log(f"打开网站失败: {e}")
 
     def _on_login_status(self, success: bool, msg: str):
         if success:
@@ -435,13 +453,11 @@ class MainWindow(QMainWindow):
             self.login_status_lbl.setStyleSheet(
                 "QLabel { padding: 5px 12px; border-radius: 4px; background: #d4edda; color: #155724; }"
             )
-            self.login_btn.setText("重新登录")
         else:
             self.login_status_lbl.setText("未登录")
             self.login_status_lbl.setStyleSheet(
                 "QLabel { padding: 5px 12px; border-radius: 4px; background: #f8d7da; color: #721c24; }"
             )
-        self._check_ready()
 
     def _on_manual_check(self, msg: str):
         self.statusBar().showMessage(msg, 5000)
@@ -450,9 +466,6 @@ class MainWindow(QMainWindow):
     def _start_crawl(self):
         if not self._companies:
             QMessageBox.warning(self, "提示", "请先选择 Excel 文件")
-            return
-        if not self.crawler._logged_in:
-            QMessageBox.warning(self, "提示", "请先登录")
             return
 
         # 设置延迟
