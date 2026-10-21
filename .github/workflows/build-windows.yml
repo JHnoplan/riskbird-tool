@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt5 selenium openpyxl pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+    - name: Build EXE with PyInstaller
+      run: |
+        cd riskbird_build
+        python -m PyInstaller --noconfirm --onefile --windowed --name RiskBirdTool --collect-all selenium --collect-all PyQt5 riskbird_gui.py
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RiskBirdTool
+        path: riskbird_build/dist/RiskBirdTool.exe
