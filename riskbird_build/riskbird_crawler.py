@@ -359,18 +359,22 @@ class RiskBirdCrawler:
         """尝试从本地 Cookie 恢复登录"""
         if not self._cookie_file.exists():
             return False
-        self.start_browser()
-        self.driver.get(self.BASE_URL)
-        time.sleep(1)
-        self._load_cookies()
-        self.driver.refresh()
-        time.sleep(2)
-        if self._check_login_status():
-            self._logged_in = True
-            self._log("✅ 从本地 Cookie 恢复登录成功")
-            return True
-        else:
-            self._log("⚠️ 本地 Cookie 已过期，需要重新登录")
+        try:
+            self.start_browser(headed=True)
+            self.driver.get(self.BASE_URL)
+            time.sleep(2)
+            self._load_cookies()
+            self.driver.refresh()
+            time.sleep(3)
+            if self._check_login_status():
+                self._logged_in = True
+                self._log("✅ 从本地 Cookie 恢复登录成功")
+                return True
+            else:
+                self._log("⚠️ 本地 Cookie 已过期，需要重新登录")
+                return False
+        except Exception as e:
+            self._log(f"⚠️ Cookie 恢复失败: {e}")
             return False
 
     # ── 搜索公司 ──────────────────────────────
