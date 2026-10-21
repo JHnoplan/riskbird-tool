@@ -167,25 +167,32 @@ class RiskBirdCrawler:
         try:
             self.driver.get(self.BASE_URL)
             time.sleep(2)
-            # 已登录时右上角显示用户头像/手机号
+            # 已登录时右上角显示用户头像/手机号/SVIP
             indicators = [
                 "//div[contains(@class,'user')]",
                 "//a[contains(@class,'user')]",
                 "//span[contains(@class,'phone')]",
                 "//div[contains(@class,'avatar')]",
                 "//a[contains(text(),'SVIP')]",
+                "//span[contains(text(),'SVIP')]",
+                "//*[contains(text(),'SVIP')]",
+                # 匹配手机号格式 1XX****XXXX
+                "//*[contains(text(),'****')]",
+                "//span[contains(text(),'****')]",
+                "//a[contains(text(),'****')]",
             ]
             for xpath in indicators:
                 try:
                     el = self.driver.find_element(By.XPATH, xpath)
                     if el and el.is_displayed():
+                        self._log(f"  检测到登录标识: {xpath}")
                         return True
                 except NoSuchElementException:
                     continue
-            # 备用：检查是否没有"登录"按钮
+            # 备用：检查是否没有"登录"按钮（已登录时登录按钮会消失）
             try:
                 login_btn = self.driver.find_element(
-                    By.XPATH, "//a[contains(text(),'登录')]"
+                    By.XPATH, "//a[contains(text(),'登录') or contains(text(),'登 录')]"
                 )
                 return not login_btn.is_displayed()
             except NoSuchElementException:

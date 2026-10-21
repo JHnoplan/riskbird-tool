@@ -146,7 +146,6 @@ class LoginDialog(QDialog):
 
         def _start_and_login():
             try:
-                import traceback
                 if self.crawler.driver is None:
                     self.status_label.setText("正在启动 Chrome...")
                     self.crawler.start_browser(headed=True)
@@ -157,21 +156,27 @@ class LoginDialog(QDialog):
                 # 回到 GUI 线程更新界面
                 self.auto_btn.setEnabled(True)
                 self.manual_btn.setEnabled(True)
-                self.status_label.setText("请在浏览器中完成登录...")
+                self.status_label.setText("请在浏览器中完成登录，自动检测中...")
                 self.status_label.setStyleSheet("color: blue;")
-                # 添加验证按钮
-                if not hasattr(self, 'verify_btn'):
-                    from PyQt5.QtCore import QTimer
-                    def _add_btn():
-                        self.verify_btn = QPushButton("我已登录，验证")
-                        self.verify_btn.setMinimumHeight(36)
-                        self.verify_btn.setStyleSheet(
-                            "QPushButton { background-color: #ED7D31; color: white; border-radius: 5px; font-size: 13px; }"
-                            "QPushButton:hover { background-color: #D06A20; }"
-                        )
-                        self.verify_btn.clicked.connect(self._do_verify)
-                        self.layout().insertWidget(self.layout().count() - 1, self.verify_btn)
-                    QTimer.singleShot(0, _add_btn)
+                # 启动自动检测（每 3 秒检测一次，最多 60 秒）
+                from PyQt5.QtCore import QTimer
+                self._login_check_count = 0
+                def _check_login():
+                    self._login_check_count += 1
+                    if self.crawler._check_login_status():
+                        self.crawler._logged_in = True
+                        self.crawler._save_cookies()
+                        self.status_label.setText("✅ 检测到登录成功！")
+                        self.status_label.setStyleSheet("color: green;")
+                        QTimer.singleShot(1000, self.accept)
+                    elif self._login_check_count >= 20:  # 60 秒超时
+                        self.status_label.setText("⏰ 超时，请重新点击手动登录")
+                        self.status_label.setStyleSheet("color: red;")
+                    else:
+                        self.status_label.setText(f"等待登录... ({self._login_check_count * 3}秒)")
+                self._login_timer = QTimer()
+                self._login_timer.timeout.connect(_check_login)
+                self._login_timer.start(3000)  # 每 3 秒检测一次
             except Exception as e:
                 import traceback
                 err_detail = traceback.format_exc()
@@ -179,7 +184,6 @@ class LoginDialog(QDialog):
                 self.manual_btn.setEnabled(True)
                 self.status_label.setText(f"启动浏览器失败: {e}")
                 self.status_label.setStyleSheet("color: red;")
-                # 打印详细错误到日志
                 print("=== 浏览器启动错误详情 ===")
                 print(err_detail)
                 print("========================")
