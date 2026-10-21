@@ -1,6 +1,5 @@
 """
-qizhidao_crawler.py - 企知道 (qizhidao.com) 企业数据爬虫模块
-使用 Selenium 控制 Chrome 浏览器，实现搜索、数据采集
+qcc_crawler.py - 企查查 (qcc.com) 企业数据爬虫模块
 """
 
 import json
@@ -8,9 +7,7 @@ import os
 import sys
 import time
 import re
-import subprocess
 import threading
-import traceback
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -20,9 +17,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    NoSuchElementException, TimeoutException, WebDriverException
-)
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
@@ -31,56 +26,6 @@ except ImportError:
     HAS_PYQT = False
 
 
-# ──────────────────────────────────────────────
-#  Chrome 检测与自动安装
-# ─────────────────────────────────────────────
-CHROME_PATHS = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-]
-
-
-def is_chrome_installed() -> bool:
-    for path in CHROME_PATHS:
-        if os.path.isfile(path):
-            return True
-    try:
-        import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            key = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe")
-            winreg.CloseKey(key)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def download_and_install_chrome(callback=None) -> bool:
-    try:
-        url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
-        installer = os.path.join(os.environ.get("TEMP", "/tmp"), "chrome_installer.exe")
-        if callback:
-            callback("正在下载 Google Chrome...")
-        ps_script = f"""
-$ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest -Uri '{url}' -OutFile '{installer}'
-Start-Process -FilePath '{installer}' -Args '/silent /install' -Wait
-Remove-Item '{installer}' -Force
-"""
-        subprocess.run(["powershell", "-Command", ps_script], check=True, timeout=120)
-        if callback:
-            callback("Chrome 安装成功！")
-        return True
-    except Exception as e:
-        if callback:
-            callback(f"Chrome 安装失败：{e}")
-        return False
-
-
-# ─────────────────────────────────────────────
-#  信号类
-# ─────────────────────────────────────────────
 if HAS_PYQT:
     class CrawlerSignals(QObject):
         log_signal = pyqtSignal(str)
@@ -91,12 +36,9 @@ else:
         pass
 
 
-# ─────────────────────────────────────────────
-#  爬虫主类
-# ─────────────────────────────────────────────
-class QiZhiDaoCrawler:
-    BASE_URL = "https://www.qizhidao.com"
-    SEARCH_URL = f"{BASE_URL}/check"
+class QCCCrawler:
+    BASE_URL = "https://www.qcc.com"
+    SEARCH_URL = f"{BASE_URL}/web/search"
 
     def __init__(self, gui_callback=None):
         self.driver = None
@@ -113,8 +55,7 @@ class QiZhiDaoCrawler:
         else:
             self.signals = None
 
-        self.delay_between = 0.5
-        self.max_retries = 2
+        self.delay_between = 1.0  # 企查查需要稍长间隔
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -135,8 +76,6 @@ class QiZhiDaoCrawler:
             opts.add_argument("--window-size=1400,900")
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.add_argument("--disable-notifications")
-            opts.add_argument("--no-first-run")
-            opts.add_argument("--disable-infobars")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
 
@@ -155,10 +94,9 @@ class QiZhiDaoCrawler:
             except Exception:
                 pass
             self.driver = None
-            self._log("🔒 浏览器已关闭")
 
     def search_company(self, name: str) -> dict:
-        """搜索公司并返回第一条结果的基本信息"""
+        """搜索公司并返回第一条结果"""
         result = {
             "公司名": name,
             "法定代表人": "",
@@ -167,7 +105,6 @@ class QiZhiDaoCrawler:
             "统一社会信用代码": "",
             "电话": "",
             "邮箱": "",
-            "官网": "",
             "地址": "",
             "经营状态": "",
             "搜索结果 URL": "",
@@ -176,33 +113,32 @@ class QiZhiDaoCrawler:
             if self.driver is None:
                 self.start_browser(headed=True)
 
-            # 使用企知道搜索 URL
-            search_url = f"{self.SEARCH_URL}?searchKey={urllib.parse.quote(name)}&tagNum=1&scPageTitle=PC 站首页&searchModeType=8&fromRoutePage=index&businessSourceDzlQuery="
+            search_url = f"{self.SEARCH_URL}?key={urllib.parse.quote(name)}"
             self.driver.get(search_url)
-            time.sleep(2)
+            time.sleep(3)  # 等待页面加载
 
-            # 等待搜索结果加载
-            time.sleep(1)
-
-            # 获取第一条结果
+            # 尝试多种选择器定位结果列表
             cards = []
-            card_selectors = [
+            selectors = [
+                "//div[contains(@class,'search-result')]//div[contains(@class,'item')]",
+                "//div[contains(@class,'list-item')]",
                 "//div[contains(@class,'company-item')]",
-                "//div[contains(@class,'result-item')]",
-                "//div[contains(@class,'search-result')]",
-                "//li[contains(@class,'company')]",
-                "//div[contains(@class,'card')]",
+                "//a[contains(@class,'title')]/ancestor::div[contains(@class,'item')]",
+                "//div[@id='search-result']//div[contains(@class,'item')]",
             ]
-            for sel in card_selectors:
+            for sel in selectors:
                 try:
                     cards = self.driver.find_elements(By.XPATH, sel)
                     if cards:
+                        self._log(f"  找到 {len(cards)} 条结果 (选择器: {sel[:30]}...)")
                         break
                 except Exception:
                     continue
 
             if not cards:
-                self._log(f"   未找到 '{name}' 的搜索结果")
+                # 获取页面文本用于调试
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text[:500]
+                self._log(f"  未找到结果，页面内容前 500 字：{page_text}")
                 result["经营状态"] = "未找到"
                 return result
 
@@ -211,9 +147,7 @@ class QiZhiDaoCrawler:
 
             # 提取公司名
             try:
-                name_el = card.find_element(
-                    By.XPATH, ".//a[contains(@class,'name')] | .//h3 | .//h4 | .//div[contains(@class,'title')]//a | .//a[1]"
-                )
+                name_el = card.find_element(By.XPATH, ".//a[contains(@class,'title')] | .//h3 | .//span[contains(@class,'name')]")
                 result["公司名"] = name_el.text.strip()
                 href = name_el.get_attribute("href") or ""
                 if href:
@@ -222,70 +156,56 @@ class QiZhiDaoCrawler:
                 pass
 
             # 提取各项信息
-            # 法定代表人
-            m = re.search(r"法定代表人 [：:\s]*(\S+)", card_text)
-            if m:
-                result["法定代表人"] = m.group(1).strip()
-
-            # 注册资本
-            m = re.search(r"注册资本 [：:\s]*([\d.]+\s*万\S*)", card_text)
-            if m:
-                result["注册资本"] = m.group(1).strip()
-
-            # 成立日期
-            m = re.search(r"成立日期 [：:\s]*(\d{4}[-/]\d{1,2}[-/]\d{1,2})", card_text)
-            if m:
-                result["成立日期"] = m.group(1).strip()
-
-            # 信用代码
-            m = re.search(r"(?:统一社会信用代码 | 信用代码)[：:\s]*([A-Z0-9]{18})", card_text)
-            if m:
-                result["统一社会信用代码"] = m.group(1).strip()
-
-            # 电话
-            m = re.search(r"电话 [：:\s]*([\d\-]+)", card_text)
-            if m:
-                phone = m.group(1).strip()
-                phone = re.sub(r'[更多\s]+$', '', phone)
-                result["电话"] = phone
-
-            # 邮箱
-            m = re.search(r"邮箱 [：:\s]*([\w.+-]+@[\w.-]+)", card_text)
-            if m:
-                email = m.group(1).strip()
-                email = re.sub(r'[更多\s]+$', '', email)
-                result["邮箱"] = email
-
-            # 官网
-            m = re.search(r"官网 [：:\s]*(https?://\S+)", card_text)
-            if m:
-                result["官网"] = m.group(1).strip().rstrip("，。,.")
+            patterns = {
+                "法定代表人": r"法定代表人 [：:\s]*(\S+)",
+                "注册资本": r"注册资本 [：:\s]*([\d.]+\s*万\S*)",
+                "成立日期": r"成立日期 [：:\s]*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+                "统一社会信用代码": r"(?:统一社会信用代码 | 信用代码)[：:\s]*([A-Z0-9]{18})",
+                "电话": r"电话 [：:\s]*([\d\-]+)",
+                "邮箱": r"邮箱 [：:\s]*([\w.+-]+@[\w.-]+)",
+            }
+            for key, pattern in patterns.items():
+                m = re.search(pattern, card_text)
+                if m:
+                    value = m.group(1).strip()
+                    if key in ["电话", "邮箱"]:
+                        value = re.sub(r'[更多\s]+$', '', value)
+                    result[key] = value
 
             # 地址
-            m = re.search(r"(?:通信地址 | 地址)[：:\s]*(.+?)(?:电话 | 邮箱 | 官网|$)", card_text, re.DOTALL)
+            m = re.search(r"(?:地址 | 通信地址)[：:\s]*(.+?)(?:电话 | 邮箱 | 官网|$)", card_text, re.DOTALL)
             if m:
                 result["地址"] = m.group(1).strip()[:100]
 
             # 经营状态
-            status_patterns = ["在营", "存续", "在业", "注销", "吊销", "迁出"]
-            for s in status_patterns:
-                if s in card_text:
-                    result["经营状态"] = s
+            for status in ["存续", "在业", "在营", "注销", "吊销"]:
+                if status in card_text:
+                    result["经营状态"] = status
                     break
 
             self._log(f"  ✅ 搜索到：{result['公司名']}")
 
         except TimeoutException:
-            self._log(f"   搜索 '{name}' 超时")
+            self._log(f"  搜索 '{name}' 超时")
             result["经营状态"] = "搜索超时"
         except Exception as e:
-            self._log(f"   搜索 '{name}' 异常：{e}")
+            self._log(f"  搜索 '{name}' 异常：{e}")
             result["经营状态"] = f"异常：{str(e)[:50]}"
 
         return result
 
+    def test_search(self, company_name: str) -> dict:
+        """测试搜索单个公司"""
+        self._log(f"🔍 测试搜索：{company_name}")
+        result = self.search_company(company_name)
+        if result.get("经营状态") and result["经营状态"] not in ["未找到", "搜索超时"]:
+            self._log(f"✅ 测试成功！采集到数据")
+        else:
+            self._log(f" 测试失败：{result.get('经营状态', '未知错误')}")
+        return result
+
     def crawl(self, companies: list, start_index: int = 0):
-        """批量采集公司数据，支持从指定位置恢复"""
+        """批量采集"""
         self._crawling = True
         self._stop_requested = False
         self._pause_requested = False
@@ -295,10 +215,9 @@ class QiZhiDaoCrawler:
 
         for idx in range(start_index, total):
             if self._stop_requested:
-                self._log(f" 用户停止采集，已采集 {len(self.results)} 条")
+                self._log(f"  用户停止采集，已采集 {len(self.results)} 条")
                 break
 
-            # 暂停检查
             while self._pause_requested:
                 time.sleep(0.5)
                 if self._stop_requested:
@@ -313,7 +232,6 @@ class QiZhiDaoCrawler:
             if self.signals:
                 self.signals.progress_signal.emit(idx + 1, total)
 
-            # 搜索
             result = self.search_company(name)
             self.results.append(result)
             time.sleep(self.delay_between)
@@ -325,56 +243,42 @@ class QiZhiDaoCrawler:
 
     def stop_crawl(self):
         self._stop_requested = True
-        self._log(" 正在停止...")
 
     def pause_crawl(self):
-        """暂停采集"""
         self._pause_requested = True
-        self._log(" 采集已暂停")
 
     def resume_crawl(self):
-        """恢复采集"""
         self._pause_requested = False
-        self._log("▶ 采集已恢复")
 
     def export_excel(self, filepath: str):
-        """将采集结果导出为 Excel"""
+        """导出 Excel"""
         try:
             from openpyxl import Workbook
-            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            from openpyxl.styles import Font, Alignment, PatternFill
 
             wb = Workbook()
             ws = wb.active
             ws.title = "企业数据"
 
             if not self.results:
-                self._log("⚠️ 没有数据可导出")
                 return
 
-            # 表头
             headers = ["公司名", "法定代表人", "注册资本", "成立日期", "统一社会信用代码",
-                       "电话", "邮箱", "官网", "地址", "经营状态", "搜索结果 URL"]
+                       "电话", "邮箱", "地址", "经营状态", "搜索结果 URL"]
             header_font = Font(bold=True, color="FFFFFF", size=11)
             header_fill = PatternFill(start_color="1a3c6e", end_color="1a3c6e", fill_type="solid")
-            header_align = Alignment(horizontal="center", vertical="center")
 
             for col, header in enumerate(headers, 1):
                 cell = ws.cell(row=1, column=col, value=header)
                 cell.font = header_font
                 cell.fill = header_fill
-                cell.alignment = header_align
+                cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            # 数据
             for row_idx, result in enumerate(self.results, 2):
                 for col_idx, key in enumerate(headers, 1):
                     value = result.get(key, "")
                     cell = ws.cell(row=row_idx, column=col_idx, value=value)
                     cell.alignment = Alignment(vertical="center", wrap_text=True)
-
-            # 列宽
-            col_widths = [30, 12, 15, 12, 22, 15, 25, 25, 40, 10, 30]
-            for i, width in enumerate(col_widths, 1):
-                ws.column_dimensions[chr(64 + i) if i <= 26 else 'A'].width = width
 
             wb.save(filepath)
             self._log(f"✅ 已导出 {len(self.results)} 条数据到：{filepath}")
