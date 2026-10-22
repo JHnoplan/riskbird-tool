@@ -7,7 +7,11 @@ import json
 import time
 import re
 import threading
+import subprocess
+import sys
+import os
 import requests
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -122,31 +126,34 @@ class AiQiChaCrawlerV2:
         """创建新标签页并导航（或复用现有标签页）"""
         # 检查是否是详情页 URL
         is_detail = "company_detail" in url
-        
+            
         if not is_detail:
-            # 首页：必须复用已有的爱企查首页标签页（关键！）
-            # 不能通过 CDP 导航到爱企查，否则会触发反爬虫检测
+            # 首页：复用已有的爱企查首页标签页
             tabs = self._get_tabs()
             for tab in tabs:
                 tab_url = tab.get("url", "")
                 if "aiqicha.baidu.com" in tab_url and "/s?" not in tab_url and "company_detail" not in tab_url:
-                    self._log(f"复用现有爱企查标签页：{tab.get('title', 'N/A')[:30]}")
+                    self._log(f"复用现有爱企查标签页")
                     return tab.get("webSocketDebuggerUrl")
-            
-            # 如果没有可用的爱企查标签页，提示用户手动打开
-            self._log("⚠️ 未找到爱企查标签页！请先在 Chrome 中手动打开 aiqicha.baidu.com")
-            self._log("等待用户打开爱企查页面...")
-            for i in range(30):  # 等待最多 30 秒
-                time.sleep(1)
-                tabs = self._get_tabs()
-                for tab in tabs:
-                    tab_url = tab.get("url", "")
-                    if "aiqicha.baidu.com" in tab_url and "/s?" not in tab_url and "company_detail" not in tab_url:
-                        self._log(f"检测到爱企查页面：{tab.get('title', 'N/A')[:30]}")
-                        return tab.get("webSocketDebuggerUrl")
-            self._log("❌ 超时：用户未打开爱企查页面")
+                
+            # 没有现有标签页，创建新标签页并导航到爱企查
+            self._log("正在打开爱企查...")
+            result = self._send_command(
+                self._get_ws_url(),
+                "Target.createTarget",
+                {"url": self.BASE_URL}
+            )
+            target_id = result.get("result", {}).get("targetId")
+            if not target_id:
+                return None
+                
+            time.sleep(5)
+            tabs = self._get_tabs()
+            for tab in tabs:
+                if target_id in tab.get("id", ""):
+                    return tab.get("webSocketDebuggerUrl")
             return None
-        
+            
         # 详情页：创建新标签页
         result = self._send_command(
             self._get_ws_url(),
@@ -156,7 +163,7 @@ class AiQiChaCrawlerV2:
         target_id = result.get("result", {}).get("targetId")
         if not target_id:
             return None
-        
+            
         # 获取新标签页的 WebSocket URL
         time.sleep(3)
         tabs = self._get_tabs()
@@ -227,17 +234,113 @@ class AiQiChaCrawlerV2:
         return self._execute_js(ws_url, "(function() { return document.body.innerHTML; })()")
     
     # ── 浏览器管理 ──
+    def _find_chrome(self):
+        """查找 Chrome 可执行文件路径"""
+        candidates = []
+        if sys.platform == "win32":
+            candidates = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            ]
+        elif sys.platform == "darwin":
+            candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+    
+    def _kill_chrome(self):
+        """关闭所有 Chrome 进程"""
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    [r"C:\Windows\System32\taskkill.exe", "/F", "/IM", "chrome.exe"],
+                    capture_output=True, timeout=10
+                )
+            elif sys.platform == "darwin":
+                subprocess.run(["pkill", "-9", "Google Chrome"], capture_output=True, timeout=10)
+            time.sleep(2)  # 等待进程完全退出
+        except Exception:
+            pass
+    
+    def _get_temp_profile(self):
+        """获取临时 Chrome 配置目录"""
+        if sys.platform == "win32":
+            real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+            temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile"
+        else:
+            real_profile = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+            temp_profile = Path("/tmp/aiqicha_chrome_profile")
+        
+        # 如果临时配置不存在或损坏，从真实配置复制
+        cookies_file = temp_profile / "Default" / "Cookies"
+        if not temp_profile.exists() or (cookies_file.exists() and cookies_file.stat().st_size < 1000):
+            if os.path.exists(real_profile):
+                self._log("正在准备 Chrome 配置...")
+                if temp_profile.exists():
+                    shutil.rmtree(str(temp_profile), ignore_errors=True)
+                shutil.copytree(real_profile, str(temp_profile), ignore=shutil.ignore_patterns("SingletonLock", "SingletonSocket", "SingletonCookie"))
+        
+        return str(temp_profile)
+    
     def start_browser(self, headed: bool = True):
-        """启动浏览器（检查 Chrome 是否已运行）"""
+        """启动浏览器（自动管理 Chrome 进程）"""
         with self._browser_lock:
+            # 1. 先检查是否已有可用的调试端口
             try:
                 tabs = self._get_tabs()
                 if tabs:
-                    self._log("Chrome 已运行")
+                    self._log("Chrome 调试端口已连接")
                     return True
             except Exception:
                 pass
-            self._log("请先手动启动 Chrome（带 --remote-debugging-port=9233）")
+            
+            # 2. 关闭所有现有 Chrome 进程
+            self._log("正在关闭已有 Chrome...")
+            self._kill_chrome()
+            
+            # 3. 查找 Chrome
+            chrome_path = self._find_chrome()
+            if not chrome_path:
+                self._log("❌ 未找到 Chrome，请先安装 Google Chrome")
+                return False
+            
+            # 4. 准备临时配置目录
+            temp_profile = self._get_temp_profile()
+            
+            # 5. 启动 Chrome（带调试端口）
+            self._log("正在启动 Chrome...")
+            cmd = [
+                chrome_path,
+                f"--remote-debugging-port={self.debug_port}",
+                f"--user-data-dir={temp_profile}",
+                "--profile-directory=Default",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self._log(f"启动 Chrome 失败：{e}")
+                return False
+            
+            # 6. 等待调试端口就绪
+            self._log("等待 Chrome 启动...")
+            for i in range(15):
+                time.sleep(1)
+                try:
+                    tabs = self._get_tabs()
+                    if tabs:
+                        self._log("Chrome 启动成功")
+                        return True
+                except Exception:
+                    pass
+            
+            self._log("❌ Chrome 启动超时，请检查是否已安装 Google Chrome")
             return False
     
     def close_browser(self):
