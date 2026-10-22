@@ -121,15 +121,30 @@ class AiQiChaCrawlerV2:
         is_detail = "company_detail" in url
         
         if not is_detail:
-            # 首页：复用已有的爱企查首页标签页
+            # 首页：必须复用已有的爱企查首页标签页（关键！）
+            # 不能通过 CDP 导航到爱企查，否则会触发反爬虫检测
             tabs = self._get_tabs()
             for tab in tabs:
                 tab_url = tab.get("url", "")
                 if "aiqicha.baidu.com" in tab_url and "/s?" not in tab_url and "company_detail" not in tab_url:
-                    self._log(f"复用现有标签页：{tab.get('title', 'N/A')[:30]}")
+                    self._log(f"复用现有爱企查标签页：{tab.get('title', 'N/A')[:30]}")
                     return tab.get("webSocketDebuggerUrl")
+            
+            # 如果没有可用的爱企查标签页，提示用户手动打开
+            self._log("⚠️ 未找到爱企查标签页！请先在 Chrome 中手动打开 aiqicha.baidu.com")
+            self._log("等待用户打开爱企查页面...")
+            for i in range(30):  # 等待最多 30 秒
+                time.sleep(1)
+                tabs = self._get_tabs()
+                for tab in tabs:
+                    tab_url = tab.get("url", "")
+                    if "aiqicha.baidu.com" in tab_url and "/s?" not in tab_url and "company_detail" not in tab_url:
+                        self._log(f"检测到爱企查页面：{tab.get('title', 'N/A')[:30]}")
+                        return tab.get("webSocketDebuggerUrl")
+            self._log("❌ 超时：用户未打开爱企查页面")
+            return None
         
-        # 创建新标签页（详情页或没有可用首页标签）
+        # 详情页：创建新标签页
         result = self._send_command(
             self._get_ws_url(),
             "Target.createTarget",
@@ -304,6 +319,23 @@ class AiQiChaCrawlerV2:
                 
                 # 2. 等待页面完全加载
                 time.sleep(8)
+                
+                # 检查页面是否正常加载（关键！）
+                page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
+                
+                if page_body and '请关闭浏览器的调试窗口' in page_body:
+                    self._log("❌ 爱企查检测到调试窗口！")
+                    self._log("解决方案：")
+                    self._log("1. 按 F12 关闭开发者工具面板（如果打开了）")
+                    self._log("2. 刷新页面（F5）")
+                    self._log("3. 如果还是不行，关闭 Chrome 重新启动（不带 --auto-open-devtools-for-tabs）")
+                    result["状态"] = "被反爬虫检测"
+                    return result
+                
+                if not page_body or len(page_body) < 100:
+                    self._log("⚠️ 页面内容异常，可能未完全加载")
+                    result["状态"] = "页面加载失败"
+                    return result
                 
                 # 3. 点击搜索框聚焦并清空
                 self._execute_js(ws_url, """
