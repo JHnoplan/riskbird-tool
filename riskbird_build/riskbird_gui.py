@@ -749,6 +749,7 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(True)
         self.statusBar().showMessage("已暂停")
+        self._auto_save("点击暂停")
 
     def _resume_crawl(self):
         self.crawler.resume_crawl()
@@ -763,6 +764,7 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(False)
         self.start_btn.setEnabled(True)  # 允许重新开始
         self.export_btn.setEnabled(True)  # 允许导出
+        self._auto_save("点击停止")
 
     def _on_crawl_finished(self):
         self.start_btn.setEnabled(True)
@@ -771,6 +773,7 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(bool(self.crawler.results))
         self.statusBar().showMessage(f"采集完成 — 共 {len(self.crawler.results)} 条数据")
         self.progress_bar.setFormat(f"完成 — {len(self.crawler.results)} 条数据")
+        self._auto_save("采集完成")
 
     def _update_progress(self, current: int, total: int):
         pct = int(current / total * 100) if total else 0
@@ -788,6 +791,29 @@ class MainWindow(QMainWindow):
         # 更新计数
         count = self.log_text.document().blockCount()
         self.log_count_lbl.setText(f"日志: {count} 条")
+
+    # ── 自动保存 ──────────────────────────────
+    def _auto_save(self, reason: str = ""):
+        """自动保存到 exe 同目录下的「自动保存」文件夹"""
+        if not self.crawler.results:
+            return
+
+        # 保存位置：exe 同目录 / 自动保存
+        base_dir = Path(__file__).parent / "自动保存"
+        base_dir.mkdir(exist_ok=True)
+
+        # 根据数据源动态命名
+        source_names = ["风鸟", "企知道", "爱企查"]
+        source_name = source_names[self._current_source] if self._current_source < len(source_names) else "企业数据"
+        filename = f"{source_name}_自动保存_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        filepath = base_dir / filename
+
+        try:
+            self.crawler.export_excel(str(filepath))
+            reason_text = f"（{reason}）" if reason else ""
+            self._append_log(f"✅ 已自动保存 {len(self.crawler.results)} 条数据到：{filepath} {reason_text}")
+        except Exception as e:
+            self._append_log(f"️ 自动保存失败：{e}")
 
     # ── 导出 ──────────────────────────────────
     def _export_excel(self):
