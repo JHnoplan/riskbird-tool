@@ -231,14 +231,24 @@ class QiZhiDaoCrawler:
                     opts.add_argument("--profile-directory=Default")
                     self._log("使用 Chrome 配置（登录态）")
             else:
+                # Windows: 复制 Chrome 配置到临时目录，避免单实例锁冲突
                 chrome_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+                temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile"
                 if os.path.exists(chrome_profile):
-                    opts.add_argument(f"--user-data-dir={chrome_profile}")
+                    import shutil
+                    if not temp_profile.exists():
+                        self._log("正在复制 Chrome 配置...")
+                        shutil.copytree(chrome_profile, str(temp_profile), dirs_exist_ok=True)
+                    opts.add_argument(f"--user-data-dir={temp_profile}")
                     opts.add_argument("--profile-directory=Default")
                     self._log("使用 Chrome 配置（登录态）")
 
-            # 使用本地 ChromeDriver
-            chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
+            # 使用本地 ChromeDriver（优先项目内，否则用系统 PATH）
+            if sys.platform == "darwin":
+                chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
+            else:
+                chromedriver_path = Path(__file__).parent / "chromedriver-win64" / "chromedriver.exe"
+            
             if chromedriver_path.exists():
                 service = Service(executable_path=str(chromedriver_path))
                 self.driver = webdriver.Chrome(service=service, options=opts)

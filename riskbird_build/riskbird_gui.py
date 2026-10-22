@@ -244,10 +244,10 @@ class MainWindow(QMainWindow):
 
         # ── 顶部：标题栏 ──
         title_bar = QHBoxLayout()
-        title_label = QLabel("美亚风鸟 企业数据采集工具")
-        title_label.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 18, QFont.Bold))
-        title_label.setStyleSheet("color: #1a3c6e;")
-        title_bar.addWidget(title_label)
+        self.title_label = QLabel("企知道 企业数据采集工具")  # 默认企知道，动态更新
+        self.title_label.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 18, QFont.Bold))
+        self.title_label.setStyleSheet("color: #1a3c6e;")
+        title_bar.addWidget(self.title_label)
         title_bar.addStretch()
 
         # 数据来源选择
@@ -563,10 +563,13 @@ class MainWindow(QMainWindow):
         self._update_window_title()
     
     def _update_window_title(self):
-        """根据当前数据源更新窗口标题"""
+        """根据当前数据源更新窗口标题和界面标题"""
         site_names = ["风鸟", "企知道", "爱企查"]
         name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
         self.setWindowTitle(f"{name} 企业数据采集工具")
+        # 同时更新界面内的大标题
+        if hasattr(self, 'title_label'):
+            self.title_label.setText(f"{name} 企业数据采集工具")
         
     def _show_login(self):
         dlg = LoginDialog(self.crawler, self)
