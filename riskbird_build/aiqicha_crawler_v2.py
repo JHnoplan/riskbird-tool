@@ -755,67 +755,94 @@ class AiQiChaCrawlerV2:
                     }
                 }
                 
-                // 从整个页面文本中提取新字段（更可靠）
+                // 从整个页面文本中提取新字段（处理 tab 分隔格式）
                 for (var i = 0; i < lines.length; i++) {
                     var line = lines[i].trim();
                     
-                    // 所属行业
+                    // 按 tab 分割处理（爱企查用 tab 分隔字段）
+                    if (line.indexOf('\\t') >= 0) {
+                        var parts = line.split('\\t');
+                        for (var j = 0; j < parts.length; j++) {
+                            var part = parts[j].trim();
+                            
+                            // 企业类型
+                            if (!result.companyType && part.indexOf('企业类型') >= 0) {
+                                var match = part.match(/企业类型[\\s：:]*(.+)/);
+                                if (match) result.companyType = match[1].trim().substring(0, 50);
+                            }
+                            // 所属行业
+                            if (!result.industry && part.indexOf('所属行业') >= 0) {
+                                var match = part.match(/所属行业[\\s：:]*(.+)/);
+                                if (match) result.industry = match[1].trim().substring(0, 50);
+                            }
+                            // 营业期限
+                            if (!result.businessTerm && part.indexOf('营业期限') >= 0) {
+                                var match = part.match(/营业期限[\\s：:]*(.+)/);
+                                if (match) result.businessTerm = match[1].trim().substring(0, 50);
+                            }
+                            // 核准日期
+                            if (!result.approvalDate && part.indexOf('核准日期') >= 0) {
+                                var match = part.match(/核准日期[\\s：:]*(\\d{4}-\\d{2}-\\d{2}|\\*{4}-\\*{2}-\\*{2})/);
+                                if (match) result.approvalDate = match[1];
+                            }
+                            // 参保人数
+                            if (!result.insuredCount && part.indexOf('参保人数') >= 0) {
+                                var match = part.match(/参保人数[\\s：:]*(\\d+)/);
+                                if (match) result.insuredCount = match[1];
+                            }
+                            // 登记机关
+                            if (!result.registrationAuthority && part.indexOf('登记机关') >= 0) {
+                                var match = part.match(/登记机关[\\s：:]*(.+)/);
+                                if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
+                            }
+                        }
+                    }
+                    
+                    // 处理非 tab 分隔的行
                     if (!result.industry && line.indexOf('所属行业') >= 0) {
-                        var match = line.match(/所属行业[：:]\\s*(.+)/);
+                        var match = line.match(/所属行业[\\s：:]*(.+)/);
                         if (match) result.industry = match[1].trim().substring(0, 50);
                     }
-                    // 企业类型
                     if (!result.companyType && (line.indexOf('企业类型') >= 0 || line.indexOf('公司类型') >= 0)) {
-                        var match = line.match(/(?:企业类型|公司类型)[：:]\\s*(.+)/);
+                        var match = line.match(/(?:企业类型|公司类型)[\\s：:]*(.+)/);
                         if (match) result.companyType = match[1].trim().substring(0, 50);
                     }
-                    // 营业期限
                     if (!result.businessTerm && line.indexOf('营业期限') >= 0) {
-                        var match = line.match(/营业期限[：:]\\s*(.+)/);
+                        var match = line.match(/营业期限[\\s：:]*(.+)/);
                         if (match) result.businessTerm = match[1].trim().substring(0, 50);
                     }
-                    // 登记机关
                     if (!result.registrationAuthority && line.indexOf('登记机关') >= 0) {
-                        var match = line.match(/登记机关[：:]\\s*(.+)/);
+                        var match = line.match(/登记机关[\\s：:]*(.+)/);
                         if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
                     }
-                    // 核准日期
                     if (!result.approvalDate && line.indexOf('核准日期') >= 0) {
-                        var match = line.match(/核准日期[：:]\\s*(\\d{4}-\\d{2}-\\d{2})/);
+                        var match = line.match(/核准日期[\\s：:]*(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.approvalDate = match[1];
                     }
-                    // 参保人数
                     if (!result.insuredCount && line.indexOf('参保人数') >= 0) {
-                        var match = line.match(/参保人数[：:]\\s*(\\d+)/);
+                        var match = line.match(/参保人数[\\s：:]*(\\d+)/);
                         if (match) result.insuredCount = match[1];
                     }
                 }
                 
-                // 提取简介（从 .enterprise-intro 或更具体的选择器）
-                if (!result.introduction) {
-                    var introEl = document.querySelector('.enterprise-intro, .company-intro-content, [class*="enterprise-intro"]');
-                    if (!introEl) {
-                        var introLabel = document.querySelector('[class*="intro"] span, [class*="intro"] label');
-                        if (introLabel && introLabel.textContent.indexOf('简介') >= 0) {
-                            introEl = introLabel.parentElement;
-                        }
-                    }
-                    if (introEl) {
-                        var introText = introEl.textContent.trim();
-                        if (introText.length > 20 && 
-                            introText.indexOf('实时查看') < 0 && 
-                            introText.indexOf('扫一扫') < 0 &&
-                            introText.indexOf('APP') < 0) {
+                // 提取简介和经营范围（从"简介："开始的内容）
+                if (!result.introduction || !result.businessScope) {
+                    var introMatch = allText.match(/简介 [：:]([\\s\\S]{50,2000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系|动态|风险)|$)/);
+                    if (introMatch) {
+                        var introText = introMatch[1].trim();
+                        // 分离简介和经营范围
+                        var scopeMatch = introText.match(/^(.+?)(?=\\s*经营范围 [：:])/);
+                        if (scopeMatch) {
+                            result.introduction = scopeMatch[1].trim().substring(0, 500);
+                            var scopeText = introText.substring(scopeMatch[1].length);
+                            var scopeOnly = scopeText.match(/经营范围 [：:]([\\s\\S]+)/);
+                            if (scopeOnly) {
+                                result.businessScope = scopeOnly[1].trim().substring(0, 500);
+                            }
+                        } else {
+                            // 没有明确的经营范围分隔
                             result.introduction = introText.substring(0, 500);
                         }
-                    }
-                }
-                
-                // 提取经营范围（从整个页面文本）
-                if (!result.businessScope) {
-                    var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{20,1000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系)|$)/);
-                    if (scopeMatch) {
-                        result.businessScope = scopeMatch[1].trim().substring(0, 500);
                     }
                 }
                     
