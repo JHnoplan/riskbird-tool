@@ -523,7 +523,7 @@ class AiQiChaCrawlerV2:
                 self._log(f"已跳转到详情页")
                 
                 # 7. 等待详情页数据渲染（智能等待：检查关键元素）
-                for i in range(6):  # 6 * 0.5 = 3 秒
+                for i in range(8):  # 8 * 0.5 = 4 秒
                     time.sleep(0.5)
                     data_check = self._execute_js(ws_url, """
                         (function() {
@@ -533,6 +533,9 @@ class AiQiChaCrawlerV2:
                     """)
                     if data_check == 'ready':
                         break
+                
+                # 额外等待 2 秒确保所有动态数据加载完成
+                time.sleep(2)
                 
                 # 8. 提取详情页全量数据
                 detail_data = self._extract_detail_data_full(ws_url, name)
@@ -661,6 +664,33 @@ class AiQiChaCrawlerV2:
                     approvalDate: '', insuredCount: ''
                 };
                 
+                // 尝试从页面的 JSON 数据中提取（更完整）
+                try {
+                    if (window.__INITIAL_STATE__ || window.__NUXT__ || window.__NEXT_DATA__) {
+                        var pageData = window.__INITIAL_STATE__ || window.__NUXT__ || window.__NEXT_DATA__;
+                        var dataStr = JSON.stringify(pageData);
+                        
+                        // 从 JSON 数据中提取
+                        var match;
+                        if (match = dataStr.match(/"legalPerson"[\\s:]*"([^"]+)"/)) result.legalPerson = match[1];
+                        if (match = dataStr.match(/"registeredCapital"[\\s:]*"([^"]+)"/)) result.registeredCapital = match[1];
+                        if (match = dataStr.match(/"establishDate"[\\s:]*"([^"]+)"/)) result.establishDate = match[1];
+                        if (match = dataStr.match(/"creditCode"[\\s:]*"([^"]+)"/)) result.creditCode = match[1];
+                        if (match = dataStr.match(/"phone"[\\s:]*"([^"]+)"/)) result.phone = match[1];
+                        if (match = dataStr.match(/"email"[\\s:]*"([^"]+)"/)) result.email = match[1];
+                        if (match = dataStr.match(/"website"[\\s:]*"([^"]+)"/)) result.website = match[1];
+                        if (match = dataStr.match(/"address"[\\s:]*"([^"]+)"/)) result.address = match[1];
+                        if (match = dataStr.match(/"introduction"[\\s:]*"([^"]+)"/)) result.introduction = match[1];
+                        if (match = dataStr.match(/"businessScope"[\\s:]*"([^"]+)"/)) result.businessScope = match[1];
+                        if (match = dataStr.match(/"industry"[\\s:]*"([^"]+)"/)) result.industry = match[1];
+                        if (match = dataStr.match(/"companyType"[\\s:]*"([^"]+)"/)) result.companyType = match[1];
+                        if (match = dataStr.match(/"businessTerm"[\\s:]*"([^"]+)"/)) result.businessTerm = match[1];
+                        if (match = dataStr.match(/"registrationAuthority"[\\s:]*"([^"]+)"/)) result.registrationAuthority = match[1];
+                        if (match = dataStr.match(/"approvalDate"[\\s:]*"([^"]+)"/)) result.approvalDate = match[1];
+                        if (match = dataStr.match(/"insuredCount"[\\s:]*"([^"]+)"/)) result.insuredCount = match[1];
+                    }
+                } catch(e) {}
+                
                 // 获取整个页面文本
                 var allText = document.body.innerText;
                 var lines = allText.split('\\n');
@@ -671,12 +701,12 @@ class AiQiChaCrawlerV2:
                     var text = items[i].textContent.trim();
                         
                     // 统一社会信用代码
-                    if (text.indexOf('统一社会信用代码') >= 0) {
+                    if (!result.creditCode && text.indexOf('统一社会信用代码') >= 0) {
                         var match = text.match(/统一社会信用代码[：:]\\s*(\\S+)/);
                         if (match) result.creditCode = match[1];
                     }
                     // 电话
-                    if (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0) {
+                    if (!result.phone && (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0)) {
                         var match = text.match(/(?:电话|手机|联系方式)[：:]\\s*(\\d[\\d\\-,\\s]+)/);
                         if (match) {
                             result.phone = match[1].trim();
@@ -686,7 +716,7 @@ class AiQiChaCrawlerV2:
                         }
                     }
                     // 法定代表人
-                    if (text.indexOf('法定代表人') >= 0) {
+                    if (!result.legalPerson && text.indexOf('法定代表人') >= 0) {
                         var match = text.match(/法定代表人[：:]\\s*[\\u4e00-\\u9fa5][\\s\\n]+([\\u4e00-\\u9fa5]{2,4})/);
                         if (match) {
                             result.legalPerson = match[1];
@@ -696,27 +726,27 @@ class AiQiChaCrawlerV2:
                         }
                     }
                     // 邮箱
-                    if (text.indexOf('邮箱') >= 0) {
+                    if (!result.email && text.indexOf('邮箱') >= 0) {
                         var match = text.match(/邮箱[：:]\\s*([\\w@.]+)/);
                         if (match) result.email = match[1];
                     }
                     // 注册资本
-                    if (text.indexOf('注册资本') >= 0) {
+                    if (!result.registeredCapital && text.indexOf('注册资本') >= 0) {
                         var match = text.match(/注册资本[：:]\\s*(.+?)(?:\\s|$)/);
                         if (match) result.registeredCapital = match[1].trim();
                     }
                     // 网址
-                    if (text.indexOf('网址') >= 0) {
+                    if (!result.website && text.indexOf('网址') >= 0) {
                         var match = text.match(/网址[：:]\\s*(http\\S+)/);
                         if (match) result.website = match[1];
                     }
                     // 地址
-                    if (text.indexOf('地址') >= 0 && text.length > 10) {
+                    if (!result.address && text.indexOf('地址') >= 0 && text.length > 10) {
                         var match = text.match(/地址[：:]\\s*([\\u4e00-\\u9fa5].+)/);
                         if (match) result.address = match[1].trim().substring(0, 100);
                     }
                     // 成立日期/注册时间
-                    if (text.indexOf('注册时间') >= 0 || text.indexOf('成立日期') >= 0) {
+                    if (!result.establishDate && (text.indexOf('注册时间') >= 0 || text.indexOf('成立日期') >= 0)) {
                         var match = text.match(/(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.establishDate = match[1];
                     }
@@ -727,61 +757,63 @@ class AiQiChaCrawlerV2:
                     var line = lines[i].trim();
                     
                     // 所属行业
-                    if (line.indexOf('所属行业') >= 0 && !result.industry) {
+                    if (!result.industry && line.indexOf('所属行业') >= 0) {
                         var match = line.match(/所属行业[：:]\\s*(.+)/);
                         if (match) result.industry = match[1].trim().substring(0, 50);
                     }
                     // 企业类型
-                    if ((line.indexOf('企业类型') >= 0 || line.indexOf('公司类型') >= 0) && !result.companyType) {
+                    if (!result.companyType && (line.indexOf('企业类型') >= 0 || line.indexOf('公司类型') >= 0)) {
                         var match = line.match(/(?:企业类型|公司类型)[：:]\\s*(.+)/);
                         if (match) result.companyType = match[1].trim().substring(0, 50);
                     }
                     // 营业期限
-                    if (line.indexOf('营业期限') >= 0 && !result.businessTerm) {
+                    if (!result.businessTerm && line.indexOf('营业期限') >= 0) {
                         var match = line.match(/营业期限[：:]\\s*(.+)/);
                         if (match) result.businessTerm = match[1].trim().substring(0, 50);
                     }
                     // 登记机关
-                    if (line.indexOf('登记机关') >= 0 && !result.registrationAuthority) {
+                    if (!result.registrationAuthority && line.indexOf('登记机关') >= 0) {
                         var match = line.match(/登记机关[：:]\\s*(.+)/);
                         if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
                     }
                     // 核准日期
-                    if (line.indexOf('核准日期') >= 0 && !result.approvalDate) {
+                    if (!result.approvalDate && line.indexOf('核准日期') >= 0) {
                         var match = line.match(/核准日期[：:]\\s*(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.approvalDate = match[1];
                     }
                     // 参保人数
-                    if (line.indexOf('参保人数') >= 0 && !result.insuredCount) {
+                    if (!result.insuredCount && line.indexOf('参保人数') >= 0) {
                         var match = line.match(/参保人数[：:]\\s*(\\d+)/);
                         if (match) result.insuredCount = match[1];
                     }
                 }
                 
                 // 提取简介（从 .enterprise-intro 或更具体的选择器）
-                var introEl = document.querySelector('.enterprise-intro, .company-intro-content, [class*="enterprise-intro"]');
-                if (!introEl) {
-                    // 尝试从"简介："标签后提取
-                    var introLabel = document.querySelector('[class*="intro"] span, [class*="intro"] label');
-                    if (introLabel && introLabel.textContent.indexOf('简介') >= 0) {
-                        introEl = introLabel.parentElement;
+                if (!result.introduction) {
+                    var introEl = document.querySelector('.enterprise-intro, .company-intro-content, [class*="enterprise-intro"]');
+                    if (!introEl) {
+                        var introLabel = document.querySelector('[class*="intro"] span, [class*="intro"] label');
+                        if (introLabel && introLabel.textContent.indexOf('简介') >= 0) {
+                            introEl = introLabel.parentElement;
+                        }
                     }
-                }
-                if (introEl) {
-                    var introText = introEl.textContent.trim();
-                    // 过滤掉广告文本
-                    if (introText.length > 20 && 
-                        introText.indexOf('实时查看') < 0 && 
-                        introText.indexOf('扫一扫') < 0 &&
-                        introText.indexOf('APP') < 0) {
-                        result.introduction = introText.substring(0, 500);
+                    if (introEl) {
+                        var introText = introEl.textContent.trim();
+                        if (introText.length > 20 && 
+                            introText.indexOf('实时查看') < 0 && 
+                            introText.indexOf('扫一扫') < 0 &&
+                            introText.indexOf('APP') < 0) {
+                            result.introduction = introText.substring(0, 500);
+                        }
                     }
                 }
                 
                 // 提取经营范围（从整个页面文本）
-                var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{20,1000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系)|$)/);
-                if (scopeMatch) {
-                    result.businessScope = scopeMatch[1].trim().substring(0, 500);
+                if (!result.businessScope) {
+                    var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{20,1000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系)|$)/);
+                    if (scopeMatch) {
+                        result.businessScope = scopeMatch[1].trim().substring(0, 500);
+                    }
                 }
                     
                 return JSON.stringify(result);
@@ -813,8 +845,8 @@ class AiQiChaCrawlerV2:
         return data
     
     # ─ 采集控制 ──
-    def crawl(self, companies: list, delay: float = 0.5):
-        """批量采集"""
+    def crawl(self, companies: list, delay: float = 3.0):
+        """批量采集（默认 3 秒间隔，避免触发验证码）"""
         self._crawling = True
         self._stop_requested = False
         self.results = []
