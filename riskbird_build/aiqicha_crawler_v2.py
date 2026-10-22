@@ -316,6 +316,7 @@ class AiQiChaCrawlerV2:
             cmd = [
                 chrome_path,
                 f"--remote-debugging-port={self.debug_port}",
+                "--remote-allow-origins=*",
                 f"--user-data-dir={temp_profile}",
                 "--profile-directory=Default",
                 "--no-first-run",
