@@ -355,8 +355,25 @@ class AiQiChaCrawlerV2:
                         self._log("正在打开爱企查...")
                         first_tab_ws = tabs[0].get("webSocketDebuggerUrl")
                         if first_tab_ws:
-                            self._execute_js(first_tab_ws, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
-                            time.sleep(5)
+                            # 尝试导航到爱企查（最多重试 3 次）
+                            nav_success = False
+                            for retry in range(3):
+                                try:
+                                    self._execute_js(first_tab_ws, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
+                                    time.sleep(3)
+                                    # 验证是否真的打开了爱企查
+                                    current_url = self._execute_js(first_tab_ws, "(function() { return window.location.href; })()")
+                                    if current_url and "aiqicha" in current_url:
+                                        nav_success = True
+                                        self._log("爱企查页面已打开")
+                                        break
+                                    else:
+                                        self._log(f"导航未生效（第{retry+1}次），重试...")
+                                except Exception:
+                                    time.sleep(2)
+                            
+                            if not nav_success:
+                                self._log("⚠ 爱企查页面未自动打开，请手动在浏览器中访问 aiqicha.baidu.com")
                         return True
                 except Exception:
                     pass
