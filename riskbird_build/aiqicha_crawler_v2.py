@@ -458,56 +458,91 @@ class AiQiChaCrawlerV2:
                     result["状态"] = "浏览器错误"
                     return result
                 
-                # 2. 等待页面加载
-                time.sleep(5)
+                # 2. 等待页面加载（智能等待：检查搜索框是否存在）
+                for i in range(5):  # 最多等 5 秒
+                    search_check = self._execute_js(ws_url, """
+                        (function() {
+                            var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                            return input ? 'ready' : 'loading';
+                        })()
+                    """)
+                    if search_check == 'ready':
+                        break
+                    time.sleep(1)
                 
                 # 检查页面状态
                 page_check = self._check_page_status(ws_url)
                 if page_check == 'blocked':
                     self._log("️ 检测到反爬虫，尝试刷新...")
                     self._execute_js(ws_url, "(function() { location.reload(); })()")
-                    time.sleep(8)
+                    time.sleep(5)
                 
                 # 3. 清空并输入公司名
                 self._clear_and_input_search(ws_url, name)
-                time.sleep(4)  # 等待自动补全
                 
-                # 4. 点击自动补全第一项（会直接跳转到详情页）
-                clicked = self._click_first_autocomplete(ws_url)
-                if not clicked:
+                # 4. 等待自动补全出现（智能等待：最多 3 秒）
+                autocomplete_found = False
+                for i in range(6):  # 6 * 0.5 = 3 秒
+                    time.sleep(0.5)
+                    check = self._execute_js(ws_url, """
+                        (function() {
+                            var items = document.querySelectorAll('.ivu-select-item, .sug-company-line');
+                            return items.length > 0 ? 'found' : 'waiting';
+                        })()
+                    """)
+                    if check == 'found':
+                        autocomplete_found = True
+                        break
+                
+                if not autocomplete_found:
                     self._log(f"未找到自动补全：{name}")
                     result["状态"] = "未找到"
                     return result
                 
-                # 5. 等待跳转到详情页
-                self._log("等待跳转到详情页...")
-                time.sleep(8)
+                # 5. 点击自动补全第一项（会直接跳转到详情页）
+                self._click_first_autocomplete(ws_url)
                 
-                # 验证是否成功跳转到详情页
-                current_url = self._execute_js(ws_url, "(function() { return window.location.href; })()")
-                if not current_url or 'company_detail' not in current_url:
-                    self._log(f"未跳转到详情页：{current_url}")
+                # 6. 等待跳转到详情页（智能等待：检查 URL 变化）
+                self._log("等待跳转到详情页...")
+                detail_loaded = False
+                for i in range(10):  # 10 * 0.5 = 5 秒
+                    time.sleep(0.5)
+                    current_url = self._execute_js(ws_url, "(function() { return window.location.href; })()")
+                    if current_url and 'company_detail' in current_url:
+                        detail_loaded = True
+                        company_id_match = re.search(r'company_detail_(\d+)', current_url)
+                        if company_id_match:
+                            result["搜索结果 URL"] = f"company_detail_{company_id_match.group(1)}"
+                        break
+                
+                if not detail_loaded:
+                    self._log(f"未跳转到详情页")
                     result["状态"] = "跳转失败"
                     return result
                 
-                company_id_match = re.search(r'company_detail_(\d+)', current_url)
-                if company_id_match:
-                    result["搜索结果 URL"] = f"company_detail_{company_id_match.group(1)}"
-                
                 self._log(f"已跳转到详情页")
                 
-                # 6. 等待详情页数据渲染完成
-                time.sleep(5)
+                # 7. 等待详情页数据渲染（智能等待：检查关键元素）
+                for i in range(6):  # 6 * 0.5 = 3 秒
+                    time.sleep(0.5)
+                    data_check = self._execute_js(ws_url, """
+                        (function() {
+                            var items = document.querySelectorAll('.info-item');
+                            return items.length > 0 ? 'ready' : 'loading';
+                        })()
+                    """)
+                    if data_check == 'ready':
+                        break
                 
-                # 7. 提取详情页全量数据
+                # 8. 提取详情页全量数据
                 detail_data = self._extract_detail_data_full(ws_url, name)
                 result.update(detail_data)
                 result["状态"] = "成功"
                 
-                # 8. 导航回首页（关键！让下一个公司能复用这个标签页）
+                # 9. 导航回首页（关键！让下一个公司能复用这个标签页）
                 self._log("返回首页...")
                 self._navigate_to_homepage(ws_url)
-                time.sleep(3)
+                time.sleep(2)  # 减少等待时间
                 
                 self._log(f"采集完成：{name}")
                 return result
@@ -625,8 +660,12 @@ class AiQiChaCrawlerV2:
                     companyType: '', businessTerm: '', registrationAuthority: '',
                     approvalDate: '', insuredCount: ''
                 };
-                    
-                // 从 .info-item 元素中提取
+                
+                // 获取整个页面文本
+                var allText = document.body.innerText;
+                var lines = allText.split('\\n');
+                
+                // 从 .info-item 元素中提取基础字段
                 var items = document.querySelectorAll('.info-item');
                 for (var i = 0; i < items.length; i++) {
                     var text = items[i].textContent.trim();
@@ -636,7 +675,7 @@ class AiQiChaCrawlerV2:
                         var match = text.match(/统一社会信用代码[：:]\\s*(\\S+)/);
                         if (match) result.creditCode = match[1];
                     }
-                    // 电话（匹配 "电话：xxx" 或 "手机：xxx"）
+                    // 电话
                     if (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0) {
                         var match = text.match(/(?:电话|手机|联系方式)[：:]\\s*(\\d[\\d\\-,\\s]+)/);
                         if (match) {
@@ -681,47 +720,66 @@ class AiQiChaCrawlerV2:
                         var match = text.match(/(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.establishDate = match[1];
                     }
+                }
+                
+                // 从整个页面文本中提取新字段（更可靠）
+                for (var i = 0; i < lines.length; i++) {
+                    var line = lines[i].trim();
+                    
                     // 所属行业
-                    if (text.indexOf('所属行业') >= 0) {
-                        var match = text.match(/所属行业[：:]\\s*(.+)/);
+                    if (line.indexOf('所属行业') >= 0 && !result.industry) {
+                        var match = line.match(/所属行业[：:]\\s*(.+)/);
                         if (match) result.industry = match[1].trim().substring(0, 50);
                     }
                     // 企业类型
-                    if (text.indexOf('企业类型') >= 0 || text.indexOf('公司类型') >= 0) {
-                        var match = text.match(/(?:企业类型|公司类型)[：:]\\s*(.+)/);
+                    if ((line.indexOf('企业类型') >= 0 || line.indexOf('公司类型') >= 0) && !result.companyType) {
+                        var match = line.match(/(?:企业类型|公司类型)[：:]\\s*(.+)/);
                         if (match) result.companyType = match[1].trim().substring(0, 50);
                     }
                     // 营业期限
-                    if (text.indexOf('营业期限') >= 0) {
-                        var match = text.match(/营业期限[：:]\\s*(.+)/);
+                    if (line.indexOf('营业期限') >= 0 && !result.businessTerm) {
+                        var match = line.match(/营业期限[：:]\\s*(.+)/);
                         if (match) result.businessTerm = match[1].trim().substring(0, 50);
                     }
                     // 登记机关
-                    if (text.indexOf('登记机关') >= 0) {
-                        var match = text.match(/登记机关[：:]\\s*(.+)/);
+                    if (line.indexOf('登记机关') >= 0 && !result.registrationAuthority) {
+                        var match = line.match(/登记机关[：:]\\s*(.+)/);
                         if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
                     }
                     // 核准日期
-                    if (text.indexOf('核准日期') >= 0) {
-                        var match = text.match(/核准日期[：:]\\s*(\\d{4}-\\d{2}-\\d{2})/);
+                    if (line.indexOf('核准日期') >= 0 && !result.approvalDate) {
+                        var match = line.match(/核准日期[：:]\\s*(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.approvalDate = match[1];
                     }
                     // 参保人数
-                    if (text.indexOf('参保人数') >= 0) {
-                        var match = text.match(/参保人数[：:]\\s*(\\d+)/);
+                    if (line.indexOf('参保人数') >= 0 && !result.insuredCount) {
+                        var match = line.match(/参保人数[：:]\\s*(\\d+)/);
                         if (match) result.insuredCount = match[1];
                     }
                 }
-                    
-                // 提取简介（从 .company-intro 或 .intro 或 .desc 元素）
-                var introEl = document.querySelector('.company-intro, .intro, .desc, [class*="intro"]');
-                if (introEl) {
-                    result.introduction = introEl.textContent.trim().substring(0, 500);
+                
+                // 提取简介（从 .enterprise-intro 或更具体的选择器）
+                var introEl = document.querySelector('.enterprise-intro, .company-intro-content, [class*="enterprise-intro"]');
+                if (!introEl) {
+                    // 尝试从"简介："标签后提取
+                    var introLabel = document.querySelector('[class*="intro"] span, [class*="intro"] label');
+                    if (introLabel && introLabel.textContent.indexOf('简介') >= 0) {
+                        introEl = introLabel.parentElement;
+                    }
                 }
-                    
-                // 提取经营范围（从包含"经营范围"的元素）
-                var allText = document.body.innerText;
-                var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{10,500}?)(?=\\n\\s*[\\u4e00-\\u9fa5]{2,4}[：:]|$)/);
+                if (introEl) {
+                    var introText = introEl.textContent.trim();
+                    // 过滤掉广告文本
+                    if (introText.length > 20 && 
+                        introText.indexOf('实时查看') < 0 && 
+                        introText.indexOf('扫一扫') < 0 &&
+                        introText.indexOf('APP') < 0) {
+                        result.introduction = introText.substring(0, 500);
+                    }
+                }
+                
+                // 提取经营范围（从整个页面文本）
+                var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{20,1000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系)|$)/);
                 if (scopeMatch) {
                     result.businessScope = scopeMatch[1].trim().substring(0, 500);
                 }
