@@ -336,6 +336,12 @@ class AiQiChaCrawlerV2:
                     tabs = self._get_tabs()
                     if tabs:
                         self._log("Chrome 启动成功")
+                        # 自动打开爱企查首页
+                        self._log("正在打开爱企查...")
+                        first_tab_ws = tabs[0].get("webSocketDebuggerUrl")
+                        if first_tab_ws:
+                            self._execute_js(first_tab_ws, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
+                            time.sleep(5)
                         return True
                 except Exception:
                     pass
@@ -498,6 +504,11 @@ class AiQiChaCrawlerV2:
                 result.update(detail_data)
                 result["状态"] = "成功"
                 
+                # 8. 导航回首页（关键！让下一个公司能复用这个标签页）
+                self._log("返回首页...")
+                self._navigate_to_homepage(ws_url)
+                time.sleep(3)
+                
                 self._log(f"采集完成：{name}")
                 return result
                 
@@ -589,6 +600,10 @@ class AiQiChaCrawlerV2:
             })()
         """)
         return result is not None
+    
+    def _navigate_to_homepage(self, ws_url):
+        """导航回爱企查首页"""
+        self._execute_js(ws_url, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
     
     def _extract_detail_data_full(self, ws_url, company_name: str) -> dict:
         """从详情页提取全量数据"""
@@ -795,7 +810,9 @@ class AiQiChaCrawlerV2:
             ws.title = "爱企查数据"
             
             headers = ["序号", "公司名", "法定代表人", "注册资本", "成立日期",
-                      "统一社会信用代码", "电话", "邮箱", "官网", "地址", "状态", "数据来源"]
+                      "统一社会信用代码", "电话", "邮箱", "官网", "地址",
+                      "简介", "经营范围", "所属行业", "企业类型", "营业期限",
+                      "登记机关", "核准日期", "参保人数", "状态", "数据来源"]
             ws.append(headers)
             
             for i, r in enumerate(self.results, 1):
@@ -804,6 +821,10 @@ class AiQiChaCrawlerV2:
                     r.get("注册资本", ""), r.get("成立日期", ""),
                     r.get("统一社会信用代码", ""), r.get("电话", ""),
                     r.get("邮箱", ""), r.get("官网", ""), r.get("地址", ""),
+                    r.get("简介", ""), r.get("经营范围", ""),
+                    r.get("所属行业", ""), r.get("企业类型", ""),
+                    r.get("营业期限", ""), r.get("登记机关", ""),
+                    r.get("核准日期", ""), r.get("参保人数", ""),
                     r.get("状态", ""), r.get("数据来源", "")
                 ])
             
