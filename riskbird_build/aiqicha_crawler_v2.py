@@ -267,7 +267,7 @@ class AiQiChaCrawlerV2:
             pass
     
     def _get_temp_profile(self):
-        """获取临时 Chrome 配置目录"""
+        """获取临时 Chrome 配置目录（只复制必要文件，跳过缓存加速）"""
         if sys.platform == "win32":
             real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
             temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile"
@@ -279,10 +279,24 @@ class AiQiChaCrawlerV2:
         cookies_file = temp_profile / "Default" / "Cookies"
         if not temp_profile.exists() or (cookies_file.exists() and cookies_file.stat().st_size < 1000):
             if os.path.exists(real_profile):
-                self._log("正在准备 Chrome 配置...")
+                self._log("正在准备 Chrome 配置（仅复制必要文件，跳过缓存）...")
                 if temp_profile.exists():
                     shutil.rmtree(str(temp_profile), ignore_errors=True)
-                shutil.copytree(real_profile, str(temp_profile), ignore=shutil.ignore_patterns("SingletonLock", "SingletonSocket", "SingletonCookie"))
+                
+                # 只复制必要文件，跳过巨大的缓存目录
+                skip_patterns = [
+                    "SingletonLock", "SingletonSocket", "SingletonCookie",
+                    "Cache", "Code Cache", "GPUCache", "Service Worker",
+                    "DawnCache", "GrShaderCache", "ShaderCache",
+                    "IndexedDB", "File System", "Platform Notifications",
+                    "Network", "Origin Trials", "Trust Tokens",
+                    "optimization_guide_model_store",
+                ]
+                shutil.copytree(
+                    real_profile, str(temp_profile),
+                    ignore=shutil.ignore_patterns(*skip_patterns)
+                )
+                self._log("Chrome 配置准备完成")
         
         return str(temp_profile)
     
