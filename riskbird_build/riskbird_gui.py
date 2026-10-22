@@ -505,8 +505,12 @@ class MainWindow(QMainWindow):
             for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
                 headers.append(str(cell).strip() if cell else "")
             
-            # 常见的公司名列名
-            company_keywords = ["公司名", "单位名称", "企业名称", "公司名称", "公司", "单位"]
+            # 常见的公司名列名（按优先级排序，长的在前避免误匹配）
+            company_keywords = [
+                "公司名", "单位名称", "企业名称", "公司名称",
+                "企业名", "公司", "单位", "企业",  # 添加"企业名"和"企业"
+                "客户名", "客户", "厂商", "厂家",
+            ]
             company_col = None
             
             for i, header in enumerate(headers):
@@ -567,7 +571,11 @@ class MainWindow(QMainWindow):
             for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
                 headers.append(str(cell).strip() if cell else "")
             
-            company_keywords = ["公司名", "单位名称", "企业名称", "公司名称", "公司", "单位"]
+            company_keywords = [
+                "公司名", "单位名称", "企业名称", "公司名称",
+                "企业名", "公司", "单位", "企业",
+                "客户名", "客户", "厂商", "厂家",
+            ]
             company_col = None
             
             for i, header in enumerate(headers):
