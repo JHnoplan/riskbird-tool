@@ -477,15 +477,45 @@ class MainWindow(QMainWindow):
             self._append_log(f"从 {len(paths)} 个文件加载 {len(all_companies)} 家公司，去重后 {len(self._companies)} 家")
 
     def _load_companies_from_file(self, path: str) -> list:
-        """从单个文件加载公司名"""
+        """从单个文件加载公司名（智能检测公司名列）"""
         try:
             from openpyxl import load_workbook
             wb = load_workbook(path, read_only=True)
             ws = wb.active
+            
+            # 读取第一行（表头），查找公司名列
+            headers = []
+            for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
+                headers.append(str(cell).strip() if cell else "")
+            
+            # 常见的公司名列名
+            company_keywords = ["公司名", "单位名称", "企业名称", "公司名称", "公司", "单位"]
+            company_col = None
+            
+            for i, header in enumerate(headers):
+                for keyword in company_keywords:
+                    if keyword in header:
+                        company_col = i
+                        break
+                if company_col is not None:
+                    break
+            
+            # 如果没找到，默认使用最后一列或第 2 列
+            if company_col is None:
+                if len(headers) >= 3:
+                    company_col = 2  # 第 3 列
+                elif len(headers) >= 2:
+                    company_col = 1  # 第 2 列
+                else:
+                    company_col = 0  # 第 1 列
+            
+            self._append_log(f"检测到公司名列：第{company_col+1}列 ({headers[company_col] if company_col < len(headers) else 'N/A'})")
+            
+            # 从第 2 行开始读取数据
             companies = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and row[0]:
-                    name = str(row[0]).strip()
+                if row and len(row) > company_col and row[company_col]:
+                    name = str(row[company_col]).strip()
                     if name and name != "None":
                         companies.append(name)
             wb.close()
@@ -511,10 +541,35 @@ class MainWindow(QMainWindow):
             from openpyxl import load_workbook
             wb = load_workbook(path, read_only=True)
             ws = wb.active
+            
+            # 智能检测公司名列
+            headers = []
+            for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
+                headers.append(str(cell).strip() if cell else "")
+            
+            company_keywords = ["公司名", "单位名称", "企业名称", "公司名称", "公司", "单位"]
+            company_col = None
+            
+            for i, header in enumerate(headers):
+                for keyword in company_keywords:
+                    if keyword in header:
+                        company_col = i
+                        break
+                if company_col is not None:
+                    break
+            
+            if company_col is None:
+                if len(headers) >= 3:
+                    company_col = 2
+                elif len(headers) >= 2:
+                    company_col = 1
+                else:
+                    company_col = 0
+            
             companies = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and row[0]:
-                    name = str(row[0]).strip()
+                if row and len(row) > company_col and row[company_col]:
+                    name = str(row[company_col]).strip()
                     if name and name != "None":
                         companies.append(name)
             wb.close()
@@ -522,7 +577,7 @@ class MainWindow(QMainWindow):
             self.company_count_lbl.setText(f"共 {len(companies)} 家")
             self.preview_btn.setEnabled(True)
             self._check_ready()
-            self._append_log(f"已加载 {len(companies)} 家公司")
+            self._append_log(f"已加载 {len(companies)} 家公司 (第{company_col+1}列：{headers[company_col] if company_col < len(headers) else 'N/A'})")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"读取 Excel 失败:\n{e}")
 
