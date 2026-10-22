@@ -480,7 +480,7 @@ class MainWindow(QMainWindow):
         """从单个文件加载公司名（智能检测公司名列）"""
         try:
             from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True)
+            wb = load_workbook(path, read_only=False, data_only=True)
             ws = wb.active
             
             # 读取第一行（表头），查找公司名列
@@ -511,13 +511,16 @@ class MainWindow(QMainWindow):
             
             self._append_log(f"检测到公司名列：第{company_col+1}列 ({headers[company_col] if company_col < len(headers) else 'N/A'})")
             
-            # 从第 2 行开始读取数据
+            # 从第 2 行开始读取数据（遍历所有行，跳过空行）
             companies = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and len(row) > company_col and row[company_col]:
-                    name = str(row[company_col]).strip()
-                    if name and name != "None":
-                        companies.append(name)
+                if row and len(row) > company_col:
+                    cell_value = row[company_col]
+                    # 处理各种空值情况
+                    if cell_value is not None:
+                        name = str(cell_value).strip()
+                        if name and name != "None" and name != "":
+                            companies.append(name)
             wb.close()
             return companies
         except Exception as e:
@@ -539,7 +542,7 @@ class MainWindow(QMainWindow):
     def _load_companies(self, path: str):
         try:
             from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True)
+            wb = load_workbook(path, read_only=False, data_only=True)
             ws = wb.active
             
             # 智能检测公司名列
@@ -568,10 +571,12 @@ class MainWindow(QMainWindow):
             
             companies = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and len(row) > company_col and row[company_col]:
-                    name = str(row[company_col]).strip()
-                    if name and name != "None":
-                        companies.append(name)
+                if row and len(row) > company_col:
+                    cell_value = row[company_col]
+                    if cell_value is not None:
+                        name = str(cell_value).strip()
+                        if name and name != "None" and name != "":
+                            companies.append(name)
             wb.close()
             self._companies = companies
             self.company_count_lbl.setText(f"共 {len(companies)} 家")
@@ -870,38 +875,59 @@ def main():
 
     sys.excepthook = global_excepthook
 
-    # PyInstaller --onefile 首次运行解压保护
-    # 清理上次崩溃残留的临时文件
+    # PyInstaller --onefile 启动保护
+    # 1. 清理旧进程和临时目录（防止强制关闭后无法启动）
     if getattr(sys, 'frozen', False):
-        base_path = sys._MEIPASS
-        # 检查是否有崩溃标记
-        crash_marker = os.path.join(os.path.dirname(sys.executable), ".crashed")
-        if os.path.exists(crash_marker):
-            # 上次非正常退出，清理临时文件
-            try:
-                import shutil
-                temp_base = os.path.join(os.environ.get("TEMP", "/tmp"), "_MEI")
-                for d in os.listdir(os.environ.get("TEMP", "/tmp")):
-                    if d.startswith("_MEI"):
-                        full = os.path.join(os.environ.get("TEMP", "/tmp"), d)
+        import shutil
+        import subprocess
+
+        # 1.1 杀掉同名的旧进程（防止端口/文件锁定）
+        try:
+            current_pid = os.getpid()
+            if sys.platform == "win32":
+                subprocess.run(
+                    [r"C:\Windows\System32\tasklist.exe", "/FI", "IMAGENAME eq RiskBirdTool.exe", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=5
+                )
+                # 用 taskkill 杀掉其他实例（保留当前进程）
+                subprocess.run(
+                    [r"C:\Windows\System32\taskkill.exe", "/F", "/FI", "IMAGENAME eq RiskBirdTool.exe", "/FI", f"PID ne {current_pid}"],
+                    capture_output=True, timeout=5
+                )
+        except Exception:
+            pass
+
+        # 1.2 清理旧的临时目录（排除当前进程使用的）
+        try:
+            current_mei = getattr(sys, '_MEIPASS', '')
+            temp_dir = os.environ.get("TEMP", r"C:\temp")
+            for d in os.listdir(temp_dir):
+                if d.startswith("_MEI"):
+                    full_path = os.path.join(temp_dir, d)
+                    # 跳过当前进程正在使用的目录
+                    if os.path.abspath(full_path) == os.path.abspath(current_mei):
+                        continue
+                    try:
+                        shutil.rmtree(full_path, ignore_errors=True)
+                    except Exception:
+                        # 如果删除失败，尝试重命名（Windows 可能锁定）
                         try:
-                            shutil.rmtree(full, ignore_errors=True)
+                            old_name = full_path + "_old"
+                            if os.path.exists(old_name):
+                                shutil.rmtree(old_name, ignore_errors=True)
+                            os.rename(full_path, old_name)
                         except Exception:
                             pass
-            except Exception:
-                pass
-            try:
-                os.remove(crash_marker)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    # 写入运行标记（正常退出时删除）
+    # 2. 写入运行标记（正常退出时删除）
     if getattr(sys, 'frozen', False):
         crash_marker = os.path.join(os.path.dirname(sys.executable), ".crashed")
         with open(crash_marker, "w") as f:
             f.write("running")
 
-    # 注册退出时清理
+    # 3. 注册退出时清理
     import atexit
     def _on_exit():
         try:

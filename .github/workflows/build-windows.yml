@@ -28,8 +28,14 @@ jobs:
         cd riskbird_build
         python -m PyInstaller --noconfirm --onefile --windowed --name RiskBirdTool --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import websocket --hidden-import websocket_client riskbird_gui.py
 
+    - name: Copy startup batch file
+      run: |
+        copy riskbird_build\启动RiskBirdTool.bat riskbird_build\dist\启动RiskBirdTool.bat
+
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
       with:
         name: RiskBirdTool
-        path: riskbird_build/dist/RiskBirdTool.exe
+        path: |
+          riskbird_build/dist/RiskBirdTool.exe
+          riskbird_build/dist/启动RiskBirdTool.bat
