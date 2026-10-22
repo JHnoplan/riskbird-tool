@@ -383,12 +383,29 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(ctrl_group)
 
-        # ── 进度条 ──
+        # ── 进度条 + 计时器 ──
+        progress_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimumHeight(28)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("就绪")
-        main_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_bar, 1)
+
+        self.timer_lbl = QLabel("⏱ 00:00:00")
+        self.timer_lbl.setFont(QFont("Menlo" if sys.platform == "darwin" else "Consolas", 11))
+        self.timer_lbl.setStyleSheet("color: #1a73e8; font-weight: bold; padding: 0 12px;")
+        self.timer_lbl.setMinimumWidth(100)
+        self.timer_lbl.setAlignment(Qt.AlignCenter)
+        progress_layout.addWidget(self.timer_lbl)
+
+        main_layout.addLayout(progress_layout)
+
+        # 采集计时器
+        from PyQt5.QtCore import QTimer
+        self._crawl_timer = QTimer()
+        self._crawl_timer.timeout.connect(self._update_timer)
+        self._crawl_start_time = None
+        self._crawl_elapsed = 0  # 累计已用时间（秒），暂停时保留
 
         # ── 日志区 ──
         log_group = QGroupBox("  运行日志")
@@ -636,64 +653,44 @@ class MainWindow(QMainWindow):
         dlg.exec_()
     
     def _open_website(self):
-        """打开当前选择的网站"""
-        try:
-            self.open_web_btn.setEnabled(False)
-            self.open_web_btn.setText("加载中...")
-            QApplication.processEvents()
-            
-            # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
-            for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
-                if c is not self.crawler and c.driver is not None:
-                    try:
-                        c.close_browser()
-                    except Exception:
-                        c.driver = None
-                
-            # 检查会话是否存活
-            if self.crawler.driver is None or not self.crawler._is_session_alive():
-                self._append_log("浏览器会话已断开，正在重启...")
+        """打开当前选择的网站（后台线程启动浏览器，不阻塞 GUI）"""
+        self.open_web_btn.setEnabled(False)
+        self.open_web_btn.setText("加载中...")
+        QApplication.processEvents()
+        
+        # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
+        for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+            if c is not self.crawler and c.driver is not None:
                 try:
-                    if self.crawler.driver:
-                        try:
-                            self.crawler.driver.quit()
-                        except Exception:
-                            pass
-                        self.crawler.driver = None
+                    c.close_browser()
                 except Exception:
-                    self.crawler.driver = None
-                self.crawler.start_browser(headed=True)
-            
+                    c.driver = None
+        
+        # 用后台线程启动浏览器，避免卡死 GUI
+        self._open_thread = _OpenBrowserWorker(self.crawler)
+        self._open_thread.finished.connect(self._on_open_finished)
+        self._open_thread.log_signal.connect(self._append_log)
+        self._open_thread.start()
+
+    def _on_open_finished(self, success: bool, msg: str):
+        """浏览器启动完成回调"""
+        self.open_web_btn.setEnabled(True)
+        self.open_web_btn.setText("打开网页")
+        
+        if success:
             # 导航到网站（CDP 爬虫不需要，用户已手动打开）
             from aiqicha_crawler_v2 import AiQiChaCrawlerV2
             if not isinstance(self.crawler, AiQiChaCrawlerV2):
-                self.crawler.driver.get(self.crawler.BASE_URL)
+                try:
+                    self.crawler.driver.get(self.crawler.BASE_URL)
+                except Exception as e:
+                    self._append_log(f"导航失败：{e}")
             
             site_names = ["riskbird.com", "qizhidao.com", "aiqicha.baidu.com"]
             site_name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
             self._append_log(f"已打开 {site_name} 网站")
-        except Exception as e:
-            self._append_log(f"打开网站失败：{e}")
-            # 尝试重启浏览器
-            try:
-                self._append_log("尝试重启浏览器...")
-                if self.crawler.driver:
-                    try:
-                        self.crawler.driver.quit()
-                    except Exception:
-                        pass
-                    self.crawler.driver = None
-                self.crawler.start_browser(headed=True)
-                # CDP 爬虫不需要导航
-                from aiqicha_crawler_v2 import AiQiChaCrawlerV2
-                if not isinstance(self.crawler, AiQiChaCrawlerV2):
-                    self.crawler.driver.get(self.crawler.BASE_URL)
-                self._append_log("重启成功，已打开网站")
-            except Exception as e2:
-                self._append_log(f"重启也失败：{e2}")
-        finally:
-            self.open_web_btn.setEnabled(True)
-            self.open_web_btn.setText("打开网页")
+        else:
+            self._append_log(f"打开网站失败：{msg}")
 
     def _on_login_status(self, success: bool, msg: str):
         if success:
@@ -743,6 +740,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("采集中... 0%")
 
+        # 开始计时
+        self._start_timer()
+
         self._crawl_thread = CrawlWorker(self.crawler, self._companies, start_index)
         self._crawl_thread.finished.connect(self._on_crawl_finished)
         self._crawl_thread.start()
@@ -754,6 +754,7 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(True)
         self.statusBar().showMessage("已暂停")
+        self._pause_timer()
         self._auto_save("点击暂停")
 
     def _resume_crawl(self):
@@ -761,6 +762,7 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
         self.statusBar().showMessage("采集中...")
+        self._resume_timer()
 
     def _stop_crawl(self):
         self.crawler.stop_crawl()
@@ -769,6 +771,10 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(False)
         self.start_btn.setEnabled(True)  # 允许重新开始
         self.export_btn.setEnabled(True)  # 允许导出
+        self._stop_timer()
+        # 输出用时摘要
+        count = len(self.crawler.results)
+        self._append_log(f" {self._get_time_summary(count)}")
         self._auto_save("点击停止")
 
     def _on_crawl_finished(self):
@@ -776,14 +782,73 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.select_file_btn.setEnabled(True)
         self.export_btn.setEnabled(bool(self.crawler.results))
-        self.statusBar().showMessage(f"采集完成 — 共 {len(self.crawler.results)} 条数据")
-        self.progress_bar.setFormat(f"完成 — {len(self.crawler.results)} 条数据")
+        self._stop_timer()
+        count = len(self.crawler.results)
+        self.statusBar().showMessage(f"采集完成 — 共 {count} 条数据")
+        self.progress_bar.setFormat(f"完成 — {count} 条数据")
+        # 输出用时摘要
+        self._append_log(f"✅ {self._get_time_summary(count)}")
         self._auto_save("采集完成")
 
     def _update_progress(self, current: int, total: int):
         pct = int(current / total * 100) if total else 0
         self.progress_bar.setValue(pct)
-        self.progress_bar.setFormat(f"采集中... {current}/{total} ({pct}%)")
+        self.progress_bar.setFormat(f"采集中... {current}/{total} ({pct}%)  ⏱ {self._format_time(self._crawl_elapsed)}")
+
+    # ── 计时器 ────────────────────────────────
+    @staticmethod
+    def _format_time(seconds: int) -> str:
+        """格式化秒数为 HH:MM:SS"""
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _update_timer(self):
+        """每秒更新计时器显示"""
+        if self._crawl_start_time:
+            self._crawl_elapsed = int(time.time() - self._crawl_start_time)
+        self.timer_lbl.setText(f" {self._format_time(self._crawl_elapsed)}")
+
+    def _start_timer(self):
+        """开始计时"""
+        self._crawl_elapsed = 0
+        self._crawl_start_time = time.time()
+        self._crawl_timer.start(1000)  # 每秒更新
+        self.timer_lbl.setText("⏱ 00:00:00")
+
+    def _stop_timer(self):
+        """停止计时"""
+        self._crawl_timer.stop()
+        if self._crawl_start_time:
+            self._crawl_elapsed = int(time.time() - self._crawl_start_time)
+        self.timer_lbl.setText(f"⏱ {self._format_time(self._crawl_elapsed)}")
+
+    def _pause_timer(self):
+        """暂停计时（保留已用时间）"""
+        self._crawl_timer.stop()
+        if self._crawl_start_time:
+            self._crawl_elapsed = int(time.time() - self._crawl_start_time)
+        self._crawl_start_time = None
+
+    def _resume_timer(self):
+        """恢复计时（在已用时间基础上继续）"""
+        self._crawl_start_time = time.time() - self._crawl_elapsed
+        self._crawl_timer.start(1000)
+
+    def _get_time_summary(self, count: int) -> str:
+        """生成用时摘要"""
+        total_seconds = self._crawl_elapsed
+        time_str = self._format_time(total_seconds)
+        if count > 0:
+            avg_seconds = total_seconds / count
+            if avg_seconds < 60:
+                avg_str = f"{avg_seconds:.1f}秒"
+            else:
+                avg_min = avg_seconds / 60
+                avg_str = f"{avg_min:.1f}分钟"
+            return f"总用时 {time_str}，共 {count} 条，平均 {avg_str}/条"
+        return f"总用时 {time_str}"
 
     # ── 日志 ───────────────────────────────────
     def _append_log(self, msg: str):
@@ -837,6 +902,43 @@ class MainWindow(QMainWindow):
         if path:
             self.crawler.export_excel(path)
             QMessageBox.information(self, "导出成功", f"数据已保存到:\n{path}")
+
+
+# ═══════════════════════════════════════════════
+#  打开浏览器工作线程
+# ═══════════════════════════════════════════════
+class _OpenBrowserWorker(QThread):
+    """后台启动浏览器，不阻塞 GUI"""
+    finished = pyqtSignal(bool, str)  # success, message
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, crawler):
+        super().__init__()
+        self.crawler = crawler
+
+    def run(self):
+        try:
+            # 检查会话是否存活
+            if self.crawler.driver is None or not self.crawler._is_session_alive():
+                self.log_signal.emit("浏览器会话已断开，正在重启...")
+                try:
+                    if self.crawler.driver:
+                        try:
+                            self.crawler.driver.quit()
+                        except Exception:
+                            pass
+                        self.crawler.driver = None
+                except Exception:
+                    self.crawler.driver = None
+
+                success = self.crawler.start_browser(headed=True)
+                if not success:
+                    self.finished.emit(False, "浏览器启动失败")
+                    return
+
+            self.finished.emit(True, "浏览器已启动")
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 # ═══════════════════════════════════════════════
