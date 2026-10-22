@@ -5,6 +5,7 @@ riskbird_gui.py - 美亚风鸟企业数据采集工具 GUI
 
 import sys
 import os
+import re
 import time
 import threading
 from pathlib import Path
@@ -205,6 +206,181 @@ class LoginDialog(QDialog):
 # ═══════════════════════════════════════════════
 #  主窗口
 # ═══════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#  公司名列智能识别（表头语义打分 + 单元格内容抽样打分，低置信时人工确认）
+# ══════════════════════════════════════════════
+_COMPANY_SUFFIX_RE = re.compile(
+    r"(有限责任公司|股份有限公司|有限公司|集团公司|合作社|经营部|工作室|事务所|"
+    r"研究中心|中心|集团|公司|工厂|厂|商行|商店|门市部|营业部|分公司|办事处|协会|商会|研究院|研究所)$"
+)
+_COMPANY_BODY_RE = re.compile(r"(公司|集团|工厂|商行|商店|门市部|经营部|工作室|事务所|中心|厂)")
+_ORG_KEYWORDS = ("银行", "医院", "学校", "学院", "大学", "政府", "管理局", "委员会", "合作社")
+_PERSON_NAME_RE = re.compile(r"^[\u4e00-\u9fa5]{2,3}$")
+
+# 表头精确命中（归一化后全等）
+_HEADER_EXACT = {
+    "公司名", "公司名称", "企业名", "企业名称", "单位名称", "公司", "企业", "单位",
+    "客户名称", "客户", "厂商名称", "厂家名称", "供应商名称", "商户名称", "店铺名称",
+    "企业名称公司名称", "companyname", "company", "企业名称或姓名",
+}
+# 表头强包含命中
+_HEADER_STRONG = ("公司名称", "企业名称", "公司名称", "单位名称", "客户名称", "供应商名称",
+                  "厂商名称", "厂家名称", "公司名", "企业名", "单位名称", "商户名称")
+# 表头弱命中（还需内容打分佐证）
+_HEADER_WEAK = ("公司", "企业", "单位", "客户", "厂商", "厂家", "供应商", "商户", "店铺", "名称")
+# 表头负向词（命中则大幅降分，防止"公司电话""企业地址"等误判）
+_HEADER_PENALTY = ("电话", "手机", "联系", "地址", "邮箱", "邮件", "网址", "官网", "法人", "代表人",
+                   "税号", "编号", "编码", "账号", "银行", "状态", "类型", "日期", "时间", "金额",
+                   "注册资本", "营业", "范围", "所在", "地区", "省份", "城市", "备注", "来源",
+                   "姓名", "负责人", "经理", "职位", "职务", "QQ", "qq", "微信")
+
+
+def _normalize_header(h) -> str:
+    s = re.sub(r"[\s：:：*#\d一二三四五六七八九十（）()\[\]【】/\\\-_.。、,，]", "", str(h or ""))
+    return s.lower()
+
+
+def _header_score(header) -> int:
+    """表头语义打分：精确 > 强包含 > 弱包含，负向词扣分"""
+    norm = _normalize_header(header)
+    if not norm:
+        return 0
+    if norm in _HEADER_EXACT:
+        score = 100
+    elif any(k in norm for k in _HEADER_STRONG):
+        score = 80
+    elif any(k in norm for k in _HEADER_WEAK):
+        score = 40
+    else:
+        score = 0
+    if any(p in str(header or "") for p in _HEADER_PENALTY):
+        score -= 60
+    return max(score, 0)
+
+
+def _company_name_score(value) -> float:
+    """单元格内容像不像公司名（0~1），抽样打分的核心"""
+    if value is None:
+        return 0.0
+    s = str(value).strip()
+    if not s or s.lower() in ("none", "null", "-"):
+        return 0.0
+    if len(s) < 4 or len(s) > 60:
+        return 0.0
+    # 纯数字/日期/电话/邮箱/网址 → 绝不可能是公司名
+    if re.fullmatch(r"[\d\s.,\-/年月日:：()（）万亿千百元整]+", s):
+        return 0.0
+    if re.search(r"[@]|\.(com|cn|net|org)|^(https?://|www\.)|1[3-9]\d{9}|0\d{2,3}-\d{7,8}", s):
+        return 0.0
+    han = re.findall(r"[\u4e00-\u9fa5]", s)
+    if len(han) < 4:
+        return 0.0
+    # 以企业组织后缀结尾 → 最像
+    if _COMPANY_SUFFIX_RE.search(s):
+        return 1.0
+    # 含公司/集团等主体词且足够长
+    if _COMPANY_BODY_RE.search(s) and len(s) >= 6:
+        return 0.9
+    # 机构类名称（银行/医院/学校等）
+    if len(s) >= 6 and any(k in s for k in _ORG_KEYWORDS):
+        return 0.6
+    # 2~3 个纯汉字 → 更像联系人姓名
+    if _PERSON_NAME_RE.fullmatch(s):
+        return 0.1
+    return 0.2
+
+
+def _detect_company_column(rows) -> dict:
+    """综合表头与内容识别公司名列。rows 为前若干行的元组列表（第 1 行可能是表头）。
+    返回 {"col", "start_row", "need_confirm", "candidates"}"""
+    if not rows:
+        return {"col": 0, "start_row": 1, "need_confirm": False, "candidates": []}
+    first = rows[0]
+    ncols = max(len(r) for r in rows)
+
+    # 第一行本身就是数据（无表头文件）的判断
+    first_scores = [_company_name_score(v) for v in first]
+    headerless = sum(1 for s in first_scores if s >= 0.9) >= max(1, len(first_scores) // 2)
+
+    candidates = []
+    for c in range(ncols):
+        header = str(first[c]).strip() if c < len(first) and first[c] is not None else ""
+        hs = 0 if headerless else _header_score(header)
+        vals = [r[c] if c < len(r) else None for r in rows[(0 if headerless else 1):21]]
+        vals = [v for v in vals if v is not None and str(v).strip()]
+        cs = (sum(_company_name_score(v) for v in vals[:20]) / min(len(vals), 20)) * 100 if vals else 0.0
+        total = hs * 0.4 + cs * 0.6
+        candidates.append({
+            "col": c, "header": header,
+            "sample": "、".join(str(v).strip()[:20] for v in vals[:3]),
+            "header_score": round(hs), "content_score": round(cs), "total": round(total),
+        })
+    candidates.sort(key=lambda x: -x["total"])
+
+    best = candidates[0] if candidates else None
+    need_confirm = True
+    if headerless:
+        need_confirm = best is None or best["content_score"] < 60
+    elif best:
+        second = candidates[1] if len(candidates) > 1 else None
+        ambiguous = second and abs(best["total"] - second["total"]) < 15 and best["header_score"] == 0
+        need_confirm = best["total"] < 60 or bool(ambiguous)
+    return {
+        "col": best["col"] if best else 0,
+        "start_row": 0 if headerless else 1,
+        "need_confirm": need_confirm,
+        "candidates": candidates,
+    }
+
+
+class CompanyColumnDialog(QDialog):
+    """低置信时让用户确认公司名列（默认选中打分最高列）"""
+
+    def __init__(self, candidates, best_col, filename, parent=None):
+        super().__init__(parent)
+        self.selected_col = best_col
+        self.remember = True
+        self.setWindowTitle("确认公司名列")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"文件「{os.path.basename(filename)}」无法确定公司名所在列，请人工选择：\n"
+            "（已按可能性排序，选项格式：列号 | 表头 | 内容示例）"
+        ))
+        self._boxes = {}
+        for cand in candidates[:10]:
+            text = f"第{cand['col'] + 1}列 | {cand['header'] or '(无表头)'} | {cand['sample'] or '(空)'}"
+            cb = QCheckBox(text)
+            cb.setChecked(cand["col"] == best_col)
+            cb.toggled.connect(lambda on, c=cand["col"]: on and self._pick(c))
+            self._boxes[cand["col"]] = cb
+            layout.addWidget(cb)
+        self._remember_chk = QCheckBox("记住选择（本次运行中同类文件不再询问）")
+        self._remember_chk.setChecked(True)
+        layout.addWidget(self._remember_chk)
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def _pick(self, col):
+        # 单选互斥：勾一个自动取消其它
+        for c, box in self._boxes.items():
+            if c != col and box.isChecked():
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+        self.selected_col = col
+
+    def accept(self):
+        self.remember = self._remember_chk.isChecked()
+        super().accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -225,8 +401,13 @@ class MainWindow(QMainWindow):
 
         self._companies = []
         self._excel_paths = []  # 支持多文件
+        self._col_pick_cache = {}  # 公司名列人工确认结果缓存（表头组合 → 列号）
         self._crawl_thread = None
         self._current_source = 1  # 0=风鸟，1=企知道，2=爱企查
+        # 跨平台续采 + 桌面会话文件夹 + 每 10 条自动保存
+        self._all_crawlers = [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]
+        self._session_folder = None       # 桌面/企业数据自动采集工具/<第一次开始采集时间>
+        self._last_autosave_bucket = 0    # 每 10 条自动保存的计数桶
 
         self._update_window_title()
         self.setMinimumSize(900, 700)
@@ -400,6 +581,16 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(progress_layout)
 
+        # ── 各平台已采集条数（跨平台续采时直观显示进度） ──
+        count_font = "Microsoft YaHei" if sys.platform == "win32" else "Arial"
+        self.platform_count_lbl = QLabel("风鸟: 0 条    企知道: 0 条    爱企查: 0 条    合计: 0 条")
+        self.platform_count_lbl.setFont(QFont(count_font, 10, QFont.Bold))
+        self.platform_count_lbl.setStyleSheet(
+            "QLabel { color: #1a73e8; background: #eef4ff; border: 1px solid #d0e0ff; border-radius: 4px; padding: 6px; }"
+        )
+        self.platform_count_lbl.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.platform_count_lbl)
+
         # 采集计时器
         from PyQt5.QtCore import QTimer
         self._crawl_timer = QTimer()
@@ -494,53 +685,51 @@ class MainWindow(QMainWindow):
             self._append_log(f"从 {len(paths)} 个文件加载 {len(all_companies)} 家公司，去重后 {len(self._companies)} 家")
 
     def _load_companies_from_file(self, path: str) -> list:
-        """从单个文件加载公司名（智能检测公司名列）"""
+        """从单个文件加载公司名（智能识别公司名列：表头语义 + 内容抽样打分，低置信弹窗确认）"""
         try:
             from openpyxl import load_workbook
             wb = load_workbook(path, read_only=False, data_only=True)
             ws = wb.active
-            
-            # 读取第一行（表头），查找公司名列
-            headers = []
-            for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
-                headers.append(str(cell).strip() if cell else "")
-            
-            # 常见的公司名列名（按优先级排序，长的在前避免误匹配）
-            company_keywords = [
-                "公司名", "单位名称", "企业名称", "公司名称",
-                "企业名", "公司", "单位", "企业",  # 添加"企业名"和"企业"
-                "客户名", "客户", "厂商", "厂家",
-            ]
-            company_col = None
-            
-            for i, header in enumerate(headers):
-                for keyword in company_keywords:
-                    if keyword in header:
-                        company_col = i
-                        break
-                if company_col is not None:
-                    break
-            
-            # 如果没找到，默认使用最后一列或第 2 列
-            if company_col is None:
-                if len(headers) >= 3:
-                    company_col = 2  # 第 3 列
-                elif len(headers) >= 2:
-                    company_col = 1  # 第 2 列
+
+            # 取前 21 行做检测样本（1 行表头 + 20 行内容）
+            sample = [row for row in ws.iter_rows(min_row=1, max_row=21, values_only=True)]
+            det = _detect_company_column(sample)
+            company_col = det["col"]
+            start_row = det["start_row"] + 1  # iter_rows 的 min_row 是 1-based
+
+            best = det["candidates"][0] if det["candidates"] else None
+            self._append_log(
+                f"公司名列识别：第{company_col + 1}列 "
+                f"({best['header'] if best else 'N/A'}) "
+                f"[表头分{best['header_score'] if best else 0}/内容分{best['content_score'] if best else 0}]"
+            )
+
+            # 低置信 → 弹窗人工确认（本会话已记住的表头组合直接复用）
+            if det["need_confirm"] and det["candidates"]:
+                cache_key = tuple(c["header"] for c in sorted(det["candidates"], key=lambda x: x["col"]))
+                if cache_key in self._col_pick_cache:
+                    company_col = self._col_pick_cache[cache_key]
+                    self._append_log(f"  ↳ 使用已记住的选择：第{company_col + 1}列")
                 else:
-                    company_col = 0  # 第 1 列
-            
-            self._append_log(f"检测到公司名列：第{company_col+1}列 ({headers[company_col] if company_col < len(headers) else 'N/A'})")
-            
-            # 从第 2 行开始读取数据（遍历所有行，跳过空行）
+                    dlg = CompanyColumnDialog(det["candidates"], company_col, path, self)
+                    if dlg.exec_() == QDialog.Accepted:
+                        company_col = dlg.selected_col
+                        if dlg.remember:
+                            self._col_pick_cache[cache_key] = company_col
+                        self._append_log(f"  ↳ 人工确认公司名列：第{company_col + 1}列")
+                    else:
+                        wb.close()
+                        self._append_log("  ↳ 已取消选择，未加载该文件")
+                        return []
+
+            # 读取数据行（跳过空行与无效值）
             companies = []
-            for row in ws.iter_rows(min_row=2, values_only=True):
+            for row in ws.iter_rows(min_row=start_row, values_only=True):
                 if row and len(row) > company_col:
                     cell_value = row[company_col]
-                    # 处理各种空值情况
                     if cell_value is not None:
                         name = str(cell_value).strip()
-                        if name and name != "None" and name != "":
+                        if name and name != "None":
                             companies.append(name)
             wb.close()
             return companies
@@ -558,58 +747,19 @@ class MainWindow(QMainWindow):
         self.preview_btn.setEnabled(False)
         self.clear_files_btn.setEnabled(False)
         self._check_ready()
+        # 清空文件视为开启新会话：重置自动保存目录与每10条计数桶（下次开始采集会新建时间戳文件夹）
+        self._session_folder = None
+        self._last_autosave_bucket = 0
         self._append_log("已清空文件列表")
 
     def _load_companies(self, path: str):
-        try:
-            from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=False, data_only=True)
-            ws = wb.active
-            
-            # 智能检测公司名列
-            headers = []
-            for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
-                headers.append(str(cell).strip() if cell else "")
-            
-            company_keywords = [
-                "公司名", "单位名称", "企业名称", "公司名称",
-                "企业名", "公司", "单位", "企业",
-                "客户名", "客户", "厂商", "厂家",
-            ]
-            company_col = None
-            
-            for i, header in enumerate(headers):
-                for keyword in company_keywords:
-                    if keyword in header:
-                        company_col = i
-                        break
-                if company_col is not None:
-                    break
-            
-            if company_col is None:
-                if len(headers) >= 3:
-                    company_col = 2
-                elif len(headers) >= 2:
-                    company_col = 1
-                else:
-                    company_col = 0
-            
-            companies = []
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and len(row) > company_col:
-                    cell_value = row[company_col]
-                    if cell_value is not None:
-                        name = str(cell_value).strip()
-                        if name and name != "None" and name != "":
-                            companies.append(name)
-            wb.close()
-            self._companies = companies
-            self.company_count_lbl.setText(f"共 {len(companies)} 家")
-            self.preview_btn.setEnabled(True)
-            self._check_ready()
-            self._append_log(f"已加载 {len(companies)} 家公司 (第{company_col+1}列：{headers[company_col] if company_col < len(headers) else 'N/A'})")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"读取 Excel 失败:\n{e}")
+        """（兼容旧入口）委托给 _load_companies_from_file 的智能识别逻辑"""
+        companies = self._load_companies_from_file(path)
+        self._companies = companies
+        self.company_count_lbl.setText(f"共 {len(companies)} 家")
+        self.preview_btn.setEnabled(True)
+        self._check_ready()
+        self._append_log(f"已加载 {len(companies)} 家公司")
 
     def _preview_companies(self):
         preview = "\n".join(self._companies[:20])
@@ -625,6 +775,10 @@ class MainWindow(QMainWindow):
     def _on_source_changed(self, index):
         """切换数据来源"""
         old_crawler = self.crawler
+        old_index = self._current_source
+        # 切换前先把旧平台数据落盘（不足 10 条未触发自动保存时避免丢失）
+        if old_index != index:
+            self._save_platform_file(old_index, "切换平台")
         self._current_source = index
         if index == 0:
             self.crawler = self.riskbird_crawler
@@ -646,6 +800,12 @@ class MainWindow(QMainWindow):
         
         # 更新窗口标题
         self._update_window_title()
+        # 刷新各平台已采集条数显示，并提示续采起点
+        self._update_platform_counts()
+        _names = ["风鸟", "企知道", "爱企查"]
+        _cnt = len(self._all_crawlers[index].results)
+        _g = self._get_global_index()
+        self._append_log(f"{_names[index]} 平台已采集 {_cnt} 条；全局累计 {_g} 条，点开始采集将从第 {_g + 1} 条继续")
     
     def _update_window_title(self):
         """根据当前数据源更新窗口标题和界面标题"""
@@ -690,7 +850,11 @@ class MainWindow(QMainWindow):
             from aiqicha_crawler_v2 import AiQiChaCrawlerV2
             if not isinstance(self.crawler, AiQiChaCrawlerV2):
                 try:
-                    self.crawler.driver.get(self.crawler.BASE_URL)
+                    # 关闭多余标签页并验证导航到平台首页（解决 hao123 劫持/多标签）
+                    if hasattr(self.crawler, "_goto_homepage_verified"):
+                        self.crawler._goto_homepage_verified()
+                    else:
+                        self.crawler.driver.get(self.crawler.BASE_URL)
                 except Exception as e:
                     self._append_log(f"导航失败：{e}")
             
@@ -736,8 +900,16 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.crawler.delay_between = 0.5
 
-        # 如果是恢复采集，从上次停止的位置继续
-        start_index = len(self.crawler.results) if self.crawler.results else 0
+        # 跨平台续采：从所有平台已采集的总条数继续（切换平台/暂停后不重头开始）
+        start_index = self._get_global_index()
+        if start_index >= len(self._companies):
+            QMessageBox.information(self, "提示", f"全部 {len(self._companies)} 家公司已采集完成，无需继续。")
+            return
+        # 首次开始采集时创建桌面会话文件夹（以第一次开始采集的时间命名）
+        self._get_or_create_session_folder()
+        self._last_autosave_bucket = start_index // 10
+        if start_index > 0:
+            self._append_log(f"↻ 续采：已完成 {start_index} 条，从第 {start_index + 1} 条继续")
 
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -763,6 +935,7 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(True)
         self.statusBar().showMessage("已暂停")
         self._pause_timer()
+        self._update_platform_counts()
         self._auto_save("点击暂停")
 
     def _resume_crawl(self):
@@ -780,6 +953,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)  # 允许重新开始
         self.export_btn.setEnabled(True)  # 允许导出
         self._stop_timer()
+        self._update_platform_counts()
         # 输出用时摘要
         count = len(self.crawler.results)
         self._append_log(f" {self._get_time_summary(count)}")
@@ -789,11 +963,13 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.select_file_btn.setEnabled(True)
-        self.export_btn.setEnabled(bool(self.crawler.results))
+        self.export_btn.setEnabled(bool(self._all_results()))
         self._stop_timer()
         count = len(self.crawler.results)
-        self.statusBar().showMessage(f"采集完成 — 共 {count} 条数据")
-        self.progress_bar.setFormat(f"完成 — {count} 条数据")
+        total_all = self._get_global_index()
+        self.statusBar().showMessage(f"采集完成 — 本平台 {count} 条，全部平台合计 {total_all} 条")
+        self.progress_bar.setFormat(f"完成 — 合计 {total_all} 条数据")
+        self._update_platform_counts()
         # 输出用时摘要
         self._append_log(f"✅ {self._get_time_summary(count)}")
         self._auto_save("采集完成")
@@ -802,6 +978,14 @@ class MainWindow(QMainWindow):
         pct = int(current / total * 100) if total else 0
         self.progress_bar.setValue(pct)
         self.progress_bar.setFormat(f"采集中... {current}/{total} ({pct}%)  ⏱ {self._format_time(self._crawl_elapsed)}")
+        # 刷新各平台已采集条数显示
+        self._update_platform_counts()
+        # 每采集 10 条自动保存一次
+        total_done = self._get_global_index()
+        bucket = total_done // 10
+        if bucket > self._last_autosave_bucket:
+            self._last_autosave_bucket = bucket
+            self._auto_save(f"每10条自动保存·已{total_done}条")
 
     # ── 计时器 ────────────────────────────────
     @staticmethod
@@ -870,46 +1054,177 @@ class MainWindow(QMainWindow):
         count = self.log_text.document().blockCount()
         self.log_count_lbl.setText(f"日志: {count} 条")
 
+    # ── 跨平台进度 / 桌面会话文件夹 / 自动保存 ──
+    def _all_results(self) -> list:
+        """合并三个平台的全部采集结果（风鸟→企知道→爱企查 顺序）"""
+        combined = []
+        for c in self._all_crawlers:
+            combined.extend(c.results)
+        return combined
+
+    def _get_global_index(self) -> int:
+        """全局进度 = 所有平台已采集条数之和（跨平台续采的起点）"""
+        return sum(len(c.results) for c in self._all_crawlers)
+
+    def _get_desktop_dir(self) -> Path:
+        """获取桌面路径（兼容 Windows OneDrive 重定向）"""
+        desktop = Path.home() / "Desktop"
+        if desktop.exists():
+            return desktop
+        for env in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            od = os.environ.get(env)
+            if od:
+                d = Path(od) / "Desktop"
+                if d.exists():
+                    return d
+        try:
+            desktop.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return desktop
+
+    def _get_or_create_session_folder(self):
+        """本次采集会话的桌面子文件夹：桌面/企业数据自动采集工具/<第一次开始采集时间>"""
+        if self._session_folder is not None and self._session_folder.exists():
+            return self._session_folder
+        try:
+            base = self._get_desktop_dir() / "企业数据自动采集工具"
+            base.mkdir(parents=True, exist_ok=True)
+            # Windows 文件夹名不能含冒号，用 年-月-日_时-分-秒 安全格式
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            folder = base / stamp
+            folder.mkdir(parents=True, exist_ok=True)
+            self._session_folder = folder
+            self._append_log(f"📁 自动保存目录：{folder}")
+            return folder
+        except Exception as e:
+            self._append_log(f"⚠ 创建自动保存目录失败：{e}")
+            return None
+
+    def _update_platform_counts(self):
+        """刷新界面上各平台已采集条数显示"""
+        if not hasattr(self, "platform_count_lbl"):
+            return
+        counts = [len(c.results) for c in self._all_crawlers]
+        total = sum(counts)
+        self.platform_count_lbl.setText(
+            f"风鸟: {counts[0]} 条    企知道: {counts[1]} 条    爱企查: {counts[2]} 条    合计: {total} 条"
+        )
+
+    def _save_platform_file(self, source_index: int, reason: str = ""):
+        """将指定平台结果保存为 桌面会话文件夹/<平台名>.xlsx（同名覆盖，每平台最多 1 个文件）"""
+        if not (0 <= source_index < len(self._all_crawlers)):
+            return
+        c = self._all_crawlers[source_index]
+        if not c.results:
+            return
+        folder = self._get_or_create_session_folder()
+        if folder is None:
+            return
+        name = ["风鸟", "企知道", "爱企查"][source_index]
+        filepath = folder / f"{name}.xlsx"
+        try:
+            c.export_excel(str(filepath))
+            reason_text = f"（{reason}）" if reason else ""
+            self._append_log(f"✅ 已自动保存 {name} {len(c.results)} 条 → {filepath} {reason_text}")
+        except Exception as e:
+            self._append_log(f"⚠ {name} 自动保存失败：{e}")
+
     # ── 自动保存 ──────────────────────────────
     def _auto_save(self, reason: str = ""):
-        """自动保存到 exe 同目录下的「自动保存」文件夹"""
-        if not self.crawler.results:
-            return
-
-        # 保存位置：exe 同目录 / 自动保存
-        base_dir = Path(__file__).parent / "自动保存"
-        base_dir.mkdir(exist_ok=True)
-
-        # 根据数据源动态命名
-        source_names = ["风鸟", "企知道", "爱企查"]
-        source_name = source_names[self._current_source] if self._current_source < len(source_names) else "企业数据"
-        filename = f"{source_name}_自动保存_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        filepath = base_dir / filename
-
+        """自动保存当前平台数据到桌面会话文件夹（覆盖该平台同名文件）"""
         try:
-            self.crawler.export_excel(str(filepath))
-            reason_text = f"（{reason}）" if reason else ""
-            self._append_log(f"✅ 已自动保存 {len(self.crawler.results)} 条数据到：{filepath} {reason_text}")
+            self._save_platform_file(self._current_source, reason)
         except Exception as e:
             self._append_log(f"️ 自动保存失败：{e}")
 
-    # ── 导出 ──────────────────────────────────
+    # ── 导出（合并风鸟/企知道/爱企查全部数据） ──
     def _export_excel(self):
-        if not self.crawler.results:
+        combined = self._all_results()
+        if not combined:
             QMessageBox.warning(self, "提示", "没有数据可导出")
             return
 
-        # 根据数据源动态命名文件
-        source_names = ["风鸟", "企知道", "爱企查"]
-        source_name = source_names[self._current_source] if self._current_source < len(source_names) else "企业数据"
-        default_name = f"{source_name}_企业数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"企业数据_全部平台_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 Excel", default_name,
+            self, "导出 Excel（合并全部平台数据）", default_name,
             "Excel 文件 (*.xlsx)"
         )
-        if path:
-            self.crawler.export_excel(path)
-            QMessageBox.information(self, "导出成功", f"数据已保存到:\n{path}")
+        if not path:
+            return
+        try:
+            self._write_merged_excel(combined, path)
+            counts = [len(c.results) for c in self._all_crawlers]
+            QMessageBox.information(
+                self, "导出成功",
+                f"已合并导出 {len(combined)} 条数据到:\n{path}\n\n"
+                f"风鸟 {counts[0]} 条 / 企知道 {counts[1]} 条 / 爱企查 {counts[2]} 条"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def _write_merged_excel(self, results: list, filepath: str):
+        """把多平台结果合并写入一个 Excel（统一表头 + 样式，含"数据来源"列区分平台）"""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+        # 统一表头：常用字段优先，其余按首次出现顺序补充
+        preferred = [
+            "公司名", "状态", "数据来源", "法定代表人", "注册资本", "成立日期",
+            "统一社会信用代码", "电话", "邮箱", "官网", "地址", "简介",
+            "经营范围", "经营业务范围", "所属行业", "企业类型", "营业期限",
+            "登记机关", "核准日期", "参保人数", "搜索结果URL",
+        ]
+        keys = []
+        for r in results:
+            for k in r.keys():
+                if k not in keys:
+                    keys.append(k)
+        headers = [k for k in preferred if k in keys] + [k for k in keys if k not in preferred]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "企业数据(全部平台)"
+
+        header_font = Font(bold=True, size=11, color="FFFFFF")
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin = Border(left=Side(style="thin"), right=Side(style="thin"),
+                      top=Side(style="thin"), bottom=Side(style="thin"))
+
+        cell = ws.cell(row=1, column=1, value="序号")
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin
+        for col, h in enumerate(headers, 2):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+            cell.border = thin
+
+        data_align = Alignment(vertical="top", wrap_text=True)
+        center_align = Alignment(horizontal="center")
+        for row_idx, r in enumerate(results, 2):
+            ws.cell(row=row_idx, column=1, value=row_idx - 1).alignment = center_align
+            for col_idx, h in enumerate(headers, 2):
+                cell = ws.cell(row=row_idx, column=col_idx, value=r.get(h, ""))
+                cell.alignment = data_align
+                cell.border = thin
+
+        for col in ws.columns:
+            max_len = 0
+            letter = col[0].column_letter
+            for c in col:
+                if c.value:
+                    max_len = max(max_len, len(str(c.value)))
+            ws.column_dimensions[letter].width = min(max_len + 4, 50)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        wb.save(filepath)
+        self._append_log(f"✅ 已合并导出 {len(results)} 条到 {filepath}")
 
 
 # ═══════════════════════════════════════════════

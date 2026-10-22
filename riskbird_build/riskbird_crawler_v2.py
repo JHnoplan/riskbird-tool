@@ -256,6 +256,9 @@ class RiskBirdCrawlerV2:
             opts.add_argument("--disable-infobars")
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")  # 避免内存不足
+            # 防止 Chrome 恢复上次会话/弹出"恢复页面"气泡（避免打开 hao123 等被劫持的启动页）
+            opts.add_argument("--disable-session-crashed-bubble")
+            opts.add_argument("--hide-crash-restore-bubble")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
 
@@ -325,6 +328,41 @@ class RiskBirdCrawlerV2:
             )
             self.wait = WebDriverWait(self.driver, 15)
             self._log("Chrome 浏览器已启动")
+            # 显式导航到平台首页并验证（解决配置被 hao123 劫持、多标签页等问题）
+            self._goto_homepage_verified()
+            return True
+
+    def _goto_homepage_verified(self) -> bool:
+        """关闭多余标签页并导航到平台首页，验证成功（解决 hao123 劫持/多标签问题）"""
+        try:
+            # 1. 只保留第一个标签页，关闭其余（hao123 等启动页可能在多余标签）
+            handles = self.driver.window_handles
+            if len(handles) > 1:
+                for h in handles[1:]:
+                    try:
+                        self.driver.switch_to.window(h)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                try:
+                    self.driver.switch_to.window(handles[0])
+                except Exception:
+                    pass
+
+            # 2. 导航并验证（最多 3 次）
+            domain = self.BASE_URL.split("//")[-1].split("/")[0]
+            for attempt in range(3):
+                self.driver.get(self.BASE_URL)
+                time.sleep(2)
+                cur = self.driver.current_url or ""
+                if domain in cur:
+                    return True
+                self._log(f"  首页导航未生效（第{attempt+1}次），重试...")
+            self._log(f"  ⚠ 未能自动打开 {domain}，请手动在浏览器访问")
+            return False
+        except Exception as e:
+            self._log(f"  首页导航异常: {e}")
+            return False
 
     def close_browser(self):
         if self.driver:
@@ -451,12 +489,16 @@ class RiskBirdCrawlerV2:
             self._log(f"Cookie 恢复失败: {e}")
             return False
 
-    # ── 搜索公司（直接构造详情页URL，不浪费查询次数） ──
+    # ── 搜索公司（企知道式：拦截补全取 entid → 单标签直连详情，不点击/不新标签/不耗次数） ──
     def search_company(self, name: str) -> dict:
-        """搜索公司：直接构造详情页URL → 进入详情采集（不浪费查询次数）
-        
-        实机验证：风鸟详情页URL格式为 /ent/公司名.html，无需entid参数，
-        直接导航即可进入详情页，完全跳过搜索列表，不消耗平台查询次数。
+        """搜索公司：完全参考企知道已实测成功的链路，全程单标签处理。
+
+        链路（与 qizhidao_crawler._get_company_hash 同款）：
+        1. 回首页并注入 XHR/fetch 拦截器；
+        2. 搜索框逐字输入公司名，触发页面自身 fast-search 补全请求；
+        3. 从拦截到的补全响应取 entid（精确匹配优先，否则首条）；
+        4. 同标签直连 /ent/<公司名>.html?entid=<entid>（即补全下拉点击所打开的 URL）提取详情；
+        5. 同标签回首页供下一家复用，全程不开新标签、不点"查询"、不消耗查询次数。
         """
         result = {
             "公司名": name,
@@ -478,12 +520,24 @@ class RiskBirdCrawlerV2:
                         result["状态"] = "失败: 浏览器会话无法恢复"
                         return result
 
-                # 直接构造详情页URL（不浪费查询次数）
+                # 1. 拦截补全响应取 entid（失败再重试一次，防页面未加载完）
+                entid, matched = self._get_entid_via_fastsearch(name)
+                if not entid:
+                    entid, matched = self._get_entid_via_fastsearch(name)
+                if not entid:
+                    result["状态"] = "未找到"
+                    self._log(f"  ❌ 补全未拦截到 entid: {name}")
+                    break
+
+                # 2. 同标签直连详情页（URL 与补全下拉点击一致，不消耗查询次数）
                 from urllib.parse import quote
-                detail_url = f"{self.BASE_URL}/ent/{quote(name)}.html"
-                self._log(f"  直接访问详情页: {detail_url}")
+                detail_url = f"{self.BASE_URL}/ent/{quote(matched or name)}.html?entid={entid}"
                 self.driver.get(detail_url)
-                time.sleep(3)
+                time.sleep(2)
+                if "/ent/" not in self.driver.current_url:
+                    self._log(f"  直连被重定向，重试一次: {self.driver.current_url}")
+                    self.driver.get(detail_url)
+                    time.sleep(2)
 
                 result["搜索结果URL"] = self.driver.current_url
 
@@ -501,7 +555,11 @@ class RiskBirdCrawlerV2:
                     # 可能在其他页面，尝试从页面中查找公司名
                     self._log(f"  页面URL: {self.driver.current_url}")
                     result = self._extract_detail_data(result)
-                
+
+                # 3. 同标签回首页供下一家复用（单标签复用，全程不开新标签）
+                self.driver.get(self.BASE_URL)
+                time.sleep(1)
+
                 # 成功则跳出重试
                 break
 
@@ -523,6 +581,131 @@ class RiskBirdCrawlerV2:
                     break
 
         return result
+
+    # ── 补全拦截辅助方法（企知道式） ──
+    def _find_search_input(self):
+        """定位首页搜索框（可见优先）"""
+        for xpath in [
+            "//input[contains(@placeholder,'企业名')]",
+            "//input[contains(@placeholder,'公司')]",
+            "//div[contains(@class,'search-input')]//input",
+            "//input[contains(@class,'el-input__inner')]",
+        ]:
+            for el in self.driver.find_elements(By.XPATH, xpath):
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+        return None
+
+    def _get_entid_via_fastsearch(self, name: str):
+        """企知道式：拦截首页 fast-search 补全响应取 entid（不点查询、不计次），本平台主链路。
+
+        参考 qizhidao_crawler._get_company_hash 的成功做法：注入 XHR/fetch 拦截器，
+        模拟输入触发页面自身请求，从响应中取 entid，用于直连详情页
+        （与人工点击下拉打开的 URL 完全一致）。返回 (entid, 公司名)。
+        """
+        try:
+            self.driver.get(self.BASE_URL)
+            # 等搜索框出现（即页面加载完成）再注入拦截器，避免加载不全导致漏拦截
+            inp = None
+            for _ in range(20):
+                inp = self._find_search_input()
+                if inp is not None:
+                    break
+                time.sleep(0.5)
+            if inp is None:
+                return "", ""
+            self.driver.execute_script("""
+                window.__rbFastSearch = null;
+                if (!window.__rbHooked) {
+                    window.__rbHooked = true;
+                    var origOpen = XMLHttpRequest.prototype.open;
+                    var origSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this.__url = url;
+                        return origOpen.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function() {
+                        var self = this;
+                        if (self.__url && self.__url.indexOf('fast-search') >= 0) {
+                            self.addEventListener('load', function() {
+                                try { window.__rbFastSearch = JSON.parse(self.responseText); } catch(e) {}
+                            });
+                        }
+                        return origSend.apply(this, arguments);
+                    };
+                    var origFetch = window.fetch;
+                    window.fetch = function() {
+                        var a0 = arguments[0];
+                        var urlStr = (typeof a0 === 'string') ? a0 : ((a0 && a0.url) || '');
+                        return origFetch.apply(this, arguments).then(function(resp) {
+                            if (urlStr.indexOf('fast-search') >= 0) {
+                                try { resp.clone().json().then(function(d) { window.__rbFastSearch = d; }); } catch(e) {}
+                            }
+                            return resp;
+                        });
+                    };
+                }
+            """)
+            inp.click()
+            time.sleep(0.2)
+            self.driver.execute_script(
+                "arguments[0].value=''; "
+                "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));", inp)
+            for ch in name:
+                inp.send_keys(ch)
+                time.sleep(0.06)
+            resp = None
+            for _ in range(16):
+                time.sleep(0.5)
+                resp = self.driver.execute_script("return window.__rbFastSearch;")
+                if resp:
+                    break
+            lst = self._extract_suggest_list(resp)
+            if not lst:
+                return "", ""
+
+            def _pick(item):
+                ename = (item.get("ENTNAME") or item.get("entName")
+                         or item.get("name") or item.get("entname") or "")
+                eid = (item.get("entid") or item.get("entId")
+                       or item.get("id") or item.get("pid") or "")
+                return str(eid) if eid else "", ename
+
+            for item in lst:  # 精确匹配优先
+                if isinstance(item, dict):
+                    eid, ename = _pick(item)
+                    if eid and ename == name:
+                        return eid, ename
+            for item in lst:  # 否则首条
+                if isinstance(item, dict):
+                    eid, ename = _pick(item)
+                    if eid:
+                        return eid, ename
+            return "", ""
+        except Exception as e:
+            self._log(f"  兜底取 entid 异常: {e}")
+            return "", ""
+
+    @staticmethod
+    def _extract_suggest_list(resp):
+        """从补全响应中稳健取出建议列表"""
+        if isinstance(resp, list):
+            return resp
+        if isinstance(resp, dict):
+            for key in ("list", "rows", "records"):
+                if isinstance(resp.get(key), list):
+                    return resp[key]
+            data = resp.get("data")
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("list", "rows", "records"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+        return []
 
     def _extract_detail_data(self, result: dict) -> dict:
         """从详情页提取所有字段（基于实机调试验证的选择器）"""

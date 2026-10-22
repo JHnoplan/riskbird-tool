@@ -210,6 +210,9 @@ class QiZhiDaoCrawler:
             opts.add_argument("--disable-infobars")
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
+            # 防止 Chrome 恢复上次会话/弹出"恢复页面"气泡（避免打开 hao123 等被劫持的启动页）
+            opts.add_argument("--disable-session-crashed-bubble")
+            opts.add_argument("--hide-crash-restore-bubble")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
 
@@ -261,6 +264,41 @@ class QiZhiDaoCrawler:
             )
             self.wait = WebDriverWait(self.driver, 10)
             self._log("浏览器已启动")
+            # 显式导航到平台首页并验证（解决配置被 hao123 劫持、多标签页等问题）
+            self._goto_homepage_verified()
+            return True
+
+    def _goto_homepage_verified(self) -> bool:
+        """关闭多余标签页并导航到平台首页，验证成功（解决 hao123 劫持/多标签问题）"""
+        try:
+            # 1. 只保留第一个标签页，关闭其余（hao123 等启动页可能在多余标签）
+            handles = self.driver.window_handles
+            if len(handles) > 1:
+                for h in handles[1:]:
+                    try:
+                        self.driver.switch_to.window(h)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                try:
+                    self.driver.switch_to.window(handles[0])
+                except Exception:
+                    pass
+
+            # 2. 导航并验证（最多 3 次）
+            domain = self.BASE_URL.split("//")[-1].split("/")[0]
+            for attempt in range(3):
+                self.driver.get(self.BASE_URL)
+                time.sleep(2)
+                cur = self.driver.current_url or ""
+                if domain in cur:
+                    return True
+                self._log(f"  首页导航未生效（第{attempt+1}次），重试...")
+            self._log(f"  ⚠ 未能自动打开 {domain}，请手动在浏览器访问")
+            return False
+        except Exception as e:
+            self._log(f"  首页导航异常: {e}")
+            return False
 
     def close_browser(self):
         """关闭浏览器"""

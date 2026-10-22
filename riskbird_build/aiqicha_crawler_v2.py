@@ -471,12 +471,13 @@ class AiQiChaCrawlerV2:
         """搜索公司并采集数据（全程只用 1 个标签页）"""
         result = {
             "公司名": name,
-            "状态": "", "法定代表人": "", "注册资本": "",
-            "成立日期": "", "统一社会信用代码": "",
-            "电话": "", "邮箱": "", "官网": "", "地址": "",
+            "状态": "", "法定代表人": "", "注册资本": "", "实缴资本": "",
+            "成立日期": "", "统一社会信用代码": "", "工商注册号": "",
+            "组织机构代码": "", "纳税人识别号": "", "纳税人资质": "",
+            "电话": "", "邮箱": "", "官网": "", "地址": "", "行政区划": "",
             "简介": "", "经营范围": "", "所属行业": "",
             "企业类型": "", "营业期限": "", "登记机关": "",
-            "核准日期": "", "参保人数": "", "数据来源": "爱企查",
+            "核准日期": "", "参保人数": "", "曾用名": "", "数据来源": "爱企查",
             "搜索结果 URL": "",
         }
         
@@ -679,267 +680,205 @@ class AiQiChaCrawlerV2:
         self._execute_js(ws_url, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
     
     def _extract_detail_data_full(self, ws_url, company_name: str) -> dict:
-        """从详情页提取全量数据"""
+        """从详情页提取全量数据（window.pageData + 工商信息表结构化解析，避免 innerText 正则错位）"""
         data = {
-            "法定代表人": "", "注册资本": "", "成立日期": "",
-            "统一社会信用代码": "", "电话": "", "邮箱": "",
-            "官网": "", "地址": "", "简介": "", "经营范围": "",
-            "所属行业": "", "企业类型": "", "营业期限": "",
-            "登记机关": "", "核准日期": "", "参保人数": "",
+            "法定代表人": "", "注册资本": "", "实缴资本": "", "成立日期": "",
+            "统一社会信用代码": "", "工商注册号": "", "组织机构代码": "",
+            "纳税人识别号": "", "纳税人资质": "",
+            "电话": "", "邮箱": "", "官网": "", "地址": "", "行政区划": "",
+            "简介": "", "经营范围": "", "所属行业": "", "企业类型": "",
+            "营业期限": "", "登记机关": "", "核准日期": "", "参保人数": "",
+            "曾用名": "",
         }
-            
-        # 提取基本信息（使用实际 DOM 结构）
+
+        # 一次 JS 调用取回三路数据：pageData JSON / 工商信息表键值对 / 头部信息
         info_json = self._execute_js(ws_url, """
             (function() {
-                var result = {
-                    legalPerson: '', registeredCapital: '', establishDate: '',
-                    creditCode: '', phone: '', email: '', website: '', address: '',
-                    introduction: '', businessScope: '', industry: '',
-                    companyType: '', businessTerm: '', registrationAuthority: '',
-                    approvalDate: '', insuredCount: ''
-                };
-                
-                // 尝试从页面的 JSON 数据中提取（更完整）
+                var out = {pd: null, table: {}, head: {}};
                 try {
-                    if (window.__INITIAL_STATE__ || window.__NUXT__ || window.__NEXT_DATA__) {
-                        var pageData = window.__INITIAL_STATE__ || window.__NUXT__ || window.__NEXT_DATA__;
-                        var dataStr = JSON.stringify(pageData);
-                        
-                        // 从 JSON 数据中提取
-                        var match;
-                        if (match = dataStr.match(/"legalPerson"[\\s:]*"([^"]+)"/)) result.legalPerson = match[1];
-                        if (match = dataStr.match(/"registeredCapital"[\\s:]*"([^"]+)"/)) result.registeredCapital = match[1];
-                        if (match = dataStr.match(/"establishDate"[\\s:]*"([^"]+)"/)) result.establishDate = match[1];
-                        if (match = dataStr.match(/"creditCode"[\\s:]*"([^"]+)"/)) result.creditCode = match[1];
-                        if (match = dataStr.match(/"phone"[\\s:]*"([^"]+)"/)) result.phone = match[1];
-                        if (match = dataStr.match(/"email"[\\s:]*"([^"]+)"/)) result.email = match[1];
-                        if (match = dataStr.match(/"website"[\\s:]*"([^"]+)"/)) result.website = match[1];
-                        if (match = dataStr.match(/"address"[\\s:]*"([^"]+)"/)) result.address = match[1];
-                        if (match = dataStr.match(/"introduction"[\\s:]*"([^"]+)"/)) result.introduction = match[1];
-                        if (match = dataStr.match(/"businessScope"[\\s:]*"([^"]+)"/)) result.businessScope = match[1];
-                        if (match = dataStr.match(/"industry"[\\s:]*"([^"]+)"/)) result.industry = match[1];
-                        if (match = dataStr.match(/"companyType"[\\s:]*"([^"]+)"/)) result.companyType = match[1];
-                        if (match = dataStr.match(/"businessTerm"[\\s:]*"([^"]+)"/)) result.businessTerm = match[1];
-                        if (match = dataStr.match(/"registrationAuthority"[\\s:]*"([^"]+)"/)) result.registrationAuthority = match[1];
-                        if (match = dataStr.match(/"approvalDate"[\\s:]*"([^"]+)"/)) result.approvalDate = match[1];
-                        if (match = dataStr.match(/"insuredCount"[\\s:]*"([^"]+)"/)) result.insuredCount = match[1];
+                    if (window.pageData && window.pageData.result) {
+                        out.pd = JSON.stringify(window.pageData.result);
                     }
                 } catch(e) {}
-                
-                // 获取整个页面文本
-                var allText = document.body.innerText;
-                var lines = allText.split('\\n');
-                
-                // 从 .info-item 元素中提取基础字段
-                var items = document.querySelectorAll('.info-item');
-                for (var i = 0; i < items.length; i++) {
-                    var text = items[i].textContent.trim();
-                        
-                    // 统一社会信用代码
-                    if (!result.creditCode && text.indexOf('统一社会信用代码') >= 0) {
-                        var match = text.match(/统一社会信用代码[：:]\\s*(\\S+)/);
-                        if (match) result.creditCode = match[1];
-                    }
-                    // 电话
-                    if (!result.phone && (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0)) {
-                        var match = text.match(/(?:电话|手机|联系方式)[：:]\\s*(\\d[\\d\\-,\\s]+)/);
-                        if (match) {
-                            result.phone = match[1].trim();
-                        } else {
-                            var match2 = text.match(/(\\d{3,4}[-]?\\d{7,8}|\\d{11})/);
-                            if (match2) result.phone = match2[1];
+                function cellText(td) {
+                    var c = td.cloneNode(true);
+                    var sels = ['.ivu-poptip-popper', '.fold-btn', 'a', 'button', 'img', 'svg', 'i'];
+                    for (var s = 0; s < sels.length; s++) {
+                        var nodes = c.querySelectorAll(sels[s]);
+                        for (var n = 0; n < nodes.length; n++) {
+                            if (nodes[n].parentNode) nodes[n].parentNode.removeChild(nodes[n]);
                         }
                     }
-                    // 法定代表人
-                    if (!result.legalPerson && text.indexOf('法定代表人') >= 0) {
-                        var match = text.match(/法定代表人[：:]\\s*[\\u4e00-\\u9fa5][\\s\\n]+([\\u4e00-\\u9fa5]{2,4})/);
-                        if (match) {
-                            result.legalPerson = match[1];
-                        } else {
-                            var match2 = text.match(/法定代表人[：:]\\s*([\\u4e00-\\u9fa5]{2,4})/);
-                            if (match2) result.legalPerson = match2[1];
-                        }
-                    }
-                    // 邮箱
-                    if (!result.email && text.indexOf('邮箱') >= 0) {
-                        var match = text.match(/邮箱[：:]\\s*([\\w@.]+)/);
-                        if (match) result.email = match[1];
-                    }
-                    // 注册资本
-                    if (!result.registeredCapital && text.indexOf('注册资本') >= 0) {
-                        var match = text.match(/注册资本[：:]\\s*(.+?)(?:\\s|$)/);
-                        if (match) result.registeredCapital = match[1].trim();
-                    }
-                    // 网址
-                    if (!result.website && text.indexOf('网址') >= 0) {
-                        var match = text.match(/网址[：:]\\s*(http\\S+)/);
-                        if (match) result.website = match[1];
-                    }
-                    // 地址
-                    if (!result.address && text.indexOf('地址') >= 0 && text.length > 10) {
-                        var match = text.match(/地址[：:]\\s*([\\u4e00-\\u9fa5].+)/);
-                        if (match) result.address = match[1].trim().substring(0, 100);
-                    }
-                    // 成立日期/注册时间
-                    if (!result.establishDate && (text.indexOf('注册时间') >= 0 || text.indexOf('成立日期') >= 0)) {
-                        var match = text.match(/(\\d{4}-\\d{2}-\\d{2})/);
-                        if (match) result.establishDate = match[1];
-                    }
+                    return (c.textContent || '').replace(/\\s+/g, ' ').trim();
                 }
-                
-                // 从整个页面文本中提取新字段（处理 tab 分隔格式）
-                for (var i = 0; i < lines.length; i++) {
-                    var line = lines[i].trim();
-                    
-                    // 按 tab 分割处理（爱企查用 tab 分隔字段）
-                    if (line.indexOf('\\t') >= 0) {
-                        var parts = line.split('\\t');
-                        for (var j = 0; j < parts.length; j++) {
-                            var part = parts[j].trim();
-                            
-                            // 企业类型
-                            if (!result.companyType && part.indexOf('企业类型') >= 0) {
-                                var match = part.match(/企业类型[\\s：:]*(.+)/);
-                                if (match) result.companyType = match[1].trim().substring(0, 50);
-                            }
-                            // 所属行业
-                            if (!result.industry && part.indexOf('所属行业') >= 0) {
-                                var match = part.match(/所属行业[\\s：:]*(.+)/);
-                                if (match) result.industry = match[1].trim().substring(0, 50);
-                            }
-                            // 营业期限
-                            if (!result.businessTerm && part.indexOf('营业期限') >= 0) {
-                                var match = part.match(/营业期限[\\s：:]*(.+)/);
-                                if (match) result.businessTerm = match[1].trim().substring(0, 50);
-                            }
-                            // 核准日期
-                            if (!result.approvalDate && part.indexOf('核准日期') >= 0) {
-                                var match = part.match(/核准日期[\\s：:]*(\\d{4}-\\d{2}-\\d{2}|\\*{4}-\\*{2}-\\*{2})/);
-                                if (match) result.approvalDate = match[1];
-                            }
-                            // 参保人数
-                            if (!result.insuredCount && part.indexOf('参保人数') >= 0) {
-                                var match = part.match(/参保人数[\\s：:]*(\\d+)/);
-                                if (match) result.insuredCount = match[1];
-                            }
-                            // 登记机关
-                            if (!result.registrationAuthority && part.indexOf('登记机关') >= 0) {
-                                var match = part.match(/登记机关[\\s：:]*(.+)/);
-                                if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
+                var KNOWN = ['企业名称', '法定代表人', '经营状态', '成立日期', '行政区划',
+                    '注册资本', '实缴资本', '企业类型', '所属行业', '工商注册号',
+                    '组织机构代码', '统一社会信用代码', '纳税人识别号', '纳税人资质',
+                    '营业期限', '核准日期', '参保人数', '登记机关', '曾用名',
+                    '注册地址', '经营范围', '英文名'];
+                function normLabel(raw) {
+                    for (var k = 0; k < KNOWN.length; k++) {
+                        if (raw.indexOf(KNOWN[k]) === 0) return KNOWN[k];
+                    }
+                    return raw.split(' ')[0].replace(/[：:]\\s*$/, '');
+                }
+                try {
+                    var tbl = document.querySelector('table.zx-detail-basic-table');
+                    if (tbl) {
+                        var trs = tbl.querySelectorAll('tr');
+                        for (var r = 0; r < trs.length; r++) {
+                            var tds = trs[r].querySelectorAll('td');
+                            for (var i = 0; i + 1 < tds.length; i += 2) {
+                                var label = normLabel(cellText(tds[i]));
+                                var value = cellText(tds[i + 1]);
+                                if (label && value && !out.table[label]) out.table[label] = value;
                             }
                         }
                     }
-                    
-                    // 处理非 tab 分隔的行
-                    if (!result.industry && line.indexOf('所属行业') >= 0) {
-                        var match = line.match(/所属行业[\\s：:]*(.+)/);
-                        if (match) result.industry = match[1].trim().substring(0, 50);
-                    }
-                    if (!result.companyType && (line.indexOf('企业类型') >= 0 || line.indexOf('公司类型') >= 0)) {
-                        var match = line.match(/(?:企业类型|公司类型)[\\s：:]*(.+)/);
-                        if (match) result.companyType = match[1].trim().substring(0, 50);
-                    }
-                    if (!result.businessTerm && line.indexOf('营业期限') >= 0) {
-                        var match = line.match(/营业期限[\\s：:]*(.+)/);
-                        if (match) result.businessTerm = match[1].trim().substring(0, 50);
-                    }
-                    if (!result.registrationAuthority && line.indexOf('登记机关') >= 0) {
-                        var match = line.match(/登记机关[\\s：:]*(.+)/);
-                        if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
-                    }
-                    if (!result.approvalDate && line.indexOf('核准日期') >= 0) {
-                        var match = line.match(/核准日期[\\s：:]*(\\d{4}-\\d{2}-\\d{2})/);
-                        if (match) result.approvalDate = match[1];
-                    }
-                    if (!result.insuredCount && line.indexOf('参保人数') >= 0) {
-                        var match = line.match(/参保人数[\\s：:]*(\\d+)/);
-                        if (match) result.insuredCount = match[1];
-                    }
-                }
-                
-                // 提取简介和经营范围（从"简介："开始的内容）
-                if (!result.introduction || !result.businessScope) {
-                    var introMatch = allText.match(/简介 [：:]([\\s\\S]{50,2000}?)(?=\\n\\s*(?:所属|企业|营业|登记|核准|参保|联系|动态|风险)|$)/);
-                    if (introMatch) {
-                        var introText = introMatch[1].trim();
-                        // 分离简介和经营范围
-                        var scopeMatch = introText.match(/^(.+?)(?=\\s*经营范围 [：:])/);
-                        if (scopeMatch) {
-                            result.introduction = scopeMatch[1].trim().substring(0, 500);
-                            var scopeText = introText.substring(scopeMatch[1].length);
-                            var scopeOnly = scopeText.match(/经营范围 [：:]([\\s\\S]+)/);
-                            if (scopeOnly) {
-                                result.businessScope = scopeOnly[1].trim().substring(0, 500);
-                            }
-                        } else {
-                            // 没有明确的经营范围分隔
-                            result.introduction = introText.substring(0, 500);
+                } catch(e) {}
+                try {
+                    var items = document.querySelectorAll('.info-item');
+                    for (var k = 0; k < items.length; k++) {
+                        var it = items[k];
+                        if (it.querySelector('.telphone-lists-wrap') || it.querySelector('.email-lists-wrap')) continue;
+                        var t = (it.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t.indexOf('注册时间') >= 0 && !out.head.regTime) {
+                            var m = t.match(/\\d{4}-\\d{2}-\\d{2}/);
+                            if (m) out.head.regTime = m[0];
+                        }
+                        if (t.indexOf('网址') === 0 && !out.head.website) {
+                            var cd = it.querySelector('.child-data');
+                            var w = (cd ? cd.textContent : t).replace(/\\s+/g, ' ').trim();
+                            if (w && w.indexOf('暂无') < 0) out.head.website = w;
                         }
                     }
-                }
-                    
-                return JSON.stringify(result);
+                    var brief = document.querySelector('.item-brief .child-data');
+                    if (brief) {
+                        var txt = '';
+                        for (var nd = 0; nd < brief.childNodes.length; nd++) {
+                            if (brief.childNodes[nd].nodeType === 3) txt += brief.childNodes[nd].textContent;
+                        }
+                        out.head.brief = txt.replace(/\\s+/g, ' ').replace(/^简介[：:]\\s*/, '').trim();
+                    }
+                } catch(e) {}
+                return JSON.stringify(out);
             })()
         """)
-            
-        if info_json:
+
+        if not info_json:
+            return data
+        try:
+            info = json.loads(info_json)
+        except json.JSONDecodeError:
+            return data
+
+        table = info.get("table") or {}
+        head = info.get("head") or {}
+        pd = {}
+        pd_str = info.get("pd")
+        if pd_str:
             try:
-                info = json.loads(info_json)
-                data["法定代表人"] = info.get("legalPerson", "")
-                data["注册资本"] = info.get("registeredCapital", "")
-                data["成立日期"] = info.get("establishDate", "")
-                data["统一社会信用代码"] = info.get("creditCode", "")
-                data["地址"] = info.get("address", "")
-                data["电话"] = info.get("phone", "")
-                data["邮箱"] = info.get("email", "")
-                data["官网"] = info.get("website", "")
-                data["简介"] = info.get("introduction", "")
-                data["经营范围"] = info.get("businessScope", "")
-                data["所属行业"] = info.get("industry", "")
-                data["企业类型"] = info.get("companyType", "")
-                data["营业期限"] = info.get("businessTerm", "")
-                data["登记机关"] = info.get("registrationAuthority", "")
-                data["核准日期"] = info.get("approvalDate", "")
-                data["参保人数"] = info.get("insuredCount", "")
+                pd = json.loads(pd_str)
             except json.JSONDecodeError:
-                pass
-            
+                pd = {}
+
+        def pick(*vals):
+            for v in vals:
+                if v and str(v).strip() and str(v).strip() not in ("-", "--", "暂无"):
+                    return str(v).strip()
+            return ""
+
+        # 全量电话/邮箱（pageData 内含历史年报联系方式）
+        phones, emails = [], []
+        if pd.get("telephone"):
+            phones.append(str(pd["telephone"]).strip())
+        for p in (pd.get("phoneinfo") or []):
+            num = str((p or {}).get("phone", "")).strip()
+            if num and num not in phones:
+                phones.append(num)
+        if pd.get("email"):
+            emails.append(str(pd["email"]).strip())
+        for e in (pd.get("emailinfo") or []):
+            addr = str((e or {}).get("email", "")).strip()
+            if addr and addr.lower() not in [x.lower() for x in emails]:
+                emails.append(addr)
+
+        website = pick(pd.get("website"), head.get("website"))
+        if website in ("-", "暂无网址"):
+            website = ""
+        insured = pick(table.get("参保人数"))
+        if insured:
+            insured = re.sub(r"[人\s]", "", insured)
+        approval = pick(table.get("核准日期"))
+        if approval:
+            m = re.search(r"\d{4}-\d{2}-\d{2}", approval)
+            approval = m.group(0) if m else approval
+
+        data["法定代表人"] = pick(pd.get("legalPerson"), table.get("法定代表人"))
+        data["注册资本"] = pick(table.get("注册资本"), pd.get("regCapital"))
+        data["实缴资本"] = pick(table.get("实缴资本"))
+        data["成立日期"] = pick(table.get("成立日期"), pd.get("startDate"), head.get("regTime"))
+        data["统一社会信用代码"] = pick(pd.get("unifiedCode"), table.get("统一社会信用代码"))
+        data["工商注册号"] = pick(pd.get("licenseNumber"), table.get("工商注册号"))
+        data["组织机构代码"] = pick(table.get("组织机构代码"))
+        data["纳税人识别号"] = pick(pd.get("taxNo"), table.get("纳税人识别号"))
+        data["纳税人资质"] = pick(table.get("纳税人资质"))
+        data["电话"] = ";".join(phones)
+        data["邮箱"] = ";".join(emails)
+        data["官网"] = website
+        data["地址"] = pick(table.get("注册地址"), pd.get("regAddr"), pd.get("addr"))
+        data["行政区划"] = pick(table.get("行政区划"))
+        data["简介"] = pick(pd.get("describe"), head.get("brief"))
+        data["经营范围"] = pick(table.get("经营范围"), pd.get("scope"))
+        data["所属行业"] = pick(pd.get("industry"), table.get("所属行业"))
+        data["企业类型"] = pick(table.get("企业类型"))
+        data["营业期限"] = pick(table.get("营业期限"))
+        data["登记机关"] = pick(table.get("登记机关"))
+        data["核准日期"] = approval
+        data["参保人数"] = insured
+        data["曾用名"] = pick(table.get("曾用名"))
         return data
     
     # ─ 采集控制 ──
-    def crawl(self, companies: list, delay: float = 3.0):
-        """批量采集（默认 3 秒间隔，避免触发验证码）"""
+    def crawl(self, companies: list, start_index: int = 0):
+        """批量采集，支持从指定位置续采（签名与风鸟/企知道一致，不重置已有结果）"""
         self._crawling = True
         self._stop_requested = False
-        self.results = []
+        self._pause_requested = False
         total = len(companies)
-        
-        self._log(f"开始采集 {total} 家公司")
-        
-        for i, company in enumerate(companies):
+
+        self._log(f"开始采集，共 {total} 家公司，从第 {start_index + 1} 条开始")
+
+        for idx in range(start_index, total):
             if self._stop_requested:
-                self._log("采集已停止")
+                self._log(f"用户停止采集，已采集 {len(self.results)} 条")
                 break
-            
+
+            name = str(companies[idx]).strip()
+            if not name:
+                continue
+
             while self._pause_requested:
-                time.sleep(1)
-            
+                time.sleep(0.5)
+                if self._stop_requested:
+                    break
+
             try:
-                result = self.search_company(company)
+                result = self.search_company(name)
                 self.results.append(result)
-                
+
                 if self.signals:
-                    self.signals.progress_signal.emit(i + 1, total)
-                
-                if i < total - 1:
-                    time.sleep(delay)
-                    
+                    self.signals.progress_signal.emit(idx + 1, total)
+
+                if idx < total - 1:
+                    time.sleep(self.delay_between)
+
             except Exception as e:
                 self._log(f"采集异常：{e}")
-        
+
         self._crawling = False
         self._log(f"采集完成，共 {len(self.results)} 家")
-        
+
         if self.signals:
             self.signals.crawl_finished_signal.emit()
     
@@ -961,24 +900,17 @@ class AiQiChaCrawlerV2:
             ws = wb.active
             ws.title = "爱企查数据"
             
-            headers = ["序号", "公司名", "法定代表人", "注册资本", "成立日期",
-                      "统一社会信用代码", "电话", "邮箱", "官网", "地址",
+            headers = ["序号", "公司名", "法定代表人", "注册资本", "实缴资本",
+                      "成立日期", "统一社会信用代码", "工商注册号",
+                      "组织机构代码", "纳税人识别号", "纳税人资质",
+                      "电话", "邮箱", "官网", "地址", "行政区划",
                       "简介", "经营范围", "所属行业", "企业类型", "营业期限",
-                      "登记机关", "核准日期", "参保人数", "状态", "数据来源"]
+                      "登记机关", "核准日期", "参保人数", "曾用名",
+                      "状态", "数据来源", "搜索结果 URL"]
             ws.append(headers)
             
             for i, r in enumerate(self.results, 1):
-                ws.append([
-                    i, r.get("公司名", ""), r.get("法定代表人", ""),
-                    r.get("注册资本", ""), r.get("成立日期", ""),
-                    r.get("统一社会信用代码", ""), r.get("电话", ""),
-                    r.get("邮箱", ""), r.get("官网", ""), r.get("地址", ""),
-                    r.get("简介", ""), r.get("经营范围", ""),
-                    r.get("所属行业", ""), r.get("企业类型", ""),
-                    r.get("营业期限", ""), r.get("登记机关", ""),
-                    r.get("核准日期", ""), r.get("参保人数", ""),
-                    r.get("状态", ""), r.get("数据来源", "")
-                ])
+                ws.append([i] + [r.get(h, "") for h in headers[1:]])
             
             wb.save(filepath)
             self._log(f"已导出 {len(self.results)} 条数据到 {filepath}")
