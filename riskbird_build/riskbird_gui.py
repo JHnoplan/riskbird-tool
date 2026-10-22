@@ -19,7 +19,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 
-from riskbird_crawler import RiskBirdCrawler, is_chrome_installed, download_and_install_chrome
+from riskbird_crawler_v2 import RiskBirdCrawlerV2, is_chrome_installed, download_and_install_chrome
+from qizhidao_crawler import QiZhiDaoCrawler
 from aiqicha_crawler import AiQiChaCrawler
 
 try:
@@ -33,7 +34,7 @@ except ImportError:
 #  登录对话框
 # ═══════════════════════════════════════════════
 class LoginDialog(QDialog):
-    def __init__(self, crawler: RiskBirdCrawler, parent=None):
+    def __init__(self, crawler, parent=None):
         super().__init__(parent)
         self.crawler = crawler
         self.setWindowTitle("美亚风鸟 - 登录")
@@ -47,7 +48,7 @@ class LoginDialog(QDialog):
 
         # 标题
         title = QLabel("美亚风鸟 账号登录")
-        title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        title.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
@@ -207,13 +208,14 @@ class LoginDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # 初始化两个爬虫
-        self.riskbird_crawler = RiskBirdCrawler()
+        # 初始化三个爬虫
+        self.riskbird_crawler = RiskBirdCrawlerV2()
+        self.qizhidao_crawler = QiZhiDaoCrawler()
         self.aiqicha_crawler = AiQiChaCrawler()
-        self.crawler = self.riskbird_crawler  # 默认使用风鸟
+        self.crawler = self.qizhidao_crawler  # 默认使用企知道
         
         # 连接信号
-        for crawler in [self.riskbird_crawler, self.aiqicha_crawler]:
+        for crawler in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
             crawler.signals.log_signal.connect(self._append_log)
             crawler.signals.progress_signal.connect(self._update_progress)
             crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
@@ -222,11 +224,11 @@ class MainWindow(QMainWindow):
         self.riskbird_crawler.signals.manual_check_signal.connect(self._on_manual_check)
 
         self._companies = []
-        self._excel_path = ""
+        self._excel_paths = []  # 支持多文件
         self._crawl_thread = None
-        self._current_source = 0  # 0=风鸟，1=爱企查
+        self._current_source = 1  # 0=风鸟，1=企知道，2=爱企查
 
-        self.setWindowTitle("企业数据采集工具 v1.0")
+        self._update_window_title()
         self.setMinimumSize(900, 700)
         self.resize(1000, 750)
         self._init_ui()
@@ -256,15 +258,17 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QComboBox
         self.source_combo = QComboBox()
         self.source_combo.addItem("风鸟 (riskbird.com)")
+        self.source_combo.addItem("企知道 (qizhidao.com)")
         self.source_combo.addItem("爱企查 (aiqicha.baidu.com)")
-        self.source_combo.setMinimumWidth(200)
+        self.source_combo.setCurrentIndex(1)  # 默认企知道
+        self.source_combo.setMinimumWidth(220)
         self.source_combo.setMinimumHeight(30)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         title_bar.addWidget(self.source_combo)
 
         # 登录状态
         self.login_status_lbl = QLabel("未登录")
-        self.login_status_lbl.setFont(QFont("Microsoft YaHei", 10))
+        self.login_status_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 10))
         self.login_status_lbl.setStyleSheet(
             "QLabel { padding: 5px 12px; border-radius: 4px; background: #f0f0f0; color: #999; }"
         )
@@ -286,30 +290,45 @@ class MainWindow(QMainWindow):
         hint_lbl.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(hint_lbl)
 
-        # ── 文件选择区 ──
-        file_group = QGroupBox("  数据文件")
-        file_layout = QHBoxLayout(file_group)
+        # ─ 文件选择区 ──
+        file_group = QGroupBox("  数据文件（支持多选）")
+        file_layout = QVBoxLayout(file_group)
 
-        self.file_path_lbl = QLabel("请选择 Excel 文件（.xlsx）")
+        # 第一行：文件路径显示
+        path_layout = QHBoxLayout()
+        self.file_path_lbl = QLabel("请选择 Excel 文件（.xlsx），支持多选")
         self.file_path_lbl.setStyleSheet("color: #666; font-size: 13px;")
-        file_layout.addWidget(self.file_path_lbl, 1)
+        self.file_path_lbl.setWordWrap(True)
+        path_layout.addWidget(self.file_path_lbl, 1)
+        file_layout.addLayout(path_layout)
 
-        self.select_file_btn = QPushButton("选择文件")
+        # 第二行：按钮
+        btn_layout = QHBoxLayout()
+        self.select_file_btn = QPushButton("选择文件（可多选）")
         self.select_file_btn.setMinimumHeight(36)
-        self.select_file_btn.setMinimumWidth(100)
-        self.select_file_btn.clicked.connect(self._select_file)
-        file_layout.addWidget(self.select_file_btn)
+        self.select_file_btn.setMinimumWidth(140)
+        self.select_file_btn.clicked.connect(self._select_files)
+        btn_layout.addWidget(self.select_file_btn)
+
+        self.clear_files_btn = QPushButton("清空文件列表")
+        self.clear_files_btn.setMinimumHeight(36)
+        self.clear_files_btn.setMinimumWidth(120)
+        self.clear_files_btn.setEnabled(False)
+        self.clear_files_btn.clicked.connect(self._clear_files)
+        btn_layout.addWidget(self.clear_files_btn)
 
         self.preview_btn = QPushButton("预览公司列表")
         self.preview_btn.setMinimumHeight(36)
         self.preview_btn.setMinimumWidth(120)
         self.preview_btn.setEnabled(False)
         self.preview_btn.clicked.connect(self._preview_companies)
-        file_layout.addWidget(self.preview_btn)
+        btn_layout.addWidget(self.preview_btn)
 
         self.company_count_lbl = QLabel("共 0 家")
-        self.company_count_lbl.setStyleSheet("color: #4472C4; font-weight: bold;")
-        file_layout.addWidget(self.company_count_lbl)
+        self.company_count_lbl.setStyleSheet("color: #4472C4; font-weight: bold; font-size: 13px;")
+        btn_layout.addWidget(self.company_count_lbl)
+        btn_layout.addStretch()
+        file_layout.addLayout(btn_layout)
 
         main_layout.addWidget(file_group)
 
@@ -428,16 +447,64 @@ class MainWindow(QMainWindow):
         self.export_btn.setObjectName("exportBtn")
 
     # ── 文件选择 ───────────────────────────────
-    def _select_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择 Excel 文件", "",
+    def _select_files(self):
+        """选择多个 Excel 文件"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择 Excel 文件（可多选）", "",
             "Excel 文件 (*.xlsx *.xls);;所有文件 (*)"
         )
-        if path:
-            self._excel_path = path
-            self.file_path_lbl.setText(path)
+        if paths:
+            self._excel_paths.extend(paths)
+            # 显示文件列表
+            if len(paths) == 1:
+                self.file_path_lbl.setText(paths[0])
+            else:
+                self.file_path_lbl.setText(f"已选择 {len(paths)} 个文件")
             self.file_path_lbl.setStyleSheet("color: #333; font-size: 12px;")
-            self._load_companies(path)
+            self.clear_files_btn.setEnabled(True)
+            
+            # 加载所有文件的公司名
+            all_companies = []
+            for path in paths:
+                companies = self._load_companies_from_file(path)
+                all_companies.extend(companies)
+            
+            # 去重
+            self._companies = list(dict.fromkeys(all_companies))
+            self.company_count_lbl.setText(f"共 {len(self._companies)} 家（去重后）")
+            self.preview_btn.setEnabled(True)
+            self._check_ready()
+            self._append_log(f"从 {len(paths)} 个文件加载 {len(all_companies)} 家公司，去重后 {len(self._companies)} 家")
+
+    def _load_companies_from_file(self, path: str) -> list:
+        """从单个文件加载公司名"""
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(path, read_only=True)
+            ws = wb.active
+            companies = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0]:
+                    name = str(row[0]).strip()
+                    if name and name != "None":
+                        companies.append(name)
+            wb.close()
+            return companies
+        except Exception as e:
+            self._append_log(f"读取文件失败 {path}: {e}")
+            return []
+
+    def _clear_files(self):
+        """清空文件列表"""
+        self._excel_paths = []
+        self._companies = []
+        self.file_path_lbl.setText("请选择 Excel 文件（.xlsx），支持多选")
+        self.file_path_lbl.setStyleSheet("color: #666; font-size: 13px;")
+        self.company_count_lbl.setText("共 0 家")
+        self.preview_btn.setEnabled(False)
+        self.clear_files_btn.setEnabled(False)
+        self._check_ready()
+        self._append_log("已清空文件列表")
 
     def _load_companies(self, path: str):
         try:
@@ -472,13 +539,34 @@ class MainWindow(QMainWindow):
     # ─ 登录 ───────────────────────────────────
     def _on_source_changed(self, index):
         """切换数据来源"""
+        old_crawler = self.crawler
         self._current_source = index
         if index == 0:
             self.crawler = self.riskbird_crawler
             self._append_log("已切换到：风鸟 (riskbird.com)")
+        elif index == 1:
+            self.crawler = self.qizhidao_crawler
+            self._append_log("已切换到：企知道 (qizhidao.com)")
         else:
             self.crawler = self.aiqicha_crawler
             self._append_log("已切换到：爱企查 (aiqicha.baidu.com)")
+        
+        # 切换时关闭旧爬虫的浏览器（释放 Chrome 配置目录锁）
+        if old_crawler is not self.crawler and old_crawler.driver is not None:
+            self._append_log("关闭上一个数据源的浏览器...")
+            try:
+                old_crawler.close_browser()
+            except Exception:
+                old_crawler.driver = None
+        
+        # 更新窗口标题
+        self._update_window_title()
+    
+    def _update_window_title(self):
+        """根据当前数据源更新窗口标题"""
+        site_names = ["风鸟", "企知道", "爱企查"]
+        name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
+        self.setWindowTitle(f"{name} 企业数据采集工具")
         
     def _show_login(self):
         dlg = LoginDialog(self.crawler, self)
@@ -490,15 +578,49 @@ class MainWindow(QMainWindow):
             self.open_web_btn.setEnabled(False)
             self.open_web_btn.setText("加载中...")
             QApplication.processEvents()
+            
+            # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
+            for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+                if c is not self.crawler and c.driver is not None:
+                    try:
+                        c.close_browser()
+                    except Exception:
+                        c.driver = None
                 
-            if self.crawler.driver is None:
+            # 检查会话是否存活
+            if self.crawler.driver is None or not self.crawler._is_session_alive():
+                self._append_log("浏览器会话已断开，正在重启...")
+                try:
+                    if self.crawler.driver:
+                        try:
+                            self.crawler.driver.quit()
+                        except Exception:
+                            pass
+                        self.crawler.driver = None
+                except Exception:
+                    self.crawler.driver = None
                 self.crawler.start_browser(headed=True)
+            
             self.crawler.driver.get(self.crawler.BASE_URL)
-            site_names = ["riskbird.com", "aiqicha.baidu.com"]
+            site_names = ["riskbird.com", "qizhidao.com", "aiqicha.baidu.com"]
             site_name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
             self._append_log(f"已打开 {site_name} 网站")
         except Exception as e:
             self._append_log(f"打开网站失败：{e}")
+            # 尝试重启浏览器
+            try:
+                self._append_log("尝试重启浏览器...")
+                if self.crawler.driver:
+                    try:
+                        self.crawler.driver.quit()
+                    except Exception:
+                        pass
+                    self.crawler.driver = None
+                self.crawler.start_browser(headed=True)
+                self.crawler.driver.get(self.crawler.BASE_URL)
+                self._append_log("重启成功，已打开网站")
+            except Exception as e2:
+                self._append_log(f"重启也失败：{e2}")
         finally:
             self.open_web_btn.setEnabled(True)
             self.open_web_btn.setText("打开网页")
@@ -523,6 +645,14 @@ class MainWindow(QMainWindow):
         if not self._companies:
             QMessageBox.warning(self, "提示", "请先选择 Excel 文件")
             return
+
+        # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
+        for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+            if c is not self.crawler and c.driver is not None:
+                try:
+                    c.close_browser()
+                except Exception:
+                    c.driver = None
 
         # 设置延迟
         try:
@@ -616,7 +746,7 @@ class MainWindow(QMainWindow):
 class CrawlWorker(QThread):
     finished = pyqtSignal()
 
-    def __init__(self, crawler: RiskBirdCrawler, companies: list, start_index: int = 0):
+    def __init__(self, crawler, companies: list, start_index: int = 0):
         super().__init__()
         self.crawler = crawler
         self.companies = companies

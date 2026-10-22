@@ -95,6 +95,17 @@ class AiQiChaCrawler:
                 pass
             self.driver = None
 
+    def _is_session_alive(self) -> bool:
+        """检查浏览器会话是否存活"""
+        try:
+            if self.driver is None:
+                return False
+            self.driver.execute_script("return document.title")
+            _ = self.driver.current_url
+            return True
+        except Exception:
+            return False
+
     def search_company(self, name: str) -> dict:
         """搜索公司并返回第一条结果"""
         result = {
