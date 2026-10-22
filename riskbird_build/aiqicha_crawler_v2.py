@@ -430,181 +430,74 @@ class AiQiChaCrawlerV2:
     
     # ── 搜索公司 ──
     def search_company(self, name: str) -> dict:
-        """搜索公司并采集数据（通过自动补全直跳详情页）"""
+        """搜索公司并采集数据（全程只用 1 个标签页）"""
         result = {
             "公司名": name,
             "状态": "", "法定代表人": "", "注册资本": "",
             "成立日期": "", "统一社会信用代码": "",
             "电话": "", "邮箱": "", "官网": "", "地址": "",
-            "数据来源": "爱企查", "搜索结果 URL": "",
+            "简介": "", "经营范围": "", "所属行业": "",
+            "企业类型": "", "营业期限": "", "登记机关": "",
+            "核准日期": "", "参保人数": "", "数据来源": "爱企查",
+            "搜索结果 URL": "",
         }
         
         for attempt in range(self.max_retries):
             try:
-                # 1. 创建新标签页到爱企查首页
+                # 1. 复用或创建爱企查首页标签页（全程只用这 1 个标签页）
                 self._log(f"搜索：{name}")
-                ws_url = self._create_tab(self.BASE_URL)
+                ws_url = self._get_or_create_homepage_tab()
                 if not ws_url:
-                    self._log("无法创建标签页")
+                    self._log("无法获取首页标签页")
                     result["状态"] = "浏览器错误"
                     return result
                 
-                self._log(f"标签页 WebSocket: {ws_url[:60]}...")
+                # 2. 等待页面加载
+                time.sleep(5)
                 
-                # 2. 等待页面完全加载（增加到 10 秒确保 Vue 组件渲染完成）
-                time.sleep(10)
-                
-                # 检查页面是否正常加载（关键！）
-                page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
-                
-                if page_body and '请关闭浏览器的调试窗口' in page_body:
-                    self._log("⚠️ 爱企查检测到调试模式")
-                    self._log("正在尝试刷新页面...")
-                    self._execute_js(ws_url, "(function() { location.reload(); })()")
-                    time.sleep(10)
-                    page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
-                    
-                    if page_body and '请关闭浏览器的调试窗口' in page_body:
-                        self._log(" 刷新后仍被检测，请手动在 Chrome 中访问 aiqicha.baidu.com")
-                        result["状态"] = "被反爬虫检测"
-                        return result
-                
-                # 检查搜索框是否存在
-                search_box_check = self._execute_js(ws_url, """
-                    (function() {
-                        var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
-                        return input ? 'found' : 'not_found';
-                    })()
-                """)
-                
-                if search_box_check != 'found':
-                    self._log("⚠️ 未找到搜索框，页面可能未完全加载")
-                    time.sleep(5)  # 额外等待
-                
-                # 3. 点击搜索框聚焦并清空
-                self._execute_js(ws_url, """
-                    (function() {
-                        var input = document.querySelector('#aqc-search-input');
-                        if (!input) input = document.querySelector('#aqc-header-search-input');
-                        if (input) {
-                            input.click();
-                            input.focus();
-                            input.value = '';
-                        }
-                    })()
-                """)
-                time.sleep(1)
-                
-                # 4. 输入公司名（使用 JavaScript 触发 Vue 事件）
-                self._execute_js(ws_url, """
-                    (function() {
-                        var input = document.querySelector('#aqc-search-input');
-                        if (!input) input = document.querySelector('#aqc-header-search-input');
-                        if (input) {
-                            // 使用原生方式设置值
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                            nativeInputValueSetter.call(input, '""" + name + """');
-                            // 触发 InputEvent（Vue 3 监听这个）
-                            input.dispatchEvent(new InputEvent('input', {
-                                bubbles: true,
-                                cancelable: true,
-                                inputType: 'insertText',
-                                data: '""" + name + """'
-                            }));
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    })()
-                """)
-                time.sleep(5)  # 等待自动补全出现
-                
-                # 5. 查找自动补全结果并点击第一个（iView 组件）
-                company_id = self._execute_js(ws_url, """
-                    (function() {
-                        // 查找 iView 自动补全下拉项
-                        var items = document.querySelectorAll('.ivu-select-item, .sug-company-line');
-                        if (items.length > 0) {
-                            var first = items[0];
-                            // 点击下拉项
-                            first.click();
-                            
-                            // 尝试从父元素获取 href
-                            var parent = first;
-                            while (parent) {
-                                if (parent.tagName === 'A') {
-                                    var href = parent.getAttribute('href') || '';
-                                    var match = href.match(/company_detail_(\\d+)/);
-                                    if (match) return match[1];
-                                }
-                                parent = parent.parentElement;
-                            }
-                            return 'clicked:' + first.textContent.trim().substring(0, 50);
-                        }
-                        return null;
-                    })()
-                """)
-                
-                if not company_id:
-                    self._log(f"未找到自动补全结果：{name}")
-                    result["状态"] = "未找到"
-                    self._close_tab(ws_url)
-                    return result
-                
-                # 处理点击后的情况
-                if company_id.startswith("clicked:"):
-                    # 已点击，等待页面导航
-                    self._log("已点击下拉项，等待跳转...")
-                    time.sleep(5)
-                    
-                    # 从 URL 获取 company_id
-                    current_url = self._execute_js(ws_url, "(function() { return window.location.href; })()")
-                    match = re.search(r'company_detail_(\d+)', current_url or '')
-                    if match:
-                        company_id = match.group(1)
-                    else:
-                        self._log(f"无法从 URL 获取公司 ID: {current_url}")
-                        result["状态"] = "跳转失败"
-                        self._close_tab(ws_url)
-                        return result
-                
-                self._log(f"找到公司 ID: {company_id}")
-                result["搜索结果 URL"] = f"company_detail_{company_id}"
-                
-                # 6. 关闭当前标签，创建详情页标签
-                self._close_tab(ws_url)
-                time.sleep(1)
-                
-                detail_url = self.DETAIL_URL.format(company_id)
-                ws_url = self._create_tab(detail_url)
-                if not ws_url:
-                    self._log("无法创建详情页标签")
-                    continue
-                
-                # 7. 等待详情页加载（增加等待时间确保数据渲染完成）
-                time.sleep(10)
-                
-                # 检查页面是否被反爬虫检测
-                page_check = self._execute_js(ws_url, """
-                    (function() {
-                        var body = document.body ? document.body.innerText : '';
-                        if (body.indexOf('请关闭浏览器的调试窗口') >= 0) return 'blocked';
-                        if (body.indexOf('公司详情') >= 0 || body.indexOf('法定代表人') >= 0) return 'ok';
-                        return 'unknown';
-                    })()
-                """)
-                
+                # 检查页面状态
+                page_check = self._check_page_status(ws_url)
                 if page_check == 'blocked':
-                    self._log("⚠️ 爱企查检测到调试模式，尝试刷新页面...")
+                    self._log("️ 检测到反爬虫，尝试刷新...")
                     self._execute_js(ws_url, "(function() { location.reload(); })()")
                     time.sleep(8)
-                elif page_check == 'unknown':
-                    self._log("⚠️ 页面内容异常，可能未完全加载")
                 
-                # 8. 采集详情页数据
-                detail_data = self._extract_detail_data(ws_url, name)
+                # 3. 清空并输入公司名
+                self._clear_and_input_search(ws_url, name)
+                time.sleep(4)  # 等待自动补全
+                
+                # 4. 点击自动补全第一项（会直接跳转到详情页）
+                clicked = self._click_first_autocomplete(ws_url)
+                if not clicked:
+                    self._log(f"未找到自动补全：{name}")
+                    result["状态"] = "未找到"
+                    return result
+                
+                # 5. 等待跳转到详情页
+                self._log("等待跳转到详情页...")
+                time.sleep(8)
+                
+                # 验证是否成功跳转到详情页
+                current_url = self._execute_js(ws_url, "(function() { return window.location.href; })()")
+                if not current_url or 'company_detail' not in current_url:
+                    self._log(f"未跳转到详情页：{current_url}")
+                    result["状态"] = "跳转失败"
+                    return result
+                
+                company_id_match = re.search(r'company_detail_(\d+)', current_url)
+                if company_id_match:
+                    result["搜索结果 URL"] = f"company_detail_{company_id_match.group(1)}"
+                
+                self._log(f"已跳转到详情页")
+                
+                # 6. 等待详情页数据渲染完成
+                time.sleep(5)
+                
+                # 7. 提取详情页全量数据
+                detail_data = self._extract_detail_data_full(ws_url, name)
                 result.update(detail_data)
                 result["状态"] = "成功"
                 
-                self._close_tab(ws_url)
                 self._log(f"采集完成：{name}")
                 return result
                 
@@ -616,27 +509,113 @@ class AiQiChaCrawlerV2:
         result["状态"] = "失败"
         return result
     
-    def _extract_detail_data(self, ws_url, company_name: str) -> dict:
-        """从详情页提取数据"""
+    def _get_or_create_homepage_tab(self):
+        """获取或创建爱企查首页标签页（复用现有，避免重复打开）"""
+        tabs = self._get_tabs()
+        
+        # 查找已有的爱企查首页标签页
+        for tab in tabs:
+            tab_url = tab.get("url", "")
+            if "aiqicha.baidu.com" in tab_url and "/s?" not in tab_url and "company_detail" not in tab_url:
+                self._log("复用现有爱企查首页标签页")
+                return tab.get("webSocketDebuggerUrl")
+        
+        # 没有现有标签页，创建新标签页
+        self._log("创建新的爱企查首页标签页")
+        result = self._send_command(
+            self._get_ws_url(),
+            "Target.createTarget",
+            {"url": self.BASE_URL}
+        )
+        target_id = result.get("result", {}).get("targetId")
+        if not target_id:
+            return None
+        
+        time.sleep(5)
+        tabs = self._get_tabs()
+        for tab in tabs:
+            if target_id in tab.get("id", ""):
+                return tab.get("webSocketDebuggerUrl")
+        return None
+    
+    def _check_page_status(self, ws_url):
+        """检查页面状态"""
+        page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
+        if page_body and '请关闭浏览器的调试窗口' in page_body:
+            return 'blocked'
+        return 'ok'
+    
+    def _clear_and_input_search(self, ws_url, name):
+        """清空搜索框并输入公司名"""
+        # 点击聚焦并清空
+        self._execute_js(ws_url, """
+            (function() {
+                var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                if (input) {
+                    input.click();
+                    input.focus();
+                    input.value = '';
+                }
+            })()
+        """)
+        time.sleep(0.5)
+        
+        # 输入公司名（触发 Vue 事件）
+        self._execute_js(ws_url, """
+            (function() {
+                var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                if (input) {
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(input, '""" + name + """');
+                    input.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, cancelable: true,
+                        inputType: 'insertText', data: '""" + name + """'
+                    }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            })()
+        """)
+    
+    def _click_first_autocomplete(self, ws_url):
+        """点击自动补全第一项，返回是否成功"""
+        result = self._execute_js(ws_url, """
+            (function() {
+                var items = document.querySelectorAll('.ivu-select-item, .sug-company-line');
+                if (items.length > 0) {
+                    items[0].click();
+                    return 'clicked';
+                }
+                return null;
+            })()
+        """)
+        return result is not None
+    
+    def _extract_detail_data_full(self, ws_url, company_name: str) -> dict:
+        """从详情页提取全量数据"""
         data = {
             "法定代表人": "", "注册资本": "", "成立日期": "",
             "统一社会信用代码": "", "电话": "", "邮箱": "",
-            "官网": "", "地址": "",
+            "官网": "", "地址": "", "简介": "", "经营范围": "",
+            "所属行业": "", "企业类型": "", "营业期限": "",
+            "登记机关": "", "核准日期": "", "参保人数": "",
         }
-        
+            
         # 提取基本信息（使用实际 DOM 结构）
         info_json = self._execute_js(ws_url, """
             (function() {
                 var result = {
                     legalPerson: '', registeredCapital: '', establishDate: '',
-                    creditCode: '', phone: '', email: '', website: '', address: ''
+                    creditCode: '', phone: '', email: '', website: '', address: '',
+                    introduction: '', businessScope: '', industry: '',
+                    companyType: '', businessTerm: '', registrationAuthority: '',
+                    approvalDate: '', insuredCount: ''
                 };
-                
+                    
                 // 从 .info-item 元素中提取
                 var items = document.querySelectorAll('.info-item');
                 for (var i = 0; i < items.length; i++) {
                     var text = items[i].textContent.trim();
-                    
+                        
                     // 统一社会信用代码
                     if (text.indexOf('统一社会信用代码') >= 0) {
                         var match = text.match(/统一社会信用代码[：:]\\s*(\\S+)/);
@@ -644,24 +623,20 @@ class AiQiChaCrawlerV2:
                     }
                     // 电话（匹配 "电话：xxx" 或 "手机：xxx"）
                     if (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0) {
-                        // 尝试多种格式
-                        var match = text.match(/(?:电话|手机|联系方式)[：:]\s*(\d[\d\-,\s]+)/);
+                        var match = text.match(/(?:电话|手机|联系方式)[：:]\\s*(\\d[\\d\\-,\\s]+)/);
                         if (match) {
                             result.phone = match[1].trim();
                         } else {
-                            // 直接匹配数字
-                            var match2 = text.match(/(\d{3,4}[-]?\d{7,8}|\d{11})/);
+                            var match2 = text.match(/(\\d{3,4}[-]?\\d{7,8}|\\d{11})/);
                             if (match2) result.phone = match2[1];
                         }
                     }
                     // 法定代表人
                     if (text.indexOf('法定代表人') >= 0) {
-                        // 匹配 "法定代表人：秦\\n 秦双玉" - 取换行后的完整姓名
                         var match = text.match(/法定代表人[：:]\\s*[\\u4e00-\\u9fa5][\\s\\n]+([\\u4e00-\\u9fa5]{2,4})/);
                         if (match) {
                             result.legalPerson = match[1];
                         } else {
-                            // 简单匹配 "法定代表人：秦双玉"
                             var match2 = text.match(/法定代表人[：:]\\s*([\\u4e00-\\u9fa5]{2,4})/);
                             if (match2) result.legalPerson = match2[1];
                         }
@@ -686,22 +661,60 @@ class AiQiChaCrawlerV2:
                         var match = text.match(/地址[：:]\\s*([\\u4e00-\\u9fa5].+)/);
                         if (match) result.address = match[1].trim().substring(0, 100);
                     }
-                }
-                
-                // 从 .info-item 获取注册时间
-                var allItems = document.querySelectorAll('.info-item');
-                for (var i = 0; i < allItems.length; i++) {
-                    var text = allItems[i].textContent.trim();
+                    // 成立日期/注册时间
                     if (text.indexOf('注册时间') >= 0 || text.indexOf('成立日期') >= 0) {
                         var match = text.match(/(\\d{4}-\\d{2}-\\d{2})/);
                         if (match) result.establishDate = match[1];
                     }
+                    // 所属行业
+                    if (text.indexOf('所属行业') >= 0) {
+                        var match = text.match(/所属行业[：:]\\s*(.+)/);
+                        if (match) result.industry = match[1].trim().substring(0, 50);
+                    }
+                    // 企业类型
+                    if (text.indexOf('企业类型') >= 0 || text.indexOf('公司类型') >= 0) {
+                        var match = text.match(/(?:企业类型|公司类型)[：:]\\s*(.+)/);
+                        if (match) result.companyType = match[1].trim().substring(0, 50);
+                    }
+                    // 营业期限
+                    if (text.indexOf('营业期限') >= 0) {
+                        var match = text.match(/营业期限[：:]\\s*(.+)/);
+                        if (match) result.businessTerm = match[1].trim().substring(0, 50);
+                    }
+                    // 登记机关
+                    if (text.indexOf('登记机关') >= 0) {
+                        var match = text.match(/登记机关[：:]\\s*(.+)/);
+                        if (match) result.registrationAuthority = match[1].trim().substring(0, 50);
+                    }
+                    // 核准日期
+                    if (text.indexOf('核准日期') >= 0) {
+                        var match = text.match(/核准日期[：:]\\s*(\\d{4}-\\d{2}-\\d{2})/);
+                        if (match) result.approvalDate = match[1];
+                    }
+                    // 参保人数
+                    if (text.indexOf('参保人数') >= 0) {
+                        var match = text.match(/参保人数[：:]\\s*(\\d+)/);
+                        if (match) result.insuredCount = match[1];
+                    }
                 }
-                
+                    
+                // 提取简介（从 .company-intro 或 .intro 或 .desc 元素）
+                var introEl = document.querySelector('.company-intro, .intro, .desc, [class*="intro"]');
+                if (introEl) {
+                    result.introduction = introEl.textContent.trim().substring(0, 500);
+                }
+                    
+                // 提取经营范围（从包含"经营范围"的元素）
+                var allText = document.body.innerText;
+                var scopeMatch = allText.match(/经营范围[：:]([\\s\\S]{10,500}?)(?=\\n\\s*[\\u4e00-\\u9fa5]{2,4}[：:]|$)/);
+                if (scopeMatch) {
+                    result.businessScope = scopeMatch[1].trim().substring(0, 500);
+                }
+                    
                 return JSON.stringify(result);
             })()
         """)
-        
+            
         if info_json:
             try:
                 info = json.loads(info_json)
@@ -713,9 +726,17 @@ class AiQiChaCrawlerV2:
                 data["电话"] = info.get("phone", "")
                 data["邮箱"] = info.get("email", "")
                 data["官网"] = info.get("website", "")
+                data["简介"] = info.get("introduction", "")
+                data["经营范围"] = info.get("businessScope", "")
+                data["所属行业"] = info.get("industry", "")
+                data["企业类型"] = info.get("companyType", "")
+                data["营业期限"] = info.get("businessTerm", "")
+                data["登记机关"] = info.get("registrationAuthority", "")
+                data["核准日期"] = info.get("approvalDate", "")
+                data["参保人数"] = info.get("insuredCount", "")
             except json.JSONDecodeError:
                 pass
-        
+            
         return data
     
     # ─ 采集控制 ──
