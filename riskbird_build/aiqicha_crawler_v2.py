@@ -56,6 +56,9 @@ class AiQiChaCrawlerV2:
         self.results = []
         self._browser_lock = threading.Lock()
         
+        # 兼容性属性（GUI 期望这些属性存在）
+        self.driver = None  # CDP 模式不使用 Selenium WebDriver
+        
         if HAS_PYQT:
             self.signals = CrawlerSignals()
         else:
@@ -252,6 +255,34 @@ class AiQiChaCrawlerV2:
     def try_restore_session(self) -> bool:
         """恢复会话"""
         return self._is_session_alive()
+    
+    # ─ GUI 兼容性方法 ──
+    def login_with_credentials(self, phone: str, password: str) -> bool:
+        """使用账号密码登录（爱企查不支持，返回 False）"""
+        self._log("爱企查请使用手动登录方式")
+        return False
+    
+    def login_manual(self) -> bool:
+        """手动登录（提示用户在浏览器中完成）"""
+        ws_url = self._get_ws_url("aiqicha.baidu.com")
+        if not ws_url:
+            self._log("请先在 Chrome 中打开 aiqicha.baidu.com")
+            return False
+        
+        self._log("请在浏览器中完成登录...")
+        # 等待用户登录
+        for i in range(60):  # 最多等待 60 秒
+            time.sleep(1)
+            if self._check_login_status():
+                self._logged_in = True
+                self._log("登录成功！")
+                return True
+        self._log("登录超时")
+        return False
+    
+    def verify_manual_login(self) -> bool:
+        """验证手动登录状态"""
+        return self._check_login_status()
     
     # ── 登录 ──
     def _check_login_status(self) -> bool:

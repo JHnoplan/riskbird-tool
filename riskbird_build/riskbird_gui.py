@@ -21,7 +21,7 @@ from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 
 from riskbird_crawler_v2 import RiskBirdCrawlerV2, is_chrome_installed, download_and_install_chrome
 from qizhidao_crawler import QiZhiDaoCrawler
-from aiqicha_crawler import AiQiChaCrawler
+from aiqicha_crawler_v2 import AiQiChaCrawlerV2
 
 try:
     import openpyxl
@@ -211,7 +211,7 @@ class MainWindow(QMainWindow):
         # 初始化三个爬虫
         self.riskbird_crawler = RiskBirdCrawlerV2()
         self.qizhidao_crawler = QiZhiDaoCrawler()
-        self.aiqicha_crawler = AiQiChaCrawler()
+        self.aiqicha_crawler = AiQiChaCrawlerV2()
         self.crawler = self.qizhidao_crawler  # 默认使用企知道
         
         # 连接信号
@@ -604,7 +604,11 @@ class MainWindow(QMainWindow):
                     self.crawler.driver = None
                 self.crawler.start_browser(headed=True)
             
-            self.crawler.driver.get(self.crawler.BASE_URL)
+            # 导航到网站（CDP 爬虫不需要，用户已手动打开）
+            from aiqicha_crawler_v2 import AiQiChaCrawlerV2
+            if not isinstance(self.crawler, AiQiChaCrawlerV2):
+                self.crawler.driver.get(self.crawler.BASE_URL)
+            
             site_names = ["riskbird.com", "qizhidao.com", "aiqicha.baidu.com"]
             site_name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
             self._append_log(f"已打开 {site_name} 网站")
@@ -620,7 +624,10 @@ class MainWindow(QMainWindow):
                         pass
                     self.crawler.driver = None
                 self.crawler.start_browser(headed=True)
-                self.crawler.driver.get(self.crawler.BASE_URL)
+                # CDP 爬虫不需要导航
+                from aiqicha_crawler_v2 import AiQiChaCrawlerV2
+                if not isinstance(self.crawler, AiQiChaCrawlerV2):
+                    self.crawler.driver.get(self.crawler.BASE_URL)
                 self._append_log("重启成功，已打开网站")
             except Exception as e2:
                 self._append_log(f"重启也失败：{e2}")
