@@ -160,6 +160,28 @@ class QiZhiDaoCrawler:
         except (WebDriverException, Exception):
             return False
 
+    def try_restore_session(self) -> bool:
+        """从 Cookie 恢复登录"""
+        if not self._cookie_file.exists():
+            return False
+        try:
+            self.start_browser(headed=True)
+            self.driver.get(self.BASE_URL)
+            time.sleep(2)
+            self._load_cookies()
+            self.driver.refresh()
+            time.sleep(3)
+            if self._check_login_status():
+                self._logged_in = True
+                self._log("从 Cookie 恢复登录成功")
+                return True
+            else:
+                self._log("Cookie 已过期，需重新登录")
+                return False
+        except Exception as e:
+            self._log(f"Cookie 恢复失败: {e}")
+            return False
+
     def _restart_browser(self, headed: bool = True):
         """重启浏览器"""
         self._log("正在重启浏览器...")
