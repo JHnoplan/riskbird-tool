@@ -451,25 +451,35 @@ class AiQiChaCrawlerV2:
                 
                 self._log(f"标签页 WebSocket: {ws_url[:60]}...")
                 
-                # 2. 等待页面完全加载
-                time.sleep(8)
+                # 2. 等待页面完全加载（增加到 10 秒确保 Vue 组件渲染完成）
+                time.sleep(10)
                 
                 # 检查页面是否正常加载（关键！）
                 page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
                 
                 if page_body and '请关闭浏览器的调试窗口' in page_body:
-                    self._log("❌ 爱企查检测到调试窗口！")
-                    self._log("解决方案：")
-                    self._log("1. 按 F12 关闭开发者工具面板（如果打开了）")
-                    self._log("2. 刷新页面（F5）")
-                    self._log("3. 如果还是不行，关闭 Chrome 重新启动（不带 --auto-open-devtools-for-tabs）")
-                    result["状态"] = "被反爬虫检测"
-                    return result
+                    self._log("⚠️ 爱企查检测到调试模式")
+                    self._log("正在尝试刷新页面...")
+                    self._execute_js(ws_url, "(function() { location.reload(); })()")
+                    time.sleep(10)
+                    page_body = self._execute_js(ws_url, "(function() { return document.body ? document.body.innerText : ''; })()")
+                    
+                    if page_body and '请关闭浏览器的调试窗口' in page_body:
+                        self._log(" 刷新后仍被检测，请手动在 Chrome 中访问 aiqicha.baidu.com")
+                        result["状态"] = "被反爬虫检测"
+                        return result
                 
-                if not page_body or len(page_body) < 100:
-                    self._log("⚠️ 页面内容异常，可能未完全加载")
-                    result["状态"] = "页面加载失败"
-                    return result
+                # 检查搜索框是否存在
+                search_box_check = self._execute_js(ws_url, """
+                    (function() {
+                        var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                        return input ? 'found' : 'not_found';
+                    })()
+                """)
+                
+                if search_box_check != 'found':
+                    self._log("⚠️ 未找到搜索框，页面可能未完全加载")
+                    time.sleep(5)  # 额外等待
                 
                 # 3. 点击搜索框聚焦并清空
                 self._execute_js(ws_url, """
@@ -569,8 +579,25 @@ class AiQiChaCrawlerV2:
                     self._log("无法创建详情页标签")
                     continue
                 
-                # 7. 等待详情页加载
-                time.sleep(8)
+                # 7. 等待详情页加载（增加等待时间确保数据渲染完成）
+                time.sleep(10)
+                
+                # 检查页面是否被反爬虫检测
+                page_check = self._execute_js(ws_url, """
+                    (function() {
+                        var body = document.body ? document.body.innerText : '';
+                        if (body.indexOf('请关闭浏览器的调试窗口') >= 0) return 'blocked';
+                        if (body.indexOf('公司详情') >= 0 || body.indexOf('法定代表人') >= 0) return 'ok';
+                        return 'unknown';
+                    })()
+                """)
+                
+                if page_check == 'blocked':
+                    self._log("⚠️ 爱企查检测到调试模式，尝试刷新页面...")
+                    self._execute_js(ws_url, "(function() { location.reload(); })()")
+                    time.sleep(8)
+                elif page_check == 'unknown':
+                    self._log("⚠️ 页面内容异常，可能未完全加载")
                 
                 # 8. 采集详情页数据
                 detail_data = self._extract_detail_data(ws_url, name)
@@ -615,10 +642,17 @@ class AiQiChaCrawlerV2:
                         var match = text.match(/统一社会信用代码[：:]\\s*(\\S+)/);
                         if (match) result.creditCode = match[1];
                     }
-                    // 电话
-                    if (text.indexOf('电话') >= 0 && text.indexOf('手机') >= 0) {
-                        var match = text.match(/手机[号]?[：:]?\\s*(\\d+)/);
-                        if (match) result.phone = match[1];
+                    // 电话（匹配 "电话：xxx" 或 "手机：xxx"）
+                    if (text.indexOf('电话') >= 0 || text.indexOf('手机') >= 0) {
+                        // 尝试多种格式
+                        var match = text.match(/(?:电话|手机|联系方式)[：:]\s*(\d[\d\-,\s]+)/);
+                        if (match) {
+                            result.phone = match[1].trim();
+                        } else {
+                            // 直接匹配数字
+                            var match2 = text.match(/(\d{3,4}[-]?\d{7,8}|\d{11})/);
+                            if (match2) result.phone = match2[1];
+                        }
                     }
                     // 法定代表人
                     if (text.indexOf('法定代表人') >= 0) {

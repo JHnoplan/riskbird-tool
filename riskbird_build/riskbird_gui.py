@@ -740,7 +740,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "没有数据可导出")
             return
 
-        default_name = f"美亚风鸟_企业数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        # 根据数据源动态命名文件
+        source_names = ["风鸟", "企知道", "爱企查"]
+        source_name = source_names[self._current_source] if self._current_source < len(source_names) else "企业数据"
+        default_name = f"{source_name}_企业数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
             self, "导出 Excel", default_name,
             "Excel 文件 (*.xlsx)"
