@@ -458,15 +458,18 @@ class AiQiChaCrawlerV2:
                     result["状态"] = "浏览器错误"
                     return result
                 
-                # 2. 等待页面加载（智能等待：检查搜索框是否存在）
-                for i in range(5):  # 最多等 5 秒
-                    search_check = self._execute_js(ws_url, """
+                # 2. 等待页面加载（智能等待：检查搜索框和 Vue 组件是否就绪）
+                for i in range(8):  # 最多等 8 秒
+                    page_ready = self._execute_js(ws_url, """
                         (function() {
                             var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
-                            return input ? 'ready' : 'loading';
+                            if (!input) return 'loading';
+                            // 检查 Vue 是否已挂载（检查是否有 iView 组件）
+                            var vueApp = document.querySelector('#app') || document.querySelector('[data-v-]');
+                            return (input && vueApp) ? 'ready' : 'loading';
                         })()
                     """)
-                    if search_check == 'ready':
+                    if page_ready == 'ready':
                         break
                     time.sleep(1)
                 
@@ -545,7 +548,7 @@ class AiQiChaCrawlerV2:
                 # 9. 导航回首页（关键！让下一个公司能复用这个标签页）
                 self._log("返回首页...")
                 self._navigate_to_homepage(ws_url)
-                time.sleep(2)  # 减少等待时间
+                time.sleep(5)  # 增加等待时间，确保页面完全重新加载
                 
                 self._log(f"采集完成：{name}")
                 return result
