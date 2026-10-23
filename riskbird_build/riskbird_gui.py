@@ -25,6 +25,12 @@ from qizhidao_crawler import QiZhiDaoCrawler
 from aiqicha_crawler_v2 import AiQiChaCrawlerV2
 
 try:
+    import customer_library_cleaner as _cleaner
+    HAS_CLEANER = True
+except ImportError:
+    HAS_CLEANER = False
+
+try:
     import openpyxl
     HAS_OPENPYXL = True
 except ImportError:
@@ -1138,7 +1144,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._append_log(f"️ 自动保存失败：{e}")
 
-    # ── 导出（合并风鸟/企知道/爱企查全部数据） ──
+    # ── 导出（合并风鸟/企知道/爱企查全部数据 + 生成清洗后入库数据） ──
     def _export_excel(self):
         combined = self._all_results()
         if not combined:
@@ -1155,13 +1161,46 @@ class MainWindow(QMainWindow):
         try:
             self._write_merged_excel(combined, path)
             counts = [len(c.results) for c in self._all_crawlers]
-            QMessageBox.information(
-                self, "导出成功",
+            cleaned_path = self._export_cleaned_library(combined, path)
+            msg = (
                 f"已合并导出 {len(combined)} 条数据到:\n{path}\n\n"
                 f"风鸟 {counts[0]} 条 / 企知道 {counts[1]} 条 / 爱企查 {counts[2]} 条"
             )
+            if cleaned_path:
+                msg += f"\n\n已另存清洗后入库数据到:\n{cleaned_path}"
+            QMessageBox.information(self, "导出成功", msg)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
+
+    def _export_cleaned_library(self, combined: list, merged_path: str) -> str:
+        """按《客户库数据导入模板》生成清洗后入库数据，写到合并文件同目录。"""
+        if not HAS_CLEANER:
+            self._append_log("⚠ 清洗模块未加载，跳过入库数据生成")
+            return ""
+        cleaner = _cleaner
+        try:
+            self._append_log("🧹 开始生成清洗后客户库入库数据…")
+            rows = cleaner.build_clean_rows(combined, log=self._append_log)
+            if not rows:
+                self._append_log("⚠ 清洗后无有效入库记录（均为未找到/失败/空），已跳过")
+                return ""
+            template = cleaner.locate_template(
+                start_dirs=[os.path.dirname(merged_path), self._get_last_import_dir()]
+            )
+            merged_dir = os.path.dirname(merged_path) or "."
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cleaned_path = os.path.join(merged_dir, f"清洗后客户库入库数据_{stamp}.xlsx")
+            cleaner.write_clean_excel(rows, cleaned_path, template_path=template,
+                                       log=self._append_log)
+            return cleaned_path
+        except Exception as e:
+            self._append_log(f"⚠ 生成清洗后入库数据失败：{e}")
+            return ""
+
+    def _get_last_import_dir(self) -> str:
+        """返回最近一次选择文件所在目录，用于就近查找入库模板。"""
+        files = getattr(self, "_excel_paths", None) or []
+        return os.path.dirname(files[-1]) if files else ""
 
     def _write_merged_excel(self, results: list, filepath: str):
         """把多平台结果合并写入一个 Excel（统一表头 + 样式，含"数据来源"列区分平台）"""

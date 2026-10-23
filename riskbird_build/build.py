@@ -141,6 +141,7 @@ def build_exe():
         "--hidden-import", "selenium.webdriver.support.expected_conditions",
         "--hidden-import", "selenium.common",
         "--hidden-import", "selenium.common.exceptions",
+        "--hidden-import", "customer_library_cleaner",
         "--collect-all", "selenium",
         "--collect-all", "PyQt5",
         "riskbird_gui.py"
