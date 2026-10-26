@@ -14,6 +14,7 @@ import requests
 import shutil
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import block_guard
 
@@ -44,6 +45,13 @@ if HAS_PYQT:
 else:
     class CrawlerSignals:
         pass
+
+
+# 搜索结果页“渲染完了但确实一家都没有”的正文长度下限：
+# 结果页空壳时正文只有几百字，拿它当“查无此公司”会把限流误判成未找到、白烧名单
+SEARCH_PAGE_READY_LEN = 1200
+# 要连续这么多次“正文已渲染但结果区空”才敢定“查无此公司”（每轮约 0.7 秒）
+SEARCH_PAGE_NONE_POLLS = 4
 
 
 class AiQiChaCrawlerV2:
@@ -132,17 +140,6 @@ class AiQiChaCrawlerV2:
             return block_guard.detect_cdp(lambda e: self._execute_js(ws, e))
         except Exception:
             return ""
-
-    def _wait_unblock(self, reason: str, max_wait: int = 1800) -> bool:
-        """被拦截时原地等人工验证，不推进名单、不写入空记录"""
-        ok = block_guard.wait_unblock(
-            reason, self._log, self._emit_blocked,
-            lambda: self._stop_requested, self._detect_block,
-            max_wait=max_wait,
-        )
-        if ok:
-            self._emit_cleared(reason)
-        return ok
 
     def _emit_cleared(self, reason: str):
         if self.signals:
@@ -650,6 +647,316 @@ class AiQiChaCrawlerV2:
         self._navigate(ws_url, self.BASE_URL)
         time.sleep(5)
     
+    def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = 5,
+                      ready=None, heal=None, heal_every: int = 30) -> bool:
+        """被拦截/被限流时原地等恢复，不推进名单、不写入空记录
+
+        ready 传能力探针时，“验证页没了”不再算恢复，必须实测能拿到数据才放行；
+        heal 默认给上 _heal_block，验证页挂在另一个标签时不至于死等到超时。
+        """
+        ok = block_guard.wait_unblock(
+            reason, self._log, self._emit_blocked,
+            lambda: self._stop_requested, self._detect_block,
+            max_wait=max_wait, interval=interval,
+            ready=ready, heal=heal or self._heal_block, heal_every=heal_every,
+        )
+        if ok:
+            self._emit_cleared(reason)
+        return ok
+
+    def _heal_block(self) -> bool:
+        """卡在验证页时的自愈，返回是否做了动作（调用方会再判一次拦截）。
+
+        过验证码最常见的两种“假死”：
+        ① 平台另开了一个标签做验证，用户在那个标签里验过了，但本会话的标签
+          还停在 wappass 验证页上——只看本标签就会一直判拦截，直到 30 分钟超时；
+        ② 本标签已经飘到验证页/空白页，而验证已写进全局 Cookie，导回首页就能直接用。
+        """
+        ws = self._get_ws_url()
+        if not ws:
+            return False
+        # ① 双标签并行时，共享浏览器里若有另一个没被拦的爱企查标签，把会话切过去
+        if self.pin_tab_id:
+            for t in (self._get_tabs() or []):
+                if t.get("type") != "page" or t.get("id") == self.pin_tab_id:
+                    continue
+                u = str(t.get("url") or "")
+                tws = t.get("webSocketDebuggerUrl")
+                if "aiqicha.baidu.com" not in u or "/login" in u or not tws:
+                    continue
+                if self._detect_block(tws):
+                    continue
+                self.pin_tab_id = t.get("id")
+                self._log(f"  改用已恢复的爱企查标签 {str(self.pin_tab_id)[:8]}")
+                return True
+        # ② 本标签不在爱企查域名上（停在验证页/空白页）：导回首页
+        try:
+            cur = str(self._execute_js(ws, "(function(){return location.href;})()") or "")
+        except Exception:
+            cur = ""
+        if "aiqicha.baidu.com" not in cur:
+            self._navigate_to_homepage(ws)
+            time.sleep(4)
+            return True
+        return False
+
+    # ── 搜索结果页（联想挂了时的兜底路线，与手工搜公司名同一条路） ──
+    @staticmethod
+    def _norm_name(text: str) -> str:
+        """比公司名用：去空白与括号装饰、转小写"""
+        s = re.sub(r"[\s\u3000（）()【】\[】\]《》·、,，.。_-]", "", str(text or ""))
+        return s.lower()
+
+    def _current_url(self, ws_url) -> str:
+        try:
+            return str(self._execute_js(ws_url, "(function(){return location.href;})()") or "")
+        except Exception:
+            return ""
+
+    def _wait_detail_url(self, ws_url, seconds: float = 10.0, expect: str = "company_detail") -> str:
+        """等本标签跳到详情页，返回详情页 URL（超时尚未跳转返回空串）"""
+        for _ in range(int(seconds * 2)):
+            time.sleep(0.5)
+            cur = self._current_url(ws_url)
+            if expect in cur:
+                return cur
+            if not cur:
+                break
+        return ""
+
+    def _goto_search_page(self, ws_url, name: str, reload: bool = False) -> bool:
+        """把本标签导航到这家公司的搜索结果页，并等到地址栏真的落在 /s? 上
+
+        reload=True 时无论是否已在本页都重新加载（用来做“第二次独立查询”的确认）。
+        不等导航落地就读页面会读到上一个页面（首页/详情页），把状态判错。
+        """
+        url = self.SEARCH_URL.format(quote(name))
+        cur = self._current_url(ws_url)
+        if not reload and "/s?" in cur and self._norm_name(name) in self._norm_name(unquote(cur)):
+            return True
+        self._execute_js(ws_url, "(function(){window.location.href=%s;})()" % json.dumps(url))
+        for _ in range(20):        # 最多等 10 秒：被弹去登录页也算落地
+            time.sleep(0.5)
+            cur = self._current_url(ws_url)
+            if "/s?" in cur or "/login" in cur:
+                return True
+        return False
+
+    def _read_search_page(self, ws_url, name: str, wait: float = 10.0,
+                         reload: bool = False) -> dict:
+        """读当前标签的搜索结果页，判断这次查询到底给了什么。
+
+        返回 {"state": ..., "pid": "", "text": ""}
+          found   结果区里有公司（pid 已按公司名匹配挑好）
+          none    页面明确“无搜索结果”且结果区确实没有这家——这才是真查无此公司
+          pending 还在渲染/正文太短/页面结构不认，不能下结论（既不写未找到也不当成限流）
+          login   被弹到登录页（登录态失效）
+        没单独返 blocked：调用方自己用 _detect_block 看验证页，避免两套判据打架。
+
+        结果区的取法刻意做得宽：href 里的 company_detail 优先，没命中再扫全页带公司名的
+        文字链（从 href/属性里抽 pid，抽不到就记 href），避免爱企查改版或后台标签被节流时，
+        只靠一个选择器把“没认出来”误判成“查无此公司”——那样整份名单会被烧成未找到。
+        """
+        self._goto_search_page(ws_url, name, reload=reload)
+        want = json.dumps([str(name)[:8], self._norm_name(name)[:8]], ensure_ascii=False)
+        probe = """
+            (function() {
+                var b = document.body ? (document.body.innerText || '') : '';
+                var out = {u: location.href, len: b.length, c: [], t: 0, none: 0};
+                var want = %s;
+                var as = document.querySelectorAll('a[href*="company_detail"]');
+                for (var i = 0; i < as.length && i < 12; i++) {
+                    var h = as[i].getAttribute('href') || '';
+                    var m = h.match(/company_detail_(\\d+)/);
+                    if (m) out.c.push([m[1], (as[i].innerText || '').replace(/\\s+/g, ' ').slice(0, 60)]);
+                }
+                if (!out.c.length) {
+                    var all = document.querySelectorAll('a');
+                    out.t = all.length;
+                    var re1 = /company_detail_(\\d+)/;
+                    var re3 = /^https?:\\/\\//;
+                    for (var j = 0; j < all.length && out.c.length < 12; j++) {
+                        var a = all[j];
+                        var tx = (a.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (!tx || tx.length < 4 || !/(公司|集团|企业|厂|院|所|社)/.test(tx)) continue;
+                        var ok = false;
+                        for (var k = 0; k < want.length; k++) {
+                            if (want[k] && tx.indexOf(want[k]) >= 0) { ok = true; break; }
+                        }
+                        if (!ok) continue;
+                        var pid = '';
+                        var href = a.getAttribute('href') || '';
+                        var abs = a.href || '';
+                        var mm = abs.match(re1) || href.match(re1);
+                        if (mm) pid = mm[1];
+                        else {
+                            var attrs = ['data-pid','data-id','data-comid','baseurl','data-href'];
+                            for (var q = 0; q < attrs.length; q++) {
+                                var mv = (a.getAttribute(attrs[q]) || '').match(re1);
+                                if (mv) { pid = mv[1]; break; }
+                            }
+                        }
+                        // 抽不到 id 就把整条链接当地址用（绝对地址去掉域名前缀，统一走 "@" 分支）；
+                        // 什么链接都没有的条目不能当结果——它会导到一个拼出来的假地址
+                        if (!pid) {
+                            if (!href || href.indexOf('javascript') === 0 || href === '#') continue;
+                            pid = '@' + (re3.test(abs) ? abs.slice(abs.indexOf('/', 8)) : href);
+                        }
+                        out.c.push([pid, tx.slice(0, 60)]);
+                    }
+                }
+                if (/没有找到相关|无搜索结果|未找到相关|暂无匹配|相关的公司信息/.test(b)) out.none = 1;
+                return JSON.stringify(out);
+            })()
+        """ % want
+        polls = max(4, int(wait / 0.7) + 1)      # 按轮数而不是挂钟，避开后台标签被节流时的慢渲染
+        empty_polls = 0
+        last = {"state": "pending", "pid": "", "text": ""}
+        for _ in range(polls):
+            raw = self._execute_js(ws_url, probe)
+            try:
+                info = json.loads(raw) or {}
+            except Exception:
+                info = {}
+            url = str(info.get("u") or "")
+            cands = [(str(p), str(x)) for p, x in (info.get("c") or [])]
+            if "/login" in url:
+                return {"state": "login", "pid": "", "text": ""}
+            if cands:
+                pid, text, exact = self._pick_pid(name, cands)
+                if not exact:
+                    self._log(f"  ⚠ 结果页没找到名字完全对得上的公司，用第一条：{text[:30]}")
+                return {"state": "found", "pid": pid, "text": text}
+            # 结果区一个都没抽到：只有页面自己说了“无搜索结果”且正文已渲染完整才算查无
+            rendered = "/s?" in url and int(info.get("len") or 0) >= SEARCH_PAGE_READY_LEN
+            if rendered and info.get("none"):
+                empty_polls += 1
+                last = {"state": "none", "pid": "", "text": ""}
+                if empty_polls >= SEARCH_PAGE_NONE_POLLS:
+                    return last
+            elif rendered and int(info.get("t") or 0) >= 20:
+                # 页面上有二十多个链接却一个公司结果都抽不到：是我们不认这个页面，
+                # 不是平台查无——绝不能拿它写未找到
+                self._log("  ⚠ 搜索结果页认不出结果条目（可能改版），先按限流退避而不是写未找到")
+                last = {"state": "pending", "pid": "", "text": ""}
+            else:
+                empty_polls = 0
+            time.sleep(0.7)
+        return last
+
+    def _pick_pid(self, name: str, cands: list):
+        """从结果条目里挑一家：公司名互包含的优先，否则退而取第一条
+
+        反向包含（条目名是公司名的前缀）只在条目名够长时才信，免得“某某公司”这种
+        短名字匹配到另一家不相干的公司。
+        """
+        want = self._norm_name(name)
+        for pid, text in cands:
+            got = self._norm_name(text)
+            if want and got and (want in got or (len(got) >= 8 and got in want)):
+                return pid, text, True
+        pid, text = cands[0]
+        return pid, text, False
+
+    def _goto_detail(self, ws_url, pid: str) -> str:
+        """直接把本标签导到详情页（点联想之外第二条路），等到数据块出现再返回 URL
+
+        pid 以 "@" 开头时是结果条目自己的链接（抽不到 company_detail_<id> 时的退路），
+        相对地址补成绝对地址；导航失败（href 不可用）就返回空串交上层换路。
+        """
+        pid = str(pid or "")
+        expect = "company_detail"
+        if pid.startswith("@"):
+            url = pid[1:]
+            if url.startswith("/"):
+                url = self.BASE_URL + url
+            if "aiqicha.baidu.com" not in url:
+                return ""
+            expect = url.rstrip("/").rsplit("/", 1)[-1][:16] or "company"
+        else:
+            url = self.DETAIL_URL.format(pid)
+        try:
+            self._execute_js(ws_url, "(function(){window.location.href=%s;})()" % json.dumps(url))
+        except Exception:
+            return ""
+        got = self._wait_detail_url(ws_url, 12.0, expect)
+        if not got:
+            return ""
+        for _ in range(12):        # 详情数据比 URL 渲染得晚，直接取会拿到空字段
+            time.sleep(0.5)
+            try:
+                if self._execute_js(ws_url,
+                                    "(function(){return document.querySelectorAll('.info-item').length>0;})()"):
+                    break
+            except Exception:
+                break
+        return got
+
+    def _detail_via_search(self, ws_url, name: str):
+        """走搜索结果页把本标签带到详情页（验证码过后联想常被抑制但搜索仍可用）
+
+        返回 ("detail"/"empty"/"stop", 当前应用的爱企查标签 ws)。等待恢复期间
+        _heal_block 可能把会话换到另一个标签，所以句柄必须回传给调用方，否则会
+        拿着已作废的标签继续读一个死页面。
+        含义："detail" 已在详情页 / "empty" 确认查无此公司 / "stop" 仍在限流，
+        这一家不能写入结果，否则整份名单会被烧成一片“未找到”。
+        """
+        for _ in range(2):
+            ws_url = self._get_ws_url() or ws_url
+            st = self._read_search_page(ws_url, name)
+            if st["state"] == "found":
+                if self._goto_detail(ws_url, st["pid"]):
+                    return "detail", ws_url
+                self._log("  详情页没打开，再试一次搜索结果页")
+                continue
+            if st["state"] == "login":
+                self._log("  ⚠ 页面被弹到爱企查登录页：登录态已失效")
+                if not self._ask_login("爱企查登录态已失效（页面被跳转到登录页）"):
+                    return "stop", ws_url
+                continue
+            if st["state"] == "none":
+                # 一次空结果不能直接定“未找到”：先确认再来一次独立查询还是空
+                if self._read_search_page(ws_url, name, 6.0, reload=True)["state"] == "none":
+                    return "empty", ws_url
+                continue
+            reason = self._detect_block(ws_url) or \
+                "⏳ 平台限流中：搜索联想与搜索结果页都没给出公司"
+            hit = {}
+
+            def ready():
+                s = self._read_search_page(ws_url, name, 8.0)
+                if s["state"] == "found":
+                    hit["pid"] = s["pid"]
+                    return True
+                return s["state"] in ("none", "login")
+
+            if not self._wait_unblock(reason, max_wait=900, interval=15, ready=ready):
+                return "stop", self._get_ws_url() or ws_url
+            if hit.get("pid"):
+                ws_url = self._get_ws_url() or ws_url
+                if self._goto_detail(ws_url, hit["pid"]):
+                    return "detail", ws_url
+                continue
+            # ready 认为“能判定了”（none/login）：回到循环开头重新读一次，
+            # 连续两轮都空才会写未找到
+        return "stop", ws_url
+
+    def _reach_detail(self, ws_url, name: str, suggest_ready: bool):
+        """把本标签带到这家公司详情页。返回 (是否到位, 详情页 URL, 结束状态, 当前标签 ws)"""
+        if suggest_ready and self._click_first_autocomplete(ws_url):
+            url = self._wait_detail_url(ws_url, 5.0)
+            if url:
+                return True, url, "", ws_url
+            self._log("  点了联想但没跳详情，改用搜索结果页")
+        outcome, ws_url = self._detail_via_search(ws_url, name)
+        if outcome == "detail":
+            return True, self._current_url(ws_url), "", ws_url
+        if outcome == "empty":
+            return False, "", "未找到", ws_url
+        if outcome == "stop":
+            return False, "", "拦截未解除", ws_url
+        return False, "", "跳转失败", ws_url
+
     # ── 搜索公司 ──
     def search_company(self, name: str) -> dict:
         """搜索公司并采集数据（全程只用 1 个标签页）"""
@@ -727,50 +1034,24 @@ class AiQiChaCrawlerV2:
                             break
 
                 if not autocomplete_found:
-                    # 先分清是“真没这家公司”还是“联想被风控抑制”，
-                    # 被抑制时绝不能把这一家记成未找到并往下烧名单（否则整份名单会瞬间变成空数据）
-                    block = self._detect_block(ws_url)
-                    suppressed = bool(block) or self._suggest_suppressed(ws_url, name)
-                    if not suppressed:
-                        self._log(f"未找到自动补全：{name}")
-                        result["状态"] = "未找到"
-                        return result
-                    if not block:
-                        block = "搜索联想被平台抑制（多为请求过快触发风控）"
-                    self._log(f"⚠ {block}：{name}")
-                    if not self._wait_unblock(block):
-                        result["状态"] = "拦截未解除"
-                        return result
-                    # 恢复后重新归位首页并重试这一家
-                    self._navigate_to_homepage(ws_url)
-                    time.sleep(4)
-                    self._wait_page_hydrated(ws_url, 15)
-                    self._clear_and_input_search(ws_url, name)
-                    autocomplete_found = self._wait_autocomplete(ws_url, 5.0)
-                    if not autocomplete_found:
-                        result["状态"] = "未找到"
-                        return result
-                
-                # 5. 点击自动补全第一项（会直接跳转到详情页）
-                self._click_first_autocomplete(ws_url)
-                
-                # 6. 等待跳转到详情页（智能等待：检查 URL 变化）
+                    # 联想没出来不能直接定“未找到”：验证码刚过时页面正常、输入框里还是我们注的
+                    # 公司名但联想恒为空是常态（此时手工搜公司名仍能进详情），所以走搜索结果页兜底
+                    why = "联想被平台抑制" if self._suggest_suppressed(ws_url, name) else "联想未出（可能是查无此公司）"
+                    self._log(f"  {why}：{name}，改走搜索结果页")
+
+                # 5-6. 进详情页：优先点联想，进不去就走搜索结果页（两条路都不给结果时绝不写未找到）
                 self._log("等待跳转到详情页...")
-                detail_loaded = False
-                for i in range(10):  # 10 * 0.5 = 5 秒
-                    time.sleep(0.5)
-                    current_url = self._execute_js(ws_url, "(function() { return window.location.href; })()")
-                    if current_url and 'company_detail' in current_url:
-                        detail_loaded = True
-                        company_id_match = re.search(r'company_detail_(\d+)', current_url)
-                        if company_id_match:
-                            result["搜索结果 URL"] = f"company_detail_{company_id_match.group(1)}"
-                        break
-                
-                if not detail_loaded:
-                    self._log(f"未跳转到详情页")
-                    result["状态"] = "跳转失败"
+                reached, detail_url, status, ws_url = self._reach_detail(ws_url, name, autocomplete_found)
+                if not reached:
+                    if status == "未找到":
+                        self._log(f"搜索结果页确认查无此公司：{name}")
+                    elif status == "跳转失败":
+                        self._log("未跳转到详情页")
+                    result["状态"] = status
                     return result
+                company_id_match = re.search(r'company_detail_(\d+)', detail_url or "")
+                if company_id_match:
+                    result["搜索结果 URL"] = f"company_detail_{company_id_match.group(1)}"
                 
                 self._log(f"已跳转到详情页")
                 

@@ -85,13 +85,20 @@ def detect_cdp(execute_js):
 
 
 def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
-                 max_wait: int = 1800, interval: int = 5, first_wait: int = 25) -> bool:
-    """被拦截时原地等人工处理。返回 True 表示已恢复可继续，False 表示该结束本轮。
+                 max_wait: int = 1800, interval: int = 5, first_wait: int = 25,
+                 ready=None, heal=None, heal_every: int = 30) -> bool:
+    """被拦截（或平台在限流）时原地等恢复。返回 True 表示确实可以继续采，False 表示该结束本轮。
 
     log:            写日志的回调（str）
     emit_blocked:   通知界面的回调（str），由界面提示"请在浏览器完成验证"
     is_stopped:     返回 bool 的回调，用户点了停止要能立刻退出
-    probe:          返回拦截原因字符串的回调，返回空串即代表已恢复
+    probe:          返回拦截原因字符串的回调，返回空串即代表验证页已消失
+    ready:          能力探针（返回 bool）。给了就必须真正拿得动数据才算恢复：
+                    平台限流常常不弹验证页，只看页面签名会「1 秒即判定已解除」，
+                    于是同一家在死页面上反复空转，日志一直报「限制」却始终不前进。
+    heal:           返回 bool 的自愈回调（如把会话切到已经验证通过的标签页 /
+                    重刷当前标签）。验证页挂在别的标签时，本会话标签会一直被判
+                    拦截而死等到超时，所以每隔 heal_every 秒主动试一次。
     """
     if emit_blocked:
         try:
@@ -99,8 +106,13 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
         except Exception:
             pass
     log(f"🛑 {reason}")
-    log("   已暂停推进名单（不会把空记录写进结果）。请在浏览器窗口里完成验证，验证通过后自动继续采集。")
+    if ready is None:
+        log("   已暂停推进名单（不会把空记录写进结果）。请在浏览器窗口里完成验证，验证通过后自动继续采集。")
+    else:
+        log("   已暂停推进名单（不会把空记录写进结果）。工具会一边退避一边实测能不能拿数据，"
+            "确认恢复后自动继续；浏览器里如果有验证页请顺手完成。")
     waited = 0
+    said_throttle = False
     while waited < max_wait:
         step = interval if waited >= first_wait else 1
         for _ in range(step):
@@ -112,13 +124,35 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
         if is_stopped():
             log("⏹ 用户在等待验证期间停止采集")
             return False
-        if not probe():
-            log(f"✅ 拦截已解除（等待约 {waited} 秒），继续采集")
-            return True
+        still = probe()
+        if still and heal and waited >= heal_every:
+            try:
+                fixed = bool(heal())
+            except Exception:
+                fixed = False
+            if fixed:
+                log("   已尝试自愈（回到可用页面/换回正常标签），重新检查拦截状态…")
+                still = probe()
+        if not still:
+            if ready is None:
+                log(f"✅ 拦截已解除（等待约 {waited} 秒），继续采集")
+                return True
+            try:
+                works = bool(ready())
+            except Exception:
+                works = False
+            if works:
+                log(f"✅ 平台已恢复，能正常拿到数据（等待约 {waited} 秒），继续采集")
+                return True
+            if not said_throttle:
+                log("   验证页已经没了，但平台仍然不给数据（这是限流不是验证），继续退避等待…")
+                said_throttle = True
+        else:
+            said_throttle = False
         if waited == first_wait:
             log("   ⚠ 验证页反复出现通常是请求过快：可先停止，调大“采集间隔”后再续采")
         if waited % 60 < interval:
-            log(f"   仍在等待人工验证…已等 {waited} 秒")
+            log(f"   仍在等待恢复…已等 {waited} 秒")
     log(f"⚠ 等待 {max_wait // 60} 分钟仍未解除拦截，本轮到此结束（已采集的数据不受影响）")
     return False
 

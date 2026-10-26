@@ -2269,11 +2269,14 @@ class MainWindow(QMainWindow):
 
     # ── 平台拦截（安全验证/风控）提示 ──────────────
     def _on_blocked(self, platform: str, reason: str):
-        """采集线程发现页面被安全验证/风控拦截：醒目提示去浏览器完成验证
+        """采集线程发现页面被安全验证拦下或正在被限流：醒目提示用户
 
-        采集线程自己会在 block_guard 里原地等人工处理，这里只负责把“要你动手”
+        采集线程自己会在 block_guard 里原地等恢复，这里只负责把“要不要你动手”
         这件事说到脸上：以前只会在一堆日志里夹一行，用户看到的只是“卡死了”。
+        reason 以 ⏳ 开头表示没有验证页、只是平台限流：此时叫用户去验证是误导，
+        工具已在退避实测，不需要人动手。
         """
+        throttle = str(reason or "").startswith("⏳")
         found = False
         for item in self._blocked_info:
             if item[0] == platform:
@@ -2284,11 +2287,15 @@ class MainWindow(QMainWindow):
             self._blocked_info.append([platform, reason or "页面被平台拦截"])
         self._refresh_blocked_banner()
         self._append_log(f"🛑【{platform}】{reason}")
-        self._append_log("   名单已暂停推进（不会写入空记录）。请在浏览器窗口完成验证，通过后自动继续。")
+        if throttle:
+            self._append_log("   名单已暂停推进（不会写入空记录）。平台在限流，工具正在退避重试，"
+                             "实测能拿到数据会自动继续；若浏览器里有验证页请顺手完成。")
+        else:
+            self._append_log("   名单已暂停推进（不会写入空记录）。请在浏览器窗口完成验证，通过后自动继续。")
         # 采集正在跑且用户没主动暂停时，才由拦截接管计时（否则验证等待会把平均耗时算虚高）
         if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
             self._pause_timer()
-        self._show_blocked_dialog()
+        self._show_blocked_dialog(throttle)
 
     def _on_block_cleared(self, platform: str):
         """人工完成验证/登录，采集已自动继续"""
@@ -2368,8 +2375,13 @@ class MainWindow(QMainWindow):
         parts = []
         if self._blocked_info:
             names = "、".join(it[0] for it in self._blocked_info)
-            parts.append(f"{names} 被平台拦截：{self._blocked_info[-1][1]}"
-                         f"（请在浏览器窗口完成验证，没有验证页时稍候会自动恢复）")
+            reason = str(self._blocked_info[-1][1] or "")
+            if reason.startswith("⏳"):
+                # 限流：页面上没有验证件，叫用户“完成验证”会让人对着正常页面找滑块
+                tail = "（平台限流中，工具已退避实测，能拿到数据会自动继续）"
+            else:
+                tail = "（请在浏览器窗口完成验证，没有验证页时稍候会自动恢复）"
+            parts.append(f"{names} 被平台拦截：{reason}{tail}")
         if self._login_info:
             lnames = "、".join(it[0] for it in self._login_info)
             parts.append(f"{lnames} 未登录：{self._login_info[-1][1]}"
@@ -2387,20 +2399,39 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "双标签采集中..." if self._dual_running else "采集中...")
 
-    def _show_blocked_dialog(self):
+    @staticmethod
+    def _blocked_dialog_message(throttle: bool):
+        """拦截提示框的标题与正文（纯函数，便于离线核对两套口径）
+
+        throttle=True 时页面上根本没有验证件，只是平台临时限流：叫用户去验证会
+        让人对着一个正常页面找不存在的滑块，所以文案必须分开。
+        """
+        if throttle:
+            return "平台正在限流", (
+                "平台暂时不给数据（页面上并没有要你填的验证码）。\n\n"
+                "工具已在退避重试，并会实测“能不能真拿到数据”才继续，通常几分钟内自行恢复。\n"
+                "这时不需要关工具、也不需要重开浏览器；如果浏览器里确实有验证页，去点几下完成即可。\n\n"
+                "名单已暂停推进，不会把空记录写进结果；建议适当调大“采集间隔”再续采。"
+            )
+        return "需要人工验证", (
+            "采集页面被平台安全验证拦住了。\n\n"
+            "请切到浏览器窗口，手动完成验证（滑块/图形验证码）。\n"
+            "验证通过后采集会自动继续，不需要在本窗口点任何按钮。\n"
+            "如果验证已经做完了但采集仍未前进，工具会自动重试（它现在会实测能不能拿到数据，"
+            "而不是只看验证页还在不在）。\n\n"
+            "名单已暂停推进，不会把空记录写进结果。"
+        )
+
+    def _show_blocked_dialog(self, throttle: bool = False):
         """用非模态提示框：模态框会冻结本窗口，而用户此刻需要去的是浏览器窗口"""
         if self._blocked_box is not None:
             self._blocked_box.raise_()
             return
+        title, body = self._blocked_dialog_message(throttle)
         box = QMessageBox(self)
-        box.setWindowTitle("需要人工验证")
         box.setIcon(QMessageBox.Warning)
-        box.setText(
-            "采集页面被平台安全验证拦住了。\n\n"
-            "请切到浏览器窗口，手动完成验证（滑块/图形验证码）。\n"
-            "验证通过后采集会自动继续，不需要在本窗口点任何按钮。\n\n"
-            "名单已暂停推进，不会把空记录写进结果。"
-        )
+        box.setWindowTitle(title)
+        box.setText(body)
         box.setStandardButtons(QMessageBox.Ok)
         box.finished.connect(self._hide_blocked_dialog)
         self._blocked_box = box
