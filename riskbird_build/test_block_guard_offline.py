@@ -86,6 +86,9 @@ print("② 等待人工验证：超时/停止/解除三条路径都对 ✓")
 # ── 3. 被拦时不推进名单、不写空记录 ────────────────────
 c = A.AiQiChaCrawlerV2()
 c.signals = None
+# crawl() 开头有一道登录闸门，会真的去请求共享浏览器的 9233 调试端口；
+# 离线测试不能依赖“本机刚好开着那个浏览器”，直接把登录判据桩成已登录
+c.check_login = lambda: ("ok", "测试桩：视为已登录")
 c.delay_between = 0
 c.max_retries = 0
 seen = []
@@ -129,6 +132,7 @@ def detect_clear_soon():
 
 c2 = A.AiQiChaCrawlerV2()
 c2.signals = None
+c2.check_login = lambda: ("ok", "测试桩：视为已登录")
 c2.delay_between = 0
 c2.max_retries = 0
 seen2 = []

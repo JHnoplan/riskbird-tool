@@ -26,7 +26,7 @@ jobs:
     - name: Build EXE with PyInstaller
       run: |
         cd riskbird_build
-        python -m PyInstaller --noconfirm --onefile --windowed --name RiskBirdTool --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import customer_library_cleaner --hidden-import dual_session --hidden-import block_guard riskbird_gui.py
+        python -m PyInstaller --noconfirm --onefile --windowed --name RiskBirdTool --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import customer_library_cleaner --hidden-import dual_session --hidden-import block_guard --hidden-import yzd_client --hidden-import task_registry riskbird_gui.py
 
     - name: Copy startup batch file
       run: |

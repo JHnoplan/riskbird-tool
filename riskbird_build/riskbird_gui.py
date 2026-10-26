@@ -1,5 +1,5 @@
 """
-riskbird_gui.py - 美亚风鸟企业数据采集工具 GUI
+riskbird_gui.py - 公司名查企业数据工具 GUI（风鸟 / 企知道 / 爱企查 三平台采集 + 云展动力客户库导入）
 使用 PyQt5 构建，支持 Excel 上传、登录管理、批量采集、日志输出、Excel 导出
 """
 
@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QTextEdit, QProgressBar, QFileDialog,
     QGroupBox, QFrame, QSplitter, QMessageBox, QDialog,
     QLineEdit, QCheckBox, QStatusBar, QSizePolicy, QScrollArea,
+    QListWidget, QListWidgetItem, QStackedWidget, QButtonGroup, QInputDialog,
+    QAbstractItemView,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
@@ -35,6 +37,14 @@ try:
     HAS_CLEANER = True
 except ImportError:
     HAS_CLEANER = False
+
+try:
+    # 云展动力客户库对接（接口 3/4/5/6）+ 采集任务索引/绑定账号持久化
+    import yzd_client as _yzd
+    import task_registry as _tasks
+    HAS_YZD = True
+except ImportError:
+    HAS_YZD = False
 
 try:
     import openpyxl
@@ -564,8 +574,756 @@ class AutoSaveWorker(QThread):
         self.finished_save.emit(True, f"已自动保存：原数据 {raw_n} 条 / 清洗后入库 {clean_n} 条{note}")
 
 
+# ══════════════════════════════════════════════
+#  外部数据智能清洗（「清洗数据」按钮：别的渠道拿到的名单 → 入库格式）
+# ══════════════════════════════════════════════
+class ExternalCleanWorker(QThread):
+    """读外部表格 → 智能匹配列名 → 清洗 → 写出《清洗后客户库入库数据》。
+
+    多个文件全量读写可能几十秒，放 GUI 线程会直接白屏，所以跟自动保存一样走后台线程。
+    单个文件读不了（旧 .xls / 空表）只记一条错误接着处理剩下的，不会一坏就全盘停。
+    """
+    logged = pyqtSignal(str)
+    finished_clean = pyqtSignal(bool, str)     # ok, 给用户看的摘要
+
+    def __init__(self, paths, out_path, template_dirs=None):
+        super().__init__()
+        self.paths = list(paths or [])
+        self.out_path = out_path
+        self.template_dirs = [d for d in (template_dirs or []) if d]
+
+    def run(self):
+        try:
+            self._run_all()
+        except Exception as e:
+            self.finished_clean.emit(False, f"清洗异常：{e}")
+
+    def _run_all(self):
+        if not HAS_CLEANER:
+            self.finished_clean.emit(False, "清洗模块未加载，无法清洗数据")
+            return
+        records, report = _cleaner.clean_external_records(self.paths, log=self.logged.emit)
+        bad = [r for r in report if r.get("error")]
+        if not records:
+            detail = "\n".join(f"· {r['file']}：{r['error']}" for r in bad) or "· 所选文件里没有数据行"
+            self.finished_clean.emit(False,
+                                    f"没读到任何数据：\n{detail}\n\n"
+                                    f"请确认文件里有公司名（或企业名称）列。")
+            return
+        rows = _cleaner.build_external_rows(records, log=self.logged.emit)
+        if HAS_YZD:
+            # 与导入云展同一口径的批内去重，保证“清洗结果”和“真传上去的行数”对得上
+            rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+        if not rows:
+            self.finished_clean.emit(False, "清洗后没有可入库的记录（公司名全为空或状态异常）")
+            return
+
+        template = _cleaner.locate_template(start_dirs=self.template_dirs)
+        tmp = f"{self.out_path}.tmp"
+        _drop_tmp(tmp)
+        try:
+            _cleaner.write_clean_excel(rows, tmp, template_path=template, log=self.logged.emit)
+            os.replace(tmp, self.out_path)
+        except PermissionError:
+            _drop_tmp(tmp)
+            self.finished_clean.emit(False,
+                                     f"目标文件正被 Excel/WPS 打开，写不进去：\n{self.out_path}\n"
+                                     f"请先关掉这个文件再重做一次清洗。")
+            return
+        except Exception as e:
+            _drop_tmp(tmp)
+            self.finished_clean.emit(False, f"写出清洗结果失败：{e}")
+            return
+        _drop_tmp(tmp)
+
+        files = "\n".join(
+            f"· {r['file']}（{r['sheet']}）：{r['rows']} 条" for r in report if not r.get("error"))
+        skipped = "\n".join(f"⚠ {r['file']}：{r['error']}" for r in bad)
+        matched = "；".join(
+            "，".join(r.get("identified") or []) for r in report if r.get("identified"))
+        summary = (f"共清洗 {len(rows)} 条入库数据 →\n{self.out_path}\n\n"
+                   f"读入的文件：\n{files or '· 无'}")
+        if skipped:
+            summary += f"\n\n被跳过：\n{skipped}"
+        self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
+        self.finished_clean.emit(True, summary)
+
+
+# ══════════════════════════════════════════════
+#  云展动力：账号绑定 / 客户库分组 / 导入
+# ═══════════════════════════════════════════════
+YZD_IMPORT_CHUNK = 5000   # 接口6 建议单次 ≤5000 行，超出自动切分成多次上传
+
+
+def _yzd_font(size=10, bold=False):
+    return QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", size, QFont.Bold if bold else QFont.Normal)
+
+
+class YzdBindWorker(QThread):
+    """接口3：校验手机号格式与账号是否存在。
+
+    必须放线程里跑：这是真实网络请求，写在槽函数里会让界面白屏几秒，
+    后端慢的时候用户只会以为程序挂了。
+    """
+    finished_bind = pyqtSignal(bool, str)   # ok, 成功=手机号 / 失败=给用户看的提示
+
+    def __init__(self, phone):
+        super().__init__()
+        self.phone = phone
+
+    def run(self):
+        try:
+            _yzd.YzdClient().check_phone(self.phone)
+            self.finished_bind.emit(True, self.phone)
+        except _yzd.YzdError as e:
+            self.finished_bind.emit(False, str(e))
+        except Exception as e:
+            self.finished_bind.emit(False, f"校验手机号异常：{e}")
+
+
+class YzdGroupsWorker(QThread):
+    """接口4：拉取分组列表（foreign_flag 0=国内 1=国外）"""
+    finished_groups = pyqtSignal(int, list, str)   # flag, groups, error
+
+    def __init__(self, phone, foreign_flag, keyword=""):
+        super().__init__()
+        self.phone = phone
+        self.foreign_flag = foreign_flag
+        self.keyword = keyword
+
+    def run(self):
+        try:
+            groups = _yzd.YzdClient(self.phone).list_groups(
+                foreign_flag=self.foreign_flag, group_name=self.keyword)
+            self.finished_groups.emit(self.foreign_flag, groups, "")
+        except Exception as e:
+            self.finished_groups.emit(self.foreign_flag, [], str(e))
+
+
+class YzdCreateGroupWorker(QThread):
+    """接口5：新建分组（同名后端会自动追加序号后缀，这里不自造）"""
+    finished_create = pyqtSignal(dict, str)   # group, error
+
+    def __init__(self, phone, group_name, foreign_flag):
+        super().__init__()
+        self.phone = phone
+        self.group_name = group_name
+        self.foreign_flag = foreign_flag
+
+    def run(self):
+        try:
+            group = _yzd.YzdClient(self.phone).create_group(
+                self.group_name, foreign_flag=self.foreign_flag)
+            self.finished_create.emit(group, "")
+        except Exception as e:
+            self.finished_create.emit({}, str(e))
+
+
+class YzdImportWorker(QThread):
+    """接口6：把若干采集任务逐个清洗成 9 列 Excel 后导入指定分组。
+
+    逐任务上传（用户确认的口径）：每个任务单独一组分片调用，进度里能看到
+    「正在导入 2/3」，某个任务失败也只影响它自己，不会连累已上传成功的。
+    """
+    logged = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)                    # done, total, 阶段文案
+    task_done = pyqtSignal(str, int, int, int, str)         # 任务名, importTotal, saveTotal, failTotal, error
+    finished_all = pyqtSignal(list, str)                    # 逐任务结果, 致命错误
+
+    def __init__(self, phone, jobs, group_id, foreign_flag, tmp_dir):
+        super().__init__()
+        self.phone = phone
+        self.jobs = jobs            # [{"name":…, "records": list|None, "raw_file":…}]
+        self.group_id = group_id
+        self.foreign_flag = foreign_flag
+        self.tmp_dir = tmp_dir
+
+    def _records(self, job):
+        """当前会话优先用内存快照，历史任务回读会话目录里的原数据文件"""
+        if job.get("records") is not None:
+            return job["records"]
+        return _tasks.read_records_from_xlsx(job.get("raw_file", ""))
+
+    def run(self):
+        """整个流程包一层兜底：中途抛到外面的异常会把线程直接结束，
+        而界面还在等 finished_all 解锁，用户看到的就是一个关不掉的加载框。"""
+        try:
+            self._run_all()
+        except Exception as e:
+            self.finished_all.emit([], f"导入线程异常：{e}")
+
+    def _run_all(self):
+        total = len(self.jobs)
+        results = []
+        client = _yzd.YzdClient(self.phone, log=self.logged.emit)
+        for idx, job in enumerate(self.jobs, 1):
+            name = job.get("name") or f"任务{idx}"
+            self.progress.emit(idx - 1, total, f"正在导入 {idx}/{total}：{name}")
+            try:
+                records = self._records(job)
+            except Exception as e:
+                self.logged.emit(f"⚠ 读取「{name}」数据失败：{e}")
+                results.append((name, 0, 0, 0, f"读取数据失败：{e}"))
+                self.task_done.emit(name, 0, 0, 0, f"读取数据失败：{e}")
+                continue
+            if not records:
+                msg = "该任务没有原数据"
+                self.logged.emit(f"⚠ 「{name}」跳过：{msg}")
+                results.append((name, 0, 0, 0, msg))
+                self.task_done.emit(name, 0, 0, 0, msg)
+                continue
+            try:
+                if not HAS_CLEANER:
+                    raise RuntimeError("清洗模块未加载")
+                rows = _cleaner.build_clean_rows(records, log=self.logged.emit)
+                # 批内去重：接口6 自己不做重复校验，同一批里完全一样的行只传一次
+                rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+            except Exception as e:
+                msg = f"清洗失败：{e}"
+                self.logged.emit(f"⚠ 「{name}」{msg}")
+                results.append((name, 0, 0, 0, msg))
+                self.task_done.emit(name, 0, 0, 0, msg)
+                continue
+            if not rows:
+                msg = "清洗后没有可导入的记录"
+                self.logged.emit(f"⚠ 「{name}」跳过：{msg}")
+                results.append((name, 0, 0, 0, msg))
+                self.task_done.emit(name, 0, 0, 0, msg)
+                continue
+
+            chunks = [rows[i:i + YZD_IMPORT_CHUNK] for i in range(0, len(rows), YZD_IMPORT_CHUNK)] or [[]]
+            imp = sav = fail = 0
+            err = ""
+            for c_idx, chunk in enumerate(chunks, 1):
+                tag = f"{name}（{c_idx}/{len(chunks)}）" if len(chunks) > 1 else name
+                self.progress.emit(idx - 1, total,
+                                   f"正在导入 {idx}/{total}：{tag} · {len(chunk)} 条")
+                file_path = os.path.join(self.tmp_dir, f"yzd_import_{idx}_{c_idx}.xlsx")
+                try:
+                    written = _yzd.write_import_workbook(chunk, file_path, log=self.logged.emit)
+                    if written == 0:
+                        raise RuntimeError("清洗结果全为空行，没有可上传的数据")
+                    self.logged.emit(f"⬆ {tag}：已生成上传文件 {written} 行，正在提交云展…")
+                    res = client.import_excel(file_path, group_id=self.group_id,
+                                              foreign_flag=self.foreign_flag)
+                    imp += res["importTotal"]
+                    sav += res["saveTotal"]
+                    fail += res["failTotal"]
+                    self.logged.emit(f"  ↳ 云展返回：导入 {res['importTotal']} / 成功 {res['saveTotal']} / 失败 {res['failTotal']}")
+                except Exception as e:
+                    err = str(e)
+                    self.logged.emit(f"❌ {tag} 导入失败：{err}")
+                    break
+                finally:
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except Exception:
+                        pass
+            results.append((name, imp, sav, fail, err))
+            self.task_done.emit(name, imp, sav, fail, err)
+        self.progress.emit(total, total, "导入结束")
+        self.finished_all.emit(results, "")
+
+
+class YzdProgressDialog(QDialog):
+    """导入期间的模态遮罩：锁住主界面 + busy 进度条动画。
+
+    总耗时取决于任务条数和后端处理速度，事先给百分比只会是假数字，
+    所以用不确定进度条（一直跑动）+ 文案显示当前任务，比假百分比诚实。
+    没做完时不给关掉：中途关窗口只会让用户以为导入停了（其实线程还在跑）。
+    """
+
+    def __init__(self, parent, title="正在导入云展客户库"):
+        super().__init__(parent)
+        self._allow_close = False
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(24, 22, 24, 20)
+        self.info_lbl = QLabel("准备中…")
+        self.info_lbl.setFont(_yzd_font(11))
+        self.info_lbl.setWordWrap(True)
+        layout.addWidget(self.info_lbl)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)          # busy 动画
+        self.bar.setTextVisible(False)
+        self.bar.setMinimumHeight(20)
+        layout.addWidget(self.bar)
+        self.detail_lbl = QLabel("导入期间请勿关闭程序，也不要执行其他操作。")
+        self.detail_lbl.setFont(_yzd_font(9))
+        self.detail_lbl.setStyleSheet("color: #999;")
+        self.detail_lbl.setWordWrap(True)
+        layout.addWidget(self.detail_lbl)
+
+    def set_text(self, main: str, detail: str = ""):
+        self.info_lbl.setText(main)
+        if detail:
+            self.detail_lbl.setText(detail)
+
+    def allow_close(self):
+        """导入跑完后才能真关（close() 也要走 closeEvent）"""
+        self._allow_close = True
+
+    def closeEvent(self, event):
+        # 没做完不给关：关掉也只是让用户以为导入停了（线程其实还在跑）
+        if self._allow_close:
+            event.accept()
+        else:
+            event.ignore()
+
+
+class YzdGroupDialog(QDialog):
+    """「导入云展客户库」弹窗（对应云展的两张图）：
+
+      第一页：国内/国外 tab + 分组名模糊搜索 + 「+ 新建分组」+ 分组单选列表，
+              底部「取消 / 导入其他 / 导入最新」，分组必选；
+      第二页：所有历史采集任务，按采集时间倒序，多选 + 全选，必选。
+
+    分组必选、任务必选、未绑定提示这三件事全部在这里拦住，
+    MainWindow 只负责“拿到 group + mode + tasks 去上传”。
+
+    pick_group_only=True 时是「采集完自动导入」预先选分组的场景：只选分组、
+    不马上导入，所以藏掉「导入其他」并把确认按钮改成「选用该分组」，
+    避免用户以为点下去就开始传数据。
+    """
+    MODE_LATEST = "latest"
+    MODE_OTHERS = "others"
+    HINT_IMPORT = "选完分组后点右下「导入最新」或「导入其他」"
+    HINT_PICK = "选一个分组作为采集完自动导入的目标，然后点右下「选用该分组」"
+
+    def __init__(self, phone, parent=None, pick_group_only=False):
+        super().__init__(parent)
+        self.phone = phone
+        self._pick_only = bool(pick_group_only)
+        self._hint_text = self.HINT_PICK if self._pick_only else self.HINT_IMPORT
+        self.mode = ""
+        self.chosen_group = None
+        self.chosen_tasks = []
+        self._groups = {0: None, 1: None}    # 每个 tab 缓存一次结果，切回去不重复请求
+        self._flag = 0
+        self._worker = None
+        self._create_worker = None
+        self._pending_name = ""
+        self._created_id = ""
+        self.setWindowTitle("选择自动导入的客户库分组" if self._pick_only else "导入云展客户库")
+        self.setMinimumSize(560, 460)
+        self.resize(600, 500)
+        self._init_ui()
+        self._load_groups()
+
+    # ── UI ──
+    def _init_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
+        self.stack.addWidget(self._build_group_page())
+        self.stack.addWidget(self._build_task_page())
+
+    def _build_group_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setSpacing(10)
+
+        tab_row = QHBoxLayout()
+        self.tab_btns = {}
+        self.tab_group = QButtonGroup(self)
+        self.tab_group.setExclusive(True)
+        for flag, text in ((0, "国内客户库"), (1, "国外客户库")):
+            btn = QPushButton(text)
+            btn.setCheckable(True)
+            btn.setChecked(flag == 0)
+            btn.setMinimumHeight(32)
+            btn.setStyleSheet(
+                "QPushButton { background: #eef1f6; color: #1a3c6e; border: 1px solid #d0d8e8; }"
+                "QPushButton:checked { background: #4472C4; color: white; font-weight: bold; }")
+            btn.clicked.connect(lambda _c, f=flag: self._switch_flag(f))
+            self.tab_group.addButton(btn, flag)
+            self.tab_btns[flag] = btn
+            tab_row.addWidget(btn)
+        tab_row.addStretch()
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setMinimumHeight(32)
+        self.refresh_btn.setMinimumWidth(64)
+        self.refresh_btn.setToolTip(
+            "重新向云展后端查一次分组和客户数。\n"
+            "「客户数」是后端统计值（最长约 60 秒才更新），刚导完立刻看可能还是旧数字。")
+        self.refresh_btn.clicked.connect(self._refresh_groups)
+        tab_row.addWidget(self.refresh_btn)
+        self.new_group_btn = QPushButton("+ 新建分组")
+        self.new_group_btn.setMinimumHeight(32)
+        self.new_group_btn.clicked.connect(self._create_group)
+        tab_row.addWidget(self.new_group_btn)
+        lay.addLayout(tab_row)
+
+        search_row = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索分组名称（模糊匹配）")
+        self.search_edit.setMinimumHeight(30)
+        self.search_edit.returnPressed.connect(self._search)
+        search_row.addWidget(self.search_edit, 1)
+        self.search_btn = QPushButton("搜索")
+        self.search_btn.setMinimumHeight(30)
+        self.search_btn.setMinimumWidth(70)
+        self.search_btn.clicked.connect(self._search)
+        search_row.addWidget(self.search_btn)
+        lay.addLayout(search_row)
+
+        self.group_status_lbl = QLabel("正在加载分组…")
+        self.group_status_lbl.setFont(_yzd_font(9))
+        self.group_status_lbl.setStyleSheet("color: #666;")
+        self.group_status_lbl.setWordWrap(True)
+        lay.addWidget(self.group_status_lbl)
+
+        self.group_list = QListWidget()
+        self.group_list.setMinimumHeight(180)
+        self.group_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.group_list.itemSelectionChanged.connect(self._update_hint)
+        lay.addWidget(self.group_list, 1)
+
+        self.hint_lbl = QLabel(self._hint_text)
+        self.hint_lbl.setFont(_yzd_font(9))
+        self.hint_lbl.setStyleSheet("color: #666;")
+        self.hint_lbl.setWordWrap(True)
+        lay.addWidget(self.hint_lbl)
+
+        btn_row = QHBoxLayout()
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setMinimumHeight(36)
+        self.cancel_btn.setMinimumWidth(90)
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addStretch()
+        self.others_btn = QPushButton("导入其他")
+        self.others_btn.setMinimumHeight(36)
+        self.others_btn.setMinimumWidth(110)
+        self.others_btn.clicked.connect(self._show_tasks)
+        btn_row.addWidget(self.others_btn)
+        self.latest_btn = QPushButton("导入最新")
+        self.latest_btn.setMinimumHeight(36)
+        self.latest_btn.setMinimumWidth(110)
+        self.latest_btn.setDefault(True)
+        self.latest_btn.clicked.connect(self._accept_latest)
+        btn_row.addWidget(self.latest_btn)
+        if self._pick_only:
+            # 预先选分组：不需要选任务，确认也不是“立刻导入”
+            self.others_btn.setVisible(False)
+            self.latest_btn.setText("选用该分组")
+        lay.addLayout(btn_row)
+        return page
+
+    def _build_task_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setSpacing(10)
+
+        top = QHBoxLayout()
+        self.back_btn = QPushButton("← 返回")
+        self.back_btn.setMinimumHeight(32)
+        self.back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        top.addWidget(self.back_btn)
+        title = QLabel("选择要导入的采集任务（可多选，必选）")
+        title.setFont(_yzd_font(11, True))
+        top.addWidget(title, 1)
+        self.all_chk = QCheckBox("全选")
+        self.all_chk.toggled.connect(self._toggle_all)
+        top.addWidget(self.all_chk)
+        lay.addLayout(top)
+
+        self.task_count_lbl = QLabel("共 0 个任务")
+        self.task_count_lbl.setFont(_yzd_font(9))
+        self.task_count_lbl.setStyleSheet("color: #666;")
+        lay.addWidget(self.task_count_lbl)
+
+        self.task_list = QListWidget()
+        self.task_list.setMinimumHeight(200)
+        self.task_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.task_list.itemChanged.connect(lambda _i: self._update_task_hint())
+        lay.addWidget(self.task_list, 1)
+
+        self.task_hint_lbl = QLabel("至少选择一个任务")
+        self.task_hint_lbl.setFont(_yzd_font(9))
+        self.task_hint_lbl.setStyleSheet("color: #666;")
+        self.task_hint_lbl.setWordWrap(True)
+        lay.addWidget(self.task_hint_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.task_cancel_btn = QPushButton("取消")
+        self.task_cancel_btn.setMinimumHeight(36)
+        self.task_cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.task_cancel_btn)
+        self.task_ok_btn = QPushButton("确认导入")
+        self.task_ok_btn.setMinimumHeight(36)
+        self.task_ok_btn.setMinimumWidth(110)
+        self.task_ok_btn.clicked.connect(self._accept_others)
+        btn_row.addWidget(self.task_ok_btn)
+        lay.addLayout(btn_row)
+        return page
+
+    # ── 分组加载 ──
+    def _set_busy(self, busy: bool):
+        """等接口期间把会触发重复请求的按钮先锁住（连点两次会起两个线程）"""
+        for w in (self.new_group_btn, self.search_btn, self.search_edit,
+                  self.refresh_btn, self.latest_btn, self.others_btn):
+            w.setEnabled(not busy)
+        if busy:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            QApplication.restoreOverrideCursor()
+
+    def _switch_flag(self, flag: int):
+        if flag == self._flag and self._groups[flag] is not None:
+            return
+        self._flag = flag
+        cached = self._groups.get(flag)
+        if cached is None:
+            self._load_groups()
+        else:
+            self._render_groups(cached, "")
+
+    def _search(self):
+        self._groups[self._flag] = None      # 搜索结果是另一个集合，不能拿旧缓存当新结果
+        self._load_groups()
+
+    def _refresh_groups(self):
+        """主动绕过缓存重查一次：客户数是后端算的，不刷就只会一直显示旧值"""
+        self._groups[self._flag] = None
+        self._load_groups()
+
+    def _load_groups(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        keyword = self.search_edit.text().strip()
+        self.group_status_lbl.setText("正在加载分组…")
+        self._set_busy(True)
+        self._worker = YzdGroupsWorker(self.phone, self._flag, keyword)
+        self._worker.finished_groups.connect(self._on_groups)
+        self._worker.start()
+
+    def _on_groups(self, flag: int, groups: list, error: str):
+        self._groups[flag] = groups if not error else None
+        if flag != self._flag:
+            self._set_busy(False)      # 切了 tab，旧请求的结果只入缓存
+            return
+        self._render_groups(groups, error)
+        self._set_busy(False)
+
+    def _render_groups(self, groups: list, error: str):
+        self.group_list.clear()
+        if error:
+            self.group_status_lbl.setText(f"分组加载失败：{error}")
+            self.group_status_lbl.setStyleSheet("color: #c62828;")
+            self._update_hint()
+            return
+        self.group_status_lbl.setStyleSheet("color: #666;")
+        if not groups:
+            keyword = self.search_edit.text().strip()
+            self.group_status_lbl.setText(
+                f"没搜到分组，换个关键词试试" if keyword else
+                "该账号下还没有分组，请先点「+ 新建分组」创建一个")
+            self._update_hint()
+            return
+        self.group_status_lbl.setText(
+            f"共 {len(groups)} 个分组，选中一个后点右下角导入" if not self._pick_only else
+            f"共 {len(groups)} 个分组，选一个当自动导入目标")
+        self.group_status_lbl.setToolTip(
+            "括号里的「客户数」直接取自云展后端接口返回（不是本地统计）。\n"
+            "后端是缓存值，最长约 60 秒才更新一次；刚导完看到数字没变是正常的，"
+            "点右上「刷新」重新查一次即可。")
+        for g in groups:
+            num = g.get("clientNum")
+            text = f"{g.get('groupName', '')}"
+            if num is not None:
+                # 文档说明 clientNum 是缓存值（最长 60 秒更新），所以不强调精确
+                text += f"　（客户数 {num}）"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, g)
+            self.group_list.addItem(item)
+        if self._created_id and self._select_group_by_id(self._created_id):
+            # 刚新建完就默认选中它：用户的下一步八成就是往这个新分组里导入
+            self._created_id = ""
+        self._update_hint()
+
+    def _current_group(self):
+        items = self.group_list.selectedItems()
+        return items[0].data(Qt.UserRole) if items else None
+
+    def _update_hint(self, error: bool = False):
+        """分组必选：选中就清空提示，没选上才标红提醒（默认只给中性引导文案）"""
+        if self._current_group():
+            self.hint_lbl.setText("")
+            self.hint_lbl.setStyleSheet("color: #666;")
+        elif error:
+            self.hint_lbl.setText("请先选择一个分组（必选）")
+            self.hint_lbl.setStyleSheet("color: #c62828;")
+        else:
+            self.hint_lbl.setText(self._hint_text)
+            self.hint_lbl.setStyleSheet("color: #666;")
+
+    def _need_group(self):
+        """导入前统一拦住：没选分组就不往下走（必选）"""
+        group = self._current_group()
+        if group is None:
+            self._update_hint(error=True)
+            QMessageBox.warning(self, "提示", "请选择一个分组")
+        return group
+
+    # ── 新建分组（接口5）──
+    def _create_group(self):
+        if not self.phone:
+            QMessageBox.warning(self, "提示", "请先绑定云展动力账号")
+            return
+        name, ok = QInputDialog.getText(self, "新建分组", "群组名称（最多 10 个字符）：")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "群组名称不能为空！")
+            return
+        if len(name) > _yzd.GROUP_NAME_MAX:
+            QMessageBox.warning(self, "提示", f"群组名称最多输入{_yzd.GROUP_NAME_MAX}个字符！")
+            return
+        if self._create_worker is not None and self._create_worker.isRunning():
+            return
+        self._set_busy(True)
+        self.group_status_lbl.setText(f"正在创建分组「{name}」…")
+        self._pending_name = name
+        self._create_worker = YzdCreateGroupWorker(self.phone, name, self._flag)
+        self._create_worker.finished_create.connect(self._on_group_created)
+        self._create_worker.start()
+
+    def _on_group_created(self, group: dict, error: str):
+        if error:
+            self._set_busy(False)
+            self.group_status_lbl.setText(f"新建分组失败：{error}")
+            QMessageBox.warning(self, "新建分组失败", error)
+            return
+        # 后端同名会自动加序号后缀（返回的 groupName 才是最终名字），先丢分组再按名字重查
+        self._groups = {0: None, 1: None}
+        self._created_id = str(group.get("id") or "")
+        self.search_edit.clear()
+        self.group_status_lbl.setText(f"已创建分组「{group.get('groupName') or self._pending_name}」")
+        self._load_groups()
+
+    def _select_group_by_id(self, gid: str):
+        for i in range(self.group_list.count()):
+            item = self.group_list.item(i)
+            data = item.data(Qt.UserRole) or {}
+            if str(data.get("id")) == gid:
+                self.group_list.setCurrentItem(item)
+                return True
+        return False
+
+    # ── 导入最新 ──
+    def _accept_latest(self):
+        group = self._need_group()
+        if group is None:
+            return
+        self.mode = self.MODE_LATEST
+        self.chosen_group = group
+        self.accept()
+
+    # ── 导入其他 ──
+    def _show_tasks(self):
+        group = self._need_group()
+        if group is None:
+            return
+        self.chosen_group = group
+        self._fill_tasks()
+        self.stack.setCurrentIndex(1)
+
+    def _fill_tasks(self):
+        self.task_list.clear()
+        self.all_chk.blockSignals(True)
+        self.all_chk.setChecked(False)
+        self.all_chk.blockSignals(False)
+        tasks = _tasks.sorted_for_import(_tasks.load_tasks())
+        self._task_map = {}
+        for t in tasks:
+            raw = t.get("raw_file") or ""
+            name = t.get("name") or t.get("id") or "未命名任务"
+            text = (f"{name}\n"
+                    f"采集时间 {t.get('started_at') or '—'}"
+                    f"　{t.get('count') or 0} 条"
+                    f"　[{t.get('status') or '—'}]")
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            item.setData(Qt.UserRole, t)
+            self.task_list.addItem(item)
+            self._task_map[id(item)] = t
+        if not tasks:
+            self.task_count_lbl.setText(
+                "暂无采集任务记录：先在主界面完成一次「开始采集 → 采集完成」")
+        else:
+            self.task_count_lbl.setText(
+                f"共 {len(tasks)} 个任务（按采集时间倒序），任务名取本次导入的采集文档")
+        self._update_task_hint()
+
+    def _toggle_all(self, checked: bool):
+        for i in range(self.task_list.count()):
+            self.task_list.item(i).setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def _checked_tasks(self):
+        out = []
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item.checkState() == Qt.Checked:
+                task = item.data(Qt.UserRole)
+                if task:
+                    out.append(task)
+        return out
+
+    def _update_task_hint(self, error: bool = False):
+        n = len(self._checked_tasks())
+        if n:
+            self.task_hint_lbl.setText("")
+            self.task_hint_lbl.setStyleSheet("color: #666;")
+        elif error:
+            self.task_hint_lbl.setText("请至少选择一个任务（必选）")
+            self.task_hint_lbl.setStyleSheet("color: #c62828;")
+        else:
+            self.task_hint_lbl.setText("勾选要导入的采集任务（可多选）")
+            self.task_hint_lbl.setStyleSheet("color: #666;")
+        self.task_ok_btn.setText(f"确认导入（{n}）" if n else "确认导入")
+
+    def _accept_others(self):
+        tasks = self._checked_tasks()
+        if not tasks:
+            self._update_task_hint(error=True)
+            QMessageBox.warning(self, "提示", "请至少选择一个任务")
+            return
+        self.mode = self.MODE_OTHERS
+        self.chosen_tasks = tasks
+        self.accept()
+
+    def closeEvent(self, event):
+        # 后台线程还在发请求时不能直接拆窗口（Qt 会警告“destroying thread while running”）
+        for w in (self._worker, self._create_worker):
+            if w is not None and w.isRunning():
+                w.wait(3000)
+        event.accept()
+
+
 class MainWindow(QMainWindow):
-    PLATFORM_NAMES = ["风鸟", "企知道", "爱企查"]
+    APP_TITLE = "公司名查企业数据工具"
+    # 数据来源下拉顺序（风鸟排最后）：(key, 中文名, 站点域名)，_current_source 就是这里的下标；
+    # 平台判定一律用 key，以后再调顺序不用到处改魔法数字
+    SOURCES = (("qizhidao", "企知道", "qizhidao.com"),
+               ("aiqicha", "爱企查", "aiqicha.baidu.com"),
+               ("riskbird", "风鸟", "riskbird.com"))
+    SOURCE_KEYS = tuple(s[0] for s in SOURCES)
+    SOURCE_LABELS = {s[0]: s[1] for s in SOURCES}
+    SOURCE_DOMAINS = {s[0]: s[2] for s in SOURCES}
+    PLATFORM_NAMES = [s[1] for s in SOURCES]
+    # 合并同名公司时“先出现的非空字段胜出”，这里保持改造前的数据优先级不动
+    MERGE_ORDER = ("riskbird", "qizhidao", "aiqicha")
 
     def __init__(self):
         super().__init__()
@@ -575,9 +1333,14 @@ class MainWindow(QMainWindow):
         self.aiqicha_crawler = AiQiChaCrawlerV2()
         self.crawler = self.qizhidao_crawler  # 默认使用企知道
         
+        # key → 爬虫；_all_crawlers 与下拉框同序，下标可直接配 _current_source
+        self._by_key = {"riskbird": self.riskbird_crawler,
+                        "qizhidao": self.qizhidao_crawler,
+                        "aiqicha": self.aiqicha_crawler}
+        self._all_crawlers = [self._by_key[k] for k in self.SOURCE_KEYS]
+
         # 连接信号
-        for platform, crawler in zip(self.PLATFORM_NAMES,
-                                     [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]):
+        for platform, crawler in zip(self.PLATFORM_NAMES, self._all_crawlers):
             crawler.signals.log_signal.connect(self._append_log)
             crawler.signals.progress_signal.connect(self._update_progress)
             crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
@@ -594,10 +1357,9 @@ class MainWindow(QMainWindow):
         self._excel_paths = []  # 支持多文件
         self._col_pick_cache = {}  # 公司名列人工确认结果缓存（表头组合 → 列号）
         self._crawl_thread = None
-        self._current_source = 1  # 0=风鸟，1=企知道，2=爱企查
+        self._current_source = 0  # 下拉框下标，默认企知道（顺序见 SOURCE_KEYS）
         self._dual_running = False  # 是否正在双标签并行采集
-        # 跨平台续采 + 桌面会话文件夹 + 每 10 条自动保存
-        self._all_crawlers = [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]
+        # 跨平台续采 + 桌面会话文件夹 + 每 10 条自动保存（_all_crawlers 已在信号区建好）
         self._session_folder = None       # 桌面/企业数据自动采集工具/<第一次开始采集时间>
         self._last_autosave_bucket = 0    # 每 10 条自动保存的计数桶
         self._autosave_worker = None        # 后台写盘线程（存引用防被 GC）
@@ -605,6 +1367,23 @@ class MainWindow(QMainWindow):
         self._blocked_info = []           # 正在等人工处理的平台：[[平台名, 原因], …]
         self._blocked_box = None          # 非模态提示框（不阻塞界面，用户要去浏览器操作）
         self._login_info = []             # 正在等人工登录的平台：[[平台名, 原因], …]
+        # 云展动力客户库（绑定账号 + 导入）
+        if HAS_YZD:
+            # 两边必须用同一个桌面：GUI 自己有一套 OneDrive 判定，任务索引不能另算一份
+            _tasks.set_desktop_dir(self._get_desktop_dir())
+        self._yzd_phone = _tasks.load_account() if HAS_YZD else ""
+        self._yzd_worker = None           # 绑定账号线程（存引用防被 GC）
+        self._yzd_import_worker = None    # 导入线程（同上）
+        self._yzd_dialog = None           # 选分组/选任务弹窗
+        self._yzd_progress = None         # 导入锁定遮罩
+        self._yzd_importing = False       # 导入中标志（closeEvent 也看它）
+        self._yzd_jobs = []               # 本轮导入的任务快照（用于回写导入结果）
+        self._yzd_group_name = ""         # 本轮导入的目标分组名（回写任务索引用）
+        self._clean_worker = None         # 「清洗数据」后台线程（存引用防被 GC）
+        self._cleaning = False            # 正在清洗中（closeEvent 与重复点按钮都看它）
+        self._clean_progress = None       # 清洗期间的锁定遮罩
+        self._auto_import_group = None    # 「采集完自动导入」选定的分组
+        self._task_id = None              # 本次采集会话对应的任务 id（=会话文件夹名）
 
         self._update_window_title()
         self.setMinimumSize(900, 700)
@@ -622,7 +1401,7 @@ class MainWindow(QMainWindow):
 
         # ── 顶部：标题栏 ──
         title_bar = QHBoxLayout()
-        self.title_label = QLabel("企知道 企业数据采集工具")  # 默认企知道，动态更新
+        self.title_label = QLabel(self.APP_TITLE)
         self.title_label.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 18, QFont.Bold))
         self.title_label.setStyleSheet("color: #1a3c6e;")
         title_bar.addWidget(self.title_label)
@@ -635,22 +1414,13 @@ class MainWindow(QMainWindow):
         
         from PyQt5.QtWidgets import QComboBox
         self.source_combo = QComboBox()
-        self.source_combo.addItem("风鸟 (riskbird.com)")
-        self.source_combo.addItem("企知道 (qizhidao.com)")
-        self.source_combo.addItem("爱企查 (aiqicha.baidu.com)")
-        self.source_combo.setCurrentIndex(1)  # 默认企知道
+        for _i, _key in enumerate(self.SOURCE_KEYS):
+            self.source_combo.addItem(f"{self.SOURCE_LABELS[_key]} ({self.SOURCE_DOMAINS[_key]})")
+        self.source_combo.setCurrentIndex(0)  # 默认企知道
         self.source_combo.setMinimumWidth(220)
         self.source_combo.setMinimumHeight(30)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         title_bar.addWidget(self.source_combo)
-
-        # 登录状态
-        self.login_status_lbl = QLabel("未登录")
-        self.login_status_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 10))
-        self.login_status_lbl.setStyleSheet(
-            "QLabel { padding: 5px 12px; border-radius: 4px; background: #f0f0f0; color: #999; }"
-        )
-        title_bar.addWidget(self.login_status_lbl)
 
         # 打开网页按钮
         self.open_web_btn = QPushButton("打开网页")
@@ -662,11 +1432,11 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(title_bar)
 
         # 提示
-        hint_lbl = QLabel("提示：如未登录请先登录后再操作其他功能")
-        hint_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 9))
-        hint_lbl.setStyleSheet("color: #999; padding: 2px 0;")
-        hint_lbl.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(hint_lbl)
+        self.hint_lbl = QLabel("提示：建议先点“打开网页”，在浏览器里确认已登录目标平台，再开始采集")
+        self.hint_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 9))
+        self.hint_lbl.setStyleSheet("color: #999; padding: 2px 0;")
+        self.hint_lbl.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.hint_lbl)
 
         # ─ 文件选择区 ──
         file_group = QGroupBox("  数据文件（支持多选）")
@@ -710,46 +1480,60 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(file_group)
 
-        # ── 控制区 ──
+        # ── 控制区（按钮一行、选项一行：勾选项就在“开始采集”下方）──
         ctrl_group = QGroupBox("  采集控制")
-        ctrl_layout = QHBoxLayout(ctrl_group)
+        ctrl_layout = QVBoxLayout(ctrl_group)
+        btn_row = QHBoxLayout()
 
         self.start_btn = QPushButton("开始采集")
         self.start_btn.setMinimumHeight(42)
         self.start_btn.setMinimumWidth(100)
         self.start_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._start_crawl)
-        ctrl_layout.addWidget(self.start_btn)
+        btn_row.addWidget(self.start_btn)
 
         self.pause_btn = QPushButton("暂停")
         self.pause_btn.setMinimumHeight(42)
         self.pause_btn.setMinimumWidth(80)
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self._pause_crawl)
-        ctrl_layout.addWidget(self.pause_btn)
+        btn_row.addWidget(self.pause_btn)
 
         self.resume_btn = QPushButton("恢复")
         self.resume_btn.setMinimumHeight(42)
         self.resume_btn.setMinimumWidth(80)
         self.resume_btn.setEnabled(False)
         self.resume_btn.clicked.connect(self._resume_crawl)
-        ctrl_layout.addWidget(self.resume_btn)
+        btn_row.addWidget(self.resume_btn)
 
         self.stop_btn = QPushButton("停止采集")
         self.stop_btn.setMinimumHeight(42)
         self.stop_btn.setMinimumWidth(100)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_crawl)
-        ctrl_layout.addWidget(self.stop_btn)
+        btn_row.addWidget(self.stop_btn)
 
         self.export_btn = QPushButton("导出 Excel")
         self.export_btn.setMinimumHeight(42)
         self.export_btn.setMinimumWidth(100)
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export_excel)
-        ctrl_layout.addWidget(self.export_btn)
+        btn_row.addWidget(self.export_btn)
 
-        ctrl_layout.addStretch()
+        # 清洗数据：不依赖本工具采到的数据，随时可用（拿别人给的名单也能洗）
+        self.clean_btn = QPushButton("清洗数据")
+        self.clean_btn.setMinimumHeight(42)
+        self.clean_btn.setMinimumWidth(100)
+        self.clean_btn.setToolTip(
+            "把其他渠道拿到的 Excel/CSV 名单清洗成《清洗后客户库入库数据》（与自动保存同格式）。\n"
+            "支持多选文件；列名会自动识别（企业名/联系电话/邮箱/联系人/职位/地址等），\n"
+            "列名对不上时按单元格内容猜，识别结果与未使用的列都会写进运行日志。\n"
+            "自动剔除空公司名、完成电话/邮箱格式清洗与跨文件去重合并。")
+        self.clean_btn.clicked.connect(self._clean_external_data)
+        btn_row.addWidget(self.clean_btn)
+
+        btn_row.addStretch()
+        ctrl_layout.addLayout(btn_row)
 
         # 延迟设置
         delay_layout = QHBoxLayout()
@@ -773,7 +1557,7 @@ class MainWindow(QMainWindow):
         )
         self.rb_detail_check.toggled.connect(self._on_force_detail_toggled)
         delay_layout.addWidget(self.rb_detail_check)
-        self.rb_detail_check.setVisible(getattr(self, "_current_source", 1) == 0)
+        self.rb_detail_check.setVisible(getattr(self, "_current_source", 0) == self.SOURCE_KEYS.index("riskbird"))
 
         # ── 双标签并行采集（企知道 + 爱企查，单双数分公司）──
         self._dual_pref = True   # 用户意愿（切到风鸟时临时置灰，切回来恢复）
@@ -792,9 +1576,55 @@ class MainWindow(QMainWindow):
         self.dual_tab_check.toggled.connect(self._on_dual_tab_toggled)
         delay_layout.addWidget(self.dual_tab_check)
         self._sync_dual_tab_enabled()
+
+        # ── 采集完自动导入云展客户库（默认不勾选）──
+        self.auto_import_check = QCheckBox("采集完自动导入云展客户库")
+        self.auto_import_check.setToolTip(
+            "勾选时会先让你选一个客户库分组；采集完成后自动把本次采集的数据\n"
+            "上传到该分组，并在日志里提示导入结果（不需再手动点「导入云展客户库」）。\n"
+            "需先绑定云展动力账号。手动点“停止采集”不会触发自动导入。\n"
+            "不勾选（默认）：采集完只能自己点按钮导入。")
+        self.auto_import_check.toggled.connect(self._on_auto_import_toggled)
+        delay_layout.addWidget(self.auto_import_check)
         ctrl_layout.addLayout(delay_layout)
 
         main_layout.addWidget(ctrl_group)
+
+        # ── 云展动力客户库（绑定账号 + 导入）──
+        yzd_group = QGroupBox("  云展动力客户库")
+        yzd_layout = QHBoxLayout(yzd_group)
+
+        self.yzd_status_lbl = QLabel("未绑定云展动力账号")
+        self.yzd_status_lbl.setFont(QFont("Microsoft YaHei" if sys.platform == "win32" else "Arial", 10))
+        self.yzd_status_lbl.setMinimumWidth(200)
+        yzd_layout.addWidget(self.yzd_status_lbl)
+        yzd_layout.addStretch()
+
+        self.bind_yzd_btn = QPushButton("绑定云展动力账号")
+        self.bind_yzd_btn.setMinimumHeight(36)
+        self.bind_yzd_btn.setMinimumWidth(150)
+        self.bind_yzd_btn.setToolTip(
+            "输入云展动力手机号，调云展接口校验格式与账号是否存在，校验通过后才保存绑定。\n"
+            "绑定信息存在：桌面/企业数据自动采集工具/_云展账号.json（跨重启仍有效）。"
+        )
+        self.bind_yzd_btn.clicked.connect(self._bind_yzd_account)
+        yzd_layout.addWidget(self.bind_yzd_btn)
+
+        self.import_yzd_btn = QPushButton("导入云展客户库")
+        self.import_yzd_btn.setMinimumHeight(36)
+        self.import_yzd_btn.setMinimumWidth(140)
+        self.import_yzd_btn.setObjectName("exportBtn")
+        self.import_yzd_btn.setToolTip(
+            "选择客户库分组后，把采集结果上传到云展动力客户库。\n"
+            "· 导入最新：只传最近一次采集任务；\n"
+            "· 导入其他：从历史采集任务里挑（可多选）。\n"
+            "上传中间会锁定界面并显示加载动画，走完弹结果汇总。"
+        )
+        self.import_yzd_btn.clicked.connect(self._open_yzd_import)
+        yzd_layout.addWidget(self.import_yzd_btn)
+
+        main_layout.addWidget(yzd_group)
+        self._refresh_yzd_status()
 
         # ── 进度条 + 计时器 ──
         progress_layout = QHBoxLayout()
@@ -815,7 +1645,7 @@ class MainWindow(QMainWindow):
 
         # ── 各平台已采集条数（跨平台续采时直观显示进度） ──
         count_font = "Microsoft YaHei" if sys.platform == "win32" else "Arial"
-        self.platform_count_lbl = QLabel("风鸟: 0 条    企知道: 0 条    爱企查: 0 条    合计: 0 条")
+        self.platform_count_lbl = QLabel("    ".join(f"{n}: 0 条" for n in self.PLATFORM_NAMES) + "    合计: 0 条")
         self.platform_count_lbl.setFont(QFont(count_font, 10, QFont.Bold))
         self.platform_count_lbl.setStyleSheet(
             "QLabel { color: #1a73e8; background: #eef4ff; border: 1px solid #d0e0ff; border-radius: 4px; padding: 6px; }"
@@ -926,6 +1756,8 @@ class MainWindow(QMainWindow):
             self.preview_btn.setEnabled(True)
             self._check_ready()
             self._append_log(f"从 {len(paths)} 个文件加载 {len(all_companies)} 家公司，去重后 {len(self._companies)} 家")
+            # 已有会话时再选文件 = 往当前任务里加料，不拆新任务
+            self._update_task_files()
 
     def _load_companies_from_file(self, path: str) -> list:
         """从单个文件加载公司名（智能识别公司名列：表头语义 + 内容抽样打分，低置信弹窗确认）"""
@@ -993,6 +1825,7 @@ class MainWindow(QMainWindow):
         # 清空文件视为开启新会话：重置自动保存目录与每10条计数桶（下次开始采集会新建时间戳文件夹）
         self._session_folder = None
         self._last_autosave_bucket = 0
+        self._task_id = None
         self._append_log("已清空文件列表")
 
     def _load_companies(self, path: str):
@@ -1032,7 +1865,7 @@ class MainWindow(QMainWindow):
         chk = getattr(self, "dual_tab_check", None)
         if chk is None:
             return
-        usable = HAS_DUAL and getattr(self, "_current_source", 1) in (1, 2)
+        usable = HAS_DUAL and self._source_key() != "riskbird"
         chk.setEnabled(usable)
         if usable:
             # 从风鸟切回来时恢复用户原本的勾选意愿
@@ -1051,7 +1884,7 @@ class MainWindow(QMainWindow):
         """本次采集是否走双标签并行"""
         return bool(HAS_DUAL and getattr(self, "dual_tab_check", None)
                     and self.dual_tab_check.isChecked()
-                    and self._current_source in (1, 2))
+                    and self._source_key() != "riskbird")
 
     def _on_dual_tab_toggled(self, checked):
         self._dual_pref = bool(checked)
@@ -1109,6 +1942,11 @@ class MainWindow(QMainWindow):
         finally:
             self._dual_logs_on = on
 
+    def _source_key(self, index=None) -> str:
+        """下拉框下标 → 平台 key：平台判定统一走这里，不再用魔法数字"""
+        i = self._current_source if index is None else index
+        return self.SOURCE_KEYS[i] if 0 <= i < len(self.SOURCE_KEYS) else ""
+
     def _on_source_changed(self, index):
         """切换数据来源"""
         old_crawler = self.crawler
@@ -1117,15 +1955,9 @@ class MainWindow(QMainWindow):
         if old_index != index:
             self._auto_save("切换平台")
         self._current_source = index
-        if index == 0:
-            self.crawler = self.riskbird_crawler
-            self._append_log("已切换到：风鸟 (riskbird.com)")
-        elif index == 1:
-            self.crawler = self.qizhidao_crawler
-            self._append_log("已切换到：企知道 (qizhidao.com)")
-        else:
-            self.crawler = self.aiqicha_crawler
-            self._append_log("已切换到：爱企查 (aiqicha.baidu.com)")
+        key = self._source_key(index)
+        self.crawler = self._by_key[key]
+        self._append_log(f"已切换到：{self.SOURCE_LABELS[key]} ({self.SOURCE_DOMAINS[key]})")
         
         # 切换时关闭旧爬虫的浏览器（释放 Chrome 配置目录锁）
         # 双标签模式下企知道/爱企查共用一个浏览器，不能关
@@ -1143,7 +1975,7 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         # 详情页开关只对风鸟有意义
         if hasattr(self, "rb_detail_check"):
-            self.rb_detail_check.setVisible(index == 0)
+            self.rb_detail_check.setVisible(key == "riskbird")
         # 双标签开关：风鸟不可用
         self._sync_dual_tab_enabled()
         if self._dual_enabled():
@@ -1153,19 +1985,16 @@ class MainWindow(QMainWindow):
             )
         # 刷新各平台已采集条数显示，并提示续采起点
         self._update_platform_counts()
-        _names = ["风鸟", "企知道", "爱企查"]
-        _cnt = len(self._all_crawlers[index].results)
+        _cnt = len(self.crawler.results)
         _g = self._get_global_index()
-        self._append_log(f"{_names[index]} 平台已采集 {_cnt} 条；全局累计 {_g} 条，点开始采集将从第 {_g + 1} 条继续")
+        self._append_log(f"{self.SOURCE_LABELS[key]} 平台已采集 {_cnt} 条；全局累计 {_g} 条，点开始采集将从第 {_g + 1} 条继续")
     
     def _update_window_title(self):
-        """根据当前数据源更新窗口标题和界面标题"""
-        site_names = ["风鸟", "企知道", "爱企查"]
-        name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
-        self.setWindowTitle(f"{name} 企业数据采集工具")
+        """窗口标题固定为工具名（不随数据源切换而变）"""
+        self.setWindowTitle(self.APP_TITLE)
         # 同时更新界面内的大标题
         if hasattr(self, 'title_label'):
-            self.title_label.setText(f"{name} 企业数据采集工具")
+            self.title_label.setText(self.APP_TITLE)
         
     def _show_login(self):
         dlg = LoginDialog(self.crawler, self)
@@ -1217,23 +2046,14 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self._append_log(f"导航失败：{e}")
             
-            site_names = ["riskbird.com", "qizhidao.com", "aiqicha.baidu.com"]
-            site_name = site_names[self._current_source] if self._current_source < len(site_names) else "未知"
+            site_name = self.SOURCE_DOMAINS.get(self._source_key(), "未知平台")
             self._append_log(f"已打开 {site_name} 网站")
         else:
             self._append_log(f"打开网站失败：{msg}")
 
     def _on_login_status(self, success: bool, msg: str):
-        if success:
-            self.login_status_lbl.setText("已登录")
-            self.login_status_lbl.setStyleSheet(
-                "QLabel { padding: 5px 12px; border-radius: 4px; background: #d4edda; color: #155724; }"
-            )
-        else:
-            self.login_status_lbl.setText("未登录")
-            self.login_status_lbl.setStyleSheet(
-                "QLabel { padding: 5px 12px; border-radius: 4px; background: #f8d7da; color: #721c24; }"
-            )
+        """风鸟登录状态信号：界面上的登录/未登录标识已按需求去掉，只写进日志"""
+        self._append_log(("✅ 已检测到登录态：" if success else "⚠ 未检测到登录态：") + (msg or ""))
 
     def _on_manual_check(self, msg: str):
         self.statusBar().showMessage(msg, 5000)
@@ -1283,7 +2103,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", f"全部 {len(self._companies)} 家公司已采集完成，无需继续。")
             return
         # 首次开始采集时创建桌面会话文件夹（以第一次开始采集的时间命名）
-        self._get_or_create_session_folder()
+        folder = self._get_or_create_session_folder()
+        self._register_task(folder)
         self._last_autosave_bucket = start_index // 10
         if start_index > 0:
             self._append_log(f"↻ 续采：已完成 {start_index} 条，从第 {start_index + 1} 条继续")
@@ -1367,6 +2188,7 @@ class MainWindow(QMainWindow):
         count = sum(len(c.results) for c in self._active_crawlers())
         self._append_log(f" {self._get_time_summary(count)}")
         self._auto_save("点击停止")
+        self._finish_task(_tasks.TASK_STATUS_STOPPED, self._get_global_index())
 
     def _on_crawl_finished(self):
         if self._dual_running:
@@ -1385,6 +2207,9 @@ class MainWindow(QMainWindow):
         # 输出用时摘要
         self._append_log(f"✅ {self._get_time_summary(count)}")
         self._auto_save("采集完成")
+        if HAS_YZD:
+            self._finish_task(_tasks.TASK_STATUS_DONE, total_all)
+            self._maybe_auto_import("采集完成")
 
     def _on_dual_setup_failed(self, msg: str):
         """双标签环境没准备好（共享浏览器/会话附加失败）"""
@@ -1424,6 +2249,9 @@ class MainWindow(QMainWindow):
         self._update_platform_counts()
         self._append_log(f"✅ 双标签并行结束：企知道 {qn} 条、爱企查 {an} 条 {self._get_time_summary(qn + an)}")
         self._auto_save("双标签采集完成")
+        if HAS_YZD:
+            self._finish_task(_tasks.TASK_STATUS_DONE, total_all)
+            self._maybe_auto_import("双标签采集完成")
         self._append_log("ℹ 共享浏览器保持打开（下次开双标签直接复用）；如不需要可手动关掉它")
 
     def _update_progress(self, current: int, total: int):
@@ -1659,12 +2487,15 @@ class MainWindow(QMainWindow):
 
     # ── 跨平台进度 / 桌面会话文件夹 / 自动保存 ──
     def _all_results(self) -> list:
-        """合并三个平台的全部采集结果（风鸟→企知道→爱企查 顺序）
+        """合并三个平台的全部采集结果（按 MERGE_ORDER：风鸟→企知道→爱企查）
 
         拿的是每个爬虫的快照（连 dict 一起拷），采集线程同时追加也不会写坏。
+        这里的顺序不能随便改：同名公司合并时先出现的非空字段会胜出，
+        与下拉框的展示顺序无关。
         """
         combined = []
-        for c in self._all_crawlers:
+        for key in self.MERGE_ORDER:
+            c = self._by_key[key]
             if hasattr(c, "snapshot_results"):
                 combined.extend(c.snapshot_results())
             else:
@@ -1710,15 +2541,58 @@ class MainWindow(QMainWindow):
             self._append_log(f"⚠ 创建自动保存目录失败：{e}")
             return None
 
+    # ── 采集任务登记（“导入其他”要列历史任务，靠这份索引）──
+    def _register_task(self, folder):
+        """一次“开始采集”对应一个任务：任务 id = 会话文件夹名，任务名取采集文档名
+
+        重复点“开始采集”（暂停后继续、采完又接着跑同一批文件）走同一个任务，
+        所以这里必须保留最早那次 started_at，不能把历史任务的采集时间刷成现在。
+        """
+        if not HAS_YZD or folder is None:
+            return
+        try:
+            tid = Path(folder).name
+            task = _tasks.new_task(tid, self._excel_paths, str(folder),
+                                   count=self._get_global_index())
+            existing = next((t for t in _tasks.load_tasks() if t.get("id") == tid), None)
+            if existing:
+                task["started_at"] = existing.get("started_at") or task["started_at"]
+            _tasks.upsert_task(task)
+            self._task_id = tid
+            if existing is None:
+                self._append_log(f"📁 已登记采集任务：{task['name']}")
+        except Exception as e:
+            self._append_log(f"⚠ 采集任务登记失败：{e}")
+
+    def _update_task_files(self):
+        """采集途中加文件：不拆新任务，只把当前任务的任务名/文件列表补齐"""
+        if not HAS_YZD or not self._task_id:
+            return
+        try:
+            _tasks.update_task(self._task_id,
+                               name=_tasks.make_task_name(self._excel_paths),
+                               files=[os.path.basename(p) for p in self._excel_paths])
+        except Exception as e:
+            self._append_log(f"⚠ 采集任务文件列表更新失败：{e}")
+
+    def _finish_task(self, status: str, count: int):
+        """采集完成/停止：补上结束时间与条数（“导入其他”列表里能看到采了多少条）"""
+        if not HAS_YZD or not self._task_id:
+            return
+        try:
+            if _tasks.finish_task(self._task_id, status, count):
+                self._append_log(f"📁 任务「{status}」已记录：合计 {count} 条")
+        except Exception as e:
+            self._append_log(f"⚠ 任务结束状态写入失败：{e}")
+
     def _update_platform_counts(self):
         """刷新界面上各平台已采集条数显示"""
         if not hasattr(self, "platform_count_lbl"):
             return
         counts = [len(c.results) for c in self._all_crawlers]
+        parts = [f"{name}: {cnt} 条" for name, cnt in zip(self.PLATFORM_NAMES, counts)]
         total = sum(counts)
-        self.platform_count_lbl.setText(
-            f"风鸟: {counts[0]} 条    企知道: {counts[1]} 条    爱企查: {counts[2]} 条    合计: {total} 条"
-        )
+        self.platform_count_lbl.setText("    ".join(parts) + f"    合计: {total} 条")
 
     def _start_autosave(self, combined: list, folder: str, reason: str = ""):
         """起一个后台写盘线程（引用存在 self 上，否则 QThread 被 GC 会直接崩）"""
@@ -1733,6 +2607,12 @@ class MainWindow(QMainWindow):
 
     def _on_autosave_finished(self, ok: bool, summary: str):
         self._append_log(("✅ " if ok else "⚠ ") + summary)
+        if ok and HAS_YZD and self._task_id:
+            # 条数跟着自动保存同步进任务索引，“导入其他”列表里的条数才不会是旧值
+            try:
+                _tasks.update_task(self._task_id, count=self._get_global_index())
+            except Exception:
+                pass
         pending, self._autosave_pending = self._autosave_pending, None
         if pending:
             combined, folder, reason = pending
@@ -1782,11 +2662,12 @@ class MainWindow(QMainWindow):
             return
         try:
             self._write_merged_excel(combined, path)
-            counts = [len(c.results) for c in self._all_crawlers]
+            detail = " / ".join(f"{name} {len(c.results)} 条"
+                                 for name, c in zip(self.PLATFORM_NAMES, self._all_crawlers))
             cleaned_path = self._export_cleaned_library(combined, path)
             msg = (
                 f"已合并导出 {len(combined)} 条数据到:\n{path}\n\n"
-                f"风鸟 {counts[0]} 条 / 企知道 {counts[1]} 条 / 爱企查 {counts[2]} 条"
+                f"{detail}"
             )
             if cleaned_path:
                 msg += f"\n\n已另存清洗后入库数据到:\n{cleaned_path}"
@@ -1825,16 +2706,405 @@ class MainWindow(QMainWindow):
         """薄封装：与自动保存共用模块级写盘函数，保证两条路径出的表完全一致"""
         return write_merged_excel(results, filepath, log=self._append_log)
 
+    # ── 清洗数据（其他渠道的名单 → 入库格式）──────
+    def _clean_external_data(self):
+        """「清洗数据」入口：多选外部表格 → 智能匹配列 → 清洗 → 写出入库格式文件"""
+        if not HAS_CLEANER:
+            QMessageBox.warning(self, "提示", "清洗模块未加载，无法清洗数据")
+            return
+        if self._cleaning:
+            QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要清洗的数据文件（可多选）", self._get_last_import_dir(),
+            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+        if not paths:
+            return
+        self._append_log(f"🧹 清洗数据：选中 {len(paths)} 个文件")
+
+        default_dir = os.path.dirname(paths[0]) or str(self._get_desktop_dir())
+        out, _ = QFileDialog.getSaveFileName(
+            self, "清洗结果保存为（与自动保存的入库文件同格式）",
+            os.path.join(default_dir, CLEAN_FILE_NAME), "Excel 文件 (*.xlsx)")
+        if not out:
+            self._append_log("已取消清洗数据（未选保存位置）")
+            return
+        if not out.lower().endswith(".xlsx"):
+            out += ".xlsx"
+        if os.path.exists(out):
+            if QMessageBox.question(self, "覆盖已有文件",
+                                    f"目标文件已存在，确认覆盖？\n{out}",
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) != QMessageBox.Yes:
+                self._append_log("已取消清洗数据（不覆盖已有文件）")
+                return
+
+        # 清洗也要走后台：多个大文件读下来几十秒，直接在 GUI 线程里做就是白屏
+        self._cleaning = True
+        self.setEnabled(False)
+        prog = YzdProgressDialog(None, "正在清洗数据")
+        prog.set_text(f"正在清洗 {len(paths)} 个文件…", "清洗在后台进行，请勿关闭程序。")
+        self._clean_progress = prog
+        prog.show()
+
+        worker = ExternalCleanWorker(paths, out, template_dirs=[
+            os.path.dirname(out), default_dir, self._get_last_import_dir()])
+        worker.logged.connect(self._append_log)
+        worker.finished_clean.connect(self._on_clean_finished)
+        self._clean_worker = worker
+        worker.start()
+
+    def _on_clean_finished(self, ok: bool, msg: str):
+        self._cleaning = False
+        self.setEnabled(True)
+        if self._clean_progress is not None:
+            try:
+                self._clean_progress.allow_close()
+                self._clean_progress.close()
+            except Exception:
+                pass
+            self._clean_progress = None
+        self.activateWindow()
+        self._append_log(("✅ " if ok else "❌ ") + msg.replace("\n", "  "))
+        if ok:
+            QMessageBox.information(self, "清洗完成", msg)
+        else:
+            QMessageBox.warning(self, "清洗未完成", msg)
+
+    # ── 云展动力：绑定账号 / 导入客户库 ──────
+    def _refresh_yzd_status(self):
+        """把绑定态反到界面上：启动时从本地文件恢复，绑完/换号后刷新"""
+        if not hasattr(self, "yzd_status_lbl"):
+            return
+        if not HAS_YZD:
+            self.yzd_status_lbl.setText("云展模块未加载（缺 yzd_client / task_registry）")
+            self.yzd_status_lbl.setStyleSheet(
+                "QLabel { padding: 4px 10px; border-radius: 4px; background: #fdecea; color: #c62828; }")
+            self.bind_yzd_btn.setEnabled(False)
+            self.import_yzd_btn.setEnabled(False)
+            return
+        if self._yzd_phone:
+            self.yzd_status_lbl.setText(f"已绑定云展账号：{self._yzd_phone}")
+            self.yzd_status_lbl.setStyleSheet(
+                "QLabel { padding: 4px 10px; border-radius: 4px; background: #e8f5e9; color: #2e7d32; }")
+            self.bind_yzd_btn.setText("更换绑定账号")
+        else:
+            self.yzd_status_lbl.setText("未绑定云展动力账号")
+            self.yzd_status_lbl.setStyleSheet(
+                "QLabel { padding: 4px 10px; border-radius: 4px; background: #f0f0f0; color: #999; }")
+            self.bind_yzd_btn.setText("绑定云展动力账号")
+
+    def _bind_yzd_account(self):
+        """接口3：先本地校格式（省一次往返，提示也能即时出现），后端 msg 直接当用户文案"""
+        if not HAS_YZD:
+            QMessageBox.warning(self, "提示", "云展模块未加载，无法绑定账号")
+            return
+        if self._yzd_worker is not None and self._yzd_worker.isRunning():
+            return
+        tip = "请输入云展动力手机号"
+        if self._yzd_phone:
+            tip += f"（当前绑定：{self._yzd_phone}）"
+        phone, ok = QInputDialog.getText(self, "绑定云展动力账号", tip,
+                                         QLineEdit.Normal, self._yzd_phone)
+        if not ok:
+            return
+        phone = (phone or "").strip().replace(" ", "").replace("-", "")
+        if not phone or not _yzd.PHONE_RE.match(phone):
+            QMessageBox.warning(self, "提示", "请输入正确的手机号")
+            return
+        self.bind_yzd_btn.setEnabled(False)
+        self.statusBar().showMessage("正在校验云展手机号…")
+        self._append_log(f"🔗 正在校验云展动力账号 {phone} …")
+        self._yzd_worker = YzdBindWorker(phone)
+        self._yzd_worker.finished_bind.connect(self._on_bind_finished)
+        self._yzd_worker.start()
+
+    def _on_bind_finished(self, ok: bool, msg: str):
+        self.bind_yzd_btn.setEnabled(HAS_YZD)
+        if ok:
+            self._yzd_phone = msg
+            saved = _tasks.save_account(msg)
+            self._append_log(f"✅ 已绑定云展动力账号：{msg}"
+                             + ("" if saved else "（本地保存失败，下次启动需重新绑定）"))
+            QMessageBox.information(self, "绑定成功", f"已绑定云展动力账号：{msg}")
+        else:
+            # 后端文案就是“请输入正确的手机号”/“云展账号不存在”，不自造一套
+            self._append_log(f"⚠ 绑定云展账号失败：{msg}")
+            QMessageBox.warning(self, "绑定失败", msg)
+        self._refresh_yzd_status()
+        if not self.stop_btn.isEnabled():
+            self.statusBar().showMessage("就绪")
+
+    def _open_yzd_import(self):
+        """“导入云展客户库”入口：未绑定先拦下，绑定后进选分组弹窗"""
+        if not HAS_YZD:
+            QMessageBox.warning(self, "提示", "云展模块未加载，无法导入客户库")
+            return
+        if self._yzd_importing:
+            QMessageBox.information(self, "提示", "正在导入云展客户库，请等当前导入完成")
+            return
+        if not self._yzd_phone:
+            QMessageBox.warning(self, "提示", "请先绑定云展动力账号")
+            return
+        # 把装上本功能之前的历史会话补登进来，不然那些采好的数据永远列不出来
+        try:
+            added = _tasks.backfill_tasks()
+            if added:
+                self._append_log(f"📁 已补登记历史采集会话 {added} 个，可在「导入其他」里选中")
+        except Exception as e:
+            self._append_log(f"⚠ 历史会话补登记失败：{e}")
+        dlg = YzdGroupDialog(self._yzd_phone, self)
+        self._yzd_dialog = dlg
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        group = dlg.chosen_group or {}
+        tasks = dlg.chosen_tasks if dlg.mode == YzdGroupDialog.MODE_OTHERS else None
+        self._start_yzd_import(group, tasks)
+
+    def _current_task_id(self):
+        return self._session_folder.name if self._session_folder is not None else ""
+
+    # ── 采集完自动导入云展客户库 ──────
+    def _on_auto_import_toggled(self, checked: bool):
+        """勾选时就先把分组选好：等采完了才弹窗问导哪个库，人早就不在电脑前了"""
+        if not hasattr(self, "log_text"):
+            return
+        if not checked:
+            self._auto_import_group = None
+            self._append_log("已关闭「采集完自动导入云展客户库」，采集完成后需手动点导入")
+            return
+        if not HAS_YZD:
+            self._revert_auto_import("云展模块未加载，无法自动导入客户库")
+            return
+        if self._yzd_importing or self._cleaning:
+            self._revert_auto_import("当前有任务正在执行，请等它结束后再开启自动导入")
+            return
+        if not self._yzd_phone:
+            self._revert_auto_import("请先点「绑定云展动力账号」，绑定后才能选自动导入的目标分组")
+            return
+        dlg = YzdGroupDialog(self._yzd_phone, self, pick_group_only=True)
+        self._yzd_dialog = dlg
+        if dlg.exec_() != QDialog.Accepted or not dlg.chosen_group:
+            self._auto_import_group = None
+            chk = getattr(self, "auto_import_check", None)
+            if chk is not None:
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(False)
+            self._append_log("ℹ 没选定分组，“采集完自动导入”已取消")
+            return
+        self._auto_import_group = dlg.chosen_group
+        flag = self._flag_from_group(self._auto_import_group)
+        self._append_log(
+            f"🤖 已设置采集完自动导入：分组「{self._auto_import_group.get('groupName') or ''}」"
+            f"（{'国外' if flag else '国内'}客户库），采集完成后自动上传并在日志提示结果")
+
+    def _revert_auto_import(self, msg: str):
+        """开不了就把勾退回未勾选，别让界面显示“已开启”但实际不生效"""
+        self._auto_import_group = None
+        chk = getattr(self, "auto_import_check", None)
+        if chk is not None:
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+        self._append_log(f"⚠ {msg}")
+        QMessageBox.warning(self, "无法开启自动导入", msg)
+
+    def _maybe_auto_import(self, reason: str):
+        """采集正常结束时按勾选自动上传；点“停止采集”不走这里（人工中断不算“采集完”）"""
+        chk = getattr(self, "auto_import_check", None)
+        if chk is None or not chk.isChecked():
+            return
+        if self._yzd_importing:
+            return
+        group = self._auto_import_group or {}
+        if not group.get("id"):
+            self._append_log("⚠ 已勾选自动导入但没拿到分组，本次不自动上传；可手动点「导入云展客户库」")
+            return
+        if not self._all_results():
+            self._append_log("ℹ 本次没采到数据，自动导入已跳过")
+            return
+        tid = self._current_task_id()
+        if not tid:
+            self._append_log("⚠ 本次采集没登记到任务索引（会话目录未创建），自动导入已跳过")
+            return
+        # 固定传本次会话（即使索引里有更早的任务也不会错传）
+        tasks = [t for t in _tasks.load_tasks() if t.get("id") == tid] or [
+            {"id": tid, "name": f"本次采集 {tid}", "folder": str(self._session_folder)}]
+        self._append_log(
+            f"🤖 {reason}，按勾选自动导入云展客户库：分组「{group.get('groupName') or ''}」")
+        self._start_yzd_import(group, tasks)
+
+    def _build_jobs(self, tasks: list) -> list:
+        """把任务列表换成线程可吃的 jobs
+
+        当前会话直接吃内存快照（避开“刚采完还没落盘”的空档），
+        历史任务才回读会话目录里的原数据文件。
+        """
+        jobs = []
+        tid = self._current_task_id()
+        for t in tasks or []:
+            name = t.get("name") or t.get("id") or "未命名任务"
+            if t.get("id") and t.get("id") == tid and self._all_results():
+                jobs.append({"id": t.get("id"), "name": name,
+                             "records": self._all_results(), "raw_file": ""})
+                continue
+            raw_file = t.get("raw_file") or ""
+            if not raw_file and t.get("folder"):
+                raw_file = os.path.join(str(t.get("folder")), RAW_FILE_NAME)
+            jobs.append({"id": t.get("id") or "", "name": name,
+                         "records": None, "raw_file": raw_file})
+        return jobs
+
+    def _start_yzd_import(self, group: dict, tasks):
+        if self._yzd_importing:
+            return
+        if tasks is None:
+            latest = _tasks.latest_task()
+            if not latest:
+                QMessageBox.warning(self, "提示",
+                                    "暂无采集任务：请先在主界面完成一次采集")
+                return
+            jobs = self._build_jobs([latest])
+        else:
+            jobs = self._build_jobs(tasks)
+        if not jobs:
+            QMessageBox.warning(self, "提示", "没有可导入的采集任务")
+            return
+        empty = [j for j in jobs if not j["raw_file"] and not (j["records"] or [])]
+        if len(empty) == len(jobs):
+            QMessageBox.warning(self, "提示", "选中的采集任务里没有数据")
+            return
+
+        import tempfile
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="yzd_import_")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", f"无法创建临时上传目录：{e}")
+            return
+
+        self._yzd_jobs = jobs
+        self._yzd_importing = True
+        group_name = group.get("groupName") or ""
+        self._yzd_group_name = group_name
+        flag = self._flag_from_group(group)
+        self._append_log(f"⬆ 开始导入云展客户库：分组「{group_name}」（{'国外' if flag else '国内'}）"
+                         f"· 共 {len(jobs)} 个任务")
+
+        # 锁界面：直接把主窗口 setEnabled(False)。比逐个缓存按钮状态可靠——
+        # 导入期间采集线程的完成/停止槽函数还会改子控件状态，
+        # 而父窗口禁用时子控件的有效状态永远是禁用，解锁后自然回到它们自己的最新状态。
+        self.setEnabled(False)
+        prog = YzdProgressDialog(None, f"正在导入云展客户库：{group_name}")
+        self._yzd_progress = prog
+        prog.show()
+
+        worker = YzdImportWorker(self._yzd_phone, jobs, group.get("id"), flag, tmp_dir)
+        worker.logged.connect(self._append_log)
+        worker.progress.connect(self._on_yzd_import_progress)
+        worker.finished_all.connect(self._on_yzd_import_finished)
+        self._yzd_import_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _flag_from_group(group: dict) -> int:
+        value = group.get("foreignFlag")
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _on_yzd_import_progress(self, done: int, total: int, text: str):
+        if self._yzd_progress is not None:
+            self._yzd_progress.set_text(text,
+                                        f"已完成 {done}/{total} 个任务。导入期间请勿关闭程序。")
+
+    def _unlock_yzd_import(self):
+        self._yzd_importing = False
+        self.setEnabled(True)
+        if self._yzd_progress is not None:
+            try:
+                self._yzd_progress.allow_close()
+                self._yzd_progress.close()
+            except Exception:
+                pass
+            self._yzd_progress = None
+        self.activateWindow()
+
+    def _on_yzd_import_finished(self, results: list, fatal: str):
+        # 后端只按“导入行数”回计数，失败行只计 failTotal 不说原因，这里只如实透传三个数
+        if fatal:
+            self._append_log(f"❌ 导入异常：{fatal}")
+            self._unlock_yzd_import()
+            QMessageBox.critical(self, "导入失败", fatal)
+            return
+        lines = []
+        saved_total = 0
+        for idx, item in enumerate(results or []):
+            name, imp, sav, fail, err = item
+            saved_total += sav
+            if err:
+                lines.append(f"· {name}：导入失败（{err}）")
+                self._append_log(f"❌ {name}：{err}")
+            else:
+                lines.append(f"· {name}：上传 {imp} 条 / 入库成功 {sav} 条 / 失败 {fail} 条")
+                self._append_log(f"✅ {name}：上传 {imp} / 入库 {sav} / 失败 {fail}")
+            if idx < len(self._yzd_jobs):
+                job = self._yzd_jobs[idx]
+                if job.get("id"):
+                    try:
+                        _tasks.update_task(
+                            job["id"],
+                            yzd_import_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            yzd_group=self._yzd_group_name,
+                            yzd_saved=sav)
+                    except Exception as e:
+                        self._append_log(f"⚠ 任务导入结果回写失败：{e}")
+        # 先解锁再弹结果：锁着弹框会让用户以为还没导完
+        self._unlock_yzd_import()
+        self._append_log("ℹ 云展接口不做重复校验，同一批数据重复导入会在客户库里产生多条记录")
+        self._append_log("ℹ 分组名括号里的「客户数」是云展后端统计值（最长约 60 秒才更新），"
+                         "刚导完数字没变是正常的，在弹窗里点「刷新」重查即可")
+        summary = "\n".join(lines) if lines else "没有任何任务被处理"
+        if saved_total == 0:
+            QMessageBox.warning(self, "导入结果",
+                                f"未入库任何客户：\n{summary}\n\n请查看运行日志里的后端返回。")
+        else:
+            QMessageBox.information(self, "导入结果",
+                                    f"共入库 {saved_total} 条客户：\n\n{summary}")
+        import shutil
+        worker, self._yzd_import_worker = self._yzd_import_worker, None
+        if worker is not None:
+            try:
+                shutil.rmtree(worker.tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     # ── 退出 ───────────────────────────────
     def closeEvent(self, event):
         """关窗口前给后台自动保存留时间：写完再退
 
         写盘是“临时文件 + 原子替换”，即使被打断也不会把已有文件写成半个，
         但这里等一下能让最后一次保存真正落盘。"""
+        if self._yzd_importing:
+            # 导入中途退程序会把云展那边留下“传了一半”的数据，而且线程被强杀只会拿到半个结果
+            QMessageBox.information(self, "请等一下",
+                                    "正在导入云展客户库，请等导入完成后再关闭程序。")
+            event.ignore()
+            return
+        if self._cleaning:
+            # 清洗线程还在读写文件，强杀只会得到一个没写完的 Excel
+            QMessageBox.information(self, "请等一下",
+                                    "正在清洗数据，请等清洗完成后再关闭程序。")
+            event.ignore()
+            return
         worker = self._autosave_worker
         if worker is not None and worker.isRunning():
             self._append_log("⏳ 自动保存正在写盘，稍等几秒…")
             worker.wait(15000)
+        bind_worker = self._yzd_worker
+        if bind_worker is not None and bind_worker.isRunning():
+            bind_worker.wait(5000)
         super().closeEvent(event)
 
 

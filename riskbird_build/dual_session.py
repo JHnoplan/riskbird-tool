@@ -96,9 +96,14 @@ def _find_chrome() -> str:
 
 
 def is_shared_chrome_alive(port: int = DUAL_PORT) -> bool:
-    """共享 Chrome 的调试端口是否可用"""
+    """共享 Chrome 的调试端口是否可访问。
+
+    只探端口、不看页面数：“Chrome 在跑但一个窗口都没了”不能当成没在跑——
+    那样会再拉一个同配置目录的 Chrome，新进程只会把请求转交给老进程后自己退出，
+    结果谁都连不上，界面表现就是一直“启动失败”。
+    """
     try:
-        return bool(requests.get(f"http://127.0.0.1:{port}/json/list", timeout=3).json())
+        return requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3).status_code == 200
     except Exception:
         return False
 
@@ -177,6 +182,17 @@ def list_page_targets(port: int = DUAL_PORT) -> list:
     return [t for t in data if isinstance(t, dict) and t.get("type") == "page"]
 
 
+def open_window(port: int = DUAL_PORT, url: str = "about:blank"):
+    """在共享 Chrome 里新开一个窗口，返回 target id（失败返回 None）。
+
+    Selenium 附加时至少要有一个窗口能拿句柄，0 窗口的 Chrome 会让附加直接报错。
+    """
+    try:
+        return (requests.put(f"http://127.0.0.1:{port}/json/new?url={url}", timeout=5).json() or {}).get("id")
+    except Exception:
+        return None
+
+
 def cleanup_blank_tabs(log, keep_ids=(), port: int = DUAL_PORT) -> int:
     """关掉共享浏览器里遗留的空白窗口（about:blank / chrome://newtab）。
 
@@ -185,8 +201,12 @@ def cleanup_blank_tabs(log, keep_ids=(), port: int = DUAL_PORT) -> int:
     keep_ids 里指定的会话标签即使正好是空白也不关。返回实际关闭数。
     """
     keep = {str(i) for i in keep_ids if i}
-    targets = [t for t in list_page_targets(port)
+    pages = list_page_targets(port)
+    targets = [t for t in pages
                if _is_blank_url(t.get("url")) and str(t.get("id")) not in keep]
+    # 绝不把最后一个窗口也关掉：0 窗口的 Chrome 会让接下来的附加拿不到句柄，
+    # 刚启动的共享浏览器只有一个空白窗口，那个窗口就是给会话用的
+    targets = targets[:max(0, len(pages) - 1)]
     if not targets:
         return 0
     closed = 0
@@ -238,7 +258,13 @@ def attach_qizhidao(crawler, log, port: int = DUAL_PORT) -> bool:
             return True
         if crawler.driver is not None:
             crawler.close_browser()
-        return bool(crawler.start_browser(headed=True, attach_port=port))
+        if crawler.start_browser(headed=True, attach_port=port):
+            return True
+        # 最常见的卡点是共享浏览器一个窗口都没有，补开一个再试一次
+        if not list_page_targets(port) and open_window(port):
+            log("共享浏览器没有窗口，已补开一个，重新附加企知道会话…")
+            return bool(crawler.start_browser(headed=True, attach_port=port))
+        return False
     except Exception as e:
         log(f"❌ 企知道会话附加失败：{e}")
         return False
@@ -259,13 +285,21 @@ def setup_dual(qzd_crawler, aqc_crawler, log, port: int = DUAL_PORT):
     """开启双标签：启动共享浏览器 + 两个会话各自附加。返回 (是否成功, 提示信息)"""
     if not ensure_shared_chrome(log, port):
         return False, "共享浏览器启动失败"
+    # 上一轮可能把窗口全关完了（进程还在但 0 窗口），先补一个，否则下面附加必挂
+    if not list_page_targets(port):
+        if not open_window(port):
+            return False, "共享浏览器无可用窗口（请手动结束 Chrome 进程后重试）"
+        log("共享浏览器无窗口，已新开一个")
     # 在两个会话附加之前先洗一次：此刻还没有属于本会话的标签，任何空白页
-    # 都是上一轮遗留的，关掉不会误伤正在采集的窗口
+    # 都是上一轮遗留的，关掉不会误伤正在采集的窗口（清理内部会保留至少一个窗口）
     cleanup_blank_tabs(log, keep_ids=_session_tab_ids(qzd_crawler, aqc_crawler), port=port)
     if not attach_qizhidao(qzd_crawler, log, port):
         return False, "企知道会话附加失败"
     if not attach_aiqicha(aqc_crawler, log, port):
         return False, "爱企查会话附加失败"
+    # Chrome 自己启动时可能带一个 chrome://newtab 空窗口，附加前那次清理为了保底窗口
+    # 没法关它；现在两个会话都落到真实页面上了，再洗一次把这种空窗口收掉
+    cleanup_blank_tabs(log, keep_ids=_session_tab_ids(qzd_crawler, aqc_crawler), port=port)
     return True, "双标签已就绪"
 
 

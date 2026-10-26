@@ -58,7 +58,7 @@ base.save(f"{OUT}/overview.png")
 
 steps = {
     "step1_source": [(win.source_combo, "1")],
-    "step2_login": [(win.open_web_btn, "2"), (win.login_status_lbl, "2")],
+    "step2_login": [(win.open_web_btn, "2")],
     "step3_file": [(win.select_file_btn, "3")],
     "step4_start": [(win.start_btn, "4"), (win.pause_btn, "a"),
                     (win.resume_btn, "b"), (win.stop_btn, "c"), (win.delay_spin, "d")],
