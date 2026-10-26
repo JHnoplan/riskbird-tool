@@ -1,0 +1,6 @@
+# 1688 企业数据自动采集工具 依赖
+# 与主项目共用 .venv；如单独环境请 pip install -r requirements.txt
+PyQt5>=5.15
+selenium>=4.15
+openpyxl>=3.1
+requests>=2.28
