@@ -47,10 +47,15 @@ assert tencent["客户名称"] == "马化腾" and tencent["岗位"] == "法定�
 assert set(tencent["数据来源"].split(",")) == {"风鸟", "企知道"}
 assert "13800138000" in tencent["手机号"] and "13700137000" in tencent["手机号"]
 assert "0755-88881111" in tencent["固话"] and "010-65985888转802" in tencent["固话"]
+# 多值分隔符：手机号/固话/邮箱全部用英文逗号（以前手机号、固话用“/”，导入时会被当成一个号码）
+assert tencent["手机号"].count(",") == 2 and "/" not in tencent["手机号"], tencent["手机号"]
+assert tencent["固话"].count(",") == 1 and "/" not in tencent["固话"], tencent["固话"]
+assert "," in tencent["邮箱"] and "/" not in tencent["邮箱"], tencent["邮箱"]
 huawei = next(r for r in rows if "华为" in r["企业名称"])
 assert huawei["客户名称"] == "任正非"
 assert "18800001111" in huawei["手机号"] and "12345" not in huawei["固话"]
-assert huawei["邮箱"] == "sales@huawei.com;service@huawei.com"
+assert huawei["邮箱"] == "sales@huawei.com,service@huawei.com", \
+    "手机号/固话/邮箱多值统一用英文逗号分隔"
 
 out = "/tmp/清洗后客户库入库数据_test.xlsx"
 tpl = C.locate_template() or TEMPLATE
@@ -69,3 +74,18 @@ print("\n输出行2:", r2)
 # A-I 与 J-R 两块数据一致
 assert r2[0] == r2[9] and r2[1] == r2[10] and r2[3] == r2[12] and r2[8] == r2[17]
 print("\nALL ASSERTS PASSED")
+
+# ── 风鸟新增状态与多联系方式（详情页"更多"能给出 12-16 个电话） ──
+import re as _re
+from customer_library_cleaner import is_valid_record, split_phones, split_emails
+
+for st in ("访问频繁待重试", "额度用尽待重试", "未找到",
+           "模糊查询额度用尽待重试", "模糊查询额度用尽待重试（登记状态:在营）", "在营"):
+    valid = is_valid_record({"公司名": "X公司", "状态": st, "电话": "13800001111"})
+    assert valid == (st == "在营"), (st, valid)
+
+mb, ld = split_phones("13815037273；17368303772；0519-88776088；021-69926000；16970087955")
+assert all(_re.fullmatch(r"1[3-9]\d{9}", m) for m in mb), mb
+assert len(mb) == 3 and len(ld) == 2, (mb, ld)
+assert len(split_emails("a@b.com；c@d.org；bad@@x")) == 2
+print("\n✅ 风鸟新增状态剔除与多联系方式拆分断言通过")

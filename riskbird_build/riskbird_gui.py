@@ -25,6 +25,12 @@ from qizhidao_crawler import QiZhiDaoCrawler
 from aiqicha_crawler_v2 import AiQiChaCrawlerV2
 
 try:
+    import dual_session as _dual
+    HAS_DUAL = True
+except ImportError:
+    HAS_DUAL = False
+
+try:
     import customer_library_cleaner as _cleaner
     HAS_CLEANER = True
 except ImportError:
@@ -387,7 +393,180 @@ class CompanyColumnDialog(QDialog):
         super().accept()
 
 
+# ══════════════════════════════════════════
+#  自动保存的两份固定文件（与“导出 Excel”同效果，不分平台）
+# ══════════════════════════════════════════
+RAW_FILE_NAME = "企业数据_全部平台.xlsx"
+CLEAN_FILE_NAME = "清洗后客户库入库数据.xlsx"
+
+# 统一表头：常用字段优先，其余按首次出现顺序补充
+_PREFERRED_HEADERS = [
+    "公司名", "状态", "数据来源", "法定代表人", "注册资本", "成立日期",
+    "统一社会信用代码", "电话", "邮箱", "官网", "地址", "简介",
+    "经营范围", "经营业务范围", "所属行业", "企业类型", "营业期限",
+    "登记机关", "核准日期", "参保人数", "搜索结果URL",
+]
+
+
+def _quiet_log(msg):
+    """没有日志回调时吐到 stdout（打包后无窗口也无影响），不报错中断写盘"""
+    print(msg)
+
+
+def _drop_tmp(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _atomic_save_workbook(wb, filepath):
+    """先写同目录临时文件再原子替换。
+
+    自动保存是反复覆盖同一个文件：直接写目标文件时，一旦写一半时进程被杀或磁盘满，
+    上一份好文件就变成半个坏文件。换成 tmp + os.replace 后，要么新要么旧，不会坏。
+    文件被 Excel/WPS 占用时 os.replace 报 PermissionError，由调用方提示。
+    """
+    tmp = f"{filepath}.tmp"
+    _drop_tmp(tmp)
+    try:
+        wb.save(tmp)
+        os.replace(tmp, filepath)
+    finally:
+        _drop_tmp(tmp)
+
+
+def collect_headers(results: list) -> list:
+    """合并多平台字段：各平台字段不一样，按首次出现顺序补齐"""
+    keys = []
+    for r in results:
+        for k in r.keys():
+            if k not in keys:
+                keys.append(k)
+    return ([k for k in _PREFERRED_HEADERS if k in keys]
+            + [k for k in keys if k not in _PREFERRED_HEADERS])
+
+
+def write_merged_excel(results: list, filepath: str, log=None) -> int:
+    """把三个平台的全部结果合并写成一个原数据 Excel（统一表头 + 样式，含“数据来源”列）"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    log = log or _quiet_log
+    headers = collect_headers(results)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "企业数据(全部平台)"
+
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Border(left=Side(style="thin"), right=Side(style="thin"),
+                  top=Side(style="thin"), bottom=Side(style="thin"))
+
+    cell = ws.cell(row=1, column=1, value="序号")
+    cell.font = header_font
+    cell.fill = header_fill
+    cell.alignment = header_align
+    cell.border = thin
+    for col, h in enumerate(headers, 2):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin
+
+    data_align = Alignment(vertical="top", wrap_text=True)
+    center_align = Alignment(horizontal="center")
+    for row_idx, r in enumerate(results, 2):
+        ws.cell(row=row_idx, column=1, value=row_idx - 1).alignment = center_align
+        for col_idx, h in enumerate(headers, 2):
+            cell = ws.cell(row=row_idx, column=col_idx, value=r.get(h, ""))
+            cell.alignment = data_align
+            cell.border = thin
+
+    for col in ws.columns:
+        max_len = 0
+        letter = col[0].column_letter
+        for c in col:
+            if c.value:
+                max_len = max(max_len, len(str(c.value)))
+        ws.column_dimensions[letter].width = min(max_len + 4, 50)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    _atomic_save_workbook(wb, filepath)
+    log(f"✅ 原数据文件已保存 {len(results)} 条 → {filepath}")
+    return len(results)
+
+
+def write_cleaned_excel(results: list, filepath: str, template_dirs=None, log=None) -> int:
+    """按《客户库数据导入模板》写清洗后入库数据，返回写入行数（0=本次没写）"""
+    log = log or _quiet_log
+    if not HAS_CLEANER:
+        log("⚠ 清洗模块未加载，跳过入库数据生成")
+        return 0
+    rows = _cleaner.build_clean_rows(results, log=log)
+    if not rows:
+        log("⚠ 清洗后无有效入库记录（均为未找到/失败/空），本次未更新入库文件")
+        return 0
+    template = _cleaner.locate_template(start_dirs=[d for d in (template_dirs or []) if d])
+    tmp = f"{filepath}.tmp"
+    _drop_tmp(tmp)
+    try:
+        _cleaner.write_clean_excel(rows, tmp, template_path=template, log=log)
+        os.replace(tmp, filepath)
+    finally:
+        _drop_tmp(tmp)
+    log(f"✅ 清洗后入库文件已保存 {len(rows)} 条 → {filepath}")
+    return len(rows)
+
+
+class AutoSaveWorker(QThread):
+    """自动保存放后台线程写盘。
+
+    实测 480 条数据「合并 + 清洗 + 两份写盘」约 3.6 秒，放在 GUI 线程会让界面
+    每几十秒僵一下。写盘用的是一份 dict 快照（进线程前就拷好），之后不再碰爬虫对象。
+    """
+    logged = pyqtSignal(str)
+    finished_save = pyqtSignal(bool, str)   # ok, 结果摘要
+
+    def __init__(self, combined: list, folder: str, template_dirs=None):
+        super().__init__()
+        self.combined = combined
+        self.folder = folder
+        self.template_dirs = template_dirs or []
+
+    def run(self):
+        raw_path = os.path.join(self.folder, RAW_FILE_NAME)
+        try:
+            raw_n = write_merged_excel(self.combined, raw_path, log=self.logged.emit)
+        except PermissionError:
+            self.finished_save.emit(False, f"{RAW_FILE_NAME} 正被 Excel/WPS 占用，本次自动保存已跳过（数据仍在内存，关掉文件后下一轮会补上）")
+            return
+        except Exception as e:
+            self.finished_save.emit(False, f"自动保存原数据失败：{e}")
+            return
+
+        clean_path = os.path.join(self.folder, CLEAN_FILE_NAME)
+        clean_n = 0
+        note = ""
+        try:
+            clean_n = write_cleaned_excel(self.combined, clean_path,
+                                          template_dirs=self.template_dirs,
+                                          log=self.logged.emit)
+        except PermissionError:
+            note = f"（{CLEAN_FILE_NAME} 被占用，本轮未更新）"
+        except Exception as e:
+            note = f"（清洗文件本轮未更新：{e}）"
+        self.finished_save.emit(True, f"已自动保存：原数据 {raw_n} 条 / 清洗后入库 {clean_n} 条{note}")
+
+
 class MainWindow(QMainWindow):
+    PLATFORM_NAMES = ["风鸟", "企知道", "爱企查"]
+
     def __init__(self):
         super().__init__()
         # 初始化三个爬虫
@@ -397,10 +576,16 @@ class MainWindow(QMainWindow):
         self.crawler = self.qizhidao_crawler  # 默认使用企知道
         
         # 连接信号
-        for crawler in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+        for platform, crawler in zip(self.PLATFORM_NAMES,
+                                     [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]):
             crawler.signals.log_signal.connect(self._append_log)
             crawler.signals.progress_signal.connect(self._update_progress)
             crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
+            # 平台安全验证/风控拦截：醒目提示“去浏览器完成验证”，而不是一直挂着等超时
+            crawler.signals.blocked_signal.connect(lambda msg, p=platform: self._on_blocked(p, msg))
+            crawler.signals.block_cleared_signal.connect(lambda msg, p=platform: self._on_block_cleared(p))
+            # 未登录：弹窗让用户决定“去登录/仍然继续/停止”，不能默默把名单烧成空数据
+            crawler.signals.login_required_signal.connect(lambda msg, p=platform: self._on_login_required(p, msg))
         # 风鸟特有的信号
         self.riskbird_crawler.signals.login_status_signal.connect(self._on_login_status)
         self.riskbird_crawler.signals.manual_check_signal.connect(self._on_manual_check)
@@ -410,10 +595,16 @@ class MainWindow(QMainWindow):
         self._col_pick_cache = {}  # 公司名列人工确认结果缓存（表头组合 → 列号）
         self._crawl_thread = None
         self._current_source = 1  # 0=风鸟，1=企知道，2=爱企查
+        self._dual_running = False  # 是否正在双标签并行采集
         # 跨平台续采 + 桌面会话文件夹 + 每 10 条自动保存
         self._all_crawlers = [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]
         self._session_folder = None       # 桌面/企业数据自动采集工具/<第一次开始采集时间>
         self._last_autosave_bucket = 0    # 每 10 条自动保存的计数桶
+        self._autosave_worker = None        # 后台写盘线程（存引用防被 GC）
+        self._autosave_pending = None       # 上一次还在写时，只记最后一次请求，写完补一轮
+        self._blocked_info = []           # 正在等人工处理的平台：[[平台名, 原因], …]
+        self._blocked_box = None          # 非模态提示框（不阻塞界面，用户要去浏览器操作）
+        self._login_info = []             # 正在等人工登录的平台：[[平台名, 原因], …]
 
         self._update_window_title()
         self.setMinimumSize(900, 700)
@@ -566,6 +757,41 @@ class MainWindow(QMainWindow):
         self.delay_spin = QLineEdit("0.5")
         self.delay_spin.setFixedWidth(50)
         delay_layout.addWidget(self.delay_spin)
+
+        # 风鸟专属：是否逐家进详情页抽取全量联系方式（消耗每日详情额度）
+        self.rb_detail_check = QCheckBox("风鸟：进详情页抽全量联系方式")
+        self.rb_detail_check.setToolTip(
+            "风鸟账号有两层独立的每日额度（均 0 点恢复）：\n"
+            "  1) 关键词搜索（模糊查询）次数——控制搜索结果页，每家只给 1 个电话 + 1 个邮箱；\n"
+            "  2) 详情页查询次数（每账号每日 50 次，工具限制到 40 次）——才能拿到“更多”里的全量电话/邮箱。\n"
+            "不勾选：只用搜索结果页，用完一次模糊查询额度就采不了新公司；\n"
+            "勾选：逐家进详情页，适合重点名单（建议 ≤40 家）。\n"
+            "两者撞墙后工具会自动降级到不计次的补全接口（只拿登记信息），\n"
+            "并把未采到的写进 riskbird_data/风鸟待补采清单.txt 供次日重跑。\n"
+            "已采过的公司会缓存在 riskbird_data/风鸟列表缓存.json（30 天内直接复用、不耗次数，\n"
+            "想强制重新采集删掉该文件即可）。"
+        )
+        self.rb_detail_check.toggled.connect(self._on_force_detail_toggled)
+        delay_layout.addWidget(self.rb_detail_check)
+        self.rb_detail_check.setVisible(getattr(self, "_current_source", 1) == 0)
+
+        # ── 双标签并行采集（企知道 + 爱企查，单双数分公司）──
+        self._dual_pref = True   # 用户意愿（切到风鸟时临时置灰，切回来恢复）
+        self.dual_tab_check = QCheckBox("双标签并行采集（企知道+爱企查）")
+        self.dual_tab_check.setChecked(True)
+        self.dual_tab_check.setToolTip(
+            "勾选后两个平台同时采集（共用一个浏览器、各占一个窗口，登录态共用、互不干扰）：\n"
+            "  · 窗口A = 企知道，采第 1、3、5… 家；\n"
+            "  · 窗口B = 爱企查，采第 2、4、6… 家。\n"
+            "两边结果自动合并，导出时照样生成《清洗后客户库入库数据》，\n"
+            "自动保存也各存各的（企知道.xlsx / 爱企查.xlsx）。\n"
+            "实测比单平台逐个跑省约一半时间，且不会采串公司。\n"
+            "不勾选：只按上面选中的平台单独采集。\n"
+            "风鸟不支持双标签（它有每日额度限制，并行只会更快用完）。"
+        )
+        self.dual_tab_check.toggled.connect(self._on_dual_tab_toggled)
+        delay_layout.addWidget(self.dual_tab_check)
+        self._sync_dual_tab_enabled()
         ctrl_layout.addLayout(delay_layout)
 
         main_layout.addWidget(ctrl_group)
@@ -596,6 +822,17 @@ class MainWindow(QMainWindow):
         )
         self.platform_count_lbl.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.platform_count_lbl)
+
+        # ── 平台拦截提示条（默认隐藏，触发安全验证/风控时置顶提醒）──
+        self.blocked_lbl = QLabel("")
+        self.blocked_lbl.setFont(QFont(count_font, 10, QFont.Bold))
+        self.blocked_lbl.setWordWrap(True)
+        self.blocked_lbl.setStyleSheet(
+            "QLabel { color: #ffffff; background: #c62828; border-radius: 4px; padding: 8px; }"
+        )
+        self.blocked_lbl.setAlignment(Qt.AlignCenter)
+        self.blocked_lbl.hide()
+        main_layout.addWidget(self.blocked_lbl)
 
         # 采集计时器
         from PyQt5.QtCore import QTimer
@@ -778,13 +1015,107 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(ready)
 
     # ─ 登录 ───────────────────────────────────
+    def _on_force_detail_toggled(self, checked):
+        """风鸟“进详情页抽全量联系方式”开关"""
+        crawler = getattr(self, "riskbird_crawler", None)
+        if crawler is not None:
+            crawler.force_detail = bool(checked)
+        if checked:
+            self._append_log(
+                "⚠ 已开启风鸟详情页模式：每家会消耗 1 次每日详情额度（本轮上限 40 家），"
+                "额度用完自动回到仅列表页采集（详情额度与搜索额度相互独立）"
+            )
+
+    # ── 双标签并行采集 ──────────────
+    def _sync_dual_tab_enabled(self):
+        """风鸟有每日额度限制，不参与双标签；其余两个平台可用"""
+        chk = getattr(self, "dual_tab_check", None)
+        if chk is None:
+            return
+        usable = HAS_DUAL and getattr(self, "_current_source", 1) in (1, 2)
+        chk.setEnabled(usable)
+        if usable:
+            # 从风鸟切回来时恢复用户原本的勾选意愿
+            if self._dual_pref and not chk.isChecked():
+                chk.setChecked(True)
+        elif chk.isChecked():
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+            if hasattr(self, "log_text"):
+                self._append_log("ℹ 风鸟有每日额度限制，不参与双标签，已自动改为单平台采集")
+        if not HAS_DUAL:
+            chk.setToolTip("双标签模块未加载（dual_session.py 缺失），仅能单平台采集")
+
+    def _dual_enabled(self) -> bool:
+        """本次采集是否走双标签并行"""
+        return bool(HAS_DUAL and getattr(self, "dual_tab_check", None)
+                    and self.dual_tab_check.isChecked()
+                    and self._current_source in (1, 2))
+
+    def _on_dual_tab_toggled(self, checked):
+        self._dual_pref = bool(checked)
+        if not hasattr(self, "log_text"):
+            return
+        if checked:
+            self._append_log(
+                "⚡ 已开启双标签并行：企知道采单数（1、3、5…）、爱企查采双数（2、4、6…），"
+                "两个窗口共用一份登录态、各自独立采集，结果自动合并"
+            )
+        else:
+            self._append_log("已关闭双标签并行，只按上面选中的平台单独采集")
+
+    def _log_dual_platform(self, tag):
+        """并行时给两个平台的日志加前缀（缓存函数对象，否则后续 disconnect 对不上）"""
+        cache = self.__dict__.setdefault("_dual_log_fns", {})
+        if tag not in cache:
+            def _emit(msg, _t=tag):
+                self._append_log(f"【{_t}】{msg}")
+            cache[tag] = _emit
+        return cache[tag]
+
+    def _attach_dual_logs(self, on: bool):
+        """并行期间把两个爬虫的日志/进度/完成信号改接到双标签专用处理（幂等）"""
+        on = bool(on)
+        if getattr(self, "_dual_logs_on", False) == on:
+            return   # 重复调用会把 _append_log 连两遍，造成日志翻倍，这里直接短路
+        pairs = [
+            (self.qizhidao_crawler, self._log_dual_platform("企知道")),
+            (self.aiqicha_crawler, self._log_dual_platform("爱企查")),
+        ]
+        try:
+            for crawler, prefixed in pairs:
+                if crawler.signals is None:
+                    continue
+                if on:
+                    try:
+                        crawler.signals.log_signal.disconnect(self._append_log)
+                    except TypeError:
+                        pass
+                    crawler.signals.log_signal.connect(prefixed)
+                    try:
+                        crawler.signals.progress_signal.disconnect(self._update_progress)
+                        crawler.signals.crawl_finished_signal.disconnect(self._on_crawl_finished)
+                    except TypeError:
+                        pass
+                else:
+                    try:
+                        crawler.signals.log_signal.disconnect(prefixed)
+                    except TypeError:
+                        pass
+                    crawler.signals.log_signal.connect(self._append_log)
+                    crawler.signals.progress_signal.connect(self._update_progress)
+                    crawler.signals.crawl_finished_signal.connect(self._on_crawl_finished)
+        finally:
+            self._dual_logs_on = on
+
     def _on_source_changed(self, index):
         """切换数据来源"""
         old_crawler = self.crawler
         old_index = self._current_source
-        # 切换前先把旧平台数据落盘（不足 10 条未触发自动保存时避免丢失）
+        # 切换前先把已有数据落盘（不足 10 条未触发自动保存时避免丢失）
         if old_index != index:
-            self._save_platform_file(old_index, "切换平台")
+            self._auto_save("切换平台")
         self._current_source = index
         if index == 0:
             self.crawler = self.riskbird_crawler
@@ -797,15 +1128,29 @@ class MainWindow(QMainWindow):
             self._append_log("已切换到：爱企查 (aiqicha.baidu.com)")
         
         # 切换时关闭旧爬虫的浏览器（释放 Chrome 配置目录锁）
+        # 双标签模式下企知道/爱企查共用一个浏览器，不能关
+        dual = self._dual_enabled()
         if old_crawler is not self.crawler and old_crawler.driver is not None:
-            self._append_log("关闭上一个数据源的浏览器...")
-            try:
-                old_crawler.close_browser()
-            except Exception:
-                old_crawler.driver = None
+            keep = dual and old_crawler in (self.qizhidao_crawler, self.aiqicha_crawler)
+            if not keep:
+                self._append_log("关闭上一个数据源的浏览器...")
+                try:
+                    old_crawler.close_browser()
+                except Exception:
+                    old_crawler.driver = None
         
         # 更新窗口标题
         self._update_window_title()
+        # 详情页开关只对风鸟有意义
+        if hasattr(self, "rb_detail_check"):
+            self.rb_detail_check.setVisible(index == 0)
+        # 双标签开关：风鸟不可用
+        self._sync_dual_tab_enabled()
+        if self._dual_enabled():
+            self._append_log(
+                "⚡ 双标签已开：本次将同时采集企知道（单数）+ 爱企查（双数），"
+                "上面的数据源选择只决定“登录/打开网页”默认操作哪个平台"
+            )
         # 刷新各平台已采集条数显示，并提示续采起点
         self._update_platform_counts()
         _names = ["风鸟", "企知道", "爱企查"]
@@ -832,8 +1177,11 @@ class MainWindow(QMainWindow):
         self.open_web_btn.setText("加载中...")
         QApplication.processEvents()
         
+        dual = self._dual_enabled()
         # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
         for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+            if dual and c in (self.qizhidao_crawler, self.aiqicha_crawler):
+                continue   # 双标签：这两个共用一个浏览器，不能关
             if c is not self.crawler and c.driver is not None:
                 try:
                     c.close_browser()
@@ -841,7 +1189,8 @@ class MainWindow(QMainWindow):
                     c.driver = None
         
         # 用后台线程启动浏览器，避免卡死 GUI
-        self._open_thread = _OpenBrowserWorker(self.crawler)
+        targets = (self.qizhidao_crawler, self.aiqicha_crawler) if dual else None
+        self._open_thread = _OpenBrowserWorker(self.crawler, dual_targets=targets)
         self._open_thread.finished.connect(self._on_open_finished)
         self._open_thread.log_signal.connect(self._append_log)
         self._open_thread.start()
@@ -852,6 +1201,10 @@ class MainWindow(QMainWindow):
         self.open_web_btn.setText("打开网页")
         
         if success:
+            if self._dual_running or (self._dual_enabled() and getattr(self, "_open_thread", None)
+                                       and getattr(self._open_thread, "dual_targets", None)):
+                self._append_log("已打开双标签：企知道 + 爱企查各一个窗口，如需登录请分别在两个窗口完成")
+                return
             # 导航到网站（CDP 爬虫不需要，用户已手动打开）
             from aiqicha_crawler_v2 import AiQiChaCrawlerV2
             if not isinstance(self.crawler, AiQiChaCrawlerV2):
@@ -891,23 +1244,41 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择 Excel 文件")
             return
 
-        # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
-        for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
-            if c is not self.crawler and c.driver is not None:
+        dual = self._dual_enabled()
+        if dual:
+            # 双标签：风鸟的浏览器必须让位（它启动时会清理/独占 Chrome），
+            # 企知道与爱企查共用一个带调试端口的浏览器
+            if self.riskbird_crawler.driver is not None:
                 try:
-                    c.close_browser()
+                    self.riskbird_crawler.close_browser()
                 except Exception:
-                    c.driver = None
+                    self.riskbird_crawler.driver = None
+        else:
+            # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
+            for c in [self.riskbird_crawler, self.qizhidao_crawler, self.aiqicha_crawler]:
+                if c is not self.crawler and c.driver is not None:
+                    try:
+                        c.close_browser()
+                    except Exception:
+                        c.driver = None
 
-        # 设置延迟
+        # 设置延迟（双标签时两个平台都要设）
         try:
             delay = float(self.delay_spin.text())
-            self.crawler.delay_between = max(0.1, delay)
+            delay = max(0.1, delay)
         except ValueError:
-            self.crawler.delay_between = 0.5
+            delay = 0.5
+        for c in ([self.qizhidao_crawler, self.aiqicha_crawler] if dual else [self.crawler]):
+            c.delay_between = delay
+        # 同步风鸟详情页开关（避免切换平台后残留设置与实际不符）
+        self.riskbird_crawler.force_detail = self.rb_detail_check.isChecked()
 
         # 跨平台续采：从所有平台已采集的总条数继续（切换平台/暂停后不重头开始）
         start_index = self._get_global_index()
+        if dual:
+            # 双标签只看企知道+爱企查两边的已采数（风鸟的历史数据不参与单双数分工），
+            # 两边各自从自己的已采条数续采，同一家公司永远归同一个平台
+            start_index = len(self.qizhidao_crawler.results) + len(self.aiqicha_crawler.results)
         if start_index >= len(self._companies):
             QMessageBox.information(self, "提示", f"全部 {len(self._companies)} 家公司已采集完成，无需继续。")
             return
@@ -929,14 +1300,40 @@ class MainWindow(QMainWindow):
         # 开始计时
         self._start_timer()
 
+        if dual:
+            self._dual_running = True
+            self._attach_dual_logs(True)
+            self._append_log("⚡ 双标签并行：正在准备共享浏览器与两个会话（首次启动约十几秒）…")
+            self._crawl_thread = DualCrawlWorker(
+                self.qizhidao_crawler, self.aiqicha_crawler, self._companies)
+            self._crawl_thread.progress.connect(self._update_progress)
+            self._crawl_thread.log_signal.connect(self._append_log)
+            self._crawl_thread.setup_failed.connect(self._on_dual_setup_failed)
+            self._crawl_thread.finished.connect(self._on_dual_finished)
+            self._crawl_thread.start()
+            self.statusBar().showMessage("双标签采集中（企知道 + 爱企查）...")
+            return
+
         self._crawl_thread = CrawlWorker(self.crawler, self._companies, start_index)
+        # 上一轮会话/切换数据源留下的空白窗口白占内存，开跑前洗一次
+        # （双标签模式在 setup_dual 里已经洗过，这里只管单平台）
+        if HAS_DUAL and _dual.is_shared_chrome_alive():
+            _dual.cleanup_blank_tabs(self._append_log,
+                                     keep_ids=[self.aiqicha_crawler.pin_tab_id])
         self._crawl_thread.finished.connect(self._on_crawl_finished)
         self._crawl_thread.start()
 
         self.statusBar().showMessage("采集中...")
 
+    def _active_crawlers(self):
+        """当前受“暂停/继续/停止”控制的爬虫"""
+        if self._dual_running:
+            return [self.qizhidao_crawler, self.aiqicha_crawler]
+        return [self.crawler]
+
     def _pause_crawl(self):
-        self.crawler.pause_crawl()
+        for c in self._active_crawlers():
+            c.pause_crawl()
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(True)
         self.statusBar().showMessage("已暂停")
@@ -945,32 +1342,41 @@ class MainWindow(QMainWindow):
         self._auto_save("点击暂停")
 
     def _resume_crawl(self):
-        self.crawler.resume_crawl()
+        for c in self._active_crawlers():
+            c.resume_crawl()
+            # 如果这个爬虫正卡在登录闸门里，“继续采集”就等于“我登录好了，重新验一下”
+            c.resolve_login_gate("login_done")
         self.pause_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
-        self.statusBar().showMessage("采集中...")
+        self.statusBar().showMessage("双标签采集中..." if self._dual_running else "采集中...")
         self._resume_timer()
 
     def _stop_crawl(self):
-        self.crawler.stop_crawl()
+        for c in self._active_crawlers():
+            c.stop_crawl()
+            c.resolve_login_gate("stop")   # 卡在登录闸门里时要能立刻退出
         self.stop_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(False)
         self.start_btn.setEnabled(True)  # 允许重新开始
         self.export_btn.setEnabled(True)  # 允许导出
         self._stop_timer()
+        self._clear_blocked_state()
         self._update_platform_counts()
         # 输出用时摘要
-        count = len(self.crawler.results)
+        count = sum(len(c.results) for c in self._active_crawlers())
         self._append_log(f" {self._get_time_summary(count)}")
         self._auto_save("点击停止")
 
     def _on_crawl_finished(self):
+        if self._dual_running:
+            return   # 双标签由 DualCrawlWorker 统一收尾，不响应单平台的完成信号
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.select_file_btn.setEnabled(True)
         self.export_btn.setEnabled(bool(self._all_results()))
         self._stop_timer()
+        self._clear_blocked_state()
         count = len(self.crawler.results)
         total_all = self._get_global_index()
         self.statusBar().showMessage(f"采集完成 — 本平台 {count} 条，全部平台合计 {total_all} 条")
@@ -979,6 +1385,46 @@ class MainWindow(QMainWindow):
         # 输出用时摘要
         self._append_log(f"✅ {self._get_time_summary(count)}")
         self._auto_save("采集完成")
+
+    def _on_dual_setup_failed(self, msg: str):
+        """双标签环境没准备好（共享浏览器/会话附加失败）"""
+        self._dual_running = False
+        self._attach_dual_logs(False)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.select_file_btn.setEnabled(True)
+        self._stop_timer()
+        self._clear_blocked_state()
+        self.statusBar().showMessage("双标签启动失败")
+        self.progress_bar.setFormat("双标签启动失败")
+        self._append_log(f"❌ 双标签启动失败：{msg}")
+        self._append_log("ℹ 可取消勾选“双标签并行采集”后按单平台重试")
+        QMessageBox.warning(self, "双标签启动失败",
+                            f"{msg}\n\n可取消勾选“双标签并行采集”，改按单平台采集。")
+
+    def _on_dual_finished(self):
+        """双标签并行采集结束（两个会话都跑完）"""
+        self._dual_running = False
+        self._attach_dual_logs(False)
+        qn = len(self.qizhidao_crawler.results)
+        an = len(self.aiqicha_crawler.results)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.select_file_btn.setEnabled(True)
+        self.export_btn.setEnabled(bool(self._all_results()))
+        self._stop_timer()
+        self._clear_blocked_state()
+        total_all = self._get_global_index()
+        self.statusBar().showMessage(f"双标签采集完成 — 企知道 {qn} 条 / 爱企查 {an} 条，合计 {total_all} 条")
+        self.progress_bar.setFormat(f"完成 — 企知道 {qn} + 爱企查 {an}，合计 {total_all} 条")
+        self._update_platform_counts()
+        self._append_log(f"✅ 双标签并行结束：企知道 {qn} 条、爱企查 {an} 条 {self._get_time_summary(qn + an)}")
+        self._auto_save("双标签采集完成")
+        self._append_log("ℹ 共享浏览器保持打开（下次开双标签直接复用）；如不需要可手动关掉它")
 
     def _update_progress(self, current: int, total: int):
         pct = int(current / total * 100) if total else 0
@@ -992,6 +1438,157 @@ class MainWindow(QMainWindow):
         if bucket > self._last_autosave_bucket:
             self._last_autosave_bucket = bucket
             self._auto_save(f"每10条自动保存·已{total_done}条")
+
+    # ── 平台拦截（安全验证/风控）提示 ──────────────
+    def _on_blocked(self, platform: str, reason: str):
+        """采集线程发现页面被安全验证/风控拦截：醒目提示去浏览器完成验证
+
+        采集线程自己会在 block_guard 里原地等人工处理，这里只负责把“要你动手”
+        这件事说到脸上：以前只会在一堆日志里夹一行，用户看到的只是“卡死了”。
+        """
+        found = False
+        for item in self._blocked_info:
+            if item[0] == platform:
+                item[1] = reason or item[1]
+                found = True
+                break
+        if not found:
+            self._blocked_info.append([platform, reason or "页面被平台拦截"])
+        self._refresh_blocked_banner()
+        self._append_log(f"🛑【{platform}】{reason}")
+        self._append_log("   名单已暂停推进（不会写入空记录）。请在浏览器窗口完成验证，通过后自动继续。")
+        # 采集正在跑且用户没主动暂停时，才由拦截接管计时（否则验证等待会把平均耗时算虚高）
+        if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
+            self._pause_timer()
+        self._show_blocked_dialog()
+
+    def _on_block_cleared(self, platform: str):
+        """人工完成验证/登录，采集已自动继续"""
+        self._blocked_info = [it for it in self._blocked_info if it[0] != platform]
+        self._login_info = [it for it in self._login_info if it[0] != platform]
+        self._append_log(f"✅【{platform}】已恢复，采集继续")
+        if not (self._blocked_info or self._login_info):
+            self._hide_blocked_dialog()
+            if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
+                self._resume_timer()
+        self._refresh_blocked_banner()
+
+    def _crawler_by_name(self, platform: str):
+        for name, crawler in zip(self.PLATFORM_NAMES, self._all_crawlers):
+            if name == platform:
+                return crawler
+        return None
+
+    def _on_login_required(self, platform: str, reason: str):
+        """采集线程发现未登录：弹窗问用户是去登录、还是不登录继续采
+
+        采集线程会在登录闸门里原地等这个选择，所以这里用模态框不会卡死采集：
+        名单没推进、也没写空记录，用户怎么选都不会丢数据。
+        以前未登录也能直接开采，整份名单会被采成“只有公司名”的空数据。
+        """
+        crawler = self._crawler_by_name(platform)
+        if crawler is None:
+            return
+        found = False
+        for item in self._login_info:
+            if item[0] == platform:
+                item[1] = reason or item[1]
+                found = True
+                break
+        if not found:
+            self._login_info.append([platform, reason or "未检测到登录状态"])
+        self._refresh_blocked_banner()
+        # 等人工登录期间不计入采集用时（否则平均耗时会被等待撑大）
+        if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
+            self._pause_timer()
+        box = QMessageBox(self)
+        box.setWindowTitle("未检测到登录状态")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"【{platform}】{reason}")
+        box.setInformativeText(
+            "未登录时详情页里的法定代表人、注册资本、邮箱、地址这些字段全是空的（实测只有电话能采到），"
+            "继续采就是把整份名单白烧掉。\n\n"
+            "· 去浏览器登录（推荐）：在浏览器窗口里登录该平台，登录成功后点界面上的“继续采集”，"
+            "会从卡住的这一家重新采；\n"
+            "· 仍然继续采集：不等登录了，直接往下采；\n"
+            "· 停止采集：本轮结束，已采到的数据不受影响。"
+        )
+        b_login = box.addButton("去浏览器登录（推荐）", QMessageBox.AcceptRole)
+        b_cont = box.addButton("仍然继续采集", QMessageBox.ActionRole)
+        b_stop = box.addButton("停止采集", QMessageBox.RejectRole)
+        box.setDefaultButton(b_login)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_cont:
+            # 闸门放行后会自己发“已恢复”信号，界面提示交给它统一收起
+            crawler.resolve_login_gate("continue")
+            self._append_log(f"ℹ【{platform}】按你的选择继续采集（未登录时字段可能仍然是空的）")
+        elif clicked is b_stop:
+            crawler.resolve_login_gate("stop")
+            self._stop_crawl()
+        else:
+            # 选了“去登录”或直接关掉弹窗：不回应闸门，采集线程继续原地等，
+            # 出口是界面上的“继续采集”（_resume_crawl 会替用户回答 login_done）
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(True)
+            self.statusBar().showMessage(f"等待 {platform} 登录…登录完成后点“继续采集”")
+            self._append_log(f"⏳【{platform}】等你在浏览器里登录，登录完成后点“继续采集”接着采")
+
+    def _refresh_blocked_banner(self):
+        if not hasattr(self, "blocked_lbl"):
+            return
+        parts = []
+        if self._blocked_info:
+            names = "、".join(it[0] for it in self._blocked_info)
+            parts.append(f"{names} 被平台拦截：{self._blocked_info[-1][1]}"
+                         f"（请在浏览器窗口完成验证，没有验证页时稍候会自动恢复）")
+        if self._login_info:
+            lnames = "、".join(it[0] for it in self._login_info)
+            parts.append(f"{lnames} 未登录：{self._login_info[-1][1]}"
+                         f"（请在浏览器窗口登录后点“继续采集”）")
+        if parts:
+            waiting = "、".join(sorted({it[0] for it in self._blocked_info + self._login_info}))
+            self.blocked_lbl.setText(
+                "⚠ " + "；".join(parts) + " —— 名单已暂停推进，不会写入空记录"
+            )
+            self.blocked_lbl.show()
+            self.statusBar().showMessage(f"等待人工处理：{waiting}")
+        else:
+            self.blocked_lbl.hide()
+            if self._crawl_start_time:
+                self.statusBar().showMessage(
+                    "双标签采集中..." if self._dual_running else "采集中...")
+
+    def _show_blocked_dialog(self):
+        """用非模态提示框：模态框会冻结本窗口，而用户此刻需要去的是浏览器窗口"""
+        if self._blocked_box is not None:
+            self._blocked_box.raise_()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("需要人工验证")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(
+            "采集页面被平台安全验证拦住了。\n\n"
+            "请切到浏览器窗口，手动完成验证（滑块/图形验证码）。\n"
+            "验证通过后采集会自动继续，不需要在本窗口点任何按钮。\n\n"
+            "名单已暂停推进，不会把空记录写进结果。"
+        )
+        box.setStandardButtons(QMessageBox.Ok)
+        box.finished.connect(self._hide_blocked_dialog)
+        self._blocked_box = box
+        box.show()
+
+    def _hide_blocked_dialog(self):
+        if self._blocked_box is not None:
+            box, self._blocked_box = self._blocked_box, None
+            box.close()
+
+    def _clear_blocked_state(self):
+        """采集结束/停止时清掉拦截与登录提示，避免红条残在界面上"""
+        self._blocked_info = []
+        self._login_info = []
+        self._hide_blocked_dialog()
+        self._refresh_blocked_banner()
 
     # ── 计时器 ────────────────────────────────
     @staticmethod
@@ -1062,10 +1659,16 @@ class MainWindow(QMainWindow):
 
     # ── 跨平台进度 / 桌面会话文件夹 / 自动保存 ──
     def _all_results(self) -> list:
-        """合并三个平台的全部采集结果（风鸟→企知道→爱企查 顺序）"""
+        """合并三个平台的全部采集结果（风鸟→企知道→爱企查 顺序）
+
+        拿的是每个爬虫的快照（连 dict 一起拷），采集线程同时追加也不会写坏。
+        """
         combined = []
         for c in self._all_crawlers:
-            combined.extend(c.results)
+            if hasattr(c, "snapshot_results"):
+                combined.extend(c.snapshot_results())
+            else:
+                combined.extend([dict(r) for r in c.results])
         return combined
 
     def _get_global_index(self) -> int:
@@ -1117,35 +1720,54 @@ class MainWindow(QMainWindow):
             f"风鸟: {counts[0]} 条    企知道: {counts[1]} 条    爱企查: {counts[2]} 条    合计: {total} 条"
         )
 
-    def _save_platform_file(self, source_index: int, reason: str = ""):
-        """将指定平台结果保存为 桌面会话文件夹/<平台名>.xlsx（同名覆盖，每平台最多 1 个文件）"""
-        if not (0 <= source_index < len(self._all_crawlers)):
-            return
-        c = self._all_crawlers[source_index]
-        if not c.results:
-            return
-        folder = self._get_or_create_session_folder()
-        if folder is None:
-            return
-        name = ["风鸟", "企知道", "爱企查"][source_index]
-        filepath = folder / f"{name}.xlsx"
-        try:
-            c.export_excel(str(filepath))
-            reason_text = f"（{reason}）" if reason else ""
-            self._append_log(f"✅ 已自动保存 {name} {len(c.results)} 条 → {filepath} {reason_text}")
-        except Exception as e:
-            self._append_log(f"⚠ {name} 自动保存失败：{e}")
+    def _start_autosave(self, combined: list, folder: str, reason: str = ""):
+        """起一个后台写盘线程（引用存在 self 上，否则 QThread 被 GC 会直接崩）"""
+        worker = AutoSaveWorker(combined, folder,
+                                template_dirs=[folder, self._get_last_import_dir()])
+        worker.logged.connect(self._append_log)
+        worker.finished_save.connect(self._on_autosave_finished)
+        self._autosave_worker = worker
+        worker.start()
+        if reason:
+            self._append_log(f"💾 自动保存（{reason}）：共 {len(combined)} 条原数据 → 两份文件")
+
+    def _on_autosave_finished(self, ok: bool, summary: str):
+        self._append_log(("✅ " if ok else "⚠ ") + summary)
+        pending, self._autosave_pending = self._autosave_pending, None
+        if pending:
+            combined, folder, reason = pending
+            self._start_autosave(combined, folder, reason or "补保存")
 
     # ── 自动保存 ──────────────────────────────
     def _auto_save(self, reason: str = ""):
-        """自动保存当前平台数据到桌面会话文件夹（覆盖该平台同名文件）"""
+        """自动保存 = 跟“导出 Excel”同效果：一次写两份文件，不再按平台分文件
+
+        桌面会话文件夹里固定两个名字（反复覆盖，不堆文件）：
+          企业数据_全部平台.xlsx      原数据（三个平台合并）
+          清洗后客户库入库数据.xlsx  按入库模板清洗后的数据
+
+        并发：写盘放后台线程；上一轮还在写时只保留最后一次请求（而不是排队），
+        这样“暂停/停止/采集完成”那一次必然落盘，也不会堆积重复写盘。"""
         try:
-            self._save_platform_file(self._current_source, reason)
+            combined = self._all_results()
+            if not combined:
+                return
+            folder = self._get_or_create_session_folder()
+            if folder is None:
+                return
+            if self._autosave_worker is not None and self._autosave_worker.isRunning():
+                self._autosave_pending = (combined, str(folder), reason)
+                return
+            self._start_autosave(combined, str(folder), reason)
         except Exception as e:
-            self._append_log(f"️ 自动保存失败：{e}")
+            self._append_log(f"⚠ 自动保存失败：{e}")
 
     # ── 导出（合并风鸟/企知道/爱企查全部数据 + 生成清洗后入库数据） ──
     def _export_excel(self):
+        # 后台自动保存可能在写同一批数据：先让它收尾，避免两个线程同时写盘
+        if self._autosave_worker is not None and self._autosave_worker.isRunning():
+            self._append_log("⏳ 自动保存正在写盘，等它完成后开始导出…")
+            self._autosave_worker.wait(20000)
         combined = self._all_results()
         if not combined:
             QMessageBox.warning(self, "提示", "没有数据可导出")
@@ -1173,26 +1795,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(e))
 
     def _export_cleaned_library(self, combined: list, merged_path: str) -> str:
-        """按《客户库数据导入模板》生成清洗后入库数据，写到合并文件同目录。"""
+        """手动导出时另存一份带时间戳的清洗后入库数据（自动保存用固定名，两者不相互覆盖）"""
         if not HAS_CLEANER:
             self._append_log("⚠ 清洗模块未加载，跳过入库数据生成")
             return ""
-        cleaner = _cleaner
+        merged_dir = os.path.dirname(merged_path) or "."
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cleaned_path = os.path.join(merged_dir, f"清洗后客户库入库数据_{stamp}.xlsx")
         try:
             self._append_log("🧹 开始生成清洗后客户库入库数据…")
-            rows = cleaner.build_clean_rows(combined, log=self._append_log)
-            if not rows:
-                self._append_log("⚠ 清洗后无有效入库记录（均为未找到/失败/空），已跳过")
-                return ""
-            template = cleaner.locate_template(
-                start_dirs=[os.path.dirname(merged_path), self._get_last_import_dir()]
-            )
-            merged_dir = os.path.dirname(merged_path) or "."
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            cleaned_path = os.path.join(merged_dir, f"清洗后客户库入库数据_{stamp}.xlsx")
-            cleaner.write_clean_excel(rows, cleaned_path, template_path=template,
-                                       log=self._append_log)
-            return cleaned_path
+            if write_cleaned_excel(combined, cleaned_path,
+                                   template_dirs=[merged_dir, self._get_last_import_dir()],
+                                   log=self._append_log):
+                return cleaned_path
+            return ""
+        except PermissionError:
+            self._append_log("⚠ 入库文件正被 Excel/WPS 占用，本次未能写出")
+            return ""
         except Exception as e:
             self._append_log(f"⚠ 生成清洗后入库数据失败：{e}")
             return ""
@@ -1203,67 +1822,20 @@ class MainWindow(QMainWindow):
         return os.path.dirname(files[-1]) if files else ""
 
     def _write_merged_excel(self, results: list, filepath: str):
-        """把多平台结果合并写入一个 Excel（统一表头 + 样式，含"数据来源"列区分平台）"""
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        """薄封装：与自动保存共用模块级写盘函数，保证两条路径出的表完全一致"""
+        return write_merged_excel(results, filepath, log=self._append_log)
 
-        # 统一表头：常用字段优先，其余按首次出现顺序补充
-        preferred = [
-            "公司名", "状态", "数据来源", "法定代表人", "注册资本", "成立日期",
-            "统一社会信用代码", "电话", "邮箱", "官网", "地址", "简介",
-            "经营范围", "经营业务范围", "所属行业", "企业类型", "营业期限",
-            "登记机关", "核准日期", "参保人数", "搜索结果URL",
-        ]
-        keys = []
-        for r in results:
-            for k in r.keys():
-                if k not in keys:
-                    keys.append(k)
-        headers = [k for k in preferred if k in keys] + [k for k in keys if k not in preferred]
+    # ── 退出 ───────────────────────────────
+    def closeEvent(self, event):
+        """关窗口前给后台自动保存留时间：写完再退
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "企业数据(全部平台)"
-
-        header_font = Font(bold=True, size=11, color="FFFFFF")
-        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        thin = Border(left=Side(style="thin"), right=Side(style="thin"),
-                      top=Side(style="thin"), bottom=Side(style="thin"))
-
-        cell = ws.cell(row=1, column=1, value="序号")
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = thin
-        for col, h in enumerate(headers, 2):
-            cell = ws.cell(row=1, column=col, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = header_align
-            cell.border = thin
-
-        data_align = Alignment(vertical="top", wrap_text=True)
-        center_align = Alignment(horizontal="center")
-        for row_idx, r in enumerate(results, 2):
-            ws.cell(row=row_idx, column=1, value=row_idx - 1).alignment = center_align
-            for col_idx, h in enumerate(headers, 2):
-                cell = ws.cell(row=row_idx, column=col_idx, value=r.get(h, ""))
-                cell.alignment = data_align
-                cell.border = thin
-
-        for col in ws.columns:
-            max_len = 0
-            letter = col[0].column_letter
-            for c in col:
-                if c.value:
-                    max_len = max(max_len, len(str(c.value)))
-            ws.column_dimensions[letter].width = min(max_len + 4, 50)
-
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        wb.save(filepath)
-        self._append_log(f"✅ 已合并导出 {len(results)} 条到 {filepath}")
+        写盘是“临时文件 + 原子替换”，即使被打断也不会把已有文件写成半个，
+        但这里等一下能让最后一次保存真正落盘。"""
+        worker = self._autosave_worker
+        if worker is not None and worker.isRunning():
+            self._append_log("⏳ 自动保存正在写盘，稍等几秒…")
+            worker.wait(15000)
+        super().closeEvent(event)
 
 
 # ═══════════════════════════════════════════════
@@ -1274,12 +1846,19 @@ class _OpenBrowserWorker(QThread):
     finished = pyqtSignal(bool, str)  # success, message
     log_signal = pyqtSignal(str)
 
-    def __init__(self, crawler):
+    def __init__(self, crawler, dual_targets=None):
         super().__init__()
         self.crawler = crawler
+        self.dual_targets = dual_targets   # (企知道爬虫, 爱企查爬虫) → 双标签模式
 
     def run(self):
         try:
+            if self.dual_targets:
+                qzd, aqc = self.dual_targets
+                ok, msg = _dual.setup_dual(qzd, aqc, self.log_signal.emit)
+                self.finished.emit(ok, msg if ok else f"双标签准备失败：{msg}")
+                return
+
             # 检查会话是否存活
             if self.crawler.driver is None or not self.crawler._is_session_alive():
                 self.log_signal.emit("浏览器会话已断开，正在重启...")
@@ -1317,6 +1896,70 @@ class CrawlWorker(QThread):
 
     def run(self):
         self.crawler.crawl(self.companies, self.start_index)
+        self.finished.emit()
+
+
+# ══════════════════════════════════
+#  双标签并行采集工作线程（企知道采单数 + 爱企查采双数）
+# ══════════════════════════════════
+class DualCrawlWorker(QThread):
+    """两个会话共用一个浏览器、各占一个窗口，同时采集互不干扰。
+
+    分工按原始位置单双数切分（第 1、3、5… 家 → 企知道；第 2、4、6… 家 → 爱企查），
+    所以暂停后续采时同一家公司仍归同一个平台，不会重复也不会漏。
+    """
+    progress = pyqtSignal(int, int)
+    log_signal = pyqtSignal(str)
+    setup_failed = pyqtSignal(str)
+
+    def __init__(self, qzd_crawler, aqc_crawler, companies: list):
+        super().__init__()
+        self.qzd = qzd_crawler
+        self.aqc = aqc_crawler
+        self.companies = companies
+
+    def run(self):
+        ok, msg = _dual.setup_dual(self.qzd, self.aqc, self.log_signal.emit)
+        if not ok:
+            self.setup_failed.emit(msg)
+            self.finished.emit()
+            return
+
+        qzd_names, aqc_names = _dual.split_parity(self.companies)
+        total = len(self.companies)
+        qzd_start = len(self.qzd.results)
+        aqc_start = len(self.aqc.results)
+        self.log_signal.emit(
+            f"⚡ 双标签分工：企知道 {len(qzd_names)} 家（单数，已完成 {qzd_start}）、"
+            f"爱企查 {len(aqc_names)} 家（双数，已完成 {aqc_start}）"
+        )
+
+        stop = threading.Event()
+
+        def monitor():
+            # 两个会话各自跑，进度合并上报（每秒一次）
+            while not stop.wait(1.0):
+                done = len(self.qzd.results) + len(self.aqc.results)
+                self.progress.emit(min(done, total), total)
+
+        mon = threading.Thread(target=monitor, daemon=True)
+        mon.start()
+
+        def run_one(crawler, names, start, tag):
+            try:
+                crawler.crawl(names, start)
+            except Exception as e:
+                self.log_signal.emit(f"❌ {tag} 采集中断：{e}")
+
+        t1 = threading.Thread(target=run_one, args=(self.qzd, qzd_names, qzd_start, "企知道"))
+        t2 = threading.Thread(target=run_one, args=(self.aqc, aqc_names, aqc_start, "爱企查"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        stop.set()
+        done = len(self.qzd.results) + len(self.aqc.results)
+        self.progress.emit(min(done, total), total)
         self.finished.emit()
 
 

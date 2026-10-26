@@ -15,12 +15,12 @@ schema mapping + 数据质量校验 + 跨平台合并去重，输出可直接入
     外呼备注/备注 ← 状态异常说明 + 官网 + 地址摘要
 
 清洗规则：
-    1. 剔除「未找到」与「失败」记录；
+    1. 剔除「未找到」「失败」「额度用尽待重试」记录；
     2. 同一公司跨平台合并为一条（字段取首个非空值，电话/邮箱取并集），
        避免入库侧重复；
     3. 电话、邮箱拆分为手机号 / 固话 / 邮箱三个独立字段并逐个校验格式；
     4. 文本归一化（去零宽字符与首尾空白、全角标点转半角）；
-    5. 手机号与固话各保留 3 个，多个用 / 分隔，避免入库字段超长；
+    5. 手机号与固话各保留 3 个，多个用 , 分隔（与邮箱一致），避免入库字段超长；
     6. 模板表头按列名动态定位，不写死列序；模板缺失时回退内置表头。
 """
 
@@ -150,12 +150,12 @@ def split_emails(raw: str):
 
 
 def is_valid_record(record: dict) -> bool:
-    """有效性判定：公司名非空，且状态不含 未找到/失败/异常/无结果/空壳。"""
+    """有效性判定：公司名非空，且状态不含 未找到/失败/异常/无结果/额度受限。"""
     name = _get_field(record, "公司名")
     if not name:
         return False
     status = _get_field(record, "状态")
-    for kw in ("未找到", "失败", "异常", "无结果", "不存在", "未匹配"):
+    for kw in ("未找到", "失败", "异常", "无结果", "不存在", "未匹配", "额度", "待重试"):
         if kw in status:
             return False
     return True
@@ -209,8 +209,9 @@ def _normalize_key(name: str) -> str:
     return key.replace("（", "(").replace("）", ")").upper()
 
 
-def _join_limited(values, limit=3):
-    return "/".join(list(values)[:limit])
+def _join_limited(values, limit=3, sep=","):
+    """多个号码用逗号拼接（与邮箱一致）；逗号已在 _SPLIT_RE 里，回读清洗不会错拆"""
+    return sep.join(list(values)[:limit])
 
 
 def _remark(fields: dict):
@@ -250,7 +251,7 @@ def build_clean_rows(results: list, log=print):
             "岗位": "法定代表人" if legal_rep else "",
             "手机号": _join_limited(mobiles),
             "固话": _join_limited(landlines),
-            "邮箱": ";".join(emails[:3]),
+            "邮箱": _join_limited(emails),
             "微信号": "",
             "数据来源": ",".join(item["sources"]),
             "外呼备注": remark,

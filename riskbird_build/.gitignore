@@ -1,0 +1,13 @@
+# 登录凭证与采集数据：内含 accessToken / BDUSS 等登录 Cookie，绝不入库
+riskbird_data/
+
+# 打包产物与字节码
+__pycache__/
+*.pyc
+build/
+dist/
+
+# 调试脚本与调试输出（页面快照、日志）
+debug_*
+*.log
+*.html

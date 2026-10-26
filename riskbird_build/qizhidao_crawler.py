@@ -13,6 +13,8 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
+import block_guard
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -41,6 +43,9 @@ if HAS_PYQT:
         crawl_finished_signal = pyqtSignal()
         login_status_signal = pyqtSignal(bool, str)
         manual_check_signal = pyqtSignal(str)
+        blocked_signal = pyqtSignal(str)   # 被安全验证/风控拦截，需人工在浏览器完成验证
+        block_cleared_signal = pyqtSignal(str)  # 人工完成验证，采集已自动继续
+        login_required_signal = pyqtSignal(str)  # 未登录，需界面上确认去登录还是继续
 else:
     class CrawlerSignals:
         pass
@@ -49,6 +54,7 @@ else:
 class QiZhiDaoCrawler:
     BASE_URL = "https://www.qizhidao.com"
     DETAIL_BASE = "https://qiye.qizhidao.com/company/"
+    PLATFORM_LABEL = "企知道"
 
     def __init__(self, gui_callback=None):
         self.driver = None
@@ -58,8 +64,15 @@ class QiZhiDaoCrawler:
         self._stop_requested = False
         self._pause_requested = False
         self.results = []
+        # 采集线程在写、GUI 线程在读（双标签并行时两个线程同时写），靠锁交接快照
+        self.results_lock = threading.RLock()
         self.gui_callback = gui_callback
         self._browser_lock = threading.Lock()
+
+        # 双标签并行采集：附加到共享 Chrome 的调试端口，本实例只操作自己独占的那个标签
+        self.attach_port = None
+        self.shared_session = False
+        self._own_handle = None
 
         if HAS_PYQT:
             self.signals = CrawlerSignals()
@@ -75,6 +88,11 @@ class QiZhiDaoCrawler:
         self.delay_between = 0.5
         self.max_retries = 2
 
+        # 登录态闸门与空壳计数
+        self._login_gate_obj = None
+        self._shell_streak = 0
+        self._shell_gate_passed = False
+
     # ── 日志 ──
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -84,6 +102,106 @@ class QiZhiDaoCrawler:
         if self.gui_callback:
             self.gui_callback(line)
         print(line)
+
+    # ── 结果交接 / 拦截处理 ──
+    def _add_result(self, result: dict):
+        """线程安全地追加一条采集结果"""
+        with self.results_lock:
+            self.results.append(result)
+
+    def snapshot_results(self) -> list:
+        """给 GUI 用的快照：连每条记录的 dict 一起复制（单条记录是边采边写的，
+        只拷列表会让写 Excel 时遍历 r.keys() 撞上 dict 变大报 RuntimeError）"""
+        with self.results_lock:
+            return [dict(r) for r in self.results]
+
+    def _emit_blocked(self, reason: str):
+        if self.signals:
+            try:
+                self.signals.blocked_signal.emit(reason or "页面被平台拦截")
+            except Exception:
+                pass
+
+    def _detect_block(self):
+        """只看自己这个窗口当前的页面是不是验证页"""
+        if self.driver is None:
+            return ""
+        return block_guard.detect_selenium(self.driver)
+
+    def _wait_unblock(self, reason: str, max_wait: int = 1800) -> bool:
+        """被拦截时原地等人工验证，不推进名单、不写入空记录"""
+        ok = block_guard.wait_unblock(
+            reason, self._log, self._emit_blocked,
+            lambda: self._stop_requested, self._detect_block,
+            max_wait=max_wait,
+        )
+        if ok:
+            self._emit_cleared(reason)
+        return ok
+
+    def _emit_cleared(self, reason: str):
+        if self.signals:
+            try:
+                self.signals.block_cleared_signal.emit(reason)
+            except Exception:
+                pass
+
+    # ── 登录态确认 ──
+    def check_login(self):
+        """用浏览器 Cookie 判登录态：未登录时详情页只回电话，其余字段全空"""
+        if self.driver is None:
+            return "unknown", "浏览器还没打开"
+        try:
+            if "qizhidao.com" not in (self.driver.current_url or ""):
+                self.driver.get(self.BASE_URL)
+                time.sleep(2)
+            names = [c.get("name") for c in (self.driver.get_cookies() or [])]
+        except Exception as e:
+            return "unknown", f"读取 Cookie 失败：{str(e)[:60]}"
+        return block_guard.login_state(names, self.PLATFORM_LABEL)
+
+    def _gate(self):
+        """登录闸门（延迟创建，signals 可能在爬虫建好之后才接上）"""
+        if self._login_gate_obj is None:
+            self._login_gate_obj = block_guard.LoginGate(
+                self.PLATFORM_LABEL, self._log,
+                lambda r: self.signals.login_required_signal.emit(r) if self.signals else None,
+                lambda: self._stop_requested, self.check_login,
+                emit_cleared=self._emit_cleared,
+            )
+        return self._login_gate_obj
+
+    def resolve_login_gate(self, choice: str):
+        """界面把用户的选择（continue / login_done / stop）交回采集线程"""
+        self._gate().resolve(choice)
+
+    def _ask_login(self, reason: str) -> bool:
+        """没有界面时（命令行直接跑）不等人，直接结束本轮，避免默默卡 30 分钟"""
+        if self.signals is None:
+            self._log(f"🛑 {reason}；没有界面可确认，本轮采集结束")
+            return False
+        return self._gate().ensure(reason)
+
+    def _login_gate(self) -> bool:
+        """采集开始前确认登录态。True=继续，False=本轮结束"""
+        state, detail = self.check_login()
+        if state == "ok":
+            self._log(f"🔑 {detail}")
+            return True
+        if state != "missing":
+            return True          # 浏览器没开、会话未就绪时不拦，交给循环里的会话检查
+        return self._ask_login(detail)
+
+    def _shell_gate(self) -> bool:
+        """连续采到空壳：多半是登录失效或权限不足。不写空记录，走登录确认流程"""
+        if self._shell_gate_passed:
+            return True          # 本轮已经问过你了，再遇到空壳照写，不反复弹窗
+        self._shell_gate_passed = True
+        state, detail = self.check_login()
+        head = f"连续 {self._shell_streak} 家详情字段全空"
+        reason = (head + f"：{detail}" if state == "missing"
+                  else head + "（登录凭证仍在，可能是平台权限或页面结构变了）")
+        return self._ask_login(reason)
 
     # ── Cookie 持久化 ──
     def _save_cookies(self, phone: str = ""):
@@ -117,33 +235,26 @@ class QiZhiDaoCrawler:
         return False
 
     def _check_login_status(self) -> bool:
-        """检测是否已登录"""
+        """检测是否已登录：以登录之后才会下发的 Cookie 为准
+
+        以前是“Cookie 名字里带 token/session/auth 就算已登录”，但企知道未登录
+        时也会下发匿名的 token，于是未登录被判成已登录，整份名单会被采成只电话有值的空数据。
+        只有在实时 Cookie 压根读不到（unknown）时，才退回看页面上的用户标识。
+        """
+        state, detail = self.check_login()
+        if state == "ok":
+            self._log(f"检测到登录凭证：{detail}")
+            return True
+        if state == "missing":
+            self._log(f"未检测到登录凭证：{detail}")
+            return False
         try:
-            self.driver.get(self.BASE_URL)
-            time.sleep(2)
-
-            # 检查 Cookie 中的登录标识
-            cookies = self.driver.get_cookies()
-            cookie_names = [c['name'] for c in cookies]
-            for kw in ['token', 'session', 'login', 'auth', 'user', 'uid', 'sid']:
-                for name in cookie_names:
-                    if kw in name.lower():
-                        self._log(f"检测到登录 Cookie: {name}")
-                        return True
-
-            # 检查页面元素（手机号脱敏显示 = 已登录）
-            body_text = self.driver.find_element(By.TAG_NAME, 'body').text
-            if re.search(r'1[3-9]\d{1}\*{4}\d{4}', body_text[:500]):
-                self._log("检测到登录标识（脱敏手机号）")
+            body = self.driver.find_element(By.TAG_NAME, 'body').text[:500]
+            if re.search(r'1[3-9]\d{1}\*{4}\d{4}', body) or '普通用户' in body or 'VIP' in body:
+                self._log("检测到用户标识（脱敏手机号/普通用户/VIP）")
                 return True
-
-            # 检查"普通用户"等标识
-            if '普通用户' in body_text[:500] or 'VIP' in body_text[:500]:
-                self._log("检测到用户标识")
-                return True
-
-        except Exception as e:
-            self._log(f"登录检测异常: {e}")
+        except Exception:
+            pass
         return False
 
     # ── 会话健康检查 ──
@@ -161,9 +272,31 @@ class QiZhiDaoCrawler:
             return False
 
     def try_restore_session(self) -> bool:
-        """从 Cookie 恢复登录"""
+        """启动时的登录探测：不跟已在跑的浏览器抢配置目录
+
+        调试 Chrome 用的 user-data-dir 同一时间只能给一个实例用。双标签的共享
+        浏览器在跑时再 start_browser，新 Chrome 会直接退出，报出来的
+        “Cookie 恢复失败: session not created”会让用户误以为账号出了什么问题。
+        这时只按已保存的登录凭证给个状态提示；真正开采前还会用浏览器里的
+        实时 Cookie 再确认一次（见 _login_gate）。
+        """
         if not self._cookie_file.exists():
             return False
+        if self.driver is not None:
+            state, detail = self.check_login()
+            self._logged_in = state != "missing"
+            self._log(f"浏览器已就绪：{detail or '未读到登录凭证，开采前会再确认'}")
+            return self._logged_in
+        if block_guard.debug_chrome_alive(self.attach_port or block_guard.SHARED_DEBUG_PORT):
+            state, detail = block_guard.login_state(
+                block_guard.saved_cookie_names(self._cookie_file), self.PLATFORM_LABEL)
+            self._logged_in = state == "ok"
+            if self._logged_in:
+                self._log(f"浏览器正在运行，按上次保存的登录凭证判定：{detail}")
+            else:
+                self._log("浏览器正在运行，未另起 Chrome（避开配置目录占用）："
+                          "上次保存的凭证里没有登录标识，开采前会用实时 Cookie 再确认一次")
+            return self._logged_in
         try:
             self.start_browser(headed=True)
             self.driver.get(self.BASE_URL)
@@ -176,7 +309,7 @@ class QiZhiDaoCrawler:
                 self._log("从 Cookie 恢复登录成功")
                 return True
             else:
-                self._log("Cookie 已过期，需重新登录")
+                self._log("Cookie 已过期或从未登录，需重新登录")
                 return False
         except Exception as e:
             self._log(f"Cookie 恢复失败: {e}")
@@ -186,20 +319,81 @@ class QiZhiDaoCrawler:
         """重启浏览器"""
         self._log("正在重启浏览器...")
         try:
-            if self.driver:
+            if self.shared_session:
+                # 共享模式下绝不能 quit（可能连带关掉另一个会话正在用的浏览器），只关自己的标签
+                self._close_own_tab()
+            elif self.driver:
                 self.driver.quit()
         except Exception:
             pass
         self.driver = None
+        self._own_handle = None
         time.sleep(2)
-        self.start_browser(headed=headed)
+        self.start_browser(headed=headed, attach_port=self.attach_port)
         self._log("浏览器已重启")
 
+    def _close_own_tab(self):
+        """只关闭本会话独占的窗口/标签（共享浏览器保持运行）"""
+        try:
+            if self.driver is not None and self._own_handle:
+                handles = self.driver.window_handles
+                if self._own_handle in handles:
+                    if self.driver.current_window_handle != self._own_handle:
+                        self.driver.switch_to.window(self._own_handle)
+                    self.driver.close()
+        except Exception:
+            pass
+
+    def _ensure_own_tab(self) -> bool:
+        """共享模式下确保当前操作对象仍是自己的窗口（防止误碰另一个会话的页面）"""
+        if not self.shared_session or self.driver is None:
+            return True
+        try:
+            if self.driver.current_window_handle == self._own_handle:
+                return True
+            handles = self.driver.window_handles
+            if self._own_handle not in handles:
+                self.driver.switch_to.new_window("window")
+                self._own_handle = self.driver.current_window_handle
+                self._log("  原窗口已被关闭，已重新开一个独占窗口")
+                return True
+            self.driver.switch_to.window(self._own_handle)
+            return True
+        except Exception:
+            return False
+
     # ── 浏览器启动 / 关闭 ──
-    def start_browser(self, headed: bool = True):
+    def start_browser(self, headed: bool = True, attach_port: int = None):
         with self._browser_lock:
             if self.driver is not None:
                 return
+            if attach_port:
+                # 双标签并行模式：附加到已在运行的共享 Chrome，并新开一个自己独占的标签
+                self.attach_port = attach_port
+                self.shared_session = True
+                opts = Options()
+                opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{attach_port}")
+                # 注意：附加模式（debuggerAddress）下 chromedriver 不接受 excludeSwitches /
+                # useAutomationExtension，带上会报 "unrecognized chrome option"
+                if sys.platform == "darwin":
+                    chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
+                else:
+                    chromedriver_path = Path(__file__).parent / "chromedriver-win64" / "chromedriver.exe"
+                if chromedriver_path.exists():
+                    self.driver = webdriver.Chrome(
+                        service=Service(executable_path=str(chromedriver_path)), options=opts)
+                else:
+                    self.driver = webdriver.Chrome(options=opts)
+                self.driver.switch_to.new_window("window")
+                self._own_handle = self.driver.current_window_handle
+                self.driver.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
+                )
+                self.wait = WebDriverWait(self.driver, 10)
+                self._log(f"已附加到共享浏览器（端口 {attach_port}），独占窗口 {self._own_handle[:8]}")
+                self._goto_homepage_verified()
+                return True
             opts = Options()
             if not headed:
                 opts.add_argument("--headless=new")
@@ -272,18 +466,23 @@ class QiZhiDaoCrawler:
         """关闭多余标签页并导航到平台首页，验证成功（解决 hao123 劫持/多标签问题）"""
         try:
             # 1. 只保留第一个标签页，关闭其余（hao123 等启动页可能在多余标签）
-            handles = self.driver.window_handles
-            if len(handles) > 1:
-                for h in handles[1:]:
+            #    共享浏览器下不能这么干：其余标签属于另一个并行会话，必须只操作自己的
+            if self.shared_session:
+                if not self._ensure_own_tab():
+                    return False
+            else:
+                handles = self.driver.window_handles
+                if len(handles) > 1:
+                    for h in handles[1:]:
+                        try:
+                            self.driver.switch_to.window(h)
+                            self.driver.close()
+                        except Exception:
+                            pass
                     try:
-                        self.driver.switch_to.window(h)
-                        self.driver.close()
+                        self.driver.switch_to.window(handles[0])
                     except Exception:
                         pass
-                try:
-                    self.driver.switch_to.window(handles[0])
-                except Exception:
-                    pass
 
             # 2. 导航并验证（最多 3 次）
             domain = self.BASE_URL.split("//")[-1].split("/")[0]
@@ -304,10 +503,14 @@ class QiZhiDaoCrawler:
         """关闭浏览器"""
         try:
             if self.driver:
+                if self.shared_session:
+                    # 共享浏览器：只关自己的标签，浏览器留给另一个会话继续用
+                    self._close_own_tab()
                 self.driver.quit()
         except Exception:
             pass
         self.driver = None
+        self._own_handle = None
         self._log("浏览器已关闭")
 
     def pause_crawl(self):
@@ -351,12 +554,15 @@ class QiZhiDaoCrawler:
         for attempt in range(2):
             try:
                 if self.driver is None:
-                    self.start_browser(headed=True)
+                    self.start_browser(headed=True, attach_port=self.attach_port)
 
                 # 会话健康检查
                 if not self._is_session_alive():
                     self._log("  会话已断开，重启浏览器...")
                     self._restart_browser(headed=True)
+
+                # 双标签并行：确保操作的是自己的标签
+                self._ensure_own_tab()
 
                 # 1. 确保在首页（获取cookies/session）
                 if 'qizhidao.com' not in (self.driver.current_url or ''):
@@ -763,6 +969,16 @@ class QiZhiDaoCrawler:
 
         self._log(f"🚀 开始采集，共 {total} 家公司，从第 {start_index + 1} 条开始")
 
+        # 未登录时详情页只会回一个电话，状态/法人/注册资本/邮箱/地址全是空的，
+        # 继续跑就是把整份名单白烧掉，所以先确认登录态再开跑
+        self._shell_streak = 0
+        self._shell_gate_passed = False
+        if not self._login_gate():
+            self._crawling = False
+            if self.signals:
+                self.signals.crawl_finished_signal.emit()
+            return
+
         consecutive_errors = 0
 
         for idx in range(start_index, total):
@@ -780,6 +996,11 @@ class QiZhiDaoCrawler:
             if not name:
                 continue
 
+            # 被拦截（百度安全验证等）时原地等人工处理：不能把这一家记成失败并往下烧名单
+            block = self._detect_block()
+            if block and not self._wait_unblock(block):
+                break
+
             self._log(f"[{idx + 1}/{total}] 正在查询：{name}")
 
             if self.signals:
@@ -792,7 +1013,18 @@ class QiZhiDaoCrawler:
 
             try:
                 result = self.search_company(name)
-                self.results.append(result)
+                if block_guard.is_shell_record(result):
+                    # 不写入空壳，也不推进名单：登录补上后从这一家重新采
+                    self._shell_streak += 1
+                    self._log(f"  ⚠ 详情字段全空（连续 {self._shell_streak} 家），这一家先不写入结果")
+                    if self._shell_streak >= block_guard.SHELL_STREAK_LIMIT \
+                            and not self._shell_gate():
+                        self._log("⏹ 未登录问题未解决，本轮采集到此结束")
+                        break
+                    time.sleep(self.delay_between)
+                    continue
+                self._shell_streak = 0
+                self._add_result(result)
                 consecutive_errors = 0
 
                 # 打印摘要
@@ -807,7 +1039,7 @@ class QiZhiDaoCrawler:
             except Exception as e:
                 consecutive_errors += 1
                 self._log(f"  ❌ 查询失败: {e}")
-                self.results.append({
+                self._add_result({
                     "公司名": name, "错误": str(e), "数据来源": "企知道"
                 })
 

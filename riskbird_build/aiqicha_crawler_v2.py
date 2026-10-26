@@ -15,6 +15,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import block_guard
+
 try:
     import websocket
     HAS_WEBSOCKET = True
@@ -36,6 +38,9 @@ if HAS_PYQT:
         crawl_finished_signal = pyqtSignal()
         login_status_signal = pyqtSignal(bool, str)
         manual_check_signal = pyqtSignal(str)
+        blocked_signal = pyqtSignal(str)   # 被安全验证/风控拦截，需人工在浏览器完成验证
+        block_cleared_signal = pyqtSignal(str)  # 人工完成验证，采集已自动继续
+        login_required_signal = pyqtSignal(str)  # 未登录，需界面上确认去登录还是继续
 else:
     class CrawlerSignals:
         pass
@@ -47,17 +52,23 @@ class AiQiChaCrawlerV2:
     BASE_URL = "https://aiqicha.baidu.com"
     SEARCH_URL = "https://aiqicha.baidu.com/s?q={}"
     DETAIL_URL = "https://aiqicha.baidu.com/company_detail_{}"
+    PLATFORM_LABEL = "爱企查"
     
     def __init__(self, gui_callback=None, debug_port=9233):
         self.gui_callback = gui_callback
         self.debug_port = debug_port
         self.base_url = f"http://127.0.0.1:{debug_port}"
+        # 双标签并行采集：本会话独占的标签页 id，所有 CDP 命令只发往它
+        self.pin_tab_id = None
+        self.attach_mode = False
         
         self._logged_in = False
         self._crawling = False
         self._stop_requested = False
         self._pause_requested = False
         self.results = []
+        # 采集线程在写、GUI 线程在读（双标签并行时两个线程同时写），靠锁交接快照
+        self.results_lock = threading.RLock()
         self._browser_lock = threading.Lock()
         
         # 兼容性属性（GUI 期望这些属性存在）
@@ -75,6 +86,11 @@ class AiQiChaCrawlerV2:
         
         self.delay_between = 0.5
         self.max_retries = 2
+
+        # 登录态闸门与空壳计数
+        self._login_gate_obj = None
+        self._shell_streak = 0
+        self._shell_gate_passed = False
     
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -84,6 +100,148 @@ class AiQiChaCrawlerV2:
         if self.signals:
             self.signals.log_signal.emit(full_msg)
         print(full_msg)
+
+    # ── 结果交接 / 拦截处理 ──
+    def _add_result(self, result: dict):
+        """线程安全地追加一条采集结果"""
+        with self.results_lock:
+            self.results.append(result)
+
+    def snapshot_results(self) -> list:
+        """给 GUI 用的快照：连每条记录的 dict 一起复制。
+
+        只拷列表不够：单条记录是逐步填写的（search_company 边采边往 dict 里写），
+        写 Excel 时遍历 r.keys() 如果 dict 同时变大就会 RuntimeError。
+        """
+        with self.results_lock:
+            return [dict(r) for r in self.results]
+
+    def _emit_blocked(self, reason: str):
+        if self.signals:
+            try:
+                self.signals.blocked_signal.emit(reason or "页面被平台拦截")
+            except Exception:
+                pass
+
+    def _detect_block(self, ws_url=None):
+        """只看本会话自己那个标签，当前页面是不是验证页/风控插页"""
+        ws = ws_url or (self._get_ws_url() if self.pin_tab_id else None)
+        if not ws:
+            return ""
+        try:
+            return block_guard.detect_cdp(lambda e: self._execute_js(ws, e))
+        except Exception:
+            return ""
+
+    def _wait_unblock(self, reason: str, max_wait: int = 1800) -> bool:
+        """被拦截时原地等人工验证，不推进名单、不写入空记录"""
+        ok = block_guard.wait_unblock(
+            reason, self._log, self._emit_blocked,
+            lambda: self._stop_requested, self._detect_block,
+            max_wait=max_wait,
+        )
+        if ok:
+            self._emit_cleared(reason)
+        return ok
+
+    def _emit_cleared(self, reason: str):
+        if self.signals:
+            try:
+                self.signals.block_cleared_signal.emit(reason)
+            except Exception:
+                pass
+
+    # ── 登录态确认 ──
+    def check_login(self):
+        """用浏览器 Cookie 判登录态。
+
+        爱企查的登录凭证 BDUSS 是 HttpOnly，document.cookie 读不到，必须走
+        CDP Network.getCookies；拿不到 Cookie 时返回 unknown 而不是 missing，
+        免得把“读不到”误判成“未登录”而拦住正常采集。
+        """
+        ws = self._get_ws_url()
+        if not ws:
+            return "unknown", "爱企查标签页还没打开"
+        try:
+            resp = self._send_command(ws, "Network.getCookies",
+                                      {"urls": ["https://aiqicha.baidu.com"]})
+        except Exception as e:
+            return "unknown", f"读取 Cookie 失败：{str(e)[:60]}"
+        cookies = (resp.get("result") or {}).get("cookies")
+        if cookies is None:
+            return "unknown", "读取 Cookie 无返回"
+        return block_guard.login_state([c.get("name") for c in cookies],
+                                       self.PLATFORM_LABEL)
+
+    def _gate(self):
+        """登录闸门（延迟创建，signals 可能在爬虫建好之后才接上）"""
+        if self._login_gate_obj is None:
+            self._login_gate_obj = block_guard.LoginGate(
+                self.PLATFORM_LABEL, self._log,
+                lambda r: self.signals.login_required_signal.emit(r) if self.signals else None,
+                lambda: self._stop_requested, self.check_login,
+                emit_cleared=self._emit_cleared,
+            )
+        return self._login_gate_obj
+
+    def resolve_login_gate(self, choice: str):
+        """界面把用户的选择（continue / login_done / stop）交回采集线程"""
+        self._gate().resolve(choice)
+
+    def _ask_login(self, reason: str) -> bool:
+        """没有界面时（命令行直接跑）不等人，直接结束本轮"""
+        if self.signals is None:
+            self._log(f"🛑 {reason}；没有界面可确认，本轮采集结束")
+            return False
+        return self._gate().ensure(reason)
+
+    def _login_gate(self) -> bool:
+        """采集开始前确认登录态。True=继续，False=本轮结束"""
+        state, detail = self.check_login()
+        if state == "ok":
+            self._log(f"🔑 {detail}")
+            return True
+        if state != "missing":
+            return True
+        return self._ask_login(detail)
+
+    def _shell_gate(self) -> bool:
+        """连续采到空壳：多半是登录失效或权限不足。不写空记录，走登录确认流程"""
+        if self._shell_gate_passed:
+            return True
+        self._shell_gate_passed = True
+        state, detail = self.check_login()
+        head = f"连续 {self._shell_streak} 家详情字段全空"
+        reason = (head + f"：{detail}" if state == "missing"
+                  else head + "（登录凭证仍在，可能是平台权限或页面结构变了）")
+        return self._ask_login(reason)
+
+    def _suggest_suppressed(self, ws_url, name: str) -> bool:
+        """区分“真没这家公司”与“联想被风控抑制”。
+
+        实测：正常时注入后 1 秒内必出联想项；被抑制时输入框里仍保留我们注入的公司名
+        但联想恒为空（而真查无此公司时，前端会把输入框换成自己推荐的内容）。
+        误判代价不对称：把真没这家公司当拦截只会多等几十秒，反过来会把整份名单烧成空数据。
+        """
+        state = self._execute_js(ws_url, """
+            (function() {
+                var i = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                if (!i) return JSON.stringify({v: '', n: -1});
+                var n = document.querySelectorAll('.ivu-select-item, .sug-company-line').length;
+                return JSON.stringify({v: i.value || '', n: n});
+            })()
+        """)
+        if not state:
+            return False
+        try:
+            info = json.loads(state)
+        except Exception:
+            return False
+        val = str(info.get("v") or "").strip()
+        if int(info.get("n") or 0) > 0:
+            return False
+        key = str(name)[:6]
+        return bool(key) and (key in val or val in str(name))
     
     # ── CDP 通信 ──
     def _get_tabs(self):
@@ -92,8 +250,12 @@ class AiQiChaCrawlerV2:
         return resp.json()
     
     def _get_ws_url(self, url_pattern=None):
-        """获取 WebSocket URL"""
+        """获取 WebSocket URL（双标签并行时固定返回本会话独占的标签，不会被其他会话的页面干扰）"""
         tabs = self._get_tabs()
+        if self.pin_tab_id:
+            for tab in tabs:
+                if tab.get("id") == self.pin_tab_id:
+                    return tab.get("webSocketDebuggerUrl")
         if url_pattern:
             for tab in tabs:
                 if url_pattern in tab.get("url", ""):
@@ -300,9 +462,23 @@ class AiQiChaCrawlerV2:
         
         return str(temp_profile)
     
-    def start_browser(self, headed: bool = True):
-        """启动浏览器（自动管理 Chrome 进程）"""
+    def start_browser(self, headed: bool = True, attach: bool = False):
+        """启动浏览器（自动管理 Chrome 进程）
+
+        attach=True 时不启动也不关闭任何 Chrome，只附加到已运行的共享浏览器并开一个独占标签。
+        """
         with self._browser_lock:
+            if attach:
+                self.attach_mode = True
+                try:
+                    if not self._get_tabs():
+                        self._log("❌ 共享浏览器调试端口未就绪，无法附加")
+                        return False
+                except Exception:
+                    self._log("❌ 共享浏览器调试端口连不上，无法附加")
+                    return False
+                return self.open_own_tab()
+
             # 1. 先检查是否已有可用的调试端口
             try:
                 tabs = self._get_tabs()
@@ -383,7 +559,15 @@ class AiQiChaCrawlerV2:
     
     def close_browser(self):
         """关闭浏览器（CDP 模式下不关闭，由用户手动关闭）"""
-        pass
+        if self.attach_mode and self.pin_tab_id:
+            # 双标签并行：只关自己独占的标签，共享浏览器留给另一个会话
+            try:
+                ws = self._get_ws_url()
+                if ws:
+                    self._close_tab(ws)
+            except Exception:
+                pass
+            self.pin_tab_id = None
     
     def _is_session_alive(self) -> bool:
         """检查会话是否存活"""
@@ -506,34 +690,66 @@ class AiQiChaCrawlerV2:
                         break
                     time.sleep(1)
                 
+                # 并行采集时两个会话抢资源，首页水合明显变慢；上面的判据（#app）在本站永远不成立，
+                # 必须额外等到页面真正可交互，否则注入的公司名会被未挂载的组件丢掉
+                if self.attach_mode:
+                    self._wait_page_hydrated(ws_url, 15)
+                
                 # 检查页面状态
                 page_check = self._check_page_status(ws_url)
                 if page_check == 'blocked':
                     self._log("️ 检测到反爬虫，尝试刷新...")
                     self._execute_js(ws_url, "(function() { location.reload(); })()")
                     time.sleep(5)
+
+                # 本标签已经停在验证页上：原地等人工完成验证，不拿这一家去凑数
+                block = self._detect_block(ws_url)
+                if block:
+                    if not self._wait_unblock(block):
+                        result["状态"] = "拦截未解除"
+                        return result
+                    ws_url = self._get_or_create_homepage_tab()
                 
                 # 3. 清空并输入公司名
                 self._clear_and_input_search(ws_url, name)
                 
                 # 4. 等待自动补全出现（智能等待：最多 3 秒）
-                autocomplete_found = False
-                for i in range(6):  # 6 * 0.5 = 3 秒
-                    time.sleep(0.5)
-                    check = self._execute_js(ws_url, """
-                        (function() {
-                            var items = document.querySelectorAll('.ivu-select-item, .sug-company-line');
-                            return items.length > 0 ? 'found' : 'waiting';
-                        })()
-                    """)
-                    if check == 'found':
-                        autocomplete_found = True
-                        break
+                autocomplete_found = self._wait_autocomplete(ws_url, 3.0)
                 
+                # 并行模式下首页可能刚好在注入时才挂载完，重试两次（单平台模式保持原有时序不变）
+                if not autocomplete_found and self.attach_mode:
+                    for _retry in range(2):
+                        self._wait_page_hydrated(ws_url, 10)
+                        self._log(f"  未出现联想，第{_retry + 1}次重试输入：{name}")
+                        self._clear_and_input_search(ws_url, name)
+                        autocomplete_found = self._wait_autocomplete(ws_url, 3.0)
+                        if autocomplete_found:
+                            break
+
                 if not autocomplete_found:
-                    self._log(f"未找到自动补全：{name}")
-                    result["状态"] = "未找到"
-                    return result
+                    # 先分清是“真没这家公司”还是“联想被风控抑制”，
+                    # 被抑制时绝不能把这一家记成未找到并往下烧名单（否则整份名单会瞬间变成空数据）
+                    block = self._detect_block(ws_url)
+                    suppressed = bool(block) or self._suggest_suppressed(ws_url, name)
+                    if not suppressed:
+                        self._log(f"未找到自动补全：{name}")
+                        result["状态"] = "未找到"
+                        return result
+                    if not block:
+                        block = "搜索联想被平台抑制（多为请求过快触发风控）"
+                    self._log(f"⚠ {block}：{name}")
+                    if not self._wait_unblock(block):
+                        result["状态"] = "拦截未解除"
+                        return result
+                    # 恢复后重新归位首页并重试这一家
+                    self._navigate_to_homepage(ws_url)
+                    time.sleep(4)
+                    self._wait_page_hydrated(ws_url, 15)
+                    self._clear_and_input_search(ws_url, name)
+                    autocomplete_found = self._wait_autocomplete(ws_url, 5.0)
+                    if not autocomplete_found:
+                        result["状态"] = "未找到"
+                        return result
                 
                 # 5. 点击自动补全第一项（会直接跳转到详情页）
                 self._click_first_autocomplete(ws_url)
@@ -594,8 +810,76 @@ class AiQiChaCrawlerV2:
         result["状态"] = "失败"
         return result
     
+    def open_own_tab(self) -> bool:
+        """在共享浏览器里开一个本会话独占的页面并打开爱企查首页。
+
+        用独立窗口（newWindow）而不是同窗口的新标签：同窗口内只有一个标签是“可见”的，
+        后台标签会被 Chrome 节流（定时器降频、requestAnimationFrame 暂停），
+        并行采集时两边都保持可见才不会互相拖慢。
+        """
+        target_id = None
+        browser_ws = None
+        try:
+            ver = requests.get(f"{self.base_url}/json/version", timeout=5).json()
+            browser_ws = ver.get("webSocketDebuggerUrl")
+        except Exception:
+            browser_ws = None
+        if browser_ws:
+            for params in ({"url": self.BASE_URL, "newWindow": True}, {"url": self.BASE_URL}):
+                try:
+                    r = self._send_command(browser_ws, "Target.createTarget", params)
+                    target_id = (r.get("result") or {}).get("targetId")
+                    if target_id:
+                        break
+                except Exception:
+                    target_id = None
+        if not target_id:
+            try:
+                resp = requests.put(f"{self.base_url}/json/new?url={self.BASE_URL}", timeout=5)
+                target_id = (resp.json() or {}).get("id")
+            except Exception:
+                target_id = None
+        if not target_id:
+            self._log("❌ 无法在共享浏览器中创建爱企查标签")
+            return False
+        self.pin_tab_id = target_id
+        self._log(f"已占用爱企查独占标签 {target_id[:8]}")
+        for _ in range(8):
+            time.sleep(1)
+            try:
+                ws = self._get_ws_url()
+                cur = self._execute_js(ws, "(function() { return window.location.href; })()") if ws else ""
+                if cur and "aiqicha" in str(cur):
+                    # 光看 URL 不够：组件未挂载就采集会直接失败，等它真正可交互
+                    self._wait_page_hydrated(ws, 15)
+                    self._log("爱企查页面已打开")
+                    return True
+            except Exception:
+                pass
+        self._log("⚠ 爱企查页面未确认打开，将继续尝试")
+        return True
+
     def _get_or_create_homepage_tab(self):
         """获取或创建爱企查首页标签页（复用现有，避免重复打开）"""
+        # 双标签并行：永远只用本会话独占的那个标签，不去扫全局标签（否则会拿到另一个会话的页面）
+        if self.pin_tab_id:
+            ws = self._get_ws_url()
+            if ws:
+                cur = ""
+                try:
+                    cur = self._execute_js(ws, "(function() { return window.location.href; })()") or ""
+                except Exception:
+                    cur = ""
+                if "aiqicha.baidu.com" not in cur or "/s?" in cur or "company_detail" in cur:
+                    self._navigate_to_homepage(ws)
+                    time.sleep(4)
+                    if self.attach_mode:
+                        self._wait_page_hydrated(ws, 15)
+                elif self.attach_mode and not self._page_hydrated(ws):
+                    self._wait_page_hydrated(ws, 15)
+                return ws
+            self.pin_tab_id = None   # 标签被关掉了，下面重建
+
         tabs = self._get_tabs()
         
         # 查找已有的爱企查首页标签页
@@ -675,6 +959,52 @@ class AiQiChaCrawlerV2:
         """)
         return result is not None
     
+    def _page_hydrated(self, ws_url) -> bool:
+        """页面是否已真正可交互（组件已挂载、正文已渲染）。
+
+        不能用 #app 判断：爱企查首页根本没有 #app（实测 hasApp 永远 False），
+        也不能只看 readyState：interactive 阶段正文只有 300 多字符，此时注入公司名
+        会被还未挂载的组件直接丢掉（表现为“未找到自动补全”）。
+        """
+        try:
+            st = self._execute_js(ws_url, """
+                (function() {
+                    var input = document.querySelector('#aqc-search-input') || document.querySelector('#aqc-header-search-input');
+                    return {
+                        ready: document.readyState === 'complete',
+                        hasInput: !!input,
+                        len: (document.body.innerText || '').length
+                    };
+                })()
+            """)
+            return bool(st and st.get("ready") and st.get("hasInput") and int(st.get("len") or 0) >= 2000)
+        except Exception:
+            return False
+
+    def _wait_page_hydrated(self, ws_url, seconds: int = 15) -> bool:
+        """等页面水合完成（并行采集时两个会话抢资源，首页明显变慢）"""
+        for _ in range(seconds):
+            if self._page_hydrated(ws_url):
+                return True
+            time.sleep(1)
+        return False
+
+    def _wait_autocomplete(self, ws_url, seconds: float = 3.0) -> bool:
+        """等搜索联想项出现"""
+        for _ in range(int(seconds * 2)):
+            time.sleep(0.5)
+            try:
+                if self._execute_js(ws_url, """
+                    (function() {
+                        var items = document.querySelectorAll('.ivu-select-item, .sug-company-line');
+                        return items.length > 0 ? 'found' : 'waiting';
+                    })()
+                """) == 'found':
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _navigate_to_homepage(self, ws_url):
         """导航回爱企查首页"""
         self._execute_js(ws_url, "(function() { window.location.href = 'https://aiqicha.baidu.com/'; })()")
@@ -849,6 +1179,15 @@ class AiQiChaCrawlerV2:
 
         self._log(f"开始采集，共 {total} 家公司，从第 {start_index + 1} 条开始")
 
+        # 未登录时详情页字段是空的，先确认登录态再开跑，不白烧名单
+        self._shell_streak = 0
+        self._shell_gate_passed = False
+        if not self._login_gate():
+            self._crawling = False
+            if self.signals:
+                self.signals.crawl_finished_signal.emit()
+            return
+
         for idx in range(start_index, total):
             if self._stop_requested:
                 self._log(f"用户停止采集，已采集 {len(self.results)} 条")
@@ -863,9 +1202,30 @@ class AiQiChaCrawlerV2:
                 if self._stop_requested:
                     break
 
+            # 拦截门放在暂停之后：用户点"暂停"时优先听用户的，不抢着去等人工验证。
+            # 被拦时不推进名单、不写空记录，等人工在浏览器完成验证后从这一家继续
+            block = self._detect_block()
+            if block and not self._wait_unblock(block):
+                break
+
             try:
                 result = self.search_company(name)
-                self.results.append(result)
+                if result.get("状态") == "拦截未解除":
+                    self._log("⏹ 拦截未解除，本轮采集到此结束（这一家未写入结果，续采会从这里开始）")
+                    break
+                if block_guard.is_shell_record(result):
+                    # 不写入空壳，也不推进名单：登录补上后从这一家重新采
+                    self._shell_streak += 1
+                    self._log(f"  ⚠ 详情字段全空（连续 {self._shell_streak} 家），这一家先不写入结果")
+                    if self._shell_streak >= block_guard.SHELL_STREAK_LIMIT \
+                            and not self._shell_gate():
+                        self._log("⏹ 未登录问题未解决，本轮采集到此结束")
+                        break
+                    if idx < total - 1:
+                        time.sleep(self.delay_between)
+                    continue
+                self._shell_streak = 0
+                self._add_result(result)
 
                 if self.signals:
                     self.signals.progress_signal.emit(idx + 1, total)

@@ -142,6 +142,10 @@ def build_exe():
         "--hidden-import", "selenium.common",
         "--hidden-import", "selenium.common.exceptions",
         "--hidden-import", "customer_library_cleaner",
+        "--hidden-import", "dual_session",
+        "--hidden-import", "block_guard",
+        "--hidden-import", "requests",
+        "--hidden-import", "websocket",
         "--collect-all", "selenium",
         "--collect-all", "PyQt5",
         "riskbird_gui.py"
