@@ -25,6 +25,7 @@ from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 from riskbird_crawler_v2 import RiskBirdCrawlerV2, is_chrome_installed, download_and_install_chrome
 from qizhidao_crawler import QiZhiDaoCrawler
 from aiqicha_crawler_v2 import AiQiChaCrawlerV2
+import block_guard   # 续采比对公司名要用同一套归一化规则，不能各写一份
 
 try:
     import dual_session as _dual
@@ -1349,6 +1350,8 @@ class MainWindow(QMainWindow):
             crawler.signals.block_cleared_signal.connect(lambda msg, p=platform: self._on_block_cleared(p))
             # 未登录：弹窗让用户决定“去登录/仍然继续/停止”，不能默默把名单烧成空数据
             crawler.signals.login_required_signal.connect(lambda msg, p=platform: self._on_login_required(p, msg))
+            # 某一路已放弃等人工（夜间无人处理）：红条要撤掉，否则看起来像整个工具卡死
+            crawler.signals.handoff_signal.connect(lambda msg, p=platform: self._on_platform_handoff(p, msg))
         # 风鸟特有的信号
         self.riskbird_crawler.signals.login_status_signal.connect(self._on_login_status)
         self.riskbird_crawler.signals.manual_check_signal.connect(self._on_manual_check)
@@ -1570,6 +1573,8 @@ class MainWindow(QMainWindow):
             "两边结果自动合并，导出时照样生成《清洗后客户库入库数据》，\n"
             "自动保存也各存各的（企知道.xlsx / 爱企查.xlsx）。\n"
             "实测比单平台逐个跑省约一半时间，且不会采串公司。\n"
+            "夜间挂机：爱企查被验证码/限流拦住超过 10 分钟没人处理时会自动停这一路，\n"
+            "剩下的公司转给企知道接着采，不会整晚卡在一个验证码上。\n"
             "不勾选：只按上面选中的平台单独采集。\n"
             "风鸟不支持双标签（它有每日额度限制，并行只会更快用完）。"
         )
@@ -2302,6 +2307,20 @@ class MainWindow(QMainWindow):
         self._blocked_info = [it for it in self._blocked_info if it[0] != platform]
         self._login_info = [it for it in self._login_info if it[0] != platform]
         self._append_log(f"✅【{platform}】已恢复，采集继续")
+        if not (self._blocked_info or self._login_info):
+            self._hide_blocked_dialog()
+            if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
+                self._resume_timer()
+        self._refresh_blocked_banner()
+
+    def _on_platform_handoff(self, platform: str, reason: str):
+        """某一路采集撑不住已放弃等人工（爱企查被拦超时）：把它的待处理提示撤掉
+
+        名单已经交给企知道继续采，工具仍在跑，不该再挂“等你去验证”的红条与弹窗。
+        """
+        self._blocked_info = [it for it in self._blocked_info if it[0] != platform]
+        self._login_info = [it for it in self._login_info if it[0] != platform]
+        self._append_log(f"↪【{platform}】不再等人工处理：{reason}；剩下的公司已转给企知道接着采")
         if not (self._blocked_info or self._login_info):
             self._hide_blocked_dialog()
             if self.stop_btn.isEnabled() and not self.resume_btn.isEnabled():
@@ -3206,8 +3225,9 @@ class CrawlWorker(QThread):
 class DualCrawlWorker(QThread):
     """两个会话共用一个浏览器、各占一个窗口，同时采集互不干扰。
 
-    分工按原始位置单双数切分（第 1、3、5… 家 → 企知道；第 2、4、6… 家 → 爱企查），
-    所以暂停后续采时同一家公司仍归同一个平台，不会重复也不会漏。
+    分工按原始位置单双数切分（第 1、3、5… 家 → 企知道；第 2、4、6… 家 → 爱企查）。
+    夜间无人值守：爱企查被拦超过 block_wait_limit（默认 10 分钟）没人处理时，它会停止
+    这一路并把未采名单放进 NameHandoff 队列，企知道取走接着采，不致于采一晚只到一半。
     """
     progress = pyqtSignal(int, int)
     log_signal = pyqtSignal(str)
@@ -3226,13 +3246,44 @@ class DualCrawlWorker(QThread):
             self.finished.emit()
             return
 
+        # 移交队列只在本轮有效：两个爬虫是长驻对象，跑完必须摘掉，
+        # 否则下次单平台采集会拿着一个已经落定的旧队列去等移交
+        handoff = _dual.NameHandoff(log=self.log_signal.emit)
+        self.qzd.handoff = handoff
+        self.aqc.handoff = handoff
+        try:
+            self._run_both(handoff)
+        finally:
+            handoff.finish()          # 万一上面临时报错，企知道也不能无限等下去
+            self.qzd.handoff = None
+            self.aqc.handoff = None
+
+    def _todo_list(self, names: list, done: set) -> list:
+        """按“两边已采到的公司名”过滤待采名单
+
+        续采不能只按下标跳过：爱企查移交过来的名字会混在企知道的结果里，
+        按下标算会把企知道自己没采的那几家一并跳过；而企知道采过的公司如果
+        还留在爱企查的待采名单里，下一轮会被重复采一遍。按下标改按名字，两个
+        问题一起消失，也顺便把原名单里重复出现的公司只采一次。
+        """
+        return [n for n in names if str(n or "").strip()
+                and block_guard.norm_company(n) not in done]
+
+    def _run_both(self, handoff):
         qzd_names, aqc_names = _dual.split_parity(self.companies)
         total = len(self.companies)
-        qzd_start = len(self.qzd.results)
-        aqc_start = len(self.aqc.results)
+        done = {block_guard.norm_company(r.get("公司名"))
+                for r in self.qzd.snapshot_results() + self.aqc.snapshot_results()}
+        qzd_todo = self._todo_list(qzd_names, done)
+        aqc_todo = self._todo_list(aqc_names, done)
+        mins = max(1, int(getattr(self.aqc, "block_wait_limit", 600)) // 60)
         self.log_signal.emit(
-            f"⚡ 双标签分工：企知道 {len(qzd_names)} 家（单数，已完成 {qzd_start}）、"
-            f"爱企查 {len(aqc_names)} 家（双数，已完成 {aqc_start}）"
+            f"⚡ 双标签分工：企知道 {len(qzd_todo)} 家待采（单数，已完成 {len(self.qzd.results)}）、"
+            f"爱企查 {len(aqc_todo)} 家待采（双数，已完成 {len(self.aqc.results)}）"
+        )
+        self.log_signal.emit(
+            f"🌙 夜间无人值守：爱企查被拦超过 {mins} 分钟没人处理时会自动停止这一路，"
+            f"剩下的公司转给企知道接着采，不会整晚卡在一个验证码上"
         )
 
         stop = threading.Event()
@@ -3246,21 +3297,31 @@ class DualCrawlWorker(QThread):
         mon = threading.Thread(target=monitor, daemon=True)
         mon.start()
 
-        def run_one(crawler, names, start, tag):
+        def run_one(crawler, names, tag):
             try:
-                crawler.crawl(names, start)
+                crawler.crawl(names, 0)
             except Exception as e:
                 self.log_signal.emit(f"❌ {tag} 采集中断：{e}")
+            finally:
+                if crawler is self.aqc:
+                    # 爱企查收工就要落定：企知道自己名单跑完时靠这个信号
+                    # 决定是等移交名单还是直接收工
+                    handoff.finish()
 
-        t1 = threading.Thread(target=run_one, args=(self.qzd, qzd_names, qzd_start, "企知道"))
-        t2 = threading.Thread(target=run_one, args=(self.aqc, aqc_names, aqc_start, "爱企查"))
+        t1 = threading.Thread(target=run_one, args=(self.qzd, qzd_todo, "企知道"))
+        t2 = threading.Thread(target=run_one, args=(self.aqc, aqc_todo, "爱企查"))
         t1.start()
         t2.start()
         t1.join()
         t2.join()
         stop.set()
-        done = len(self.qzd.results) + len(self.aqc.results)
-        self.progress.emit(min(done, total), total)
+        done_count = len(self.qzd.results) + len(self.aqc.results)
+        self.progress.emit(min(done_count, total), total)
+        if handoff.gave_up:
+            self.log_signal.emit(
+                f"🔁 本轮爱企查中途停止，剩余公司已由企知道接手（企知道 {len(self.qzd.results)} 条 / "
+                f"爱企查 {len(self.aqc.results)} 条）"
+            )
         self.finished.emit()
 
 

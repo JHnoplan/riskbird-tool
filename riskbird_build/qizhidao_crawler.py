@@ -46,6 +46,7 @@ if HAS_PYQT:
         blocked_signal = pyqtSignal(str)   # 被安全验证/风控拦截，需人工在浏览器完成验证
         block_cleared_signal = pyqtSignal(str)  # 人工完成验证，采集已自动继续
         login_required_signal = pyqtSignal(str)  # 未登录，需界面上确认去登录还是继续
+        handoff_signal = pyqtSignal(str)  # 本路已放弃等人工，剩余名单转交另一平台（界面要撤掉红条）
 else:
     class CrawlerSignals:
         pass
@@ -92,6 +93,11 @@ class QiZhiDaoCrawler:
         self._login_gate_obj = None
         self._shell_streak = 0
         self._shell_gate_passed = False
+
+        # 夜间无人值守：爱企查撑不住时把剩余名单移交到这里，企知道取来接着采
+        # （handoff 由双标签工作线程注入，单平台采集时一直是 None）
+        self.handoff = None
+        self.handoff_wait = 3600   # 自己名单跑完后最多再等爱企查落定这么久
 
     # ── 日志 ──
     def _log(self, msg: str):
@@ -145,6 +151,57 @@ class QiZhiDaoCrawler:
                 self.signals.block_cleared_signal.emit(reason)
             except Exception:
                 pass
+
+    # ── 接收爱企查移交的名单（夜间无人值守）──
+    def _take_handoff(self, companies: list, wait: float = 0) -> bool:
+        """取一次爱企查移交的名单，追加到本侧名单尾部。返回是否真的追加了新名字。
+
+        wait=0 时只看一眼不等（循环内用，绝不能因为对面还在等验证就把本侧也阻住）；
+        自己名单跑完时才传一个大于 0 的时长等对面落定，否则会漏掉刚移交过来的几家。
+        """
+        if self.handoff is None:
+            return False
+        try:
+            if wait > 0:
+                self.handoff.wait_for(wait, should_stop=lambda: self._stop_requested)
+            new = self.handoff.pending()
+        except Exception as e:
+            self._log(f"  ⚠ 接收移交名单失败：{e}")
+            return False
+        if not new:
+            return False
+        # 去重两层：已经采过的公司名、以及本侧名单里已经排着的名字
+        # （移交过来的本来就是爱企查未采的，但原名单重复出现时两边会撞车）
+        with self.results_lock:
+            known = {block_guard.norm_company(r.get("公司名")) for r in self.results}
+        known |= {block_guard.norm_company(n) for n in companies}
+        fresh = [n for n in new if block_guard.norm_company(n) not in known]
+        if not fresh:
+            return False
+        companies.extend(fresh)
+        self._log(f"🔁 接下爱企查移交的 {len(fresh)} 家（企知道共 {len(companies)} 家）："
+                  + "、".join(n[:16] for n in fresh[:3]) + ("…" if len(fresh) > 3 else ""))
+        return True
+
+    def _iter_work(self, companies: list, start_index: int):
+        """按下标走名单，但每步重读名单长度：爱企查移交的名字是运行时追加进来的。
+
+        不能沿用 range(start, len(companies)) 在开头定死长度，否则移交过来那批永远没人采。
+        自己名单跑完时也不能直接收工：爱企查可能正在等人工验证，它撑不住之后才会把
+        剩余名单放过来，所以先等对面落定（或超时），落定后又有名字就继续采。
+        """
+        idx = start_index
+        while idx < len(companies):
+            self._take_handoff(companies)
+            yield idx
+            idx += 1
+        # 自己这边空了才需要等对面落定；循环途中的停止由采集循环自己记日志
+        while not self._stop_requested and self._take_handoff(companies, self.handoff_wait):
+            while idx < len(companies):
+                if self._stop_requested:
+                    return
+                yield idx
+                idx += 1
 
     # ── 登录态确认 ──
     def check_login(self):
@@ -981,7 +1038,7 @@ class QiZhiDaoCrawler:
 
         consecutive_errors = 0
 
-        for idx in range(start_index, total):
+        for idx in self._iter_work(companies, start_index):
             if self._stop_requested:
                 self._log(f"⏹ 用户停止采集，已采集 {len(self.results)} 条")
                 break
@@ -1001,10 +1058,10 @@ class QiZhiDaoCrawler:
             if block and not self._wait_unblock(block):
                 break
 
-            self._log(f"[{idx + 1}/{total}] 正在查询：{name}")
+            self._log(f"[{idx + 1}/{len(companies)}] 正在查询：{name}")
 
             if self.signals:
-                self.signals.progress_signal.emit(idx + 1, total)
+                self.signals.progress_signal.emit(idx + 1, len(companies))
 
             # 会话健康检查
             if not self._is_session_alive():

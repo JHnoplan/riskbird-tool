@@ -42,6 +42,7 @@ if HAS_PYQT:
         blocked_signal = pyqtSignal(str)   # 被安全验证/风控拦截，需人工在浏览器完成验证
         block_cleared_signal = pyqtSignal(str)  # 人工完成验证，采集已自动继续
         login_required_signal = pyqtSignal(str)  # 未登录，需界面上确认去登录还是继续
+        handoff_signal = pyqtSignal(str)  # 本路已放弃等人工，剩余名单转交另一平台（界面要撤掉红条）
 else:
     class CrawlerSignals:
         pass
@@ -52,6 +53,8 @@ else:
 SEARCH_PAGE_READY_LEN = 1200
 # 要连续这么多次“正文已渲染但结果区空”才敢定“查无此公司”（每轮约 0.7 秒）
 SEARCH_PAGE_NONE_POLLS = 4
+# 夜间挂机无人值守：拦截持续超过这个秒数就放弃爱企查、把剩余名单移交企知道
+BLOCK_WAIT_LIMIT = 600
 
 
 class AiQiChaCrawlerV2:
@@ -94,6 +97,13 @@ class AiQiChaCrawlerV2:
         
         self.delay_between = 0.5
         self.max_retries = 2
+
+        # 夜间无人值守：被拦（验证码/限流）累计超过这个时长就当作没人会来处理，
+        # 停止爱企查这一路，把剩余名单交给企知道接着采。handoff 由双标签工作线程注入；
+        # 单平台采集时 handoff 为 None，沿用原来的长等待（停下来只会让名单越积越多）。
+        self.block_wait_limit = BLOCK_WAIT_LIMIT
+        self.handoff = None
+        self._blocked_at = 0.0   # 本轮拦截开始时刻（0 表示当前没被拦）
 
         # 登录态闸门与空壳计数
         self._login_gate_obj = None
@@ -186,11 +196,28 @@ class AiQiChaCrawlerV2:
         self._gate().resolve(choice)
 
     def _ask_login(self, reason: str) -> bool:
-        """没有界面时（命令行直接跑）不等人，直接结束本轮"""
+        """没有界面时（命令行直接跑）不等人，直接结束本轮。
+
+        双标签并行（有移交对象）时按 block_wait_limit 限时等：夜间没人点“继续采集”，
+        干等 30 分钟等于整晚白跑，超时就把名单交给企知道。验证码与登录共用同一个
+        “等人工”计时，因为它们对夜间挂机来说是同一回事：没人在现场。
+        """
         if self.signals is None:
             self._log(f"🛑 {reason}；没有界面可确认，本轮采集结束")
             return False
-        return self._gate().ensure(reason)
+        if self.handoff is None:
+            return self._gate().ensure(reason)
+        now = time.time()
+        if not self._blocked_at:
+            self._blocked_at = now
+        left = int(self.block_wait_limit - (now - self._blocked_at))
+        if left <= 0:
+            self._log(f"⏱ 等人工处理已超过 {int(self.block_wait_limit) // 60} 分钟，爱企查这一路先停")
+            return False
+        if self._gate().ensure(reason, max_wait=left, rounds=1):
+            self._blocked_at = 0.0   # 人已经确认过了，下一段重新计时
+            return True
+        return False
 
     def _login_gate(self) -> bool:
         """采集开始前确认登录态。True=继续，False=本轮结束"""
@@ -664,6 +691,55 @@ class AiQiChaCrawlerV2:
             self._emit_cleared(reason)
         return ok
 
+    def _wait_unblock_limited(self, reason: str, **kw) -> bool:
+        """带“没人处理就放弃”上限的等待。返回 False = 该停止爱企查并移交名单。
+
+        上限按整段拦截累计计算（验证码反复出现也只算一段），不是每家重新给 10 分钟，
+        否则夜间挂机会变成“每家等 10 分钟、整晚都在等”。
+        没有移交对象（单平台采集）时沿用原来的长等待：这时候停下来只会把名单越积越多。
+        """
+        if self.handoff is None:
+            return self._wait_unblock(reason, **kw)
+        now = time.time()
+        if not self._blocked_at:
+            self._blocked_at = now
+        left = int(self.block_wait_limit - (now - self._blocked_at))
+        if left <= 0:
+            self._log(f"⏱ 拦截已持续 {int(self.block_wait_limit) // 60} 分钟以上无人处理，爱企查这一路先停")
+            return False
+        kw["max_wait"] = min(int(kw.get("max_wait") or left), left)
+        if int(kw.get("interval") or 1) > kw["max_wait"]:
+            kw["interval"] = max(1, kw["max_wait"])
+        if self._wait_unblock(reason, **kw):
+            self._blocked_at = 0.0   # 这一段拦截过去了，下一段重新计时
+            return True
+        return False
+
+    def _give_up_left(self, companies: list, idx: int, why: str = ""):
+        """停止本路采集，并把从这一家开始的剩余名单交给企知道接着采。
+
+        只在“不是用户主动停止”时调用：用户点停止代表全盘打算，这时候把名单
+        塞给企知道反而违背用户意图。没有移交对象（单平台采集）时直接不做。
+        """
+        if self.handoff is None:
+            return
+        left = [str(n or "").strip() for n in companies[idx:] if str(n or "").strip()]
+        mins = max(1, int(self.block_wait_limit) // 60)
+        why = why or f"验证码/限流持续 {mins} 分钟以上无人处理"
+        self._log(f"🛑 爱企查这一路到此结束（{why}），剩下 {len(left)} 家不再在这里死等")
+        if left:
+            try:
+                self.handoff.give_up(left, why)
+            except Exception as e:
+                self._log(f"  ⚠ 名单移交失败：{e}")
+        if self.signals:
+            try:
+                # 采集已经不等人了，界面上的“等待人工处理”红条要撤掉，
+                # 否则企知道还在跑、用户却以为整个工具卡在验证上
+                self.signals.handoff_signal.emit(why)
+            except Exception:
+                pass
+
     def _heal_block(self) -> bool:
         """卡在验证页时的自愈，返回是否做了动作（调用方会再判一次拦截）。
 
@@ -930,7 +1006,7 @@ class AiQiChaCrawlerV2:
                     return True
                 return s["state"] in ("none", "login")
 
-            if not self._wait_unblock(reason, max_wait=900, interval=15, ready=ready):
+            if not self._wait_unblock_limited(reason, max_wait=900, interval=15, ready=ready):
                 return "stop", self._get_ws_url() or ws_url
             if hit.get("pid"):
                 ws_url = self._get_ws_url() or ws_url
@@ -1012,7 +1088,7 @@ class AiQiChaCrawlerV2:
                 # 本标签已经停在验证页上：原地等人工完成验证，不拿这一家去凑数
                 block = self._detect_block(ws_url)
                 if block:
-                    if not self._wait_unblock(block):
+                    if not self._wait_unblock_limited(block):
                         result["状态"] = "拦截未解除"
                         return result
                     ws_url = self._get_or_create_homepage_tab()
@@ -1464,6 +1540,9 @@ class AiQiChaCrawlerV2:
         self._shell_streak = 0
         self._shell_gate_passed = False
         if not self._login_gate():
+            # 夜间没人点“去登录/继续采集”，在这一家死等不如把名单交给企知道
+            if not self._stop_requested:
+                self._give_up_left(companies, start_index, "爱企查未登录且长时间无人确认")
             self._crawling = False
             if self.signals:
                 self.signals.crawl_finished_signal.emit()
@@ -1484,15 +1563,26 @@ class AiQiChaCrawlerV2:
                     break
 
             # 拦截门放在暂停之后：用户点"暂停"时优先听用户的，不抢着去等人工验证。
-            # 被拦时不推进名单、不写空记录，等人工在浏览器完成验证后从这一家继续
+            # 被拦时不推进名单、不写空记录，等人工在浏览器完成验证后从这一家继续；
+            # 但夜间没人点验证，所以超过 block_wait_limit 就收掉这一路、把名单交给企知道
             block = self._detect_block()
-            if block and not self._wait_unblock(block):
-                break
+            if block:
+                if not self._wait_unblock_limited(block):
+                    if not self._stop_requested:
+                        self._give_up_left(companies, idx)
+                    break
+            else:
+                # 能正常开工就说明这一段拦截过去了，别拿旧时间戳去裁下一段
+                self._blocked_at = 0.0
 
             try:
                 result = self.search_company(name)
                 if result.get("状态") == "拦截未解除":
-                    self._log("⏹ 拦截未解除，本轮采集到此结束（这一家未写入结果，续采会从这里开始）")
+                    # 搜索途中被拦且等不到恢复：夜间无人处理时收掉这一路、名单交企知道
+                    if not self._stop_requested:
+                        self._give_up_left(companies, idx)
+                    if self.handoff is None:
+                        self._log("⏹ 拦截未解除，本轮采集到此结束（这一家未写入结果，续采会从这里开始）")
                     break
                 if block_guard.is_shell_record(result):
                     # 不写入空壳，也不推进名单：登录补上后从这一家重新采
@@ -1501,6 +1591,10 @@ class AiQiChaCrawlerV2:
                     if self._shell_streak >= block_guard.SHELL_STREAK_LIMIT \
                             and not self._shell_gate():
                         self._log("⏹ 未登录问题未解决，本轮采集到此结束")
+                        if not self._stop_requested:
+                            self._give_up_left(
+                                companies, idx,
+                                f"连续 {self._shell_streak} 家详情字段全空且长时间无人确认")
                         break
                     if idx < total - 1:
                         time.sleep(self.delay_between)

@@ -9,11 +9,14 @@
 - 分工：第 1、3、5… 家给企知道，第 2、4、6… 家给爱企查；两个会话的结果由 GUI 合并后
   统一写两份文件（原数据 + 清洗后入库），不再按平台各存一个 xlsx。
 - 风鸟不参与：它有每日模糊查询额度与详情额度，并行只会更快烧光额度。
+- 夜间无人值守：爱企查被拦超过约定时长没有人工处理时，走 NameHandoff 把剩余名单
+  交给企知道接着采，避免一整晚只采到一半。
 """
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -249,6 +252,84 @@ def split_parity(companies: list):
     qzd = [name for i, name in enumerate(companies) if i % 2 == 0]
     aqc = [name for i, name in enumerate(companies) if i % 2 == 1]
     return qzd, aqc
+
+
+class NameHandoff:
+    """爱企查撑不住时把剩余名单交给企知道接着采（夜间挂机无人值守场景）。
+
+    交接面很窄，只靠一个线程安全队列：
+      · 爱企查只在“放弃”时放名字（give_up），收工前必须 finish（不管是否正常采完），
+        否则企知道自己名单跑完后不知道还要不要等下去；
+      · 企知道每采完一家取一次（pending），自己名单空了则先等对面落定（wait_for），
+        否则会漏掉刚好在收尾时才移交的那几家。
+
+    队列自己已经按名字去重（同一家不会被移交两次），取方还会再按“已采结果 +
+    已排名单”过滤一层，所以原名单里重复出现的公司也不会被重复采集。
+    """
+
+    def __init__(self, log=None):
+        self._cond = threading.Condition()
+        self._pending = []
+        self._handed = set()
+        self._settled = False     # 爱企查已经收工（放弃或采完），不会再有移交
+        self._gave_up = False
+        self._log = log or (lambda m: None)
+
+    def give_up(self, names, reason: str = "") -> int:
+        """爱企查调用：把还没采的名单交出去，返回真正新增的条数"""
+        fresh = []
+        with self._cond:
+            for raw in (names or []):
+                n = str(raw or "").strip()
+                if n and n not in self._handed:
+                    self._handed.add(n)
+                    self._pending.append(n)
+                    fresh.append(n)
+            self._gave_up = True
+            self._cond.notify_all()
+        if fresh:
+            self._log(f"🔁 已把 {len(fresh)} 家未采名单移交给企知道"
+                      + (f"：{reason}" if reason else ""))
+        return len(fresh)
+
+    def finish(self):
+        """爱企查收工：企知道那边等的就是这个信号"""
+        with self._cond:
+            self._settled = True
+            self._cond.notify_all()
+
+    def pending(self) -> list:
+        """企知道调用：取出并清空队列"""
+        with self._cond:
+            out, self._pending = self._pending, []
+            return out
+
+    def wait_for(self, seconds: float, should_stop=None) -> bool:
+        """等到“有移交内容”或“爱企查落定”。返回是否拿到了名字。
+
+        用条件变量而不是 sleep 轮询：爱企查在等人工验证时企知道本来就是空转，
+        睡死在这里比提前退出把名单漏掉好。
+        """
+        deadline = time.time() + max(0.0, seconds)
+        with self._cond:
+            while not self._settled and not self._pending:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+                if should_stop and should_stop():
+                    return False
+                self._cond.wait(min(left, 0.5))
+            return bool(self._pending)
+
+    @property
+    def gave_up(self) -> bool:
+        with self._cond:
+            return self._gave_up
+
+    @property
+    def settled(self) -> bool:
+        with self._cond:
+            return self._settled
 
 
 def attach_qizhidao(crawler, log, port: int = DUAL_PORT) -> bool:

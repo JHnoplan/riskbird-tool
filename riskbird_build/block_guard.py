@@ -15,9 +15,24 @@ block_guard.py - 平台拦截（安全验证/风控）识别与等待
 """
 
 import json
+import re
 import threading
 import time
 import urllib.request
+
+def norm_company(name) -> str:
+    """公司名归一化：用于“这家是不是已经采过”的跨平台比对。
+
+    采集结果里的公司名来自页面标题/表头，与名单里的写法可能有空格、全半角括号差异，
+    不去一律就会把已采过的公司再采一遍。不抹括号内容，只抹无语义差异的字符。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    for a, b in (("（", "("), ("）", ")"), ("\u3000", " "), ("　", " ")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", "", s)
+
 
 # 命中即确定是拦截页（URL 特征最可靠）
 BLOCK_URL_MARKERS = (

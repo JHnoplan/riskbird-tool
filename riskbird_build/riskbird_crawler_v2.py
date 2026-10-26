@@ -44,6 +44,7 @@ if HAS_PYQT:
         blocked_signal = pyqtSignal(str)          # 被安全验证/风控拦截，需人工在浏览器完成验证
         block_cleared_signal = pyqtSignal(str)    # 人工完成验证，采集已自动继续
         login_required_signal = pyqtSignal(str)   # 未登录，需界面上确认去登录还是继续
+        handoff_signal = pyqtSignal(str)    # 本路已放弃等人工，剩余名单转交另一平台（风鸟不参与移交）
 else:
     class CrawlerSignals:
         pass
