@@ -18,9 +18,12 @@ schema mapping + 数据质量校验 + 跨平台合并去重，输出可直接入
     1. 剔除「未找到」「失败」「额度用尽待重试」记录；
     2. 同一公司跨平台合并为一条（字段取首个非空值，电话/邮箱取并集），
        避免入库侧重复；
-    3. 电话、邮箱拆分为手机号 / 固话 / 邮箱三个独立字段并逐个校验格式；
+    3. 电话、邮箱拆分为手机号 / 固话 / 邮箱三个独立字段并逐个校验格式，
+       电话只分类不丢弃：识别不出标准格式的号码按原样落到固话；
     4. 文本归一化（去零宽字符与首尾空白、全角标点转半角）；
-    5. 手机号与固话各保留 3 个，多个用 , 分隔（与邮箱一致），避免入库字段超长；
+    5. 手机号/固话/邮箱全量保留，多个用 , 分隔，清洗环节不做条数截断
+       （历史上每家只留 3 个号码，有用的手机号就是这么被洗没的）；
+       上传云展时若超接口长度上限，由 yzd_client.clamp_fields 按整条号码收拢。
     6. 模板表头按列名动态定位，不写死列序；模板缺失时回退内置表头。
 """
 
@@ -60,6 +63,10 @@ _MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
 _LANDLINE_RE = re.compile(r"^(?:0(\d{2,3}))?[-\s]?(\d{7,8})(?:[-\s转.]*(\d{1,6}))?$")
 # 400/800 客服热线：不能按区号拆分，保留原样
 _HOTLINE_RE = re.compile(r"^(0?)(400|800)[-\s]?(\d{3})[-\s]?(\d{4})$")
+# 分组书写的手机号（139 0806 0502 / 139-0806-0502）：不先合回 11 位会被分隔符切碎后整段丢掉
+_MOBILE_REGROUP_RE = re.compile(r"(?<!\d)(1[3-9]\d)[-\s]?(\d{4})[-\s]?(\d{4})(?!\d)")
+# 国际码前缀：只在去掉后确实是个合法手机号时才动，避免误伤 86 开头的固话
+_COUNTRY_CODE_RE = re.compile(r"^\+?0{0,2}86-?")
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 _EMAIL_EXTRACT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _SPLIT_RE = re.compile(r"[;；,，、\s/|]+")
@@ -105,13 +112,19 @@ def _clean_legal_rep(value: str) -> str:
 
 
 def split_phones(raw: str):
-    """把混合电话串拆成 (手机号列表, 固话列表)，逐个正则校验并格式化。"""
+    """把混合电话串拆成 (手机号列表, 固话列表)。
+
+    只做分类、格式化与去重，不做丢弃：标准格式都认不出的号码也归到固话，
+    否则一个有用的手机号会被静默洗没（客户要的是「只分手机/固话两档」）。
+    """
     mobiles, landlines = [], []
     if not raw:
         return mobiles, landlines
     # 先把空格/横线分隔的 400/800 热线归一为连字符形式，避免被分隔符拆开
-    raw = re.sub(r"\b([48]00)[-\s]?(\d{3})[-\s]?(\d{4})\b", r"\1-\2-\3", normalize_text(raw))
-    for token in _SPLIT_RE.split(raw):
+    text = re.sub(r"\b([48]00)[-\s]?(\d{3})[-\s]?(\d{4})\b", r"\1-\2-\3", normalize_text(raw))
+    # 分组写的手机号（139 0806 0502）先合回 11 位，否则会被分隔符切成三段全丢
+    text = _MOBILE_REGROUP_RE.sub(r"\1\2\3", text)
+    for token in _SPLIT_RE.split(text):
         token = re.sub(r"[^\d+\-]", "", normalize_text(token))
         if not token or token in ("-", "--"):
             continue
@@ -119,6 +132,12 @@ def split_phones(raw: str):
         if _MOBILE_RE.match(digits):
             if digits not in mobiles:
                 mobiles.append(digits)
+            continue
+        # 带国家码的手机号（+8613800138000 / 0086-138-0013-8000）脱码后按手机归位
+        stripped = _COUNTRY_CODE_RE.sub("", digits)
+        if _MOBILE_RE.match(stripped):
+            if stripped not in mobiles:
+                mobiles.append(stripped)
             continue
         hm = _HOTLINE_RE.match(token) or _HOTLINE_RE.match(digits)
         if hm:
@@ -129,13 +148,16 @@ def split_phones(raw: str):
         m = _LANDLINE_RE.match(token) or _LANDLINE_RE.match(digits)
         if m:
             area, number, ext = m.group(1), m.group(2), m.group(3)
-            if len(number) < 7:
-                continue
             formatted = f"0{area}-{number}" if area else number
             if ext:
                 formatted += f"转{ext}"
             if formatted not in landlines:
                 landlines.append(formatted)
+            continue
+        # 兜底：格式不规范但确实是号码的（带多个分机、国外号等）原样进固话
+        plain = re.sub(r"\D", "", digits)
+        if 7 <= len(plain) <= 15 and token not in landlines:
+            landlines.append(token)
     return mobiles, landlines
 
 
@@ -215,9 +237,9 @@ def _normalize_key(name: str) -> str:
     return key.replace("（", "(").replace("）", ")").upper()
 
 
-def _join_limited(values, limit=3, sep=","):
-    """多个号码用逗号拼接（与邮箱一致）；逗号已在 _SPLIT_RE 里，回读清洗不会错拆"""
-    return sep.join(list(values)[:limit])
+def _join_all(values, sep=","):
+    """多值用逗号拼接（手机号/固话/邮箱同一口径）；清洗不做条数截断，识别到多少留多少"""
+    return sep.join(list(values))
 
 
 def _remark(fields: dict):
@@ -252,9 +274,9 @@ def make_row(fields: dict, sources: list) -> dict:
         "客户名称": contact or legal_rep or company,
         "企业名称": company,
         "岗位": position or ("" if contact else ("法定代表人" if legal_rep else "")),
-        "手机号": _join_limited(mobiles),
-        "固话": _join_limited(landlines),
-        "邮箱": _join_limited(emails),
+        "手机号": _join_all(mobiles),
+        "固话": _join_all(landlines),
+        "邮箱": _join_all(emails),
         "微信号": normalize_text(fields.get("微信号", "")),
         "数据来源": ",".join(s for s in sources if s),
         "外呼备注": _remark(fields),

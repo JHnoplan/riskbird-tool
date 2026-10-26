@@ -15,7 +15,8 @@
 4) 上传文件单独构造：云展接口6 要求表头与它的模板完全一致（9 列），而工具里
    清洗后的入库文件是按客户《客户库数据导入模板》的 18 列双块结构写的，
    直接把那份文件传上去会因为列名重复/多余而读不到数据，必须另写一份 9 列表。
-5) 字段超长后端不入库只计 failTotal，这里主动按上限截断并记日志，避免静默丢数据。
+5) 字段超长后端不入库只计 failTotal，这里主动按上限收拢并记日志；多号码列按整条
+   递减保留，不能把号码从中间切一半。
 """
 
 import os
@@ -42,6 +43,9 @@ GROUP_DESC_MAX = 120       # 接口5：群组描述最多 120 个字符
 
 # 联系方式单元格的分隔符（后端也是按这几个分隔符拆多号码的）
 _CONTACT_SPLIT_RE = re.compile(r"[,，、;；/\|\n\r\t]+")
+
+# 逗号拼接的多值列：超长度上限时只能整条整条少放，不能从号码中间切断
+_LIST_FIELDS = ("手机号", "固话", "邮箱", "数据来源")
 
 
 class YzdError(Exception):
@@ -205,14 +209,34 @@ def dedupe_rows(rows: list, log=None) -> list:
 
 
 def clamp_fields(row: dict, log=None) -> dict:
-    """按接口6 的字段长度上限截断，超长部分丢掉（后端是整条不入库，截断比丢数据好）"""
+    """按接口6 的字段长度上限收拢（后端是整条不入库，少几个号码比整条丢了好）
+
+    清洗环节已不再截断号码条数，所以一条记录可能带十几个手机号，
+    这里超上限时按整条号码递减保留，宁可少放也不把号码切一半（切一半的号码打不通）。
+    """
     out = {}
     for k, v in (row or {}).items():
         text = "" if v is None else str(v)
         limit = FIELD_LIMITS.get(k)
-        if limit and len(text) > limit:
+        if not limit or len(text) <= limit:
+            out[k] = text
+            continue
+        kept = ""
+        if k in _LIST_FIELDS:
+            for part in text.split(","):
+                cand = f"{kept},{part}" if kept else part
+                if len(cand) > limit:
+                    break
+                kept = cand
+        if kept:
+            dropped = len(text.split(",")) - len(kept.split(","))
+            if log and dropped:
+                log(f"  ⚠ 字段「{k}」超出 {limit} 字符，本次少上传 {dropped} 条")
+            text = kept
+        else:
+            # 单条就已经超长（没逗号或第一条本身就装不下），只能按硬上限截
             if log:
-                log(f"  ⚠ 字段「{k}」超出 {limit} 字符，已截断后上传")
+                log(f"  ⚠ 字段「{k}」单条已超出 {limit} 字符，按上限截断后上传")
             text = text[:limit]
         out[k] = text
     return out

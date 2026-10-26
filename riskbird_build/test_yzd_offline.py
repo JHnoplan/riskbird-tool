@@ -203,7 +203,17 @@ assert not any(isinstance(v, str) and v.strip() == "None" for v in body[2]), \
 assert body[2][1] == "只有企业名", body[2]
 wb.close()
 assert Y.clamp_fields({"客户名称": None})["客户名称"] == ""
-print("④ 上传文件：9 列表头 / 跳空行 / 超长截断 ✓")
+# 清洗不再截断条数后，一条可能带十几个手机号：超接口上限只能整条少放，不能把号码切一半
+many_mobiles = ",".join(f"1380000{i:04d}" for i in range(12))     # 143 字符 > 100
+clamped = Y.clamp_fields({"手机号": many_mobiles})["手机号"]
+parts = clamped.split(",")
+assert len(clamped) <= Y.FIELD_LIMITS["手机号"], len(clamped)
+assert all(len(p) == 11 for p in parts), f"号码被切了一半：{parts}"
+assert parts[0] == "13800000000" and len(parts) == 8, parts
+notes = []
+Y.clamp_fields({"固话": ",".join(["0755-88881111"] * 60)}, log=notes.append)
+assert any("少上传" in m for m in notes), notes
+print("④ 上传文件：9 列表头 / 跳空行 / 超长按整条号码收拢 ✓")
 
 # 接口6：multipart 字段与返回计数
 fake = use_http([ok({"importTotal": 10, "saveTotal": 9, "failTotal": 1})])
