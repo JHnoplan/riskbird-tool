@@ -839,7 +839,8 @@ class MainWindow(QMainWindow):
 
         # 参数区
         gb_p = QGroupBox("② 采集参数")
-        hp = QHBoxLayout(gb_p)
+        vp = QVBoxLayout(gb_p)
+        hp = QHBoxLayout()
         hp.addWidget(QLabel("采集间隔(秒)："))
         self.spin_delay = QDoubleSpinBox()
         self.spin_delay.setRange(1.0, 60.0); self.spin_delay.setValue(3.0); self.spin_delay.setSingleStep(0.5)
@@ -848,6 +849,42 @@ class MainWindow(QMainWindow):
         self.spin_pages = QSpinBox(); self.spin_pages.setRange(1, 50); self.spin_pages.setValue(50)
         hp.addWidget(self.spin_pages)
         hp.addWidget(QLabel("   提示：挂着过夜请把间隔调到 6~10 秒更安全"))
+        vp.addLayout(hp)
+        hp2 = QHBoxLayout()
+        self.chk_main = QCheckBox("主搜渠道(推荐)")
+        self.chk_main.setChecked(True)
+        self.chk_main.setToolTip("1688 站内正规商品搜索页，每页约 60 条商品、覆盖约 50 家不同公司，公司池远深于其他入口，\n"
+                                 "是数据量的主力来源。与其他渠道结果自动按公司去重合并。")
+        self.chk_guard = QCheckBox("过滤类目不相关商家(推荐)")
+        self.chk_guard.setChecked(True)
+        self.chk_guard.setToolTip("主搜渠道结果参差（如搜「光伏玻璃」混入鼠标垫/修枝剪商家）。利用详情页自带的真实类目\n"
+                                  "与关键词预测类目比对自动剔除无关商家，不增加任何请求，反而省下对垃圾商家的联系方式\n"
+                                  "查询（更低频=更安全）。被过滤商家只在日志提示，不进结果表。信号取不到时一律放行不误杀。")
+        self.chk_company = QCheckBox("同时采集供应商(公司)渠道")
+        self.chk_company.setChecked(True)
+        self.chk_company.setToolTip("按「公司」维度翻页并直达联系方式页；1688 有时会把该入口改道，程序会自动识别并跳过，\n"
+                                    "不影响其他渠道采集。两渠道结果自动按公司去重合并。")
+        self.chk_expand = QCheckBox("自动扩展相关关键词")
+        self.chk_expand.setToolTip("从 1688 给出的候选词里筛选与主词字面相关的少量词追加进队列（宁缺毋滥，默认关）。")
+        hp2.addWidget(self.chk_main)
+        hp2.addWidget(self.chk_guard)
+        hp2.addWidget(self.chk_company)
+        hp2.addWidget(self.chk_expand)
+        hp2.addStretch(1)
+        vp.addLayout(hp2)
+        hp3 = QHBoxLayout()
+        self.chk_incr = QCheckBox("增量模式·跳过历史已采商家(推荐)")
+        self.chk_incr.setChecked(True)
+        self.chk_incr.setToolTip("跨运行记住本轮已采到/已判类目不符的商家，再跑同一批关键词时命中即跳过、不再重复"
+                                 "请求其详情页与联系页（省请求=防封），只补齐新出现的商家，重复挂过夜总数据量反而最大"
+                                 "；本次因拦截/未登录没采成的商家不会被记，下轮仍会重试。")
+        self.btn_clear_seen = QPushButton("清空历史种子库")
+        self.btn_clear_seen.clicked.connect(self._on_clear_seen_store)
+        self.btn_clear_seen.setToolTip("删除跨运行去重记录，让下次对同一批关键词从头重采。")
+        hp3.addWidget(self.chk_incr)
+        hp3.addWidget(self.btn_clear_seen)
+        hp3.addStretch(1)
+        vp.addLayout(hp3)
         lay.addWidget(gb_p)
 
         # 控制按钮
@@ -1013,6 +1050,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, poll)
 
     # ── 采集控制 ───────────────────────────────────────────────
+    def _on_clear_seen_store(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示", "采集进行中，请先停止后再清空种子库。")
+            return
+        if QMessageBox.question(self, "确认", "确定清空历史种子库？清空后将对同一批关键词从头重采。") \
+                == QMessageBox.Yes:
+            self.crawler.clear_seen_store()
+            QMessageBox.information(self, "完成", "历史种子库已清空。")
+
     def _on_start(self):
         if not self.keywords:
             self._on_parse()
@@ -1023,6 +1069,11 @@ class MainWindow(QMainWindow):
             return
         self.crawler.delay_between = self.spin_delay.value()
         self.crawler.max_pages = self.spin_pages.value()
+        self.crawler.main_channel = self.chk_main.isChecked()
+        self.crawler.relevance_guard = self.chk_guard.isChecked()
+        self.crawler.company_channel = self.chk_company.isChecked()
+        self.crawler.expand_related = self.chk_expand.isChecked()
+        self.crawler.incremental = self.chk_incr.isChecked()
         if not self._first_start:
             self._first_start = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.session_dir = str(self._get_desktop_dir() / "1688企业数据自动采集工具" / self._first_start)

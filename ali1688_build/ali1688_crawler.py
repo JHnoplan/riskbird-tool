@@ -76,8 +76,26 @@ LOGIN_URL_MARKERS = ("login.1688.com", "login.alibaba.com", "/member2/login")
 SEARCH_URL = ("https://www.1688.com/zw/page.html?hpageId=old-sem-pc-list"
               "&keywords={kw}&beginPage={page}&n=y")
 
+# 供应商(公司)搜索渠道：每页约 20 家不同公司，产出远高于商品渠道
+COMPANY_SEARCH_URL = ("https://s.1688.com/company/company_search.htm"
+                      "&keywords={kw}&beginPage={page}")
+
+# 主搜渠道（1688 站内正规商品搜索页）：每页约 60 条 offer、约 50 家不同公司，
+# 实测同一垂直词池深 100+ 家（SEM 落地页仅 20 余条/页且大词也只有约 70 家池子）。
+# 公司维度数据藏在 offer 卡片埋点属性 member_id@b2b-xxx^item_id=yyy 里。
+MAIN_SEARCH_URL = ("https://s.1688.com/selloffer/offer_search.htm"
+                   "&keywords={kw}&beginPage={page}")
+
 PHONE_RE = re.compile(r'(?:86[\s-]?)?(?:0\d{2,3}[\s-]?\d{7,8}|1[3-9]\d{9})')
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+# 主搜页 offer 卡片埋点属性里的 (memberId, offerId) 对（2026-10-27 实机确认）
+MAIN_MEMBER_ITEM_RE = re.compile(r'member_id@(b2b-[0-9a-z]{6,24})\^item_id@(\d+)')
+# 主搜卡片埋点里的叶子类目：leafCategory@12345^。注意实测全页 60 条同值，
+# 是「查询级预测类目」而非 offer 真实类目，逐条过滤不可用它——真实类目在详情页：
+DETAIL_LEAF_ID_RE = re.compile(r'"leafCategoryId"\s*:\s*(\d{3,12})')
+DETAIL_LEAF_NAME_RE = re.compile(r'"leafCategoryName"\s*:\s*"([^"]{1,20})"')
+DETAIL_SHOP_CAT_RE = re.compile(r'shop-category-name">([^<]{2,40})<')   # 主营：xx / xx类目
+DETAIL_TITLE_RE = re.compile(r'<title>([^<]{4,80}?)\s*[-–—]?\s*(?:阿里巴巴|1688)?\s*</title>')
 
 
 class Ali1688Crawler:
@@ -102,12 +120,33 @@ class Ali1688Crawler:
         self.delay_between = 3.0
         self.jitter = 1.5
         self._current_delay = self.delay_between
+        # 熔断（大厂 anti-abuse 的 circuit-breaker 思想）：短窗口内被反复拦截说明已进入
+        # 平台限流区，继续逐页死磕只会把软限流熬成硬封号；此时强制长冷却、必要时收本轮。
+        self._block_times = []       # 近期被拦时间戳
+        self._block_window = 900     # 统计窗口（秒）
+        self._max_blocks = 5         # 窗口内达此次数 → 判持续限流，优雅结束本轮
         self.max_pages = 10          # 每个关键词最多翻几页（1688 上限约 50）
+        self.main_channel = True     # 主搜渠道（selloffer/offer_search，每页约50家，池子最深）
+        self.company_channel = True  # 同时采集供应商(公司)渠道（实测产出为商品渠道数倍）
+        self.relevance_guard = True  # 主搜渠道类目相关性过滤：类目不符的公司不进联系方式页
+        self.max_records = 0         # 采集到 N 条自动收尾（0=不限，低频实测/限量用）
+        self._filtered_count = 0     # 本轮类目过滤计数
+        self.debug_collect = False   # 开发调参：记录类目过滤判定输入（不影响生产行为）
+        self._guard_debug = []
+        self.expand_related = False  # 自动扩展相关关键词（1688 relativeWords 多为全站热搜，保守过滤后追加）
+        # 增量种子库（大厂爬虫的 frontier 去重思想）：跨运行记住「已处理过」的公司，
+        # 再跑同一批关键词时命中即跳过，绝不重复戳同一家详情页/联系页。既省请求（防封），
+        # 又能把每次新出现、之前没采到的公司增量补齐——重复挂过夜反而总数据量最大。
+        self.incremental = True
+        self._seen_store = {}        # {key: {"at": ts, "st": 状态}}，持久化到 seen_store.json
 
         self._data_dir = Path(__file__).parent / "ali1688_data"
         self._data_dir.mkdir(exist_ok=True)
+        self._seen_store_path = self._data_dir / "seen_store.json"
         self._profile_dir = self._profile_path()
         self._seen_members = set()   # 本轮已处理公司（memberId）去重
+        self._guard_kw = ""          # 类目过滤：当前关键词
+        self._guard_pred = None      # 类目过滤：关键词级 PRECISE 预测类目集（id+名）
 
     # ── 日志 / 结果 ────────────────────────────────────────────
     def _log(self, msg):
@@ -133,6 +172,78 @@ class Ali1688Crawler:
     def _add_result(self, rec):
         with self.results_lock:
             self.results.append(rec)
+        self._commit_to_store(rec)     # 到终态的公司写进种子库（临时失败不写，下轮重试）
+        # 护栏条数：达到即自动收尾（低频实测/限量采集用）
+        if self.max_records and len(self.results) >= self.max_records:
+            self._log(f"🛡 已达限量 {self.max_records} 条，自动停止")
+            self._stop_requested = True
+
+    # ── 增量种子库（跨运行去重）───────────────────────────────
+    # 只把「已到终态」的公司永久记住：成功/无电话/无联系方式（卖家确为暂无）、
+    # 以及类目不符(已过滤)。凡带「拦截/未解除/导航失败/未登录/待重试」的临时失败
+    # 一律不记，下一轮会重新尝试——这样既不重复戳已处理过的家（省请求防封），
+    # 又不会把「这次没采成」的公司永久漏掉（保数据最全）。
+    TRANSIENT_MARKS = ("拦截", "未解除", "导航失败", "未登录", "待重试")
+
+    def _is_terminal(self, rec):
+        st = rec.get("状态", "") or ""
+        return st != "" and not any(m in st for m in self.TRANSIENT_MARKS)
+
+    def _rec_seen_keys(self, rec):
+        keys = []
+        mid = str(rec.get("memberId") or "")
+        if mid:
+            keys.append(mid if mid.startswith("b2b-") else "shop:" + mid)
+        name = self._norm_name(rec.get("公司名称") or "")
+        if name:
+            keys.append(name)
+        return keys
+
+    def _load_seen_store(self):
+        try:
+            with open(self._seen_store_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._seen_store = {str(k): v for k, v in data.items()}
+        except Exception:
+            self._seen_store = {}
+        return len(self._seen_store)
+
+    def _save_seen_store(self):
+        try:
+            tmp = self._seen_store_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._seen_store, f, ensure_ascii=False)
+            tmp.replace(self._seen_store_path)
+            return True
+        except Exception as e:
+            self._log(f"⚠ 种子库保存失败：{str(e).splitlines()[0]}")
+            return False
+
+    def _commit_to_store(self, rec):
+        if not self.incremental or not self._is_terminal(rec):
+            return
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        st = rec.get("状态", "")
+        if st == "类目不符(已过滤)":
+            # 类目不符是「关键词相关」的判定：同一家对 A 词不相关、对 B 词可能正是目标，
+            # 故只按「关键词#公司」作用域记录，换关键词重跑时仍会重新评估，绝不全局误跳。
+            mid = str(rec.get("memberId") or "")
+            if mid:
+                self._seen_store[f"{rec.get('关键词','')}#{mid}"] = {"at": ts, "st": st}
+            return
+        for k in self._rec_seen_keys(rec):
+            self._seen_store[k] = {"at": ts, "st": st}
+
+    def clear_seen_store(self):
+        """清空跨运行种子库（用户想对同一批词从头重采时用）。"""
+        self._seen_store = {}
+        try:
+            if self._seen_store_path.exists():
+                self._seen_store_path.unlink()
+        except Exception:
+            pass
+        return True
 
     # ── Chrome 生命周期 ────────────────────────────────────────
     def _profile_path(self):
@@ -433,14 +544,39 @@ class Ali1688Crawler:
             return "页面被 1688 风控拦截（滑块/访问频繁）"
         return ""
 
+    def _register_block(self):
+        """记录一次拦截并返回统计窗口内的累计次数（熔断用）。"""
+        now = time.time()
+        self._block_times = [t for t in self._block_times if now - t < self._block_window]
+        self._block_times.append(now)
+        return len(self._block_times)
+
+    def _interruptible_sleep(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._stop_requested:
+                return
+            time.sleep(0.5)
+
     def _wait_unblock(self, reason, max_wait=3600):
-        """被拦截时原地等人工过验证；过验后自动继续，并把采集间隔自动放大。"""
+        """被拦截时原地等人工过验证；过验后自动继续，并把采集间隔自动放大。
+        非登录类拦截额外走熔断：短窗口内反复被拦＝已进限流区，
+        每次都强制递增冷却（拿不到冷却窗口会把软限流熬成硬封号），
+        达到阈值则直接优雅结束本轮，绝不死磕。"""
         login = (reason == "__LOGIN__")
         if login:
             self._emit("login_required_signal", "1688 需要登录，请在弹出的 Chrome 里完成登录")
             self._log("🔑 检测到未登录，请在 Chrome 窗口里登录 1688（登录后自动继续）")
         else:
+            strikes = self._register_block()
             self._emit("blocked_signal", reason)
+            if strikes >= self._max_blocks:
+                self._log(f"🛑 {reason}")
+                self._log(f"   ⛔ {self._block_window // 60} 分钟内第 {strikes} 次被拦，"
+                          f"判定为持续限流。为保护账号，本轮到此为止（已采数据已保存），"
+                          f"请稍后（建议 ≥30 分钟）或调大采集间隔后再跑。")
+                self._stop_requested = True
+                return False
             self._log(f"🛑 {reason}")
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，通过后自动继续。")
             # 自动降速：每次被拦把间隔上调，最低 8s、最高 30s
@@ -460,6 +596,15 @@ class Ali1688Crawler:
                 else:
                     self._log(f"✅ 验证已解除（等待约 {waited} 秒），继续采集")
                     self._emit("block_cleared_signal", reason)
+                    # 冷却窗口：本轮第 2 次起，过验后先强制休息再恢复请求，
+                    # 让客户端 IP 真正拿到冷却（立刻继续 = 最容易再次触发）
+                    strikes = len([t for t in self._block_times
+                                   if time.time() - t < self._block_window])
+                    if strikes >= 2:
+                        cool = min(1800, 120 * (2 ** (strikes - 1)))
+                        self._log(f"   ❄ 已第 {strikes} 次被拦，强制冷却 {cool} 秒再继续"
+                                  f"（给 IP 冷却窗口，避免软限流升级成硬封号）")
+                        self._interruptible_sleep(cool)
                 return True
             if waited % 60 == 0:
                 self._log(f"   仍在等待{'登录' if login else '验证'}…已等 {waited} 秒")
@@ -518,12 +663,29 @@ class Ali1688Crawler:
         except Exception:
             return []
         offers = pc.get("listOffer") or []
-        total_pages = 0
-        # 分页信息（部分字段名随版本变化，取能取到的）
+        # 相关词（注意：1688 该字段多为全站热搜词，并非语义相关，使用时须保守过滤）
+        self._last_relative = pc.get("relativeWords") or []
         return offers
+
+    def _parse_company_page(self, html):
+        """供应商(公司)搜索列表页：提取每家公司卡片的公司名与店铺子域URL。"""
+        out = []
+        for m in re.finditer(
+                r'<a class="company-name" href="(https?://[^"/]+\.1688\.com)[^"]*"[^>]*>([^<]+)</a>',
+                html):
+            winport, name = m.group(1).rstrip("/"), m.group(2).strip()
+            sub = winport.split("//", 1)[-1].split(".", 1)[0].lower()
+            if sub in ("www", "s", "detail", "m", "login", "air", "page", "show"):
+                continue
+            seg = html[m.end():m.end() + 1500]
+            pos = re.search(r'company-position">.*?<span[^>]*>([^<]{2,24})</span>', seg, re.S)
+            out.append({"company": name, "winport": winport, "shop": sub,
+                        "location": pos.group(1).strip() if pos else ""})
+        return out
 
     def _iter_keyword_offers(self, kw):
         """遍历一个关键词的多页列表，逐条 yield offer（已按 memberId 去重）。"""
+        stale_streak = 0
         for page in range(1, self.max_pages + 1):
             if self._stop_requested:
                 return
@@ -540,9 +702,12 @@ class Ali1688Crawler:
             new = 0
             for o in offers:
                 mid = str(o.get("memberId") or o.get("loginId") or o.get("company") or "")
-                if not mid or mid in self._seen_members:
+                cname = self._norm_name(o.get("company") or "")
+                if not mid or mid in self._seen_members or (cname and cname in self._seen_members):
                     continue
                 self._seen_members.add(mid)
+                if cname:
+                    self._seen_members.add(cname)
                 new += 1
                 yield {"keyword": kw, "page": page, "raw": o,
                        "company": o.get("company") or "",
@@ -553,9 +718,266 @@ class Ali1688Crawler:
                        "price": o.get("price"),
                        "subject": o.get("subject") or o.get("simpleSubject") or ""}
             self._log(f"  「{kw}」第 {page} 页：{len(offers)} 条，新增公司 {new} 家")
+            # 连续多页 0 新增即枯竭（主搜渠道跑过后尤其如此），别把页数预算耗在轮回的浅池上
+            if new == 0:
+                stale_streak += 1
+                if stale_streak >= 3:
+                    self._log(f"  「{kw}」商品渠道连续 {stale_streak} 页无新增，停止翻页")
+                    return
+            else:
+                stale_streak = 0
             self._sleep()
             if len(offers) < 8:   # 尾页
                 return
+
+    @staticmethod
+    def _norm_name(name):
+        """公司名归一化：跨渠道去重用（去空白与常见括号差异）。"""
+        return re.sub(r"[\s（）()・.、，,]+", "", name or "")
+
+    def _iter_keyword_companies(self, kw):
+        """遍历供应商(公司)搜索渠道的多页列表，逐家 yield 公司条目（跨渠道去重）。
+
+        该渠道每页约 20 家公司卡片；实测大词单页新增公司数为商品渠道的 4 倍以上。
+        早停：连续 2 页解析不到卡片视为无数据；连续 3 页 0 新增视为池子枯竭。"""
+        empty_streak = stale_streak = 0
+        for page in range(1, self.max_pages + 1):
+            if self._stop_requested:
+                return
+            while self._pause_requested and not self._stop_requested:
+                time.sleep(0.5)
+            url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page)
+            if not self._goto(url):
+                return
+            entries = self._parse_company_page(self.driver.page_source)
+            if not entries:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    if page == 2:
+                        self._log(f"  「{kw}」供应商渠道无公司卡片（1688 已改道/暂无该词公司），跳过该渠道")
+                    else:
+                        self._log(f"  「{kw}」供应商渠道第 {page - 1} 页起无数据，停止翻页")
+                    return
+                continue
+            empty_streak = 0
+            new = 0
+            for e in entries:
+                key = "shop:" + e["shop"]
+                cname = self._norm_name(e["company"])
+                if key in self._seen_members or (cname and cname in self._seen_members):
+                    continue
+                self._seen_members.add(key)
+                if cname:
+                    self._seen_members.add(cname)
+                new += 1
+                e["keyword"] = kw
+                e["page"] = page
+                yield e
+            self._log(f"  「{kw}」供应商渠道第 {page} 页：{len(entries)} 家，新增公司 {new} 家")
+            if new == 0:
+                stale_streak += 1
+                if stale_streak >= 3:
+                    self._log(f"  「{kw}」供应商渠道连续 {stale_streak} 页无新增，公司池已枯竭")
+                    return
+            else:
+                stale_streak = 0
+            self._sleep()
+
+    def _parse_main_search_page(self, html):
+        """主搜商品搜索页：从 offer 卡片埋点属性提取 (memberId, offerId) 对。
+
+        每页约 60 条 offer、约 50 家不同公司；数据在 DOM 渲染属性里，
+        不依赖 window.data（该对象在部分变体页里为空壳）。"""
+        out, seen = [], set()
+        for mid, oid in MAIN_MEMBER_ITEM_RE.findall(html):
+            key = (mid, oid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"memberId": mid, "offerId": oid})
+        return out
+
+    def _parse_keywords_category(self, html):
+        """主搜页内嵌 window.data.keywordsCategory：取该关键词的预测类目集合。
+
+        allModels 里 grade 分 PRECISE（高置信）与 RELEVANT（仅相关）两档，
+        过滤只认 PRECISE 档的叶子/二级类目 id 与其类目名，避免宽泛误放行。
+        解析失败返回 None（后续判定 fail-open，绝不因取不到信号剔除商家）。"""
+        i = html.find("keywordsCategory")
+        if i < 0:
+            return None
+        s = html.find("{", i)
+        if s < 0:
+            return None
+        depth = 0
+        end = -1
+        for j in range(s, min(len(html), s + 300_000)):
+            c = html[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end < 0:
+            return None
+        try:
+            obj = json.loads(html[s:end + 1])
+            qp = obj["data"]["qpPredictCateAllPlan"]
+        except Exception:
+            return None
+        leaf_ids, names = set(), set()
+        for m in qp.get("allModels") or []:
+            if str(m.get("grade", "")).upper() != "PRECISE":
+                continue
+            for k in ("leafNode", "secondNode"):
+                v = str(m.get(k) or "")
+                if v.isdigit():
+                    leaf_ids.add(v)
+            n = str(m.get("cateName") or "").strip()
+            if n:
+                names.add(n)
+        if not leaf_ids:  # 兜底：allModels 缺失时用查询级节点
+            v = str(qp.get("postcateLeafNode") or "")
+            if v.isdigit():
+                leaf_ids.add(v)
+            for k in ("postcateLeafNodes", "postcateSecondNodes"):
+                for v in qp.get(k) or []:
+                    v = str(v)
+                    if v.isdigit():
+                        leaf_ids.add(v)
+        return {"ids": leaf_ids, "names": names}
+
+    @staticmethod
+    def _extract_offer_meta(html):
+        """详情页零额外代价提取真实类目信号：leafCategoryId/Name、店铺主营类目、标题。"""
+        meta = {"leafId": "", "leafName": "", "shopCats": [], "title": ""}
+        m = DETAIL_LEAF_ID_RE.search(html)
+        if m:
+            meta["leafId"] = m.group(1)
+        m = DETAIL_LEAF_NAME_RE.search(html)
+        if m:
+            meta["leafName"] = m.group(1).strip()
+        meta["shopCats"] = [x.strip() for x in DETAIL_SHOP_CAT_RE.findall(html) if x.strip()]
+        m = DETAIL_TITLE_RE.search(html)
+        if m:
+            meta["title"] = m.group(1).strip()
+        return meta
+
+    def _kw_relevant(self, meta, rec):
+        """主搜商家类目相关性判定（双信号，宽松方向保数据量）：
+        ① id 信号：详情页 leafCategoryId ∈ 关键词 PRECISE 预测集；
+        ② 字面信号：关键词去「批发/厂家」等后缀后的二字组与 叶子类目名/店铺主营类目/
+           商品标题/公司名 有重叠（覆盖「玻璃」⊂「光伏玻璃」这类父类目放行）。
+        两信号都拿不到时 fail-open 放行——宁多采一家，不误杀。"""
+        kw = self._guard_kw
+        pred = self._guard_pred
+        if pred and meta["leafId"] and meta["leafId"] in pred["ids"]:
+            return True
+        def grams(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+        base = re.sub(r"(批发|供应|厂家|定制|加工|工厂)", "", kw or "")
+        kg = grams(base)
+        # 字面信号仅在中文词时可靠（英文词与中文类目名之间二字组比对无意义）
+        literal_ok = bool(kg) and bool(re.search(r"[\u4e00-\u9fa5]", base))
+        if literal_ok:
+            texts = ([meta["leafName"]] + meta["shopCats"][:3] +
+                     [rec.get("公司名称") or ""])
+            for t in texts:
+                if not t:
+                    continue
+                segs = [x for x in re.split(r"[、，,;；/\s]+", t) if x] or [t]
+                for seg in segs:
+                    if kg & grams(seg) or base in seg:
+                        return True
+            # 标题营销词噪声大（「光伏鼠标垫」与「光伏玻璃」共享二字组即误放行），
+            # 故只认「关键词完整词组原样出现在标题里」这一最强字面信号
+            if base and base in meta["title"]:
+                return True
+        if pred and pred["names"] and meta["leafName"]:
+            for n in pred["names"]:
+                if grams(n) & grams(meta["leafName"]):
+                    return True
+        # fail-open：没有任何「可对比且可靠」的信号时不剔除。字面判定要有中文
+        # 二字组才可靠（单字/纯英文词极易误杀）；字面不可用时只认 id 对比。
+        comparable = bool((pred and pred["ids"] and meta["leafId"]) or
+                          (literal_ok and (meta["leafName"] or meta["shopCats"] or
+                                           meta["title"] or rec.get("公司名称"))))
+        return not comparable
+
+    def _iter_keyword_main_offers(self, kw):
+        """遍历主搜渠道多页列表，逐条 yield 可进详情链路的伪 offer（按 memberId 去重）。
+
+        早停：连续 2 页解析不到卡片视为翻页到底；连续 3 页 0 新增视为池子枯竭。"""
+        empty_streak = stale_streak = 0
+        self._guard_kw = kw
+        self._guard_pred = None
+        for page in range(1, self.max_pages + 1):
+            if self._stop_requested:
+                return
+            while self._pause_requested and not self._stop_requested:
+                time.sleep(0.5)
+            url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page)
+            if not self._goto(url):
+                return
+            src = self.driver.page_source
+            pairs = self._parse_main_search_page(src)
+            if page == 1 and self.relevance_guard:
+                # 顺带取该关键词的预测类目集（同一页源码，零额外请求）
+                self._guard_pred = self._parse_keywords_category(src)
+            if not pairs:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    self._log(f"  「{kw}」主搜渠道第 {page - 1} 页起无结果，停止翻页")
+                    return
+                continue
+            empty_streak = 0
+            new = 0
+            for p in pairs:
+                mid = p["memberId"]
+                # 命中全局已采公司 或 本关键词下已判「类目不符」的公司 → 跳过，
+                # 连详情页都不必再进（省请求=防封）；换关键词时后者不生效，仍会重评估。
+                if mid in self._seen_members or f"{kw}#{mid}" in self._seen_members:
+                    continue
+                self._seen_members.add(mid)
+                new += 1
+                yield {"keyword": kw, "page": page, "raw": {},
+                       "company": "", "offerId": p["offerId"],
+                       "odUrl": f"https://detail.1688.com/offer/{p['offerId']}.html",
+                       "memberId": mid, "loginId": "", "price": "", "subject": "",
+                       "guard": True}   # 主搜结果参差，进联系方式前做类目相关性过滤
+            self._log(f"  「{kw}」主搜渠道第 {page} 页：{len(pairs)} 条offer，新增公司 {new} 家")
+            if new == 0:
+                stale_streak += 1
+                if stale_streak >= 3:
+                    self._log(f"  「{kw}」主搜渠道连续 {stale_streak} 页无新增，公司池已枯竭")
+                    return
+            else:
+                stale_streak = 0
+            self._sleep()
+
+    def _related_candidates(self, kw):
+        """从商品列表页 relativeWords 里保守筛选相关词。
+
+        实测 1688 的 relativeWords 多为全站热搜词（搜「光伏玻璃」会给「t恤批发」），
+        故只保留与主词去掉「批发/厂家」等后缀后、仍共享至少一个二字子串的候选词。
+        多数情况下筛完所剩无几——宁缺毋滥，避免把无关行业词混进采集队列。"""
+        def grams(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+        base = re.sub(r"(批发|供应|厂家|定制|加工|工厂)$", "", kw)
+        kg = grams(base)
+        if not kg:
+            return []
+        out = []
+        for w in getattr(self, "_last_relative", []) or []:
+            w = str(w).strip()
+            if not w or w == kw or len(w) > 40 or w in out:
+                continue
+            core = re.sub(r"(批发|供应|厂家|定制|加工|工厂)$", "", w)
+            if grams(core) & kg:
+                out.append(w)
+        return out[:5]
 
     # ── 详情 + 联系方式 ────────────────────────────────────────
     def _extract_winport(self, html):
@@ -695,6 +1117,19 @@ class Ali1688Crawler:
             rec["公司名称"] = company
         rec["店铺URL"] = winport
         rec["联系方式URL"] = contact
+        if offer.get("guard"):
+            meta = self._extract_offer_meta(html)
+            if self.debug_collect:      # 开发调参用：留痕判定输入
+                self._guard_debug.append({"memberId": offer.get("memberId"),
+                                          "company": rec["公司名称"],
+                                          "kw": offer["keyword"], "meta": meta})
+            if not rec["主营商品"]:
+                rec["主营商品"] = meta["title"] or " / ".join(meta["shopCats"][:3])
+            if self.relevance_guard and not self._kw_relevant(meta, rec):
+                # 类目与关键词不符：到此为止，不再请求联系方式页（既保精准，
+                # 又省下无效商家的后续请求——低频才是防封的关键）
+                rec["状态"] = "类目不符(已过滤)"
+                return rec
         if not contact:
             rec["状态"] = "无联系方式入口"
             return rec
@@ -724,13 +1159,55 @@ class Ali1688Crawler:
                   else ("无电话(1688未公开)" if rec["地址"] else "无联系方式"))
         return rec
 
+    def _crawl_shop_company(self, entry):
+        """供应商渠道采集：店铺URL直达联系方式页（跳过商品详情页，一家只需一次导航）。"""
+        winport = entry["winport"]
+        rec = {
+            "关键词": entry.get("keyword", ""),
+            "公司名称": entry["company"],
+            "联系人": "", "电话": "", "手机": "", "传真": "", "地址": "", "邮箱": "",
+            "主营商品": "", "价格": "",
+            "店铺URL": winport, "详情URL": "", "联系方式URL": winport + "/page/contactinfo.html",
+            "offerId": "", "memberId": entry["shop"],
+            "采集时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "状态": "",
+        }
+        contact = winport + "/page/contactinfo.html"
+        if not self._goto(contact):
+            rec["状态"] = "联系方式页导航失败"
+            return rec
+        if self._detect_block() == "__LOGIN__":
+            rec["状态"] = "未登录-联系方式不可见"
+            return rec
+        rec.update(self._parse_contact(self.driver.page_source))
+        if not any(rec[k] for k in ("电话", "手机", "邮箱", "地址")):
+            # 两套模板回退：.html 取不到就试 .htm
+            alt = winport + "/page/contactinfo.htm"
+            self._sleep()
+            if self._goto(alt) and self._detect_block() != "__LOGIN__":
+                rec["联系方式URL"] = alt
+                rec.update({k: v for k, v in self._parse_contact(self.driver.page_source).items() if v})
+        rec["状态"] = ("成功" if any(rec[k] for k in ("电话", "手机", "邮箱"))
+                  else ("无电话(1688未公开)" if rec["地址"] else "无联系方式"))
+        # 联系页没给地址时，用公司卡片上的产地做兜底（不影响上面的状态判定口径）
+        if not rec["地址"] and entry.get("location"):
+            rec["地址"] = entry["location"]
+        return rec
+
     # ── 主采集循环 ─────────────────────────────────────────────
     def crawl(self, keywords, start_index=0):
         self._crawling = True
         self._stop_requested = False
         self._pause_requested = False
         self._seen_members = set()
+        self._filtered_count = 0
+        self._guard_debug = []
+        self._block_times = []
         self._current_delay = self.delay_between
+        seeded = 0
+        if self.incremental:
+            seeded = self._load_seen_store()
+            self._seen_members |= set(self._seen_store.keys())
 
         if self.driver is None or not self._is_session_alive():
             if not self.start_browser():
@@ -747,17 +1224,50 @@ class Ali1688Crawler:
                 return
 
         total = len(keywords)
-        self._log(f"🚀 开始采集，共 {total} 个关键词，每关键词最多 {self.max_pages} 页")
+        chans = []
+        if self.main_channel:
+            chans.append("主搜")
+        chans.append("商品SEM")
+        if self.company_channel:
+            chans.append("供应商")
+        skip_note = f"，增量模式已带 {seeded} 家历史公司（本轮命中即跳过、不再重复请求）" if seeded else ""
+        self._log(f"🚀 开始采集，共 {total} 个关键词（{'＋'.join(chans)} 渠道），每关键词每渠道最多 {self.max_pages} 页{skip_note}")
+        kws = [str(x).strip() for x in keywords]
         done = 0
-        for ki in range(start_index, total):
+        ki = start_index
+        self._last_relative = []
+        while ki < len(kws):
             if self._stop_requested:
                 break
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            kw = str(keywords[ki]).strip()
+            kw = kws[ki]
+            ki += 1
             if not kw:
                 continue
-            self._log(f"▶ [{ki+1}/{total}] 关键词：{kw}")
+            self._log(f"▶ [{ki}/{len(kws)}] 关键词：{kw}")
+            self._last_relative = []
+            if self.main_channel:
+                for offer in self._iter_keyword_main_offers(kw):
+                    if self._stop_requested:
+                        break
+                    while self._pause_requested and not self._stop_requested:
+                        time.sleep(0.5)
+                    rec = self._crawl_company(offer)
+                    if rec.get("状态") == "类目不符(已过滤)":
+                        # 垃圾商家不进结果表，也省掉了联系方式页请求（防封关键）
+                        self._filtered_count += 1
+                        self._commit_to_store(rec)   # 记住它，下轮连详情页都不必再进
+                        if self._filtered_count % 10 == 1:
+                            self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
+                                      f"（最近：{rec['公司名称'] or rec['主营商品'][:20]}）")
+                        continue
+                    self._add_result(rec)
+                    done += 1
+                    self._emit("progress_signal", done, max(done, 1))
+                    self._emit("stats_signal",
+                               f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
+                    self._sleep()
             for offer in self._iter_keyword_offers(kw):
                 if self._stop_requested:
                     break
@@ -768,10 +1278,38 @@ class Ali1688Crawler:
                 done += 1
                 self._emit("progress_signal", done, max(done, 1))
                 self._emit("stats_signal",
-                           f"关键词 {ki+1}/{total}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
+                           f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
                 self._sleep()
+            if self.company_channel and not self._stop_requested:
+                for entry in self._iter_keyword_companies(kw):
+                    if self._stop_requested:
+                        break
+                    while self._pause_requested and not self._stop_requested:
+                        time.sleep(0.5)
+                    rec = self._crawl_shop_company(entry)
+                    self._add_result(rec)
+                    done += 1
+                    self._emit("progress_signal", done, max(done, 1))
+                    self._emit("stats_signal",
+                               f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
+                    self._sleep()
+            if self.expand_related and not self._stop_requested:
+                added = 0
+                for w in self._related_candidates(kw):
+                    if w not in kws:
+                        kws.append(w)
+                        added += 1
+                if added:
+                    self._log(f"🔎 「{kw}」扩展相关词 {added} 个（现共 {len(kws)} 个关键词）")
+            if self.incremental:
+                self._save_seen_store()   # 每个关键词收尾即落盘，中途被拦也不丢已学到的
         self._crawling = False
-        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司")
+        if self.incremental:
+            self._save_seen_store()
+        tail = (f"，另有 {self._filtered_count} 家类目不相关已过滤"
+                if self._filtered_count else "")
+        saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
+        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{tail}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）
