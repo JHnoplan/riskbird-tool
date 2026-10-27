@@ -306,22 +306,25 @@ class Ali1688Crawler:
         except Exception:
             return False
 
-    def _driver_path(self):
-        """按优先级找一个「本地已有」的 chromedriver，完全绕开 Selenium Manager。
+    def _driver_candidates(self):
+        """列出所有「本地已有」的 chromedriver 候选（按默认优先级排序）。
 
-        exe 里原判据指向 _MEIxxxx/../riskbird_build 永远不存在 → 每次附加都走
-        Selenium Manager：它要先联网向 googlechromelabs/googleapis 查询驱动版本，
-        国内网络这些端点极慢或不通，表现为「Chrome 已打开、1688 迟迟不出、要等很久」。
-        查找顺序：随 exe 打包(_MEIPASS) → exe 同级目录（用户可手放驱动）→
-        Selenium Manager 官方缓存目录（以往成功联网拉取过就固化在用户目录）→ 开发仓库。
-        全部落空才返回 None，由 _attach 回退 Selenium Manager（至多慢一次）。"""
+        exe 里若只会命中一个固定版本驱动，一旦用户 Chrome 比它旧一个大版本
+        （Chrome for Testing 打包时是 156、用户自动更新还没到），156 驱动连 155
+        浏览器报的就是 'cannot connect to chrome'——重试/重启全都无效。
+        所以候选要全列出来，由 _driver_path 按浏览器实际版本挑配套的那一个。"""
         exe_name = "chromedriver.exe" if sys.platform == "win32" else "chromedriver"
         cands = []
         if getattr(sys, "frozen", False):
             meipass = getattr(sys, "_MEIPASS", "")
             if meipass:
                 cands.append(Path(meipass) / exe_name)
-            cands.append(Path(sys.executable).resolve().parent / exe_name)
+                # 新版打包：drivers/ 内置最近三个大版本，文件名注版 chromedriver.<N>.exe
+                d_dir = Path(meipass) / "drivers"
+                if d_dir.is_dir():
+                    cands += sorted(d_dir.glob("chromedriver*"), reverse=True)
+            exe_dir = Path(sys.executable).resolve().parent
+            cands += sorted(exe_dir.glob("chromedriver*"), reverse=True)
         # Selenium Manager 缓存：~/.cache/selenium/chromedriver/<平台>/<版本>/chromedriver[.exe]
         cache_root = Path(os.environ.get("USERPROFILE") or str(Path.home())) \
             / ".cache" / "selenium" / "chromedriver"
@@ -329,21 +332,62 @@ class Ali1688Crawler:
             def _ver_key(p):
                 nums = re.findall(r"\d+", p.parent.name)
                 return tuple(int(x) for x in nums[:4]) if nums else ()
-            found = sorted(cache_root.glob("**/" + exe_name), key=_ver_key)
-            if found:
-                cands.append(found[-1])
+            cands += sorted(cache_root.glob("**/" + exe_name), key=_ver_key, reverse=True)
         # 开发环境：与本仓库并列的风鸟驱动目录
         dev = Path(__file__).resolve().parent.parent / "riskbird_build"
         dev_sub = "chromedriver-win64/chromedriver.exe" if sys.platform == "win32" \
             else "chromedriver-mac-x64/chromedriver"
         cands.append(dev / dev_sub)
+        out = []
         for f in cands:
             try:
-                if f.is_file():
-                    return str(f)
+                if f.is_file() and str(f) not in out:
+                    out.append(str(f))
             except OSError:
                 continue
-        return None
+        return out
+
+    @staticmethod
+    def _cand_major(path):
+        """从路径推断驱动大版本：chromedriver.155.exe 文件名注版，或 SM 缓存的
+        <版本目录>/chromedriver.exe；推断不出返回 0。"""
+        name = Path(path).name
+        m = re.match(r"chromedriver\.(\d+)", name)
+        if m:
+            return int(m.group(1))
+        m = re.match(r"(\d+)\.", Path(path).parent.name)
+        return int(m.group(1)) if m else 0
+
+    def _driver_major(self, path):
+        """跑 `chromedriver --version` 拿真实大版本（推断不出时的兜底，秒级本地调用）。"""
+        try:
+            out = subprocess.run([path, "--version"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r"ChromeDriver (\d+)", out or "")
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+
+    def _browser_major(self):
+        """调试端口 /json/version 的 Browser 字段（Chrome/155.0.x）取大版本。"""
+        m = re.search(r"/(\d+)", self._devtools_browser())
+        return int(m.group(1)) if m else 0
+
+    def _driver_path(self, want_major=0):
+        """挑一个能用的本地 chromedriver：优先与浏览器大版本(want_major)配套的；
+        没有匹配项才退回默认优先级第一个（_attach 会据版本差决定是否在线兜底）。
+        全部落空返回 None，由 _attach 回退 Selenium Manager（至多慢一次）。"""
+        cands = self._driver_candidates()
+        if not cands:
+            return None
+        if want_major:
+            for f in cands:
+                if self._cand_major(f) == want_major:
+                    return f
+            for f in cands:                       # 无名驱动实跑 --version 比对
+                if self._driver_major(f) == want_major:
+                    return f
+        return cands[0]
 
     def _debug_pages(self):
         """列出调试端口上的 page 标签；查询失败返回 None，空列表表示「0 标签」。"""
@@ -428,12 +472,22 @@ class Ali1688Crawler:
     def _attach(self):
         opts = Options()
         opts.debugger_address = f"127.0.0.1:{self.debug_port}"
-        drv = self._driver_path()
+        browser = self._devtools_browser()
+        want = self._browser_major()
+        drv = self._driver_path(want)
         if drv is None:
             self._log("未检测到本地 chromedriver，改由 Selenium Manager 在线准备驱动"
                       "（首次可能较慢，请耐心等待）…")
             return webdriver.Chrome(options=opts)
-        browser = self._devtools_browser()
+        # 本地找不到与浏览器大版本配套的驱动（如驱动 156、浏览器 155）：这种失配
+        # 报的是 'cannot connect to chrome'，重试/重启 Chrome 都无解，直接交
+        # Selenium Manager 在线拉配套版本；同时提示用户升级 Chrome 这条更快的路。
+        d_major = self._cand_major(drv) or self._driver_major(drv)
+        if want and d_major and d_major != want:
+            self._log(f"⚠ 本地驱动 {d_major} 与你的 Chrome {want} 不匹配，"
+                      f"Selenium Manager 在线获取配套驱动（可能较慢；把 Chrome 升级到"
+                      f"最新——设置→关于 Google Chrome→检查更新——是更快的解法）…")
+            return webdriver.Chrome(options=opts)
         last_exc = None
         for i in range(3):
             try:
