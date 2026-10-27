@@ -57,10 +57,19 @@ jobs:
         python -m pip install --upgrade pip
         pip install PyQt5 selenium openpyxl pyinstaller requests -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+    - name: Download chromedriver (Stable win64)
+      run: |
+        $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+        $u = ($j.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
+        Invoke-WebRequest $u -OutFile cd.zip
+        Expand-Archive cd.zip -DestinationPath cd_tmp
+        Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe ali1688_build/chromedriver.exe
+        Write-Host "bundled chromedriver version: $($j.channels.Stable.version)"
+
     - name: Build EXE with PyInstaller
       run: |
         cd ali1688_build
-        python -m PyInstaller --noconfirm --onefile --windowed --name Ali1688Tool --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry ali1688_gui.py
+        python -m PyInstaller --noconfirm --onefile --windowed --name Ali1688Tool --add-data "chromedriver.exe;." --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry ali1688_gui.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4

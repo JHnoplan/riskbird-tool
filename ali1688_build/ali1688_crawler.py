@@ -307,12 +307,43 @@ class Ali1688Crawler:
             return False
 
     def _driver_path(self):
-        p = Path(__file__).resolve().parent.parent / "riskbird_build"
-        if sys.platform == "win32":
-            f = p / "chromedriver-win64" / "chromedriver.exe"
-        else:
-            f = p / "chromedriver-mac-x64" / "chromedriver"
-        return str(f) if f.exists() else None
+        """按优先级找一个「本地已有」的 chromedriver，完全绕开 Selenium Manager。
+
+        exe 里原判据指向 _MEIxxxx/../riskbird_build 永远不存在 → 每次附加都走
+        Selenium Manager：它要先联网向 googlechromelabs/googleapis 查询驱动版本，
+        国内网络这些端点极慢或不通，表现为「Chrome 已打开、1688 迟迟不出、要等很久」。
+        查找顺序：随 exe 打包(_MEIPASS) → exe 同级目录（用户可手放驱动）→
+        Selenium Manager 官方缓存目录（以往成功联网拉取过就固化在用户目录）→ 开发仓库。
+        全部落空才返回 None，由 _attach 回退 Selenium Manager（至多慢一次）。"""
+        exe_name = "chromedriver.exe" if sys.platform == "win32" else "chromedriver"
+        cands = []
+        if getattr(sys, "frozen", False):
+            meipass = getattr(sys, "_MEIPASS", "")
+            if meipass:
+                cands.append(Path(meipass) / exe_name)
+            cands.append(Path(sys.executable).resolve().parent / exe_name)
+        # Selenium Manager 缓存：~/.cache/selenium/chromedriver/<平台>/<版本>/chromedriver[.exe]
+        cache_root = Path(os.environ.get("USERPROFILE") or str(Path.home())) \
+            / ".cache" / "selenium" / "chromedriver"
+        if cache_root.is_dir():
+            def _ver_key(p):
+                nums = re.findall(r"\d+", p.parent.name)
+                return tuple(int(x) for x in nums[:4]) if nums else ()
+            found = sorted(cache_root.glob("**/" + exe_name), key=_ver_key)
+            if found:
+                cands.append(found[-1])
+        # 开发环境：与本仓库并列的风鸟驱动目录
+        dev = Path(__file__).resolve().parent.parent / "riskbird_build"
+        dev_sub = "chromedriver-win64/chromedriver.exe" if sys.platform == "win32" \
+            else "chromedriver-mac-x64/chromedriver"
+        cands.append(dev / dev_sub)
+        for f in cands:
+            try:
+                if f.is_file():
+                    return str(f)
+            except OSError:
+                continue
+        return None
 
     def _debug_pages(self):
         """列出调试端口上的 page 标签；查询失败返回 None，空列表表示「0 标签」。"""
@@ -373,7 +404,14 @@ class Ali1688Crawler:
         opts.debugger_address = f"127.0.0.1:{self.debug_port}"
         drv = self._driver_path()
         if drv:
-            return webdriver.Chrome(service=Service(executable_path=drv), options=opts)
+            # 本地驱动版本和用户 Chrome 不匹配时（浏览器自动升级过），这里会抛错，
+            # 捕获后回退 Selenium Manager——它会联网拉一次配套驱动，之后可写进缓存。
+            try:
+                return webdriver.Chrome(service=Service(executable_path=drv),
+                                        options=opts)
+            except Exception as e:
+                self._log(f"⚠ 本地驱动附加失败（{str(e).splitlines()[0][:100]}），"
+                          f"回退 Selenium Manager…")
         return webdriver.Chrome(options=opts)
 
     def _chrome_args(self, headed=True):
