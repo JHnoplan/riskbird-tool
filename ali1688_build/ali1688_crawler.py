@@ -90,6 +90,14 @@ PHONE_RE = re.compile(r'(?:86[\s-]?)?(?:0\d{2,3}[\s-]?\d{7,8}|1[3-9]\d{9})')
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 # 主搜页 offer 卡片埋点属性里的 (memberId, offerId) 对（2026-10-27 实机确认）
 MAIN_MEMBER_ITEM_RE = re.compile(r'member_id@(b2b-[0-9a-z]{6,24})\^item_id@(\d+)')
+# 主搜结果卡片 <a class="offerCard.." href="../offer/{id}.html">..</a>：列表页即可零成本
+# 拿到 offerId + 公司名(卡片 title 属性) + 商品标题(class="titleText--hash" 内文)，
+# 用于「进详情前」的早过滤（用平台自身的关键词预测类目+关键词字面做相关性打分，省大量详情导航）。
+OFFER_CARD_RE = re.compile(
+    r'<a class="offerCard[^"]*"[^>]*?href="https?://detail\.1688\.com/offer/(\d+)\.html[^"]*"[^>]*>(.*?)</a>',
+    re.S)
+CARD_TITLE_TEXT_RE = re.compile(r'class="titleText--[^"]*"[^>]*>(.*?)</div>', re.S)
+CARD_COMPANY_SUFFIX_RE = re.compile(r"(公司|厂|商行|商店|中心|经营部|经销部|部|店|馆|集团|合作社|工作室)$")
 # 主搜卡片埋点里的叶子类目：leafCategory@12345^。注意实测全页 60 条同值，
 # 是「查询级预测类目」而非 offer 真实类目，逐条过滤不可用它——真实类目在详情页：
 DETAIL_LEAF_ID_RE = re.compile(r'"leafCategoryId"\s*:\s*(\d{3,12})')
@@ -140,11 +148,11 @@ class Ali1688Crawler:
         self.incremental = True
         self._seen_store = {}        # {key: {"at": ts, "st": 状态}}，持久化到 seen_store.json
 
-        self._data_dir = Path(__file__).parent / "ali1688_data"
-        self._data_dir.mkdir(exist_ok=True)
+        self._data_dir = self._stable_data_dir()
         self._seen_store_path = self._data_dir / "seen_store.json"
         self._profile_dir = self._profile_path()
         self._seen_members = set()   # 本轮已处理公司（memberId）去重
+        self._early_skipped = 0      # 本轮列表页早过滤计数（未进详情即判无关）
         self._guard_kw = ""          # 类目过滤：当前关键词
         self._guard_pred = None      # 类目过滤：关键词级 PRECISE 预测类目集（id+名）
 
@@ -246,6 +254,27 @@ class Ali1688Crawler:
         return True
 
     # ── Chrome 生命周期 ────────────────────────────────────────
+    @staticmethod
+    def _stable_data_dir():
+        """种子库/数据目录必须跨运行持久，且要可写。
+        PyInstaller onefile 下 __file__ 指向每次启动都变、退出即删的 _MEIxxxx 临时目录，
+        用它当数据目录会让 seen_store.json 既写不进也活不到下一轮（跨运行去重彻底失效）。
+        故：打包运行时用「exe 同级目录」，开发时用模块目录；都不可写再回退用户主目录。"""
+        if getattr(sys, "frozen", False):
+            primary = Path(sys.executable).resolve().parent / "ali1688_data"
+        else:
+            primary = Path(__file__).resolve().parent / "ali1688_data"
+        for d in (primary, Path.home() / ".ali1688" / "ali1688_data"):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                probe = d / ".write_test"
+                probe.write_text("1", encoding="utf-8")
+                probe.unlink()
+                return d
+            except Exception:
+                continue
+        return primary
+
     def _profile_path(self):
         if sys.platform == "win32":
             return Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_1688_profile"
@@ -812,17 +841,35 @@ class Ali1688Crawler:
             self._sleep()
 
     def _parse_main_search_page(self, html):
-        """主搜商品搜索页：从 offer 卡片埋点属性提取 (memberId, offerId) 对。
+        """主搜商品搜索页：从 offer 卡片埋点属性提取 (memberId, offerId) 对，
+        并从卡片 DOM 附带「公司名 + 商品标题」（列表页零成本），供进详情前早过滤用。
 
         每页约 60 条 offer、约 50 家不同公司；数据在 DOM 渲染属性里，
         不依赖 window.data（该对象在部分变体页里为空壳）。"""
+        # offerId -> (公司名, 商品标题)：来自卡片 DOM，与埋点 (mid,oid) 按 offerId 关联
+        meta = {}
+        for oid, inner in OFFER_CARD_RE.findall(html):
+            comp = ""
+            for t in re.findall(r'title="([^"]{4,50})"', inner):
+                t = t.strip()
+                if t and CARD_COMPANY_SUFFIX_RE.search(t):
+                    comp = t
+                    break
+            title = ""
+            mt = CARD_TITLE_TEXT_RE.search(inner)
+            if mt:
+                title = re.sub(r"<[^>]+>", "", mt.group(1))
+                title = re.sub(r"\s+", "", title)[:80]
+            if comp or title:
+                meta[oid] = (comp, title)
         out, seen = [], set()
         for mid, oid in MAIN_MEMBER_ITEM_RE.findall(html):
             key = (mid, oid)
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"memberId": mid, "offerId": oid})
+            comp, title = meta.get(oid, ("", ""))
+            out.append({"memberId": mid, "offerId": oid, "company": comp, "title": title})
         return out
 
     def _parse_keywords_category(self, html):
@@ -934,6 +981,35 @@ class Ali1688Crawler:
                                            meta["title"] or rec.get("公司名称"))))
         return not comparable
 
+    def _list_relevant(self, company, title):
+        """列表页「进详情前」的早过滤：用卡片自带的公司名+商品标题，与
+        关键词字面 + 平台预测的 PRECISE 类目名做二字组比对，明显无关则连详情页都不必进
+        （省一次详情导航=提速+防封）。这是大规模爬虫的通用手法：fetch 前先用廉价信号打分过滤。
+
+        保守 fail-open——只有「有可靠中文信号且卡片文本中文、却零重叠」才判无关跳过；
+        任何取不到信号/英文词/卡片文本缺失一律放行去详情，绝不误杀（详情页仍会用真实类目 id 兜底复核）。"""
+        kw = self._guard_kw
+        pred = self._guard_pred
+        text = ((company or "") + " " + (title or "")).strip()
+        if not text:
+            return True   # 卡片没解析到公司名/标题 → 无法早判 → 进详情
+        if not re.search(r"[\u4e00-\u9fa5]", text):
+            return True   # 卡片文本非中文 → 字面判定不可靠 → 进详情
+
+        def grams(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+        base = re.sub(r"(批发|供应|厂家|定制|加工|工厂)", "", kw or "")
+        sig = grams(base)
+        # 平台预测类目名并入可匹配信号（扩大安全网：如搜「制冷设备」命中「冷水机组」等预测名不误杀）
+        for n in ((pred or {}).get("names") or set()):
+            sig |= grams(n)
+        if not sig:
+            return True   # 无可靠中文信号（英文/单字词）→ 不早过滤，交详情页判定
+        compact = re.sub(r"\s+", "", text)
+        if sig & grams(compact) or (base and base in compact):
+            return True
+        return False
+
     def _iter_keyword_main_offers(self, kw):
         """遍历主搜渠道多页列表，逐条 yield 可进详情链路的伪 offer（按 memberId 去重）。
 
@@ -962,6 +1038,7 @@ class Ali1688Crawler:
                 continue
             empty_streak = 0
             new = 0
+            page_skipped = 0
             for p in pairs:
                 mid = p["memberId"]
                 # 命中全局已采公司 或 本关键词下已判「类目不符」的公司 → 跳过，
@@ -969,13 +1046,21 @@ class Ali1688Crawler:
                 if mid in self._seen_members or f"{kw}#{mid}" in self._seen_members:
                     continue
                 self._seen_members.add(mid)
+                # 列表页早过滤：卡片自带的公司名+标题明显与关键词/预测类目无关 → 不进详情
+                # （省一次详情导航=提速+防封）。保守 fail-open，只在强信号零重叠时才跳过。
+                if self.relevance_guard and not self._list_relevant(p.get("company", ""), p.get("title", "")):
+                    page_skipped += 1
+                    self._early_skipped += 1
+                    continue
                 new += 1
                 yield {"keyword": kw, "page": page, "raw": {},
-                       "company": "", "offerId": p["offerId"],
+                       "company": p.get("company", ""), "offerId": p["offerId"],
                        "odUrl": f"https://detail.1688.com/offer/{p['offerId']}.html",
-                       "memberId": mid, "loginId": "", "price": "", "subject": "",
+                       "memberId": mid, "loginId": "", "price": "",
+                       "subject": p.get("title", ""),
                        "guard": True}   # 主搜结果参差，进联系方式前做类目相关性过滤
-            self._log(f"  「{kw}」主搜渠道第 {page} 页：{len(pairs)} 条offer，新增公司 {new} 家")
+            tail = f"，早过滤 {page_skipped} 家(未进详情)" if page_skipped else ""
+            self._log(f"  「{kw}」主搜渠道第 {page} 页：{len(pairs)} 条offer，新增公司 {new} 家{tail}")
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 3:
@@ -1229,6 +1314,7 @@ class Ali1688Crawler:
         self._pause_requested = False
         self._seen_members = set()
         self._filtered_count = 0
+        self._early_skipped = 0
         self._guard_debug = []
         self._block_times = []
         self._current_delay = self.delay_between
@@ -1349,8 +1435,10 @@ class Ali1688Crawler:
             self._save_seen_store()
         tail = (f"，另有 {self._filtered_count} 家类目不相关已过滤"
                 if self._filtered_count else "")
+        early = (f"，列表页早过滤 {self._early_skipped} 家(未进详情即省请求)"
+                 if self._early_skipped else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
-        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{tail}{saved}")
+        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{early}{tail}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）
