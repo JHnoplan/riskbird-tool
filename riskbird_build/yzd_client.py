@@ -242,6 +242,16 @@ def clamp_fields(row: dict, log=None) -> dict:
     return out
 
 
+def has_contact(row: dict) -> bool:
+    """该行是否留得下一个联系方式（手机号/固话/邮箱任一非空）"""
+    try:
+        import customer_library_cleaner as _cleaner
+        return _cleaner._has_contact(row or {})
+    except Exception:
+        row = row or {}
+        return any(str(row.get(k) or "").strip() for k in ("手机号", "固话", "邮箱"))
+
+
 def write_import_workbook(rows: list, file_path: str, log=None) -> int:
     """把清洗后的行写成云展接口6 专用的 9 列 Excel，返回写入行数
 
@@ -255,13 +265,20 @@ def write_import_workbook(rows: list, file_path: str, log=None) -> int:
     ws.title = "客户导入"
     ws.append(list(IMPORT_HEADERS))
     written = 0
+    no_contact = 0
     for row in rows or []:
         data = clamp_fields(row, log=log)
         values = [data.get(h, "") for h in IMPORT_HEADERS]
         if not any(str(v).strip() for v in values):
             continue          # 整行空白的后端也不会导入，这里直接不写
+        if not has_contact(data):
+            # 与清洗出口同一口径的防御：三个联系方式全空的行传上去就是一堆脏数据
+            no_contact += 1
+            continue
         ws.append(values)
         written += 1
+    if no_contact and log:
+        log(f"🧹 已跳过 {no_contact} 条无任何联系方式的记录（手机号/固话/邮箱全空，不入库）")
     widths = {"客户名称": 16, "企业名称": 34, "岗位": 12, "手机号": 22,
               "固话": 20, "邮箱": 28, "微信号": 16, "数据来源": 12, "备注": 40}
     for idx, head in enumerate(IMPORT_HEADERS, start=1):

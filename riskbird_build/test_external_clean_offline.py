@@ -140,6 +140,39 @@ assert report6[0]["identified"] == ["“企业名称”→公司名", "“联系
 rows6 = C.build_external_rows(records6, log=print)
 assert len(rows6) == 1 and rows6[0]["企业名称"] == "正常公司有限公司", rows6
 
+# ── 7. 电话多列合并：手机号列占了「电话」字段后，固话列不能被整列丢弃 ──
+twocol = os.path.join(TMP, "手机固话分列.xlsx")
+_write_xlsx(twocol, [("Sheet1", [
+    ["企业名称", "客户名称", "手机号", "固话", "邮箱", "固话", ""],
+    ["东莞市立勤科技有限公司", "陈生", "13900139000", "0769-88881111", "chen@liqin.com", "", ""],
+    ["广州金田瑞麟净化设备公司", "黄工", "13800138000", "020-84445555", "", "", ""],
+    ["佛山无名贸易公司", "", "", "", "", "", ""],            # 三空行：不能入库
+    ["深圳蓝海科技有限公司", "李娜", "13700137000;13600136000", "0755-88881111", "li@lanhai.com", "", ""],
+])])
+records7, report7 = C.clean_external_records([twocol], log=print)
+info7 = report7[0]
+assert any("→电话（两列合并）" in s and "手机号" in s and "固话" in s
+           for s in info7["identified"]), f"手机号/固话两列必须合并进电话字段：{info7['identified']}"
+assert not any("固话" == s.strip("“”") for s in info7.get("skipped") or []), \
+    f"固话列不能再被当成未使用列丢弃：{info7.get('skipped')}"
+assert not any(str(s).strip() in ("", "第7列") for s in info7.get("skipped") or []), \
+    f"没数据的重复表头/空列不该混进未使用列里干扰排查：{info7.get('skipped')}"
+
+rows7 = C.build_external_rows(records7, log=print)
+names7 = [r["企业名称"] for r in rows7]
+assert "佛山无名贸易公司" not in names7, f"手机/固话/邮箱全空的行不该出现在入库文件：{names7}"
+assert len(rows7) == 3, f"4 行原始数据应入库 3 条（剔 1 条无任何联系方式）：{rows7}"
+liqin = next(r for r in rows7 if r["企业名称"] == "东莞市立勤科技有限公司")
+assert liqin["手机号"] == "13900139000", liqin
+assert liqin["固话"] == "0769-88881111", f"固话列要合并进来：{liqin}"
+lanhai7 = next(r for r in rows7 if r["企业名称"] == "深圳蓝海科技有限公司")
+assert lanhai7["手机号"] == "13700137000,13600136000", lanhai7
+assert lanhai7["固话"] == "0755-88881111", lanhai7
+# 列号升序拼接 → 手机号列在前，拆分后主联系人号码仍排最前
+jintian7 = next(r for r in rows7 if r["企业名称"] == "广州金田瑞麟净化设备公司")
+assert jintian7["手机号"] == "13800138000" and jintian7["固话"] == "020-84445555", jintian7
+print("7 ✅ 电话多列合并 + 三空行剔除\n")
+
 # 清洗结果能直接喂给云展 9 列上传文件构造（列名对得上）
 import yzd_client as Y
 

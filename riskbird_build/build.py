@@ -144,6 +144,7 @@ def build_exe():
         "--hidden-import", "customer_library_cleaner",
         "--hidden-import", "dual_session",
         "--hidden-import", "block_guard",
+        "--hidden-import", "crawl_checkpoint",
         "--hidden-import", "requests",
         "--hidden-import", "websocket",
         "--collect-all", "selenium",

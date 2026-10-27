@@ -34,6 +34,14 @@ except ImportError:
     HAS_DUAL = False
 
 try:
+    # 断点续采进度台账（名单快照 + 条目状态机）：读不到不影响采集，只是不能续采
+    import crawl_checkpoint as _cp
+    HAS_CHECKPOINT = True
+except Exception:
+    _cp = None
+    HAS_CHECKPOINT = False
+
+try:
     import customer_library_cleaner as _cleaner
     HAS_CLEANER = True
 except ImportError:
@@ -1387,6 +1395,10 @@ class MainWindow(QMainWindow):
         self._clean_progress = None       # 清洗期间的锁定遮罩
         self._auto_import_group = None    # 「采集完自动导入」选定的分组
         self._task_id = None              # 本次采集会话对应的任务 id（=会话文件夹名）
+        # 断点续采：进度台账 + 原始名单顺序快照（奇偶分工/待采集合都按它算）
+        self._checkpoint = None           # crawl_checkpoint.CrawlCheckpoint 或 None
+        self._companies_snapshot = []     # 原始名单顺序快照（含已采完的家）
+        self._cp_cursor = {}              # 各爬虫已写进台账的结果条数（增量扫描用）
 
         self._update_window_title()
         self.setMinimumSize(900, 700)
@@ -1758,12 +1770,14 @@ class MainWindow(QMainWindow):
             
             # 去重
             self._companies = list(dict.fromkeys(all_companies))
-            self.company_count_lbl.setText(f"共 {len(self._companies)} 家（去重后）")
             self.preview_btn.setEnabled(True)
             self._check_ready()
             self._append_log(f"从 {len(paths)} 个文件加载 {len(all_companies)} 家公司，去重后 {len(self._companies)} 家")
             # 已有会话时再选文件 = 往当前任务里加料，不拆新任务
             self._update_task_files()
+            # 名单载入完就找断点：不要等用户点了“开始采集”才发现要从头烧一遍配额
+            self._maybe_offer_resume()
+            self._refresh_company_count()
 
     def _load_companies_from_file(self, path: str) -> list:
         """从单个文件加载公司名（智能识别公司名列：表头语义 + 内容抽样打分，低置信弹窗确认）"""
@@ -1832,6 +1846,10 @@ class MainWindow(QMainWindow):
         self._session_folder = None
         self._last_autosave_bucket = 0
         self._task_id = None
+        # 进度台账跟会话走：换了名单就得重建，不能拿旧任务的账去算新名单
+        self._checkpoint = None
+        self._companies_snapshot = []
+        self._cp_cursor = {}
         self._append_log("已清空文件列表")
 
     def _load_companies(self, path: str):
@@ -1852,6 +1870,264 @@ class MainWindow(QMainWindow):
     def _check_ready(self):
         ready = bool(self._companies)
         self.start_btn.setEnabled(ready)
+
+    # ── 断点续采（任务清单 + 条目状态机 + 幂等键）───────
+    def _platform_name(self, key: str) -> str:
+        return self.SOURCE_LABELS.get(key, key or "")
+
+    def _crawler_key_by_source(self, source) -> str:
+        """记录里的“数据来源”→ 爬虫 key（回读原数据 Excel 时分派用）
+
+        合并后的记录可能写成“企知道,爱企查”，按靠前的平台归位即可：
+        续采只关心“这家公司采过没有”，不靠这里做去重。
+        """
+        text = str(source or "")
+        for key in self.SOURCE_KEYS:
+            if self.SOURCE_LABELS.get(key) and self.SOURCE_LABELS[key] in text:
+                return key
+        return ""
+
+    def _sessions_base(self):
+        """会话目录的父目录：桌面/企业数据自动采集工具"""
+        return self._get_desktop_dir() / "企业数据自动采集工具"
+
+    def _merge_snapshot(self) -> list:
+        """原始名单顺序快照：老名单保持原位，新加的接在后面
+
+        双标签靠位置取奇偶分工，续采时顺序变了会让同一家公司换平台（配额、登录态都不一样），
+        所以分工一律按这份快照，不按“本次待采子集”。
+        """
+        out, seen = [], set()
+        for name in list(self._companies_snapshot) + list(self._companies):
+            text = str(name or "").strip()
+            key = block_guard.norm_company(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+        return out
+
+    def _refresh_company_count(self):
+        """名单载入后的状态行：有台账就报「待采/已完成/失败待重试/无结果跳过」四个数"""
+        if not hasattr(self, "company_count_lbl"):
+            return
+        cp = self._checkpoint
+        if cp is not None:
+            names = self._companies_snapshot or list(self._companies)
+            if names:
+                self.company_count_lbl.setText(cp.text_summary(names))
+                return
+        self.company_count_lbl.setText(f"共 {len(self._companies)} 家（去重后）")
+
+    def _todo_companies(self, include_keys=None) -> list:
+        """待采 = 名单快照 − done − no_result（临时失败计入待采重试）
+
+        台账是跨进程的账本，内存里各爬虫的 results 是本轮的账，两边都要认：
+        中途切平台时上一个平台采过的公司不该再烧一次请求。
+        """
+        snap = self._companies_snapshot or list(self._companies)
+        todo = self._checkpoint.pending(snap) if self._checkpoint is not None else snap
+        got = set()
+        for key in (include_keys or self.SOURCE_KEYS):
+            crawler = self._by_key.get(key)
+            if crawler is None:
+                continue
+            for r in (crawler.snapshot_results() if hasattr(crawler, "snapshot_results")
+                      else getattr(crawler, "results", []) or []):
+                name = block_guard.norm_company(r.get("公司名") if isinstance(r, dict) else "")
+                if name:
+                    got.add(name)
+        return [n for n in todo if block_guard.norm_company(n) not in got]
+
+    def _find_resumable(self) -> list:
+        """扫描未完成会话 → [(会话目录, 台账, 已完成数, 任务名, 任务状态)]，最接近采完的排前面"""
+        if not HAS_CHECKPOINT:
+            return []
+        base = self._sessions_base()
+        titles, statuses = {}, {}
+        if HAS_YZD:
+            try:
+                for t in _tasks.load_tasks():
+                    tid = str(t.get("id") or "")
+                    titles[tid] = str(t.get("name") or "")
+                    statuses[tid] = str(t.get("status") or "")
+            except Exception:
+                pass
+        try:
+            folders = sorted([p for p in base.iterdir() if p.is_dir()], reverse=True)[:40]
+        except Exception:
+            return []
+        out = []
+        for folder in folders:
+            if self._session_folder is not None and folder.name == self._session_folder.name:
+                continue          # 当前会话不跟自己弹续采
+            if not os.path.exists(os.path.join(str(folder), _cp.CHECKPOINT_FILE_NAME)):
+                continue
+            cp, msg = _cp.inspect_folder(folder, self._companies, self._excel_paths,
+                                         log=self._append_log)
+            if cp is None:
+                if msg and "损坏" in msg:
+                    self._append_log(f"ℹ 会话 {folder.name}：{msg}")
+                continue
+            done_n = cp.summary(self._companies)[_cp.STATUS_DONE]
+            out.append((folder, cp, done_n, titles.get(folder.name) or folder.name,
+                        statuses.get(folder.name, "")))
+        # 采集中/已停止的任务先提（本来就是没采完的），同一类里按已完成家数倒序
+        unfinished = ((_tasks.TASK_STATUS_RUNNING, _tasks.TASK_STATUS_STOPPED)
+                      if HAS_YZD else ())
+        return sorted(out, key=lambda it: (it[4] not in unfinished, -it[2]))
+
+    def _maybe_offer_resume(self):
+        """发现断点 → 弹窗「从断点继续（默认）/ 重新开始 / 取消」"""
+        if not HAS_CHECKPOINT or not self._companies:
+            return
+        found = self._find_resumable()
+        if not found:
+            return
+        folder, cp, _done_n, task_name, status = found[0]
+        c = cp.summary(self._companies)
+        extra = ""
+        if len(found) > 1:
+            extra = f"\n（还找到 {len(found) - 1} 个更早的未完成会话，需要时可从那个目录手动恢复）"
+        box = QMessageBox(self)
+        box.setWindowTitle("发现未完成的采集")
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            f"上次未完成的采集：〈{task_name}〉{f'（{status}）' if status else ''}\n"
+            f"会话目录：{folder.name}\n"
+            f"名单 {c['total']} 家 / 已完成 {c[_cp.STATUS_DONE]} 家 / "
+            f"临时失败待重试 {c[_cp.STATUS_FAILED]} 家 / 确认无结果不再采 {c[_cp.STATUS_NO_RESULT]} 家\n\n"
+            f"是否从断点继续（本次只采剩下 {c['todo']} 家）？{extra}")
+        again_btn = box.addButton("重新开始", QMessageBox.ActionRole)
+        keep_btn = box.addButton("从断点继续", QMessageBox.AcceptRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(keep_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is keep_btn:
+            self._adopt_checkpoint(cp, folder, task_name)
+        elif clicked is again_btn:
+            self._restart_session(folder)
+        elif clicked is cancel_btn or clicked is None:
+            self._append_log("ℹ 本次不按断点续采：旧进度文件保留，下次选同一份名单仍可继续")
+        self._refresh_company_count()
+
+    def _adopt_checkpoint(self, cp, folder, task_name: str = ""):
+        """继续：接回会话目录与台账，并把原数据 Excel 里的记录灌回各平台 results"""
+        self._session_folder = Path(folder)
+        self._task_id = Path(folder).name
+        self._checkpoint = cp
+        records = _cp.load_records_from_raw_excel(folder)
+        restored = self._restore_results(records)
+        self._companies_snapshot = self._merge_snapshot()
+        cp.set_snapshot(self._companies_snapshot)
+        cp.files = _cp.files_fingerprint(self._excel_paths)
+        cp.flush(force=True)
+        self._append_log(
+            f"↻ 从断点继续：{task_name or Path(folder).name}，"
+            f"回读原数据 {len(records)} 条、恢复到平台 {restored} 条")
+        self._append_log(f"   {cp.text_summary(self._companies_snapshot)}")
+        self._update_platform_counts()
+
+    def _restore_results(self, records: list) -> int:
+        """按「数据来源」把记录放回对应平台的 results（归一化公司名去重，只补不覆盖）
+
+        内存里已有的结果比 Excel 里的新（正在跑的这一轮还没写盘），续采时不能拿旧记录把它换掉。
+        """
+        got = {}
+        for key in self.SOURCE_KEYS:
+            crawler = self._by_key.get(key)
+            got[key] = {block_guard.norm_company(r.get("公司名"))
+                        for r in (getattr(crawler, "results", None) or [])}
+        restored = 0
+        for row in records or []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("公司名") or row.get("企业名称") or "").strip()
+            if not name:
+                continue
+            key = self._crawler_key_by_source(row.get("数据来源"))
+            crawler = self._by_key.get(key)
+            if crawler is None or not hasattr(crawler, "results"):
+                continue
+            nk = block_guard.norm_company(name)
+            if nk in got[key]:
+                continue
+            got[key].add(nk)
+            crawler.results.append(dict(row))
+            if self._checkpoint is not None:
+                self._checkpoint.mark_record(row, self._platform_name(key))
+            restored += 1
+        for key in self.SOURCE_KEYS:
+            crawler = self._by_key.get(key)
+            self._cp_cursor[key] = len(getattr(crawler, "results", None) or [])
+        return restored
+
+    def _restart_session(self, folder):
+        """重新开始：清进度文件与任务状态，会话目录接着用（原数据 Excel 覆盖写）"""
+        try:
+            os.remove(os.path.join(str(folder), _cp.CHECKPOINT_FILE_NAME))
+        except OSError as e:
+            self._append_log(f"⚠ 进度文件没删掉（{e}）：本次仍按全量重采")
+        self._session_folder = Path(folder)
+        self._task_id = Path(folder).name
+        self._checkpoint = None
+        self._companies_snapshot = []
+        self._cp_cursor = {}
+        if HAS_YZD:
+            try:
+                _tasks.finish_task(Path(folder).name, _tasks.TASK_STATUS_STOPPED, 0)
+            except Exception as e:
+                self._append_log(f"⚠ 任务状态重置失败：{e}")
+        self._append_log(f"↺ 重新开始：已清空该会话的采集进度，本次全量重采 {len(self._companies)} 家")
+
+    def _ensure_checkpoint(self, folder):
+        """开始采集前保证有台账：新会话建一份，已有会话补名单与指纹"""
+        if not HAS_CHECKPOINT or folder is None:
+            return None
+        if self._checkpoint is not None and str(self._checkpoint.folder) == str(folder):
+            cp = self._checkpoint
+        else:
+            cp = _cp.CrawlCheckpoint.create(
+                Path(folder).name, str(folder),
+                self._companies_snapshot or self._companies,
+                file_paths=self._excel_paths, log=self._append_log)
+            self._checkpoint = cp
+            self._companies_snapshot = list(cp.snapshot)
+            for key in self.SOURCE_KEYS:
+                self._cp_cursor.setdefault(key, 0)
+        cp.set_snapshot(self._companies_snapshot or self._companies)
+        cp.files = _cp.files_fingerprint(self._excel_paths)
+        cp.flush(force=True)
+        return cp
+
+    def _cp_mark_new(self):
+        """各爬虫新增的结果写进台账（按条数游标增量扫）；台账自己每采满 5 条落一次盘"""
+        cp = self._checkpoint
+        if cp is None:
+            return
+        for key in self.SOURCE_KEYS:
+            crawler = self._by_key.get(key)
+            results = getattr(crawler, "results", None) or []
+            start = self._cp_cursor.get(key, 0)
+            if len(results) < start:
+                start = 0        # 结果被清过：游标退回，否则以后永远对不上
+                self._cp_cursor[key] = 0
+            if len(results) == start:
+                continue
+            cp.mark_records(results[start:], self._platform_name(key))
+            self._cp_cursor[key] = len(results)
+
+    def _cp_flush(self, reason: str = ""):
+        """暂停/停止/完成/关窗：把未落盘的状态强制写一次，崩之前采的都不会白采"""
+        cp = self._checkpoint
+        if cp is None:
+            return
+        self._cp_mark_new()
+        ok = cp.flush(force=True)
+        if reason:
+            self._append_log((f"🧭 采集进度已落盘（{reason}）：" if ok
+                              else f"⚠ 采集进度落盘失败（{reason}）：") + cp.text_summary())
 
     # ─ 登录 ───────────────────────────────────
     def _on_force_detail_toggled(self, checked):
@@ -2099,21 +2375,30 @@ class MainWindow(QMainWindow):
         # 同步风鸟详情页开关（避免切换平台后残留设置与实际不符）
         self.riskbird_crawler.force_detail = self.rb_detail_check.isChecked()
 
-        # 跨平台续采：从所有平台已采集的总条数继续（切换平台/暂停后不重头开始）
-        start_index = self._get_global_index()
-        if dual:
-            # 双标签只看企知道+爱企查两边的已采数（风鸟的历史数据不参与单双数分工），
-            # 两边各自从自己的已采条数续采，同一家公司永远归同一个平台
-            start_index = len(self.qizhidao_crawler.results) + len(self.aiqicha_crawler.results)
-        if start_index >= len(self._companies):
-            QMessageBox.information(self, "提示", f"全部 {len(self._companies)} 家公司已采集完成，无需继续。")
+        # 断点续采：续采起点由「名单集合差集」决定，不再拿已采条数当索引（进程一重启就归零）。
+        # 三个爬虫的契约 crawl(companies, start_index=0) 不变：这里只改“交给它哪一份名单”。
+        # 双标签的待采只看企知道+爱企查两边（风鸟的历史结果不计入单双数分工）。
+        self._companies_snapshot = self._merge_snapshot()
+        snapshot = self._companies_snapshot
+        pending = self._todo_companies(("qizhidao", "aiqicha") if dual else None)
+        if not pending:
+            QMessageBox.information(
+                self, "提示",
+                f"名单 {len(snapshot)} 家已全部采完或已确认无结果，无需再采。\n\n"
+                f"如需重采全部公司，请先点「清空文件」再重新选择名单文件。")
             return
         # 首次开始采集时创建桌面会话文件夹（以第一次开始采集的时间命名）
         folder = self._get_or_create_session_folder()
         self._register_task(folder)
-        self._last_autosave_bucket = start_index // 10
-        if start_index > 0:
-            self._append_log(f"↻ 续采：已完成 {start_index} 条，从第 {start_index + 1} 条继续")
+        self._ensure_checkpoint(folder)
+        self._last_autosave_bucket = self._get_global_index() // 10
+        skipped = len(snapshot) - len(pending)
+        if skipped:
+            self._append_log(f"↻ 续采：跳过已完成/无结果 {skipped} 家，本次待采 {len(pending)} 家"
+                             f"（名单共 {len(snapshot)} 家）")
+        else:
+            self._append_log(f"▶ 本次待采 {len(pending)} 家（名单共 {len(snapshot)} 家）")
+        self._refresh_company_count()
 
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -2132,7 +2417,7 @@ class MainWindow(QMainWindow):
             self._attach_dual_logs(True)
             self._append_log("⚡ 双标签并行：正在准备共享浏览器与两个会话（首次启动约十几秒）…")
             self._crawl_thread = DualCrawlWorker(
-                self.qizhidao_crawler, self.aiqicha_crawler, self._companies)
+                self.qizhidao_crawler, self.aiqicha_crawler, snapshot, pending)
             self._crawl_thread.progress.connect(self._update_progress)
             self._crawl_thread.log_signal.connect(self._append_log)
             self._crawl_thread.setup_failed.connect(self._on_dual_setup_failed)
@@ -2141,7 +2426,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("双标签采集中（企知道 + 爱企查）...")
             return
 
-        self._crawl_thread = CrawlWorker(self.crawler, self._companies, start_index)
+        self._crawl_thread = CrawlWorker(self.crawler, pending, 0)
         # 上一轮会话/切换数据源留下的空白窗口白占内存，开跑前洗一次
         # （双标签模式在 setup_dual 里已经洗过，这里只管单平台）
         if HAS_DUAL and _dual.is_shared_chrome_alive():
@@ -2166,6 +2451,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已暂停")
         self._pause_timer()
         self._update_platform_counts()
+        self._cp_flush("点击暂停")
         self._auto_save("点击暂停")
 
     def _resume_crawl(self):
@@ -2193,6 +2479,7 @@ class MainWindow(QMainWindow):
         # 输出用时摘要
         count = sum(len(c.results) for c in self._active_crawlers())
         self._append_log(f" {self._get_time_summary(count)}")
+        self._cp_flush("点击停止")
         self._auto_save("点击停止")
         self._finish_task(_tasks.TASK_STATUS_STOPPED, self._get_global_index())
 
@@ -2212,6 +2499,7 @@ class MainWindow(QMainWindow):
         self._update_platform_counts()
         # 输出用时摘要
         self._append_log(f"✅ {self._get_time_summary(count)}")
+        self._cp_flush("采集完成")
         self._auto_save("采集完成")
         if HAS_YZD:
             self._finish_task(_tasks.TASK_STATUS_DONE, total_all)
@@ -2254,6 +2542,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat(f"完成 — 企知道 {qn} + 爱企查 {an}，合计 {total_all} 条")
         self._update_platform_counts()
         self._append_log(f"✅ 双标签并行结束：企知道 {qn} 条、爱企查 {an} 条 {self._get_time_summary(qn + an)}")
+        self._cp_flush("双标签采集完成")
         self._auto_save("双标签采集完成")
         if HAS_YZD:
             self._finish_task(_tasks.TASK_STATUS_DONE, total_all)
@@ -2266,6 +2555,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat(f"采集中... {current}/{total} ({pct}%)  ⏱ {self._format_time(self._crawl_elapsed)}")
         # 刷新各平台已采集条数显示
         self._update_platform_counts()
+        # 刚采完一条就把状态写进台账（台账内部每采满 5 条落一次盘）：
+        # 强杀进程最多丢最后几条，不会整批重采
+        self._cp_mark_new()
+        self._refresh_company_count()
         # 每采集 10 条自动保存一次
         total_done = self._get_global_index()
         bucket = total_done // 10
@@ -2554,7 +2847,7 @@ class MainWindow(QMainWindow):
         return combined
 
     def _get_global_index(self) -> int:
-        """全局进度 = 所有平台已采集条数之和（跨平台续采的起点）"""
+        """全局进度 = 所有平台已采集条数之和（只给进度条/统计用，续采起点靠台账算）"""
         return sum(len(c.results) for c in self._all_crawlers)
 
     def _get_desktop_dir(self) -> Path:
@@ -3153,6 +3446,8 @@ class MainWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             self._append_log("⏳ 自动保存正在写盘，稍等几秒…")
             worker.wait(15000)
+        # 进度台账最后一条也要落盘：下次开工具才能从真正的位置继续
+        self._cp_flush("关闭窗口")
         bind_worker = self._yzd_worker
         if bind_worker is not None and bind_worker.isRunning():
             bind_worker.wait(5000)
@@ -3234,11 +3529,14 @@ class DualCrawlWorker(QThread):
     log_signal = pyqtSignal(str)
     setup_failed = pyqtSignal(str)
 
-    def __init__(self, qzd_crawler, aqc_crawler, companies: list):
+    def __init__(self, qzd_crawler, aqc_crawler, companies: list, pending=None):
         super().__init__()
         self.qzd = qzd_crawler
         self.aqc = aqc_crawler
         self.companies = companies
+        # 待采子集（由进度台账算出来）：奇偶分工仍按原始名单位置取，
+        # 否则续采时同一家公司会换平台（配额与登录态都不同）
+        self.pending = list(pending) if pending is not None else None
 
     def run(self):
         ok, msg = _dual.setup_dual(self.qzd, self.aqc, self.log_signal.emit)
@@ -3275,6 +3573,12 @@ class DualCrawlWorker(QThread):
         total = len(self.companies)
         done = {block_guard.norm_company(r.get("公司名"))
                 for r in self.qzd.snapshot_results() + self.aqc.snapshot_results()}
+        if self.pending is not None:
+            # 台账已把“采过的/确认查不到的”剔出待采集；这里只拿它做奇偶分组后的交集，
+            # 保证同一家永远归同一个平台且不重不漏
+            want = {block_guard.norm_company(n) for n in self.pending}
+            qzd_names = [n for n in qzd_names if block_guard.norm_company(n) in want]
+            aqc_names = [n for n in aqc_names if block_guard.norm_company(n) in want]
         qzd_todo = self._todo_list(qzd_names, done)
         aqc_todo = self._todo_list(aqc_names, done)
         mins = max(1, int(getattr(self.aqc, "block_wait_limit", 600)) // 60)

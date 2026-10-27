@@ -184,10 +184,14 @@ rows = [
      "微信号": "", "数据来源": "企知道", "备注": "备注内容", "外呼备注": "不该上传的列"},
     {"客户名称": long_name, "手机号": "1" * 130, "企业名称": "长名公司", "备注": "y" * 3000},
     {k: "" for k in Y.IMPORT_HEADERS},                     # 整行空白
-    {"客户名称": None, "企业名称": "只有企业名"},           # None 要当空串
+    {"客户名称": None, "企业名称": "只有企业名", "手机号": "13700000000"},   # None 要当空串
+    {"客户名称": "王某", "企业名称": "没联系方式的公司"},   # 手机/固话/邮箱全空 → 不入库
 ]
 p = os.path.join(TMP, "upload.xlsx")
-assert Y.write_import_workbook(rows, p) == 3, "空白行不该计入"
+skipped = []
+assert Y.write_import_workbook(rows, p, log=lambda m: skipped.append(m)) == 3, "空白行/无联系方式行不该计入"
+assert any("无任何联系方式" in m and "1 条" in m for m in skipped), \
+    f"上传防御剔掉的行数要在日志里报得出来：{skipped}"
 wb = openpyxl.load_workbook(p)
 ws = wb.active
 head = [c.value for c in ws[1]]
@@ -201,6 +205,8 @@ assert len(body[1][8]) == Y.FIELD_LIMITS["备注"]
 assert not any(isinstance(v, str) and v.strip() == "None" for v in body[2]), \
     f"None 要当空处理，不能写成字面量“None”：{body[2]}"
 assert body[2][1] == "只有企业名", body[2]
+assert all("没联系方式的公司" not in "".join(str(v or "") for v in r) for r in body), \
+    "没有任何联系方式的行不能被传进客户库"
 wb.close()
 assert Y.clamp_fields({"客户名称": None})["客户名称"] == ""
 # 清洗不再截断条数后，一条可能带十几个手机号：超接口上限只能整条少放，不能把号码切一半
