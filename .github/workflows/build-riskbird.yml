@@ -1,0 +1,69 @@
+name: Build RiskBirdTool EXE
+
+# 独立 workflow：只有风鸟工具自身的文件变化才触发打包，
+# 不再和 1688 工具捆在同一次运行里（原 build-windows.yml 双 job 的问题）。
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'riskbird_build/**'
+  workflow_dispatch:  # 允许在 Actions 页面手动只打包这个工具
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # 同一工具的新提交自动取消仍在排队的旧构建，避免排队干等
+    concurrency:
+      group: build-riskbird-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt5 selenium openpyxl pyinstaller requests websocket-client -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+    - name: Download chromedriver (Stable win64)
+      run: |
+        $ErrorActionPreference = 'Stop'   # 不设为 Stop 时 try/catch 接不住网络失败，重试形同虚设
+        for ($i = 1; $i -le 3; $i++) {
+          try {
+            $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+            $u = ($j.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
+            Invoke-WebRequest $u -OutFile cd.zip
+            Expand-Archive cd.zip -DestinationPath cd_tmp
+            Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe riskbird_build/chromedriver.exe
+            Write-Host "bundled chromedriver version: $($j.channels.Stable.version)"
+            exit 0
+          } catch {
+            Write-Host "第 $i 次下载失败: $_"
+            Start-Sleep -Seconds 10
+          }
+        }
+        Write-Error "chromedriver 下载连续 3 次失败"
+        exit 1
+
+    - name: Build EXE with PyInstaller
+      run: |
+        cd riskbird_build
+        python -m PyInstaller --noconfirm --onefile --windowed --name RiskBirdTool --add-data "chromedriver.exe;." --collect-all selenium --collect-all PyQt5 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import customer_library_cleaner --hidden-import dual_session --hidden-import block_guard --hidden-import chrome_driver --hidden-import crawl_checkpoint --hidden-import yzd_client --hidden-import task_registry riskbird_gui.py
+
+    - name: Copy startup batch file
+      run: |
+        copy riskbird_build\启动RiskBirdTool.bat riskbird_build\dist\启动RiskBirdTool.bat
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RiskBirdTool
+        path: |
+          riskbird_build/dist/RiskBirdTool.exe
+          riskbird_build/dist/启动RiskBirdTool.bat

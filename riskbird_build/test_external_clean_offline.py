@@ -173,6 +173,29 @@ jintian7 = next(r for r in rows7 if r["企业名称"] == "广州金田瑞麟净�
 assert jintian7["手机号"] == "13800138000" and jintian7["固话"] == "020-84445555", jintian7
 print("7 ✅ 电话多列合并 + 三空行剔除\n")
 
+# ── 8. 「状态」列装的全是「存续」：不能当联系人，客户名称不能写成状态 ──
+# 「存续」两三个字会被人名正则当成联系人，状态列就此抢下联系人字段，
+# 整列客户名称被写成「存续」（法定代表人反而丢了）。
+status_sheet = os.path.join(TMP, "带工商状态列的表.xlsx")
+_write_xlsx(status_sheet, [("Sheet1", [
+    ["序号", "公司名", "状态", "数据来源", "法定代表人", "电话", "邮箱", "地址"],
+    [1, "淄博铭丰塑业有限公司", "存续", "企知道", "于波", "0533-7402660；13365336660", "a@b.com", "山东省淄博市临淄区产业园9#101"],
+    [2, "诸暨市英能制冷配件厂", "存续", "企知道", "钱红锋", "15857520615", "", "诸暨市江藻镇银江村8号"],
+    [3, "佛山市南海区恒发家具厂", "注销", "爱企查", "李常正", "0757-88886666", "c@d.com", "佛山市南海区里水镇"],
+])])
+records8, report8 = C.clean_external_records([status_sheet], log=print)
+rows8 = C.build_external_rows(records8, log=print)
+ident8 = {kv.split("→")[0].strip("“”"): kv.split("→")[1] for kv in report8[0]["identified"]}
+print("8 列识别结果:", ident8)
+assert ident8.get("状态") == "状态", f"状态列要归回状态字段，不能被认成联系人：{ident8}"
+assert ident8.get("法定代表人") == "联系人", f"法定代表人才是联系人列：{ident8}"
+for r in rows8:
+    assert r["客户名称"] not in ("存续", "注销", "在业", "吊销"), f"客户名称写成状态值了：{r}"
+assert rows8[0]["客户名称"] == "于波", rows8[0]
+assert rows8[0]["手机号"] == "13365336660" and rows8[0]["固话"] == "0533-7402660", rows8[0]
+assert rows8[2]["客户名称"] == "李常正", f"人名里的「常正」不能被当成状态词：{rows8[2]}"
+print("8 ✅ 工商状态列不再冒充联系人\n")
+
 # 清洗结果能直接喂给云展 9 列上传文件构造（列名对得上）
 import yzd_client as Y
 

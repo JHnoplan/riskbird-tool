@@ -337,6 +337,12 @@ def make_row(fields: dict, sources: list, stats: dict = None) -> dict:
     contact = _clean_legal_rep(fields.get("联系人", ""))
     company = fields.get("公司名", "")
     position = normalize_text(fields.get("岗位", ""))
+    # 兜底：联系人/法定代表人取到工商状态值（状态列被误认成联系人列就是这样），
+    # 一律作废并退回公司名——客户名称写成「存续」是致命的，宁可没有联系人。
+    if _is_status(contact):
+        contact = ""
+    if _is_status(legal_rep):
+        legal_rep = ""
     # 客户名称优先用显式联系人；没有联系人但采到法定代表人时，岗位才补「法定代表人」
     return {
         "客户名称": contact or legal_rep or company,
@@ -562,6 +568,19 @@ _EXT_COMPANY_TAIL_RE = re.compile(
 _EXT_PERSON_RE = re.compile(r"^[\u4e00-\u9fa5·]{2,4}$|^[A-Za-z]{2,12}( [A-Za-z]{1,12}){0,3}$")
 _EXT_ADDRESS_RE = re.compile(r"(省|自治区|市|区|县|镇|乡|街道|路|街|巷|号|大道|工业园|科技园|开发区|村)")
 _EXT_URL_RE = re.compile(r"^(https?://|www\.)|\.(com|cn|net|org|com\.cn|cc)(/|$)", re.I)
+# 工商登记状态值。这类两三个字的词（存续/在业/注销/吊销未注销）会被人名正则当成
+# 「2 字联系人」，状态列就此抢下联系人字段、客户名称整列写成「存续」。
+_EXT_STATUS_WORDS = {
+    "存续", "在业", "在营", "开业", "在册", "正常", "有效", "歇业", "经营", "运营",
+    "注销", "已注销", "未注销", "吊销", "已吊销", "吊销未注销", "未注册", "撤销", "撤消",
+    "关停", "关闭", "停产", "停业", "清算", "迁移", "迁出", "迁入", "移出", "转入",
+    "待查", "其他", "上市", "未上市", "已上市",
+    "active", "existing", "operational", "cancelled", "canceled", "revoked", "dormant",
+}
+# 只由状态字组成的变体（在营/已吊销/未注销…）也认；不含「正」「常」等常见姓氏用字，
+# 免得「常正」这种真人名被判成状态后联系人被洗没。
+_EXT_STATUS_CHARS = set("存续在业开注销吊未已停歇清算迁移闭查效市营搁撤关")
+_EXT_STATUS_SPLIT_RE = re.compile(r"[、，,/|()（）\s;；]+")
 
 
 def _cell_text(value) -> str:
@@ -604,8 +623,23 @@ def _is_company(v: str) -> bool:
     return len(v) >= 8 and bool(_EXT_COMPANY_RE.search(v))
 
 
+def _is_status(v: str) -> bool:
+    """是否是工商状态值：存续 / 存续(在营、开业、在册) / 吊销未注销 / active。"""
+    parts = [p for p in _EXT_STATUS_SPLIT_RE.split(normalize_text(v)) if p]
+    if not parts or len(parts) > 4:
+        return False
+    for p in parts:
+        low = p.lower()
+        if low in _EXT_STATUS_WORDS:
+            continue
+        if 2 <= len(low) <= 6 and all(ch in _EXT_STATUS_CHARS for ch in low):
+            continue
+        return False
+    return True
+
+
 def _is_person(v: str) -> bool:
-    return bool(v) and bool(_EXT_PERSON_RE.match(v)) and not _is_company(v)
+    return bool(v) and bool(_EXT_PERSON_RE.match(v)) and not _is_company(v) and not _is_status(v)
 
 
 def _is_email(v: str) -> bool:
@@ -654,7 +688,11 @@ def content_score(field: str, values: list) -> float:
         return 100 * _ratio(values, _is_url)
     if field == "地址":
         return 100 * _ratio(values, _is_address)
-    # 岗位/微信号/状态/备注/数据来源靠内容猜不出来，只看表头
+    if field == "状态":
+        # 状态列的表头「状态」只是弱别名（39 分够不到 40 的录用线），全靠内容把它认领，
+        # 否则这一列会被「存续」像人名这点抢去当联系人。
+        return 100 * _ratio(values, _is_status)
+    # 岗位/微信号/备注/数据来源靠内容猜不出来，只看表头
     return 0.0
 
 
