@@ -380,12 +380,18 @@ class Ali1688Crawler:
     def _kill_stale_profile_chrome(self):
         """关掉仍占用本工具独立配置目录、却没暴露调试端口的残留 Chrome 进程。
         Chrome 按 user-data-dir 单实例：只要旧实例还锁着配置目录，新起的带端口进程
-        只会把请求转交给旧实例然后自己退出，调试端口永远起不来。"""
-        if sys.platform == "win32":
-            return
+        只会把请求转交给旧实例然后自己退出，调试端口永远起不来。
+        Windows 也须能清（PowerShell 按命令行匹配本工具配置目录），否则重启重试全落空。"""
         try:
-            out = subprocess.run(["pgrep", "-f", str(self._profile_dir)],
-                                 capture_output=True, text=True, timeout=5).stdout
+            if sys.platform == "win32":
+                ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                      "Where-Object { $_.CommandLine -like '*chrome_1688_profile*' } | "
+                      "Select-Object -ExpandProperty ProcessId")
+                out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                     capture_output=True, text=True, timeout=25).stdout
+            else:
+                out = subprocess.run(["pgrep", "-f", str(self._profile_dir)],
+                                     capture_output=True, text=True, timeout=5).stdout
             pids = [int(x) for x in out.split() if x.strip().isdigit()]
         except Exception:
             return
@@ -394,25 +400,61 @@ class Ali1688Crawler:
         self._log(f"清理 {len(pids)} 个占用配置目录的残留 Chrome 进程…")
         for pid in pids:
             try:
-                os.kill(pid, 15)          # SIGTERM：优雅退出，释放单实例锁
+                if sys.platform == "win32":
+                    # 不带 /F：优雅退出，释放单实例锁（强杀会留脏 session 文件）
+                    subprocess.run(["taskkill", "/PID", str(pid)],
+                                   capture_output=True, timeout=10)
+                else:
+                    os.kill(pid, 15)          # SIGTERM：优雅退出，释放单实例锁
             except Exception:
                 pass
         time.sleep(1.8)
+
+    # Selenium Manager 联网也连同一个调试端口，救不了「连不上 Chrome」类失败；
+    # 只有「驱动与浏览器版本不匹配」才值得让它在线拉配套驱动。
+    DRIVER_VERSION_MISMATCH_MARKS = ("only supports chrome version",
+                                     "version mismatch",
+                                     "unable to match browser version")
+
+    def _devtools_browser(self):
+        """读调试端口 /json/version 的 Browser 字段（如 Chrome/142.0.x），用于诊断日志。"""
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.debug_port}/json/version", timeout=2) as r:
+                return json.loads(r.read().decode("utf-8", "ignore")).get("Browser", "")
+        except Exception:
+            return ""
 
     def _attach(self):
         opts = Options()
         opts.debugger_address = f"127.0.0.1:{self.debug_port}"
         drv = self._driver_path()
-        if drv:
-            # 本地驱动版本和用户 Chrome 不匹配时（浏览器自动升级过），这里会抛错，
-            # 捕获后回退 Selenium Manager——它会联网拉一次配套驱动，之后可写进缓存。
+        if drv is None:
+            self._log("未检测到本地 chromedriver，改由 Selenium Manager 在线准备驱动"
+                      "（首次可能较慢，请耐心等待）…")
+            return webdriver.Chrome(options=opts)
+        browser = self._devtools_browser()
+        last_exc = None
+        for i in range(3):
             try:
                 return webdriver.Chrome(service=Service(executable_path=drv),
                                         options=opts)
             except Exception as e:
-                self._log(f"⚠ 本地驱动附加失败（{str(e).splitlines()[0][:100]}），"
-                          f"回退 Selenium Manager…")
-        return webdriver.Chrome(options=opts)
+                last_exc = e
+                msg = str(e).splitlines()[0][:140] if str(e) else e.__class__.__name__
+                low = msg.lower()
+                if any(k in low for k in self.DRIVER_VERSION_MISMATCH_MARKS):
+                    self._log(f"⚠ 内置驱动与你的 Chrome（{browser or '版本未知'}）不匹配，"
+                              f"改由 Selenium Manager 在线获取配套驱动（可能较慢，请等待）…")
+                    return webdriver.Chrome(options=opts)
+                time.sleep(1.5)          # 启动竞态：等 Chrome 完全就绪后重试
+                browser = self._devtools_browser() or browser
+        # 反复连不上：多半 Chrome 半死或残留实例没起端口，联网回退同样连不上还易卡死。
+        # 抛出交给 start_browser：清残留进程 → 重启 Chrome → 再附加。
+        self._log(f"⚠ 连续 3 次附加 Chrome 失败（端口 {self.debug_port}，"
+                  f"{browser or '无响应'}）：{last_exc.__class__.__name__}，"
+                  f"将清理残留 Chrome 后重启重试…")
+        raise last_exc
 
     def _chrome_args(self, headed=True):
         return [
@@ -483,6 +525,8 @@ class Ali1688Crawler:
                     self.driver = self._attach()
                 except Exception as e3:
                     self._log(f"❌ 连接 Chrome 失败：{str(e3).splitlines()[0][:200] if str(e3) else e3}")
+                    self._log("请手动关闭所有 Chrome 窗口后，再点一次「打开浏览器」；"
+                              "若仍失败，重启一次电脑可释放被占用的独立配置目录。")
                     self.driver = None
                     return False
             self._log("✅ 已连接 Chrome")
