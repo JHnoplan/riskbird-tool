@@ -2287,6 +2287,8 @@ class MainWindow(QMainWindow):
         self.open_web_btn.setEnabled(False)
         self.open_web_btn.setText("加载中...")
         QApplication.processEvents()
+        # 开始计时：“打开网页很慢”要能答出到底慢在哪一步（登录态副本/驱动/附加/首页导航）
+        self._open_started = time.monotonic()
         
         dual = self._dual_enabled()
         # 关闭其他爬虫的浏览器（避免 Chrome 配置目录锁定冲突）
@@ -2310,6 +2312,9 @@ class MainWindow(QMainWindow):
         """浏览器启动完成回调"""
         self.open_web_btn.setEnabled(True)
         self.open_web_btn.setText("打开网页")
+        spent = time.monotonic() - getattr(self, "_open_started", time.monotonic())
+        if spent >= 10:
+            self._append_log(f"⏱ 本次“打开网页”共用了 {spent:.1f} 秒（超过 10 秒才会写这一行）")
         
         if success:
             if self._dual_running or (self._dual_enabled() and getattr(self, "_open_thread", None)

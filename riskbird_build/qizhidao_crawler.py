@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import block_guard
+import chrome_driver
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -432,15 +433,9 @@ class QiZhiDaoCrawler:
                 opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{attach_port}")
                 # 注意：附加模式（debuggerAddress）下 chromedriver 不接受 excludeSwitches /
                 # useAutomationExtension，带上会报 "unrecognized chrome option"
-                if sys.platform == "darwin":
-                    chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
-                else:
-                    chromedriver_path = Path(__file__).parent / "chromedriver-win64" / "chromedriver.exe"
-                if chromedriver_path.exists():
-                    self.driver = webdriver.Chrome(
-                        service=Service(executable_path=str(chromedriver_path)), options=opts)
-                else:
-                    self.driver = webdriver.Chrome(options=opts)
+                # 驱动必须先用本地的：打包版里项目内路径永远不存在，直接建会话会退给
+                # Selenium Manager 联网查版本，界面就变成“Chrome 开了但页面半天不出”
+                self.driver = chrome_driver.create(opts, self._log, ports=[attach_port])
                 self.driver.switch_to.new_window("window")
                 self._own_handle = self.driver.current_window_handle
                 self.driver.execute_cdp_cmd(
@@ -497,17 +492,8 @@ class QiZhiDaoCrawler:
                     opts.add_argument("--profile-directory=Default")
                     self._log("使用 Chrome 配置（登录态）")
 
-            # 使用本地 ChromeDriver（优先项目内，否则用系统 PATH）
-            if sys.platform == "darwin":
-                chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
-            else:
-                chromedriver_path = Path(__file__).parent / "chromedriver-win64" / "chromedriver.exe"
-            
-            if chromedriver_path.exists():
-                service = Service(executable_path=str(chromedriver_path))
-                self.driver = webdriver.Chrome(service=service, options=opts)
-            else:
-                self.driver = webdriver.Chrome(options=opts)
+            # 使用本地 ChromeDriver（避免每次联网向 Selenium Manager 查版本）
+            self.driver = chrome_driver.create(opts, self._log)
 
             self.driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",

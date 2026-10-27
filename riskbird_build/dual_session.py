@@ -70,14 +70,18 @@ def prepare_shared_profile(log) -> Path:
         return alt
     real = _real_profile_dir()
     if os.path.exists(real):
-        log("首次使用双标签：正在准备 Chrome 登录态副本（跳过缓存，约十几秒）…")
+        log("首次使用双标签：正在复制 Chrome 登录态（跳过缓存目录，只此一次）…")
         if profile.exists():
             shutil.rmtree(str(profile), ignore_errors=True)
+        t0 = time.monotonic()
         try:
             shutil.copytree(real, str(profile),
                             ignore=shutil.ignore_patterns(*_SKIP_PATTERNS), dirs_exist_ok=True)
+            # 这一步是“每次打开都要等很久”里最慢的一环（用户 Chrome 配置可能几个 G），
+            # 打出秒数就能分清是复制慢还是驱动慢
+            log(f"登录态副本已就绪，用时 {time.monotonic() - t0:.1f} 秒")
         except Exception as e:
-            log(f"⚠ 复制 Chrome 配置失败：{e}")
+            log(f"⚠ 复制 Chrome 配置失败（用时 {time.monotonic() - t0:.1f} 秒）：{e}")
     return profile if profile.exists() else alt
 
 
@@ -363,9 +367,15 @@ def attach_aiqicha(crawler, log, port: int = DUAL_PORT) -> bool:
 
 
 def setup_dual(qzd_crawler, aqc_crawler, log, port: int = DUAL_PORT):
-    """开启双标签：启动共享浏览器 + 两个会话各自附加。返回 (是否成功, 提示信息)"""
+    """开启双标签：启动共享浏览器 + 两个会话各自附加。返回 (是否成功, 提示信息)
+
+    每一步都打秒数：“打开网页很慢”可能是复制登录态慢、共享 Chrome 起得慢、
+    chromedriver 联网解析慢或首页导航慢，没读数的话只能靠猜。
+    """
+    t_all = t = time.monotonic()
     if not ensure_shared_chrome(log, port):
         return False, "共享浏览器启动失败"
+    t = _stage(log, "启动/复用共享浏览器", t)
     # 上一轮可能把窗口全关完了（进程还在但 0 窗口），先补一个，否则下面附加必挂
     if not list_page_targets(port):
         if not open_window(port):
@@ -376,12 +386,24 @@ def setup_dual(qzd_crawler, aqc_crawler, log, port: int = DUAL_PORT):
     cleanup_blank_tabs(log, keep_ids=_session_tab_ids(qzd_crawler, aqc_crawler), port=port)
     if not attach_qizhidao(qzd_crawler, log, port):
         return False, "企知道会话附加失败"
+    t = _stage(log, "企知道会话附加", t)
     if not attach_aiqicha(aqc_crawler, log, port):
         return False, "爱企查会话附加失败"
+    t = _stage(log, "爱企查会话附加", t)
     # Chrome 自己启动时可能带一个 chrome://newtab 空窗口，附加前那次清理为了保底窗口
     # 没法关它；现在两个会话都落到真实页面上了，再洗一次把这种空窗口收掉
     cleanup_blank_tabs(log, keep_ids=_session_tab_ids(qzd_crawler, aqc_crawler), port=port)
+    _stage(log, "双标签就绪总计", t_all)
     return True, "双标签已就绪"
+
+
+def _stage(log, name: str, t0: float) -> float:
+    """打一段耗时。太快（<3 秒）的不写，并且不重设起点：让时间累积到真正慢的那一步"""
+    now = time.monotonic()
+    if now - t0 >= 3:
+        log(f"⏱ {name}：{now - t0:.1f} 秒")
+        return now
+    return t0
 
 
 def release_dual(qzd_crawler, aqc_crawler, log, port: int = DUAL_PORT):

@@ -144,6 +144,7 @@ def build_exe():
         "--hidden-import", "customer_library_cleaner",
         "--hidden-import", "dual_session",
         "--hidden-import", "block_guard",
+        "--hidden-import", "chrome_driver",
         "--hidden-import", "crawl_checkpoint",
         "--hidden-import", "requests",
         "--hidden-import", "websocket",
@@ -151,6 +152,16 @@ def build_exe():
         "--collect-all", "PyQt5",
         "riskbird_gui.py"
     ]
+
+    # 随包带上 chromedriver：exe 里找不到项目内路径就会每次联网向 Selenium Manager
+    # 查驱动版本（表现为“Chrome 开了但页面半天不出”），有本地驱动就不走这一步
+    for driver_name in ("chromedriver.exe", "chromedriver"):
+        if os.path.exists(driver_name):
+            cmd[3:3] = ["--add-data", f"{driver_name};."]   # 插在 "python -m PyInstaller" 之后
+            info(f"将打包本地驱动：{driver_name}")
+            break
+    else:
+        warn("未找到本地 chromedriver，exe 里将回退 Selenium Manager（首次打开网页会慢）")
 
     print("  正在打包，请稍候...")
     result = subprocess.run(cmd, capture_output=True, text=True)

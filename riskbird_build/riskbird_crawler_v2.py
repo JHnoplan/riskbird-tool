@@ -31,6 +31,7 @@ except ImportError:
     HAS_PYQT = False
 
 import block_guard
+import chrome_driver
 
 
 # ── Qt 信号类 ──
@@ -445,18 +446,8 @@ class RiskBirdCrawlerV2:
                     opts.add_argument("--profile-directory=Default")
                     self._log("使用 Chrome 配置（登录态）")
 
-            # 使用本地 ChromeDriver（避免版本不匹配）
-            from selenium.webdriver.chrome.service import Service
-            if sys.platform == "darwin":
-                chromedriver_path = Path(__file__).parent / "chromedriver-mac-x64" / "chromedriver"
-            else:
-                chromedriver_path = Path(__file__).parent / "chromedriver-win64" / "chromedriver.exe"
-            
-            if chromedriver_path.exists():
-                service = Service(executable_path=str(chromedriver_path))
-                self.driver = webdriver.Chrome(service=service, options=opts)
-            else:
-                self.driver = webdriver.Chrome(options=opts)
+            # 使用本地 ChromeDriver（避免版本不匹配，更避免每次联网向 Selenium Manager 查版本）
+            self.driver = chrome_driver.create(opts, self._log)
             
             self.driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
