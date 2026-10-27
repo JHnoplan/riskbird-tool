@@ -49,7 +49,7 @@ BLOCK_BODY_MARKERS = ("请关闭浏览器的调试窗口", "访问过于频繁",
 SHORT_BODY_LIMIT = 600
 
 
-def _match(url: str, title: str, body_len: int, body_head: str):
+def _match(url: str, title: str, body_len: int, body_head: str, extra_markers=None):
     url = (url or "").lower()
     if any(m in url for m in BLOCK_URL_MARKERS):
         return "页面被跳转到安全验证页（百度验证）"
@@ -57,7 +57,8 @@ def _match(url: str, title: str, body_len: int, body_head: str):
     if any(m in title for m in BLOCK_TITLE_MARKERS):
         return f"当前页面是验证页：{title[:24]}"
     head = body_head or ""
-    if body_len is not None and body_len < SHORT_BODY_LIMIT and any(m in head for m in BLOCK_BODY_MARKERS):
+    markers = tuple(BLOCK_BODY_MARKERS) + tuple(extra_markers or ())
+    if body_len is not None and body_len < SHORT_BODY_LIMIT and any(m in head for m in markers):
         return "页面被平台风控拦截（提示关闭调试窗口/访问频繁）"
     return ""
 
@@ -83,8 +84,12 @@ def detect_selenium(driver):
     return _match(url, title, len(text), text[:200])
 
 
-def detect_cdp(execute_js):
-    """CDP 会话：execute_js 传本爬虫的 JS 执行方法，只看 URL/标题/正文长度"""
+def detect_cdp(execute_js, extra_markers=None):
+    """CDP 会话：execute_js 传本爬虫的 JS 执行方法，只看 URL/标题/正文长度
+
+    extra_markers: 按页面上下文追加的插页文案。只有「正文极短」时才参与判断，
+    沿用既有的防误伤约束（企业站正常页面里本来就写着“安全验证”之类的表单文案）。
+    """
     state = execute_js(
         "(function(){var b=document.body?(document.body.innerText||''):'';"
         "return JSON.stringify({u:location.href,t:document.title,l:b.length,h:b.slice(0,200)});})()"
@@ -96,7 +101,7 @@ def detect_cdp(execute_js):
     except Exception:
         return ""
     return _match(str(info.get("u") or ""), str(info.get("t") or ""),
-                  info.get("l"), str(info.get("h") or ""))
+                  info.get("l"), str(info.get("h") or ""), extra_markers)
 
 
 def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
@@ -114,6 +119,8 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
     heal:           返回 bool 的自愈回调（如把会话切到已经验证通过的标签页 /
                     重刷当前标签）。验证页挂在别的标签时，本会话标签会一直被判
                     拦截而死等到超时，所以每隔 heal_every 秒主动试一次。
+                    探针失败（页面签名正常但拿不到数据）时也照样试：过完验证码
+                    最常见的是本标签停在验证回跳页/组件已死，不重刷就一直拿不到数据。
     """
     if emit_blocked:
         try:
@@ -140,7 +147,8 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
             log("⏹ 用户在等待验证期间停止采集")
             return False
         still = probe()
-        if still and heal and waited >= heal_every:
+        need_heal = bool(heal) and waited >= heal_every
+        if still and need_heal:
             try:
                 fixed = bool(heal())
             except Exception:
@@ -159,6 +167,15 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
             if works:
                 log(f"✅ 平台已恢复，能正常拿到数据（等待约 {waited} 秒），继续采集")
                 return True
+            if need_heal:
+                # 验证页没了但探针还是拿不到数据：把标签重刷回可用状态再试，
+                # 而不是只当“还在限流”干等到超时
+                try:
+                    healed = bool(heal())
+                except Exception:
+                    healed = False
+                if healed:
+                    log("   页面正常但还拿不到数据，已重刷标签重新检查…")
             if not said_throttle:
                 log("   验证页已经没了，但平台仍然不给数据（这是限流不是验证），继续退避等待…")
                 said_throttle = True

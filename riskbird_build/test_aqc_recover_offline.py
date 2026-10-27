@@ -1,4 +1,5 @@
-"""离线验证「爱企查过了验证码却采不动」这条链路的修复。
+"""
+离线验证「爱企查过了验证码却采不动」这条链路的修复。
 
 覆盖（都不启动浏览器，JS 与标签页都用假模型顶掉）：
 1. 限流不空转：验证页消失 ≠ 恢复，必须能力探针实测能拿到数据才放行；
@@ -8,11 +9,15 @@
 5. 拿不到结果又判不准时记「拦截未解除」：名单不推进、不写空记录；
 6. 结果页被弹去登录页时走登录闸门，而不是把这家烧成「未找到」；
 7. 结果条目按公司名挑，名字对不上时用第一条并留可核对日志；
-8. 界面区分「要人去验证」与「平台限流自动退避」两种提示。
+8. 界面区分「要人去验证」与「平台限流自动退避」两种提示；
+9-13. 过码后“手工能搜、工具抽不到”的真正死点：同一个死页被反复重抽而不重走一次；
+     退避重试必须每次都是独立查询、不再密集刷、不拿同一页刷上千条日志，
+     并把现场存成证据文件；刚过码要先降速。
 """
 import json
 import os
 import re
+import tempfile
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -82,8 +87,16 @@ class Browser:
             return json.dumps({"u": p.url, "t": p.title, "l": p.length, "h": p.head})
         if "JSON.stringify({v:" in expr:               # 联想是否被抑制
             return json.dumps({"v": p.input, "n": len(p.suggest)})
-        if "return document.body ?" in expr:           # 反爬文案检查
+        if "return document.body ?" in expr:            # 反爬文案检查
             return p.head
+        if "innerText||'').length:0" in expr:          # 页面是否已渲染（要不要省掉一次导航）
+            return p.length
+        if "window.__aqcObs || []" in expr:            # 读回接口观测记录
+            return json.dumps([{"m": "GET", "u": "/website/search/suggest?kw=x", "s": 200}])
+        if "documentElement.outerHTML" in expr:        # 结果页证据快照
+            return json.dumps({"u": p.url, "t": p.title, "len": p.length, "links": p.anchors,
+                               "company_detail": 0, "iframes": 0, "body": p.head,
+                               "tops": ["/s? x3"], "html": "<html>快照</html>"})
         if "nativeInputValueSetter.call" in expr:
             m = re.search(r"nativeInputValueSetter\.call\(input, '([^']*)'", expr)
             if m:
@@ -226,7 +239,7 @@ assert any("确认查无此公司" in m for m in c.logs), c.logs
 b = Browser(Page(HOME, suggest=[], info=0, input=NAME))
 c = make_crawler(b)
 stuck = Page(HOME + "s?q=x", links=[], length=200)
-b.queue = [stuck] * 40
+b.queue = [stuck] * 300
 r = c.search_company(NAME)
 assert r["状态"] == "拦截未解除", f"拿不准时必须停下来而不是烧名单：{r['状态']}"
 assert any("平台限流中" in m for m in c.logs), c.logs[-8:]
@@ -235,7 +248,7 @@ assert any("平台限流中" in m for m in c.logs), c.logs[-8:]
 b = Browser(Page(HOME, suggest=[], info=0, input=NAME))
 c = make_crawler(b)
 mystery = Page(HOME + "s?q=x", links=[], length=9000, anchors=80, none=0)
-b.queue = [mystery] * 40
+b.queue = [mystery] * 300
 r = c.search_company(NAME)
 assert r["状态"] == "拦截未解除", f"认不出页面结构时绝不能定未找到：{r['状态']}"
 assert any("认不出结果条目" in m for m in c.logs), c.logs[-8:]
@@ -313,6 +326,83 @@ assert t2 == "需要人工验证" and "手动完成验证" in b2txt, (t2, b2txt)
 w._clear_blocked_state()
 assert w._blocked_info == [] and w.blocked_lbl.isHidden()
 print("⑧ 界面区分「要人工验证」与「平台限流自动退避」 ✓")
+
+# ── 9. 地址对但页面是死的：不能当成“已经在结果页”而省掉导航 ──
+# 这是原来最大的死点：_goto_search_page 只比地址，于是一口气在同一个旧 DOM 上
+# 重抽十几轮，看着在退避重试，其实一个请求都没再发出去
+b = Browser(Page(HOME + "s?q=" + NAME, links=[], length=120))
+c = make_crawler(b)
+assert c._goto_search_page("WS1", NAME) is True
+assert len(b.navs) == 1, f"死页必须重新导航：{b.navs}"
+
+b = Browser(Page(HOME + "s?q=" + NAME, links=[["777", NAME]], length=9000))
+c = make_crawler(b)
+assert c._goto_search_page("WS1", NAME) is True
+assert b.navs == [], f"页面已经渲染好就不该多余重刷：{b.navs}"
+print("⑨ 死页不复用：每次重试都是一次真查询，渲染好的页不重刷 ✓")
+
+# ── 10. 认不出条目：日志不刷屏，但每次探针都要重走一次查询 ──
+b = Browser(Page(HOME, suggest=[], input=NAME))
+c = make_crawler(b)
+mystery = Page(HOME + "s?q=x", links=[], length=9000, anchors=80, none=0)
+b.queue = [mystery] * 300
+out = c._detail_via_search("WS1", NAME)
+assert out[0] == "stop", f"始终判不准时不能烧名单：{out}"
+probes = [n for n in b.navs if "/s?" in n]
+assert len(probes) >= 8, f"退避期间每次探针都该重新发起查询：{len(probes)}"
+warns = [m for m in c.logs if "认不出结果条目" in m]
+assert len(warns) <= 2, f"同一个死页不该刷出上千条同样的日志：{len(warns)}"
+assert A.REPROBE_INTERVAL >= 30, "探针间隔不能回到秒级密集刷"
+print("⑩ 退避重试：每次都是独立查询，同一条告警从近千行缩到 2 行 ✓")
+
+# ── 11. 现场证据落盘：一次只存一份，文件里能看清页面与接口 ──
+tmpd = os.path.join(tempfile.mkdtemp(), "会话目录")
+b = Browser(Page(HOME, suggest=[], input=NAME))
+c = make_crawler(b)
+c.diag_dir = tmpd
+b.queue = [Page(HOME + "s?q=x", links=[], length=9000, anchors=80,
+                head="搜索结果 没有相关公司")] * 300
+c._detail_via_search("WS1", NAME)
+files = [f for f in os.listdir(tmpd) if f.startswith("爱企查_结果页证据")]
+assert len(files) == 1, f"应存下一份现场证据：{files}"
+txt = open(os.path.join(tmpd, files[0]), encoding="utf-8").read()
+assert "公司名：" + NAME in txt, txt[:200]
+assert "company_detail 链接：0" in txt, txt[:400]
+assert "/website/search/suggest?kw=x → 200" in txt, "要把接口请求一并落盘才能分清组件坏了还是限流"
+assert "【正文前 6000 字】" in txt and "【页面 HTML" in txt
+assert any("已存下当时的搜索结果页证据" in m for m in c.logs), c.logs[-6:]
+c._unknown_streak = 0
+c._detail_via_search("WS1", NAME)
+assert len([f for f in os.listdir(tmpd) if f.startswith("爱企查_结果页证据")]) == 1, "一次运行只存一份"
+print("⑪ 现场证据：页面概况+接口请求+HTML 落会话目录，只存一份 ✓")
+
+# ── 12. 刚过完验证码要先降速，不能按原速立刻再撞一次 ──
+b = Browser(Page("https://wappass.baidu.com/static/captcha/tuxing_v2.html",
+                 title="百度安全验证", length=120, head="请完成下方验证"))
+c = make_crawler(b)
+b.queue = [Page(HOME, length=9000)]           # 用户过了码，本标签回到正常首页
+assert c._wait_unblock("页面被跳转到安全验证页（百度验证）",
+                       max_wait=90, interval=1) is True
+assert c._cooldown_until > time.time(), "过码后必须先进入降速窗口"
+assert int(c._cooldown_until - time.time()) <= A.COOLDOWN_AFTER_BLOCK
+cool = []
+c.search_company = lambda nm: {"公司名": nm, "状态": "成功", "法定代表人": "李四",
+                               "注册资本": "100万", "地址": "某路1号"}
+c._cooldown_wait = lambda: cool.append(1)
+c._detect_block = lambda ws=None: ""
+c.crawl(["甲公司", "乙公司"], 0)
+assert cool == [1, 1], f"每家开工前都要过一道降速门（没被拦时它自己会立即返回）：{cool}"
+print("⑫ 过码后降速：每家开工前过一道门，不再恢复原速马上再弹验证 ✓")
+
+# ── 13. 百度插页：“没弹验证页”不代表正常 ──
+b = Browser(Page(HOME + "acount/accessrestriction", length=134,
+                 head="当前暂时无法访问 根据相关法律法规，暂不支持访问"))
+c = make_crawler(b)
+why = c._detect_block("WS1")
+assert "风控拦截" in why, f"正文极短且写着“无法访问”的插页要判成拦截：{why}"
+b.page.length = 20000                          # 同样的字样出现在正常长页面里（表单文案）
+assert not c._detect_block("WS1"), "正常页面不能因为文案里带这些字就被误判拦截"
+print("⑬ 插页识别：短页文案能判拦截，长页同字样不误伤 ✓")
 
 time.sleep = real_sleep
 print("AQC_RECOVER_OFFLINE_OK")

@@ -2389,6 +2389,12 @@ class MainWindow(QMainWindow):
             return
         # 首次开始采集时创建桌面会话文件夹（以第一次开始采集的时间命名）
         folder = self._get_or_create_session_folder()
+        # 爱企查“认不出结果条目”时把页面实况存到会话目录：改版和平台静默拒绝
+        # 在日志里长得一样，处置却完全相反，没现场文件就只能靠猜
+        try:
+            self.aiqicha_crawler.diag_dir = str(folder)
+        except Exception:
+            pass
         self._register_task(folder)
         self._ensure_checkpoint(folder)
         self._last_autosave_bucket = self._get_global_index() // 10

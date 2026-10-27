@@ -55,6 +55,19 @@ SEARCH_PAGE_READY_LEN = 1200
 SEARCH_PAGE_NONE_POLLS = 4
 # 夜间挂机无人值守：拦截持续超过这个秒数就放弃爱企查、把剩余名单移交企知道
 BLOCK_WAIT_LIMIT = 600
+# 退避期间重新发起一次独立查询的间隔（秒）。原来每 15 秒刷一轮，一轮里又按
+# 0.7 秒抽十几次同一个页面：十分钟近千条日志、几百次抽取，用户看不出重点，
+# 平台只看到我们在刷，限流更难解除
+REPROBE_INTERVAL = 45
+# 连续抽不出结果条目到这个次数，就把页面实况存成证据文件（区分“改版”与“平台静默拒绝”）
+SEARCH_PAGE_UNKNOWN_LIMIT = 6
+# 算“页面已经渲染过”的正文下限：死页/验证回跳页的地址栏也停在 /s?q= 上，
+# 拿它当“已经在这一页”会省掉一次导航，于是同一个旧 DOM 重抽十几轮都拿不到数据
+SEARCH_PAGE_MIN_BODY = 300
+# 刚被拦过之后本路的降速秒数：过码后立刻恢复原速，往往三五分钟又弹一次验证
+COOLDOWN_AFTER_BLOCK = 90
+# 按页面上下文追加的拦截插页文案（只在正文极短时参与判断，沿用 block_guard 的防误伤约束）
+PAGE_INTERSTITIAL_MARKERS = ("当前暂时无法访问", "暂不支持访问", "环境异常", "accessrestriction")
 
 
 class AiQiChaCrawlerV2:
@@ -109,6 +122,12 @@ class AiQiChaCrawlerV2:
         self._login_gate_obj = None
         self._shell_streak = 0
         self._shell_gate_passed = False
+
+        # 会话取证与降速状态：diag_dir 由界面设为本次采集的会话目录
+        self.diag_dir = None
+        self._unknown_streak = 0        # 连续抽不出结果条目的次数
+        self._evidence_dumped = False   # 一次运行只存一份证据，别堆文件
+        self._cooldown_until = 0.0      # 被拦过之后的降速截止时刻
     
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -141,13 +160,21 @@ class AiQiChaCrawlerV2:
             except Exception:
                 pass
 
-    def _detect_block(self, ws_url=None):
-        """只看本会话自己那个标签，当前页面是不是验证页/风控插页"""
+    def _detect_block(self, ws_url=None, extra_markers=None):
+        """只看本会话自己那个标签，当前页面是不是验证页/风控插页
+
+        extra_markers 默认带上爱企查自己的插页文案：这些页面地址栏仍是百度域名内
+        的正常路径、标题也常是空的，只看 URL/标题会整页漏判（实测“当前暂时无法访问”
+        插页正文只有 134 字），而正文长度上限已经把正常页面挡在外面。
+        """
         ws = ws_url or (self._get_ws_url() if self.pin_tab_id else None)
         if not ws:
             return ""
         try:
-            return block_guard.detect_cdp(lambda e: self._execute_js(ws, e))
+            return block_guard.detect_cdp(
+                lambda e: self._execute_js(ws, e),
+                extra_markers=PAGE_INTERSTITIAL_MARKERS
+                if extra_markers is None else extra_markers)
         except Exception:
             return ""
 
@@ -689,6 +716,10 @@ class AiQiChaCrawlerV2:
         )
         if ok:
             self._emit_cleared(reason)
+            # 拦刚解除时平台是“盯得最紧”的，马上按原速接着跑几乎一定会再弹一次
+            # 验证（实测就是三五分钟一轮），所以这里强制降速一段
+            self._cooldown_until = time.time() + COOLDOWN_AFTER_BLOCK
+            self._unknown_streak = 0
         return ok
 
     def _wait_unblock_limited(self, reason: str, **kw) -> bool:
@@ -774,7 +805,44 @@ class AiQiChaCrawlerV2:
             self._navigate_to_homepage(ws)
             time.sleep(4)
             return True
+        # ③ 地址在爱企查里、验证页也没了，但页面其实是个死页（组件没挂载/停在验证回跳页）：
+        #    这正是“手工搜能进详情、脚本却什么都抽不到”的样子，整页重刷一次才能拿到新 DOM
+        if not self._page_hydrated(ws):
+            self._log("  页面已不可用（组件未挂载/停在验证回跳页），整页重刷…")
+            self._soft_reset_tab(ws)
+            return True
         return False
+
+    def _soft_reset_tab(self, ws_url) -> bool:
+        """把本标签洗回“刚进首页”的干净状态，并保证真的发生了一次重新加载
+
+        两个地方必须有：① 过完验证码后手工搜同一家能进详情、工具不行；② 退避重试
+        时 `_goto_search_page` 发现地址栏已经是这一家的 /s?q= 就直接返回 True 不再导航，
+        于是一口气在同一个死页面上重抽十几轮，抽到的还是那份旧 DOM。
+        正在过验证时不做（不然会把用户正在点的验证码刷掉）。
+        """
+        if self._detect_block(ws_url):
+            return False
+        try:
+            self._execute_js(ws_url, "(function(){location.reload();})()")
+            time.sleep(3)
+            self._wait_page_hydrated(ws_url, 15)
+            self._ensure_request_observer(ws_url)   # 重刷会把观测器一起刷掉，装回来
+            return True
+        except Exception:
+            return False
+
+    def _cooldown_wait(self):
+        """被拦过之后的降速：不给平台“刚恢复又被密集请求”的理由，停止要能立即打断"""
+        left = int(self._cooldown_until - time.time())
+        if left <= 0:
+            return
+        self._log(f"  ☕ 刚被平台拦过，先降速 {left} 秒再继续（免得马上又弹验证）")
+        end = time.time() + left
+        while time.time() < end:
+            if self._stop_requested:
+                return
+            time.sleep(1)
 
     # ── 搜索结果页（联想挂了时的兜底路线，与手工搜公司名同一条路） ──
     @staticmethod
@@ -800,15 +868,26 @@ class AiQiChaCrawlerV2:
                 break
         return ""
 
+    def _search_page_rendered(self, ws_url) -> bool:
+        """本标签是不是一个已经渲染出内容的页面（用来决定要不要省掉一次导航）"""
+        try:
+            n = self._execute_js(ws_url,
+                                 "(function(){return document.body?(document.body.innerText||'').length:0;})()")
+            return int(n or 0) >= SEARCH_PAGE_MIN_BODY
+        except Exception:
+            return False
+
     def _goto_search_page(self, ws_url, name: str, reload: bool = False) -> bool:
         """把本标签导航到这家公司的搜索结果页，并等到地址栏真的落在 /s? 上
 
         reload=True 时无论是否已在本页都重新加载（用来做“第二次独立查询”的确认）。
         不等导航落地就读页面会读到上一个页面（首页/详情页），把状态判错。
+        同一家公司“已经在本页”也不能直接复用：页面可能是个死页，此时必须重走一次。
         """
         url = self.SEARCH_URL.format(quote(name))
         cur = self._current_url(ws_url)
-        if not reload and "/s?" in cur and self._norm_name(name) in self._norm_name(unquote(cur)):
+        if not reload and "/s?" in cur and self._norm_name(name) in self._norm_name(unquote(cur)) \
+                and self._search_page_rendered(ws_url):
             return True
         self._execute_js(ws_url, "(function(){window.location.href=%s;})()" % json.dumps(url))
         for _ in range(20):        # 最多等 10 秒：被弹去登录页也算落地
@@ -819,7 +898,7 @@ class AiQiChaCrawlerV2:
         return False
 
     def _read_search_page(self, ws_url, name: str, wait: float = 10.0,
-                         reload: bool = False) -> dict:
+                         reload: bool = False, quiet: bool = False) -> dict:
         """读当前标签的搜索结果页，判断这次查询到底给了什么。
 
         返回 {"state": ..., "pid": "", "text": ""}
@@ -899,6 +978,7 @@ class AiQiChaCrawlerV2:
             if "/login" in url:
                 return {"state": "login", "pid": "", "text": ""}
             if cands:
+                self._unknown_streak = 0
                 pid, text, exact = self._pick_pid(name, cands)
                 if not exact:
                     self._log(f"  ⚠ 结果页没找到名字完全对得上的公司，用第一条：{text[:30]}")
@@ -913,12 +993,138 @@ class AiQiChaCrawlerV2:
             elif rendered and int(info.get("t") or 0) >= 20:
                 # 页面上有二十多个链接却一个公司结果都抽不到：是我们不认这个页面，
                 # 不是平台查无——绝不能拿它写未找到
-                self._log("  ⚠ 搜索结果页认不出结果条目（可能改版），先按限流退避而不是写未找到")
+                self._unknown_streak += 1
+                if not quiet and self._unknown_streak <= 2:
+                    # 同一个死页按 0.7 秒一轮刷十分钟会堆出近千条同样的日志，
+                    # 只报头两次，剩下的靠证据文件说话
+                    self._log("  ⚠ 搜索结果页认不出结果条目（改版或平台静默拒绝），"
+                              "先按限流退避而不是写未找到")
+                if self._unknown_streak >= SEARCH_PAGE_UNKNOWN_LIMIT:
+                    self._dump_search_page_evidence(ws_url, name, info)
                 last = {"state": "pending", "pid": "", "text": ""}
             else:
                 empty_polls = 0
             time.sleep(0.7)
         return last
+
+    def _ensure_request_observer(self, ws_url):
+        """在本标签装一个只记录不干预的请求观测（每个页面装一次）
+
+        拿不到数据时，“联想接口压根没发请求”与“请求发了但平台回了空”是完全不同的问题，
+        前者是页面/组件坏了（重刷就好），后者是限流（只能等）。光看 DOM 分不出来，
+        这里把本标签发过的接口地址与状态码留若干条，随证据一起落盘。
+        """
+        try:
+            self._execute_js(ws_url, """
+                (function() {
+                    if (window.__aqcObs) return 'already';
+                    window.__aqcObs = [];
+                    var push = function(m, u, s) {
+                        try {
+                            window.__aqcObs.push({m: m, u: String(u || '').slice(0, 200), s: s, t: Date.now()});
+                            if (window.__aqcObs.length > 14) window.__aqcObs.shift();
+                        } catch (e) {}
+                    };
+                    var O = window.XMLHttpRequest;
+                    if (O) {
+                        var oo = O.prototype.open, os = O.prototype.send;
+                        O.prototype.open = function(m, u) { this.__m = m; this.__u = u; return oo.apply(this, arguments); };
+                        O.prototype.send = function() {
+                            var self = this;
+                            this.addEventListener('loadend', function () { push(self.__m, self.__u, self.status); });
+                            return os.apply(this, arguments);
+                        };
+                    }
+                    if (window.fetch) {
+                        var of = window.fetch;
+                        window.fetch = function(input, init) {
+                            var u = (input && input.url) || input;
+                            var m = (init && init.method) || 'GET';
+                            return of.apply(this, arguments).then(function (r) { push(m, u, r && r.status); return r; },
+                                function (e) { push(m, u, -1); throw e; });
+                        };
+                    }
+                    return 'on';
+                })()
+            """)
+        except Exception:
+            pass
+
+    def _observed_requests(self, ws_url) -> list:
+        """读回本标签发过的接口请求（观测器没装上也只是空列表，不影响采集）"""
+        try:
+            raw = self._execute_js(ws_url,
+                                   "(function(){return JSON.stringify(window.__aqcObs || []);})()")
+            data = json.loads(raw or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _dump_search_page_evidence(self, ws_url, name: str, info: dict):
+        """把“认不出结果条目”当时的页面实况存进会话目录，一次运行只存一份
+
+        这种状态只有两种可能：平台改版（我们的选择器要跟着改）或静默拒绝（限流，
+        页面正常但不给数据）。两者的处置完全不一样，而从日志上分不出来，
+        所以这里落一份能直接看的现场：没证据时只能靠猜，有证据就能一次改对。
+        """
+        if self._evidence_dumped:
+            return
+        self._evidence_dumped = True
+        base = Path(self.diag_dir) if self.diag_dir else self._data_dir
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = base / f"爱企查_结果页证据_{stamp}.txt"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            snap = self._execute_js(ws_url, """
+                (function() {
+                    var b = document.body ? (document.body.innerText || '') : '';
+                    var as = document.querySelectorAll('a');
+                    var pref = {}, cd = 0;
+                    for (var i = 0; i < as.length; i++) {
+                        var h = (as[i].getAttribute('href') || '').slice(0, 40);
+                        pref[h] = (pref[h] || 0) + 1;
+                        if (h.indexOf('company_detail') >= 0) cd++;
+                    }
+                    var tops = Object.keys(pref).sort(function (x, y) { return pref[y] - pref[x]; })
+                        .slice(0, 15).map(function (k) { return k + ' ×' + pref[k]; });
+                    return JSON.stringify({
+                        u: location.href, t: document.title, len: b.length, links: as.length,
+                        company_detail: cd, iframes: document.querySelectorAll('iframe').length,
+                        body: b.slice(0, 6000), tops: tops,
+                        html: (document.documentElement.outerHTML || '').slice(0, 300000)
+                    });
+                })()
+            """) or "{}"
+            s = json.loads(snap) if isinstance(snap, str) else {}
+            text = "\n".join([
+                f"爱企查搜索结果页抽不到条目 — {datetime.now():%Y-%m-%d %H:%M:%S}",
+                f"公司名：{name}",
+                f"页面地址：{s.get('u')}",
+                f"页面标题：{s.get('t')}",
+                f"正文长度：{s.get('len')}  链接总数：{s.get('links')}  "
+                f"company_detail 链接：{s.get('company_detail')}  iframe：{s.get('iframes')}",
+                f"探针读数：{json.dumps(info, ensure_ascii=False)}",
+                "",
+                "【链接前缀 TOP15】",
+                "\n".join(str(x) for x in (s.get("tops") or [])),
+                "",
+                "【正文前 6000 字】",
+                str(s.get("body") or ""),
+                "",
+                "【本标签最近的接口请求（状态码）】",
+                "\n".join(f"{r.get('m', 'GET')} {r.get('u')} → {r.get('s')}"
+                          for r in self._observed_requests(ws_url)) or "（没装观测器/无请求）",
+                "",
+                "【页面 HTML 前 300000 字】",
+                str(s.get("html") or ""),
+            ])
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            self._log(f"🔎 已存下当时的搜索结果页证据：{path}")
+            self._log("   如果在浏览器里手工搜同一家能进详情、工具却抽不到，"
+                      "请把这个文件发回来，就能定出是改版还是平台静默拒绝")
+        except Exception as e:
+            self._log(f"  ⚠ 结果页证据写入失败：{e}")
 
     def _pick_pid(self, name: str, cands: list):
         """从结果条目里挑一家：公司名互包含的优先，否则退而取第一条
@@ -1000,13 +1206,19 @@ class AiQiChaCrawlerV2:
             hit = {}
 
             def ready():
-                s = self._read_search_page(ws_url, name, 8.0)
+                # 必须 reload：地址栏已经停在这一家的 /s?q= 时不重走一次，
+                # 抽到的永远是同一个旧 DOM——看着在退避重试，其实一个请求都没发
+                s = self._read_search_page(ws_url, name, 8.0, reload=True, quiet=True)
                 if s["state"] == "found":
                     hit["pid"] = s["pid"]
                     return True
                 return s["state"] in ("none", "login")
 
-            if not self._wait_unblock_limited(reason, max_wait=900, interval=15, ready=ready):
+            # 先洗一次标签再开始长等：过码后停在回跳页/组件已死时，这一步就能直接解决，
+            # 不必让名单在死页面上挂满十分钟
+            self._soft_reset_tab(ws_url)
+            if not self._wait_unblock_limited(reason, max_wait=900,
+                                              interval=REPROBE_INTERVAL, ready=ready):
                 return "stop", self._get_ws_url() or ws_url
             if hit.get("pid"):
                 ws_url = self._get_ws_url() or ws_url
@@ -1077,6 +1289,9 @@ class AiQiChaCrawlerV2:
                 # 必须额外等到页面真正可交互，否则注入的公司名会被未挂载的组件丢掉
                 if self.attach_mode:
                     self._wait_page_hydrated(ws_url, 15)
+                    # 并行模式才装：单平台时序一个字都不能改，而观测器只能随
+                    # 页面加载重装，装在水合之后刚好覆盖后续几家公司的请求
+                    self._ensure_request_observer(ws_url)
                 
                 # 检查页面状态
                 page_check = self._check_page_status(ws_url)
@@ -1091,6 +1306,9 @@ class AiQiChaCrawlerV2:
                     if not self._wait_unblock_limited(block):
                         result["状态"] = "拦截未解除"
                         return result
+                    # 验证完了不等于页面能用：本标签往往还停在验证回跳页上，
+                    # 不先洗回干净首页，这一家还是“卡在搜索公司名”
+                    self._soft_reset_tab(ws_url)
                     ws_url = self._get_or_create_homepage_tab()
                 
                 # 3. 清空并输入公司名
@@ -1102,6 +1320,10 @@ class AiQiChaCrawlerV2:
                 # 并行模式下首页可能刚好在注入时才挂载完，重试两次（单平台模式保持原有时序不变）
                 if not autocomplete_found and self.attach_mode:
                     for _retry in range(2):
+                        # 页面不可用就先整页重刷：过码后本标签常停在“地址正常但组件已死”的
+                        # 首页上，原地重注几次公司名都无效（手工刷新后一搜就好就是这个道理）
+                        if not self._page_hydrated(ws_url):
+                            self._soft_reset_tab(ws_url)
                         self._wait_page_hydrated(ws_url, 10)
                         self._log(f"  未出现联想，第{_retry + 1}次重试输入：{name}")
                         self._clear_and_input_search(ws_url, name)
@@ -1563,7 +1785,7 @@ class AiQiChaCrawlerV2:
                     break
 
             # 拦截门放在暂停之后：用户点"暂停"时优先听用户的，不抢着去等人工验证。
-            # 被拦时不推进名单、不写空记录，等人工在浏览器完成验证后从这一家继续；
+            # 被拦时不推进名单、不写入空记录，等人工在浏览器完成验证后从这一家继续；
             # 但夜间没人点验证，所以超过 block_wait_limit 就收掉这一路、把名单交给企知道
             block = self._detect_block()
             if block:
@@ -1574,6 +1796,9 @@ class AiQiChaCrawlerV2:
             else:
                 # 能正常开工就说明这一段拦截过去了，别拿旧时间戳去裁下一段
                 self._blocked_at = 0.0
+
+            # 刚过完验证就按原速接着跑，几乎一定会再弹一次验证（实测三五分钟一轮）
+            self._cooldown_wait()
 
             try:
                 result = self.search_company(name)
