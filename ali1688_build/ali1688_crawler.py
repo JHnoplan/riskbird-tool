@@ -501,12 +501,25 @@ class Ali1688Crawler:
             self._timeout_set = True
         backoff = (2, 5, 10, 15)
         for i in range(tries):
-            self._ensure_tab()
             try:
+                # _ensure_tab 也放进 try：浏览器被关/崩溃时它访问 window_handles 会抛
+                # invalid session id，若留在 try 外会冒泡出 crawl 直接把采集线程打崩。
+                self._ensure_tab()
                 self.driver.get(url)
             except Exception as e:
                 # 只记录首行，避免 chromedriver 巨长堆栈刷屏；含超时/断网等
                 msg = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                if self._session_dead(msg):
+                    # 会话/浏览器已死：原地重试同一个 driver 永远救不回来，必须重启并
+                    # 重新附加 Chrome（独立 profile 登录态保留），从卡住处续采而非崩线程。
+                    self._log(f"⚠ 浏览器会话已断开（{msg[:60]}），正在重启 Chrome 续采…（第{i + 1}/{tries}次）")
+                    if not self.try_restore_session():
+                        self._log("❌ 无法恢复浏览器会话，本轮到此结束（已采数据已保存，可稍后继续）")
+                        self._stop_requested = True
+                        return False
+                    self._timeout_set = False   # 新 driver 需重设页面加载超时
+                    time.sleep(1.5)
+                    continue
                 self._log(f"导航异常（第{i + 1}/{tries}次）：{msg} → 重试")
                 time.sleep(backoff[min(i, len(backoff) - 1)])
                 continue
@@ -519,6 +532,21 @@ class Ali1688Crawler:
                 continue
             return True
         return False
+
+    # 浏览器/会话已死的特征（Selenium WebDriverError 文案）：命中即重启续采，绝不崩线程。
+    # 注意不能用裸 "disconnected"——断网 ERR_INTERNET_DISCONNECTED 也含该子串，
+    # 而断网属正常可原地重试的瞬时错误，绝不该去重启 Chrome（会误杀正在加载的页面）。
+    SESSION_DEAD_MARKS = (
+        "invalid session id", "session deleted", "browser has closed",
+        "chrome not running", "not connected to devtools",
+        "no such window", "target window already closed",
+        "unable to connect to renderer",
+    )
+
+    @classmethod
+    def _session_dead(cls, msg):
+        m = (msg or "").lower()
+        return any(k in m for k in cls.SESSION_DEAD_MARKS)
 
     # ── 拦截 / 登录 判定 ───────────────────────────────────────
     def _detect_block(self):
@@ -1247,62 +1275,75 @@ class Ali1688Crawler:
                 continue
             self._log(f"▶ [{ki}/{len(kws)}] 关键词：{kw}")
             self._last_relative = []
-            if self.main_channel:
-                for offer in self._iter_keyword_main_offers(kw):
+            try:
+                if self.main_channel:
+                    for offer in self._iter_keyword_main_offers(kw):
+                        if self._stop_requested:
+                            break
+                        while self._pause_requested and not self._stop_requested:
+                            time.sleep(0.5)
+                        rec = self._crawl_company(offer)
+                        if rec.get("状态") == "类目不符(已过滤)":
+                            # 垃圾商家不进结果表，也省掉了联系方式页请求（防封关键）
+                            self._filtered_count += 1
+                            self._commit_to_store(rec)   # 记住它，下轮连详情页都不必再进
+                            if self._filtered_count % 10 == 1:
+                                self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
+                                          f"（最近：{rec['公司名称'] or rec['主营商品'][:20]}）")
+                            continue
+                        self._add_result(rec)
+                        done += 1
+                        self._emit("progress_signal", done, max(done, 1))
+                        self._emit("stats_signal",
+                                   f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
+                        self._sleep()
+                for offer in self._iter_keyword_offers(kw):
                     if self._stop_requested:
                         break
                     while self._pause_requested and not self._stop_requested:
                         time.sleep(0.5)
                     rec = self._crawl_company(offer)
-                    if rec.get("状态") == "类目不符(已过滤)":
-                        # 垃圾商家不进结果表，也省掉了联系方式页请求（防封关键）
-                        self._filtered_count += 1
-                        self._commit_to_store(rec)   # 记住它，下轮连详情页都不必再进
-                        if self._filtered_count % 10 == 1:
-                            self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
-                                      f"（最近：{rec['公司名称'] or rec['主营商品'][:20]}）")
-                        continue
                     self._add_result(rec)
                     done += 1
                     self._emit("progress_signal", done, max(done, 1))
                     self._emit("stats_signal",
                                f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
                     self._sleep()
-            for offer in self._iter_keyword_offers(kw):
-                if self._stop_requested:
-                    break
-                while self._pause_requested and not self._stop_requested:
-                    time.sleep(0.5)
-                rec = self._crawl_company(offer)
-                self._add_result(rec)
-                done += 1
-                self._emit("progress_signal", done, max(done, 1))
-                self._emit("stats_signal",
-                           f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
-                self._sleep()
-            if self.company_channel and not self._stop_requested:
-                for entry in self._iter_keyword_companies(kw):
-                    if self._stop_requested:
-                        break
-                    while self._pause_requested and not self._stop_requested:
-                        time.sleep(0.5)
-                    rec = self._crawl_shop_company(entry)
-                    self._add_result(rec)
-                    done += 1
-                    self._emit("progress_signal", done, max(done, 1))
-                    self._emit("stats_signal",
-                               f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
-                    self._sleep()
-            if self.expand_related and not self._stop_requested:
-                added = 0
-                for w in self._related_candidates(kw):
-                    if w not in kws:
-                        kws.append(w)
-                        added += 1
-                if added:
-                    self._log(f"🔎 「{kw}」扩展相关词 {added} 个（现共 {len(kws)} 个关键词）")
+                if self.company_channel and not self._stop_requested:
+                    for entry in self._iter_keyword_companies(kw):
+                        if self._stop_requested:
+                            break
+                        while self._pause_requested and not self._stop_requested:
+                            time.sleep(0.5)
+                        rec = self._crawl_shop_company(entry)
+                        self._add_result(rec)
+                        done += 1
+                        self._emit("progress_signal", done, max(done, 1))
+                        self._emit("stats_signal",
+                                   f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
+                        self._sleep()
+                if self.expand_related and not self._stop_requested:
+                    added = 0
+                    for w in self._related_candidates(kw):
+                        if w not in kws:
+                            kws.append(w)
+                            added += 1
+                    if added:
+                        self._log(f"🔎 「{kw}」扩展相关词 {added} 个（现共 {len(kws)} 个关键词）")
+            except Exception as e:
+                # 兜底：迭代器内直接读 driver.page_source/current_url 等极端时序下仍可能
+                # 抛会话失效。会话失效→重启续采；其它异常→跳过该关键词继续，绝不让线程崩。
+                msg = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                if self._session_dead(msg):
+                    self._log(f"⚠ 「{kw}」处理中浏览器会话断开（{msg[:60]}），重启后续采…")
+                    if not self.try_restore_session():
+                        self._log("❌ 无法恢复浏览器会话，本轮结束（已采数据已保存，可稍后继续）")
+                        self._stop_requested = True
+                    self._timeout_set = False
+                else:
+                    self._log(f"⚠ 「{kw}」处理异常：{msg} → 跳过该关键词继续")
             if self.incremental:
-                self._save_seen_store()   # 每个关键词收尾即落盘，中途被拦也不丢已学到的
+                self._save_seen_store()   # 每个关键词收尾即落盘，中途被拦/异常也不丢已学到的
         self._crawling = False
         if self.incremental:
             self._save_seen_store()
