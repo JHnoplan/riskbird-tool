@@ -31,39 +31,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install PyQt5 selenium openpyxl pyinstaller requests -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-    - name: Download chromedrivers (top 3 majors, win64)
-      run: |
-        $ErrorActionPreference = 'Stop'   # 不设为 Stop 时 try/catch 接不住网络失败，重试形同虚设
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-          try {
-            $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
-            $k = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json'
-            Write-Host "stable version: $($j.channels.Stable.version)"
-            # 取 known-good-versions 里最大的 3 个大版本（各挑最新一个具体版本）。
-            # 不能用 Stable 主版本号减 1/减 2 去凑：驱动发布节奏不一致时对应版本取空，
-            # $v.downloads 立刻报错，整个 job 两秒就挂。
-            $majors = @($k.versions | ForEach-Object { [int]($_.version.Split('.')[0]) } |
-              Sort-Object -Descending -Unique | Select-Object -First 3)
-            Write-Host "bundling majors: $($majors -join ', ')"
-            New-Item -ItemType Directory -Force ali1688_build/drivers | Out-Null
-            foreach ($mj in $majors) {
-              $v = @($k.versions | Where-Object { [int]($_.version.Split('.')[0]) -eq $mj })[-1]
-              $u = ($v.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
-              Invoke-WebRequest $u -OutFile cd.zip
-              if (Test-Path cd_tmp) { Remove-Item cd_tmp -Recurse -Force }
-              Expand-Archive cd.zip -DestinationPath cd_tmp
-              Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe ali1688_build/drivers/chromedriver.$mj.exe -Force
-              Write-Host "bundled chromedriver.$mj ($($v.version))"
-            }
-            Remove-Item cd.zip,cd_tmp -Recurse -Force
-            exit 0
-          } catch {
-            Write-Host "第 $attempt 次下载失败: $_"
-            Start-Sleep -Seconds 10
-          }
-        }
-        Write-Error "chromedriver 下载连续 3 次失败"
-        exit 1
+    - name: Download chromedrivers (Stable + 2 previous majors, win64)
+      # 版本挑选与解包全部交给 .github/scripts/fetch_chromedrivers.py：pwsh 对
+      # PSCustomObject 做减法和数组索引语义不稳（op_Subtraction on Object[] 已实测挂过），
+      # 脚本内已带「不足 2 个驱动就中止」的判据。
+      run: python .github/scripts/fetch_chromedrivers.py
 
     - name: Build EXE with PyInstaller
       run: |
