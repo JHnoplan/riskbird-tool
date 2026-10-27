@@ -67,22 +67,7 @@ jobs:
         pip install PyQt5 selenium openpyxl pyinstaller requests -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     - name: Download chromedrivers (Stable + 2 previous majors, win64)
-      run: |
-        $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
-        $k = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json'
-        $stableMajor = [int]($j.channels.Stable.version.Split('.')[0])
-        Write-Host "stable major: $stableMajor (version $($j.channels.Stable.version))"
-        New-Item -ItemType Directory -Force ali1688_build/drivers | Out-Null
-        foreach ($mj in @($stableMajor, $stableMajor - 1, $stableMajor - 2)) {
-          $v = @($k.versions | Where-Object { $_.version.Split('.')[0] -eq "$mj" })[-1]
-          $u = ($v.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
-          Invoke-WebRequest $u -OutFile cd.zip
-          if (Test-Path cd_tmp) { Remove-Item cd_tmp -Recurse -Force }
-          Expand-Archive cd.zip -DestinationPath cd_tmp
-          Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe ali1688_build/drivers/chromedriver.$mj.exe -Force
-          Write-Host "bundled chromedriver.$mj ($($v.version))"
-        }
-        Remove-Item cd.zip,cd_tmp -Recurse -Force
+      run: python .github/scripts/fetch_chromedrivers.py
 
     - name: Build EXE with PyInstaller
       run: |
