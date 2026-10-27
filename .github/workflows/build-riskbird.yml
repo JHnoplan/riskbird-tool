@@ -33,23 +33,12 @@ jobs:
 
     - name: Download chromedriver (Stable win64)
       run: |
-        $ErrorActionPreference = 'Stop'   # 不设为 Stop 时 try/catch 接不住网络失败，重试形同虚设
-        for ($i = 1; $i -le 3; $i++) {
-          try {
-            $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
-            $u = ($j.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
-            Invoke-WebRequest $u -OutFile cd.zip
-            Expand-Archive cd.zip -DestinationPath cd_tmp
-            Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe riskbird_build/chromedriver.exe
-            Write-Host "bundled chromedriver version: $($j.channels.Stable.version)"
-            exit 0
-          } catch {
-            Write-Host "第 $i 次下载失败: $_"
-            Start-Sleep -Seconds 10
-          }
-        }
-        Write-Error "chromedriver 下载连续 3 次失败"
-        exit 1
+        $j = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+        $u = ($j.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
+        Invoke-WebRequest $u -OutFile cd.zip
+        Expand-Archive cd.zip -DestinationPath cd_tmp
+        Copy-Item cd_tmp/chromedriver-win64/chromedriver.exe riskbird_build/chromedriver.exe
+        Write-Host "bundled chromedriver version: $($j.channels.Stable.version)"
 
     - name: Build EXE with PyInstaller
       run: |
