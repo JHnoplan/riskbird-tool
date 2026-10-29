@@ -228,8 +228,17 @@ class ParallelSession:
                   incremental=None, max_records=None):
         for c in self._active_crawlers():
             if delay_between is not None:
-                c.delay_between = float(delay_between)
-                c._current_delay = float(delay_between)
+                d = float(delay_between)
+                # 站点下限：纯 HTTP 站一条记录要发多个请求，界面上的「采集间隔」对它们
+                # 来说不是字面意义的那个间隔。不钳住的话，用户把间隔调到 2s 就会
+                # 重现客户那次「200 多家后被 IP 限流」。下限由站点自己声明。
+                floor = float(getattr(c, "MIN_DELAY", 0.0) or 0.0)
+                if d < floor:
+                    self._log(f"ℹ {c.PLATFORM_NAME}：本站一条记录要发多个请求，"
+                              f"采集间隔按站点安全下限 {floor:g}s 执行（界面设的 {d:g}s 会被 IP 限流）")
+                    d = floor
+                c.delay_between = d
+                c._current_delay = d
             if max_pages is not None:
                 c.max_pages = int(max_pages)
             if relevance_guard is not None:
@@ -728,6 +737,46 @@ class ParallelSession:
             self.set_browser_background(False)   # 还原/前置窗口，把登录页递到眼前
             return True, "企知道已在浏览器打开，请完成登录"
         return False, f"站点 {slug} 无需登录页"
+
+    def open_site_check(self, name=""):
+        """拦截提醒里的「打开该站页面自查」：由用户主动点，把被拦的那一页（没有则首页）
+        摆到共享 Chrome 眼前，让他自己判断「是 IP 被拒（Chrome 也打不开/同样报错）还是
+        真有滑块可过」。
+
+        为什么不由工具自动打开：IP 级限流（八方 502、供应商网 520）页面里根本没有验证
+        控件，自动拉起窗口只会让用户对着打不开的页面找入口白等（实测八方等了很久）——
+        旧文案还写着「已在 Chrome 里打开对应页面」，与实际行为相反，就是客户反馈
+        「八方出验证码找不到入口、只能在你软件点确认」的直接原因。
+        name 为空（旧适配器的拦截文本里本来就没有站名）时，按「当前处于被拦状态的站」兜底。
+        必须在后台线程调用（有网络 IO、可能拉起浏览器）。返回 (ok, message)。"""
+        target = None
+        for c in self.crawlers.values():
+            if name and getattr(c, "PLATFORM_NAME", "") == name:
+                target = c
+                break
+            if not name and getattr(c, "_blocked", False):
+                target = c
+                break
+        if target is None and not name:
+            for c in self.crawlers.values():
+                if getattr(c, "_block_probe_url", ""):
+                    target = c
+                    break
+        if target is None:
+            return False, f"「{name or '相关站'}」当前没有在采集，无页面可打开"
+        if not hasattr(target, "open_verify_page"):
+            return False, f"「{target.PLATFORM_NAME}」不支持自查页，请直接去浏览器里打开该站"
+        name = target.PLATFORM_NAME
+        url = getattr(target, "_block_probe_url", "") or getattr(target, "BASE_URL", "")
+        if not url:
+            return False, f"「{name}」没有可打开的地址"
+        try:
+            if target.open_verify_page(url):
+                self.set_browser_background(False)   # 还原/前置窗口，把页面递到眼前
+                return True, f"已在 Chrome 里打开 {name} 的页面，请自行核对"
+        except Exception as e:
+            return False, f"打开失败：{str(e).splitlines()[0][:80]}"
+        return False, "打开失败：共享浏览器不可用（请确认已安装 Google Chrome）"
 
     def _is_session_alive(self):
         if any(c._is_session_alive() for c in self._active_crawlers()):

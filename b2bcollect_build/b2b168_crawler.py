@@ -71,13 +71,29 @@ class B2b168Crawler(CdpSiteCrawler):
     HOME_DOMAIN = "b2b168.com"
     # 本站改走裸 HTTP，不需要共享 Chrome 的标签
     NEEDS_BROWSER = False
-    # 本站只有 IP 限流型拦截（无验证码）：等冷却就行，不为它拉起 Chrome 窗口
-    BLOCK_OPEN_BROWSER = False
+    # 八方绝大多数拦截是 IP 级限流（502），这一类由分诊（_block_kind == "ip"）拦住，
+    # 不会拉浏览器。但不能因此把整站写成“永不开页”：客户实机反馈「这么久只跳出过 1 次
+    # 八方验证页」，说明它确实也会返回可人工过的插页。开成 True 后：真出现验证插页时
+    # 借标签把它递到眼前，过完还能把 clearance cookie 抄回 HTTP 会话（与 11467 同一做法）。
+    BLOCK_OPEN_BROWSER = True
+    BLOCK_COOKIE_DOMAIN = "b2b168.com"
+    # 一家公司最多发 5 个请求（商铺首页 + 互换域 + contact + 移动版 contact + home），
+    # 节流必须下沉到请求级，否则界面「采集间隔」只管记录收尾，实际速率是设定的 3~5 倍
+    # ——客户「采到 200 多家就被限」正是这样把出口 IP 打进 502 的。
+    PER_REQUEST_PACE = True
+    # 0.5：把整段间隔摊到每个请求上的一半，既削平突发流量（防封关键），又不至于让
+    # 一家公司付 5 整轮等待、吞吐掉到 1/5。
+    PACE_FACTOR = 0.5
+    # 4s：乘上 PACE_FACTOR 后等于每个请求 ≥2s（一家公司 5 个请求 ≈ 10s）。
+    # 没这道下限时，用户把界面「采集间隔」拉到最小的 2s 就等于每请求 1s，
+    # 一小时能打三千多个请求——正是把出口 IP 压到 502 的那个速率。
+    MIN_DELAY = 4.0
 
     def __init__(self, port=9255):
         super().__init__(port)
-        self.delay_between = 2.0
-        self.jitter = 1.0
+        # 默认间隔从 2.0 上调到与安全下限一致：请求级节流下 2s 仍是最初压垮 IP 的速率。
+        self.delay_between = 4.0
+        self.jitter = 1.5
         self.max_pages = 0          # 不限页数：一直翻到没数据再切下一个关键词
         self._session = requests.Session()
         self._session.headers.update({
@@ -102,7 +118,9 @@ class B2b168Crawler(CdpSiteCrawler):
         return True
 
     def probe_block(self):
-        """能力探测：按真实搜索形状（POST Index.aspx）发一次，能解析出公司条目才算解除。"""
+        """能力探测：按真实搜索形状（POST Index.aspx）发一次，能解析出公司条目才算解除。
+        只看状态码会把挑战页当已通（谎报恢复后立刻又被拦，实测就是这样反复摆荡）。
+        频率已由看门狗的指数退避控制（IP 冷却下首次 ≥45s），不再拿 15s 去打断冷却。"""
         try:
             html = self._fetch("POST", SEARCH_POST_URL, tries=1, guarded=False,
                                data={"q": "公司", "act": "ComSearch", "page": ""})
@@ -118,9 +136,13 @@ class B2b168Crawler(CdpSiteCrawler):
         last = ""
         for i in range(max(1, tries)):
             try:
+                # 请求级节流：本站一家公司最多要发 5 个页，旧实现只在「每条记录结束」
+                # 睡一次，记录内部背靠背发——实际速率是设定间隔的 3~5 倍，200 多家
+                # 就把出口 IP 压到 502。现在每个请求前都对齐一次节奏。
+                self._pace_before_request()
                 r = self._session.request(method, url, timeout=25, **kw)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url)
+                block = self.http_block_reason(r.status_code, r.text, url, r.headers)
                 if block:
                     # 防采/限流插页：重试只会加重风控，直接交看门狗（旧实现把它当普通
                     # 失败返空串，列表解 0 家就默默切下一个关键词）

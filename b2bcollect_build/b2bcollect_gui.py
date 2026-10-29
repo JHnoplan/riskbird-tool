@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
 )
 
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
+from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP
 import customer_library_cleaner as _cleaner
 import keyword_expander as _kwexp
 
@@ -117,7 +118,15 @@ SITE_TIPS = {
            "命中 302 自动回落标签，标签越少可见时间越短。验证码同样接看门狗，过完自动续采。",
     "b2b168": "八方资源网 b2b168.com：纯 HTTP 搜索(Index.aspx POST)→公司自有子域商铺首页+「关于我们」页，"
               "完全不占用浏览器标签（所以看不到它的标签是正常的），速度最快。\n"
-              "防采：搜索接口限流时返 4xx/5xx 插页，识别到即停手冷却等恢复（不拉浏览器），绝不当空数据写库。",
+              "防采：一家公司最多要发 5 个请求，所以「采集间隔」已下沉到每个请求前对齐，"
+              "并有 4s 安全下限（低于它会被 IP 限流）。识别到 4xx/5xx 插页即停手拉长间隔实测、等恢复，"
+              "绝不当空数据写库。\n"
+              "重要：八方绝大多数拦截是 502 = 服务端拒当前出口 IP，不是验证码，页面上没有滑块可点，"
+              "所以那种情况下不会也不该开页面让你找入口（提醒会写明「IP限流·无需操作」）；"
+              "想马上恢复只能重拨宽带/换网络（手机热点）换个出口 IP，或等 ≥30 分钟。已采数据不丢，断点续采。\n"
+              "八方偶尔也会返真正可人工过的验证插页，那时会自动借一个标签把页面摆到眼前，"
+              "过完把 clearance Cookie 抄回 HTTP 会话续采；拿不准手上这条属于哪类时，"
+              "点弹窗里的「打开该站页面自查」自己看一眼即可。",
     "11467": "顺企网 11467.com：纯 HTTP 关键词搜索(b2b.11467.com)→公司商铺子域联系方式页(contact.asp)+商铺首页，"
               "联系人/手机/固话/邮箱/QQ 微信都在标签行里直接解析；平时不占用浏览器标签。\n"
               "防采：请求过快会返 HTTP 429 + v.js 人机挑战（纯 HTTP 不执行 JS，拿到的就是空页）——"
@@ -1352,42 +1361,126 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(False)
 
     def _on_blocked(self, reason):
-        """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（验证等待不计入采集耗时）+
-        后台化时自动还原窗口，把验证码递到用户眼前（人在环不变）。
-        弹窗必须显式弹：仅靠顶部横幅在窗口后台/最小化时用户根本看不到，
-        就会出现「验证码一直拦着但没人过、关键词进度空转」的白跑现象。"""
-        self._show_banner(
-            f"⚠ 触发安全验证/风控（{reason}）：请在弹出的 Chrome 窗口里手动完成验证，通过后会自动继续采集。",
-            "#f8d7da", "#721c24")
-        self._show_block_alert(reason)
+        """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（验证等待不计入采集耗时）。
+
+        两类拦截必须分型处置，不能再一律「叫人工」（客户原话：八方出验证码却找不到
+        入口，只能在你设计的软件点确认）：
+        · IP 级限流（八方 502 / 供应商网 520）：页面里根本没滑块，工具也没开浏览器，
+          所以横幅/弹窗绝不能写「已在 Chrome 里打开对应页面」——那是句谎话，害用户
+          满屏找入口白等；也不去还原窗口（没东西可看）；
+        · 可人工过的验证页（1688 滑块那种）：才保持「已把页面递到眼前 + 后台化时还原窗口」。
+        分型依据是爬虫在 reason 里打的前缀标记，界面不再靠猜文案关键字。"""
+        kind, name, detail = self._split_block(reason)
+        self._block_site = name
+        if kind == "ip":
+            self._show_banner(
+                f"⚠ {name or '该站点'}：IP 级限流（不是验证码，不需要你操作）——{detail}。"
+                f"已停止对本站发请求，等放行后自动续采；想马上恢复请重拨宽带/换网络换个出口 IP。",
+                "#fff3cd", "#664d03")
+        else:
+            self._show_banner(
+                f"⚠ 触发人机验证（{detail}）：请到 Chrome 窗口里手动过一下验证，过后自动续采；"
+                f"没看到页面就点弹窗里的「打开该站页面自查」。",
+                "#f8d7da", "#721c24")
+        self._show_block_alert(kind, name, detail)
         self._hold_timer(True)
-        if self.chk_bg.isChecked():
+        if kind != "ip" and self.chk_bg.isChecked():
             threading.Thread(target=lambda: self.session.set_browser_background(False),
                              daemon=True).start()
 
-    def _show_block_alert(self, reason):
-        """防采/验证码人工提醒弹窗：非模态（模态会阻塞主窗口事件循环，用户反而不
-        能操作），全局只留一个实例，多站同时被拦时只更新文案不叠窗。"""
+    @staticmethod
+    def _split_block(reason):
+        """把爬虫发出的拦截文本拆成（类型, 站点名, 原因）。
+        没有类型标记的（第三方适配器旧文案）按可人工过验证处理——宁可多叫一次人，
+        也不要反过来让人对着没滑块的页面干找。"""
+        reason = reason or ""
+        if reason.startswith(BLOCK_TAG_IP):
+            kind, body = "ip", reason[len(BLOCK_TAG_IP):]
+        elif reason.startswith(BLOCK_TAG_CAP):
+            kind, body = "captcha", reason[len(BLOCK_TAG_CAP):]
+        else:
+            kind, body = "captcha", reason
+        name, sep, detail = body.partition("：")
+        # 只有“冒号前短得像个站名”时才拿它当站点名（1688 等旧适配器直接 emit 整句
+        # 拦截描述，里头的冒号是句子标点，当成站名会把同一句话重复显示两遍）。
+        if sep and 0 < len(name) <= 12:
+            return kind, name, detail
+        return kind, "", body
+
+    def _show_block_alert(self, kind, name, detail):
+        """拦截提醒弹窗：非模态（模态会阻塞主窗口事件循环，用户反而不能操作），
+        全局只留一个实例，多站同时被拦时只更新文案不叠窗。
+
+        文案按拦截类型分开写，不再一句「已在 Chrome 里打开对应页面」走天下：
+        IP 级限流根本不会开浏览器（八方 502），那句谎话就是客户「找不到入口、只能在你
+        软件里点确认」的根源；而 1688 那种真滑块的站确实会开页。两类都提供一个由用户
+        主动点的「打开该站页面自查」按钮，让他想看时能看到（人在环但不瞎拉窗口）。"""
+        ip_mode = kind == "ip"
+        label = name or "该站点"
         box = getattr(self, "_block_alert", None)
         if box is None:
             box = QMessageBox(self)
-            box.setWindowTitle("需要人工过验证")
-            box.setIcon(QMessageBox.Warning)
             box.setStandardButtons(QMessageBox.Ok)
             box.setModal(False)
+            btn = box.addButton("打开该站页面自查", QMessageBox.ActionRole)
+            btn.clicked.connect(self._on_block_selfcheck)
+            self._block_check_btn = btn
             self._block_alert = box
-        box.setText(
-            "⚠ 站点触发防采拦截，已在 Chrome 里打开对应页面。\n\n"
-            f"{reason}\n\n"
-            + ("本次是 IP 级限流/冷却：页面里没有滑块就不需要操作（别对着页面干找），\n"
-               "确实有滑块/验证码就顺手过完。\n"
-               if "HTTP" in (reason or "") else
-               "请切到那个 Chrome 窗口，把滑块/验证码手动过完。\n")
-            + "看门狗每 15 秒实测一次「能不能真拿到数据」，确认后自动续采，\n"
-              "不需要回来点任何按钮（关掉本窗也不会停等待）。")
+        box.setWindowTitle("站点限流冷却中（不需要你操作）" if ip_mode else "需要人工过验证")
+        box.setIcon(QMessageBox.Information if ip_mode else QMessageBox.Warning)
+        if ip_mode:
+            box.setText(
+                f"⚠ {label}：这是 IP 级限流/冷却，不是验证码。\n\n{detail}\n\n"
+                "・页面里没有滑块可点，不需要你做任何操作；工具已停止对本站发请求，\n"
+                "  会拉长间隔实测，站点放行后自动续采（已采数据全部保存，下次断点续采）。\n"
+                "・这一类工具不会自动打开 Chrome 页面（旧提醒里那句「已打开」对本类不适用）。\n\n"
+                "想马上恢复（按有效程度排序）：\n"
+                "① 重拨宽带/换个网络（手机热点也行）——换个出口 IP，通常立即能用；\n"
+                "② 等 30 分钟以上再跑；\n"
+                "③ 把「采集间隔」调到 8~15 秒，避开再次触发限流。\n\n"
+                "不确定？点「打开该站页面自查」自己看一眼：Chrome 里也报错就是 IP 被限，\n"
+                "只能换 IP 或等冷却；Chrome 能正常打开则可能有可手动过的验证。")
+        else:
+            box.setText(
+                f"⚠ {label}：站点弹出人机验证，需要你手动过一下。\n\n{detail}\n\n"
+                "站点页面会在 Chrome 里打开并拉到前台（没看到就点下面的自查）。\n"
+                "・有滑块/验证码 → 在那个窗口里手动过完；\n"
+                "・页面正常打开了却没验证控件 → 其实是 IP 限流，不用操作，等冷却就行。\n"
+                "看门狗会实测「能不能真拿到数据」，确认后自动续采，\n"
+                "不需要回来点任何按钮（关掉本窗也不会停等待）。")
         box.show()
         box.raise_()
         box.activateWindow()
+
+    def _on_block_selfcheck(self):
+        """拦截弹窗里的自查按钮：用户主动点才去拉/前置 Chrome 窗口（与自动拉窗相对）。
+        有网络 IO、可能首次拉起浏览器，所以走后台线程，回控靠主线程轮询。"""
+        name = getattr(self, "_block_site", "")
+        if getattr(self, "_opening_check", False):
+            return
+        self._opening_check = True
+        btn = getattr(self, "_block_check_btn", None)
+        if btn:
+            btn.setEnabled(False)
+        self._on_log("正在 Chrome 里打开被拦站点的页面供你自查（首次会拉起共享浏览器）…")
+
+        def task():
+            try:
+                ok, msg = self.session.open_site_check(name)
+                self.session._log(("✅ " if ok else "⚠ ") + msg)
+            except Exception as e:
+                self.session._log(f"⚠ 打开自查页失败：{str(e).splitlines()[0][:120]}")
+            finally:
+                self._opening_check = False
+
+        threading.Thread(target=task, daemon=True).start()
+
+        def poll():
+            if getattr(self, "_opening_check", False):
+                QTimer.singleShot(400, poll)
+            elif btn:
+                btn.setEnabled(True)
+        QTimer.singleShot(400, poll)
 
     def _close_block_alert(self):
         box = getattr(self, "_block_alert", None)

@@ -68,6 +68,12 @@ PHONE_MOBILE_RE = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
 PHONE_TEL_RE = re.compile(r'(?<!\d)(?:\+?86[\s-]?)?(0\d{2,4}[-\s]?\d{7,8})(?!\d)')
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 
+# 拦截分型标记：爬虫把它打在 blocked_signal 文本开头，界面据此定文案/要不要拉浏览器。
+# 以前界面靠「reason 里有没有 HTTP 字样」自己猜，结果八方这种 IP 限流被当成验证码弹
+# 「已在 Chrome 里打开对应页面」，用户满屏找入口找不到（客户实际反馈）。
+BLOCK_TAG_IP = "【IP限流·无需操作】"
+BLOCK_TAG_CAP = "【需人工验证】"
+
 # 会话/标签已死的特征（CDP 层）：命中即重取标签续采，绝不崩线程。
 SESSION_DEAD_MARKS = (
     "connection refused", "connection aborted", "connection reset",
@@ -452,9 +458,32 @@ class CdpSiteCrawler:
     HTTP_BLOCK_MARKS = ("访问异常", "访问过于频繁", "安全验证", "人机验证", "滑动验证",
                         "请完成验证", "拒绝访问", "访问受限", "系统繁忙", "Server Error")
     HTTP_BLOCK_MAX_BYTES = 3000     # 插页体积上限：正常商铺/列表页远大于此
-    BLOCK_POLL = 15                 # 看门狗恢复探测间隔（秒）
+    # 「人可以在浏览器里过掉」的特征（区别于纯拒 IP 的 429/502）：分诊靠它。
+    # 只收足够具体的词——被误判成 captcha 会白叫人工（客户这次的投诉），
+    # 所以像 security 这种在报错页里满天飞的泛词一律不收。
+    HTTP_CHALLENGE_MARKS = ("人机验证", "滑动验证", "安全验证", "请完成验证", "验证码",
+                            "captcha", "recaptcha", "verify", "verification",
+                            "challenge", "turnstile", "v.js", "cloudflare", "sufei")
+    BLOCK_POLL = 15                 # 看门狗恢复探测间隔（秒）——仅针对可人工解除的验证页
+    # IP 级限流的探测间隔：必须远大于验证页那种。拿 15s 去探一个正在冷却的 IP，
+    # 等于自己把冷却窗口打断（实测八方就是这样从软限流熬成硬封）。
+    BLOCK_POLL_IP = 45              # IP 冷却首次探测间隔（秒），之后按此指数退避
+    BLOCK_POLL_IP_MAX = 600         # IP 冷却探测间隔上限
     BLOCK_MAX_WAIT = 1800           # 单次等人工过验证的总时长上限（秒）
+    BLOCK_MAX_WAIT_IP = 2700        # 单次等 IP 冷却的总时长上限（冷却本来就慢，别提前放弃）
     BLOCK_COOKIE_DOMAIN = ""        # 纯 HTTP 站过验证后需要抄回的 cookie 域（子类设）
+    # 是否把「采集间隔」下沉到每个请求前对齐（只给一条记录要打多个页的纯 HTTP 站开）。
+    # 默认 False：浏览器站一条记录 = 一次导航，记录级节流已经等价，
+    # 无差别打开会让正常运行的站莫名慢 2~3 倍。
+    PER_REQUEST_PACE = False
+    # 请求级节流相对于「采集间隔」的比例：一家公司要发 5 个页的站若每个请求都付
+    # 整段间隔，吞吐会掉到 1/5。取 0.5 意味着八方的请求间隔是界面间隔的一半，
+    # 既把突发流量摊平（防封的关键），又不至于慢到不能用。
+    PACE_FACTOR = 1.0
+    # 本站可接受的「采集间隔」下限（界面下发的值低于它时会被钳到这个值）。
+    # 对开了请求级节流的纯 HTTP 站，界面间隔×PACE_FACTOR 才是真正的请求间隔，
+    # 所以它们必须自己声明下限，否则用户把间隔调到最小就会重现“200 多家后被限 IP”。
+    MIN_DELAY = 0.0
     # 被拦时是否借浏览器把验证页递到眼前：限流类站（等 IP 冷却就行）设 False，
     # 免得为了等冷却无端拉起一个 Chrome 窗口。
     BLOCK_OPEN_BROWSER = True
@@ -486,9 +515,14 @@ class CdpSiteCrawler:
         self._block_times = []
         self._block_window = 900
         self._max_blocks = 5
+        # IP 级限流的熔断比验证码更敏感：验证码是“过一道门”，IP 限流是“己方已越限”，
+        # 后者再硬撞只会把封禁时长往上叠（实测 3 次后基本就进硬封了）。
+        self._max_blocks_ip = 3
         # 看门狗状态：当前是否处于「等人工过验证/等 IP 冷却」，以及本轮拦下的原因
         self._blocked = False
         self._block_reason = ""
+        self._block_kind = ""       # "ip"=IP 级限流（无页可点）/ "captcha"=可人工解除
+        self._retry_after = 0       # 服务端 Retry-After 提示的秒数（有就听它的）
         self._block_probe_url = ""   # 探测用的代表页（就是刚被拦的那一页）
         self._borrowed_tab = False   # 纯 HTTP 站为过验证临时借的标签（恢复后归还）
 
@@ -958,26 +992,59 @@ return '';})()"""
             return f"页面弹出验证控件（{hit[:24]}）"
         return ""
 
-    def http_block_reason(self, status, html="", url=""):
+    def http_block_reason(self, status, html="", url="", headers=None):
         """裸 HTTP 响应是否防采/限流插页：状态码命中，或体积极小且带插页特征词。
         404 不在此列（商铺真失效是终态数据，不是风控）。命中时记下探测页，
-        让看门狗之后就是探这一页能不能真拿到数据。"""
+        让看门狗之后就是探这一页能不能真拿到数据。
+
+        同时做**拦截分诊**（决定后面是人过还是干等），这两类处置完全相反：
+          · "ip"      429/502/503/520… 且插页里没有验证特征 = 服务端直接拒这个出口 IP。
+            页面里根本没滑块，叫人工去 Chrome 里找入口只会白等（实测八方 502、
+            供应商网 520 都是这样）→ 不拉浏览器，拉长间隔指数退避等冷却；
+          · "captcha" 插页里带人机验证特征（验证词/captcha/challenge/v.js 这类 JS 挑战）
+            = 人在浏览器里过一下确实能清 → 借标签把页面递到眼前，过完拄 clearance Cookie 续采。
+            实测：顺企网 429 返的是 70 字节 v.js 挑战（浏览器执行 JS 就能过），归 captcha 才对；
+            上一版按状态码一律归 ip，会把这种「其实能过」的拦截误杀成只能干等。
+        服务端给了 Retry-After 就记下来，冷却时长听它的而不是我们猜。"""
         try:
             code = int(status or 0)
         except (TypeError, ValueError):
             code = 0
+        body = html or ""
         if code in self.HTTP_BLOCK_STATUS:
             if url:
                 self._block_probe_url = url
-            return f"站点返回 HTTP {code}（防采/限流插页）"
-        body = html or ""
+            self._block_kind = "captcha" if self._looks_like_challenge(body) else "ip"
+            self._retry_after = self._parse_retry_after(headers)
+            if self._block_kind == "captcha":
+                # 文案刻意不出现“HTTP”字样：上层在没拿到分诊结果时会拿它兜底判
+                # 「IP 限流」，带上这个词就会把「其实能人工过」的插页误杀成干等
+                return f"站点返 {code} 且是人机验证插页（可在浏览器里手动过）"
+            return f"站点返回 HTTP {code}（IP 级限流/冷却，非验证码）"
         if body and len(body) < self.HTTP_BLOCK_MAX_BYTES:
             hit = next((m for m in self.HTTP_BLOCK_MARKS if m in body[:4000]), "")
             if hit:
                 if url:
                     self._block_probe_url = url
+                self._block_kind = "captcha" if self._looks_like_challenge(body) else "ip"
                 return f"防采插页（{hit}）"
         return ""
+
+    def _looks_like_challenge(self, body):
+        """插页里是不是真的摆着可人工过的验证（而不是纯粹拒 IP）。
+        词表同时收中文文案与英文/脚本特征（v.js、cloudflare、sufei 这类 JS 挑战）：
+        请求体不执行 JS 的链路拿到挑战页也只是“200/429 + 一小段 script”，
+        不认这一道就会把「人过一下就能清」误判成「只能干等」。"""
+        low = (body or "")[:4000].lower()
+        return any(m in low for m in self.HTTP_CHALLENGE_MARKS)
+
+    @staticmethod
+    def _parse_retry_after(headers):
+        """读 HTTP 标准的 Retry-After（秒数形式），拿不到就回 0。"""
+        try:
+            return max(0, int(float((headers or {}).get("Retry-After") or 0)))
+        except (TypeError, ValueError):
+            return 0
 
     def probe_block(self):
         """看门狗恢复探测：返回「仍被拦的原因」，空串＝已解除。
@@ -1014,7 +1081,9 @@ return '';})()"""
                     not sc.ensure_shared_chrome(self._log, self.port, True):
                 self._log("⚠ 无法启动共享浏览器，只能干等站点限流自行冷却")
                 return False
-            if not self.ensure_tab():
+            # 纯 HTTP 站（如八方）把 ensure_tab 覆盖成了空壳（采集不需要标签），
+            # 但“借页给人看”必须真有一个标签，所以这里明确走基类实现。
+            if not CdpSiteCrawler.ensure_tab(self):
                 return False
             if not getattr(self, "NEEDS_BROWSER", True):
                 self._borrowed_tab = True
@@ -1077,13 +1146,15 @@ return '';})()"""
             return 0
 
     def handle_http_block(self, url="", reason=""):
-        """裸 HTTP 链路命中防采/限流的统一处置：弹提醒 → （纯 HTTP 站）借浏览器把验证页
-        送到用户眼前 → 看门狗轮询到恢复才返回 True，调用方据此重试同一个请求。
+        """裸 HTTP 链路命中防采/限流的统一处置：弹提醒 → （确实可人工过的站）
+        借浏览器把验证页送到用户眼前 → 看门狗轮询到恢复才返回 True，调用方据此重试同一个请求。
+        IP 级限流不拉浏览器（那一页本身就没滑块，开一个也只会多一个被打的出口）。
         返回 False 表示没恢复（超时/熔断/用户停止），上层按非终态「待重试」记账。"""
         if url:
             self._block_probe_url = url
         self._block_reason = reason or self._block_reason or "站点防采/限流插页"
-        if getattr(self, "BLOCK_OPEN_BROWSER", True):
+        if getattr(self, "BLOCK_OPEN_BROWSER", True) and \
+                getattr(self, "_block_kind", "") != "ip":
             self.open_verify_page(url)
         return self._wait_manual_unblock(self._block_reason, self.probe_block,
                                          on_cleared=self._after_block_cleared)
@@ -1108,39 +1179,64 @@ return '';})()"""
             time.sleep(0.5)
 
     def _wait_manual_unblock(self, reason, probe, max_wait=None, on_cleared=None):
-        """看门狗主循环：提醒人工过验证 → 每隔 BLOCK_POLL 探一次 probe()（空串即已解除）
-        → 自动续采。浏览器链路与 HTTP 链路共用这一套，避免各站自己死磕把软限流熬成硬封。
+        """看门狗主循环。两类拦截走两套节奏，不再一律“叫人工”：
+
+        · captcha（可人工解除的验证页）：弹提醒 + （能开页的站）把页面递到眼前，
+          每 BLOCK_POLL 探一次，用户秒过时不用白等；
+        · ip（IP 级限流）：**绝不叫人工**——页面里根本没有滑块，人对着 Chrome 找入口
+          只会白等（实测供应商网 520 等了 8 分钟）；探测间隔从 BLOCK_POLL_IP 起指数退避，
+          让 IP 真拿到冷却窗口（旧实现固定 15s 探一次，等于自己把冷却打断）；
+          服务端给了 Retry-After 就先睡够它再探。
         反复被拦（窗口内达阈值）直接优雅结束本站本轮，不再对着插页浪费机会。"""
+        kind = getattr(self, "_block_kind", "")
+        # 分诊结果优先：http_block_reason 真看过响应体，比猜文案可靠得多。
+        # 只有没经过分诊的拦截（浏览器链路自己发现的验证控件）才退回旧启发式：
+        # reason 里带 HTTP 字样，或本站压根借不到标签给人过验证。
+        if kind:
+            ip_mode = kind == "ip"
+        else:
+            ip_mode = ("HTTP" in (reason or "")) or not getattr(self, "BLOCK_OPEN_BROWSER", True)
+        self._ip_cooldown = ip_mode
+        self._block_kind = "ip" if ip_mode else "captcha"
         strikes = self._register_block()
         self._blocked = True
-        self._ip_cooldown = False
-        if strikes >= self._max_blocks:
-            self._emit("blocked_signal", f"{self.PLATFORM_NAME}：{reason}")
+        # 前缀是给界面分型用的（界面不能再靠猜“reason 里有没有 HTTP”来定文案）
+        tag = BLOCK_TAG_IP if ip_mode else BLOCK_TAG_CAP
+        cap = self._max_blocks_ip if ip_mode else self._max_blocks
+        if strikes >= cap:
+            self._emit("blocked_signal", f"{tag}{self.PLATFORM_NAME}：{reason}")
             self._log(f"🛑 {reason}")
             self._log(f"   ⛔ {self._block_window // 60} 分钟内第 {strikes} 次被拦，判定持续限流。"
-                      f"为保护 IP，{self.PLATFORM_NAME}本轮到此为止（已采数据已保存），"
-                      f"请稍后（建议 ≥30 分钟）或调大采集间隔后再跑。")
+                      f"为保护 IP，{self.PLATFORM_NAME} 本轮到此为止（已采数据已保存）。")
+            if ip_mode:
+                self._log(f"   💡 这不是验证码，人工点不掉。要恢复只能：①重拨宽带/换网络换个出口 IP（最快）；"
+                          f"②等 ≥30 分钟再跑；③把「采集间隔」调大（建议 8~15 秒）。已采数据不丢，下次从断点续采。")
             self._stop_requested = True
             self._blocked = False
             self._after_block_cleared()
             return False
-        self._emit("blocked_signal", f"{self.PLATFORM_NAME}：{reason}")
+        self._emit("blocked_signal", f"{tag}{self.PLATFORM_NAME}：{reason}")
         self._log(f"🛑 {reason}")
-        # 措辞分型：HTTP 状态码拦下来的是 IP 级限流/冷却，页面里根本没有滑块，
-        # 让用户对着 Chrome 死找验证码只会白等（实测：供应商网 520 等了 8 分钟）。
-        self._ip_cooldown = "HTTP" in (reason or "") or not getattr(self, "BLOCK_OPEN_BROWSER", True)
-        if self._ip_cooldown:
-            self._log("   已暂停推进（不写入空记录）。这属于 IP 级限流/冷却：若 Chrome 里那一页确实有滑块就顺手过掉，"
-                      "没有滑块就不需要操作；看门狗会持续实测，站点放行后自动续采。")
+        if ip_mode:
+            self._log("   已暂停推进（不写入空记录）。这是 IP 级限流/冷却，没有验证码可点也不需要你操作，"
+                      "工具会拉长间隔实测，站点放行后自动续采。")
         else:
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，"
                       "看门狗探测到验证已解除后会自动续采。")
         self._current_delay = min(30.0, max(6.0, self._current_delay * 1.6))
         self._log(f"   自动降速：采集间隔上调为约 {self._current_delay:.1f}s")
-        limit = max_wait or self.BLOCK_MAX_WAIT
+        limit = max_wait or (self.BLOCK_MAX_WAIT_IP if ip_mode else self.BLOCK_MAX_WAIT)
         waited = 0
-        gap = max(3, int(self.BLOCK_POLL))
-        first = 5                 # 首轮探短一点：用户秒过验证时不用白等一个轮询周期
+        if ip_mode:
+            # 指数退避：同一轮里被拦次数越多，下一轮探得越久，给 IP 真正的冷却窗口
+            gap = max(10, int(min(self.BLOCK_POLL_IP_MAX,
+                                  self.BLOCK_POLL_IP * (2 ** max(0, strikes - 1)))))
+            first = max(gap, int(self._retry_after or 0))
+            if first > gap:
+                self._log(f"   ⏳ 服务端提示 Retry-After {first}s，先等足这么久再探")
+        else:
+            gap = max(3, int(self.BLOCK_POLL))
+            first = 5                 # 首轮探短一点：用户秒过验证时不用白等一个轮询周期
         while waited < limit:
             nap = first if waited == 0 else gap
             # 分段短睡：停止/暂停指令能及时响应
@@ -1160,10 +1256,14 @@ return '';})()"""
                 still = f"探测异常：{str(e).splitlines()[0][:60]}"
             if not still:
                 return self._mark_block_cleared(waited, on_cleared)
-            if waited % 60 < gap:
-                word = "仍在等站点放行（IP 冷却）" if self._ip_cooldown else "仍在等待验证"
+            if waited % 60 < gap or ip_mode:
+                word = "仍在等站点放行（IP 冷却，无需操作）" if ip_mode else "仍在等待验证"
                 self._log(f"   {word}…已等 {waited} 秒（{str(still)[:50]}）")
-        self._log(f"⚠ 等待验证超时（{limit} 秒），本站本轮结束（已采数据不受影响）")
+        if ip_mode:
+            self._log(f"⚠ 等 IP 冷却超时（{limit} 秒），本站本轮结束（已采数据不受影响）。"
+                      f"想继续可重拨宽带换个出口 IP，或调大采集间隔后重跑。")
+        else:
+            self._log(f"⚠ 等待验证超时（{limit} 秒），本站本轮结束（已采数据不受影响）")
         self._blocked = False
         self._after_block_cleared()
         return False
@@ -1171,7 +1271,9 @@ return '';})()"""
     def _mark_block_cleared(self, waited, on_cleared=None):
         """探测到已解除：发信号让界面收起提醒，必要时先给 IP 冷却窗口再继续。"""
         self._blocked = False
-        self._log(f"✅ 验证已解除（等待约 {waited} 秒），自动续采")
+        word = "站点放行" if getattr(self, "_ip_cooldown", False) else "验证已解除"
+        self._log(f"✅ {word}（等待约 {waited} 秒），自动续采")
+        self._retry_after = 0
         try:
             if on_cleared:
                 on_cleared()
@@ -1181,7 +1283,8 @@ return '';})()"""
         recent = len([t for t in self._block_times if time.time() - t < self._block_window])
         if recent >= 2:
             cool = min(1800, 120 * (2 ** (recent - 1)))
-            self._log(f"   ❄ 已第 {recent} 次被拦，强制冷却 {cool} 秒再继续（给 IP 冷却窗口）")
+            self._log(f"   ❄ 已第 {recent} 次被拦，强制冷却 {cool} 秒再继续（给 IP 冷却窗口，"
+                      f"且本轮保持降速不回落）")
             self._interruptible_sleep(cool)
         return True
 
@@ -1193,13 +1296,13 @@ return '';})()"""
         """记账「一次真实网络请求/导航刚完成」：裸 HTTP 子类取页后也要调。"""
         self._last_activity = time.time()
 
-    def _sleep(self):
+    def _sleep(self, mult=1.0):
         """请求间隔统一记账：只补齐「距上一次请求完成时刻」到间隔目标的差额。
         导航/取页本身已花掉的时间计入间隔，同一条记录链路里连续多次 _sleep
         （主页面→兜底子页→收尾）不会重复支付整段等待——这是三站里
         gys/MIC 明显慢于纯 HTTP 站的主要放大器（旧实现每家最多睡 2~3 整轮）。
         节奏下限仍为随机化间隔，不会因为记账而退化成零间隔。"""
-        gap = self._current_delay + random.uniform(0, self.jitter)
+        gap = (self._current_delay + random.uniform(0, self.jitter)) * mult
         now = time.time()
         anchor = self._last_activity if self._last_activity else now
         due = max(now, anchor + gap)
@@ -1208,6 +1311,21 @@ return '';})()"""
             if self._stop_requested:
                 return
             time.sleep(0.3)
+
+    def _pace_before_request(self):
+        """**每次真实请求前**对齐节奏（纯 HTTP 站专用）。
+
+        为什么需要：浏览器站一条记录 = 一次导航，「每条记录结束睡一次」等价于
+        「每请求睡一次」；但纯 HTTP 站（八方/顺企网/供应商网）一家公司要发
+        商铺首页+备用域+contact+移动版+关于我们 最多 5 个请求，旧链路只在记录
+        结束时睡，记录内部 5 个请求背靠背发出——实际速率是设定间隔的 3~5 倍。
+        八方正是以这样约 0.5~1 请求/秒的速度在 200 多家后把出口 IP 打进 502 限流。
+        把节流下沉到请求级后，界面上的「采集间隔」才是它字面意义上的东西。
+
+        只对显式开了 PER_REQUEST_PACE 的站生效：浏览器站一条记录就是一轮导航，
+        无差别开启只会让本来正常的站莫名慢 2~3 倍。"""
+        if getattr(self, "PER_REQUEST_PACE", False) and self._last_activity:
+            self._sleep(getattr(self, "PACE_FACTOR", 1.0))
 
     # ── 关键词解析 ─────────────────────────────────────────────
     @staticmethod
