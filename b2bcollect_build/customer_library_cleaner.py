@@ -442,9 +442,54 @@ def _position_family(position, email, company):
     return ""
 
 
-def make_row(fields: dict, sources: list) -> dict:
-    """一份归一化字段 + 来源列表 → 模板行（采集链路与外部数据清洗共用这一套规则）"""
+# 裸号补区号要用到的两种固话形态：已带区号（0XXX-号码）与没带区号的裸号（可带分机）
+_LANDLINE_AREA_RE = re.compile(r"^0\d{2,3}-(\d{7,8})")
+_BARE_LANDLINE_RE = re.compile(r"^(\d{7,8})(转\d{1,6})?$")
+
+
+def fill_bare_area_code(landlines: list):
+    """同一行只有一个区号时，把没区号的裸号固话补成「区号-号码」。
+
+    出现两个及以上不同区号（跨城公司、一个名单里混了多地分公司）时一律不补：
+    猜错区号拨出去是别人家，比留一个裸号更坑。返回
+    (处理后的固话列表, 补全个数, 因同行区号不唯一而保留原样的个数)。
+    """
+    areas = {v.split("-", 1)[0] for v in landlines if _LANDLINE_AREA_RE.match(v)}
+    bare = [v for v in landlines if _BARE_LANDLINE_RE.match(v)]
+    if not bare or len(areas) != 1:
+        return landlines, 0, len(bare) if len(areas) > 1 else 0
+    area = next(iter(areas))
+    out, filled = [], 0
+    for value in landlines:
+        m = _BARE_LANDLINE_RE.match(value)
+        if not m:
+            out.append(value)
+            continue
+        fixed = f"{area}-{m.group(1)}{m.group(2) or ''}"
+        if fixed not in out:
+            out.append(fixed)
+            filled += 1
+    return out, filled, 0
+
+
+def _has_contact(row: dict) -> bool:
+    """这一行能不能入库：手机/固话/邮箱/微信至少一项非空（四项全空上到客户库就是死数据，
+    与本工具 filter_import_rows 的废数据口径完全一致）。"""
+    if not row:
+        return False
+    return any(str(row.get(k) or "").strip() for k in ("手机号", "固话", "邮箱", "微信号"))
+
+
+def make_row(fields: dict, sources: list, stats: dict = None) -> dict:
+    """一份归一化字段 + 来源列表 → 模板行（采集链路与外部数据清洗共用这一套规则）
+
+    stats 不为空时计入统计（裸号补区号多少个、多少个因区号不唯一没补），供日志对账。
+    """
     mobiles, landlines = split_phones(fields.get("电话", ""))
+    landlines, filled, kept_bare = fill_bare_area_code(landlines)
+    if stats is not None:
+        stats["area_filled"] = stats.get("area_filled", 0) + filled
+        stats["area_kept"] = stats.get("area_kept", 0) + kept_bare
     emails = split_emails(fields.get("邮箱", ""))
     legal_rep = _clean_contact(_clean_legal_rep(fields.get("法定代表人", "")))
     contact = _clean_contact(_clean_legal_rep(fields.get("联系人", "")))
@@ -498,11 +543,15 @@ def build_clean_rows(results: list, log=print, waste_sink=None):
                 waste_sink(waste)
             except Exception:
                 pass
-    rows = [make_row(item["fields"], item["sources"]) for item in merged]
+    stats = {}
+    rows = [make_row(item["fields"], item["sources"], stats) for item in merged]
     no_mobile = sum(1 for r in rows if not r["手机号"] and not r["固话"])
     log(f"清洗完成：原始 {len(results)} 条 → 有效入库 {len(rows)} 条"
         f"（剔除无效 {len(results) - sum(1 for r in results if is_valid_record(r))} 条、"
-        f"跨平台合并 {dup} 条、无联系方式 {no_mobile} 条）")
+        f"跨平台合并 {dup} 条、无联系方式 {no_mobile} 条、"
+        f"裸号补区号 {stats.get('area_filled', 0)} 个）")
+    if stats.get("area_kept"):
+        log(f"  ↳ 另有 {stats['area_kept']} 个裸号固话因「同一行区号不唯一」保持原样（不猜区号）")
     return rows
 
 
@@ -839,15 +888,22 @@ def header_score(field: str, name: str) -> float:
     return score
 
 
+# 联系方式类字段允许同一张表里多列共同命中（「手机号」+「固话」两列都并进电话），
+# 公司名/联系人/岗位等仍严格一字段一列，否则会把「张三;李四」洗成一个坏客户名称。
+MULTI_VALUE_FIELDS = ("电话", "邮箱", "微信号")
+
+
 def match_columns(headers: list, data_rows: list, log=None):
     """智能匹配列名：返回 (映射 {列下标: 规范字段}, 已识别描述, 未识别列名)
 
     表头占 6 成、内容占 4 成：“客户名称”列里装的是公司还是联系人，单看表头判不了。
-    同一字段只认一列、同一列只认一个字段，按总分贪心分配。
+    普通字段一列一字段、联系方式类字段可多列合并；重复表头的空列（入库模板右侧
+    第二块）既不参与匹配也不计进“未使用列”，不然日志看起来像丢了数据。
     """
     log = log or (lambda _m: None)
     ncols = len(headers)
     samples = {}
+    has_data = {c: False for c in range(ncols)}
     for c in range(ncols):
         vals = []
         for row in data_rows[:20]:
@@ -855,10 +911,16 @@ def match_columns(headers: list, data_rows: list, log=None):
                 text = _cell_text(row[c])
                 if text:
                     vals.append(text)
+                    has_data[c] = True
+        for row in data_rows[20:]:
+            if not has_data[c] and c < len(row) and _cell_text(row[c]):
+                has_data[c] = True
         samples[c] = vals
 
     claims = []
     for c in range(ncols):
+        if not has_data[c]:
+            continue            # 全列没一个值的（重复表头块的第二组空列）不参与匹配
         for field in EXTERNAL_FIELDS:
             hs = header_score(field, headers[c])
             cs = content_score(field, samples[c])
@@ -871,7 +933,9 @@ def match_columns(headers: list, data_rows: list, log=None):
 
     mapping, used_cols, used_fields = {}, set(), set()
     for total, c, field in claims:
-        if c in used_cols or field in used_fields:
+        if c in used_cols:
+            continue
+        if field in used_fields and field not in MULTI_VALUE_FIELDS:
             continue
         mapping[c] = field
         used_cols.add(c)
@@ -884,7 +948,7 @@ def match_columns(headers: list, data_rows: list, log=None):
             continue
         best, best_v = -1, 0.45 if field == "电话" else 0.30
         for c in range(ncols):
-            if c in used_cols:
+            if c in used_cols or not has_data[c]:
                 continue
             v = pick(c)
             if v > best_v:
@@ -895,9 +959,20 @@ def match_columns(headers: list, data_rows: list, log=None):
             used_fields.add(field)
             log(f"  ↳ 没找到「{field}」列名，按内容把“{headers[best] or '第%d列' % (best + 1)}”当{field}使用")
 
-    identified = [f"“{headers[c] or '第%d列' % (c + 1)}”→{field}"
-                  for c, field in sorted(mapping.items())]
-    skipped = [str(headers[c] or "第%d列" % (c + 1)).strip() for c in range(ncols) if c not in mapping]
+    # 日志把“合并了几列”写成事实：同一个字段吃多列时拼成“手机号”+“固话”→电话（两列合并）
+    by_field = {}
+    for c in sorted(mapping):
+        by_field.setdefault(mapping[c], []).append(c)
+    identified = []
+    for field, cols in sorted(by_field.items(), key=lambda kv: kv[1][0]):
+        names = "+".join(f"“{headers[c] or '第%d列' % (c + 1)}”" for c in cols)
+        if len(cols) > 1:
+            cn = ("两" if len(cols) == 2 else str(len(cols)))
+            identified.append(f"{names}→{field}（{cn}列合并）")
+        else:
+            identified.append(f"{names}→{field}")
+    skipped = [str(headers[c] or "第%d列" % (c + 1)).strip()
+               for c in range(ncols) if c not in mapping and has_data[c]]
     return mapping, identified, skipped
 
 
@@ -997,18 +1072,32 @@ def read_tables(path: str):
 
 
 def records_from_table(headers: list, data_rows: list, mapping: dict, default_source: str):
-    """按列映射把一张表转成规范字段记录（列名为空的无表头文件也能转）"""
+    """按列映射把一张表转成规范字段记录（列名为空的无表头文件也能转）
+
+    同一字段命中多列时按列号升序用“；”拼接而不是覆盖（拼接顺位保留“手机号列
+    在前”，拆分后主联系人号码依旧排在最前）；后面的列直接盖掉前面会导致
+    “固话”列有值、“手机号”列整列消失。
+    """
+    cols_by_field = {}
+    for col, field in mapping.items():
+        cols_by_field.setdefault(field, []).append(col)
+    for field in cols_by_field:
+        cols_by_field[field].sort()
     records = []
     for row in data_rows:
         if not row or all(not _cell_text(v) for v in row):
             continue
         rec = {}
-        for col, field in mapping.items():
-            if col >= len(row):
-                continue
-            text = _cell_text(row[col])
-            if text:
-                rec[field] = text
+        for field, cols in cols_by_field.items():
+            texts = []
+            for col in cols:
+                if col >= len(row):
+                    continue
+                text = _cell_text(row[col])
+                if text and text not in texts:
+                    texts.append(text)
+            if texts:
+                rec[field] = "；".join(texts)
         if not any(rec.values()):
             continue
         if not rec.get("数据来源"):
@@ -1056,13 +1145,23 @@ def merge_external_records(records: list):
 
 
 def build_external_rows(records: list, log=print):
-    """外部记录 → 模板行（内容与采集数据同一套清洗规则，只换合并口径）"""
+    """外部记录 → 模板行（内容与采集数据同一套清洗规则，只换合并口径）
+
+    最后一道出口：手机/固话/邮箱/微信四项全空的行不入库（客户要的是“每一条
+    都有至少一种联系方式”，脏行传上去就是客户库里一堆死数据；与采集链路
+    filter_import_rows 同一口径，废数据不会被洗丢）。
+    """
     merged, dup, invalid = merge_external_records(records)
-    rows = [make_row(item["fields"], item["sources"]) for item in merged]
-    no_contact = sum(1 for r in rows if not r["手机号"] and not r["固话"] and not r["邮箱"])
-    log(f"清洗完成：原始 {len(records)} 行 → 有效入库 {len(rows)} 条"
-        f"（剔除无效 {invalid} 行、重复合并 {dup} 行、无任何联系方式 {no_contact} 条）")
-    return rows
+    stats = {}
+    rows = [make_row(item["fields"], item["sources"], stats) for item in merged]
+    kept = [r for r in rows if _has_contact(r)]
+    log(f"清洗完成：原始 {len(records)} 行 → 有效入库 {len(kept)} 条"
+        f"（剔除无效 {invalid} 行、重复合并 {dup} 行、"
+        f"无任何联系方式 {len(rows) - len(kept)} 条、"
+        f"裸号补区号 {stats.get('area_filled', 0)} 个）")
+    if stats.get("area_kept"):
+        log(f"  ↳ 另有 {stats['area_kept']} 个裸号固话因「同一行区号不唯一」保持原样（不猜区号）")
+    return kept
 
 
 def clean_external_records(paths: list, log=print):

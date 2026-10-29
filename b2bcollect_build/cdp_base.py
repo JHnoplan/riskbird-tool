@@ -636,9 +636,16 @@ class CdpSiteCrawler:
     @staticmethod
     def _stable_data_dir():
         """数据目录必须跨运行持久且可写。PyInstaller onefile 下 __file__ 指向每次变、
-        退出即删的 _MEIxxxx，故打包运行用 exe 同级目录，开发用模块目录，再回退用户主目录。"""
+        退出即删的 _MEIxxxx，故打包运行用 exe 同级目录，开发用模块目录，再回退用户主目录。
+        Mac .app 双击启动时 exe 在 Contents/MacOS 里，数据改放 .app 旁边的可见目录：
+        既不塞胖应用包，Gatekeeper 只读转置（App Translocation）下也会落到回退位置。"""
         if getattr(sys, "frozen", False):
-            primary = Path(sys.executable).resolve().parent / "b2bcollect_data"
+            exe_dir = Path(sys.executable).resolve().parent
+            if (sys.platform == "darwin"
+                    and exe_dir.parent.parent.name.endswith(".app")):
+                primary = exe_dir.parent.parent.parent / "b2bcollect_data"
+            else:
+                primary = exe_dir / "b2bcollect_data"
         else:
             primary = Path(__file__).resolve().parent / "b2bcollect_data"
         for d in (primary, Path.home() / ".b2bcollect" / "b2bcollect_data"):

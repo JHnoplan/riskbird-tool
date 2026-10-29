@@ -263,6 +263,83 @@ class AutoSaveWorker(QThread):
         os.replace(tmp, str(path))
 
 
+# ═══════════════════════════════════════════
+#  外部表格智能清洗（「清洗数据」按钮：任意 Excel/CSV 名单 → 入库模版格式）
+# ═══════════════════════════════════════════
+class ExternalCleanWorker(QThread):
+    """读外部表格 → 智能匹配列名 → 清洗 → 写出对齐入库模版的《清洗后入库数据》。
+
+    多个文件全量读写可能几十秒，放 GUI 线程会直接白屏，所以跟自动保存一样走后台线程；
+    单个文件读不了（旧 .xls / 空表）只记一条错误接着处理剩下的，不会一坏就全盘停。
+    """
+    logged = pyqtSignal(str)
+    finished_clean = pyqtSignal(bool, str)     # ok, 给用户看的摘要
+
+    def __init__(self, paths, out_path, template_dirs=None):
+        super().__init__()
+        self.paths = list(paths or [])
+        self.out_path = out_path
+        self.template_dirs = [d for d in (template_dirs or []) if d]
+
+    def run(self):
+        try:
+            self._run_all()
+        except Exception as e:
+            self.finished_clean.emit(False, f"清洗异常：{e}")
+
+    @staticmethod
+    def _drop(p):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+    def _run_all(self):
+        records, report = _cleaner.clean_external_records(self.paths, log=self.logged.emit)
+        bad = [r for r in report if r.get("error")]
+        if not records:
+            detail = "\n".join(f"· {r['file']}：{r['error']}" for r in bad) or "· 所选文件里没有数据行"
+            self.finished_clean.emit(False,
+                                    f"没读到任何数据：\n{detail}\n\n"
+                                    f"请确认文件里有公司名（或企业名称）列。")
+            return
+        rows = _cleaner.build_external_rows(records, log=self.logged.emit)
+        if HAS_YZD:
+            # 与导入云展同一口径的批内去重，保证清洗结果与入库行数对得上
+            rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+        if not rows:
+            self.finished_clean.emit(False, "清洗后没有可入库的记录（公司名全为空或状态异常）")
+            return
+        template = _cleaner.locate_template(start_dirs=self.template_dirs)
+        tmp = f"{self.out_path}.tmp"
+        try:
+            _cleaner.write_clean_excel(rows, tmp, template_path=template, log=self.logged.emit)
+            os.replace(tmp, self.out_path)
+        except PermissionError:
+            self._drop(tmp)
+            self.finished_clean.emit(False,
+                                     f"目标文件正被 Excel/WPS 打开，写不进去：\n{self.out_path}\n"
+                                     f"请先关掉这个文件再重做一次清洗。")
+            return
+        except Exception as e:
+            self._drop(tmp)
+            self.finished_clean.emit(False, f"写出清洗结果失败：{e}")
+            return
+        self._drop(tmp)
+        files = "\n".join(
+            f"· {r['file']}（{r['sheet']}）：{r['rows']} 条" for r in report if not r.get("error"))
+        skipped = "\n".join(f"⚠ {r['file']}：{r['error']}" for r in bad)
+        matched = "；".join(
+            "，".join(r.get("identified") or []) for r in report if r.get("identified"))
+        summary = (f"共清洗 {len(rows)} 条入库数据 →\n{self.out_path}\n\n"
+                   f"读入的文件：\n{files or '· 无'}")
+        if skipped:
+            summary += f"\n\n被跳过：\n{skipped}"
+        self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
+        self.finished_clean.emit(True, summary)
+
+
 # ══════════════════════════════════════════════
 #  云展动力：账号绑定 / 客户库分组 / 导入
 # ═══════════════════════════════════════════════
@@ -1072,9 +1149,11 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("停止")
         self.btn_clean = QPushButton("清洗数据")
         self.btn_clean.setToolTip(
-            "立即把当前已采数据跑一遍清洗：生成/刷新任务文件夹里的「原始」与「清洗后入库数据」两份 Excel，\n"
-            "无联系方式的废数据会自动回流到「待采集公司名单」（启用企知道补采时会被逐家补采）。\n"
-            "采集过程中每满 20 条也会自动清洗保存一次，此按钮用于随时手动触发。")
+            "清洗两种数据之一：\n"
+            "① 上传的 Excel/CSV 表格——任何格式都行，表头+内容双路智能匹配列名，\n"
+            "   洗成符合入库模版的《清洗后入库数据》；\n"
+            "② 本工具已采数据——生成/刷新任务文件夹里的「原始」与「清洗后入库数据」，\n"
+            "   无联系方式的废数据回流「待采集公司名单」交企知道补采。")
         self.btn_export = QPushButton("导出 Excel")
         self.btn_reset = QPushButton("开始新任务")
         self.btn_reset.setToolTip(
@@ -1805,7 +1884,88 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_clean_now(self):
-        """「清洗数据」：把当前已采数据立即跑一遍清洗，落盘原始+清洗入库两份，
+        """「清洗数据」：先选清洗对象——用户上传的任意 Excel/CSV（智能匹配列名洗成
+        入库模版格式），或本工具已采集的数据（原逻辑：两份表格+废数据回流）。"""
+        if getattr(self, "_cleaning", False):
+            QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("选择清洗对象")
+        box.setText("要清洗哪种数据？")
+        btn_ext = box.addButton(
+            "清洗我上传的 Excel/CSV 表格\n（任何名单，智能匹配列名，按入库模版格式输出）",
+            QMessageBox.AcceptRole)
+        btn_session = box.addButton(
+            "清洗本工具已采集的数据\n（出原始+清洗入库两份，废数据回流补采）",
+            QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is btn_ext:
+            self._clean_external_data()
+        elif clicked is btn_session:
+            self._clean_session_data()
+
+    def _clean_external_data(self):
+        """外部表格清洗入口：多选任意 Excel/CSV → 后台智能清洗 → 写入库格式文件"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要清洗的数据文件（可多选）",
+            getattr(self, "_clean_last_dir", "") or str(self._get_desktop_dir()),
+            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+        if not paths:
+            return
+        self._clean_last_dir = os.path.dirname(paths[0]) or ""
+        self._on_log(f"🧹 清洗数据：选中 {len(paths)} 个文件")
+        default_dir = os.path.dirname(paths[0]) or str(self._get_desktop_dir())
+        out, _ = QFileDialog.getSaveFileName(
+            self, "清洗结果保存为（入库模版格式）",
+            os.path.join(default_dir, "清洗后入库数据.xlsx"), "Excel 文件 (*.xlsx)")
+        if not out:
+            self._on_log("已取消清洗数据（未选保存位置）")
+            return
+        if not out.lower().endswith(".xlsx"):
+            out += ".xlsx"
+        if os.path.exists(out) and QMessageBox.question(
+                self, "覆盖已有文件",
+                f"目标文件已存在，确认覆盖？\n{out}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            self._on_log("已取消清洗数据（不覆盖已有文件）")
+            return
+        # 清洗走后台：多个大文件读下来几十秒，直接在 GUI 线程里做就是白屏
+        self._cleaning = True
+        self.setEnabled(False)
+        prog = YzdProgressDialog(None, "正在清洗数据")
+        prog.set_text(f"正在清洗 {len(paths)} 个文件…", "清洗在后台进行，请勿关闭程序。")
+        self._clean_progress = prog
+        prog.show()
+        worker = ExternalCleanWorker(paths, out, template_dirs=[
+            os.path.dirname(out), default_dir, str(Path.home() / "Downloads")])
+        worker.logged.connect(self._on_log)
+        worker.finished_clean.connect(self._on_external_clean_finished)
+        self._clean_worker = worker
+        worker.start()
+
+    def _on_external_clean_finished(self, ok: bool, msg: str):
+        self._cleaning = False
+        self.setEnabled(True)
+        prog = getattr(self, "_clean_progress", None)
+        if prog is not None:
+            try:
+                prog.allow_close()
+                prog.close()
+            except Exception:
+                pass
+            self._clean_progress = None
+        self.activateWindow()
+        self._on_log(("✅ " if ok else "❌ ") + msg.replace("\n", "  "))
+        if ok:
+            QMessageBox.information(self, "清洗完成", msg)
+        else:
+            QMessageBox.warning(self, "清洗未完成", msg)
+
+    def _clean_session_data(self):
+        """把当前已采数据立即跑一遍清洗，落盘原始+清洗入库两份，
         废数据经 clean_records 的 waste_sink 回流待采名单。数据量有限，同步执行秒级完成。"""
         rows = self.session.snapshot_results()
         if not rows:
@@ -2214,11 +2374,33 @@ def _app_stylesheet():
     """
 
 
+def _fatal_log(exc):
+    """启动即崩时把 traceback 落盘：Finder 双击打开没有终端，错误看不见，
+    日志就是在对方电脑上排查「图标转一下消失」的唯一线索。"""
+    import traceback
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    for d in (Path.home() / "Desktop", Path.home() / ".b2bcollect"):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "B2B采集工具启动错误.log").write_text(text, encoding="utf-8")
+            break
+        except OSError:
+            continue
+
+
 def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet(_app_stylesheet())
-    w = MainWindow()
-    w.show()
+    try:
+        app = QApplication(sys.argv)
+        app.setStyleSheet(_app_stylesheet())
+        w = MainWindow()
+        w.show()
+    except Exception as e:
+        _fatal_log(e)
+        try:
+            QMessageBox.critical(None, "工具启动失败", f"{type(e).__name__}: {e}\n\n详细堆栈见桌面「B2B采集工具启动错误.log」。")
+        except Exception:
+            pass
+        raise
     sys.exit(app.exec_())
 
 

@@ -37,6 +37,31 @@ else:
     _HERE = Path(__file__).resolve().parent
     _ROOT = _HERE.parent
 
+
+def _writable_data_dir():
+    """持久数据目录：先试 exe 同级，写不动就退用户主目录。
+
+    macOS 被 Gatekeeper 隔离的 .app 会从只读随机路径（App Translocation）启动，
+    这时 exe 同级在包内且不可写，裸 mkdir 直接 PermissionError 把程序带走；
+    与 cdp_base._stable_data_dir 同一策略：Mac .app 优先放包旁边的可见目录，
+    先写探针文件验可写，不行再退 ~/.b2bcollect。
+    """
+    if (getattr(sys, "frozen", False) and sys.platform == "darwin"
+            and _HERE.parent.parent.name.endswith(".app")):
+        primary = _HERE.parent.parent.parent / "b2bcollect_data"
+    else:
+        primary = _HERE / "b2bcollect_data"
+    for d in (primary, Path.home() / ".b2bcollect" / "b2bcollect_data"):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("1", encoding="utf-8")
+            probe.unlink()
+            return d
+        except Exception:
+            continue
+    return primary
+
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
     HAS_PYQT = True
@@ -102,9 +127,9 @@ if HAS_1688:
             if _Signals1688 is not None:
                 self.signals = _Signals1688()
             self.pin_tab_id = ""      # Selenium 站不进 shared_chrome 的 CDP pin 表
-            # 种子库落在本工具数据目录（与原 1688 工具的库分开，互不污染）
-            self._data_dir = _HERE / "b2bcollect_data"
-            self._data_dir.mkdir(parents=True, exist_ok=True)
+            # 种子库落在本工具数据目录（与原 1688 工具的库分开，互不污染）；
+            # 只读启动环境（App Translocation）下自动退到 ~/.b2bcollect
+            self._data_dir = _writable_data_dir()
             self._seen_store_path = self._data_dir / "seen_store_1688.json"
             # session 级量化账目（stats() 八键契约）
             self.stat_pages = 0

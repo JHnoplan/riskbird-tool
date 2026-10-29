@@ -1,0 +1,53 @@
+name: Build B2bCollectTool Mac App
+
+# b2bcollect 工具的 macOS 云端打包（与 build-b2bcollect.yml 的 Windows 打包互相独立）。
+# macos-14 是 Apple Silicon（arm64）runner：本仓库开发机是 Intel，打不出 M 芯片原生机，
+# 必须借云端 arm64 环境。PyQt5 5.15.11+/lxml 均有 arm64 wheel，selenium 纯 Python，可直接装。
+# paths 故意不含 workflow 文件自身：改 yml 不触发，需要时手动 Run workflow（workflow_dispatch）。
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'b2bcollect_build/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    concurrency:
+      group: build-b2bcollect-mac-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python (arm64)
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+    - name: Download chromedriver (Stable mac-arm64)
+      run: python .github/scripts/fetch_chromedriver_mac_arm64.py
+
+    - name: Build .app with PyInstaller
+      # 与 Windows 版同一套 hidden-import/datas 清单（pip 名≠import 名两个都写）；
+      # macOS 用 --windowed 出 onedir .app（不用 --onefile：解包慢且杀软/ Gatekeeper 更折腾），
+      # 路径分隔符用「:」，chromedriver 打进 _MEIPASS 根（chrome_driver.candidates frozen 首选位）。
+      run: |
+        cd b2bcollect_build
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
+
+    - name: Zip app bundle (ditto preserves perms/attrs)
+      run: ditto -c -k --keepParent b2bcollect_build/dist/B2bCollectTool.app B2bCollectTool_Mac_arm64.zip
+
+    - name: Upload Mac artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: B2bCollectTool-Mac
+        path: B2bCollectTool_Mac_arm64.zip
