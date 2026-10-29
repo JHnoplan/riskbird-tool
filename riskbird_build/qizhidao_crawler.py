@@ -29,6 +29,39 @@ from selenium.common.exceptions import (
     StaleElementReferenceException, WebDriverException
 )
 
+def _stable_data_dir():
+    """Cookie 持久目录：必须跨运行稳定且可写，且绝不能在应用包内部。
+
+    两个坑（都是实机踩出来的）：
+    1. PyInstaller onefile 下 __file__ 指向每次启动都变、退出即删的 _MEIxxxx，
+       用它当 Cookie 目录会导致每次都得重新登录；
+    2. macOS 被 Gatekeeper 隔离的 .app 从只读随机路径启动（App Translocation），
+       包内裸 mkdir 直接抛 OSError [Errno 30] Read-only file system 把程序带走。
+    故打包运行用「exe 同级目录」（Mac .app 用包旁边的 b2bcollect_data，与
+    cdp_base/site_adapters 同一约定），开发运行仍用模块目录（老 Cookie 不丢），
+    每个候选都先写探针验真可写，全不可写再退 ~/.b2bcollect。
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if (sys.platform == "darwin"
+                and exe_dir.parent.parent.name.endswith(".app")):
+            primary = exe_dir.parent.parent.parent / "b2bcollect_data" / "riskbird_data"
+        else:
+            primary = exe_dir / "riskbird_data"
+    else:
+        primary = Path(__file__).resolve().parent / "riskbird_data"
+    for d in (primary, Path.home() / ".b2bcollect" / "riskbird_data"):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("1", encoding="utf-8")
+            probe.unlink()
+            return d
+        except Exception:
+            continue
+    return primary
+
+
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
     HAS_PYQT = True
@@ -81,9 +114,8 @@ class QiZhiDaoCrawler:
         else:
             self.signals = None
 
-        # Cookie 持久化
-        self._data_dir = Path(__file__).parent / "riskbird_data"
-        self._data_dir.mkdir(exist_ok=True)
+        # Cookie 持久化（目录见 _stable_data_dir：只读包内绝不落盘）
+        self._data_dir = _stable_data_dir()
         self._cookie_file = self._data_dir / "qizhidao_cookies.json"
 
         # 速率控制

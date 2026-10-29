@@ -259,9 +259,16 @@ class Ali1688Crawler:
         """种子库/数据目录必须跨运行持久，且要可写。
         PyInstaller onefile 下 __file__ 指向每次启动都变、退出即删的 _MEIxxxx 临时目录，
         用它当数据目录会让 seen_store.json 既写不进也活不到下一轮（跨运行去重彻底失效）。
-        故：打包运行时用「exe 同级目录」，开发时用模块目录；都不可写再回退用户主目录。"""
+        故：打包运行时用「exe 同级目录」，开发时用模块目录；都不可写再回退用户主目录。
+        Mac .app 双击启动时 exe 在 Contents/MacOS 里（Gatekeeper 转置下还是只读的），
+        改放 .app 旁边的 b2bcollect_data，与本工具其它持久数据同处一个可见目录。"""
         if getattr(sys, "frozen", False):
-            primary = Path(sys.executable).resolve().parent / "ali1688_data"
+            exe_dir = Path(sys.executable).resolve().parent
+            if (sys.platform == "darwin"
+                    and exe_dir.parent.parent.name.endswith(".app")):
+                primary = exe_dir.parent.parent.parent / "b2bcollect_data" / "ali1688_data"
+            else:
+                primary = exe_dir / "ali1688_data"
         else:
             primary = Path(__file__).resolve().parent / "ali1688_data"
         for d in (primary, Path.home() / ".ali1688" / "ali1688_data"):
