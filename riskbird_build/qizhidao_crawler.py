@@ -411,7 +411,7 @@ class QiZhiDaoCrawler:
                 return True
             handles = self.driver.window_handles
             if self._own_handle not in handles:
-                self.driver.switch_to.new_window("window")
+                self.driver.switch_to.new_window(getattr(self, "_own_window_type", "window"))
                 self._own_handle = self.driver.current_window_handle
                 self._log("  原窗口已被关闭，已重新开一个独占窗口")
                 return True
@@ -436,7 +436,7 @@ class QiZhiDaoCrawler:
                 # 驱动必须先用本地的：打包版里项目内路径永远不存在，直接建会话会退给
                 # Selenium Manager 联网查版本，界面就变成“Chrome 开了但页面半天不出”
                 self.driver = chrome_driver.create(opts, self._log, ports=[attach_port])
-                self.driver.switch_to.new_window("window")
+                self.driver.switch_to.new_window(getattr(self, "_own_window_type", "window"))
                 self._own_handle = self.driver.current_window_handle
                 self.driver.execute_cdp_cmd(
                     "Page.addScriptToEvaluateOnNewDocument",

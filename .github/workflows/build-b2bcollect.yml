@@ -55,21 +55,7 @@ jobs:
       # gys_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool ^
-          --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 ^
-          --hidden-import requests --hidden-import websocket --hidden-import websocket_client ^
-          --hidden-import openpyxl ^
-          --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session ^
-          --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler ^
-          --hidden-import aipage_crawler --hidden-import site_adapters --hidden-import pending_companies ^
-          --hidden-import keyword_expander --hidden-import customer_library_cleaner ^
-          --hidden-import yzd_client --hidden-import task_registry ^
-          --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" ^
-          --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" ^
-          --add-data "..\riskbird_build\block_guard.py;riskbird_build" ^
-          --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" ^
-          --add-data "..\ali1688_build\drivers;drivers" ^
-          b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
