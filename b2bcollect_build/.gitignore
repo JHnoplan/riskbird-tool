@@ -1,0 +1,11 @@
+# PyInstaller 产物与构建中间物（体积大/可再生，绝不入库）
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# 运行时产物
+b2bcollect_data/
+*.out
+*.log

@@ -1,0 +1,78 @@
+name: Build B2bCollectTool EXE
+
+# 独立 workflow：只有 B2B 多平台工具自身的文件变化才触发打包，
+# 与风鸟、1688 两个工具互不牵连（各自独立 workflow，paths 过滤到各自目录）。
+#
+# 依赖说明（更正历史错误注释）：
+#   · 5 个关键词通道（中国制造网/八方资源网/顺企网/爱采购/1688 部分）走「裸 CDP」
+#     （requests + websocket-client 直连共享 Chrome 调试端口 9255）；
+#   · 但「1688」与「企知道补采」两条通道经由 site_adapters 复用成熟的 Selenium 爬虫
+#     （ali1688_build / riskbird_build），因此本工具【确实依赖 selenium + chromedriver】，
+#     与 1688 工具一样需内置驱动——旧注释「不依赖 selenium」是错的。
+#   · site_adapters 跨目录引用的 4 个源文件与驱动，一并通过 --add-data 打进包；
+#     frozen 运行时由 site_adapters 从 sys._MEIPASS 解析这些外部模块树。
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'b2bcollect_build/**'
+  workflow_dispatch:  # 允许在 Actions 页面手动只打包这个工具
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # 同一工具的新提交自动取消仍在排队的旧构建，避免排队干等
+    concurrency:
+      group: build-b2bcollect-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      # 裸 CDP 链路（requests / websocket-client，bs4 用 lxml 解析器）＋
+      # 1688/企知道通道所需的 selenium。清单与 b2bcollect_build/*.py 顶层 import 对齐。
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+    - name: Download chromedrivers (Stable + 2 previous majors, win64)
+      # 复用 1688 工具同款脚本：下载最近 3 个大版本的 win64 驱动，按
+      # chromedriver.<大版本>.exe 注版放进 ali1688_build/drivers/，运行时按浏览器
+      # 实际版本挑配套的驱动（驱动大版本与浏览器不匹配时新版报 cannot connect）。
+      run: python .github/scripts/fetch_chromedrivers.py
+
+    - name: Build EXE with PyInstaller
+      # hidden-import 覆盖全部本地模块（跨模块新增 import 未被依赖分析收录会导致
+      # exe 启动即 ModuleNotFoundError）；pip 名≠import 名的两个名字都写
+      # （websocket-client→websocket / websocket_client；beautifulsoup4→bs4）。
+      # gys_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
+      run: |
+        cd b2bcollect_build
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool ^
+          --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 ^
+          --hidden-import requests --hidden-import websocket --hidden-import websocket_client ^
+          --hidden-import openpyxl ^
+          --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session ^
+          --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler ^
+          --hidden-import aipage_crawler --hidden-import site_adapters --hidden-import pending_companies ^
+          --hidden-import keyword_expander --hidden-import customer_library_cleaner ^
+          --hidden-import yzd_client --hidden-import task_registry ^
+          --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" ^
+          --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" ^
+          --add-data "..\riskbird_build\block_guard.py;riskbird_build" ^
+          --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" ^
+          --add-data "..\ali1688_build\drivers;drivers" ^
+          b2bcollect_gui.py
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: B2bCollectTool
+        path: b2bcollect_build/dist/B2bCollectTool.exe

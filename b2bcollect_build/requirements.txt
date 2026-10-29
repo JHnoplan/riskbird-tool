@@ -1,0 +1,13 @@
+# B2B 多平台企业数据自动采集工具 依赖
+# 与主项目共用 .venv；如单独环境请 pip install -r requirements.txt
+#
+# 说明：5 个关键词通道走「裸 CDP」（websocket-client 直连 Chrome 调试端口），
+# 但 1688 与「企知道补采」两条通道经由 site_adapters 复用 Selenium 爬虫，
+# 因此需要 selenium；仅需本机已安装 Google Chrome。
+PyQt5>=5.15
+selenium>=4.15
+requests>=2.28
+websocket-client>=1.6
+openpyxl>=3.1
+beautifulsoup4>=4.12
+lxml>=4.9
