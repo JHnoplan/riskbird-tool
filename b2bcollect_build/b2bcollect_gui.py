@@ -125,8 +125,10 @@ SITE_TIPS = {
               "所以那种情况下不会也不该开页面让你找入口（提醒会写明「IP限流·无需操作」）；"
               "想马上恢复只能重拨宽带/换网络（手机热点）换个出口 IP，或等 ≥30 分钟。已采数据不丢，断点续采。\n"
               "八方偶尔也会返真正可人工过的验证插页，那时会自动借一个标签把页面摆到眼前，"
-              "过完把 clearance Cookie 抄回 HTTP 会话续采；拿不准手上这条属于哪类时，"
-              "点弹窗里的「打开该站页面自查」自己看一眼即可。",
+              "过完把 clearance Cookie 抄回 HTTP 会话续采。\n"
+              "界面上只剩两个按钮要认：「我换好网络了，马上继续」= 换完上网地址后立刻重测"
+              "（不用等下一轮探测，也不用重启工具）；「打开网站让我看一眼」= 自己看看是真有"
+              "滑块还是单纯被拦。提醒里不再出现「请到 Chrome 找验证码」这类对白等的话。",
     "11467": "顺企网 11467.com：纯 HTTP 关键词搜索(b2b.11467.com)→公司商铺子域联系方式页(contact.asp)+商铺首页，"
               "联系人/手机/固话/邮箱/QQ 微信都在标签行里直接解析；平时不占用浏览器标签。\n"
               "防采：请求过快会返 HTTP 429 + v.js 人机挑战（纯 HTTP 不执行 JS，拿到的就是空页）——"
@@ -1361,26 +1363,28 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(False)
 
     def _on_blocked(self, reason):
-        """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（验证等待不计入采集耗时）。
+        """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（等待不计入采集耗时）。
 
-        两类拦截必须分型处置，不能再一律「叫人工」（客户原话：八方出验证码却找不到
-        入口，只能在你设计的软件点确认）：
-        · IP 级限流（八方 502 / 供应商网 520）：页面里根本没滑块，工具也没开浏览器，
-          所以横幅/弹窗绝不能写「已在 Chrome 里打开对应页面」——那是句谎话，害用户
-          满屏找入口白等；也不去还原窗口（没东西可看）；
-        · 可人工过的验证页（1688 滑块那种）：才保持「已把页面递到眼前 + 后台化时还原窗口」。
+        两类拦截必须分开说（客户原话：八方出验证码却找不到入口，只能在你设计的软件点确认）：
+        · 网站拒这台电脑的上网地址（IP 限流，八方 502 那种）：页面里根本没滑块，工具
+          也没开浏览器，所以绝不能再写「已在 Chrome 里打开对应页面」——那句谎话就是
+          用户满屏找入口的原因；也不去还原窗口（没东西可看）；
+        · 真要人过验证（1688 滑块那种）：才提「去 Chrome 里把滑块拖完」。
+        两类都给一个「我换好网络了，马上继续」按钮：换出口 IP 是前者唯一立刻有效的招，
+        而这一下只能人动手，点完工具自己重测，不用干等下一轮探测。
         分型依据是爬虫在 reason 里打的前缀标记，界面不再靠猜文案关键字。"""
         kind, name, detail = self._split_block(reason)
         self._block_site = name
+        label = name or "这个网站"
         if kind == "ip":
             self._show_banner(
-                f"⚠ {name or '该站点'}：IP 级限流（不是验证码，不需要你操作）——{detail}。"
-                f"已停止对本站发请求，等放行后自动续采；想马上恢复请重拨宽带/换网络换个出口 IP。",
+                f"⚠ {label}：暂时拦住了你这台电脑的上网地址（不是验证码，不需要你操作）。"
+                f"换个网络（比如连手机热点）后，点弹窗里的「我换好网络了，马上继续」就接着采。",
                 "#fff3cd", "#664d03")
         else:
             self._show_banner(
-                f"⚠ 触发人机验证（{detail}）：请到 Chrome 窗口里手动过一下验证，过后自动续采；"
-                f"没看到页面就点弹窗里的「打开该站页面自查」。",
+                f"⚠ {label}：需要你亲手过一下验证——到 Chrome 窗口把滑块拖完，过完自动接着采；"
+                f"没看到网页就点弹窗里的「打开网站让我看一眼」。",
                 "#f8d7da", "#721c24")
         self._show_block_alert(kind, name, detail)
         self._hold_timer(True)
@@ -1411,65 +1415,80 @@ class MainWindow(QMainWindow):
         """拦截提醒弹窗：非模态（模态会阻塞主窗口事件循环，用户反而不能操作），
         全局只留一个实例，多站同时被拦时只更新文案不叠窗。
 
-        文案按拦截类型分开写，不再一句「已在 Chrome 里打开对应页面」走天下：
-        IP 级限流根本不会开浏览器（八方 502），那句谎话就是客户「找不到入口、只能在你
-        软件里点确认」的根源；而 1688 那种真滑块的站确实会开页。两类都提供一个由用户
-        主动点的「打开该站页面自查」按钮，让他想看时能看到（人在环但不瞎拉窗口）。"""
+        文案按拦截类型分开写，而且写成没技术背景的人也看得懂的大白话：
+        只讲「发生了什么 + 要不要你动手 + 动手就点哪个按钮」，
+        不堆「IP 级限流/退避/熔断」这类只有开发者看得懂的词——
+        旧那句「已在 Chrome 里打开对应页面」对拦 IP 这一类根本不成立，
+        就是客户「找不到入口、只能在你软件里点确认」的根源。
+        两个按钮都由用户主动点：「我换好网络了，马上继续」与「打开网站让我看一眼」。"""
         ip_mode = kind == "ip"
-        label = name or "该站点"
+        label = name or "这个网站"
         box = getattr(self, "_block_alert", None)
         if box is None:
             box = QMessageBox(self)
             box.setStandardButtons(QMessageBox.Ok)
             box.setModal(False)
-            btn = box.addButton("打开该站页面自查", QMessageBox.ActionRole)
-            btn.clicked.connect(self._on_block_selfcheck)
-            self._block_check_btn = btn
+            box.button(QMessageBox.Ok).setText("知道了，先等一等")
+            b_retry = box.addButton("▶ 我换好网络了，马上继续", QMessageBox.ActionRole)
+            b_retry.clicked.connect(self._on_block_retry_now)
+            b_check = box.addButton("🌐 打开网站让我看一眼", QMessageBox.ActionRole)
+            b_check.clicked.connect(self._on_block_selfcheck)
+            self._block_retry_btn = b_retry
+            self._block_check_btn = b_check
             self._block_alert = box
-        box.setWindowTitle("站点限流冷却中（不需要你操作）" if ip_mode else "需要人工过验证")
+        box.setWindowTitle("网站暂时拦了一下（不需要你操作）" if ip_mode else "需要你亲手过一下验证")
         box.setIcon(QMessageBox.Information if ip_mode else QMessageBox.Warning)
         if ip_mode:
             box.setText(
-                f"⚠ {label}：这是 IP 级限流/冷却，不是验证码。\n\n{detail}\n\n"
-                "・页面里没有滑块可点，不需要你做任何操作；工具已停止对本站发请求，\n"
-                "  会拉长间隔实测，站点放行后自动续采（已采数据全部保存，下次断点续采）。\n"
-                "・这一类工具不会自动打开 Chrome 页面（旧提醒里那句「已打开」对本类不适用）。\n\n"
-                "想马上恢复（按有效程度排序）：\n"
-                "① 重拨宽带/换个网络（手机热点也行）——换个出口 IP，通常立即能用；\n"
-                "② 等 30 分钟以上再跑；\n"
-                "③ 把「采集间隔」调到 8~15 秒，避开再次触发限流。\n\n"
-                "不确定？点「打开该站页面自查」自己看一眼：Chrome 里也报错就是 IP 被限，\n"
-                "只能换 IP 或等冷却；Chrome 能正常打开则可能有可手动过的验证。")
+                f"⚠ {label}：这个网站暂时不肯让你这台电脑访问了。\n"
+                f"（网站那边回的一句话：{detail}）\n\n"
+                "「重点：这不是验证码」\n"
+                "页面里没有滑块要拖，也不用输文字，\n"
+                "所以你不用找入口，也不用回到这里点任何确认。\n\n"
+                "为什么会这样：网站觉得你这台电脑来得太快，把这个「上网地址」\n"
+                "暂时拦了。只要换一个新的上网地址，它立刻就放行。\n\n"
+                "照这两步做（最快，两分钟就好）：\n"
+                "第 1 步：给电脑换个上网方式\n"
+                "    ・手机上打开「个人热点」，让电脑连上手机热点；\n"
+                "    ・或者把家里路由器拔电、数 60 秒再插上。\n"
+                "第 2 步：点下面这个按钮「我换好网络了，马上继续」\n"
+                "    工具会自己马上再试一次，通了就接着往下采，不用你管。\n\n"
+                "已经采到的数据都存在电脑上，一条不会丢，接着往下采就行。\n"
+                "不想换网络也没关系：什么都不用点，等 30 分钟它一般会自己放行。")
         else:
             box.setText(
-                f"⚠ {label}：站点弹出人机验证，需要你手动过一下。\n\n{detail}\n\n"
-                "站点页面会在 Chrome 里打开并拉到前台（没看到就点下面的自查）。\n"
-                "・有滑块/验证码 → 在那个窗口里手动过完；\n"
-                "・页面正常打开了却没验证控件 → 其实是 IP 限流，不用操作，等冷却就行。\n"
-                "看门狗会实测「能不能真拿到数据」，确认后自动续采，\n"
-                "不需要回来点任何按钮（关掉本窗也不会停等待）。")
+                f"⚠ {label}：这个网站要你亲手过一下验证。\n"
+                f"（网站那边回的一句话：{detail}）\n\n"
+                "怎么做：\n"
+                "第 1 步：看电脑上的 Chrome 浏览器窗口，里面应该已经开着这个网站；\n"
+                "    ・有滑块 / 有图片要点 → 照着拖完点完（和平时上网一样）；\n"
+                "    ・没看到 Chrome 窗口 → 点下面「打开网站让我看一眼」。\n"
+                "第 2 步：过完验证什么都不用点，工具自己会发现能采了，接着往下采。\n\n"
+                "注意：如果网页能正常打开、根本没有滑块要拖，\n"
+                "那就不是验证码，而是网站暂时拦了这个上网地址——\n"
+                "碰到那种情况：换个网络（连手机热点）后点「我换好网络了，马上继续」。\n\n"
+                "已经采到的数据都存着，不会丢；关掉本窗口也不会停止等待。")
         box.show()
         box.raise_()
         box.activateWindow()
 
-    def _on_block_selfcheck(self):
-        """拦截弹窗里的自查按钮：用户主动点才去拉/前置 Chrome 窗口（与自动拉窗相对）。
-        有网络 IO、可能首次拉起浏览器，所以走后台线程，回控靠主线程轮询。"""
-        name = getattr(self, "_block_site", "")
+    def _run_block_action(self, btn, method_name, busy_msg):
+        """拦截弹窗里两个按钮共用的后台执行器：都是可能拉浏览器/发网络请求的活，
+        在主线程里直接做会把整个窗口卡成「未响应」（同类老坑），所以走线程 + 轮询恢复按钮。"""
         if getattr(self, "_opening_check", False):
             return
+        name = getattr(self, "_block_site", "")
         self._opening_check = True
-        btn = getattr(self, "_block_check_btn", None)
-        if btn:
+        if btn is not None:
             btn.setEnabled(False)
-        self._on_log("正在 Chrome 里打开被拦站点的页面供你自查（首次会拉起共享浏览器）…")
+        self._on_log(busy_msg)
 
         def task():
             try:
-                ok, msg = self.session.open_site_check(name)
+                ok, msg = getattr(self.session, method_name)(name)
                 self.session._log(("✅ " if ok else "⚠ ") + msg)
             except Exception as e:
-                self.session._log(f"⚠ 打开自查页失败：{str(e).splitlines()[0][:120]}")
+                self.session._log(f"⚠ 操作失败：{str(e).splitlines()[0][:120]}")
             finally:
                 self._opening_check = False
 
@@ -1478,9 +1497,20 @@ class MainWindow(QMainWindow):
         def poll():
             if getattr(self, "_opening_check", False):
                 QTimer.singleShot(400, poll)
-            elif btn:
+            elif btn is not None:
                 btn.setEnabled(True)
         QTimer.singleShot(400, poll)
+
+    def _on_block_selfcheck(self):
+        """「打开网站让我看一眼」：用户主动点才去拉/前置 Chrome 窗口（与自动拉窗相对）。"""
+        self._run_block_action(getattr(self, "_block_check_btn", None), "open_site_check",
+                               "正在 Chrome 里打开这个网站的页面（首次会拉起共享浏览器）…")
+
+    def _on_block_retry_now(self):
+        """「我换好网络了，马上继续」：他刚换了出口 IP，让工具不等退避立即重测。
+        这一步对不懂技术的人就是「点一下」：被拦计数与降速都会清零，不需要重启工具。"""
+        self._run_block_action(getattr(self, "_block_retry_btn", None), "retry_site_now",
+                               "正在让网站马上再试一次（已重置本站被拦计数与采集间隔）…")
 
     def _close_block_alert(self):
         box = getattr(self, "_block_alert", None)

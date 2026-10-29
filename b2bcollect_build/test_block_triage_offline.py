@@ -37,10 +37,12 @@ class FakeTime:
     def __init__(self, start=1000.0):
         self.now = start
         self.slept = []
+        self.on_sleep = None
 
     def reset(self, start=1000.0):
         self.now = start
         self.slept = []
+        self.on_sleep = None
 
     def time(self):
         return self.now
@@ -51,6 +53,9 @@ class FakeTime:
     def sleep(self, s):
         self.slept.append(s)
         self.now += s
+        cb, self.on_sleep = self.on_sleep, None      # 模拟用户在等待中途点了按钮
+        if cb:
+            cb()
 
     def __getattr__(self, item):
         return getattr(_real_time, item)
@@ -336,6 +341,46 @@ check("kind=ip 时 BLOCK_OPEN_BROWSER=True 也不会被拉去等人工（八方�
       k2._ip_cooldown is True)
 
 # ══════════════════════════════════════════════════════════
+# 4c) 小白逃生口：换了出口 IP 之后点「我换好网络了，马上继续」，当场重测
+#      （旧行为只能干等下一个 45s~600s 探测周期，读不懂也等不起）
+# ══════════════════════════════════════════════════════════
+w1 = B2b168Crawler()
+eq1, lq1 = equip(w1)
+w1._block_reason = REASON_502
+w1._block_times = []
+w1._block_probe_url = "https://b2b168.com/x"     # 刚被拦的那一页
+w1._current_delay = 30.0                 # 被拦后自动降速到的值
+w1.BLOCK_POLL_IP, w1.BLOCK_MAX_WAIT_IP = 45, 300
+w1._max_blocks_ip = 3
+hit_t = []
+
+
+def wake_probe():
+    hit_t.append(FT.now)
+    return "" if len(hit_t) >= 2 else REASON_502     # 换完网络第二次就通
+
+
+FT.on_sleep = w1.retry_now               # 等待中途模拟用户按下按钮
+res_w = w1._wait_manual_unblock(REASON_502, wake_probe)
+check(f"点了「马上继续」就不等 45s 退避，立刻真探一次（首次探测在 {round(hit_t[0] - 1000.0, 1)}s）",
+      hit_t and hit_t[0] - 1000.0 < 5)
+check("重测通过即恢复续采（返回 True 让上层重试同一请求）", res_w is True)
+check("retry_now 把被拦计数清零（换的是新出口 IP，不该按旧 IP 黑历史熔断）",
+      w1._block_times == [])
+check("retry_now 把自动降速的间隔复原（新 IP 不需要背着 30s 的包袱）",
+      w1._current_delay == w1.delay_between)
+check("retry_now 后仍记着被拦页地址，重测打的就是那一页",
+      w1._block_probe_url == "https://b2b168.com/x")
+check("等待日志里能看到「不等本轮退避，立刻重测」",
+      any("不等本轮退避" in m for m in lq1))
+
+FT.on_sleep = None
+w2 = B2b168Crawler()
+eq2, lq2 = equip(w2)
+check("没在被拦时点按钮也不谎称在重测（如实说明当前没在等放行）",
+      w2.retry_now() is False and any("没在等放行" in m for m in lq2))
+
+# ══════════════════════════════════════════════════════════
 # 5) 请求级节流：一家公司 5 个请求不再背靠背打出去
 # ══════════════════════════════════════════════════════════
 check("八方开启请求级节流（只按记录收尾睡一次是它被 502 的直接原因）",
@@ -407,16 +452,26 @@ ip_text = src_alert.split("if ip_mode:", 1)[1].split("else:", 1)[0]
 cap_text = src_alert.split("else:", 1)[1]
 check("IP 类弹窗不再出现「已在 Chrome 里打开对应页面」那句谎话",
       "已在 Chrome 里打开对应页面" not in ip_text)
-check("IP 类弹窗直说「不是验证码」并给恢复手段",
-      all(k in ip_text for k in ("不是验证码", "重拨宽带", "采集间隔", "断点续采")))
+check("IP 类弹窗直说「不是验证码」并给看得懂的两步做法",
+      all(k in ip_text for k in ("不是验证码", "手机热点", "马上继续", "不会丢")))
+check("IP 类弹窗正文不堆开发者术语（没技术背景的人也读得懂）",
+      not any(k in ip_text for k in ("IP 级", "限流", "退避", "熔断", "看门狗")))
 check("IP 类弹窗不再把用户支使去 Chrome 找入口（只给可选的自查）",
       "请切到那个 Chrome 窗口" not in ip_text)
-check("验证页弹窗保留「手动过完」指引，并提示「没控件其实是限流」",
-      all(k in cap_text for k in ("手动过完", "IP 限流")))
-check("弹窗提供用户主动点的「打开该站页面自查」按钮",
-      "打开该站页面自查" in src_alert and hasattr(W, "_on_block_selfcheck"))
-check("自查走后台线程（有网络 IO，主线程调用会白屏）",
-      "threading.Thread" in inspect.getsource(W._on_block_selfcheck))
+check("验证页弹窗讲清「第1步拖滑块、第2步什么都不用点」",
+      all(k in cap_text for k in ("拖完点完", "第 1 步", "第 2 步", "接着往下采")))
+check("验证页弹窗也提示「没有滑块就是被拦，换网络点马上继续」",
+      "根本没有滑块" in cap_text and "马上继续" in cap_text)
+check("弹窗提供「我换好网络了，马上继续」按钮（换完 IP 一键立刻重测，不用干等）",
+      "我换好网络了，马上继续" in src_alert and hasattr(W, "_on_block_retry_now"))
+check("弹窗提供「打开网站让我看一眼」按钮（想看才开页）",
+      "打开网站让我看一眼" in src_alert and hasattr(W, "_on_block_selfcheck"))
+check("两个按钮共用一个后台执行器（主线程里拉浏览器会整窗「未响应」）",
+      "threading.Thread" in inspect.getsource(W._run_block_action) and
+      "_run_block_action" in inspect.getsource(W._on_block_selfcheck) and
+      "_run_block_action" in inspect.getsource(W._on_block_retry_now))
+check("两套弹窗正文都不出现开发者术语（界面层用大白话）",
+      not any(k in ip_text + cap_text for k in ("退避", "熔断", "看门狗", "轮询")))
 check("分型前缀由采集端集中定义，界面与爬虫共用同一常量（不会各自漂移）",
       gui.BLOCK_TAG_IP is cdp_base.BLOCK_TAG_IP and gui.BLOCK_TAG_CAP is cdp_base.BLOCK_TAG_CAP)
 
@@ -431,9 +486,14 @@ class FakeCrawler:
     BASE_URL = "https://www.b2b168.com/"
     _block_probe_url = "https://b2b168.com/x"
     _blocked = True
+    retried = 0
 
     def open_verify_page(self, url=""):
         calls2.append(url)
+        return True
+
+    def retry_now(self):
+        self.retried += 1
         return True
 
 
@@ -452,7 +512,9 @@ class NoPageCrawler(FakeCrawler):
 
 
 class FakeSessionMini:
+    """只装 ParallelSession 的选站/开页/重测三个方法（不建真采集器、不联网）。"""
     port = 9255
+    _pick_site = ParallelSession._pick_site
 
     def __init__(self, crawlers):
         self.crawlers = crawlers
@@ -478,7 +540,7 @@ check("站名缺失（旧适配器文本）时按「当前被拦的站」兜底"
 
 sess3 = FakeSessionMini({"old": NoTabCrawler()})
 ok3, msg3 = ParallelSession.open_site_check(sess3, "某旧站")
-check("站点不具备自查页能力时给明确提示而不是崩", ok3 is False and "不支持自查页" in msg3)
+check("站点不具备开页能力时给明确提示而不是崩", ok3 is False and "打不开它的网页" in msg3)
 
 sess4 = FakeSessionMini({"b2b168": FakeCrawler()})
 ok4, msg4 = ParallelSession.open_site_check(sess4, "不存在的站")
@@ -492,6 +554,17 @@ sess6 = FakeSessionMini({"b2b168": type("X", (FakeCrawler,), {"open_verify_page"
 ok6, msg6 = ParallelSession.open_site_check(sess6, "八方资源网")
 check("共享浏览器不可用时如实说失败（旧实现根本开不了页却谎称已打开）",
       ok6 is False and "共享浏览器" in msg6)
+
+fc = FakeCrawler()
+sess7 = FakeSessionMini({"b2b168": fc})
+ok7, msg7 = ParallelSession.retry_site_now(sess7, "八方资源网")
+check(f"「马上继续」按站名找到对应采集器并叫醒看门狗（{msg7}）",
+      ok7 is True and fc.retried == 1)
+ok7b, msg7b = ParallelSession.retry_site_now(FakeSessionMini({"old": NoTabCrawler()}), "某旧站")
+check("旧适配器没有这个能力时如实提示，不假装重测了",
+      ok7b is False and "不支持" in msg7b)
+ok7c, msg7c = ParallelSession.retry_site_now(sess7, "不存在的站")
+check("站点没在采集时不假装成功（马上继续）", ok7c is False and "没有在采集" in msg7c)
 
 # ══════════════════════════════════════════════════════════
 # 8) 采集间隔安全下限：用户把间隔拉到最小也不能重现「200 多家后被限 IP」

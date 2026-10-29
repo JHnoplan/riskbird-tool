@@ -85,27 +85,34 @@ check("四项全空那条确实被剔除", "某从未公开联系方式的公司
 check("有手机号那条仍在（不误杀）", any("甲乙" in n for n in names))
 
 # ══ ②③ 被拦提醒：横幅 + 独立弹窗 + 计时接管；解除后全部收起 ══
-# 拦截分型（IP 限流 vs 可人工过验证）走两套文案，1688 与八方不能再共用一句“已开页”
+# 拦截分型（网站拦 IP vs 可人工过验证）走两套文案，而且必须是没技术背景也看得懂的大白话
 from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP
 
 check("初始没有提醒弹窗", w._block_alert is None)
 w._on_blocked(BLOCK_TAG_IP + "八方资源网：站点返回 HTTP 502（IP 级限流/冷却，非验证码）")
 app.processEvents()
-check("被拦时顶部横幅可见（带上站名与分型，不带看不完的细节）",
-      w.banner.isVisible() and "八方资源网" in w.banner.text() and "IP 级限流" in w.banner.text())
+check("被拦时顶部横幅可见（带上站名，说的是大白话而不是术语）",
+      w.banner.isVisible() and "八方资源网" in w.banner.text()
+      and "拦住了你这台电脑的上网地址" in w.banner.text())
+check("横幅不出现开发者术语（客户读不懂就等于没提示）",
+      not any(k in w.banner.text() for k in ("IP 级", "限流", "退避", "熔断", "看门狗")))
 check("IP 类横幅直说「不需要你操作」（客户就是被「手动完成验证」误导到满屏找入口）",
       "不需要你操作" in w.banner.text() and "手动完成验证" not in w.banner.text())
 check("被拦时弹出独立提醒窗（旧版只改横幅，最小化后用户根本看不见）",
       w._block_alert is not None and w._block_alert.isVisible())
 check("弹窗是非模态（不阻塞主窗口，用户能去操作 Chrome）", w._block_alert.isModal() is False)
 txt = w._block_alert.text()
+raw_reason = "站点返回 HTTP 502（IP 级限流/冷却，非验证码）"   # 网站原话，只作排查用附一行
+plain = txt.replace(raw_reason, "")                           # 判定「我们说的话」是否大白话
 check("弹窗带上被拦站点与原因", "八方资源网" in txt and "502" in txt)
 check("IP 类弹窗不再声称「已在 Chrome 里打开对应页面」（实际根本没开）",
       "已在 Chrome 里打开对应页面" not in txt)
-check("IP 类弹窗不叫用户去拉滑块，而是给出真正有效的恢复手段",
-      all(k in txt for k in ("重拨宽带", "采集间隔", "断点续采")))
-check("弹窗里提供用户主动点的「打开该站页面自查」按钮",
-      any("自查" in b.text() for b in w._block_alert.buttons()))
+check("IP 类弹窗讲成两步傻瓜操作并且不堆术语",
+      all(k in txt for k in ("第 1 步", "第 2 步", "手机热点", "马上继续")) and
+      not any(k in plain for k in ("IP 级", "限流", "退避", "熔断", "看门狗")))
+check("弹窗里同时提供「我换好网络了，马上继续」与「打开网站让我看一眼」两个按钮",
+      any("马上继续" in b.text() for b in w._block_alert.buttons()) and
+      any("打开网站让我看一眼" in b.text() for b in w._block_alert.buttons()))
 first_box = w._block_alert
 
 check("IP 类弹窗不会自动拉浏览器：没点按钮就不会去借标签",
@@ -114,23 +121,39 @@ check_calls = []
 w.session.open_site_check = lambda name="": (check_calls.append(name),
                                              (True, "已在 Chrome 里打开（测试替身）"))[1]
 for b in w._block_alert.buttons():
-    if "自查" in b.text():
+    if "打开网站让我看一眼" in b.text():
         b.click()
 app.processEvents()
 import time as _t
 _t.sleep(0.6)
 app.processEvents()
-check("点「自查」会把当前被拦站交给会话去开页（用户主动才能开）",
+check("点「看一眼」会把当前被拦站交给会话去开页（用户主动才能开）",
       check_calls == ["八方资源网"])
+retry_calls = []
+w.session.retry_site_now = lambda name="": (retry_calls.append(name),
+                                            (True, "已让该站马上再试一次（测试替身）"))[1]
+for b in w._block_alert.buttons():
+    if "马上继续" in b.text():
+        b.click()
+app.processEvents()
+_t.sleep(0.6)
+app.processEvents()
+check("点「马上继续」把当前被拦站交给会话立即重测（换完 IP 不用干等下一轮探测）",
+      retry_calls == ["八方资源网"])
+check("按钮跑完会被恢复可点（后台线程结束后轮询复位）",
+      all(b.isEnabled() for b in w._block_alert.buttons()
+          if "马上继续" in b.text() or "看一眼" in b.text()))
 
 w._on_blocked(BLOCK_TAG_CAP + "中国制造网：页面弹出验证控件（#tcaptcha_transform）")
 app.processEvents()
-check("真验证码场景弹窗仍明确要求人工过完", "手动过完" in w._block_alert.text())
-check("验证码类弹窗不再把「已打开」说死（借不到标签的站会被谎话误导）",
+check("验证码类弹窗给出「第1步拖滑块、第2步不用点」的读得懂的步骤",
+      all(k in w._block_alert.text()
+          for k in ("拖完点完", "第 1 步", "第 2 步", "接着往下采")))
+check("验证码类弹窗不再把「已开页」说死，改成没看到就点「看一眼」",
       "已把该站页面在 Chrome 里打开" not in w._block_alert.text()
-      and "没看到就点下面的自查" in w._block_alert.text())
-check("验证码类横幅仍明确要求去 Chrome 里手动过验证，并提「没看到页面就自查」",
-      "Chrome 窗口里手动过" in w.banner.text() and "自查" in w.banner.text())
+      and "打开网站让我看一眼" in w._block_alert.text())
+check("验证码类横幅仍明确要求去 Chrome 拖滑块，并提另一个按钮名",
+      "Chrome 窗口把滑块拖完" in w.banner.text() and "打开网站让我看一眼" in w.banner.text())
 check("多站同时被拦不叠窗（复用同一弹窗实例）", w._block_alert is first_box)
 check("复用弹窗文案更新成最新站点", "中国制造网" in w._block_alert.text())
 check("验证等待期间接管采集计时", w._hold_from > 0)

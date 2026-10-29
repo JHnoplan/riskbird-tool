@@ -738,8 +738,22 @@ class ParallelSession:
             return True, "企知道已在浏览器打开，请完成登录"
         return False, f"站点 {slug} 无需登录页"
 
+    def _pick_site(self, name=""):
+        """按站名找采集器；没给名字就找「当前正在等放行的站」，再退而找
+        「手上记着被拦页地址的站」（旧适配器的拦截文本里本来就没有站名）。"""
+        for c in self.crawlers.values():
+            if name and getattr(c, "PLATFORM_NAME", "") == name:
+                return c
+            if not name and getattr(c, "_blocked", False):
+                return c
+        if not name:
+            for c in self.crawlers.values():
+                if getattr(c, "_block_probe_url", ""):
+                    return c
+        return None
+
     def open_site_check(self, name=""):
-        """拦截提醒里的「打开该站页面自查」：由用户主动点，把被拦的那一页（没有则首页）
+        """拦截提醒里的「打开网站让我看一眼」：由用户主动点，把被拦的那一页（没有则首页）
         摆到共享 Chrome 眼前，让他自己判断「是 IP 被拒（Chrome 也打不开/同样报错）还是
         真有滑块可过」。
 
@@ -747,25 +761,12 @@ class ParallelSession:
         控件，自动拉起窗口只会让用户对着打不开的页面找入口白等（实测八方等了很久）——
         旧文案还写着「已在 Chrome 里打开对应页面」，与实际行为相反，就是客户反馈
         「八方出验证码找不到入口、只能在你软件点确认」的直接原因。
-        name 为空（旧适配器的拦截文本里本来就没有站名）时，按「当前处于被拦状态的站」兜底。
         必须在后台线程调用（有网络 IO、可能拉起浏览器）。返回 (ok, message)。"""
-        target = None
-        for c in self.crawlers.values():
-            if name and getattr(c, "PLATFORM_NAME", "") == name:
-                target = c
-                break
-            if not name and getattr(c, "_blocked", False):
-                target = c
-                break
-        if target is None and not name:
-            for c in self.crawlers.values():
-                if getattr(c, "_block_probe_url", ""):
-                    target = c
-                    break
+        target = self._pick_site(name)
         if target is None:
-            return False, f"「{name or '相关站'}」当前没有在采集，无页面可打开"
+            return False, f"「{name or '这个网站'}」当前没有在采集，无页面可打开"
         if not hasattr(target, "open_verify_page"):
-            return False, f"「{target.PLATFORM_NAME}」不支持自查页，请直接去浏览器里打开该站"
+            return False, f"「{target.PLATFORM_NAME}」打不开它的网页，请自己用浏览器打开该站看看"
         name = target.PLATFORM_NAME
         url = getattr(target, "_block_probe_url", "") or getattr(target, "BASE_URL", "")
         if not url:
@@ -773,10 +774,27 @@ class ParallelSession:
         try:
             if target.open_verify_page(url):
                 self.set_browser_background(False)   # 还原/前置窗口，把页面递到眼前
-                return True, f"已在 Chrome 里打开 {name} 的页面，请自行核对"
+                return True, f"已在 Chrome 里打开 {name} 的网页，你看一眼就行"
         except Exception as e:
             return False, f"打开失败：{str(e).splitlines()[0][:80]}"
         return False, "打开失败：共享浏览器不可用（请确认已安装 Google Chrome）"
+
+    def retry_site_now(self, name=""):
+        """拦截提醒里的「我换好网络了，马上继续」：让对应采集器不等退避立即重测。
+
+        这是给完全不懂技术的人用的逃生口：IP 被拦时唯一立刻有效的事就是换个出口 IP
+        （手机热点/重拨宽带），而这一下只能人手做；做完点这个按钮，剩下的全部自动，
+        不需要他等下一个 45 秒~10 分钟的探测周期，也不需要重启工具或重头采。"""
+        target = self._pick_site(name)
+        if target is None:
+            return False, f"「{name or '这个网站'}」当前没有在采集，不用点这个"
+        if not hasattr(target, "retry_now"):
+            return False, f"「{getattr(target, 'PLATFORM_NAME', name)}」不支持立即重测"
+        waiting = target.retry_now()
+        label = getattr(target, "PLATFORM_NAME", "")
+        if waiting:
+            return True, f"已让 {label} 马上再试一次（被拦计数与采集间隔已重置）"
+        return True, f"{label} 当前没在被拦，正常采集不受影响"
 
     def _is_session_alive(self):
         if any(c._is_session_alive() for c in self._active_crawlers()):

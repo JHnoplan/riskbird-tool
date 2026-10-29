@@ -525,6 +525,9 @@ class CdpSiteCrawler:
         self._retry_after = 0       # 服务端 Retry-After 提示的秒数（有就听它的）
         self._block_probe_url = ""   # 探测用的代表页（就是刚被拦的那一页）
         self._borrowed_tab = False   # 纯 HTTP 站为过验证临时借的标签（恢复后归还）
+        # 用户点了「我换好网络了，马上继续」时置位：把正在退避的看门狗当场叫醒，
+        # 不再让他干等下一个 45s~600s 的探测周期（换出口 IP 后马上就能接上）。
+        self._block_wake = threading.Event()
 
         self._seen_store = {}
         self._seen_members = set()
@@ -1176,7 +1179,27 @@ return '';})()"""
         while time.time() < end:
             if self._stop_requested:
                 return
+            if self._block_wake.is_set():      # 被拦冷却中用户换了网络：不等满冷却也继续
+                self._block_wake.clear()
+                self._log("   🔁 你点了「马上继续」，跳过剩余冷却直接接着采")
+                return
             time.sleep(0.5)
+
+    def retry_now(self):
+        """用户点了「我换好网络了，马上继续」：立刻重新探一次，不等本轮退避到点。
+
+        为什么要把这一步交给人：IP 级限流唯一能立见成效的手段就是换一个出口 IP，
+        而工具自己没法重拨宽带/连热点，所以只能由人做那一下，剩下的全部自动。
+        同时把被拦计数与自动降速清零：他已经换了新出口 IP，不该再按旧 IP 的黑历史
+        熔断（不然第 3 次一到就把本站收掉了）。返回是否正处在等待中。"""
+        waiting = bool(self._blocked)
+        self._block_times = []
+        self._current_delay = self.delay_between
+        self._retry_after = 0
+        self._block_wake.set()
+        self._log("   🔁 收到「马上继续」：已重置本站被拦计数与采集间隔，马上再试一次"
+                  + ("" if waiting else "（本站当前没在等放行，正常采集不受影响）"))
+        return waiting
 
     def _wait_manual_unblock(self, reason, probe, max_wait=None, on_cleared=None):
         """看门狗主循环。两类拦截走两套节奏，不再一律“叫人工”：
@@ -1239,14 +1262,24 @@ return '';})()"""
             first = 5                 # 首轮探短一点：用户秒过验证时不用白等一个轮询周期
         while waited < limit:
             nap = first if waited == 0 else gap
-            # 分段短睡：停止/暂停指令能及时响应
+            # 分段短睡：停止/暂停指令能及时响应；用户点了「马上继续」也在这里醒
+            woke = False
             for _ in range(int(nap * 2)):
                 if self._stop_requested:
                     self._blocked = False
                     self._after_block_cleared()
                     return False
+                if self._block_wake.is_set():
+                    self._block_wake.clear()
+                    woke = True
+                    break
                 time.sleep(0.5)
-            waited += nap
+            if woke:
+                # 他刚换了出口 IP，不等本轮退避到点，立刻真探一次（探不通也没关系：
+                # retry_now 已清过被拦计数，不会被误算成第 3 次而熔断）
+                self._log("   🔁 收到「马上继续」，不等本轮退避，立刻重测")
+            else:
+                waited += nap
             first = gap
             if self._pause_requested:
                 continue
