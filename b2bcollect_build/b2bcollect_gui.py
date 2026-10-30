@@ -1044,14 +1044,8 @@ class MainWindow(QMainWindow):
             "例：「制冷与热泵核心部件」→ 制冷压缩机、冷凝器、蒸发器、膨胀阀、热泵机组……\n"
             "纯服务/流程词（研发、咨询、招投标、物流、运维等）会自动忽略，因为站内搜索没有对应商品。\n"
             "注意：解析结果由内置行业知识库生成，仅供参考，不一定完全符合你的需求，请检查后再采集。")
-        self.btn_history = QPushButton("历史任务·接着上次采")
-        self.btn_history.setToolTip(
-            "列出以前采过的任务：关键词、平台勾选、采集间隔、采到哪儿都记着。\n"
-            "选中一条点「接着采」→ 点「开始采集」就从上次停下的地方继续，\n"
-            "已采完的关键词自动跳过，数据仍写进同一个文件夹（不会盖掉已采的）。")
         hr.addWidget(self.btn_file); hr.addWidget(self.btn_paste)
         hr.addWidget(self.btn_parse); hr.addWidget(self.btn_smart)
-        hr.addWidget(self.btn_history)
         hr.addStretch(1)
         v.addLayout(hr)
         self.kw_text = QPlainTextEdit()
@@ -1144,11 +1138,11 @@ class MainWindow(QMainWindow):
         self.chk_guard.setChecked(True)
         self.chk_guard.setToolTip("用关键词与「公司名+主营」做相关性比对，明显无关的连详情页都不进（省请求=提速+防封）。"
                                   "信号取不到时一律放行不误杀。")
-        self.chk_incr = QCheckBox("增量模式·跳过历史已采商家")
+        self.chk_incr = QCheckBox("增量模式·跳过已采商家")
         self.chk_incr.setChecked(True)
         self.chk_incr.setToolTip("跨运行记住已采到/已判不相关的商家，再跑同一批关键词命中即跳过、不重复请求"
                                  "（省请求=防封），只补新出现的商家；因拦截没采成的不记，下轮仍重试。")
-        self.chk_bg = QCheckBox("后台运行·最小化浏览器窗口")
+        self.chk_bg = QCheckBox("后台运行·最小化浏览器")
         # 默认勾选：多平台并行时用户根本不需要盯浏览器，挂着自动最小化才能真「无人值守」；
         # 命中验证码仍会自动还原窗口把验证递到眼前。
         self.chk_bg.setChecked(True)
@@ -1156,16 +1150,7 @@ class MainWindow(QMainWindow):
                                "命中验证码时会自动还原窗口提醒人工过验证，过后重新最小化；\n"
                                "启动浏览器已带防后台节流开关，最小化不影响页面渲染。\n"
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
-        self.chk_auto_kw = QCheckBox("自动扩词·类别名换成产品词")
-        self.chk_auto_kw.setChecked(True)
-        self.chk_auto_kw.setToolTip(
-            "点「开始采集」时自动把「暖通空调与制冷设备」这类行业类别名展开成一批具体产品词\n"
-            "（制冷压缩机、冷凝器、工业冷水机……）。\n"
-            "原因：站内搜索只认产品名，类别名不是商品，实测一个词只能翻出十几家还混着无关商家，\n"
-            "挂一天也只有几百条。展开后的词会写回关键词框，可随时删改；\n"
-            "不想要就取消勾选，完全按你填的词采。")
         hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr); hp.addWidget(self.chk_bg)
-        hp.addWidget(self.chk_auto_kw)
         hp.addStretch(1)
         self.btn_clear_seen = QPushButton("清空历史种子库")
         self.btn_clear_seen.setToolTip("删除各站跨运行去重记录，让下次对同一批关键词从头重采。")
@@ -1196,6 +1181,22 @@ class MainWindow(QMainWindow):
         # 按「准备 / 跑 / 产出」三组拉开间距，一眼能看出动作顺序。
         self.btn_start.setObjectName("primary")
         self.btn_start.setMinimumWidth(120)
+        # 自动扩词开关 / 历史任务入口放在操作行：这一行左右两簇中间原本空着
+        # 300 多像素，挂在这里既不用给关键词区加行（加了会把窗口撑爆、
+        # 反而把关键词框压成一行），又和「开始采集」「开始新任务」挨着好理解。
+        self.chk_auto_kw = QCheckBox("自动扩词")
+        self.chk_auto_kw.setChecked(True)
+        self.chk_auto_kw.setToolTip(
+            "点「开始采集」时自动把「暖通空调与制冷设备」这类行业类别名展开成一批具体产品词\n"
+            "（制冷压缩机、冷凝器、工业冷水机……）。\n"
+            "原因：站内搜索只认产品名，类别名不是商品，实测一个词只能翻出十几家还混着无关商家，\n"
+            "挂一天也只有几百条。展开后的词会写回关键词框，可随时删改；\n"
+            "不想要就取消勾选，完全按你填的词采。")
+        self.btn_history = QPushButton("历史任务")
+        self.btn_history.setToolTip(
+            "列出以前采过的任务：关键词、平台勾选、采集间隔、采到哪儿都记着。\n"
+            "选中一条点「接着采」→ 点「开始采集」就从上次停下的地方继续，\n"
+            "已采完的关键词自动跳过，数据仍写进同一个文件夹（不会盖掉已采的）。")
         for b in (self.btn_open, self.btn_start, self.btn_pause, self.btn_stop,
                   self.btn_clean, self.btn_export, self.btn_reset):
             b.setMinimumHeight(36)
@@ -1203,7 +1204,11 @@ class MainWindow(QMainWindow):
         hb.addSpacing(14)
         for b in (self.btn_start, self.btn_pause, self.btn_stop):
             hb.addWidget(b)
+        hb.addSpacing(14)
+        hb.addWidget(self.chk_auto_kw)
         hb.addStretch(1)
+        hb.addWidget(self.btn_history)
+        hb.addSpacing(14)
         for b in (self.btn_clean, self.btn_export, self.btn_reset):
             hb.addWidget(b)
         self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
@@ -1661,7 +1666,7 @@ class MainWindow(QMainWindow):
         self.lbl_kw.setText(
             f"智能解析完成：得到 {len(kws)} 个产品词（展开 {len(rep['expanded'])} 个类别"
             f"{('、忽略 ' + str(len(rep['dropped'])) + ' 个服务/流程词') if rep['dropped'] else ''}）。"
-            f"⚠ {self._SMART_HINT}")
+            "请对照下方日志核查。")
         # 日志给出可核对的明细：展开了哪些类别、忽略了哪些词、保留了哪些原词
         self._on_log(f"🪄 智能解析：{len(kws)} 个产品词（由 {len(rep['expanded'])} 个类别展开）。")
         for seg, name, added in rep["expanded"]:
@@ -2245,9 +2250,10 @@ class MainWindow(QMainWindow):
         self._kw_expanded_text = chr(10).join(kws)
         self.kw_text.setPlainText("\n".join(kws))
         self.keywords = kws
-        self.lbl_kw.setText(
-            f"自动扩词：{before} 个 → {len(kws)} 个产品词（已写回关键词框，可删改）。"
-            f"⚠ {self._SMART_HINT}")
+        # 标签只留一行（两行以上在小窗口会被裁成残句），完整说明写在日志里
+        self.lbl_kw.setText(f"自动扩词：{before} 个 → {len(kws)} 个产品词"
+                            "（已写回关键词框，可删改，请对照下方日志核查）")
+        self._on_log(f"⚠ {self._SMART_HINT}")
         self._on_log(f"🪄 自动扩词：{before} 个词 → {len(kws)} 个产品词"
                      f"（展开 {len(rep_.get('expanded') or [])} 个行业类别）。")
         for seg, name, added in (rep_.get("expanded") or [])[:12]:
@@ -2258,7 +2264,7 @@ class MainWindow(QMainWindow):
         if rep_.get("truncated"):
             self._on_log(f"   ↳ 词表已达单次上限（{len(kws)} 个）自动收住："
                          "先采完这批再补下一批更安全（一次灌上千个词会把请求量放大几十倍）。")
-        self._on_log("   ↳ 不想自动换词：取消勾选「自动扩词·类别名换成产品词」，就按你填的原词采。")
+        self._on_log("   ↳ 不想自动换词：取消勾选「自动扩词」，就按你填的原词采。")
 
     def _boost_high_yield(self, min_yield=20):
         """产出反馈闭环：把本轮净新增 ≥ min_yield 家的高产词，按同族派生一批近义词
@@ -2381,7 +2387,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._on_log(f"⚠ 读回上次数据失败（不影响接着采，只是本轮不会累加显示旧数据）："
                              f"{str(e).splitlines()[0][:120]}")
-        shown = "、".join(kws[:8]) + ("…" if len(kws) > 8 else "")
+        shown = "、".join(kws[:5]) + ("…" if len(kws) > 5 else "")
         self.lbl_kw.setText(f"已接上次任务：{len(kws)} 个关键词（已跑完 {done_n} 个）：" + shown)
         self._on_log(f"↻ 恢复任务：{task.get('name') or self._first_start}｜{len(kws)} 个关键词"
                      f"｜已跑完 {done_n} 个｜已采 {seeded} 条装回内存｜{resumed} 个通道已接上游标")
