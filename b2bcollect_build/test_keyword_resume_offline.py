@@ -252,8 +252,10 @@ _tasks.finish_task(tid, _tasks.TASK_STATUS_DONE, 6)
 # ── F. 界面：自动扩词 / 落盘 / 启动回填 / 历史任务续采 ──────────
 print("F. 界面接线（offscreen 真 MainWindow）")
 import b2bcollect_gui as gui
-from PyQt5.QtWidgets import QApplication, QDialog, QListWidget
+from PyQt5.QtWidgets import (QApplication, QDialog, QListWidget, QLabel,
+                             QDialogButtonBox)
 from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 
 app = QApplication.instance() or QApplication(sys.argv)   # 先有 QApplication 才能造控件
 gui.MainWindow._get_desktop_dir = lambda self: desk
@@ -368,6 +370,101 @@ finally:
 check("历史任务列表把以前的任务都列出来了", picked.get("count", 0) >= 2)
 check("选中历史任务后现场恢复（关键词/游标/数据都在）",
       w2.keywords[:3] == ["A词", "B词", "C词"] and w2.session_dir == str(sess_folder))
+
+# ── F2. 历史任务的「选中标识」：客户反馈「选择不太明显」─────────────
+# 根因（实测，不是猜）：①macOS 上弹窗一失焦，QListWidget 原生选中高亮就褪成几乎
+# 看不见的浅灰；②行控件按整段文字算宽度（1064px）比视口（796px）还宽，右侧状态
+# 标签和「已采 N 家」被整块裁到屏幕外；③灰行也会被设成「当前项」（current≠selected），
+# 用户以为选了、其实按下去接不上。三条各钉一组断言。
+print("F2. 历史任务选中标识")
+TASKS_DEAD = {"id": "20261026_080000", "keywords": ["热泵机组"], "count": 213,
+              "status": "已完成", "started_at": "20261026_080000"}
+v_dead = gui.task_row_view(TASKS_DEAD, False)
+check("数据文件夹已删的行：标红且明确不可选",
+      v_dead["tone"] == "error" and v_dead["selectable"] is False
+      and "接不上" in v_dead["badge"])
+v_nokw = gui.task_row_view({"id": "20261025_0900", "keywords": [], "name": "老任务"}, True)
+check("没记下关键词的老行：也不给选（选了也接不上进度）", v_nokw["selectable"] is False)
+v_run = gui.task_row_view({"id": "20261030_1100", "keywords": ["A词", "B词", "C词", "D词", "E词", "F词"],
+                           "count": 186, "status": "采集中",
+                           "started_at": "20261030_1100", "kw_raw": CUSTOMER_KW}, True, 2)
+check("上次没跑完的行：进度按已跑完的词算、标成进行中",
+      v_run["percent"] == 33 and v_run["tone"] == "run"
+      and v_run["progress_text"] == "已跑完 2/6 个关键词")
+check("主标题写的是关键词、不是那串时间戳",
+      v_run["title"].startswith("A词") and "6 个关键词" in v_run["title"])
+check("次要行按段存好（放不下就整段舍弃，不留半截话）", len(v_run["sub_parts"]) >= 2)
+v_done = gui.task_row_view({"id": "x", "keywords": ["A词"], "count": 9,
+                            "status": "已完成"}, True, 1)
+check("已跑完的行：进度条拉满、标绿", v_done["percent"] == 100 and v_done["tone"] == "ok")
+
+accent = gui._accent_color()
+row = gui.TaskRow(v_run)
+row.set_selected(True)
+check("选中一条：圆点变实心 + 整行铺强调底 + 左缘竖条 + 标题变色（四个通道）",
+      row.dot.text() == "●" and accent in row.styleSheet()
+      and "border-left: 3px solid" in row.styleSheet() and accent in row.lbl_title.styleSheet())
+row.set_selected(False)
+check("取消选中：圆点回到空心、强调底撑回去",
+      row.dot.text() == "○" and "transparent" in row.styleSheet())
+row_dead = gui.TaskRow(v_dead)
+row_dead.set_selected(True)
+check("接不上的行怎么点都不给选中态", row_dead._sel is False and row_dead.dot.text() == "○")
+row.resize(430, row.sizeHint().height())
+row.layout().activate()
+row._elide()
+check("行宽不够时文字压成省略号，不把右侧信息挤出屏幕",
+      row.lbl_title.text() != v_run["title"] and row.lbl_title.text().endswith("…")
+      and row.lbl_sub.text().endswith("…"))
+check("压缩后不会只剩「你填的：」这种半截话",
+      not row.lbl_sub.text().rstrip("…").endswith("："))
+
+# 弹窗层面：造一条文件夹已删的任务 + 一条没存关键词的老任务
+_tasks.upsert_task(_tasks.new_task("20261026_080000", ["旧词"], str(base / "20261026_080000"),
+                                   count=213, keywords=["旧词"], kw_raw=CUSTOMER_KW,
+                                   sites=["b2b168"]))
+_tasks.finish_task("20261026_080000", _tasks.TASK_STATUS_DONE, 213)
+_tasks.upsert_task(_tasks.new_task("20261025_090000", ["老任务.txt"],
+                                   str(base / "20261025_090000"), count=5))
+view = {}
+
+
+def _inspect_exec(self):
+    lw = self.findChild(QListWidget)
+    self.show()
+    app.processEvents()
+    view["count"] = lw.count()
+    view["cur"] = lw.currentRow()
+    view["flags"] = [int(lw.item(i).flags()) for i in range(lw.count())]
+    view["can"] = [lw.itemWidget(lw.item(i))._can for i in range(lw.count())]
+    view["btn"] = self.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok)
+    view["text"] = "|".join(l.text() for l in self.findChildren(QLabel))
+    dead = view["flags"].index(0)                       # 第一条 NoItemFlags 的行
+    lw.scrollToItem(lw.item(dead))
+    pos = lw.visualRect(lw.indexFromItem(lw.item(dead))).center()
+    QTest.mouseClick(lw.viewport(), Qt.LeftButton, Qt.NoModifier, pos)
+    app.processEvents()
+    view["dead"] = dead
+    view["cur_after"] = lw.currentRow()
+    view["text_after"] = "|".join(l.text() for l in self.findChildren(QLabel))
+    return QDialog.Rejected
+
+
+_exec_orig2 = QDialog.exec_
+QDialog.exec_ = _inspect_exec
+try:
+    w2._on_history_tasks()
+finally:
+    QDialog.exec_ = _exec_orig2
+check("接不上的行不给任何标志位（点不动、方向键也跳过）",
+      view["flags"][view["dead"]] == 0 and view["can"][view["dead"]] is False)
+check("默认停在能接着采的那条上（不会一进来就选到灰行）",
+      view["cur"] >= 0 and view["can"][view["cur"]] is True)
+check("点灰行不会把选中抢过去（当前行没变）", view["cur_after"] == view["cur"])
+check("开弹窗就写明要接着采哪一条", "将接着采：" in view["text"])
+check("点灰行会就地讲明白为什么接不上", "接不上" in view["text_after"])
+check("主按钮文案是动作+结果", view["btn"].text() == "接着采这一条"
+      and view["btn"].isEnabled())
 
 # 复位后不该还留着上一任务的游标（防「点开始新任务却什么都没采」）
 w2.session.reset_results()

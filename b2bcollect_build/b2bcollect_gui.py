@@ -21,14 +21,15 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent
 from PyQt5.QtGui import QFont, QPalette
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QFileDialog, QSpinBox, QDoubleSpinBox,
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
-    QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox,
+    QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
+    QSizePolicy,
 )
 
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
@@ -97,17 +98,299 @@ def _tab_toggle_style():
 
 
 def _status_badge_style(tone):
-    """云展绑定状态徽标（error / ok / neutral 三态）。
-    写死浅底深字在深色主题下像贴了张便签，三态亮度差还会被放大成一个很跳两个很暗；
+    """胶囊状态徽标（ok 绿 / error 红 / run 蓝 / pause 橙 / neutral 灰）。
+    写死浅底深字在深色主题下像贴了张便签，各态亮度差还会被放大成一个很跳两个很暗；
     这里按主题给成套的低饱和底色加同层级前景，三态只靠色相区分、不靠亮度抢视线。"""
     dark = _is_dark_theme()
     if tone == "error":
         bg, fg = ("#3a2224", "#ff6b6b") if dark else ("#fdecea", "#c62828")
     elif tone == "ok":
         bg, fg = ("#1f3324", "#7fc97f") if dark else ("#e8f5e9", "#2e7d32")
+    elif tone == "run":
+        bg, fg = ("#1d2f4a", "#8ab4f8") if dark else ("#e8f0fe", "#1a63c9")
+    elif tone == "pause":
+        bg, fg = ("#3a2f1e", "#ffcc80") if dark else ("#fff4e5", "#a85c00")
     else:
         bg, fg = ("#2f3134", _muted_color()) if dark else ("#f0f0f0", _muted_color())
     return ("QLabel { padding: 4px 10px; border-radius: 4px; background: %s; color: %s; }" % (bg, fg))
+
+
+def _accent_color():
+    """强调色（选中态、进度条、主按钮同一支蓝）：深色底用亮蓝，浅色底用深蓝。
+    跟 #1a73e8 主按钮同一个色相，界面上「能点的东西」只有一个颜色语言。"""
+    return "#8ab4f8" if _is_dark_theme() else "#1a63c9"
+
+
+def _fmt_task_time(raw):
+    """任务时间戳翻成人话：20261030_130000 → 2026-10-30 13:00。
+    索引里存的是文件夹名那种时间戳，直接摆给小白看等于摆一串乱码。"""
+    s = str(raw or "").strip()
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})[\-_ ](\d{2})(\d{2})", s)
+    if m:
+        return "%s-%s-%s %s:%s" % m.groups()
+    return s or "—"
+
+
+_SUB_SEP = "　·　"   # 次要行分段符：宽度不够时按整段舍弃，不留半截话
+
+
+def task_row_view(t, exists, done_n=0, current_id=""):
+    """把一条任务索引记录翻成「历史任务」列表里看得懂的一行（纯函数，不碰界面）。
+
+    抽成纯函数是为了能离线断言：徽章落在哪个色位、进度按什么算、文件夹没了的行
+    是不是真不让选、主标题到底写的是关键词还是那串时间戳——全都能脱离窗口测。
+    主标题优先用关键词摘要（用户认得出来自己采的是什么），时间/平台/原词降为次要行。"""
+    kws = [str(k) for k in (t.get("keywords") or []) if str(k).strip()]
+    total = len(kws)
+    cnt = int(t.get("count") or 0)
+    # 状态直接比对字面值（task_registry 是可选模块，抽成纯函数后它不该依赖对方）
+    status = str(t.get("status") or "")
+    tid = str(t.get("id") or "")
+    sites = [str(SITE_NAMES.get(s, s)) for s in (t.get("sites") or [])]
+    done_n = max(0, min(int(done_n or 0), total)) if total else 0
+
+    if kws:
+        head = "、".join(kws[:3]) + ("…" if total > 3 else "")
+        title = f"{head}　等 {total} 个关键词" if total > 3 else head
+    else:
+        title = str(t.get("name") or "").strip() or "未命名任务"
+
+    parts = [_fmt_task_time(t.get("started_at") or tid)]
+    if sites:
+        parts.append("平台 " + "、".join(sites[:3]) + ("…" if len(sites) > 3 else ""))
+    raw = str(t.get("kw_raw") or "").strip().replace("\n", "、")
+    if raw and raw != title:
+        parts.append("你填的：" + (raw[:18] + "…" if len(raw) > 18 else raw))
+    sub = _SUB_SEP.join(parts)
+
+    why = ("选中这条，点「接着采这一条」：关键词、平台、采集间隔都恢复成上次的样子，"
+           "已采完的关键词自动跳过，数据接着写进原来的文件夹。")
+    if not exists:
+        badge, tone = "■ 文件夹已删·接不上", "error"
+        why = ("这条任务的数据文件夹已经不在原来的位置（被删了或被拷走改名了），"
+               "进度和已采数据都读不到，所以接不上。\n想接着采这批词：把关键词重新填一遍，开一个新任务。")
+    elif not kws:
+        badge, tone = "■ 没记下关键词·接不上", "error"
+        why = "这条是老版本记下的任务，当时没保存关键词与进度，接不上。\n重新填关键词开新任务即可。"
+    elif current_id and tid == str(current_id):
+        badge, tone = "● 当前已接上", "ok"
+        why = "这就是界面上已经载入的这条任务。"
+    elif status == "已完成":
+        badge, tone = "✅ 已跑完", "ok"
+        why = "这批关键词上次已全部跑完。接着采只会补两件事：你新加的词、以及站内新出现的商家。"
+    elif status == "已暂停":
+        badge, tone = "■ 上次暂停了", "pause"
+    elif status == "已停止":
+        badge, tone = "■ 上次手动停了", "pause"
+    elif status == "采集中":
+        badge, tone = "● 上次没跑完", "run"
+    else:
+        badge, tone = "● 可接着采", "neutral"
+
+    return {
+        "title": title,
+        "sub": sub,
+        "sub_parts": list(parts),
+        "badge": badge,
+        "tone": tone,
+        "count_text": f"已采 {cnt} 家",
+        "total": total,
+        "done": done_n,
+        "percent": 100 if (kws and exists and status == "已完成")
+        else (int(done_n * 100 / total) if total else 0),
+        "progress_text": (f"已跑完 {done_n}/{total} 个关键词" if (kws and exists) else ""),
+        "selectable": bool(kws and exists),
+        "tooltip": why,
+    }
+
+
+class TaskRow(QFrame):
+    """「历史任务」列表里的一行：圆点 + 主标题/徽章 + 次要信息/已采条数 + 关键词进度条。
+
+    选中态刻意不依赖 QListWidget 原生高亮——macOS 上弹窗一失焦，那条高亮就褪成
+    几乎看不见的浅灰，用户回来只会问「我到底选了哪条」。这里选中给足四个通道：
+    左侧圆点变实心、整行铺淡强调底、左缘 3px 强调竖条、主标题变强调色（颜色+
+    形状+文字三通道，不靠单一颜色传态，色觉障碍也看得懂）；颜色全按系统深浅色给两套。
+    不可接上的行：圆点保持空心、文字整行置灰、鼠标悬停不亮（明摆着告诉你点不了）。
+    """
+
+    def __init__(self, view, parent=None):
+        super().__init__(parent)
+        self._v = dict(view or {})
+        self._can = bool(self._v.get("selectable"))
+        self._sel = False
+        self._hover = False
+        self.setCursor(Qt.PointingHandCursor if self._can else Qt.ArrowCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 7, 10, 7)
+        lay.setSpacing(10)
+        # 圆点用字形而不是 QSS 画框：border-radius 在 QLabel 上实测渲染成方框，
+        # 而方框在用户眼里是「可多选勾选」，与这里「单选一条任务」的语义相反。
+        self.dot = QLabel("○")
+        self.dot.setAlignment(Qt.AlignCenter)
+        self.dot.setFixedWidth(16)
+        df = self.dot.font()
+        df.setPointSize(max(11, df.pointSize() + 2))
+        self.dot.setFont(df)
+        lay.addWidget(self.dot, 0, Qt.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        line1 = QHBoxLayout()
+        line1.setSpacing(8)
+        self.lbl_title = QLabel(self._v.get("title") or "")
+        self.lbl_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        f = self.lbl_title.font()
+        f.setBold(True)
+        self.lbl_title.setFont(f)
+        self.lbl_title.setTextFormat(Qt.PlainText)
+        line1.addWidget(self.lbl_title, 1)
+        self.lbl_badge = QLabel(self._v.get("badge") or "")
+        self.lbl_badge.setStyleSheet(_status_badge_style(self._v.get("tone") or "neutral"))
+        line1.addWidget(self.lbl_badge, 0, Qt.AlignVCenter)
+        col.addLayout(line1)
+        line2 = QHBoxLayout()
+        line2.setSpacing(8)
+        self.lbl_sub = QLabel(self._v.get("sub") or "")
+        self.lbl_sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        line2.addWidget(self.lbl_sub, 1)
+        self.lbl_cnt = QLabel(self._v.get("count_text") or "")
+        line2.addWidget(self.lbl_cnt, 0, Qt.AlignVCenter)
+        col.addLayout(line2)
+        self.bar = QProgressBar()
+        self.bar.setFixedHeight(5)
+        self.bar.setFixedWidth(150)
+        self.bar.setTextVisible(False)
+        self.bar.setRange(0, 100)
+        self.bar.setValue(int(self._v.get("percent") or 0))
+        self.bar.setVisible(bool(self._v.get("progress_text")))
+        line3 = QHBoxLayout()
+        line3.setSpacing(8)
+        line3.addWidget(self.bar, 0)
+        self.lbl_prog = QLabel(self._v.get("progress_text") or "")
+        self.lbl_prog.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        line3.addWidget(self.lbl_prog, 1)
+        col.addLayout(line3)
+        lay.addLayout(col, 1)
+        self.setToolTip(self._v.get("tooltip") or "")
+        # 完整文案另存一份：显示时可能被压成「…」，工具提示里要给全
+        self._full = {self.lbl_title: self._v.get("title") or "",
+                      self.lbl_prog: self._v.get("progress_text") or ""}
+        self._sub_parts = [str(p) for p in (self._v.get("sub_parts") or [])]
+        self.set_selected(False)
+
+    def set_selected(self, on):
+        self._sel = bool(on and self._can)
+        self._apply()
+
+    def enterEvent(self, ev):
+        if self._can:
+            self._hover = True
+            self._apply()
+        return super().enterEvent(ev)
+
+    def leaveEvent(self, ev):
+        self._hover = False
+        self._apply()
+        return super().leaveEvent(ev)
+
+    def resizeEvent(self, ev):
+        self._elide()
+        return super().resizeEvent(ev)
+
+    def _elide(self):
+        """宽度不够时把主标题/进度文案压成「…」，而不是把右侧的状态标签和
+        「已采 N 家」挤出屏幕——那两处恰恰是选中标识要一眼看到的信息。"""
+        for lbl in (self.lbl_title, self.lbl_prog):
+            full = self._full.get(lbl, "")
+            avail = lbl.width()
+            if not full or avail <= 0:
+                continue
+            fm = lbl.fontMetrics()
+            shown = full if fm.horizontalAdvance(full) <= avail \
+                else fm.elidedText(full, Qt.ElideRight, avail)
+            if lbl.text() != shown:
+                lbl.setText(shown)
+        self._elide_sub()
+
+    def _elide_sub(self):
+        """次要行按「整段」取舍：放不下就整段丢掉并补一个省略号。
+        按字符砍会留下「你填的：」这种半截话，比不显示更让人琢磨不透。"""
+        avail = self.lbl_sub.width()
+        if not self._sub_parts or avail <= 0:
+            return
+        fm = self.lbl_sub.fontMetrics()
+        n = len(self._sub_parts)
+        while n > 1 and fm.horizontalAdvance(_SUB_SEP.join(self._sub_parts[:n])) > avail:
+            n -= 1
+        shown = _SUB_SEP.join(self._sub_parts[:n])
+        if n < len(self._sub_parts):
+            shown += " …"
+        if fm.horizontalAdvance(shown) > avail:
+            shown = fm.elidedText(shown, Qt.ElideRight, avail)
+        if self.lbl_sub.text() != shown:
+            self.lbl_sub.setText(shown)
+
+    def _apply(self):
+        dark = _is_dark_theme()
+        accent = _accent_color()
+        if self._sel:
+            bg = "#22304a" if dark else "#e8f0fe"
+            edge = accent
+        elif self._hover:
+            bg = "#2a2d31" if dark else "#f4f6fa"
+            edge = "transparent"
+        else:
+            bg = "transparent"
+            edge = "transparent"
+        self.setStyleSheet(
+            f"TaskRow {{ background: {bg}; border: none; border-left: 3px solid {edge};"
+            f" border-radius: 6px; }}")
+        self.dot.setText("●" if self._sel else "○")
+        muted = _muted_color()
+        faded = "#5f6368" if dark else "#b9bfc7"
+        self.dot.setStyleSheet(
+            "QLabel { background: transparent; border: none; color: %s; }"
+            % (accent if self._sel else (muted if self._can else faded)))
+        if not self._can:
+            self.lbl_title.setStyleSheet("color: %s;" % muted)
+        elif self._sel:
+            self.lbl_title.setStyleSheet("color: %s;" % accent)
+        else:
+            self.lbl_title.setStyleSheet("")
+        self.lbl_sub.setStyleSheet(_muted_style())
+        self.lbl_cnt.setStyleSheet(_muted_style("font-weight:bold;"))
+        self.lbl_prog.setStyleSheet(_muted_style())
+        track = "#3a3d42" if dark else "#dfe3ea"
+        self.bar.setStyleSheet(
+            f"QProgressBar {{ border: none; background: {track}; border-radius: 2px; }}"
+            f"QProgressBar::chunk {{ background: {accent}; border-radius: 2px; }}")
+
+
+class _ResizeWatcher(QObject):
+    """把某个控件的 resize 事件转成一次回调（QListWidget 没有现成的 resize 信号）。"""
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Resize:
+            self._fn()
+        return False
+
+
+class _PressWatcher(QObject):
+    """监听列表视口上的鼠标左键按下，回调收到命中的索引（禁用行不发 clicked）。"""
+
+    def __init__(self, lst, fn, parent=None):
+        super().__init__(parent)
+        self._lst = lst
+        self._fn = fn
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+            self._fn(self._lst.indexAt(ev.pos()))
+        return False
 
 
 # 各站链路、防采策略说明：从面板标题里抽出来挂到 tooltip，界面只留短句，
@@ -2419,41 +2702,134 @@ class MainWindow(QMainWindow):
         tasks.sort(key=lambda t: str(t.get("started_at") or ""), reverse=True)
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("历史任务 · 选中后接着上次采")
+        dlg.setWindowTitle("历史任务 · 选一条接着上次采")
         dlg.setModal(True)
-        dlg.resize(760, 430)
+        dlg.resize(860, 520)
         dv = QVBoxLayout(dlg)
         dv.setSpacing(10)
         dv.addWidget(QLabel(
-            "选中一条任务，点右下「接着采」：关键词、平台勾选、采集间隔都恢复成上次的样子，\n"
-            "已采完的关键词自动跳过，数据继续写进同一个文件夹——不重复采，也不盖掉已采的数据。"))
+            "点一下（或用键盘上下方向键）选中一条任务：选中的那条会变成「实心蓝点 + 淡蓝底 + 左边一条蓝竖线」，\n"
+            "右下角也会立刻写明要接着采哪一条，然后按回车或点「接着采这一条」。\n"
+            "整行发灰、带红标签的那几条是数据文件夹已经不在、接不上的任务，选不了。"))
+        dlg.setMinimumSize(720, 420)
         lst = QListWidget()
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        lst.setSelectionMode(QAbstractItemView.SingleSelection)
+        lst.setMouseTracking(True)
+        # 选中态改由行控件自己画：macOS 上弹窗一失焦，QListWidget 原生那条高亮
+        # 就褪成几乎看不见的浅灰——客户反馈的「选择标识不明显」根子就在这。
+        lst.setStyleSheet(
+            "QListWidget { border: 1px solid palette(mid); border-radius: 6px;"
+            " padding: 4px; background: palette(base); }"
+            "QListWidget::item { border: none; background: transparent; }"
+            "QListWidget::item:selected { background: transparent; color: palette(text); }"
+            "QListWidget::item:focus { border: none; outline: none; background: transparent; }")
+        rows = []
+        cur_id = str(self._current_task_id() or "")
         for t in tasks:
-            kws = [str(k) for k in (t.get("keywords") or []) if str(k).strip()]
             folder = str(t.get("folder") or "")
             exists = os.path.isdir(folder)
+            kws = [str(k) for k in (t.get("keywords") or []) if str(k).strip()]
             done_n = _tasks.done_keywords(t) if (kws and exists) else 0
-            cnt = int(t.get("count") or 0)
-            kw_part = (f"关键词 {len(kws)} 个（已跑完 {done_n} 个）" if kws
-                       else "旧版本·未记录关键词")
-            miss = "" if exists else "　【数据文件夹已不存在，接不上】"
-            label = (f"{t.get('started_at') or t.get('id') or '—'}　{t.get('status') or '—'}　"
-                     f"{kw_part}　已采 {cnt} 条{miss}\n　{t.get('name') or ''}")
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, t)
-            if not (kws and exists):
-                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
-            lst.addItem(item)
-        if lst.count():
-            lst.setCurrentRow(0)
-        dv.addWidget(lst, 1)
+            v = task_row_view(t, exists, done_n, cur_id)
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, t)
+            it.setData(Qt.UserRole + 1, v)
+            rw = TaskRow(v)
+            it.setSizeHint(rw.sizeHint())
+            if not v["selectable"]:
+                # 不给任何标志位：实测只留 ItemIsEnabled 时，点一下「当前项」照样会
+                # 停在这条上并画出淡色框，用户会误以为选中了（本次要修的正是这个）。
+                it.setFlags(Qt.NoItemFlags)
+            lst.addItem(it)
+            lst.setItemWidget(it, rw)
+            rows.append((it, rw))
+
+        def _fit_rows(*_a):
+            """行宽跟着列表视口走：行控件按整段文字算出来的宽度比弹窗还宽，
+            右侧的状态标签和「已采 N 家」会被整块裁到外面——而它们正是选中标识。"""
+            w0 = max(360, lst.viewport().width() - 2)
+            for it0, rw0 in rows:
+                h0 = rw0.sizeHint().height()
+                if it0.sizeHint().width() != w0 or it0.sizeHint().height() != h0:
+                    it0.setSizeHint(QSize(w0, h0))
+                if rw0.width() != w0:
+                    rw0.resize(w0, h0)
+                    rw0._elide()
+
+        lst.viewport().installEventFilter(_ResizeWatcher(_fit_rows, lst))
+        _fit_rows()
+
+        hint = QLabel()
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_muted_style())
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Ok).setText("接着采")
+        btn_ok = bb.button(QDialogButtonBox.Ok)
+        btn_ok.setText("接着采这一条")
+        btn_ok.setObjectName("primary")
+        btn_ok.setMinimumHeight(34)
+        btn_ok.setDefault(True)
         bb.button(QDialogButtonBox.Cancel).setText("关闭")
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
-        dv.addWidget(bb)
-        lst.itemDoubleClicked.connect(lambda _it: dlg.accept())
+
+        def _sync(*_a):
+            """选中变化就把四件事一起刷新：行高亮、回执文字、按钮可用与按钮上的目标。"""
+            cur = lst.currentItem()
+            for it0, rw0 in rows:
+                rw0.set_selected(it0 is cur)
+            v = cur.data(Qt.UserRole + 1) if cur is not None else None
+            # current 与 selected 是两回事：灰行也会被设成当前项，这里再判一次
+            # selectable，绝不把接不上的任务当成「用户已经选好了」。
+            if isinstance(v, dict) and v.get("selectable"):
+                tail = "　·　".join(x for x in (v["progress_text"], v["count_text"]) if x)
+                hint.setText(f"将接着采：{v['title']}（{tail}）")
+                hint.setStyleSheet(_muted_style())
+                btn_ok.setEnabled(True)
+            else:
+                hint.setText("请先选中一条能接着采的任务（左侧圆圈是空心的那几条）。")
+                hint.setStyleSheet(_danger_style())
+                btn_ok.setEnabled(False)
+
+        def _on_press(idx):
+            """点在接不上的灰行上：不改选中，但把「为什么接不上」讲在回执里——
+            否则用户连点两下没反应，只会以为按钮坏了。灰行不发 clicked 信号，
+            只能自己在视口上命中测试。点正常行则把回执刷回真正选中的那条。"""
+            it0 = lst.itemFromIndex(idx) if idx.isValid() else None
+            v = it0.data(Qt.UserRole + 1) if it0 is not None else None
+            if isinstance(v, dict) and not v.get("selectable"):
+                hint.setText("这条接不上：" + str(v.get("tooltip") or "").split("\n")[0]
+                             + "　（要接着采的还是之前选中的那条，想换就点带空心圆圈的行）")
+                hint.setStyleSheet(_danger_style())
+            else:
+                _sync()
+
+        lst.currentItemChanged.connect(_sync)
+        lst.viewport().installEventFilter(_PressWatcher(lst, _on_press, lst))
+        lst.itemDoubleClicked.connect(
+            lambda it0: dlg.accept() if (it0.data(Qt.UserRole + 1) or {}).get("selectable") else None)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
+        bottom.addWidget(hint, 1)
+        bottom.addWidget(bb, 0, Qt.AlignBottom)
+        dv.addWidget(lst, 1)
+        dv.addLayout(bottom)
+        # 默认就把该选的那条摆好：已经接在界面上的那条优先（用户点进来多半是想
+        # 确认「我接对了吗」），否则选第一条能接着采的，别让用户先手动点一下
+        want = -1
+        for i, (it0, _rw) in enumerate(rows):
+            tid0 = str((it0.data(Qt.UserRole) or {}).get("id") or "")
+            if (it0.flags() & Qt.ItemIsSelectable) and tid0 == cur_id:
+                want = i
+                break
+        if want < 0:
+            for i, (it0, _rw) in enumerate(rows):
+                if it0.flags() & Qt.ItemIsSelectable:
+                    want = i
+                    break
+        lst.setCurrentRow(want)
+        _fit_rows()
+        _sync()
         if dlg.exec_() != QDialog.Accepted:
             return
         chosen = None
@@ -2491,6 +2867,12 @@ class MainWindow(QMainWindow):
                 task["finished_at"] = existing.get("finished_at") or task["finished_at"]
             elif status:
                 task["status"] = status
+            if not self._kw_source_file and self.keywords:
+                # 关键词任务的名字：make_task_name 是给「上传的文件」设计的，
+                # 直接拿词表去套会写成「制冷压缩机 等 85 个文件」——用户填的是词
+                # 不是文件，历史列表里这句话会让人以为软件在采文档。
+                k0 = str(self.keywords[0])
+                task["name"] = k0 if len(self.keywords) == 1 else f"{k0} 等 {len(self.keywords)} 个关键词"
             _tasks.upsert_task(task)
             self._task_id = tid
             if existing is None:
