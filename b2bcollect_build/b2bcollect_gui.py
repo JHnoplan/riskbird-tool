@@ -959,9 +959,11 @@ class MainWindow(QMainWindow):
         self._opening_browser = False
         self._paused = False
         self.keywords = []
+        self._kw_raw = ""        # 用户原始输入（智能展开前），续采与任务快照回溯用
         self._kw_source_file = ""
         self._co_source_file = ""   # 公司名单文件（企知道补采）
         self._opening_login = False  # 防重复点「打开企知道/1688」同时拉多个后台线程
+        self._kw_expanded_text = ""  # 上次自动扩词写回的内容（同内容不再二次展开）
         self.session_dir = None
         self._first_start = None
         if HAS_YZD:
@@ -996,6 +998,9 @@ class MainWindow(QMainWindow):
         self._crawl_elapsed = 0.0
         self._hold_from = 0.0
         self._held_seconds = 0.0
+        # 打开工具就接上次的任务：关键词、平台勾选、参数、采到哪儿一并回填（静默）。
+        # 延到事件循环开始再做：读回上次数据要一两秒，卡在构造里窗口会先白屏。
+        QTimer.singleShot(0, self._restore_last_task)
 
     def _get_desktop_dir(self):
         desktop = Path.home() / "Desktop"
@@ -1039,8 +1044,14 @@ class MainWindow(QMainWindow):
             "例：「制冷与热泵核心部件」→ 制冷压缩机、冷凝器、蒸发器、膨胀阀、热泵机组……\n"
             "纯服务/流程词（研发、咨询、招投标、物流、运维等）会自动忽略，因为站内搜索没有对应商品。\n"
             "注意：解析结果由内置行业知识库生成，仅供参考，不一定完全符合你的需求，请检查后再采集。")
+        self.btn_history = QPushButton("历史任务·接着上次采")
+        self.btn_history.setToolTip(
+            "列出以前采过的任务：关键词、平台勾选、采集间隔、采到哪儿都记着。\n"
+            "选中一条点「接着采」→ 点「开始采集」就从上次停下的地方继续，\n"
+            "已采完的关键词自动跳过，数据仍写进同一个文件夹（不会盖掉已采的）。")
         hr.addWidget(self.btn_file); hr.addWidget(self.btn_paste)
         hr.addWidget(self.btn_parse); hr.addWidget(self.btn_smart)
+        hr.addWidget(self.btn_history)
         hr.addStretch(1)
         v.addLayout(hr)
         self.kw_text = QPlainTextEdit()
@@ -1145,7 +1156,16 @@ class MainWindow(QMainWindow):
                                "命中验证码时会自动还原窗口提醒人工过验证，过后重新最小化；\n"
                                "启动浏览器已带防后台节流开关，最小化不影响页面渲染。\n"
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
+        self.chk_auto_kw = QCheckBox("自动扩词·类别名换成产品词")
+        self.chk_auto_kw.setChecked(True)
+        self.chk_auto_kw.setToolTip(
+            "点「开始采集」时自动把「暖通空调与制冷设备」这类行业类别名展开成一批具体产品词\n"
+            "（制冷压缩机、冷凝器、工业冷水机……）。\n"
+            "原因：站内搜索只认产品名，类别名不是商品，实测一个词只能翻出十几家还混着无关商家，\n"
+            "挂一天也只有几百条。展开后的词会写回关键词框，可随时删改；\n"
+            "不想要就取消勾选，完全按你填的词采。")
         hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr); hp.addWidget(self.chk_bg)
+        hp.addWidget(self.chk_auto_kw)
         hp.addStretch(1)
         self.btn_clear_seen = QPushButton("清空历史种子库")
         self.btn_clear_seen.setToolTip("删除各站跨运行去重记录，让下次对同一批关键词从头重采。")
@@ -1286,6 +1306,7 @@ class MainWindow(QMainWindow):
         self.btn_paste.clicked.connect(self._on_paste)
         self.btn_parse.clicked.connect(self._on_parse)
         self.btn_smart.clicked.connect(self._on_smart_parse)
+        self.btn_history.clicked.connect(self._on_history_tasks)
         self.btn_co_file.clicked.connect(self._on_import_company_file)
         self.btn_open_qzd.clicked.connect(lambda: self._open_site_login("qzd"))
         self.btn_open.clicked.connect(self._on_open_browser)
@@ -1582,6 +1603,7 @@ class MainWindow(QMainWindow):
             self._on_parse()
 
     def _on_parse(self):
+        self._kw_raw = self.kw_text.toPlainText()
         self.keywords = ParallelSession.parse_keywords(self.kw_text.toPlainText())
         self.lbl_kw.setText(f"识别到 {len(self.keywords)} 个关键词：" +
                             ("、".join(self.keywords[:12]) + ("…" if len(self.keywords) > 12 else "")
@@ -1635,6 +1657,7 @@ class MainWindow(QMainWindow):
         # 写回输入框（一行一个），方便用户直接检查、增删
         self.kw_text.setPlainText("\n".join(kws))
         self.keywords = list(kws)
+        self._kw_expanded_text = chr(10).join(kws)
         self.lbl_kw.setText(
             f"智能解析完成：得到 {len(kws)} 个产品词（展开 {len(rep['expanded'])} 个类别"
             f"{('、忽略 ' + str(len(rep['dropped'])) + ' 个服务/流程词') if rep['dropped'] else ''}）。"
@@ -1891,6 +1914,8 @@ class MainWindow(QMainWindow):
             return
         if self.worker and self.worker.isRunning():
             return
+        # 自动扩词：行业类别名 → 具体产品词（放在开始采集前，用户不用记着先点「智能解析」）
+        self._auto_expand_on_start()
         self.session.set_enabled(enabled)
         self.session.configure(delay_between=self.spin_delay.value(),
                                max_pages=0,      # 不限页数：翻到没有新数据自然切下一个关键词
@@ -1901,6 +1926,8 @@ class MainWindow(QMainWindow):
             base = _tasks.tool_dir(self._get_desktop_dir()) if HAS_YZD else \
                 (self._get_desktop_dir() / "B2B多平台企业数据自动采集工具")
             self.session_dir = str(base / self._first_start)
+        # 进度台账与数据 Excel 同文件夹：拷走整个文件夹就把「采到哪儿」一起带走了
+        self.session.set_task_folder(self.session_dir)
         # 绑定待采集公司名单（任务文件夹里生成「待采集公司名单.xlsx」，与原数据/清洗入库同层级）：
         # 上传名单入列 + 清洗废数据持续回流；want_qzd=界面“启用企知道补采”开关。
         try:
@@ -1908,7 +1935,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             qzd_on = False
             self._on_log(f"⚠ 待采名单绑定失败（不影响关键词采集）：{str(e).splitlines()[0][:120]}")
-        self._register_task()
+        self._register_task(_tasks.TASK_STATUS_RUNNING)
         self._paused = False
         self.btn_start.setEnabled(False)
         self.btn_pause.setEnabled(True); self.btn_pause.setText("暂停")
@@ -1948,6 +1975,9 @@ class MainWindow(QMainWindow):
             self._paused = True
             self.btn_pause.setText("继续")
             self._hold_timer(True)
+        # 暂停那一刻就把进度写盘：用户随时关工具，下次打开看到的进度都不差于最后一次落盘
+        self._persist_progress(_tasks.TASK_STATUS_PAUSED if self._paused
+                               else _tasks.TASK_STATUS_RUNNING)
 
     def _on_stop(self):
         self._manual_stop = True
@@ -1971,8 +2001,13 @@ class MainWindow(QMainWindow):
         self._manual_stop = False
         self._finish_task(_tasks.TASK_STATUS_STOPPED if stopped else _tasks.TASK_STATUS_DONE,
                           len(self.session.snapshot_results()))
+        # 收尾把「关键词 + 采到哪儿」写回任务文件夹与索引，下次打开直接接着采
+        self._persist_progress(_tasks.TASK_STATUS_STOPPED if stopped
+                               else _tasks.TASK_STATUS_DONE)
         if not stopped:
             self._maybe_auto_import("采集完成")
+        # 每词产出反馈闭环：把本轮证明高产的词派生同族近义词补进词表（要用户再点开始才采）
+        self._boost_high_yield()
 
     # ── 自动保存 / 导出 ────────────────────────────────────────
     def request_autosave(self):
@@ -2005,6 +2040,8 @@ class MainWindow(QMainWindow):
                 _tasks.update_task(self._task_id, count=n)
             except Exception:
                 pass
+        # 每落一次数据就同步刷一次进度台账：中途强杀/断电，下次也能从最后落盘处接上
+        self._persist_progress()
 
     def _on_clean_now(self):
         """「清洗数据」：先选清洗对象——用户上传的任意 Excel/CSV（智能匹配列名洗成
@@ -2155,20 +2192,299 @@ class MainWindow(QMainWindow):
                                         f"原始明细已导出（无满足入库条件的数据）：\n{path}")
 
     # ── 云展动力：任务登记 / 绑定 / 导入 ───────────────────────
+    # ── 自动扩词 / 历史任务续采（任务 = 配置快照 + 关键词级游标）────
+    # 对齐大厂批量采集的通用做法：把「一次采集」当成可恢复的任务对象，而不是一次性
+    # 进程。配置快照决定下次打开显示什么，关键词级游标决定从哪儿继续，条目级去重
+    # 键（各站历史种子库）保证绝不重复烧请求。
+    def _params_snapshot(self):
+        """采集参数快照：续采时照原样恢复，不该让用户为接着采再调一遍参数。"""
+        return {"delay_between": float(self.spin_delay.value()),
+                "relevance_guard": bool(self.chk_guard.isChecked()),
+                "incremental": bool(self.chk_incr.isChecked()),
+                "background": bool(self.chk_bg.isChecked()),
+                "auto_keyword_expand": bool(self.chk_auto_kw.isChecked())}
+
+    def _apply_params(self, params):
+        if not isinstance(params, dict):
+            return
+        try:
+            if params.get("delay_between"):
+                self.spin_delay.setValue(float(params["delay_between"]))
+            for key, widget in (("relevance_guard", self.chk_guard),
+                                ("incremental", self.chk_incr),
+                                ("background", self.chk_bg),
+                                ("auto_keyword_expand", self.chk_auto_kw)):
+                if key in params:
+                    widget.setChecked(bool(params[key]))
+        except Exception:
+            pass
+
+    def _auto_expand_on_start(self):
+        """点「开始采集」前自动展开关键词。
+        只在勾选「自动扩词」且真展开出新词时改词表，改完写回输入框——用户看得见
+        改成什么了，随时能删改；不想要就取消勾选，完全按原词采。"""
+        if not self.chk_auto_kw.isChecked():
+            return
+        raw = self.kw_text.toPlainText()
+        if not raw.strip():
+            return
+        try:
+            rep_ = _kwexp.expand_keywords(raw)
+        except Exception as e:
+            self._on_log(f"⚠ 自动扩词失败（按你填的原词继续采）：{str(e).splitlines()[0][:120]}")
+            return
+        kws = list(rep_.get("keywords") or [])
+        if not kws or kws == self.keywords:
+            return
+        # 框里就是上次展开写回的内容时不再二次展开：否则连点两次「开始采集」，
+        # 词表会在用户没动过的情况下变长（第二轮会再匹配出别的行业类别）。
+        if self._kw_expanded_text and raw == self._kw_expanded_text:
+            return
+        before = len(self.keywords)
+        self._kw_raw = raw                      # 保留展开前的原始输入
+        self._kw_expanded_text = chr(10).join(kws)
+        self.kw_text.setPlainText("\n".join(kws))
+        self.keywords = kws
+        self.lbl_kw.setText(
+            f"自动扩词：{before} 个 → {len(kws)} 个产品词（已写回关键词框，可删改）。"
+            f"⚠ {self._SMART_HINT}")
+        self._on_log(f"🪄 自动扩词：{before} 个词 → {len(kws)} 个产品词"
+                     f"（展开 {len(rep_.get('expanded') or [])} 个行业类别）。")
+        for seg, name, added in (rep_.get("expanded") or [])[:12]:
+            self._on_log(f"   ・「{seg}」→ 归入【{name}】，新增 {added} 个产品词")
+        if rep_.get("dropped"):
+            self._on_log(f"   ・已忽略（纯服务/流程词，站内没有对应商品）："
+                         f"{'、'.join(rep_['dropped'])}")
+        if rep_.get("truncated"):
+            self._on_log(f"   ↳ 词表已达单次上限（{len(kws)} 个）自动收住："
+                         "先采完这批再补下一批更安全（一次灌上千个词会把请求量放大几十倍）。")
+        self._on_log("   ↳ 不想自动换词：取消勾选「自动扩词·类别名换成产品词」，就按你填的原词采。")
+
+    def _boost_high_yield(self, min_yield=20):
+        """产出反馈闭环：把本轮净新增 ≥ min_yield 家的高产词，按同族派生一批近义词
+        追加进关键词框。刻意不自动开下一轮——一夜之间把请求量放大好几倍会抬高防采
+        风险，所以只把词备好，由用户点「开始采集」决定要不要继续。"""
+        boost = getattr(_kwexp, "boost_high_yield", None)
+        if not callable(boost) or not self.session_dir:
+            return
+        try:
+            pairs = self.session.top_keywords(limit=60) or []
+        except Exception:
+            return
+        kw_yield = {}
+        for k, n in pairs:
+            kw_yield[str(k)] = int(n or 0)
+        if not kw_yield:
+            return
+        try:
+            res = boost(list(self.keywords), kw_yield, min_yield=min_yield)
+        except Exception as e:
+            self._on_log(f"⚠ 高产词派生新词失败：{str(e).splitlines()[0][:120]}")
+            return
+        added = res.get("added") or []
+        if not added:
+            return
+        new_words = [w for _k, _n, ws in added for w in ws]
+        self.keywords = list(res.get("keywords") or self.keywords)
+        self.kw_text.setPlainText("\n".join(self.keywords))
+        self.lbl_kw.setText(f"高产词派生：新增 {len(new_words)} 个同族产品词（已写回关键词框）。"
+                            f"共 {len(self.keywords)} 个词")
+        for kw, n, sib in added[:8]:
+            self._on_log(f"   ・「{kw}」净新增 {n} 家 → 同族派生：{'、'.join(sib)}")
+        self._on_log(f"📈 已把 {len(added)} 个高产词的同族近义词（共 {len(new_words)} 个）加进关键词框："
+                     "点「开始采集」就顺着往下采；不需要的话现在删掉即可。")
+
+    def _persist_progress(self, status=None):
+        """把「关键词/站点/参数 + 每词进度」写回任务文件夹和任务索引。
+        自动保存、暂停、结束、退出前都会调，保证下次打开看到的进度是最新的。"""
+        if not self.session_dir:
+            return
+        try:
+            self.session.set_task_folder(self.session_dir)
+            self.session.save_progress()
+        except Exception as e:
+            self._on_log(f"⚠ 采集进度保存失败（不影响本次数据）：{str(e).splitlines()[0][:100]}")
+        self._register_task(status)
+
+    def _restore_last_task(self):
+        """启动自动回填：取最近一条「能接着采」的任务，静默恢复关键词/参数/进度。"""
+        if not HAS_YZD:
+            return
+        try:
+            tasks = [t for t in _tasks.load_tasks()
+                     if t.get("status") in _tasks.RESUMABLE_STATUS
+                     and (t.get("keywords") or [])]
+        except Exception:
+            return
+        if not tasks:
+            return
+        tasks.sort(key=lambda t: str(t.get("started_at") or ""), reverse=True)
+        last = tasks[0]
+        folder = str(last.get("folder") or "")
+        if not folder or not os.path.isdir(folder):
+            return
+        if self._restore_task(last, silent=True):
+            self._on_log(f"↻ 已自动显示上次任务的关键词与进度："
+                         f"{last.get('name') or folder}（{len(self.keywords)} 个关键词）。"
+                         "点「开始采集」即接着采；想换一批词从头采就点「开始新任务」。")
+
+    def _restore_task(self, task, silent=False):
+        """按任务恢复现场：关键词/站点/参数 + 逐词游标 + 已采数据装回内存。
+        恢复完只等用户点「开始采集」——那时各站会跳过已跑完的关键词，从未采的继续。
+        silent=True 用于启动自动回填：不打扰，只在日志和横幅里说明。"""
+        folder = str(task.get("folder") or "")
+        if not folder or not os.path.isdir(folder):
+            msg = (f"找不到上次的数据文件夹：\n{folder}\n\n"
+                   "文件夹被删除或移动过就接不上了，请重新点「开始新任务」采一批。")
+            if silent:
+                self._on_log("↻ 上次任务的数据文件夹已不存在，未自动回填：" + folder)
+            else:
+                QMessageBox.warning(self, "没法接着采", msg)
+            return False
+
+        self._first_start = task.get("id") or Path(folder).name
+        self.session_dir = folder
+        self._task_id = task.get("id") or self._first_start
+        self.session.set_task_folder(folder)
+        data = self.session.load_progress(folder) or {}
+
+        # 词表：进度文件里的词最权威（就是上一轮实际参与采集的那批），
+        # 任务索引里的词兜底（老任务可能只有索引）。
+        kws = [str(k).strip() for k in ((data.get("keywords") or task.get("keywords") or []))
+               if str(k).strip()]
+        if not kws:
+            if silent:
+                return False
+            QMessageBox.information(self, "这是旧版本的任务",
+                                    "这条任务没有记下关键词（老版本只记名字和条数）。\n"
+                                    "请把关键词重新填回输入框再采集；上次已采的数据仍在数据文件夹里。")
+            return False
+        self._kw_raw = task.get("kw_raw") or "\n".join(kws)
+        self.kw_text.setPlainText("\n".join(kws))
+        self.keywords = list(kws)
+        self._kw_source_file = ""
+        self._kw_expanded_text = chr(10).join(kws)
+
+        sites = [s for s in ((data.get("sites") or task.get("sites") or [])) if s in self.site_checks]
+        if sites:
+            for slug, chk in self.site_checks.items():
+                chk.setChecked(slug in sites)
+        self._apply_params(task.get("params") or {})
+
+        resumed = self.session.apply_progress() if data else 0
+        done_n = _tasks.done_keywords(task) if HAS_YZD else 0
+        seeded = 0
+        raw_path = task.get("raw_file") or os.path.join(folder, _tasks.RAW_FILE_NAME)
+        if os.path.exists(raw_path):
+            try:
+                seeded = self.session.seed_results(_tasks.read_records_from_xlsx(raw_path))
+            except Exception as e:
+                self._on_log(f"⚠ 读回上次数据失败（不影响接着采，只是本轮不会累加显示旧数据）："
+                             f"{str(e).splitlines()[0][:120]}")
+        shown = "、".join(kws[:8]) + ("…" if len(kws) > 8 else "")
+        self.lbl_kw.setText(f"已接上次任务：{len(kws)} 个关键词（已跑完 {done_n} 个）：" + shown)
+        self._on_log(f"↻ 恢复任务：{task.get('name') or self._first_start}｜{len(kws)} 个关键词"
+                     f"｜已跑完 {done_n} 个｜已采 {seeded} 条装回内存｜{resumed} 个通道已接上游标")
+        self._show_banner(
+            f"已接上次的任务：{shown}　共 {len(kws)} 个关键词、已采 {seeded} 条。"
+            "点「开始采集」就从上次停下的地方接着采，已采过的商家不会重复采。",
+            "#e8f5e9", "#1b5e20")
+        return True
+
+    def _on_history_tasks(self):
+        """历史任务列表：选中一条 →「接着采」恢复关键词与进度（数据写回原文件夹）。"""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示",
+                                    "采集进行中。请先点「停止」并等日志出现「采集完成/已停止」"
+                                    "后再选历史任务。")
+            return
+        tasks = []
+        if HAS_YZD:
+            try:
+                tasks = list(_tasks.load_tasks())
+            except Exception as e:
+                QMessageBox.warning(self, "读不到历史任务", f"任务索引读取失败：{e}")
+                return
+        if not tasks:
+            QMessageBox.information(self, "还没有历史任务",
+                                    "以前采过的任务会列在这里（关键词、平台勾选、采集间隔、采到哪儿）。\n"
+                                    "第一次采集完成后就有记录，之后随时能选回来接着采。")
+            return
+        tasks.sort(key=lambda t: str(t.get("started_at") or ""), reverse=True)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("历史任务 · 选中后接着上次采")
+        dlg.setModal(True)
+        dlg.resize(760, 430)
+        dv = QVBoxLayout(dlg)
+        dv.setSpacing(10)
+        dv.addWidget(QLabel(
+            "选中一条任务，点右下「接着采」：关键词、平台勾选、采集间隔都恢复成上次的样子，\n"
+            "已采完的关键词自动跳过，数据继续写进同一个文件夹——不重复采，也不盖掉已采的数据。"))
+        lst = QListWidget()
+        for t in tasks:
+            kws = [str(k) for k in (t.get("keywords") or []) if str(k).strip()]
+            folder = str(t.get("folder") or "")
+            exists = os.path.isdir(folder)
+            done_n = _tasks.done_keywords(t) if (kws and exists) else 0
+            cnt = int(t.get("count") or 0)
+            kw_part = (f"关键词 {len(kws)} 个（已跑完 {done_n} 个）" if kws
+                       else "旧版本·未记录关键词")
+            miss = "" if exists else "　【数据文件夹已不存在，接不上】"
+            label = (f"{t.get('started_at') or t.get('id') or '—'}　{t.get('status') or '—'}　"
+                     f"{kw_part}　已采 {cnt} 条{miss}\n　{t.get('name') or ''}")
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, t)
+            if not (kws and exists):
+                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            lst.addItem(item)
+        if lst.count():
+            lst.setCurrentRow(0)
+        dv.addWidget(lst, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("接着采")
+        bb.button(QDialogButtonBox.Cancel).setText("关闭")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        dv.addWidget(bb)
+        lst.itemDoubleClicked.connect(lambda _it: dlg.accept())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        chosen = None
+        it = lst.currentItem()
+        if it is not None:
+            chosen = it.data(Qt.UserRole)
+        if not isinstance(chosen, dict):
+            QMessageBox.information(dlg, "提示", "请先在列表里选一条可以接着采的任务。")
+            return
+        self._restore_task(chosen)
+
     def _current_task_id(self):
         return Path(self.session_dir).name if self.session_dir else ""
 
-    def _register_task(self):
+    def _register_task(self, status=None):
+        """登记/刷新任务索引：除了名字和条数，还要存下「关键词、站点、参数」这份
+        配置快照——没有它，关掉工具就什么都不剩，续采无从谈起。"""
         if not HAS_YZD or not self.session_dir:
             return
         try:
             tid = self._current_task_id()
             name_src = [self._kw_source_file] if self._kw_source_file else list(self.keywords)
             task = _tasks.new_task(tid, name_src, self.session_dir,
-                                   count=len(self.session.snapshot_results()))
+                                   count=len(self.session.snapshot_results()),
+                                   keywords=list(self.keywords),
+                                   sites=self._enabled_sites(),
+                                   params=self._params_snapshot(),
+                                   kw_raw=self._kw_raw or "")
             existing = next((t for t in _tasks.load_tasks() if t.get("id") == tid), None)
             if existing:
                 task["started_at"] = existing.get("started_at") or task["started_at"]
+                # 状态只在调用方明确指定时才改，否则保留上次的（别让自动保存把
+                # 「已停止」刷回「采集中」，用户在历史列表里会看不懂）。
+                task["status"] = status or existing.get("status") or task["status"]
+                task["finished_at"] = existing.get("finished_at") or task["finished_at"]
+            elif status:
+                task["status"] = status
             _tasks.upsert_task(task)
             self._task_id = tid
             if existing is None:
@@ -2449,6 +2765,8 @@ class MainWindow(QMainWindow):
             self.session.stop_crawl()
             if self.autosave and self.autosave.isRunning():
                 self.autosave.wait(3000)
+            # 退出前留一份「关键词 + 进度」，下次打开工具自动回填并可续采
+            self._persist_progress()
             self.session.close_browser()
         except Exception:
             pass

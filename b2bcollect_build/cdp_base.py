@@ -547,6 +547,16 @@ class CdpSiteCrawler:
         self.stat_no_contact = 0
         self.stat_failed = 0
 
+        # 关键词级台账（续采与扩词反馈的地基）：
+        #   kw_yield —— 该词本轮净新增几条记录（判断词好不好的唯一硬指标）
+        #   _kw_done —— 该词已完整跑完一轮（续采时跳过；中途被停的不算）
+        # 旧版只有 start_index（按词表下标续采），多站并行下各站进度不同根本对不齐，
+        # 所以下标续采一直没真能用；改成「按词记账」才能做到任意时刻停、下次接着采。
+        self.kw_yield = {}
+        self._kw_done = set()
+        # 续采开关：由 restore_progress 置 True，全新任务保持 False（进 crawl 会清空台账）
+        self.resume = False
+
         self._data_dir = self._stable_data_dir()
         self._seen_store_path = self._data_dir / f"seen_store_{self.PLATFORM_SLUG}.json"
 
@@ -574,6 +584,9 @@ class CdpSiteCrawler:
     def _add_result(self, rec):
         with self.results_lock:
             self.results.append(rec)
+        kw = str(rec.get("关键词") or "").strip()
+        if kw:
+            self.kw_yield[kw] = self.kw_yield.get(kw, 0) + 1
         self._commit_to_store(rec)
         if self.max_records and len(self.results) >= self.max_records:
             self._log(f"🛡 已达限量 {self.max_records} 条，自动停止")
@@ -1494,6 +1507,7 @@ return '';})()"""
             "no_contact": self.stat_no_contact,
             "failed": self.stat_failed,
             "got": len(self.results),
+            "kw_yield": dict(self.kw_yield),
         }
 
     # ── 列表翻页迭代 ──────────────────────────────────────────
@@ -1559,6 +1573,30 @@ return '';})()"""
                 return
             self._sleep()
 
+    # ── 关键词台账：快照 / 回填（续采入口）───────────────────────
+    def progress_snapshot(self):
+        """本站当前的关键词进度（供任务落盘）。"""
+        return {"yield": dict(self.kw_yield), "done": sorted(self._kw_done)}
+
+    def restore_progress(self, snap):
+        """把上次任务的关键词进度装回来：已跑完的词直接跳过，净新增接着累加。
+        同时打开 resume 标记——crawl() 不再清空台账，否则一进循环就把刚恢复的进度抹了。"""
+        snap = snap or {}
+        self.kw_yield = {str(k): int(v or 0) for k, v in (snap.get("yield") or {}).items()}
+        self._kw_done = {str(k) for k in (snap.get("done") or [])}
+        self.resume = bool(self._kw_done or self.kw_yield)
+        return self.resume
+
+    def seed_results(self, records):
+        """续采前把本任务已采到的记录装回内存：自动保存是按 results 全量覆写
+        原数据 Excel 的，不装回来就会用「本轮新采的」盖掉上次已采的那几百上千条。"""
+        rows = [r for r in (records or []) if isinstance(r, dict) and r.get("公司名称")]
+        if not rows:
+            return 0
+        with self.results_lock:
+            self.results.extend(rows)
+        return len(rows)
+
     # ── 主采集循环 ─────────────────────────────────────────────
     def crawl(self, keywords, start_index=0):
         self._crawling = True
@@ -1569,6 +1607,10 @@ return '';})()"""
         self._early_skipped = 0
         self.stat_pages = self.stat_listed = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
+        if not self.resume:
+            # 全新任务才清台账；续采（restore_progress 已置 resume）要留着上次的进度接着跑
+            self.kw_yield = {}
+            self._kw_done = set()
         self._last_activity = 0.0
         self._last_pace = 0.0
         self._block_times = []
@@ -1605,6 +1647,10 @@ return '';})()"""
                 time.sleep(0.5)
             kw = kws[ki]
             ki += 1
+            if kw in self._kw_done:
+                self._log(f"↻ 续采：「{kw}」上次已跑完（净新增 {self.kw_yield.get(kw, 0)} 家），本轮跳过")
+                self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
+                continue
             self._log(f"▶ [{ki}/{len(kws)}] 关键词：{kw}")
             try:
                 for stub in self._iter_keyword(kw):
@@ -1652,6 +1698,10 @@ return '';})()"""
                         self._stop_requested = True
                 else:
                     self._log(f"⚠ 「{kw}」处理异常：{msg} → 跳过该关键词继续")
+            if not self._stop_requested:
+                # 完整跑完一轮才记「已跑过」；中途被停止/暂停掉开的词下次重来，
+                # 重复条目由跨运行种子库兜住，不会多烧请求。
+                self._kw_done.add(kw)
             if self.incremental:
                 self._save_seen_store()
             self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
@@ -1702,6 +1752,9 @@ return '';})()"""
         self._early_skipped = 0
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
+        self.kw_yield = {}
+        self._kw_done = set()
+        self.resume = False
         self._last_activity = 0.0
         self._last_pace = 0.0
         self._current_delay = self.delay_between

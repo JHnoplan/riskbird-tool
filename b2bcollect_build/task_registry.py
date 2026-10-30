@@ -23,6 +23,11 @@ RAW_FILE_NAME = "企业数据_原始.xlsx"      # 会话目录里的原数据文
 TASK_STATUS_RUNNING = "采集中"
 TASK_STATUS_DONE = "已完成"
 TASK_STATUS_STOPPED = "已停止"
+TASK_STATUS_PAUSED = "已暂停"
+# 能接着采的状态（界面「历史任务」列表里高亮提示用）：
+# 已完成的任务不鼓动用户重跑（要重采请开新任务），但也不禁止。
+RESUMABLE_STATUS = (TASK_STATUS_RUNNING, TASK_STATUS_STOPPED, TASK_STATUS_PAUSED)
+PROGRESS_FILENAME = "采集进度.json"
 
 
 # ── 路径 ────────────────────────────────────────────
@@ -230,7 +235,17 @@ def sorted_for_import(tasks: list) -> list:
                   reverse=True)
 
 
-def new_task(task_id: str, file_paths, folder: str, count: int = 0) -> dict:
+def new_task(task_id: str, file_paths, folder: str, count: int = 0,
+             keywords=None, sites=None, params=None, kw_raw: str = "") -> dict:
+    """新建任务条目。
+
+    keywords/sites/params/kw_raw 是「续采」要用的配置快照（旧版本只记名字和条数，
+    所以关掉工具就什么都不剩了）：
+      keywords —— 本次**实际参与采集**的词表（已经智能解析展开后的）
+      kw_raw   —— 用户在框里原始输入（回溯展开前的意图）
+      sites    —— 勾选的站点 slug
+      params   —— 采集间隔/相关性/增量等开关
+    """
     return {
         "id": task_id,
         "name": make_task_name(file_paths),
@@ -241,7 +256,50 @@ def new_task(task_id: str, file_paths, folder: str, count: int = 0) -> dict:
         "count": count,
         "folder": str(folder),
         "raw_file": os.path.join(str(folder), RAW_FILE_NAME),
+        "keywords": [str(k) for k in (keywords or []) if str(k).strip()],
+        "kw_raw": kw_raw or "",
+        "sites": list(sites or []),
+        "params": dict(params or {}),
     }
+
+
+def progress_path(task_folder: str) -> str:
+    """任务文件夹里的进度台账文件路径（与 parallel_session.PROGRESS_FILENAME 同一名字）。"""
+    return os.path.join(str(task_folder or ""), PROGRESS_FILENAME)
+
+
+def task_progress(task: dict) -> dict:
+    """读回任务的实际进度（哪些词跑完了、每词净新增）。
+    存在两个源头：索引里冷写的 ledger 字段（旧条目没有）与任务文件夹里的
+    采集进度.json（权威、每次自动保存都刷）——以后者为准，前者兜底。"""
+    if not isinstance(task, dict):
+        return {}
+    p = progress_path(task.get("folder") or "")
+    if p and os.path.exists(p):
+        data = _read_json(Path(p), {})
+        if isinstance(data, dict) and isinstance(data.get("ledger"), dict):
+            return data
+    if isinstance(task.get("ledger"), dict):
+        return {"ledger": task["ledger"], "keywords": task.get("keywords") or []}
+    return {}
+
+
+def task_yield_total(task: dict) -> int:
+    """任务台账里的净新增总数（界面显示「累计已采」而不是只本轮）。"""
+    total = 0
+    for v in (task_progress(task).get("ledger") or {}).values():
+        if isinstance(v, dict):
+            total += sum(int(n or 0) for n in (v.get("yield") or {}).values())
+    return total
+
+
+def done_keywords(task: dict) -> int:
+    """已完整跑完的关键词个数（跨站取并集：给用户看「上次跑到哪儿」最直白的一个数）。"""
+    out = set()
+    for v in (task_progress(task).get("ledger") or {}).values():
+        if isinstance(v, dict):
+            out |= {str(k) for k in (v.get("done") or [])}
+    return len(out)
 
 
 def finish_task(task_id: str, status: str, count: int = 0, desktop_dir=None) -> bool:

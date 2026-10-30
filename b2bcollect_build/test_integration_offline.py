@@ -189,9 +189,14 @@ def test_smart_expand():
     assert r2["keywords"] == [], r2
     assert len(r2["dropped"]) == 3, r2["dropped"]
     # ③ 未收录的词原样保留（不误删用户已经写好的产品词）
-    r3 = ke.expand_keywords("太阳能路灯")
-    assert r3["keywords"] == ["太阳能路灯"], r3
-    assert r3["kept"] == ["太阳能路灯"], r3
+    r3 = ke.expand_keywords("宠物智能喂食器")
+    assert r3["keywords"] == ["宠物智能喂食器"], r3
+    assert r3["kept"] == ["宠物智能喂食器"], r3
+    # ③b 知识库批量扩行业后：光伏类也能展开（「太阳能路灯」归入【光伏与太阳能】）
+    r3b = ke.expand_keywords("太阳能路灯")
+    assert r3b["expanded"][0][1] == "光伏与太阳能", r3b["expanded"]
+    assert "光伏组件" in r3b["keywords"] and "太阳能路灯" in r3b["keywords"], r3b["keywords"]
+    assert r3b["truncated"] is False and r3b["expanded"][0][2] >= 5, r3b
     # ④ 最长特征短语优先：「空气过滤与净化设备」归设备类而非材料类
     r4 = ke.expand_keywords("空气过滤与净化设备")
     assert "FFU风机过滤单元" in r4["keywords"], r4["keywords"]

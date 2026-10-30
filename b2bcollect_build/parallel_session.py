@@ -18,7 +18,9 @@
   start_browser/close_browser、clear_seen_store、_is_session_alive、_log。
 """
 import re
+import os
 import sys
+import json
 import time
 import threading
 from pathlib import Path
@@ -93,6 +95,12 @@ class ParallelSession:
         self._done_sites = set()
         self._total_done = 0
         self._kw_progress = {}          # slug -> (已完成关键词数, 关键词总数)
+        # 关键词级进度台账（slug -> {"yield": {词: 净新增}, "done": [跑完的词]}）：
+        # 续采靠它而不是靠 start_index——五个站并行推进速度不同，下标根对不齐。
+        self._kw_ledger = {}
+        self._last_keywords = []
+        self.task_folder = ""
+        self.progress_path = ""
         self._lock = threading.RLock()
         # ── 企知道名单通道（第六路）：不在 SITE_ORDER/关键词并行里，独立线程按需驱动 ──
         self.qzd = _adapters.QizhidaoSite(port=port) if _adapters.HAS_QZD else None
@@ -254,10 +262,139 @@ class ParallelSession:
     def set_enabled(self, enabled):
         self.enabled = set(enabled or [])
 
+    # ── 任务进度台账（暂停/停止/关工具后下次接着采）───────────────
+    PROGRESS_FILENAME = "采集进度.json"
+
+    def set_task_folder(self, folder):
+        """绑定任务文件夹（桌面/B2B三站企业数据自动采集工具/<会话时间戳>/）。
+        进度台账与原数据 Excel 同层：用户拷走整个文件夹就把「关键词、参数、
+        采到哪儿」一起带走了。"""
+        self.task_folder = str(folder or "")
+        self.progress_path = (str(Path(self.task_folder) / self.PROGRESS_FILENAME)
+                              if self.task_folder else "")
+        return self.progress_path
+
+    def snapshot_site_progress(self):
+        """把各爬虫内存里的逐词台账同步到会话台账（爬虫才是逐词的权威记录者）。"""
+        with self._lock:
+            for slug, c in self.crawlers.items():
+                snap = getattr(c, "progress_snapshot", None)
+                if callable(snap):
+                    d = snap() or {}
+                    self._kw_ledger[slug] = {"yield": dict(d.get("yield") or {}),
+                                             "done": list(d.get("done") or [])}
+        return self._kw_ledger
+
+    def keyword_progress(self):
+        """当前各通道进度（界面看板/任务索引显示用）。"""
+        with self._lock:
+            return {s: {"yield": dict(v.get("yield") or {}),
+                        "done": list(v.get("done") or [])}
+                    for s, v in self._kw_ledger.items()}
+
+    def total_yield(self):
+        """台账里的净新增总数（续采后显示「累计已采」而不是只有本轮）。"""
+        with self._lock:
+            return sum(sum((v.get("yield") or {}).values()) for v in self._kw_ledger.values())
+
+    def top_keywords(self, limit=12):
+        """跨站汇总的每词产出榜（高产词榜）——下一轮同族派生扩词的输入。"""
+        merged = {}
+        for v in self.keyword_progress().values():
+            for kw, n in (v.get("yield") or {}).items():
+                merged[kw] = merged.get(kw, 0) + int(n or 0)
+        return sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+    def save_progress(self):
+        """进度落盘：tmp + os.replace 原子替换，强杀/断电不会留下半个坏文件。"""
+        if not self.progress_path:
+            return False
+        self.snapshot_site_progress()
+        data = {
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "keywords": list(self._last_keywords or []),
+            "sites": sorted(self.enabled),
+            "ledger": self.keyword_progress(),
+        }
+        try:
+            Path(self.progress_path).parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.progress_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.progress_path)
+            return True
+        except Exception as e:
+            self._log(f"⚠ 采集进度落盘失败（不影响本次采集）：{str(e).splitlines()[0][:100]}")
+            return False
+
+    def load_progress(self, folder=""):
+        """读任务里的进度台账；没文件返回 None（当全新任务）。"""
+        if folder:
+            self.set_task_folder(folder)
+        if not self.progress_path or not os.path.exists(self.progress_path):
+            return None
+        try:
+            with open(self.progress_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return None
+        if isinstance(data, dict) and isinstance(data.get("ledger"), dict):
+            with self._lock:
+                self._kw_ledger = data["ledger"]
+            return data
+        return None
+
+    def apply_progress(self):
+        """把台账装回各爬虫（CDP 系有细粒度逐词台账；1688 适配器没有，
+        就靠下面的关键词子集过滤实现续采）。返回生效的站点数。"""
+        applied = 0
+        with self._lock:
+            items = list(self._kw_ledger.items())
+        for slug, snap in items:
+            c = self.crawlers.get(slug)
+            if c is None:
+                continue
+            rp = getattr(c, "restore_progress", None)
+            if callable(rp) and rp(snap):
+                applied += 1
+        return applied
+
+    def seed_results(self, records):
+        """续采第 2 步：把任务里已采到的记录按「数据来源」装回各通道内存。
+        这一步不能省——自动保存是按内存 results 全量覆写原数据 Excel 的，
+        不装回来就会用本轮新采的几十条盖掉上次已采的几百条（客户最敏感的
+        「数据丢了」就这么发生）。返回装回的条数。"""
+        by_src = {}
+        for r in records or []:
+            if isinstance(r, dict):
+                by_src.setdefault(str(r.get("数据来源") or "").strip(), []).append(r)
+        total = 0
+        targets = list(self.crawlers.items())
+        if self.qzd is not None:
+            targets.append((QZD_SLUG, self.qzd))
+        for slug, c in targets:
+            rows = by_src.get(SITE_NAMES.get(slug, slug)) or by_src.get(slug) or []
+            if not rows:
+                continue
+            seed = getattr(c, "seed_results", None)
+            if callable(seed):
+                total += seed(rows) or 0
+            else:
+                lock = getattr(c, "results_lock", None)
+                if lock is not None:
+                    with lock:
+                        c.results.extend(rows)
+                else:
+                    c.results.extend(rows)
+                total += len(rows)
+        return total
+
     # ── 采集主入口（阻塞，供 QThread worker 调用）──────────────
     def crawl(self, keywords, start_index=0):
         kws = [str(x).strip() for x in (keywords or []) if str(x).strip()]
         self._kw_count = len(kws)
+        with self._lock:
+            self._last_keywords = list(kws)
         actives = self._active_crawlers()
         qzd_on = self.qzd is not None and self.qzd_enabled
         if not kws and not actives and not qzd_on:
@@ -315,6 +452,22 @@ class ParallelSession:
         if self._qzd_active():
             total += len(self.qzd.results)
         self._log(f"✅ 多平台采集全部结束，合计 {total} 家")
+        self.save_progress()
+        # 每词产出榜：直接回答「哪些词白跑了」——0 产出的词就是下一轮该换掉的词，
+        # 高产词则是同族派生扩词的种子（客户「挂一天才几百条」的根因就在这张表里）。
+        board = self.top_keywords(999)
+        if board:
+            hit = [(k, n) for k, n in board if n > 0]
+            dry = [k for k, n in board if n == 0]
+            self._log("🏆 每词产出榜（跨站净新增）：" +
+                      "、".join(f"{k} {n}家" for k, n in self.top_keywords(8)))
+            if dry:
+                self._log(f"🪙 其中 {len(dry)} 个词一家没出（{('、'.join(dry[:8]))}"
+                          f"{('…' if len(dry) > 8 else '')}）——这类词多半是行业类别名而非具体产品词，"
+                          f"建议点「智能解析」展开或换更具体的产品名")
+            if hit:
+                self._log(f"📈 高产词 {hit[0][0]}（{hit[0][1]} 家）可继续同族派生扩量"
+                          f"（例：螺杆式/风冷式/水冷式…），工具下一轮会自动带上")
         # 汇总账目：回答「实际采了多少 / 过滤了多少」
         for name, s in self.site_stats().items():
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
@@ -322,11 +475,65 @@ class ParallelSession:
                       f"早过滤 {s['early']}｜详情不相关 {s['filtered']}")
         self._emit("crawl_finished_signal")
 
+    def _pending_keywords(self, crawler, keywords):
+        """续采过滤：把本站**已完整跑完**的关键词剔掉，只把剩下的交给爬虫。
+        放在会话层做（而不是每个爬虫里改）是因为 1688 适配器继承的是 Selenium 爬虫、
+        没有逐词台账；在这里统一过滤，五个通道一套语义。"""
+        snap = getattr(crawler, "progress_snapshot", None)
+        if callable(snap):
+            done = {str(k) for k in ((snap() or {}).get("done") or [])}
+        else:
+            slug = getattr(crawler, "PLATFORM_SLUG", "")
+            done = {str(k) for k in ((self._kw_ledger.get(slug) or {}).get("done") or [])}
+        if not done:
+            return list(keywords)
+        return [k for k in keywords if str(k) not in done]
+
+    def _merge_site_progress(self, crawler, subset):
+        """单站跑完后并账：CDP 系直接取爬虫的逐词台账（它知道哪些词真跑完了、
+        每个词净新增几条）；适配器没有台账，就按「本轮子集 + 未被打断」推 done，
+        净新增从 results 按关键词回算（含续采装回的history，口径为累计）。"""
+        slug = getattr(crawler, "PLATFORM_SLUG", "")
+        if not slug:
+            return
+        snap = getattr(crawler, "progress_snapshot", None)
+        if callable(snap):
+            d = snap() or {}
+            with self._lock:
+                self._kw_ledger[slug] = {"yield": dict(d.get("yield") or {}),
+                                         "done": list(d.get("done") or [])}
+            return
+        with self._lock:
+            prev = self._kw_ledger.get(slug) or {"yield": {}, "done": []}
+            done = {str(k) for k in (prev.get("done") or [])}
+            if not getattr(crawler, "_stop_requested", False):
+                done |= {str(k) for k in subset}
+            # 每词条数按 results 回算（续采装回的 history 也算在内，口径为累计）
+            n = {}
+            for rec in crawler.results:
+                kw = str(rec.get("关键词") or "").strip()
+                if kw:
+                    n[kw] = n.get(kw, 0) + 1
+            y = dict(prev.get("yield") or {})
+            for kw, v in n.items():
+                y[kw] = max(int(y.get(kw, 0) or 0), v)
+            self._kw_ledger[slug] = {"yield": y, "done": sorted(done)}
+
     def _run_site(self, crawler, keywords, start_index):
+        subset = self._pending_keywords(crawler, keywords)
+        skipped = len(keywords) - len(subset)
+        if skipped:
+            crawler._log(f"↻ 续采：本站上次已跑完 {skipped} 个关键词，本轮只跑剩下 {len(subset)} 个")
+        if not subset:
+            crawler._log("↻ 本站关键词上次已全部跑完，本轮不重跑（要彻底重采请点「开始新任务」）")
+            self._on_site_finished(crawler.PLATFORM_SLUG)
+            return
         try:
-            crawler.crawl(keywords, start_index=start_index)
+            crawler.crawl(subset, start_index=start_index)
         except Exception as e:
             crawler._log(f"❌ {crawler.PLATFORM_NAME}采集线程异常：{str(e).splitlines()[0][:160]}")
+        finally:
+            self._merge_site_progress(crawler, subset)
 
     # ── 企知道名单通道（看门狗：名单空则休眠，废数据回流后自动苏醒）────
     def bind_pending(self, session_dir, list_file="", want_qzd=None):
@@ -596,6 +803,11 @@ class ParallelSession:
             self._done_sites = set()
             self._total_done = 0
             self._kw_progress = {}
+            # 逐词游标账目也要清：留着的话 _pending_keywords 还会按上一个任务的
+            # 记录跳过老关键词，用户点「开始新任务」等于什么都没采。
+            self._kw_ledger = {}
+            self._last_keywords = []
+        self.set_task_folder("")
         return True
 
     def build_clean_rows(self, log=None):
