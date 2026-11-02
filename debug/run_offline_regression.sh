@@ -11,6 +11,7 @@ debug/contact_field_offline_test.py
 debug/contact_selfheal_offline_test.py
 debug/maimaib2b_offline_test.py
 debug/solarbe_offline_test.py
+debug/solarbe_fullslice_offline_test.py
 debug/gui_smoke_test.py
 debug/gui_ux_offline_test.py
 debug/position_smart_offline_test.py
