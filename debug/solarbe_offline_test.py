@@ -12,7 +12,8 @@
 import sys, pathlib, re
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
 
-from solarbe_crawler import SolarbeCrawler, _UA, _UA_MOBILE, CATIDS, AREAIDS   # noqa: E402
+from solarbe_crawler import (SolarbeCrawler, _UA, _UA_MOBILE, CATIDS, AREAIDS,   # noqa: E402
+                             _NAME_PLACEHOLDER)
 from parallel_session import SITE_ORDER                                       # noqa: E402
 from cdp_base import strip_country_code                          # noqa: E402
 
@@ -48,8 +49,20 @@ check("详情URL 指向 /<slug>/contact/",
 check("主营产品/所在区域都来自卡片字段",
       all(e["主营产品"] and e["所在区域"] for e in entries))
 check("页头「共找到 N 条」解析（本片标称 575 家）", c.slice_total(lst_html) == 575)
-check("导航位锚点不混进卡片（公司名都够长且含中文）",
-      all(len(e["公司名称"]) >= 4 and re.search(r"[\u4e00-\u9fa5]", e["公司名称"]) for e in entries))
+check("导航位链接不混进卡片（公司名都含中文且不为空）",
+      all(e["公司名称"] and re.search(r"[\u4e00-\u9fa5]", e["公司名称"]) for e in entries))
+check("卡片名不会被按钮文字顶替（不是「企业商铺」这类占位词）",
+      all(e["公司名称"] not in _NAME_PLACEHOLDER for e in entries))
+
+# ── 2b. 公司名只有一两个人名的卡片（真实缓存：行业＝组件 页）─────
+# 旧正则把链接文本限在 4 字以上，于是 h3 里的「刘鑫」被跳过，落到了同一张卡片里
+# href 相同的「企业商铺」按钮上，64 家因此被存成公司名＝企业商铺。
+comp_html = cached("c_com_search_php_keyword_E7_BB_84_E4_BB_B6")
+comp = {e["公司ID"]: e["公司名称"] for e in c.parse_list(comp_html, "组件")}
+check("两字人名公司名不再拿成「企业商铺」（fhdgkfj235＝刘鑫，实际 %s）"
+      % comp.get("fhdgkfj235"), comp.get("fhdgkfj235") == "刘鑫")
+check("整页 20 家一家不丢、一家不成占位名",
+      len(comp) == 20 and not [v for v in comp.values() if v in _NAME_PLACEHOLDER])
 
 # ── 3. 翻页：6 页硬上限 → 切片细分 ────────────────────────────
 check("搜索 URL 带 catid/areaid/page 三维度",
@@ -112,6 +125,30 @@ check(f"手机+邮箱一次拿齐（{r.get('手机')}／{r.get('邮箱')}）",
 check(f"部门(职位)拼出完整岗位（{r.get('岗位')}）", r.get("岗位") == "销售部（销售经理）")
 check("传真号 0335-3850621 不进电话列（实测有人把传真当号码）",
       "0335-3850621" not in (r.get("电话", "") + r.get("手机", "")))
+
+# ── 4b. 正文公司名与占位邮箱（页面结构照真实缓存 contact_*_mobile.html）───
+# 两个实测坑：① 站点允许公司名就是一两个人名（fhdgkfj235＝「刘鑫」），旧门槛「满 4 字」
+# 会把它当没填；② 16 家不同公司共用同一个占位邮箱 1@qq.com，当可用联系方式入库就是脏数据。
+body_page = ('<html><body><div class="content bd-t">\n公司名称：刘鑫<br/>\n'
+             '公司地址：安康市高新区<br/>\n公司电话：021-50790323<br/>\n'
+             '</div><a href="mailto:1@qq.com">发邮件</a>'
+             '<a href="tel:021-50790323">拨打</a></body></html>')
+c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=body_page: _h
+r = c.crawl_detail({"公司名称": "企业商铺", "公司ID": "fhdgkfj235",
+                    "所在区域": "陕西安康", "主营产品": ""})
+c._fetch = SolarbeCrawler._fetch.__get__(c)
+check("列表把「企业商铺」当名字带回来时，以正文真名为准（实际 %s）" % r.get("公司名称"),
+      r.get("公司名称") == "刘鑫")
+check("两字人名不会被当作「没填名字」丢掉", bool(r.get("公司名称")))
+check("占位邮箱 1@qq.com 作废（16 家共用同一个号，不是联系方式）", not r.get("邮箱"))
+check("仅因占位邮箱不算数据：有正文固话仍判成功", r.get("状态") == "成功" and r.get("电话"))
+normal = c._parse_contact(body_page.replace("1@qq.com", "liuxin2020@qq.com"), {})
+check("正常 QQ 邮箱（多位数账号）不误杀", normal.get("邮箱") == "liuxin2020@qq.com")
+c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=body_page: _h
+r2 = c.crawl_detail({"公司名称": "刘鑫光伏设备", "公司ID": "fhdgkfj235",
+                     "所在区域": "", "主营产品": ""})
+c._fetch = SolarbeCrawler._fetch.__get__(c)
+check("列表已是真名时不被正文随便改写", r2.get("公司名称") == "刘鑫光伏设备")
 
 # ── 5. 86 国际前缀归一（实测 86-0755-… 直接拨不通）─────────────
 check("86- 前缀固话归回 0 区号", strip_country_code("86-0755-89810939") == "0755-89810939")

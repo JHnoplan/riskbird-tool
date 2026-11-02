@@ -68,9 +68,14 @@ AREAIDS = {
 }
 
 _TOTAL_RE = re.compile(r"共找到[^0-9]{0,40}([\d,]+)")
-# 列表卡片：qyk_sublistleft 块里的公司锚点（href 带 slug，文本是公司名）
+# 列表卡片：qyk_sublistleft 块里指向公司主页的锚点（第一个在 h3 标题里，文本才是公司名）。
+# 同一张卡片的几个锚点 slug 相同，但后面的「企业商铺」是按钮文字、「免费企业」是会员标签，
+# 当公司名用就是脏数据（实测 64 家因此名字被写成「企业商铺」，其中 fhdgkfj235 真名
+# 「刘鑫」——站点允许一两个人名当公司名，所以名字长度门槛也不能写死 4）。
 _CARD_ANCHOR = re.compile(
-    r'href="https?://company\.solarbe\.com/([a-z0-9_-]+)/"[^>]*>\s*([^<]{4,60}?)\s*</a>')
+    r'href="https?://company\.solarbe\.com/([a-z0-9_-]+)/"[^>]*>([^<]{0,60})</a>')
+# 绝不可能出现在公司名里的卡片按钮/标签文字
+_NAME_PLACEHOLDER = {"企业商铺", "免费企业", "已认证", "更多", "详情", "查看商铺", "进入商铺"}
 _CARD_FIELD = re.compile(r"<span>(公司名称|经营模式|主营产品|公司产地|企业地址|客户群体|企业资料)"
                          r"：</span>(.*?)</li>", re.S)
 _CONTENT_BLOCK = re.compile(r'class="content bd-t">(.*?)</div>', re.S)
@@ -78,6 +83,9 @@ _TEL_HREF = re.compile(r'href="tel:([^"]+)"')
 _MAILTO = re.compile(r'mailto:([^"\'>?\s]+)')
 # 平台自己的邮箱不是公司联系方式
 _JUNK_MAIL = ("solarbe.com", "solarbe.cn", "destoon")
+# 有人把邮箱填成占位号（实测 16 家不同公司共用同一个 1@qq.com）：这类 local part 只有一两个
+# 纯数字的邮箱根本打不通，留在库里就是「一排公司同一个邮箱」的脏数据，后台入库前必须作废。
+_PLACEHOLDER_MAIL = re.compile(r"^\d{1,3}@")
 
 
 class SolarbeCrawler(CdpSiteCrawler):
@@ -195,18 +203,24 @@ class SolarbeCrawler(CdpSiteCrawler):
 
     def parse_list(self, html, kw):
         """qyk_sublistleft 卡片 → 公司条目（按 slug 去重）。
-        卡片里的 slug 才是公司主页，导航/推荐位那些锚点不在卡片内，天然被排除。"""
+        卡片里的 slug 才是公司主页，导航/推荐位那些链接不在卡片内，天然被排除。"""
         out, seen = [], set()
         for chunk in (html or "").split("qyk_sublistleft")[1:]:
-            m = _CARD_ANCHOR.search(chunk)
-            if not m:
+            anchors = [(m.group(1).strip().lower(), _htmlmod.unescape(m.group(2)).strip())
+                       for m in _CARD_ANCHOR.finditer(chunk)]
+            anchors = [(s, t) for s, t in anchors if s]
+            if not anchors:
                 continue
-            slug = m.group(1).strip().lower()
-            name = _htmlmod.unescape(m.group(2)).strip()
-            if not slug or slug in seen or len(name) < 4:
+            slug = anchors[0][0]
+            if slug in seen:
                 continue
             fields = {k.strip(): _htmlmod.unescape(re.sub(r"<[^>]+>", "", v)).strip()
                       for k, v in _CARD_FIELD.findall(chunk)}
+            # 只把「不是按钮/标签文字」的第一个链接文本当公司名，再退到卡片「公司名称」栏
+            name = next((t for _s, t in anchors if t and t not in _NAME_PLACEHOLDER), "")
+            name = name or fields.get("公司名称", "")
+            if len(name) < 2:
+                continue
             seen.add(slug)
             home = f"http://company.solarbe.com/{slug}/"
             out.append({
@@ -334,8 +348,12 @@ class SolarbeCrawler(CdpSiteCrawler):
         for k, v in parsed.items():
             if v and not rec.get(k):
                 rec[k] = v
-        if not rec.get("公司名称") or len(rec.get("公司名称", "")) < 4:
-            rec["公司名称"] = strip_name_marketing_tail(stub.get("公司名称", "")) or rec.get("公司名称", "")
+        cur = rec.get("公司名称", "")
+        if cur in _NAME_PLACEHOLDER or len(cur) < 2:
+            # 列表把按钮文字（「企业商铺」）当成名字带回来的，以详情页正文的「公司名称」栏为准；
+            # 正文也没名字才退回洗过后缀的列表名（原本只判 len<4，刚好把 4 个字的占位词放过去）
+            rec["公司名称"] = (parsed.get("公司名称")
+                              or strip_name_marketing_tail(stub.get("公司名称", "")) or cur)
         if not rec.get("所在区域"):
             rec["所在区域"] = stub.get("所在区域", "")
         # 官网只认正文「公司网址」栏（_parse_contact 已取）。实测扫页面里的 href 当兜底
@@ -367,7 +385,9 @@ class SolarbeCrawler(CdpSiteCrawler):
             if k and v and k not in kv:
                 kv[k] = v
         name = kv.get("公司名称", "")
-        if len(name) >= 4:
+        # 站点允许公司名就是一两个人名（实测「刘鑫」），不能拿「满 4 个字」当门槛；
+        # 但正文里也不可能出现卡片按钮文字，遇到就当没填
+        if len(name) >= 2 and name not in _NAME_PLACEHOLDER:
             out["公司名称"] = name[:60]
         raw_person = kv.get("联系人", "")
         cname, cpos = parse_contact_field(raw_person)
@@ -407,7 +427,8 @@ class SolarbeCrawler(CdpSiteCrawler):
         for cand in _MAILTO.findall(html) + [kv.get("电子邮件", ""), kv.get("邮箱", "")]:
             em = (cand or "").strip().lower()
             g = EMAIL_RE.search(em) if em else None
-            if g and not any(j in g.group(0) for j in _JUNK_MAIL):
+            if g and not any(j in g.group(0) for j in _JUNK_MAIL) \
+                    and not _PLACEHOLDER_MAIL.match(g.group(0)):
                 mails.append(g.group(0))
         if mails:
             out["邮箱"] = " / ".join(list(dict.fromkeys(mails))[:3])

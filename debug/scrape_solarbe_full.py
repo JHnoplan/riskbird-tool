@@ -44,7 +44,8 @@ from collections import deque, Counter
 from urllib.parse import quote
 
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
-from solarbe_crawler import SolarbeCrawler, SEARCH_URL, CATIDS, AREAIDS   # noqa: E402
+from solarbe_crawler import (SolarbeCrawler, SEARCH_URL, CATIDS, AREAIDS,      # noqa: E402
+                             _NAME_PLACEHOLDER)
 
 ROOT = pathlib.Path("/Users/jhnoplan/Desktop/PythonDemo")
 OUT_DIR = ROOT / "采集的数据汇总"
@@ -214,6 +215,10 @@ def load_state():
             print(f"续跑：台账 {len(st['records'])} 家明细，队列剩 {len(st['queue'])} 片，"
                   f"切片记录 {len(st['slices'])} 条")
             st.setdefault("stalled", [])      # 旧台账没这个字段，补上再跑
+            n = refix_placeholder_names(st)
+            if n:
+                print(f"台账里 {n} 家公司名被存成「企业商铺」（那是列表卡片上的按钮文字，"
+                      f"不是名字），已排回详情重采，以详情页正文的真名为准", flush=True)
             return st
     root = new_slice(areaid=SEED_AREAID or 0)
     return {"v": STATE_VERSION, "started": time.strftime("%F %T"),
@@ -222,6 +227,21 @@ def load_state():
                                     "total": None, "own": 0}},
             "tree": {"area": {}, "cat": {}},
             "list_req": 0, "detail_req": 0, "rounds": 0, "stalled": []}
+
+
+def refix_placeholder_names(st):
+    """旧解析把公司名限在 4 字以上，h3 里只有一两个人名的卡片（实测「刘鑫」）被跳过，
+    名字落到了同一张卡片 href 相同的「企业商铺」按钮上（台账里 64 家）。解析已修，这
+    里把受影响的记录摘掉 done 让它们重进一次详情（详情页正文有「公司名称」栏），
+    并记一笔 namefix，免得正文也没名字时每次重启都重采一轮。"""
+    hit = 0
+    for v in st["records"].values():
+        d = v.get("detail")
+        if d and d.get("公司名称", "") in _NAME_PLACEHOLDER and not v.get("namefix"):
+            v["namefix"] = 1
+            v.pop("done", None)
+            hit += 1
+    return hit
 
 
 def save_state(st):
