@@ -1,7 +1,7 @@
 """test_integration_offline.py —— 多平台整合后的离线回归断言（无需浏览器/网络）。
 
-覆盖本次整合（去 gys、加 1688、企知道名单通道、GUI 重排）的关键契约：
-  · 站点拓扑：gys 已下线、SITE_ORDER=5 平台、SITE_TIPS 全覆盖（防 GUI 索引 KeyError）；
+覆盖本次整合（去 gys、加 1688、企知道名单通道、GUI 重排、加索比光伏网/麦麦B2B）的关键契约：
+  · 站点拓扑：gys 已下线、SITE_ORDER=7 平台、SITE_TIPS 全覆盖（防 GUI 索引 KeyError）；
   · 状态行富文本渲染（含 1688）；
   · 待采集公司名单三台账：bind 建表 / seed 入列 / add_waste 回流 / pop 记 tried /
     mark_result 记 collected / requeue 回队首 / 探针跳过已采；
@@ -39,10 +39,12 @@ def ok(name):
 # ── 1. 站点拓扑 ────────────────────────────────────────────────
 def test_site_topology():
     assert "gys" not in SITE_ORDER, "供应商网应已下线"
-    assert SITE_ORDER == ["mic", "b2b168", "11467", "aipage", "1688"], SITE_ORDER
+    assert SITE_ORDER == ["mic", "b2b168", "11467", "aipage", "solarbe", "maimaib2b", "1688"], SITE_ORDER
     assert SITE_NAMES.get("1688") == "1688"
     assert SITE_NAMES.get("qzd") == "企知道"
-    ok("站点拓扑：gys 下线、5 平台 + 企知道通道")
+    assert SITE_NAMES.get("solarbe") == "索比光伏网", SITE_NAMES.get("solarbe")
+    assert SITE_NAMES.get("maimaib2b") == "麦麦B2B", SITE_NAMES.get("maimaib2b")
+    ok("站点拓扑：gys 下线、7 平台 + 企知道通道")
 
 
 # ── 2. 公司名识别 ──────────────────────────────────────────────

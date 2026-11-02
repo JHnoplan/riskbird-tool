@@ -109,6 +109,24 @@ def clean_cell(val):
     return _ILLEGAL_RE.sub('', val)
 
 
+def strip_country_code(val):
+    """国际区号归一：商家把号码写成「86-0755-89810939」「+86 13912345678」（麦麦B2B/索比
+    光伏网实测两种形态混着写）。直接正则会把「86-0」改成「00」造出打不通的号；
+    这里按「固话补 0、手机去 0」的电信规则统一，同时去掉空格/横线分隔。"""
+    s = re.sub(r"[\s\u3000]+", "", str(val or ""))
+    m = re.match(r"^(?:\+?86)[-_]?(.+)$", s)
+    if not m:
+        return s.strip("()-（）")
+    rest = m.group(1)
+    if re.fullmatch(r"1[3-9]\d{9}", rest):
+        return rest                       # 手机号：国家码去掉即可
+    if re.fullmatch(r"0\d{2,4}[-]?\d{7,8}", rest):
+        return rest                       # 「86-0755-89810939」本体已带长途 0
+    if re.fullmatch(r"[1-9]\d{2,4}[-]?\d{7,8}", rest):
+        return "0" + rest                 # 「86-755-89810939」：漏写 0 的补回来
+    return rest
+
+
 # ── 联系人 / 岗位（五站共用）───────────────────────────────────
 # 实机取证各站把「谁负责接电话」写成完全不同的形态：
 #   gys     商铺页 <dt>联系人：</dt><dd>朱先生</dd> + <dt>职位：</dt><dd>市场部经理</dd>
@@ -139,7 +157,8 @@ _TITLE_SUFFIX_RE = re.compile(
     r"|技术总工|总工|专员|业务员|业务代表|销售代表|跟单员|跟单|客户服务|客服|内勤|助理|顾问|代表"
     r"|老板|师傅|采购员|采购|质检员|质检|仓管|会计|出纳|人事)")
 _CONTACT_PLACEHOLDERS = {"", "-", "--", "无", "暂无", "未知", "待补充", "未提供", "不详", "待定", "其他",
-                         "联系人", "姓名", "公司", "客户", "负责人", "法人代表", "法定代表人", "NULL", "null", "N/A"}
+                         "未开", "未开通", "未公开", "保密", "联系人", "姓名", "公司", "客户",
+                         "负责人", "法人代表", "法定代表人", "NULL", "null", "N/A"}
 # 公司名/行业词误入联系人列（标签错位时会把公司名当人名），一律作废。
 # 注意不能加「厂」：「张厂长」是真实称呼，误杀代价比漏拦更大。
 _NOT_A_NAME_RE = re.compile(r"(公司|企业|集团|有限|商行|商贸|工作室|营业部|分部|店铺)")
@@ -234,6 +253,11 @@ def parse_contact_field(raw):
 _BARE_TITLE_RE = re.compile(
     r"^(?:先生|女士|小姐|经理|主管|主任|科长|处长|总监|厂长|老板|师傅|专员|业务员|代表|顾问"
     r"|工程师|技术员|总工|客服|助理|采购|质检|跟单|内勤|会计|出纳|人事)+$")
+# 纯性别/礼貌称谓（不含任何职务信息）：实测索比光伏网联系页写「联 系 人：赵福兴 （先生）」、
+# 麦麦B2B 同款，括号里只有性别称谓时不该单独立一个「岗位：先生」的废列（外呼毫无用处）。
+HONORIFIC_ONLY_RE = re.compile(r"^(?:先\s*生|女\s*士|小\s*姐|男|女|同\s*志)$")
+# 括号前的多余空格（实测索比光伏网岗位字段写「销售部 （销售经理）」，那个空格是页面排版带出来的）
+_PAREN_GAP_RE = re.compile(r"\s*([（(])\s*")
 # 页面部门写法 → 归一部门名（实测供应商网 <div class="position"> 只写「销售」「市场」二字）
 _DEPT_CANON = {
     "销售": "销售部", "销售部": "销售部", "营销": "销售部", "网络销售": "电商部",
@@ -325,17 +349,20 @@ def compose_position(field="", title=""):
     """页面岗位/职位/部门字段原值 + 从联系人名后缀拆出的称谓 → 完整岗位。
     实测供应商网联系区块把信息拆成两半写：<div class=position>销售</div> + 联系人「王经理」，
     单独取哪一半都不完整，合起来才是「销售经理」；而字段本身已写完整岗位（「市场部经理」
-    「销售总监」）时直接沿用，绝不先降级成部门再拼回去。人名侧写了更具体的岗位时以它为准。"""
+    「销售总监」）时直接沿用，绝不先降级成部门再拼回去。人名侧写了更具体的岗位时以它为准。
+    统一收尾：括号前不留空格（否则入库就是一串怪样，外呼念不出来）。"""
     raw = normalize_spaces(field)
     dept = norm_dept(raw) if _is_pure_dept(raw) else ""
     t = normalize_spaces(title)
     if not dept:                        # 没有部门线索：用完整岗位，其次用称谓
-        return raw or t
-    if not t:
-        return dept
-    if _BARE_TITLE_RE.fullmatch(t):
-        return (dept[:-1] if dept.endswith("部") else dept) + t
-    return t if len(t) >= len(dept) else dept
+        pos = raw or t
+    elif not t:
+        pos = dept
+    elif _BARE_TITLE_RE.fullmatch(t):
+        pos = (dept[:-1] if dept.endswith("部") else dept) + t
+    else:
+        pos = t if len(t) >= len(dept) else dept
+    return _PAREN_GAP_RE.sub(r"\1", pos) if pos else ""
 
 
 def dept_from_email(email):
@@ -1018,7 +1045,7 @@ return '';})()"""
             页面里根本没滑块，叫人工去 Chrome 里找入口只会白等（实测八方 502、
             供应商网 520 都是这样）→ 不拉浏览器，拉长间隔指数退避等冷却；
           · "captcha" 插页里带人机验证特征（验证词/captcha/challenge/v.js 这类 JS 挑战）
-            = 人在浏览器里过一下确实能清 → 借标签把页面递到眼前，过完拄 clearance Cookie 续采。
+            = 人在浏览器里过一下确实能清 → 借标签把页面递到眼前，过完抄 clearance Cookie 续采。
             实测：顺企网 429 返的是 70 字节 v.js 挑战（浏览器执行 JS 就能过），归 captcha 才对；
             上一版按状态码一律归 ip，会把这种「其实能过」的拦截误杀成只能干等。
         服务端给了 Retry-After 就记下来，冷却时长听它的而不是我们猜。"""

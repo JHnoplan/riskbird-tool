@@ -2,8 +2,9 @@
 b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI）
 
 一个共享 Chrome、需浏览器的站各占一个标签并行采集：
-  · 关键词并行（5 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
-    顺企网 11467.com / 爱采购 b2b.aipage.com（后三站纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
+  · 关键词并行（7 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
+    顺企网 11467.com / 爱采购 b2b.aipage.com / 索比光伏网 company.solarbe.com /
+    麦麦B2B maimaib2b.com（后五站纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
   · 名单驱动（企知道）：从「待采集公司名单」逐家补采，看门狗语义——名单空则休眠，
     关键词采集清洗掉的无联系方式废数据会自动回流到名单、唤醒企知道补采（变废为宝）。
 导入或粘贴一批关键词（或上传公司名单）→ 智能匹配行业列表页 → 进详情页取联系方式 →
@@ -29,7 +30,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
-    QSizePolicy,
+    QSizePolicy, QGridLayout,
 )
 
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
@@ -421,6 +422,22 @@ SITE_TIPS = {
               "进店联系方式页(/shop?xzhid=&tpath=contact)，联系人/手机/固话/邮箱/微信/地址服务端直接注水解析；"
               "完全不占用浏览器标签。公司按店铺 id 去重，同店多产品只采一次。\n"
               "防采：限流插页识别到即停手冷却等恢复（不拉浏览器），绝不当空数据写库。",
+    "solarbe": "索比光伏网企业库 company.solarbe.com（光伏/新能源行业名录）：纯 HTTP 关键词搜索→进每家公司"
+              "「查看联系方式」页，公司名/联系人/电话/地址直接明文给，邮箱也能拿到（实测抽样："
+              "95% 有电话、39% 有邮箱）；完全不占用浏览器标签。\n"
+              "两个已实测的坑已处理：① 这个站把电话/邮箱“画成图片”防采集，工具会自动改用"
+              "手机版页面取字（不用装图像识别、不用登录）；② 它每个分类最多只让翻 6 页（120 家），"
+              "所以工具会按行业、再按地区自动细分去取，不会以为“只有 120 家”。\n"
+              "防采：它只会嫌你来得太快（回一张空白页），识别到即停手冷却等恢复，不拉浏览器；已采数据不丢，断点续采。",
+    "maimaib2b": "麦麦B2B www.maimaib2b.com（全行业企业库，实数 54 万家商铺）：关键词公司搜索"
+              "(/search/公司名/)→逐家进 /Shop/编号/link.html，公司名/联系人/手机/固话/地址明文给"
+              "（实测抽样：联系人 98%、任一电话 90%，假占位号 0）。\n"
+              "防采：这个网站前面挂着一道自动防线，直接请求会被挡（它回一句“请稍候…”）。"
+              "实测共享 Chrome 打开约 12 秒会自己放行，多数时候不需你点；"
+              "放行后工具把浏览器拿到的“通行证”抄回后台请求，平均 1 秒拿一家且不占标签；"
+              "通行证过期再被拦时，才临时借一个标签把页面摆到眼前（必要时你点一下验证框），"
+              "过完自动接着跑。\n"
+              "商家常把固话填进“手机”栏，工具按号码长相归回正确列，不会拿着区号当手机号。",
     "1688": "1688 www.1688.com：关键词→商品/店铺搜索→公司详情页。需先登录（有登录限制，故默认不勾选）；"
             "勾选后会弹窗提示并可一键打开 1688 登录页，请先在浏览器里确认已登录再开始采集。\n"
             "与其它需浏览器的站共享同一个 Chrome（各占自己标签），绝不会另开浏览器。",
@@ -1376,23 +1393,25 @@ class MainWindow(QMainWindow):
         gb_site = QGroupBox("③ 采集平台（关键词并行）")
         gb_site.setToolTip(
             "任一站点命中防采验证都会弹窗提醒并由看门狗自动续采。\n"
-            "八方资源网 / 顺企网 / 爱采购为纯 HTTP，不占浏览器标签（看不到它们的标签是正常的）；\n"
+            "八方资源网 / 顺企网 / 爱采购 / 索比光伏网 / 麦麦B2B 为纯 HTTP，不占浏览器标签"
+            "（看不到它们的标签是正常的，被反采质询时才会临时借一个标签过盾）；\n"
             "中国制造网 / 1688 各占一个浏览器标签。1688 需登录，默认不勾选。\n\n"
             + "\n\n".join(SITE_TIPS.get(s, "") for s in SITE_ORDER))
         vs = QVBoxLayout(gb_site)
-        hs = QHBoxLayout()
+        # 七个站一排会把名字挤掉，改成每行 4 个的网格（按 SITE_ORDER 顺序填）
+        gs = QGridLayout()
+        gs.setContentsMargins(0, 0, 0, 0)
         self.site_checks = {}
-        for slug in SITE_ORDER:
+        for i, slug in enumerate(SITE_ORDER):
             chk = QCheckBox(SITE_NAMES[slug])
             # 1688 有登录限制，默认不勾（勾选时弹窗提示登录）
             chk.setChecked(slug != "1688")
             chk.setToolTip(SITE_TIPS.get(slug, ""))
             if slug == "1688":
                 chk.toggled.connect(lambda on, s=slug: self._on_site_toggled(s, on))
-            hs.addWidget(chk)
+            gs.addWidget(chk, i // 4, i % 4)
             self.site_checks[slug] = chk
-        hs.addStretch(1)
-        vs.addLayout(hs)
+        vs.addLayout(gs)
         lay.addWidget(gb_site)
 
         gb_p = QGroupBox("④ 采集参数")
@@ -1429,7 +1448,7 @@ class MainWindow(QMainWindow):
         # 默认勾选：多平台并行时用户根本不需要盯浏览器，挂着自动最小化才能真「无人值守」；
         # 命中验证码仍会自动还原窗口把验证递到眼前。
         self.chk_bg.setChecked(True)
-        self.chk_bg.setToolTip("开始采集后自动最小化共享 Chrome（八方资源网/顺企网/爱采购本就不开标签）。\n"
+        self.chk_bg.setToolTip("开始采集后自动最小化共享 Chrome（八方资源网/顺企网/爱采购/索比光伏网/麦麦B2B 本就不开标签）。\n"
                                "命中验证码时会自动还原窗口提醒人工过验证，过后重新最小化；\n"
                                "启动浏览器已带防后台节流开关，最小化不影响页面渲染。\n"
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
