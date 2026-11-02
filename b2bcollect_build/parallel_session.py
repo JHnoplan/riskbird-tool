@@ -1,13 +1,13 @@
 """parallel_session.py —— 多通道并行采集编排（一个共享 Chrome，需浏览器的站各占一个标签）。
 
 职责：
-  · mic / b2b168 / 顺企网(11467) / 爱采购(aipage) / 索比光伏网(solarbe) / 麦麦B2B(maimaib2b)
-    / 1688 七个**关键词并行**采集器
+  · mic / b2b168 / 顺企网(11467) / 爱采购(aipage) / 麦麦B2B(maimaib2b)
+    / 1688 六个**关键词并行**采集器
     ＋ 企知道(qzd) 一个**名单驱动**通道（从待采集公司名单逐家补采，看门狗语义：
     名单空则休眠，废数据回流后自动苏醒），按界面开关决定谁参与本轮；
   · crawl(keywords) 在**各自的线程**里并行推进各站点（裸 CDP 命令通道彼此独立，
     每条命令显式带本站标签 ws 地址，故各线程真并行、互不抢活动标签；
-    纯 HTTP 站 b2b168/11467/aipage/solarbe/maimaib2b 不占标签（后两站被反采质询时才临时
+    纯 HTTP 站 b2b168/11467/aipage/maimaib2b 不占标签（后两站被反采质询时才临时
     借一个标签过盾）；1688/企知道用 Selenium 附加同一
     共享 Chrome，各占自己的标签/窗口，绝不起第二个浏览器实例）；
   · 把各采集器的信号汇聚到 session 级信号，界面只连一处即可；
@@ -44,20 +44,21 @@ from mic_crawler import MicCrawler
 from b2b168_crawler import B2b168Crawler
 from qihuo11467_crawler import Qihuo11467Crawler
 from aipage_crawler import AipageCrawler
-from solarbe_crawler import SolarbeCrawler
 from maimaib2b_crawler import Maimaib2bCrawler
 from pending_companies import PendingCompanyList, extract_company_names
 import site_adapters as _adapters
 
 # 站点顺序固定：日志/进度里显示顺序稳定，便于用户对照浏览器标签
 # （gys 供应商网已下线：验证码频发+限 IP，留着只会拖累整体成功率；文件保留备将来攻坚）
-SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "solarbe", "maimaib2b"]
+# （solarbe 索比光伏网按用户指令下线：光伏行业垂直库，改用独立脚本全量采一次性数据，
+#   不占工具日常关键词通道；文件保留 solarbe_crawler.py 供那条脚本复用解析）
+SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "maimaib2b"]
 SITE_CLASSES = {"mic": MicCrawler, "b2b168": B2b168Crawler,
                 "11467": Qihuo11467Crawler, "aipage": AipageCrawler,
-                "solarbe": SolarbeCrawler, "maimaib2b": Maimaib2bCrawler}
+                "maimaib2b": Maimaib2bCrawler}
 SITE_NAMES = {"mic": "中国制造网", "b2b168": "八方资源网",
               "11467": "顺企网", "aipage": "爱采购",
-              "solarbe": "索比光伏网", "maimaib2b": "麦麦B2B"}
+              "maimaib2b": "麦麦B2B"}
 # Selenium 附加通道（共享同一 Chrome，各自管自己的标签/窗口）
 if _adapters.HAS_1688:
     SITE_ORDER.append("1688")

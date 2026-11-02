@@ -1,4 +1,7 @@
-# 离线自测：索比光伏网(company.solarbe.com) 新站点关键逻辑（真实页面缓存，不触网、不开浏览器）
+# 离线自测：索比光伏网(company.solarbe.com) 解析链路（真实页面缓存，不触网、不开浏览器）
+#
+# 本站已按用户指令从工具的关键词并行通道下线，solarbe_crawler.py 保留作
+# 独立全量采集脚本（debug/scrape_solarbe_full.py）的解析库，本测试守护那条链路。
 #
 # 覆盖 2026-11-02 实机探测确认的几个关键点：
 #   · 详情必须用手机版 UA 才拿得到明文联系方式（桌面版被 Destoon 图片化）；
@@ -10,7 +13,7 @@ import sys, pathlib, re
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
 
 from solarbe_crawler import SolarbeCrawler, _UA, _UA_MOBILE, CATIDS, AREAIDS   # noqa: E402
-from parallel_session import ParallelSession, SITE_ORDER, SITE_CLASSES, SITE_NAMES  # noqa: E402
+from parallel_session import SITE_ORDER                                       # noqa: E402
 from cdp_base import strip_country_code                          # noqa: E402
 
 CACHE = pathlib.Path(__file__).parent / "probe_solarbe_cache"
@@ -162,12 +165,9 @@ for _ in range(3):
     c2._fetch("http://company.solarbe.com/x/", tries=1, guarded=False)
 check("连续 3 页空白判 IP 限流（交看门狗等冷却）", c2._block_kind == "ip" and "空白页" in c2._block_reason)
 
-# ── 8. 注册到并行编排 ────────────────────────────────────────
-check("SITE_ORDER 含 solarbe", "solarbe" in SITE_ORDER)
-check("SITE_CLASSES/SITE_NAMES 均注册", SITE_CLASSES["solarbe"] is SolarbeCrawler
-      and SITE_NAMES["solarbe"] == "索比光伏网")
-sess = ParallelSession()
-check("ParallelSession 实例化出 solarbe 采集器", "solarbe" in sess.crawlers)
-check("种子库按 slug 隔离", c._seen_store_path.name == "seen_store_solarbe.json")
+# ── 8. 已从工具下线（防误接回），解析库本身仍归全量脚本在用 ────────
+check("solarbe 不在 SITE_ORDER（已按用户指令下线）", "solarbe" not in SITE_ORDER)
+check("种子库路径仍按本站 slug 隔离（全量脚本在用）",
+      c._seen_store_path.name == "seen_store_solarbe.json")
 
 print(f"\nALL PASS ({ok} checks)")

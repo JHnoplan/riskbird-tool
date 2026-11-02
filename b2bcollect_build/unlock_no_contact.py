@@ -34,7 +34,6 @@ SITE_BY_SOURCE = {
     "八方资源网": "b2b168",
     "顺企网": "11467",
     "爱采购": "aipage",
-    "索比光伏网": "solarbe",
     "麦麦B2B": "maimaib2b",
     "中国制造网": "mic",
 }

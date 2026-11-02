@@ -25,9 +25,9 @@ def check(name, cond, got=None):
 
 
 print("── 1. build_stats_html 渲染 ─────────────────────────")
-# 状态行必须覆盖当前 SITE_ORDER 的全部站（gys 已下线、1688/索比/麦麦都是后加入，不能硬写站数）
+# 状态行必须覆盖当前 SITE_ORDER 的全部站（gys/索比已下线、1688/麦麦是后加入，不能硬写站数）
 NUMS = {"gys": 60, "mic": 143, "b2b168": 285, "11467": 321, "aipage": 281,
-        "solarbe": 96, "maimaib2b": 214, "1688": 42}
+        "maimaib2b": 214, "1688": 42}
 STOPPED, RUNNING, DONE_S = "11467", "aipage", "b2b168"
 text = "已采 1072 家　" + "｜".join(f"{SITE_NAMES[s]} {NUMS[s]}" for s in SITE_ORDER)
 st = {s: ("stopped" if s == STOPPED else "running" if s == RUNNING else "done")
