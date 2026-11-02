@@ -13,8 +13,12 @@
 #      实测语义），二分切点与档位分界都必须落在 x.5，否则「正好 50/100/500 万」这些
 #      最扎堆的整数档会被两侧同时排掉（真实站点因此少采过 2457 家）；
 #   7) 零产出防滑坡：连续两层都列不出新公司就不再细分（不然上千家的扎堆档会把请求
-#      预算全花在同样的 120 家重排上）。
-import sys, json, tempfile, pathlib
+#      预算全花在同样的 120 家重排上）；
+#   8) 流水线：每片枚举完当场把这一片新公司的详情采回来（客户不能干等几个小时看空表格）；
+#   9) 限流刹车：看门狗判定“持续限流”后一个请求都不再发（实测真跑时这里空转过
+#      4.5 请求/秒），且“整片拿不到页”不许被当成“这一片 0 家”写进台账（那样名下
+#      几百上千家会被补漏轮永久跳过、静默丢数据）。
+import sys, json, tempfile, pathlib, time
 from collections import deque
 
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/debug")
@@ -74,6 +78,7 @@ class FakeCrawler:
 
     def __init__(self):
         self.calls = []
+        self.blank = False             # ＝站点对我们 IP 返回空白页（限流）
 
     def _match(self, it, q):
         if int(q.get("catid", 0)) and not cat_hit(it, int(q["catid"])):
@@ -96,6 +101,8 @@ class FakeCrawler:
 
     def _fetch(self, url, tries=1, ua=None, guarded=True):
         self.calls.append(url)
+        if self.blank:                     # 限流：整个站点对这个 IP 返回空正文
+            return ""
         q = dict(p.split("=", 1) for p in url.split("?", 1)[1].split("&"))
         hit = [it["公司ID"] for it in ITEMS if self._match(it, q)]
         page = min(int(q.get("page", 1)), 6)          # 触顶：第 7 页往后都返回第 6 页
@@ -158,6 +165,13 @@ check("根片名下并集＝全库家数", st["slices"][ROOT_KEY]["own"] == 300,
 check("详情队列按 slug 全局去重", len(st["seen_slugs"]) == 300
       and len(set(st["seen_slugs"])) == 300, len(st["seen_slugs"]))
 check("列表请求量没有被维度组合炸开", len(M.c.calls) < 900, len(M.c.calls))
+
+# ── 2b) 流水线：边枚举边采详情（用户反馈「Excel 都没有联系方式」的根因）──
+check("枚举当片就顺手把详情采回来，不再等到收尾",
+      st["detail_req"] == 300 and all(v.get("done") for v in st["records"].values()),
+      st["detail_req"])
+rows = M.flatten(st)
+check("导出行已带上联系方式列", all(r["电话"] for r in rows), rows[0].get("电话"))
 
 # ── 3) 台账每片落盘 + 断点续跑结果一致 ──────────────────────
 check("台账文件已落盘", M.STATE_FILE.exists())
@@ -264,7 +278,7 @@ def fresh_state(parent_dead):
          "seen_slugs": [it["公司ID"] for it in ITEMS],
          "records": {it["公司ID"]: {"stub": it} for it in ITEMS},
          "slices": {}, "tree": {"area": {}, "cat": {}},
-         "list_req": 0, "detail_req": 0, "rounds": 0}
+         "list_req": 0, "detail_req": 0, "rounds": 0, "stalled": []}
     s["seen_set"] = set(s["seen_slugs"])
     pk = M.skey(M.new_slice())
     s["slices"][pk] = {"f": json.loads(pk), "parent": None, "depth": 0, "used": [],
@@ -286,6 +300,45 @@ for dead, expect, label in ((1, 2, "父片也零产出时不再细分"), (0, 13,
     check("零产出防滑坡：" + label, len(sx["slices"]) == expect and sx["slices"][
         M.skey(M.new_slice(areaid=101))]["dead"] == (1 if dead else 0),
         (len(sx["slices"]), expect))
+
+# ── 8) 限流刹车：该收工就收工，且拿不到页不许错记成 0 家 ──────────
+# 真实运行踩到的两个坑（2026-11-02 日志）：17:34 看门狗已判「持续限流、本轮到此
+# 为止」，但 _sleep 看置位就不睡，脚本拿着空白页以 4.5 请求/秒空转了几千次；同时
+# 「整片拿不到页」被写成 meta["total"]=0，那片名下的公司从此被补漏轮跳过。
+M.STATE_FILE = pathlib.Path(tempfile.mkdtemp(prefix="solarbe_slice_stop_")) / "state.json"
+M.LISTED.clear()
+SL_KEY = M.skey(M.new_slice(areaid=101))
+s8 = fresh_state(0)
+before = len(M.c.calls)
+M.c._stop_requested = True
+check("看门狗置位后 drain 一个请求都不发、立刻收工",
+      M.drain(s8, deque(s8["queue"]), 0) == 0 and len(M.c.calls) == before,
+      len(M.c.calls) - before)
+check("收工时当前片仍完整留在队列里（不丢片）", s8["queue"] == [SL_KEY], s8["queue"])
+check("收工时台账已落盘", M.STATE_FILE.exists())
+M.gap_rounds(s8, deque(s8["queue"]))
+check("补漏轮看到置位同样不重切、不发请求", len(M.c.calls) == before and s8["rounds"] == 0,
+      (len(M.c.calls) - before, s8["rounds"]))
+M.c._stop_requested = False
+
+s9 = fresh_state(0)
+M.c.blank = True
+M.drain(s9, deque(s9["queue"]), 0)
+M.c.blank = False
+check("整片拿不到页：两次重试用完进 stalled，标称数保持未知（不写 0）",
+      s9["slices"][SL_KEY]["total"] is None and s9["stalled"] == [SL_KEY],
+      (s9["slices"][SL_KEY]["total"], s9["stalled"]))
+check("补漏轮开头把 stalled 片重新排回队列重给机会",
+      (lambda q=deque(s9["queue"]): (M.gap_rounds(s9, q), SL_KEY in q and not s9["stalled"])[1])(),
+      (s9["stalled"], SL_KEY))
+
+# 导出计时器：必须是模块级的墙上时钟。原先它是 drain 的局部变量，开新一轮就归零，
+# 真实运行里 17:21 导完那份「只有 35 家有联系方式」的表之后到 17:39 一次没刷。
+M.EXPORT_EVERY = 0
+M._LAST_EXPORT = 0.0
+check("到点就导，跑下轮不会把计时器归零", M.maybe_export(s9, 0) is not None)
+M.EXPORT_EVERY = 10 ** 9
+check("没到点不重复导（不然每片都在写盘）", M.maybe_export(s9, 0) is None)
 
 print("\n".join(checks))
 print(f"ALL PASS ({n} checks)")

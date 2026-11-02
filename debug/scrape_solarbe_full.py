@@ -79,6 +79,13 @@ CAP_LADDER = [(0, 0.5), (0.5, 50.5), (50.5, 100.5), (100.5, 300.5), (300.5, 500.
               (10000.5, 50000.5), (50000.5, CAP_INF)]
 MAX_SUB_KW = 8
 KW_MIN_COVER = 10             # 高频子词至少要出现在这么多家才值得切一刀
+# 流水线：原先是「先把全库名单捞完，再回头逐家进详情」，导致中间好几个小时
+# Excel 里联系人/手机/邮箱一栏全是空的（用户 2026-11-02 反馈「都没有联系方式」）。
+# 现在改成每跑完一片就当场把这片新公司点进详情页抄联系方式，总请求量不变，
+# 但 Excel 从一开始就在长联系方式。试采模式（只验覆盖率）不适用，仍然只枚举。
+DETAIL_INLINE = True
+BACKLOG_PER_SLICE = 30        # 每跑完一片，顺手补这么多家「已经进了名单、还没进详情」的旧记录
+BACKLOG = deque()             # 旧记录队列（开跑时从台账里的 not done 名单灌进来）
 # 实测教训：滑窗分词会被「有限公司/科技有限」这类后缀碎片主导（kw=有限 440 家几乎
 # 没压小）。子词只从「主营产品」取业务实词，公司名只取品牌段（剔掉常见后缀后），
 # 且入队前要真探一刀验证能压小，探不动就不切。
@@ -88,6 +95,24 @@ _STOP_WORDS = {"有限", "公司", "集团", "股份", "科技", "技术", "贸�
 
 c = SolarbeCrawler()
 c.incremental = False          # 台账走自己的 state 文件，不用工具的种子库
+# 全库一万三千多家、两万次请求，把基线节奏放温和：实测 2s/请求在只跑列表时能扣住，
+# 列表+详情混着跑（本轮流水线）同一 IP 的请求量翻倍，15 分钟内被拦 9 次。
+# 看门狗自己会接着降速（6→30s），这里只是不把基线定在刚好触限的边缘。
+c.delay_between, c.jitter = 4.0, 2.0
+c._current_delay = c.delay_between
+
+
+def stopped():
+    """看门狗判定「持续限流、本轮到此为止」时会置位 _stop_requested，同时 _sleep 就不
+    再睡了（防的是对着插页空转）。这个脚本直接调 _fetch，不看这个标志就会以 7 请求/秒
+    硬冲（实测 17:34 后就这么空转了几千次），还会把「拿不到页」错当「这一片 0 家」写进
+    台账、那片名下上百家公司就静默丢了。一看到置位就收工存盘，等半小时后续采。"""
+    return bool(getattr(c, "_stop_requested", False))
+
+
+def pending_details(st):
+    """已经进了名单、但还没抄回联系方式的家数。"""
+    return sum(1 for s in st["seen_slugs"] if not st["records"][s].get("done"))
 
 # 小流量试跑：`... scrape_solarbe_full.py 10414` 只采「深圳」这一片（台账/产出另外存，
 # 不污染全量台账），用来验切片策略在最大城片上能不能把 6152 家接近拿全。
@@ -188,6 +213,7 @@ def load_state():
         else:
             print(f"续跑：台账 {len(st['records'])} 家明细，队列剩 {len(st['queue'])} 片，"
                   f"切片记录 {len(st['slices'])} 条")
+            st.setdefault("stalled", [])      # 旧台账没这个字段，补上再跑
             return st
     root = new_slice(areaid=SEED_AREAID or 0)
     return {"v": STATE_VERSION, "started": time.strftime("%F %T"),
@@ -195,7 +221,7 @@ def load_state():
             "slices": {skey(root): {"f": root, "parent": None, "depth": 0, "used": [],
                                     "total": None, "own": 0}},
             "tree": {"area": {}, "cat": {}},
-            "list_req": 0, "detail_req": 0, "rounds": 0}
+            "list_req": 0, "detail_req": 0, "rounds": 0, "stalled": []}
 
 
 def save_state(st):
@@ -403,6 +429,8 @@ def enqueue_children(st, queue, parent_key, dim, kids, depth):
 def try_split(st, queue, key, meta, entries):
     """超限就顺着维度优先级找第一个切得动的维度，切完把子片排进队列。
     返回开出的子片数（0 表示这一片暂时没法再细分）。"""
+    if stopped():                      # 细分要逐个子项探一刀（几十上百个请求），限流时不探
+        return 0
     f, depth = meta["f"], meta.get("depth", 0)
     for dim in DIMS:
         if dim in meta["used"]:
@@ -465,6 +493,38 @@ def process_one(st, slug):
     # 详情间距同样交给 PER_REQUEST_PACE，不在这里叠睡
 
 
+def process_many(st, slugs, tag, leftover=None):
+    """逐家进详情，每 20 家落一次盘并打一行进度（不然几分钟没输出看着像卡死）。
+    leftover：限流时把还没做的几家回塞给调用方的队列（旧记录补做队），不丢。"""
+    for i, slug in enumerate(slugs, 1):
+        if stopped():
+            if leftover is not None:
+                leftover(slugs[i - 1:])
+            print(f"  ⚠ 限流收工：{tag} 做到 {i - 1}/{len(slugs)}，剩下的下次续（不丢）", flush=True)
+            save_state(st)
+            return
+        process_one(st, slug)
+        if i % 20 == 0 or i == len(slugs):
+            save_state(st)
+            print(f"  [{tag}] {i}/{len(slugs)} 已采过详情 {st['detail_req']} 次，"
+                  f"台账已见 {len(st['seen_slugs'])} 家", flush=True)
+
+
+def inline_slice_details(st, entries):
+    """本片新列出的公司当场进详情；顺带从旧记录队列里补 BACKLOG_PER_SLICE 家。
+    旧记录是「改流水线之前就进了名单」的那批，不补的话它们要等到收尾阶段才有联系方式。"""
+    if SEED_AREAID or not DETAIL_INLINE:
+        return
+    todo = [s for s in dict.fromkeys(e["公司ID"] for e in entries)
+            if not st["records"][s].get("done")]
+    if todo:
+        process_many(st, todo, "详情")
+    catch = [BACKLOG.popleft() for _ in range(min(BACKLOG_PER_SLICE, len(BACKLOG)))]
+    if catch:
+        process_many(st, catch, "补旧记录详情",
+                     leftover=lambda rest: BACKLOG.extendleft(reversed(rest)))
+
+
 # ── 导出 ──────────────────────────────────────────────────────
 COLS = ["公司名称", "联系人", "岗位", "手机", "电话", "邮箱", "QQ", "微信",
         "地址", "所在区域", "公司网址", "主营产品", "经营模式", "详情URL", "状态"]
@@ -513,11 +573,44 @@ def export_excel(st):
 
 
 # ── 主流程 ────────────────────────────────────────────────────
+def stop_and_save(st, queue, where):
+    """站点判定持续限流：立刻收工存盘（一片不丢、剩下的下次续），不再对着空白页空转。"""
+    st["queue"] = list(queue)
+    save_state(st)
+    n, k = force_export(st)
+    print(f"\n⚠ 限流收工（{where}）：名单 {len(st['seen_slugs'])} 家、还有 {len(queue)} 片没跑、"
+          f"{pending_details(st)} 家待补联系方式，Excel 已刷新（{n} 行/入库 {k}）。\n"
+          f"   等 30 分钟以上再跑同一条命令就自动从这里接着采。", flush=True)
+
+
+_LAST_EXPORT = 0.0               # 上次导 Excel 的时刻（模块级，跨轮次不重置）
+
+
+def force_export(st, t0=0.0):
+    global _LAST_EXPORT
+    n, k = export_excel(st)
+    _LAST_EXPORT = time.time()
+    tail = f"，已跑 {(time.time()-t0)/60:.1f} 分钟" if t0 else ""
+    print(f"[导出] 明细 {n} 行（入库 {k}）→ {EXPORT_XLSX.name}{tail}", flush=True)
+    return n, k
+
+
+def maybe_export(st, t0=0.0):
+    """按墙上时钟每 EXPORT_EVERY 秒导一次。计时器必须放模块级：原先它是 drain 的局部变量，
+    每开新一轮就归零，实测 17:21 导了那份「只有 35 家有联系方式」的旧表之后，直到 17:39
+    再没导出过——用户对着空表看了半小时，以为整个脚本没在抄联系方式。"""
+    if time.time() - _LAST_EXPORT < EXPORT_EVERY:
+        return None
+    return force_export(st, t0)
+
+
 def drain(st, queue, t0):
     """把当前队列跑干净：每一片翻满，被 120 截断就顺着优先级再切一刀。"""
-    last_export = time.time()
     done = 0
     while queue:
+        if stopped():
+            stop_and_save(st, queue, "枚举")
+            return done
         key = queue.popleft()
         meta = st["slices"].get(key) or {"f": json.loads(key), "parent": None,
                                          "depth": 0, "used": [], "total": None, "own": 0}
@@ -527,8 +620,13 @@ def drain(st, queue, t0):
         total = crawl_slice(st, f, entries)
         if total is None:
             if meta.get("retried"):
-                print(f"  ⚠ 拿不到页，放弃本片：{sdesc(st, f)}", flush=True)
-                meta["total"] = 0
+                # 这里原来写 meta["total"] = 0：等于向上层报告「这一片 0 家」。限流时整片
+                # 拿不到页也会走到这一支，那片名下几百上千家公司从此被补漏轮的
+                # 「if not total: continue」永久跳过——静默丢数据。改成记进待重试名单，
+                # 标称数保持未知，下一轮开头再给两次机会。
+                print(f"  ⚠ 连续两次拿不到页，记入待重试：{sdesc(st, f)}", flush=True)
+                if key not in st["stalled"]:
+                    st["stalled"].append(key)
             else:
                 meta["retried"] = 1
                 queue.append(key)
@@ -552,13 +650,10 @@ def drain(st, queue, t0):
         if (total > got and not meta["dead"] and meta["depth"] < MAX_DEPTH
                 and st["list_req"] < MAX_LIST_REQ):
             try_split(st, queue, key, meta, entries)
+        inline_slice_details(st, entries)          # 当场把联系方式抄回来
         st["queue"] = list(queue)
         save_state(st)                          # 每片落盘：中途被杀也不丢进度
-        if time.time() - last_export > EXPORT_EVERY:
-            n, k = export_excel(st)
-            print(f"[导出] 明细 {n} 行（入库 {k}）→ {EXPORT_XLSX.name}"
-                  f"，已跑 {(time.time()-t0)/60:.1f} 分钟", flush=True)
-            last_export = time.time()
+        maybe_export(st, t0)
     return done
 
 
@@ -570,9 +665,24 @@ def gap_rounds(st, queue):
         if st["list_req"] >= MAX_LIST_REQ:
             print(f"  列表请求量已到上限 {MAX_LIST_REQ}，补漏停止", flush=True)
             return
+        if stopped():
+            stop_and_save(st, queue, "补漏轮开头")
+            return
+        # 之前拿不到页的片记在 stalled 里，每轮开头重新排回队列（每片再给两次机会），
+        # 最多重试 MAX_ROUNDS 轮，不会无限循环。
+        if st["stalled"]:
+            for key in st["stalled"]:
+                meta = st["slices"].get(key)
+                if meta is not None:
+                    meta["retried"] = 0
+                queue.append(key)
+            print(f"[补漏] 重排 {len(st['stalled'])} 个之前拿不到页的片", flush=True)
+            st["stalled"] = []
         rnd += 1
         opened = 0
         for key, meta in list(st["slices"].items()):
+            if stopped():
+                break
             total, own = meta.get("total"), meta.get("own", 0)
             if not total or total <= own or meta.get("dead") or meta.get("depth", 0) >= MAX_DEPTH:
                 continue
@@ -588,6 +698,8 @@ def gap_rounds(st, queue):
         n = drain(st, queue, time.time())
         st["queue"] = list(queue)
         save_state(st)
+        if stopped():
+            return
         if not n:
             return
 
@@ -600,6 +712,10 @@ def main():
     st = load_state()
     st["seen_set"] = set(st["seen_slugs"])
     print(f"台账并集账本：已细分片 {rebuild_listed(st)} 个", flush=True)
+    # 流水线起步安排：把「已进名单但还没进详情」的旧记录排进补做队，每片带跑几家，
+    # 不让它们等到收尾阶段才填上联系方式
+    if not SEED_AREAID and DETAIL_INLINE:
+        BACKLOG.extend(s for s in st["seen_slugs"] if not st["records"][s].get("done"))
     queue = deque(st["queue"])
     OUT_DIR.mkdir(exist_ok=True)
     t0 = time.time()
@@ -608,7 +724,11 @@ def main():
 
     # 阶段一：枚举全库（切片翻满→超限按维度优先级细分→跑完再补漏换维度切）
     drain(st, queue, t0)
+    if stopped():
+        return                         # 队列已在 stop_and_save 里存好，下次接着跑
     gap_rounds(st, queue)
+    if stopped():
+        return
     st["queue"] = []
     save_state(st)
     print(f"\n枚举完成：共 {len(st['seen_slugs'])} 家（列表请求 {st['list_req']} 个，"
@@ -629,6 +749,9 @@ def main():
         for gap, m in short[:5]:
             print(f"    {sdesc(st, m['f'])} 标称{m['total']} 名下{m['own']} 差{gap} "
                   f"已用维度{m['used']}", flush=True)
+    if st["stalled"]:
+        print(f"⚠ 还有 {len(st['stalled'])} 个片始终拿不到页（限流），名下公司未计入上面的缺口，"
+              f"下次续跑会自动重试", flush=True)
 
     # 阶段二：逐家进详情（slug 全局去重；瞬时失败的不标 done）
     if SEED_AREAID:
@@ -637,23 +760,25 @@ def main():
         return
     todo = [s for s in st["seen_slugs"] if not st["records"][s].get("done")]
     print(f"\n详情采集：待采 {len(todo)} 家", flush=True)
-    t1 = last_export = time.time()
+    t1 = time.time()
     for i, slug in enumerate(todo, 1):
+        if stopped():
+            stop_and_save(st, deque(), "详情采集")
+            return
         process_one(st, slug)
         if i % 20 == 0:
             save_state(st)
-        if time.time() - last_export > EXPORT_EVERY:
-            n, k = export_excel(st)
-            save_state(st)
-            print(f"[{i}/{len(todo)}] 导出 {n} 行（入库 {k}）", flush=True)
-            last_export = time.time()
+            print(f"  [{i}/{len(todo)}] 已采过详情 {st['detail_req']} 次", flush=True)
+        maybe_export(st, t1)
     # 收尾：把仍判“导航失败”的重采一轮（多为偶发空正文）
     retry = [s for s in st["seen_slugs"] if not st["records"][s].get("done")]
-    if retry:
+    if retry and not stopped():
         print(f"\n收尾重采 {len(retry)} 家（上轮空正文/导航失败）", flush=True)
         for s in retry:
+            if stopped():
+                break
             process_one(st, s)
-    n, k = export_excel(st)
+    n, k = force_export(st)
     save_state(st)
     dt = (time.time() - t1) / 60
     print(f"\n全部完成：明细 {n} 行、入库口径 {k} 行，详情耗时 {dt:.1f} 分钟", flush=True)
