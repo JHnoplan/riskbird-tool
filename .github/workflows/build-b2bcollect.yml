@@ -38,9 +38,12 @@ jobs:
     - name: Install dependencies
       # 裸 CDP 链路（requests / websocket-client，bs4 用 lxml 解析器）＋
       # 1688/企知道通道所需的 selenium。清单与 b2bcollect_build/*.py 顶层 import 对齐。
+      # pillow 不能省：马可波罗「号码图片码」识别引擎 mk_phone_ocr.py 顶层写了
+      # `from PIL import Image`，而 parallel_session 是静态 import 这条链路的——缺 PIL
+      # 不是马可波罗一个站降级，而是整个 exe 启动即 ModuleNotFoundError。
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pillow pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     - name: Download chromedrivers (Stable + 2 previous majors, win64)
       # 复用 1688 工具同款脚本：下载最近 3 个大版本的 win64 驱动，按
@@ -51,11 +54,17 @@ jobs:
     - name: Build EXE with PyInstaller
       # hidden-import 覆盖全部本地模块（跨模块新增 import 未被依赖分析收录会导致
       # exe 启动即 ModuleNotFoundError）；pip 名≠import 名的两个名字都写
-      # （websocket-client→websocket / websocket_client；beautifulsoup4→bs4）。
-      # gys_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
+      # （websocket-client→websocket / websocket_client；beautifulsoup4→bs4；pillow→PIL）。
+      # gys_crawler/solarbe_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
+      # 维护约定：每次给 b2bcollect_build/*.py 新增 import 或新增本地模块，必须把
+      #   grep -hoE "^(import|from) [a-zA-Z_]+" *.py
+      # 与下面两个清单逐行对一次，而不是凭记忆维护（新增采集站 gi_crawler /
+      # makepolo_crawler / maimaib2b_crawler / province_filter / mk_phone_ocr 一度就这么漏过）。
+      # mk_phone_font.json 是马可波罗图片码的字形字典（运行时零标注成本的全部本钱），
+      # 不 --add-data 进包则打包版手机号识别永远拿不到字典。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry --add-data "mk_phone_font.json;." --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
