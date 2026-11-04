@@ -2,12 +2,13 @@
 
 职责：
   · mic / b2b168 / 顺企网(11467) / 爱采购(aipage) / 麦麦B2B(maimaib2b)
-    / 1688 六个**关键词并行**采集器
+    / 跨国采购网(globalimporter) / 马可波罗(makepolo)
+    / 1688 八个**关键词并行**采集器
     ＋ 企知道(qzd) 一个**名单驱动**通道（从待采集公司名单逐家补采，看门狗语义：
     名单空则休眠，废数据回流后自动苏醒），按界面开关决定谁参与本轮；
   · crawl(keywords) 在**各自的线程**里并行推进各站点（裸 CDP 命令通道彼此独立，
     每条命令显式带本站标签 ws 地址，故各线程真并行、互不抢活动标签；
-    纯 HTTP 站 b2b168/11467/aipage/maimaib2b 不占标签（后两站被反采质询时才临时
+    纯 HTTP 站 b2b168/11467/aipage/maimaib2b/globalimporter/makepolo 不占标签（其中两站被反采质询时才临时
     借一个标签过盾）；1688/企知道用 Selenium 附加同一
     共享 Chrome，各占自己的标签/窗口，绝不起第二个浏览器实例）；
   · 把各采集器的信号汇聚到 session 级信号，界面只连一处即可；
@@ -45,6 +46,8 @@ from b2b168_crawler import B2b168Crawler
 from qihuo11467_crawler import Qihuo11467Crawler
 from aipage_crawler import AipageCrawler
 from maimaib2b_crawler import Maimaib2bCrawler
+from gi_crawler import GiCrawler
+from makepolo_crawler import MakepoloCrawler
 from pending_companies import PendingCompanyList, extract_company_names
 import site_adapters as _adapters
 
@@ -52,13 +55,20 @@ import site_adapters as _adapters
 # （gys 供应商网已下线：验证码频发+限 IP，留着只会拖累整体成功率；文件保留备将来攻坚）
 # （solarbe 索比光伏网按用户指令下线：光伏行业垂直库，改用独立脚本全量采一次性数据，
 #   不占工具日常关键词通道；文件保留 solarbe_crawler.py 供那条脚本复用解析）
-SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "maimaib2b"]
+# （qympw 企业名片网 / b2b818 快采购网 / goepe 谷瀑网 按用户指令下线：实机复验发现
+#   goepe 关键词公司搜索是 JS 后加载（纯 HTTP 只会拿到全关键词相同的固定推荐位）；
+#   b2b818 真实但易触发对端 WAF 出口 IP 封锁；qympw 名片库对深度工业词覆盖过薄——
+#   三者数据质量不达要求，已从工具移除，采集器文件一并删除）
+SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "maimaib2b",
+              "globalimporter", "makepolo"]
 SITE_CLASSES = {"mic": MicCrawler, "b2b168": B2b168Crawler,
                 "11467": Qihuo11467Crawler, "aipage": AipageCrawler,
-                "maimaib2b": Maimaib2bCrawler}
+                "maimaib2b": Maimaib2bCrawler, "globalimporter": GiCrawler,
+                "makepolo": MakepoloCrawler}
 SITE_NAMES = {"mic": "中国制造网", "b2b168": "八方资源网",
               "11467": "顺企网", "aipage": "爱采购",
-              "maimaib2b": "麦麦B2B"}
+              "maimaib2b": "麦麦B2B", "globalimporter": "跨国采购网",
+              "makepolo": "马可波罗"}
 # Selenium 附加通道（共享同一 Chrome，各自管自己的标签/窗口）
 if _adapters.HAS_1688:
     SITE_ORDER.append("1688")
@@ -117,6 +127,11 @@ class ParallelSession:
         self._qzd_thread = None
         self._qzd_idle_exit = 300       # 名单空转这么久（秒）后通道休眠退出（看门狗）
         self._crawling_active = False   # 关键词采集进行中：企知道通道据此保持监听废数据回流
+        # 通道启动失败类型（""/chrome/driver/login）：浏览器/驱动型属瞬时故障要退避重试，
+        # 登录型属要用户动手的状态（等登录超时后休眠，反复重试没有意义）。
+        self._qzd_fail_kind = ""
+        self._qzd_attach_retries = 5    # 瞬时故障的退避重试上限（5/10/20/40/60 秒）
+        self._qzd_halted = False        # 本轮通道已放弃（≠ 开关关闭：已补到的结果仍要导出）
         self._wire_signals()
 
     # ── 信号汇聚 ───────────────────────────────────────────────
@@ -240,7 +255,7 @@ class ParallelSession:
 
     # ── 配置下发 ───────────────────────────────────────────────
     def configure(self, delay_between=None, max_pages=None, relevance_guard=None,
-                  incremental=None, max_records=None):
+                  incremental=None, max_records=None, province=None):
         for c in self._active_crawlers():
             if delay_between is not None:
                 d = float(delay_between)
@@ -255,16 +270,40 @@ class ParallelSession:
                 c.delay_between = d
                 c._current_delay = d
             if max_pages is not None:
-                c.max_pages = int(max_pages)
+                # 站点可以声明「每关键词页数硬上限」：有的站是按行业限量的（实测跨国采购网：
+                # 非会员每行业只给前 3 页，超了直接 2 小时冷却），不能让全局的「不限页数」
+                # 把这类站的配额撞光；马可波罗则是库太大（一个词上百万条），不限页会失控。
+                req = int(max_pages)
+                cap = int(getattr(c, "MAX_PAGES_HARD_CAP", 0) or 0)
+                c.max_pages = min([x for x in (req, cap) if x > 0] or [req or cap])
+                if cap and req > cap:
+                    self._log(f"ℹ {c.PLATFORM_NAME}：本站每个关键词最多翻 {cap} 页"
+                              f"（站方限量，翻多了会被冷却），已按 {cap} 页执行")
             if relevance_guard is not None:
                 c.relevance_guard = bool(relevance_guard)
             if incremental is not None:
                 c.incremental = bool(incremental)
             if max_records is not None:
                 c.max_records = int(max_records)
-        # 企知道名单通道只吃节奏参数（逐家查询没有翻页/相关性的概念）
-        if self.qzd is not None and delay_between is not None:
-            self.qzd.delay_between = max(0.8, float(delay_between) / 2)
+            if province is not None:
+                # 省份精准采集：参数直筛站拼进搜索 URL（各爬虫 build_search_url），
+                # 数据层站在 _add_result 入库关卡过滤（cdp_base._apply_province_filter）。
+                # 1688 适配器是独立基类，province 属性已在其 __init__ 里声明。
+                c.province = str(province or "").strip()
+            # 属地判不出的公司名回流企知道待采名单（由工商登记反查一次属地）：
+            # 入库关卡是 fail-closed（判不出就不入库，宁可少不可污），但这些公司大
+            # 概率只是页面没写省份、实际就在目标省，直接丢是纯产能损失——企知道查
+            # 一家就能同时定属地＋补联系方式，比人工黑盒重试便宜。
+            if hasattr(c, "province_unknown_sink"):
+                c.province_unknown_sink = self._unverified_sink
+        # 企知道名单通道：逐家查询没有翻页/相关性的概念，但属地关卡必须接上——
+        # 它是唯一一条不参与关键词并行、也不经过 cdp_base 漏斗的通道，本轮
+        # 就放进过 1 条浙江公司（工商地址与目标省不符），属于监管空白。
+        if self.qzd is not None:
+            if delay_between is not None:
+                self.qzd.delay_between = max(0.8, float(delay_between) / 2)
+            if province is not None:
+                self.qzd.province = str(province or "").strip()
 
     def set_enabled(self, enabled):
         self.enabled = set(enabled or [])
@@ -475,11 +514,16 @@ class ParallelSession:
             if hit:
                 self._log(f"📈 高产词 {hit[0][0]}（{hit[0][1]} 家）可继续同族派生扩量"
                           f"（例：螺杆式/风冷式/水冷式…），工具下一轮会自动带上")
-        # 汇总账目：回答「实际采了多少 / 过滤了多少」
+        # 汇总账目：回答「实际采了多少 / 过滤了多少」——省份把关也算进去，
+        # 否则“采到很多却没入库”在账上看不透（客户上一轮就是因为这一项没披露，
+        # 只能看到总数、不知道 300+ 家是被属地关卡拦下的）。
         for name, s in self.site_stats().items():
+            pf = (f"｜省份把关：外省 {s.get('pf_miss', 0)}、"
+                  f"属地未标注转企知道 {s.get('pf_unknown', 0)}"
+                  if (s.get('pf_miss') or s.get('pf_unknown')) else "")
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
                       f"无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
-                      f"早过滤 {s['early']}｜详情不相关 {s['filtered']}")
+                      f"早过滤 {s['early']}｜详情不相关 {s['filtered']}{pf}")
         self._emit("crawl_finished_signal")
 
     def _pending_keywords(self, crawler, keywords):
@@ -627,6 +671,21 @@ class ParallelSession:
                 return True
         return any(str(r.get(k) or "").strip() for k in ("微信", "微信号"))
 
+    def _unverified_sink(self, names):
+        """属地关卡钩子：页面/公司名都判不出省份的公司名回流待采名单，由企知道
+        按工商登记地址反查一次属地（外省不入库、在本省则连联系方式一起补上）。
+        与废数据回流共用一套台账，只要任务文件夹已绑定就持续累积。"""
+        if not self.pending.is_bound:
+            return
+        try:
+            n = self.pending.add_waste(names)
+            if n:
+                note = "企知道将逐家反查属地并补采" if self._qzd_can_run() \
+                    else "已存待采名单，下次任务（或企知道通道恢复后）自动接续"
+                self._log(f"🗺 {n} 家页面未写属地的公司已加入待采名单（{note}）")
+        except Exception:
+            pass     # 辅佐通道不得影响采集主流程
+
     def _waste_sink(self, names):
         """清洗钩子（自动保存/导出共用）：被入库口径剔掉的废数据公司名回流待采名单。
         只要任务文件夹已绑定就持续累积（不依赖通道是否正在跑，变废为宝）。"""
@@ -635,24 +694,47 @@ class ParallelSession:
         try:
             n = self.pending.add_waste(names)
             if n:
-                note = "企知道将逐家补采" if self.qzd_enabled else "已存待采名单，开企知道补采后可用"
+                note = "企知道将逐家补采" if self._qzd_can_run() \
+                    else "已存待采名单，下次任务（或企知道通道恢复后）自动接续"
                 self._log(f"♻ {n} 家无联系方式的公司已加入待采集名单（{note}）")
         except Exception:
             pass
 
+    def _qzd_can_run(self):
+        """文案口径：本轮通道是否还会去补采。开关开着但已放弃（未接上浏览器/登录失效）不算。"""
+        return bool(self.qzd_enabled) and not self._qzd_halted
+
+    def _qzd_wait(self, seconds, q):
+        """可打断的退避等待：期间点了停止就立刻收工，不许闷头睡死。"""
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if q._stop_requested:
+                return False
+            time.sleep(0.5)
+        return not q._stop_requested
+
     def _ensure_qzd_ready(self):
-        """懒附加 + 登录门（首次有活干时才开，名单空转不占任何浏览器资源）。"""
+        """懒附加 + 登录门（首次有活干时才开，名单空转不占任何浏览器资源）。
+
+        失败原因归类记进 self._qzd_fail_kind，看门狗据此决定「退避后重试」还是「休眠」：
+        chrome/driver 属浏览器侧的瞬时状态（2026-11-04 实测：同一份驱动 08:33 连不上、
+        几分钟后 0.2 秒附加成功），login 属需要用户动手的状态。
+        """
+        self._qzd_fail_kind = ""
         if self.qzd.driver is not None:
             return True
         import shared_chrome as sc
         if not sc.ensure_shared_chrome(self._log, self.port, True):
+            self._qzd_fail_kind = "chrome"
             return False
         if not self.qzd.attach():
+            self._qzd_fail_kind = "driver"
             return False
         state, detail = self.qzd.login_state()
         if state == "ok":
             return True
         if state == "need_login":
+            self._qzd_fail_kind = "login"
             self._emit("login_required_signal", "企知道未登录，补采通道等待登录（已在浏览器打开企知道）")
             self._log("🔐 企知道未登录：已打开企知道首页，请在浏览器里完成登录（最多等 10 分钟）")
             deadline = time.time() + 600
@@ -673,9 +755,13 @@ class ParallelSession:
         q._stop_requested = False
         started = False
         idle_since = None
+        halt = False                # 本轮放弃（绝不动 qzd_enabled：关了开关已补到的结果会被导出漏掉）
+        attach_try = 0              # 接浏览器失败次数（成功附加后清零）
         shell_streak = 0            # 连续空壳计数：登录门解决不了的空壳不能死循环重排
+        net_streak = 0              # 连续「链路异常」计数：断网不能一家家死循环重排
+        self._qzd_halted = False
         self._log("🐕 企知道补采通道启动（看门狗：名单空自动休眠，废数据回流自动苏醒）")
-        while not q._stop_requested and self.qzd_enabled:
+        while not q._stop_requested and self.qzd_enabled and not halt:
             while q._pause_requested and not q._stop_requested:
                 time.sleep(0.5)
             if q._stop_requested:
@@ -702,9 +788,34 @@ class ParallelSession:
             if not started:
                 if not self._ensure_qzd_ready():
                     self.pending.requeue(name)   # 没真正查成：回队首，不记 tried（到手名字不能丢）
-                    self.qzd_enabled = False
-                    return
+                    kind = self._qzd_fail_kind
+                    # 浏览器/驱动型属瞬时故障：退避后重试。一次失败就把整轮补采判死是
+                    # 2026-11-04 的实际事故 —— 08:33 附加失败后，待采名单一路攒到 30+ 家
+                    # 再没被查过一次，而界面上「企知道补采已启用」看着一切正常。
+                    if kind in ("chrome", "driver"):
+                        attach_try += 1
+                        if attach_try <= self._qzd_attach_retries:
+                            wait = min(60, 5 * (2 ** (attach_try - 1)))
+                            why = "共享浏览器没起来" if kind == "chrome" \
+                                else "浏览器正忙，没接受补采通道的连接"
+                            self._log(f"↻ 企知道暂时接不上浏览器（{why}），{wait} 秒后重试"
+                                      f"（第 {attach_try}/{self._qzd_attach_retries} 次）；"
+                                      f"其余通道照常跑，待采名单一家都不会丢")
+                            if not self._qzd_wait(wait, q):
+                                break
+                            continue
+                    c0 = self.pending.counts()
+                    if kind == "login":
+                        self._log("💤 企知道还没登录，补采通道本轮休眠："
+                                  f"待采 {c0['pending']} 家已存盘，登录后重新开始任务会自动接续")
+                    else:
+                        self._log("💤 企知道补采通道多次重试仍未接上浏览器，本轮放弃："
+                                  f"待采 {c0['pending']} 家已存盘，重新开始任务会自动接续")
+                    halt = True
+                    self._qzd_halted = True
+                    break
                 started = True
+                attach_try = 0
             try:
                 block = q._detect_block()
                 if block and not q._wait_unblock(block):
@@ -714,6 +825,29 @@ class ParallelSession:
                 result = q.search_company(name)
                 err = (result.get("错误") or "").strip()
                 if err:
+                    if result.get("可重采"):
+                        # 链路异常＝这一家根本没查成：回队首、不记 tried，网络/浏览器
+                        # 恢复后自动补采（旧实现把断网记成「查不到→永久丢弃」，
+                        # 2026-11-04 09:35 断网那一下永久判死了「青岛太平洋海洋工程(深圳)
+                        # 有限公司」，而它只是那一刻没网）。连着多家都查不成＝还在断网，
+                        # 退避重试而不是死循环烧名单，攒够 4 家就本轮休眠等下次接续。
+                        net_streak += 1
+                        self.pending.requeue(name)
+                        self._log(f"  ↻ 企知道这一家没查成：{err[:70]}；"
+                                  f"已退回队首，链路恢复后自动补采（不记「查不到」）")
+                        if net_streak >= 4:
+                            c0 = self.pending.counts()
+                            self._log("💤 企知道补采连续 4 家都是链路异常（多为断网或浏览器掉线），"
+                                      f"本轮休眠：待采 {c0['pending']} 家已存盘，"
+                                      f"重新开始任务会自动接续"
+                                      f"（已补到的 {len(q.results)} 家仍照常入库）")
+                            halt = True
+                            self._qzd_halted = True
+                            break
+                        if not self._qzd_wait(max(3.0, q.delay_between), q):
+                            break
+                        continue
+                    net_streak = 0
                     found = False
                     q.bump_stat(missing=True)
                     self._log(f"  ⚠ 企知道未查到「{name}」，按约定直接丢弃（不再重复尝试）")
@@ -731,20 +865,47 @@ class ParallelSession:
                         self.pending.requeue(name)
                         if shell_streak >= 3 or not self._ensure_qzd_ready():
                             self._log("💤 企知道详情连续空壳（多为登录态失效），补采通道休眠；"
-                                      "请在浏览器完成企知道登录后重新开始任务")
-                            self.qzd_enabled = False
-                            return
+                                      "请在浏览器完成企知道登录后重新开始任务"
+                                      f"（已补到的 {len(q.results)} 家仍照常入库）")
+                            halt = True
+                            self._qzd_halted = True
+                            break
                         continue
                     shell_streak = 0
-                    found = True
+                    # 入库前后一比确定这条有没有真进表：企知道通道自己的属地关卡
+                    # （QizhidaoSite._add_result）会把登记地址不属本省的结果拦在外面。
+                    # 拦下的一家：台账上算「查过了」（记 tried、不回队反复烧请求），
+                    # 但账目不能记成「查到」，否则看板会出现「查到 N 家、实际入库不足 N 条」
+                    # 的对不上账（与整个体系的「账实相符」口径一致）。
+                    before = len(q.results)
                     q._add_result(result)
-                    q.bump_stat(found=True)
+                    found = len(q.results) > before
+                    if found:
+                        q.bump_stat(found=True)
+                    else:
+                        q.bump_stat()      # 只记「查过一家」，既不算查到也不算查不到
                 self.pending.mark_result(name, found)
                 self._emit("progress_signal", 0, 1)   # 触发总量/状态行刷新
             except Exception as e:
+                # 抛异常同样＝没查成，与上面「可重采」一个口径：回队首，不记 tried。
+                # 但必须同样带闸：断网持续时 pop→异常→requeue→pop 是同一个名字，
+                # 不设阈值就原地死循环，而且一家接一家连发请求（2026-11-04 09:35
+                # 那种整段断网最容易撞上）。
+                net_streak += 1
                 q.bump_stat(found=False)
-                self.pending.mark_result(name, False)
-                self._log(f"❌ 企知道补采「{name}」异常：{str(e).splitlines()[0][:120]}")
+                self.pending.requeue(name)
+                self._log(f"❌ 企知道补采「{name}」异常：{str(e).splitlines()[0][:120]}"
+                          f"（已退回队首，下次接着补采）")
+                if net_streak >= 4:
+                    c0 = self.pending.counts()
+                    self._log("💤 企知道补采连续 4 家都异常（多为断网或浏览器掉线），本轮休眠："
+                              f"待采 {c0['pending']} 家已存盘，重新开始任务会自动接续"
+                              f"（已补到的 {len(q.results)} 家仍照常入库）")
+                    halt = True
+                    self._qzd_halted = True
+                    break
+                if not self._qzd_wait(max(3.0, q.delay_between), q):
+                    break
             time.sleep(max(0.5, q.delay_between))
         c = self.pending.counts()
         self._log(f"🏁 企知道补采通道收工：本轮查到 {q._stat_found} 家｜查不到丢弃 {q._stat_missing} 家"
@@ -1034,5 +1195,6 @@ class ParallelSession:
         return {SITE_NAMES[s]: len(self.crawlers[s]._seen_store) for s in SITE_ORDER}
 
     @staticmethod
-    def parse_keywords(text):
-        return MicCrawler.parse_keywords(text)
+    def parse_keywords(text, junk_out=None):
+        # junk_out 必须透传：界面靠它把「剔掉了哪些碎片、为什么」如实说给用户。
+        return MicCrawler.parse_keywords(text, junk_out=junk_out)

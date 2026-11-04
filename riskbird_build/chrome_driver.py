@@ -140,6 +140,50 @@ def candidates(ports=None) -> list:
     return [str(c) for c in uniq]
 
 
+_drv_ver_cache = {}      # 驱动自身版本号很稳定：同一路径只问一次
+
+
+def driver_version(path) -> str:
+    """问某个 chromedriver 文件的版本（形如 156.0.8078.47）；问不到返回空串。
+
+    只在失败分支调用 —— 建会话成功时不该为了写日志多起一次进程。
+    """
+    key = str(path)
+    if key in _drv_ver_cache:
+        return _drv_ver_cache[key]
+    ver = ""
+    try:
+        out = subprocess.run([key, "--version"], capture_output=True,
+                             text=True, timeout=6).stdout
+        m = re.search(r"\b(\d+\.\d+\.\d+\.\d+)", out or "")
+        ver = m.group(1) if m else ""
+    except Exception:
+        ver = ""
+    _drv_ver_cache[key] = ver
+    return ver
+
+
+def classify_driver_error(msg, drv_ver="", chrome_ver="") -> str:
+    """建会话失败分两类，日志与上层重试判据都按这个分流：
+
+    version —— 驱动与 Chrome 主版本对不上，chromedriver 明确拒绝，只有换驱动才有用；
+    connect —— 端口在但浏览器那一刻不接驱动的连接，同一驱动稍后重试即可（2026-11-04
+               08:33 企知道通道撞的就是这一类，同一份驱动随后 0.2 秒附加成功）。
+    """
+    s = (msg or "").lower()
+    if "only supports chrome version" in s or "this version of chromedriver" in s:
+        return "version"
+    if ("cannot connect to chrome" in s or "session not created" in s
+            or "websocket" in s or "failed to parse" in s):
+        return "connect"
+    try:    # 老驱动有时只给一句含糊报错：主版本对不上仍按版本型处理
+        if drv_ver and chrome_ver and str(drv_ver).split(".")[0] != str(chrome_ver).split(".")[0]:
+            return "version"
+    except Exception:
+        pass
+    return "connect"
+
+
 def _short_err(e) -> str:
     """chromedriver 的报错动辄几十行堆栈，只留第一行给人看"""
     s = str(e) or e.__class__.__name__
@@ -156,8 +200,11 @@ def create(options, log=None, ports=None, retries: int = 3):
 
     log = log or (lambda m: None)
     tried = []
+    kinds = []
     paths = candidates(ports)[:retries]
-    for p in paths:
+
+    def _attempt(p):
+        """用一个本地驱动建会话；成功返回 driver，失败返回异常消息（并记归因）。"""
         service = None
         t0 = time.monotonic()
         try:
@@ -173,8 +220,35 @@ def create(options, log=None, ports=None, retries: int = 3):
                 except Exception:
                     pass
             msg = _short_err(e)
+            dver = driver_version(p)
+            cver = chrome_major(ports)
+            kind = classify_driver_error(msg, dver, cver)
             tried.append(msg)
-            log(f"  本地驱动不可用（{Path(p).name}：{msg[:100]}），换下一个…")
+            kinds.append(kind)
+            where = f"{Path(p).parent.name}/{Path(p).name}"
+            if kind == "version":
+                log(f"  本地驱动版本不符（{where} {dver or '?'}，Chrome {cver or '?'}）："
+                    f"{msg[:100]}，换下一个…")
+            else:
+                log(f"  本地驱动连不上浏览器（{where} {dver or '?'}：端口在但这一刻没接受"
+                    f"驱动的连接，稍后重试通常就好）：{msg[:100]}，换下一个…")
+            return None
+
+    for p in paths:
+        driver = _attempt(p)
+        if driver is not None:
+            return driver
+
+    # 本地全败且全是「浏览器不接连接」：联网换驱动治不了这个，先原地退避再试一遍本地
+    if paths and kinds and all(k == "connect" for k in kinds):
+        for wait in (3, 6):
+            log(f"   本地驱动都是「浏览器没接连接」这一类失败，{wait} 秒后原地重试一遍"
+                f"（不联网下载）…")
+            time.sleep(wait)
+            for p in paths:
+                driver = _attempt(p)
+                if driver is not None:
+                    return driver
     if paths:
         log("⚠ 本机可用的 ChromeDriver 都没能建会话，回退 Selenium Manager（可能要联网查版本，会慢）")
     else:
@@ -187,4 +261,9 @@ def create(options, log=None, ports=None, retries: int = 3):
     except Exception as e:
         if tried:
             log(f"   （本地驱动失败原因：{tried[0]}）")
-        raise RuntimeError(f"创建浏览器会话失败：{_short_err(e)}") from e
+        tail = ""
+        if kinds and all(k == "connect" for k in kinds):
+            tail = "（浏览器端口在但没接受驱动的连接，多为浏览器正忙/刚启动，稍后重试即可）"
+        elif "version" in kinds:
+            tail = "（驱动与 Chrome 版本不匹配，需要换成配套的 ChromeDriver）"
+        raise RuntimeError(f"创建浏览器会话失败：{_short_err(e)}{tail}") from e

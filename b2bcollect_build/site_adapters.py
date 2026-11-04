@@ -71,6 +71,7 @@ except ImportError:
 # ── 预热本目录同名模块（必须在 append 外部路径之前 import，锁定清洗口径）──
 import customer_library_cleaner as _cleaner  # noqa: F401  先进 sys.modules 防遮蔽
 import shared_chrome as _sc                 # noqa: F401
+import province_filter as _pf               # 属地判定词表（1688/企知道通道的省份核验用）
 
 for _p in (str(_ROOT / "ali1688_build"), str(_ROOT / "riskbird_build")):
     if _p not in sys.path:
@@ -134,6 +135,14 @@ if HAS_1688:
             # session 级量化账目（stats() 八键契约）
             self.stat_pages = 0
             self.stat_listed = 0
+            # 站外 SEM 渠道（www.1688.com/zw/page.html?src=zhanwai）在本体系里默认关闭：
+            # 实测该页既不吃 keywords 也不吃 province，本轮 1688 入库的 91 条全部来自
+            # 这个渠道、真属广东的只有 12 条 —— 属于「渠道不可信」而非「参数没设对」，
+            # 大厂口径是直接封掉不可信渠道，而不是想着怎么给它叠补丁。
+            # 需要跑商详/供应商搜索时把这里的开关打开即可（基类逻辑已补相关性护栏）。
+            self.sem_channel = False
+            # 属地判不出来的公司名回流到企知道待采名单，让工商数据反查一次属地
+            self.province_unknown_sink = None
 
         # ── 参数护栏 ────────────────────────────────────────────
         @property
@@ -143,12 +152,53 @@ if HAS_1688:
         @max_pages.setter
         def max_pages(self, v):
             # 基类翻页是 range(1, max_pages+1)：下发 0 会变「一页都不采」的哑炮。
-            # session.configure(max_pages=0) 语义是"不限制"，这里守住下限 1。
+            # 0/负数在 session 语义里是「不限制」，对本站要翻译成站点硬上限 10 页；
+            # 旧写法 max(1, v) 把「不限」读成了「最少」，等于界面说不限页、实际只跑
+            # 1 页（客户那轮 1688 只翻 8 页、主搜几乎零新增，根子就在这里）。
             try:
                 v = int(v)
             except Exception:
                 return
-            self._max_pages = max(1, v)
+            self._max_pages = v if v > 0 else self.MAX_PAGES_HARD_CAP
+
+        # 1688 基类用 range(1, max_pages+1) 翻页，表达不了「不限」；10 页是实测
+        # 不撞风控的安企深度（站方上限约 50 页，越往后越容易被弹验证）。
+        MAX_PAGES_HARD_CAP = 10
+
+        # ── 省份精准采集：参数直筛 + 本地核验（strict）──────
+        def _apply_province_filter(self, rec):
+            """基类只负责把 `&province=` 拼进搜索 URL；这里拿每条记录自己带回来的
+            地址/公司名把属地核一遍，判不出就不入库（province_filter 把 1688 列为 strict：
+            实测那个参数在站外页上完全不生效，不能拿它当保证）。
+            同时修掉一个伪数据源：不再拿已选省份盖进空白的「所在区域」，
+            回填的值永远有页面证据支撑（「广东·深圳」这种）。"""
+            pv = str(getattr(self, "province", "") or "").strip()
+            if not pv or not isinstance(rec, dict):
+                return rec
+            text = _pf.record_region_text(rec)
+            verdict, keep = _pf.judge_record(self.PLATFORM_SLUG, pv, rec)
+            if keep:
+                if not str(rec.get("所在区域") or "").strip():
+                    label = _pf.region_label(pv, text)
+                    if label:
+                        rec["所在区域"] = label
+                return rec
+            full = str(rec.get("公司名称") or "").strip()
+            name = full[:24]
+            if verdict == "miss":
+                self._pf_dropped += 1
+                self._log(f"🗺 [{pv}] 站方 province 参数没筛住、本地按地址拦下："
+                          f"{name}（{text.strip()[:36]}）")
+                return None
+            self._pf_unknown += 1
+            self._log(f"🗺 [{pv}] 页面与公司名都没写省份、无法确认，不入库：{name}")
+            sink = getattr(self, "province_unknown_sink", None)
+            if callable(sink) and full:
+                try:
+                    sink([full])     # 企知道反查一次属地，比拍脑袋丢/入都便宜
+                except Exception:
+                    pass
+            return None
 
         # ── 原始记录补全「数据来源」──────────────────────────
         def _add_result(self, rec):
@@ -299,13 +349,17 @@ if HAS_1688:
                     failed += 1
             return {"pages": self.stat_pages, "listed": self.stat_listed, "ok": ok,
                     "early": self._early_skipped, "filtered": self._filtered_count,
-                    "no_contact": no_contact, "failed": failed, "got": len(self.results)}
+                    "no_contact": no_contact, "failed": failed, "got": len(self.results),
+                    "pf_miss": self._pf_dropped,      # 省份把关：确认外省已排除
+                    "pf_unknown": self._pf_unknown}   # 省份把关：属地未标注（已转企知道反查）
 
         def reset_run_state(self):
             with self.results_lock:
                 self.results = []
             self.stat_pages = 0
             self.stat_listed = 0
+            self._pf_dropped = 0
+            self._pf_unknown = 0
             self._filtered_count = 0
             self._early_skipped = 0
             self._seen_members = set()
@@ -351,7 +405,48 @@ if HAS_QZD:
             self._stat_queried = 0    # 名单通道账目（stats() 由通道侧回填八键）
             self._stat_found = 0
             self._stat_missing = 0
+            # 省份精准采集：企知道是名单驱动通道（拿不到搜索参数），但它的查回结果是
+            # 工商登记地址——全体系最硬的属地证据，所以必须在这里补上数据层关卡：
+            # 本轮它就放进过 1 条浙江公司（嘉兴市桐乡），属于补采通道无监管的漏洞。
+            self.province = ""
+            self._pf_dropped = 0
+            self._pf_unknown = 0
             self.delay_between = 1.5  # 名单逐家查：比原工具略放缓，挂机过夜稳字当头
+
+        # ── 省份关卡（名单通道的入库漏斗）───────────────────
+        def _add_result(self, result):
+            """企知道结果进表前过一遍属地：登记地址不在本省就不入库。
+            查不到/查询失败的记录照旧进：它们是「未找到」台账线索、不含联系方式，
+            不会污染数据；因判不出属地而丢线索反而适得其反。
+            同时修一个原始表可读性问题：企知道记录只带「公司名」键，而原始表
+            表头只有「公司名称」（现场取证：2 条企知道记录的公司名称列全空白），
+            这里顺带补上「公司名称」与有证据的「所在区域」。"""
+            if not isinstance(result, dict):
+                return super()._add_result(result)
+            err = str(result.get("错误") or "").strip()
+            name = str(result.get("公司名") or "").strip()
+            pv = str(getattr(self, "province", "") or "").strip()
+            if not err:
+                result.setdefault("公司名称", name)
+            if pv and not err:
+                text = _pf.record_region_text(result)
+                verdict, keep = _pf.judge_record(self.PLATFORM_SLUG, pv, result)
+                if keep:
+                    if not str(result.get("所在区域") or "").strip():
+                        label = _pf.region_label(pv, text)
+                        if label:
+                            result["所在区域"] = label
+                    return super()._add_result(result)
+                short = name[:24]
+                if verdict == "miss":
+                    self._pf_dropped += 1
+                    self._log(f"🗺 [{pv}] 企知道查回的工商登记地址不属本省、不入库："
+                              f"{short}（{text.strip()[:36]}）")
+                else:
+                    self._pf_unknown += 1
+                    self._log(f"🗺 [{pv}] 工商地址也判不出属地、保守不入库：{short}")
+                return None
+            return super()._add_result(result)
 
         # ── 通道入口（session 企知道线程调用）──────────────────
         def attach(self):
@@ -419,7 +514,8 @@ if HAS_QZD:
             return {"pages": 0, "listed": self._stat_queried, "ok": self._stat_found,
                     "early": 0, "filtered": 0, "no_contact": self._stat_missing,
                     "failed": max(0, self._stat_queried - self._stat_found - self._stat_missing),
-                    "got": len(self.results)}
+                    "got": len(self.results),
+                    "pf_miss": self._pf_dropped, "pf_unknown": self._pf_unknown}
 
         def reset_run_state(self):
             with self.results_lock:
@@ -427,6 +523,8 @@ if HAS_QZD:
             self._stat_queried = 0
             self._stat_found = 0
             self._stat_missing = 0
+            self._pf_dropped = 0
+            self._pf_unknown = 0
             self._stop_requested = False
             self._pause_requested = False
             self._crawling = False

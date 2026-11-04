@@ -2,7 +2,9 @@
 
 覆盖本次整合（去 gys、加 1688、企知道名单通道、GUI 重排、加索比光伏网/麦麦B2B、
 其后索比光伏网按用户指令下线改独立脚本全量采）的关键契约：
-  · 站点拓扑：gys/solarbe 已下线、SITE_ORDER=6 平台 + 1688、SITE_TIPS 全覆盖（防 GUI 索引 KeyError）；
+  · 站点拓扑：gys/solarbe 已下线、SITE_ORDER=7 关键词站 + 1688、SITE_TIPS 全覆盖（防 GUI 索引 KeyError）；
+  · 跨国采购网 / 马可波罗 两个新站的离线契约（均纯 HTTP 不占标签、风控薄壳绝不当空结果、
+    脏号还原不编造、号码图片码通路可按需自动停用、站方假号/假邮箱必剔）；
   · 状态行富文本渲染（含 1688）；
   · 待采集公司名单三台账：bind 建表 / seed 入列 / add_waste 回流 / pop 记 tried /
     mark_result 记 collected / requeue 回队首 / 探针跳过已采；
@@ -41,11 +43,19 @@ def ok(name):
 def test_site_topology():
     assert "gys" not in SITE_ORDER, "供应商网应已下线"
     assert "solarbe" not in SITE_ORDER, "索比光伏网已按用户指令下线（改独立脚本全量采）"
-    assert SITE_ORDER == ["mic", "b2b168", "11467", "aipage", "maimaib2b", "1688"], SITE_ORDER
+    assert SITE_ORDER == ["mic", "b2b168", "11467", "aipage", "maimaib2b",
+                          "globalimporter", "makepolo",
+                          "1688"], SITE_ORDER
     assert SITE_NAMES.get("1688") == "1688"
     assert SITE_NAMES.get("qzd") == "企知道"
     assert SITE_NAMES.get("maimaib2b") == "麦麦B2B", SITE_NAMES.get("maimaib2b")
-    ok("站点拓扑：gys/solarbe 下线、6 平台 + 企知道通道")
+    # 跨国采购网 / 马可波罗：已按用户指令集成（前者数据形态同级麦麦B2B，后者胜在库大覆盖深）
+    assert SITE_NAMES.get("globalimporter") == "跨国采购网", SITE_NAMES.get("globalimporter")
+    assert SITE_NAMES.get("makepolo") == "马可波罗", SITE_NAMES.get("makepolo")
+    # 企业名片网/快采购网/谷瀑网 已按用户指令下线（数据质量不达要求）
+    for gone in ("qympw", "b2b818", "goepe", "企业名片网", "快采购网", "谷瀑网"):
+        assert gone not in SITE_ORDER and gone not in SITE_NAMES, gone
+    ok("站点拓扑：gys/solarbe/qympw/b2b818/goepe 下线、7 关键词平台 + 1688 + 企知道通道")
 
 
 # ── 2. 公司名识别 ──────────────────────────────────────────────
@@ -210,6 +220,158 @@ def test_smart_expand():
     ok("智能解析：类别→产品词展开 / 服务词忽略 / 未收录保留 / 最长匹配优先 / 去重")
 
 
+# ── 6.6 跨国采购网 / 马可波罗 新站离线契约 ────────────────────
+def test_two_new_sites():
+    from parallel_session import SITE_CLASSES
+    from mk_phone_ocr import expected_chars
+
+    gi = SITE_CLASSES["globalimporter"]()
+    mp = SITE_CLASSES["makepolo"]()
+    assert gi.PLATFORM_SLUG == "globalimporter" and mp.PLATFORM_SLUG == "makepolo"
+    # 两站都纯 HTTP：不占浏览器标签，被拦时也不弹浏览器（都无可人工过的验证框）
+    for c, nm in ((gi, "跨国采购网"), (mp, "马可波罗")):
+        assert c.NEEDS_BROWSER is False, nm
+        assert c.BLOCK_OPEN_BROWSER is False, nm
+        assert c.start_browser() is True and c.ensure_tab() is True, nm
+        assert c.close_browser() is None and c._is_session_alive() is True, nm
+
+    # ① 风控薄壳必须判为拦截，绝不能当「本轮无公司」写空数据
+    shell = ('<html><script>function JumpSelf(){self.location='
+             '"/search_company.asp?WebShieldSessionVerify=ABC";}</script></html>')
+    assert gi.http_block_reason(200, shell), "WAF 会话质询薄壳应判为拦截"
+    quota = ("<html>网站已启用防采集功能，非会员可浏览每个行业的前 3 页信息 "
+             "Your IP has too many visits in a short time. "
+             "Please continue browsing after 2 hours!</html>")
+    assert gi.http_block_reason(200, quota), "IP 配额页应判为拦截"
+    assert not gi.http_block_reason(200, "<html>" + ("制冷设备公司" * 800) + "</html>"), \
+        "正常列表页不该误判为拦截"
+
+    # ② 脏号还原：只重组商家写全的数字，位数对不上就整个作废（绝不补位、绝不编造）
+    assert gi._split_numbers("010-13920758-444") == (["13920758444"], []), "区号+手机混写"
+    assert gi._split_numbers("010-13920758-44")[0] == [], "位数不够不能当手机入库"
+    assert gi._split_numbers("0755-86331949") == ([], ["0755-86331949"]), "真固话不许被拆成手机"
+    # ③ 详情零请求：列表页已含全部明文，配额全留给翻页
+    def _no_request(*a, **k):
+        raise AssertionError("跨国采购网详情阶段不该再发请求")
+    gi._fetch = _no_request
+    rec = gi.crawl_detail({"公司名称": "东莞市华英制冷设备厂", "公司ID": "dongguanhy",
+                           "memberId": "dongguanhy", "关键词": "制冷设备",
+                           "主营产品": "制冷设备 冷库板", "列表联系人": "张先生",
+                           "列表电话": "13392381815",
+                           "详情URL": "https://www.globalimporter.net/cdetail_1_1.html"})
+    assert rec["状态"] == "成功" and rec["手机"] == "13392381815", rec
+    assert rec["数据来源"] == "跨国采购网", rec["数据来源"]
+
+    # ④ 马可波罗号码图片码：token 长度先验 + 假值必剔 + 通路空转自适应停用
+    assert expected_chars("A" * 54) == 11 and expected_chars("A" * 55) == 12, "长度先验偏移 43"
+    ms, ts = [], []
+    mp._tally("17368614555", ms, ts)      # 站方模板假号
+    mp._tally("", ms, ts)                 # 读不出的一律不进
+    assert not ms and not ts, (ms, ts)
+    mp._tally("13650342510", ms, ts)
+    mp._tally("021-54783528", ms, ts)
+    assert ms == ["13650342510"] and ts == ["021-54783528"], (ms, ts)
+    assert mp.src_count["码图"] == 1, mp.src_count
+
+    calls = []
+    TEXT_PAGE = ('<div><li>联系人：王先生</li><li>手机：13512345678</li>'
+                 '<li>Email：13512345678@139.com</li>'
+                 '<li>传真：0755-83034002</li>'
+                 '<li>公司地址：深圳市龙岗区某路 1 号</li></div>').encode("utf-8")
+
+    class _Resp:
+        def __init__(self, body=b""):
+            self.content = body
+            self.status_code = 200
+            self.headers = {}
+            self.text = body.decode("utf-8", "ignore")
+
+    class _NoImageSession:
+        """联系方式页给明文，号码图一律回 0 字节（实测本站不放图时就是这个形状）。"""
+
+        def get(self, url, timeout=None, headers=None):
+            calls.append(url)
+            return _Resp(b"" if "buildStringToimg" in url else TEXT_PAGE)
+
+    mp._session = _NoImageSession()
+    mp._pace_before_request = lambda *a, **k: None
+    dead_page = ('<li>手机：<img src="/purchase/buildStringToimg.php?t_page=pro'
+                 '&phone=%s"/></li>' % ("T" * 54))
+    # 两阶段取法：一张都不给时，一家最多只花「探测两张 + 补一张」= 3 个请求，
+    # 而不是把页上所有号码图全打一遍（实测出图是按店的，在不出图的店上多打没有意义）
+    # 页面按真实 B 型模板写：码图挂在 <li>联系电话：…</li> 作用域里（归属过滤只收这一种）
+    six_codes = "".join('<li>联系电话：<img src="/purchase/buildStringToimg.php?t_page=y_left&phone=%s"/></li>'
+                        % ("T" * 53 + str(i)) for i in range(6))
+    calls.clear()
+    mp._codes("shopx", six_codes, "http://shopx.cn.makepolo.com/contact_us.html")
+    assert len(calls) == mp.IMG_PROBE_CODES + mp.IMG_PROBE_FALLBACK, len(calls)
+    # 归属过滤：CPC 推广弹窗里的码图（不挂联系方式标签、也不在本店子域卡片里）
+    # 一张都不许取：实机抓到过两家毫不相干的公司（长沙泵厂 / 厦门微电子）共享同一对
+    # 上海号码，那就是站方推广位广告主的号——记到本公司头上就是外呼打不通的假数据。
+    promo_page = ('<div class="phone_mask_list"><span>现货微信同步</span>'
+                  '<img src="/purchase/buildStringToimg.php?t_page=y_left&phone=%s"/></div>' % ("T" * 54))
+    calls.clear()
+    mp._codes("shopx", promo_page, "http://shopx.cn.makepolo.com/contact_us.html")
+    assert not [u for u in calls if "buildStringToimg" in u], "推广位码图不应发起取图请求"
+    # 但同一份本店号码的另一种字体（弹窗「供应商」卡里的 pro 通道）要保留：
+    # 实测有张 y_left 读不出、pro 能读出的本店手机，两通道互为冗余
+    dup_page = ('<a href="//shopx.cn.makepolo.com/x">本店</a>'
+                '<p class="title_left_2"><img src="/purchase/buildStringToimg.php'
+                '?t_page=pro&phone=%s"/></p>' % ("T" * 54))
+    calls.clear()
+    mp._codes("shopx", dup_page, "http://shopx.cn.makepolo.com/contact_us.html")
+    assert any("buildStringToimg" in u for u in calls), "本店子域卡片里的 pro 通道码图要保留"
+    # 跨店公共号哨兵（归属过滤之外的第二道闸）：同一号第 3 家店起剔除
+    mp._num_shops = {}
+    assert [mp._public_num_hit("13900001111", s) for s in ("a", "b", "c")] \
+        == [False, False, True], "公共号应从第 3 家起剔除"
+    assert mp._public_num_hit("13900002222", "d") is False, "不同号互不干扰"
+    for _ in range(mp.IMG_DEAD_STREAK):
+        mp._codes("shopx", dead_page, "http://shopx.cn.makepolo.com/contact_us.html")
+    assert mp._img_off is True, "连续多家不给图应停用图片通路"
+    n = len(calls)
+    mp._codes("shopx", dead_page, "http://shopx.cn.makepolo.com/contact_us.html")
+    assert len(calls) == n, "停用后不该再发一张图片请求"
+    # 停用图片通路不等于丢公司：明文/邮箱前缀仍能把联系方式拿全，传真不许当电话
+    rec2 = mp.crawl_detail({"公司名称": "深圳市宏业包装制品有限公司", "公司ID": "szhybz",
+                            "memberId": "szhybz", "关键词": "包装制品",
+                            "主营产品": "包装制品", "公司网址": "",
+                            "详情URL": "http://szhybz.cn.makepolo.com/contact_us.html"})
+    assert rec2["状态"] == "成功", rec2["状态"]
+    assert rec2["手机"] == "13512345678", rec2["手机"]     # 明文与邮箱前缀同号，不重复计入
+    assert rec2["邮箱"] == "13512345678@139.com", rec2["邮箱"]
+    assert rec2["电话"] == "", "传真不该被当成电话入库"
+    assert rec2["联系人"] == "王先生", rec2["联系人"]
+    assert not [u for u in calls[n:] if "buildStringToimg" in u], "停图后详情阶段也不发图片请求"
+    # ⑤ 配额类站点必须有「页数硬上限」：界面一律下发 max_pages=0（不限页），
+    # 跨国采购网非会员只给每行业前 3 页（超了就 2 小时冷却），马可波罗一词上百万条产（不限页会失控）
+    assert gi.MAX_PAGES_HARD_CAP == 3, gi.MAX_PAGES_HARD_CAP
+    assert gi.max_pages_default == 3 and gi.max_pages == 3
+    assert mp.MAX_PAGES_HARD_CAP == 5 and mp.max_pages == 5
+    # 硬上限的钳制口径与 configure 一致（界面给 0 ＝取站点 cap；给得比 cap 大＝钳回 cap）
+    for req, cap, want in ((0, 3, 3), (9, 3, 3), (2, 3, 2), (0, 0, 0)):
+        got = min([x for x in (req, cap) if x > 0] or [req or cap])
+        assert got == want, (req, cap, got, want)
+    # ⑥ 请求预算：到预算就优雅收本轮（不能一路把 IP 撞进 2 小时冷却）
+    gi2 = SITE_CLASSES["globalimporter"]()
+    gi2.incremental = False
+    gi2._booted = True
+    gi2._pace_before_request = lambda *a, **k: None
+    gi2._req_used = gi2.REQ_BUDGET
+    hit = []
+
+    class _Counting:
+        def get(self, *a, **k):
+            hit.append(1)
+            raise AssertionError("到预算后不该再发请求")
+    gi2._session = _Counting()
+    assert gi2._fetch("https://www.globalimporter.net/search_company.asp?keyword=x&curpage=1") == ""
+    assert not hit, "到预算后一个请求都不该再发"
+    ok("跨国采购网/马可波罗：纯 HTTP 不弹浏览器、薄壳不当空结果、脏号不编造、"
+       "详情零请求、假号假邮箱必剔、图片码通路自适应停用且停用后明文仍成单、"
+       "页数硬上限与请求预算生效")
+
+
 # ── 7. GUI 默认态（需 Qt）──────────────────────────────────────
 def test_gui_defaults():
     if not HAS_QT:
@@ -251,6 +413,7 @@ def main():
         test_parse_keywords()
         test_1688_source_stamp()
         test_smart_expand()
+        test_two_new_sites()
         test_gui_defaults()
     print(f"\n全部通过：{len(PASS)} 组断言")
 

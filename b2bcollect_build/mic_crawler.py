@@ -29,6 +29,8 @@ import html as _htmlmod
 import requests
 from urllib.parse import quote
 
+import province_filter as _pf
+
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, dept_only)
 
@@ -142,7 +144,16 @@ class MicCrawler(CdpSiteCrawler):
             return quote(str(kw).encode("gbk", "ignore"))
 
     def build_search_url(self, kw, page):
-        return COMPANY_SEARCH_URL.format(page=page, kw=self._gbk_quote(kw))
+        url = COMPANY_SEARCH_URL.format(page=page, kw=self._gbk_quote(kw))
+        # 省份精准采集：站方原生 comProvince 参数（2026-11-04 探针 A/B 实锤服务端真
+        # 过滤：广东/浙江各 60 卡、与全国重合仅 2/60、两省交集 0）。英文值表见
+        # province_filter.MIC_EN；无对应值时退回 nolimit 全国采，绝不带错参数。
+        pv = getattr(self, "province", "")
+        if pv:
+            en = _pf.param_value("mic", pv, "en")
+            if en:
+                return url.replace("comProvince=nolimit", f"comProvince={en}")
+        return url
 
     def parse_list(self, html, kw):
         """公司搜索页：从 class="co-name" 锚点逐张卡片取子域/主机/中文公司名 + 主营产品。

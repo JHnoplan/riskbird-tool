@@ -294,16 +294,18 @@ class Qihuo11467Crawler(CdpSiteCrawler):
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
                     continue
-                self._seen_members.add(key)
-                self._seen_members.add(nkey)
                 # 早过滤只看产品信号（公司直列版式无主营产品→fail-open），
                 # 相关性判定交给详情页复核。
+                # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
                     self._early_skipped += 1
+                    self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
                     continue
+                self._seen_members.add(key)
+                self._seen_members.add(nkey)
                 e["关键词"] = kw
                 new += 1
                 yield e

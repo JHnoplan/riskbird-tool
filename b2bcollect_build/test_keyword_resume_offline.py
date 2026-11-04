@@ -143,6 +143,35 @@ rows = [{"关键词": "A词", "公司名称": "老数据公司", "数据来源":
 check("seed_results 返回装回条数", c3.seed_results(rows) == 1)
 check("装回的记录进内存 results", any(r["公司名称"] == "老数据公司" for r in c3.results))
 
+# ── C2. 一页都没取到的词，绝不能记「已跑完」（2026-11-02 麦麦B2B 事故）──────
+# 旧实现：只要本轮没被用户点停，就无条件把关键词记成「已跑完」。于是列表取页链路
+# 没接上的那一轮（翻 0 页、净产出 0）把 10 个词全标成跑完，写进任务台账；用户再点
+# 「开始采集」全部被跳过，看到的就永远是「只有这一家 0 条成功」。
+print("C2. 一页都没取到的词不记已跑完")
+logs_c2 = []
+c4 = _wire_fake(B2b168Crawler(), [])
+c4._log = lambda m: logs_c2.append(m)
+c4._iter_keyword = lambda kw: (_ for _ in ()).throw(
+    RuntimeError("no tab：列表一页都取不到")) if kw == "坏词" else iter(())
+c4.crawl(["坏词", "空词"])
+check("一页都没取到的词不记「已跑完」（下次续采自动重来）", "坏词" not in c4._kw_done)
+check("这种情形会如实提醒而不是静默", any("一页都没取到" in m and "坏词" in m for m in logs_c2))
+
+
+c5 = _wire_fake(B2b168Crawler(), [])
+c5._log = lambda m: None
+
+
+def _empty_but_paged(kw):
+    c5.stat_pages += 1          # 真和站上说上话了：页取到了，只是这个词没公司
+    return iter(())
+
+
+c5._iter_keyword = _empty_but_paged
+c5.crawl(["真没结果的词"])
+check("取到页但确实一家没有的词仍记「已跑完」（下次不再白烧请求）",
+      c5._kw_done == {"真没结果的词"})
+
 
 class StubNoLedger:
     """没有逐词台账的通道（1688/企知道适配器就是这类）：靠会话层过滤词表续采。"""

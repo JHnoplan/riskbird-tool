@@ -30,6 +30,8 @@ from pathlib import Path
 
 import requests
 
+import province_filter as _pf
+
 try:
     import websocket  # websocket-client
     HAS_WS = True
@@ -73,6 +75,11 @@ EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 # 「已在 Chrome 里打开对应页面」，用户满屏找入口找不到（客户实际反馈）。
 BLOCK_TAG_IP = "【IP限流·无需操作】"
 BLOCK_TAG_CAP = "【需人工验证】"
+# 探针返回这个前缀＝本机网络不通（断网/DNS/连接被重置），不是站点在拦。
+# 以前两类混成一句「仍在等站点放行（IP 冷却，无需操作）」，用户就会对着
+# 一台断网的电脑等站点放行（2026-11-04 09:36 实机：HTTPSConnectionPool
+# 那条连接失败被写成 IP 冷却，白等 300 秒）。分开的成本只有这一个前缀。
+NET_FAIL_TAG = "本机网络不通："
 
 # 会话/标签已死的特征（CDP 层）：命中即重取标签续采，绝不崩线程。
 SESSION_DEAD_MARKS = (
@@ -107,6 +114,23 @@ def clean_cell(val):
     if not isinstance(val, str):
         return val if val is not None else ""
     return _ILLEGAL_RE.sub('', val)
+
+
+# 长途区号只存在这三种形状：010 / 02X / 03xx~09xx（0193、04450 之类都不在网内）。
+# PHONE_TEL_RE 只看「0 开头 + 7~8 位本体」，凑得出这种假区号，外呼一定打不通。
+_AREA_CODE_RE = re.compile(r"^0(?:10|2\d|[3-9]\d{2})$")
+
+
+def is_valid_landline(tel):
+    """固话能不能打：区号必须在真实存在的号码树里。
+    实测马可波罗把手机 19352178592 写成「0193-52178592」（商家把手机前缀当区号填），
+    形状合法但 0193 不是任何地区的长途前缀——这种号入库就是白送一列打不通的电话。"""
+    digits = re.sub(r"\D", "", str(tel or ""))
+    for L in (3, 4):                     # 区号含前导 0 共 3 位（010/020）或 4 位（0755）
+        area, tail = digits[:L], digits[L:]
+        if _AREA_CODE_RE.match(area) and re.fullmatch(r"\d{7,8}", tail):
+            return True
+    return False
 
 
 def strip_country_code(val):
@@ -499,6 +523,36 @@ class CdpSiteCrawler:
     BLOCK_MAX_WAIT = 1800           # 单次等人工过验证的总时长上限（秒）
     BLOCK_MAX_WAIT_IP = 2700        # 单次等 IP 冷却的总时长上限（冷却本来就慢，别提前放弃）
     BLOCK_COOKIE_DOMAIN = ""        # 纯 HTTP 站过验证后需要抄回的 cookie 域（子类设）
+    # 「自动挑战页」卡住不动时主动推进（Cloudflare 那种只有转圈、没有任何可点控件的插页）。
+    # 默认 False：只有明确实测过「刷新确实能让它继续走」的站才打开（2026-11-02 麦麦B2B 实测）。
+    BLOCK_AUTO_REFRESH = False
+    BLOCK_REFRESH_EVERY = 10        # 连续被拦多久算「卡住」，到点推一把（实测约 10 秒一次有放行的）
+    BLOCK_REFRESH_MAX = 200         # 单轮等待最多推几次（点「刷新此页面」不重开挑战，可以给足次数；
+                                    # 按 10 秒一次算要能撑满整个等待窗口 BLOCK_MAX_WAIT）
+    BLOCK_RELOAD_LAST_RESORT = 90   # 插页上没任何可点入口、也没真人勾选框时，卡满这么久才「清掉本站通行证再重开这一页」
+    # 真人勾选框（Cloudflare Turnstile「请验证您是真人」那种 300×65 嵌入式控件）在跨域 iframe 里：
+    # JS 碰不到它，element.click() 也不算真人（CF 只认可信事件）——但鼠标只看屏幕坐标，
+    # 所以按控件的几何位置发一次真鼠标点击就能点到勾选框（2026-11-03 麦麦B2B 实测）。
+    TURNSTILE_CLICK_X = 30          # 勾选框画在控件左端约 30 像素处，竖向居中
+    TURNSTILE_CLICK_COOLDOWN = 30   # 点一下之后给它这么久的时间自己跑完（连着点会把这一轮进度顶回去）
+    TURNSTILE_WIDGET_JS = """(function(){
+function box(e){if(!e)return null;var r=e.getBoundingClientRect();
+return (r.width>=150&&r.height>=40&&r.bottom>0&&r.top<(window.innerHeight||900)*0.92)?
+JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height}):null;}
+var s=['.cf-turnstile iframe','.cf-turnstile','iframe[src*="challenges.cloudflare.com"]',
+'#challenge-stage','iframe[src*="captcha"]','iframe[src*="verify"]'];
+for(var i=0;i<s.length;i++){try{var e=document.querySelector(s[i]);
+var r=e&&box(e);if(r)return r;}catch(x){}}
+return '';})()"""
+    # 插页上那个「刷新此页面」链接（Cloudflare 自己写的 id=challenge-refresh）。优先点它：
+    # 它是“拿着现有令牌再试一次”；整页重载则是“重新开始一场挑战”，反而更慢。
+    CHALLENGE_REFRESH_JS = """(function(){
+var els=[].slice.call(document.querySelectorAll('a,button'));
+for(var i=0;i<els.length;i++){var e=els[i];
+var t=(e.innerText||e.textContent||'').trim();
+if(e.id==='challenge-refresh'||/刷新此页面|刷新页面|refresh this page/i.test(t)){
+e.click();return t.slice(0,20)||e.id;}}
+return '';})()"""
     # 是否把「采集间隔」下沉到每个请求前对齐（只给一条记录要打多个页的纯 HTTP 站开）。
     # 默认 False：浏览器站一条记录 = 一次导航，记录级节流已经等价，
     # 无差别打开会让正常运行的站莫名慢 2~3 倍。
@@ -537,6 +591,13 @@ class CdpSiteCrawler:
         self.max_records = 0         # 采到 N 条自动收尾（0=不限）
         self.relevance_guard = True  # 相关性（关键词↔行业）过滤
         self.incremental = True      # 跨运行增量去重
+        self.province = ""           # 省份精准采集：""=全国不限（GUI 省份选择下发）
+        self._pf_dropped = 0         # 属地明确指向外省而丢弃计数（完成时如实汇报）
+        self._pf_unknown = 0         # 属地无法确认而丢弃计数（同上，并回流待核实名单）
+        # 属地无法确认的公司名回注入口（ParallelSession 接 企知道待采名单）：
+        # 页面没写属地不等于这家不是目标省，交给企知道按名反查一次属地再定入库，
+        # 比拍脑袋丢弃/拍脑袋入库都便宜。没有接线时为 None（单站自测/独立工具）。None-safe。
+        self.province_unknown_sink = None
 
         # 熔断：短窗口内反复被拦＝已进限流区，强制冷却、必要时优雅收本轮
         self._block_times = []
@@ -552,6 +613,8 @@ class CdpSiteCrawler:
         self._retry_after = 0       # 服务端 Retry-After 提示的秒数（有就听它的）
         self._block_probe_url = ""   # 探测用的代表页（就是刚被拦的那一页）
         self._borrowed_tab = False   # 纯 HTTP 站为过验证临时借的标签（恢复后归还）
+        self._reloaded_once = False   # 本轮被拦是否已做过「保底整页重载」（重载会重开挑战，只做一次）
+        self._turnstile_last_click = 0.0   # 上次替用户点验证勾选框的时刻（见 TURNSTILE_CLICK_COOLDOWN）
         # 用户点了「我换好网络了，马上继续」时置位：把正在退避的看门狗当场叫醒，
         # 不再让他干等下一个 45s~600s 的探测周期（换出口 IP 后马上就能接上）。
         self._block_wake = threading.Event()
@@ -559,6 +622,8 @@ class CdpSiteCrawler:
         self._seen_store = {}
         self._seen_members = set()
         self._filtered_count = 0
+        self._pf_dropped = 0
+        self._pf_unknown = 0
         self._early_skipped = 0
 
         # 请求间隔统一记账（见 _sleep）：锚定「上一次真实请求完成」的时刻，
@@ -608,7 +673,58 @@ class CdpSiteCrawler:
         with self.results_lock:
             return [dict(r) for r in self.results]
 
+    def _apply_province_filter(self, rec):
+        """省份精准采集的入库关卡（所有站都经 _add_result 这一条漏斗）。
+
+        统一口径：拿记录自己带回来的「所在区域/地址/公司名」做一次属地判定，
+        参数直筛站也不例外——trust but verify：站方参数只在它真的生效时才是优选项，
+        而“真的生效”是个会随改版静默失效的前提（1688 实锤：标着广东的 91 条里
+        只有 12 条真属广东）。分档由 province_filter.param_verify_policy 定：
+          · 数据层站与 strict 参数站：只收 match（fail-closed，判不出也不入库）；
+          · lenient 参数站（mic/makepolo）：只砍 miss（站方已筛过，无标注不重复杀）。
+        match 且原「所在区域」为空时，回填一个**有页面证据支撑**的属地标签（广东·深圳），
+        绝不拿已选省份臆测填。判不出的公司名回 Sink 到企知道待采队列二次核实。
+        返回 None = 丢弃；丢弃只记日志计数，不写种子库（没采过≠采完）。"""
+        pv = str(self.province or "").strip()
+        if not pv or not isinstance(rec, dict):
+            return rec
+        slug = str(getattr(self, "PLATFORM_SLUG", "") or "").lower()
+        text = _pf.record_region_text(rec)
+        verdict, keep = _pf.judge_record(slug, pv, rec)
+        if keep:
+            if not str(rec.get("所在区域") or "").strip():
+                label = _pf.region_label(pv, text)
+                if label:
+                    rec["所在区域"] = label
+            return rec
+        name = str(rec.get("公司名称") or rec.get("公司名") or "")[:24]
+        if verdict == "miss":
+            self._pf_dropped += 1
+            tag = "站方筛漏了、本地按地址拦下" if _pf.uses_param_filter(slug) else "跳过非本省商家"
+            self._log(f"🗺 [{pv}] {tag}：{name}（{text.strip()[:36]}）")
+            return None
+        self._pf_unknown += 1
+        self._log(f"🗺 [{pv}] 页面与公司名都没写省份、无法确认，不入库：{name}")
+        self._sink_unverified(rec)
+        return None
+
+    def _sink_unverified(self, rec):
+        """属地判不出的公司交给外部钩子（企知道反查一次属地比直接丢便宜）；没接线就无操作。"""
+        sink = getattr(self, "province_unknown_sink", None)
+        if not callable(sink):
+            return
+        name = str(rec.get("公司名称") or rec.get("公司名") or "").strip()
+        if not name:
+            return
+        try:
+            sink([name])
+        except Exception:
+            pass     # 辅助通道不得影响采集主流程
+
     def _add_result(self, rec):
+        rec = self._apply_province_filter(rec)
+        if rec is None:
+            return
         with self.results_lock:
             self.results.append(rec)
         kw = str(rec.get("关键词") or "").strip()
@@ -1148,6 +1264,257 @@ return '';})()"""
         except Exception:
             pass
 
+    # 自动挑战页特征：Cloudflare 质询页的标题/URL 写法。这类页面人点不了任何东西。
+    AUTO_CHALLENGE_MARKS = ("just a moment", "请稍候", "attention required",
+                            "checking your browser", "__cf_chl", "cf-chl", "challenge-solving")
+
+    def _auto_challenge_page(self):
+        """标签当前是否停在「纯自动挑战页」：只有转圈动画、没有任何可点控件的插页。
+        这种页面人做不了任何动作，刷新是唯一能推进的操作；而带滑块/验证码控件的页面
+        一律不算——那种页面一刷新就把用户正在拖的滑块重置掉了（绝对不行）。"""
+        try:
+            if self._eval(self.CAPTCHA_WIDGET_JS):
+                return False
+            text = ((self._current_url() or "") + " " + (self._title() or "")).lower()
+            if any(m in text for m in self.AUTO_CHALLENGE_MARKS):
+                return True
+            st = self._page_state() or {}
+            dom = (getattr(self, "HOME_DOMAIN", "") or "").lower()
+            # 地址已经落在本站、正文却几乎是空的：插页把真页面挡住了
+            return bool(dom) and dom in (st.get("url") or "").lower() \
+                and int(st.get("len") or 0) < 200
+        except Exception:
+            return False
+
+    def _cdp_open(self, timeout=15):
+        """为「一组必须连着做完的 CDP 命令」开一条专用连接（见 _frames_eval）。"""
+        ws_url = self._ws_url()
+        if not ws_url:
+            raise RuntimeError("no target tab websocket")
+        return websocket.create_connection(ws_url, timeout=timeout)
+
+    def _frames_eval(self, js, timeout=15):
+        """把同一段 JS 依次送进主文档和每一个 iframe（含 challenges.cloudflare.com
+        那种跨域帧）执行，返回 [(帧URL, 结果), …]。
+        必须一条连接里做完：Page/Runtime 域是按连接启用的，isolated world 的上下文
+        也只属于创建它的那条连接——先取帧树、再另开连接执行会「找不到上下文」。
+        之前用 _send 分三条命令查帧树，实测直接被拒（Page domain is not enabled），
+        所以点不到插页里的「刷新此页面」。"""
+        out = []
+        try:
+            ws = self._cdp_open(timeout)
+        except Exception:
+            return out
+        seq = [0]
+
+        def call(method, params=None, wait=6):
+            seq[0] += 1
+            mid = seq[0]
+            try:
+                ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            except Exception:
+                return {}
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                try:
+                    raw = ws.recv()
+                except Exception:
+                    break
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if msg.get("id") == mid:
+                    return msg.get("result") or {}
+            return {}
+
+        try:
+            call("Page.enable")
+            call("Runtime.enable")
+            tree = call("Page.getFrameTree").get("frameTree") or {}
+            frames = []
+
+            def walk(node, depth=0):
+                f = node.get("frame") or {}
+                if f.get("id"):
+                    frames.append((f["id"], f.get("url") or "", depth))
+                for ch in node.get("childFrames") or []:
+                    walk(ch, depth + 1)
+
+            walk(tree)
+            for fid, furl, depth in frames:
+                params = {"expression": js, "returnByValue": True}
+                if depth:                     # 跨域帧：给它单独建一个可执行的上下文
+                    ctx = call("Page.createIsolatedWorld",
+                               {"frameId": fid, "worldName": "b2bassist"}
+                               ).get("executionContextId")
+                    if not ctx:
+                        continue
+                    params["contextId"] = ctx
+                v = call("Runtime.evaluate", params).get("result", {}).get("value")
+                if v not in (None, "", False, 0):
+                    out.append((furl, v))
+        except Exception:
+            pass
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        return out
+
+    def _click_in_frames(self, js):
+        """先主文档找、找不到再逐帧（iframe）找并执行。
+        Cloudflare 的插页常把内容放在 challenges.cloudflare.com 的跨域 iframe 里，
+        主文档 JS 碰不到它（跨域），但 CDP 可以：Page.createIsolatedWorld 拿到那个帧的
+        执行上下文，再在那个上下文里跑同一段 JS。点到就回元素文本，没点到回空串。"""
+        try:
+            hit = self._eval(js)
+            if hit:
+                return str(hit)
+        except Exception:
+            pass
+        for _furl, v in self._frames_eval(js):
+            if v:
+                return str(v)
+        return ""
+
+    def _cdp_cmds(self, cmds, timeout=10):
+        """在同一条 CDP 连接上按顺序发完一串命令。
+        鼠标按下/抬起、以及「先看 Cookie 再删 Cookie」都得走同一条连接：
+        分开连接在 CDP 里是两个独立会话，不算一次完整动作。"""
+        ws = self._cdp_open(timeout=timeout)
+        try:
+            out = []
+            for mid, (method, params) in enumerate(cmds, 1):
+                ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+                deadline = time.time() + timeout
+                got = {}
+                while time.time() < deadline:
+                    raw = ws.recv()
+                    if not raw:
+                        continue
+                    msg = json.loads(raw)
+                    if msg.get("id") == mid:
+                        got = msg.get("result") or {}
+                        break
+                out.append(got)
+            return out
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _turnstile_widget(self):
+        """页面上有没有摆着要人点的验证控件，有就回它的屏幕位置（跨域不影响坐标）。"""
+        try:
+            hit = self._eval(self.TURNSTILE_WIDGET_JS)
+            return json.loads(hit) if hit else None
+        except Exception:
+            return None
+
+    def _click_turnstile_at(self, g):
+        """按控件几何位置发一次「真鼠标」点击点到勾选框上。
+        为什么不能用 JS 点：Cloudflare 只认可信事件（isTrusted），element.click() 发出去的是
+        非可信事件，它直接忽略（这就是程序对着勾选框什么也推不动的原因）；而鼠标事件按
+        屏幕坐标发，跟控件在跨域 iframe 里无关。实测 2026-11-03 麦麦B2B：
+        人工点了也回不来的那种循环，坐标点击＋清掉本站通行证才能把循环打断。"""
+        try:
+            x = float(g.get("x") or 0) + getattr(self, "TURNSTILE_CLICK_X", 30)
+            y = float(g.get("y") or 0) + float(g.get("h") or 60) / 2.0
+            self._cdp_cmds([("Input.dispatchMouseEvent",
+                             {"type": t, "x": x, "y": y})
+                            if t == "mouseMoved" else
+                            ("Input.dispatchMouseEvent",
+                             {"type": t, "x": x, "y": y, "button": "left", "clickCount": 1})
+                            for t in ("mouseMoved", "mousePressed", "mouseReleased")])
+        except Exception:
+            return False
+        self._log(f"   🖱 页面上摆着要人点的验证勾选框，已按坐标替用户点一下"
+                  f"（控件 {int(g.get('w') or 0)}×{int(g.get('h') or 0)}）")
+        return True
+
+    def _purge_block_cookies(self, url=""):
+        """删掉本站的 Cloudflare 通行证与挑战计数（cf_clearance / cf_chl_*）。
+        实测依据（2026-11-03）：陷在验证循环里的那个共享配置里 cf_chl_rc_ni=11
+        （＝这份会话已经重复挑战 11 次），而同一时间、同一网络、同一台机器上另开一份
+        干净配置打开同一个页面是秒过、连验证页都不出——循环是跟着这份会话 Cookie 走的。
+        所以卡到保底时间要做的不是「拿同一张废通行证再刷一次」，而是先把本站 cf_* 清掉
+        再重开这一页。"""
+        probe = url or self._block_probe_url or self.BASE_URL
+        if not probe:
+            return False
+        try:
+            got = self._cdp_cmds([("Network.getCookies", {"urls": [probe]})])[0]
+            cookies = got.get("cookies") or []
+        except Exception:
+            return False
+        cmds = [("Network.deleteCookies", {"name": c.get("name"), "domain": c.get("domain"),
+                                          "path": c.get("path") or "/"})
+                for c in cookies if str(c.get("name") or "").startswith("cf_")]
+        if not cmds:
+            return False
+        try:
+            self._cdp_cmds(cmds)
+        except Exception:
+            return False
+        self._log(f"   🧹 已清掉本站 {len(cmds)} 张 Cloudflare 通行证与挑战计数"
+                  f"（会话已反复验证 {len(cmds)} 次以上，拿旧通行证再刷只会一直循环）")
+        return True
+
+    def _refresh_stalled_challenge(self, waited=0, target=""):
+        """到点了就推进验证页，别让整轮采集干等在一个不推进的页面上。
+        三种页分开处置（2026-11-02~03 麦麦B2B 实机各踩过一次）：
+          · 插页上有「刷新此页面」→ 点它（拿着现有令牌再试一次，不重开挑战）；
+          · 页面上摆着要人点的验证勾选框（Turnstile）→ 绝不刷新、绝不整页重载：
+            那会把用户（或上一次点击）刚积累的进度清零，实测就是「人工点了还是回到这一页」；
+            改成按坐标发一次可信鼠标点击替用户点它；
+          · 只有转圈、什么都没得点 → 放着让它自己跑（实测不动它 10~50 秒会放行，
+            而 8 秒重载一次连着几次、248 秒还停在「Just a moment…」）；
+            卡到保底时间才「清掉本站通行证 + 重开这一页」。
+        target：调用方明确要拿哪一页时传进来。重开必须回那一页，不能拿 _block_probe_url
+        或站点首页顶替——借标签取页的调用方会把重开后的页面当成「我要的那一页」收走，
+        那样就采到别的页的数据了（自审发现，2026-11-03）。"""
+        if not getattr(self, "BLOCK_AUTO_REFRESH", False) or not self.pin_tab_id:
+            return False
+        # 先认定「这一页是插页」再动手：真页面上也可能摆着验证码控件（商铺表单里那种），
+        # 不能因为看得到控件就去点它。
+        if not self._auto_challenge_page():
+            return False
+        widget = self._turnstile_widget()
+        self._show_tab_window()
+        if widget:
+            # 有真人勾选框：只点，绝不刷新、绝不整页重载（那会把刚积累的进度清零）。
+            # 也不连着点：点一下之后 CF 自己要跑 5~20 秒，这期间再点等于重开一轮。
+            now = time.time()
+            if now - getattr(self, "_turnstile_last_click", 0.0) < \
+                    getattr(self, "TURNSTILE_CLICK_COOLDOWN", 30):
+                return False
+            self._turnstile_last_click = now
+            return self._click_turnstile_at(widget)
+        clicked = self._click_in_frames(self.CHALLENGE_REFRESH_JS)
+        if clicked:
+            self._log(f"   🔄 验证页卡住不动，已点页面上的「{clicked[:12]}」推进（并把浏览器窗口带到前台）")
+            return True
+        if waited < getattr(self, "BLOCK_RELOAD_LAST_RESORT", 90) or self._reloaded_once:
+            # 自动挑战页自己会跑完，动它反而更慢：这一拍只把窗口带回前台，继续等
+            return False
+        target = target or self._block_probe_url or self.BASE_URL
+        if not target:
+            return False
+        try:
+            self._reloaded_once = True
+            self._purge_block_cookies(target)
+            self._cdp_navigate(target)
+            self._wait_ready(None, timeout=15)
+            self._log("   🔄 验证页长时间毫无进展、页面上也没可点入口：清掉本站通行证后重开这一页")
+            return True
+        except Exception:
+            return False
+
     def _release_verify_tab(self):
         """归还为过验证临时借的标签（本站自己的标签不动）。"""
         if not self._borrowed_tab:
@@ -1288,7 +1655,13 @@ return '';})()"""
                       "看门狗探测到验证已解除后会自动续采。")
         self._current_delay = min(30.0, max(6.0, self._current_delay * 1.6))
         self._log(f"   自动降速：采集间隔上调为约 {self._current_delay:.1f}s")
-        limit = max_wait or (self.BLOCK_MAX_WAIT_IP if ip_mode else self.BLOCK_MAX_WAIT)
+        # max_wait 要显式判 None：写成 `max_wait or 默认` 时，调用方传 0
+        # （＝「不要等，按当前判定立刻收」）会被 or 吞成默认上限，意图整个失效。
+        # 实机证据：debug/gi_mp_offline_check.py 第 399 行传 0 只验文案，却按新的
+        # 静默节奏真等了一轮探测间隔，把整条离线回归卡在那里十几分钟。
+        limit = (self.BLOCK_MAX_WAIT_IP if ip_mode else self.BLOCK_MAX_WAIT)
+        if max_wait is not None:
+            limit = max_wait
         waited = 0
         if ip_mode:
             # 指数退避：同一轮里被拦次数越多，下一轮探得越久，给 IP 真正的冷却窗口
@@ -1300,6 +1673,10 @@ return '';})()"""
         else:
             gap = max(3, int(self.BLOCK_POLL))
             first = 5                 # 首轮探短一点：用户秒过验证时不用白等一个轮询周期
+        next_refresh = self.BLOCK_REFRESH_EVERY
+        self._reloaded_once = False          # 本轮被拦只允许一次保底重载（见上面实测）
+        refreshes = 0
+        net_hits = 0              # 连续「本机网络不通」探测次数（归因要与站点拦截分开）
         while waited < limit:
             nap = first if waited == 0 else gap
             # 分段短睡：停止/暂停指令能及时响应；用户点了「马上继续」也在这里醒
@@ -1327,12 +1704,36 @@ return '';})()"""
                 still = probe()
             except Exception as e:
                 still = f"探测异常：{str(e).splitlines()[0][:60]}"
+            # 探针带 NET_FAIL_TAG 前缀＝本机网络层就没通（断网/DNS/连接被重置），
+            # 与「站点在拦」是两本账：文案、超时归因都按这个分叉走。
+            if str(still).startswith(NET_FAIL_TAG):
+                net_hits += 1
+            else:
+                net_hits = 0
             if not still:
                 return self._mark_block_cleared(waited, on_cleared)
+            # 可人工过的验证页：等了一会儿仍是插页，就主动刷新推一把（见 BLOCK_AUTO_REFRESH）
+            if not ip_mode and waited >= next_refresh and refreshes < self.BLOCK_REFRESH_MAX:
+                refreshes += 1
+                next_refresh += self.BLOCK_REFRESH_EVERY
+                self._refresh_stalled_challenge(waited)
             if waited % 60 < gap or ip_mode:
-                word = "仍在等站点放行（IP 冷却，无需操作）" if ip_mode else "仍在等待验证"
-                self._log(f"   {word}…已等 {waited} 秒（{str(still)[:50]}）")
-        if ip_mode:
+                # 断网不是站点在拦：探针带 NET_FAIL_TAG 前缀就换一句归因，
+                # 并且不能继续按「被站点拦」的账算（上面 strikes 已经记过一次，
+                # 长静默下不会连着触发，这里先把话说对）。
+                if str(still).startswith(NET_FAIL_TAG):
+                    word = "本机网络没通（不是站点在拦），等网络恢复后自动续采"
+                else:
+                    word = "仍在等站点放行（IP 冷却，无需操作）" if ip_mode else "仍在等待验证"
+                self._log(f"   {word}…已等 {waited} 秒（{str(still)[:60]}）")
+        if ip_mode and net_hits:
+            # 断网不能记到站点头上（2026-11-04 09:36 实机：断网期间一路写
+            # 「IP 冷却，无需操作」，收工又写「等 IP 冷却超时」，用户以为站点封了他
+            # 这台电脑，其实是公司网络断了——两条都得说成网络账才知道该做什么）。
+            self._log(f"⚠ 本机网络仍未恢复（{limit} 秒内每次探测都是连接失败，"
+                      f"不是站点在拦），本站本轮结束（已采数据不受影响）。"
+                      f"网络恢复后重新开始任务会自动续采。")
+        elif ip_mode:
             self._log(f"⚠ 等 IP 冷却超时（{limit} 秒），本站本轮结束（已采数据不受影响）。"
                       f"想继续可重拨宽带换个出口 IP，或调大采集间隔后重跑。")
         else:
@@ -1434,8 +1835,37 @@ return '';})()"""
         m = re.search(r"[（(【\[]([^）)】\]]+)[）)】\]]", part)
         return (m.group(1).strip() if m else part.strip(" 　"))
 
+    # 「绝不可能是关键词」的文档碎片：从行业报告（markdown/Word）整段粘贴时混进来的
+    # 小节标题、括号残片、机构名。判据都刻意取得很窄，宁放勿杀——真正可疑但可能是
+    # 产品词的（环节名、类别名）交给界面提示 _warn_abstract_keywords，不在这里删。
+    _KW_JUNK_PATTERNS = (
+        (r"#", "文档标题符号"),
+        # 四类括号全覆盖：漏一种就会放走一种切坏的半句（实机 '从重到轻）' 正是全角右括号漏网）
+        (r"【|】|\[|\]|（|）|\(|\)", "括号残片（配对括注早被 _strip_brackets 剥掉了）"),
+        (r"TOP\s*\d", "榜单小节标题"),
+        (r"(协会|学会|研究院|研究所|委员会|联合会|商会)$", "机构名而非产品词"),
+    )
+    _KW_JUNK_MAX_LEN = 16       # 中文关键词的长度感：超过这么多还带空格＝整句描述
+
     @staticmethod
-    def parse_keywords(text):
+    def _kw_junk_reason(k):
+        """这个「关键词」其实是文档碎片的理由；正常词回空串。
+
+        括号那条只会在**不配对**的残片上命中：_strip_brackets 已经把配对括注
+        （「浮式生产储卸油装置（FPSO）」）剥成主体词，剩下降号的必然是切坏的半句。"""
+        if not k:
+            return "空"
+        for pat, why in CdpSiteCrawler._KW_JUNK_PATTERNS:
+            if re.search(pat, k):
+                return why
+        if (len(k) > CdpSiteCrawler._KW_JUNK_MAX_LEN and " " in k
+                and re.search(r"[\u4e00-\u9fa5]", k)):
+            return "带空格的整句描述"
+        return ""
+
+    @staticmethod
+    def parse_keywords(text, junk_out=None):
+        """junk_out 传一个列表就回收被剔的碎片（(词, 理由)），供界面如实说明。"""
         if not text:
             return []
         # 一级分隔：换行/逗号/分号/竖线/制表符（「、」和「/」交给括号感知切分）
@@ -1451,6 +1881,17 @@ return '';})()"""
             k = re.sub(r"\s+", " ", k).strip(" 　・-")
             # 丢弃退化碎片：空、无中英文数字、单个汉字（如「初」）——它们检索必然零结果
             if len(k) < 2 or not re.search(r"[\u4e00-\u9fa5A-Za-z0-9]", k):
+                # 也要如实记账：整段粘贴的报告标题行（'#### 【TOP3 核心装备平台类】'）
+                # 会被 _strip_brackets 剥成 '####' 落到这里，不记的话界面报的剔除数就比
+                # 实际少，用户对自己的关键词表拿到的是错的数。
+                if k and junk_out is not None and (k, "剥掉括注后只剩符号") not in junk_out:
+                    junk_out.append((k, "剥掉括注后只剩符号"))
+                continue
+            # 丢弃文档碎片（报告小节标题/括号残片/机构名）：见 _kw_junk_reason 的实机账
+            why = CdpSiteCrawler._kw_junk_reason(k)
+            if why:
+                if junk_out is not None and (k, why) not in junk_out:
+                    junk_out.append((k, why))
                 continue
             if k not in seen and len(k) <= 40:
                 seen.add(k)
@@ -1458,12 +1899,18 @@ return '';})()"""
         return out
 
     # ── 相关性（关键词↔行业）判定：默认按中文二字组，子类可覆盖 ──
+    _PEER_FN = None      # keyword_expander.peer_words 的惰性缓存（None=未取过，False=没有）
+
     def _kw_grams(self, kw):
         base = re.sub(r"(批发|供应|厂家|定制|加工|工厂|价格|报价|大全|网)$", "", kw or "")
         return base, {base[i:i + 2] for i in range(len(base) - 1)}
 
     def is_relevant(self, kw, text):
         """关键词与「公司名+主营+标题」的相关性：中文二字组重叠或完整词组命中即相关。
+        二字组仍不命中时再过一道**同族类目桥**（见 _peer_words）：同行在站上常把同一类
+        设备写成兄弟类目（搜「数控机床」回「车床,加工中心」的厂），这类词与关键词零二字组
+        重叠，不补这一刀就是成片误杀（实机「数控机床」两页砍掉 36 家里有 5~7 家这样的真同行）。
+        桥表是窄的人工表，只收实机证明过误杀的行业，不做泛用词库。
         取不到可靠中文信号时 fail-open（宁多采一家不误杀）。"""
         if not self.relevance_guard:
             return True
@@ -1478,7 +1925,23 @@ return '';})()"""
             return True
         if base and base in compact:
             return True
+        for peer in self._peer_words(kw):
+            if peer in compact:
+                return True
         return False
+
+    @classmethod
+    def _peer_words(cls, kw):
+        """同族类目词（keyword_expander.PEER_CATEGORY）。取不到那个模块、或这个词不在
+        桥表里，就返回空元组——判定退回「纯二字组」的老行为，绝不因为桥而放宽别的词。
+        函数引用挂在类属性上只做一次导入（每张列表卡都要过判定，不能反复 import）。"""
+        if cls._PEER_FN is None:
+            try:
+                import keyword_expander as _ke
+                cls._PEER_FN = getattr(_ke, "peer_words", None) or False
+            except Exception:
+                cls._PEER_FN = False
+        return cls._PEER_FN(kw) if cls._PEER_FN else ()
 
     # ── 站点钩子（子类实现）───────────────────────────────────
     def build_search_url(self, kw, page):
@@ -1534,6 +1997,8 @@ return '';})()"""
             "no_contact": self.stat_no_contact,
             "failed": self.stat_failed,
             "got": len(self.results),
+            "pf_miss": self._pf_dropped,        # 省份把关：确认外省已排除
+            "pf_unknown": self._pf_unknown,     # 省份把关：属地未标注已排除（已转企知道反查）
             "kw_yield": dict(self.kw_yield),
         }
 
@@ -1574,16 +2039,18 @@ return '';})()"""
                 if key in self._seen_members or (nkey and nkey in self._seen_members) \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
                     continue
-                self._seen_members.add(key)
-                if nkey:
-                    self._seen_members.add(nkey)
                 # 列表页早过滤：明显与关键词无关的连详情页都不进（省请求=提速+防封）
+                # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
                     self._early_skipped += 1
+                    self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e.get("公司名称", ""), "memberId": mid})
                     continue
+                self._seen_members.add(key)
+                if nkey:
+                    self._seen_members.add(nkey)
                 e["关键词"] = kw
                 new += 1
                 yield e
@@ -1631,6 +2098,8 @@ return '';})()"""
         self._pause_requested = False
         self._seen_members = set()
         self._filtered_count = 0
+        self._pf_dropped = 0
+        self._pf_unknown = 0
         self._early_skipped = 0
         self.stat_pages = self.stat_listed = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
@@ -1678,6 +2147,8 @@ return '';})()"""
                 self._log(f"↻ 续采：「{kw}」上次已跑完（净新增 {self.kw_yield.get(kw, 0)} 家），本轮跳过")
                 self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
                 continue
+            pages_before = self.stat_pages
+            yield_before = self.kw_yield.get(kw, 0)
             self._log(f"▶ [{ki}/{len(kws)}] 关键词：{kw}")
             try:
                 for stub in self._iter_keyword(kw):
@@ -1726,9 +2197,16 @@ return '';})()"""
                 else:
                     self._log(f"⚠ 「{kw}」处理异常：{msg} → 跳过该关键词继续")
             if not self._stop_requested:
-                # 完整跑完一轮才记「已跑过」；中途被停止/暂停掉开的词下次重来，
-                # 重复条目由跨运行种子库兜住，不会多烧请求。
-                self._kw_done.add(kw)
+                # 跑完一轮才记「已跑过」；中途被停止/暂停掉开的词下次重来，
+                # 重复条目由种子库兜住（种子库会一直留着），不会多烧请求。
+                # 但“一页都没取到”不能算跑完：那不是「这个词没公司」，而是根本没和站上
+                # 说上话（被防采拦、会话断、或列表取页链路没接上）。旧实现连这种也记
+                # 「已跑完」，2026-11-02 麦麦B2B 就是十个关键词全被标成跑完、净产出 0，
+                # 用户再点续采全部被跳过，看到的就永远是「只有这一家 0 条成功」。
+                if self.stat_pages > pages_before or self.kw_yield.get(kw, 0) > yield_before:
+                    self._kw_done.add(kw)
+                else:
+                    self._log(f"⚠ 「{kw}」一页都没取到（被拦或链路没通），本轮不记「已跑完」，下次自动重来")
             if self.incremental:
                 self._save_seen_store()
             self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
@@ -1736,13 +2214,19 @@ return '';})()"""
         if self.incremental:
             self._save_seen_store()
         tail = f"，另有 {self._filtered_count} 家不相关已过滤" if self._filtered_count else ""
+        if self.province and (self._pf_dropped or self._pf_unknown):
+            tail += (f"、{self._pf_dropped} 家非{self.province}已排除"
+                     f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
+                     if self._pf_unknown else f"、{self._pf_dropped} 家非{self.province}已排除")
         early = f"，列表页早过滤 {self._early_skipped} 家" if self._early_skipped else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
         self._log(f"✅ {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家{early}{tail}{saved}")
         s = self.stats()
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
-                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}")
+                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}"
+                  + (f"｜省份把关：外省 {s['pf_miss']}、属地未标注 {s['pf_unknown']}"
+                     if self.province else ""))
         self._emit("crawl_finished_signal")
 
     def _base_rec(self, stub):
@@ -1776,6 +2260,8 @@ return '';})()"""
         self._block_times = []
         self._seen_members = set()
         self._filtered_count = 0
+        self._pf_dropped = 0
+        self._pf_unknown = 0
         self._early_skipped = 0
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0

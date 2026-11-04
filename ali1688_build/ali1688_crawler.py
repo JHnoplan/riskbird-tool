@@ -108,6 +108,7 @@ DETAIL_TITLE_RE = re.compile(r'<title>([^<]{4,80}?)\s*[-–—]?\s*(?:阿里巴�
 
 class Ali1688Crawler:
     PLATFORM_NAME = "1688"
+    PLATFORM_SLUG = "1688"
     BASE_URL = "https://www.1688.com/"
 
     def __init__(self, debug_port=9244):
@@ -136,8 +137,23 @@ class Ali1688Crawler:
         self.max_pages = 10          # 每个关键词最多翻几页（1688 上限约 50）
         self.main_channel = True     # 主搜渠道（selloffer/offer_search，每页约50家，池子最深）
         self.company_channel = True  # 同时采集供应商(公司)渠道（实测产出为商品渠道数倍）
+        # 站外 SEM 落地页渠道（www.1688.com/zw/page.html?hpageId=old-sem-pc-list）。
+        # 2026-11-04 客户现场取证判死：这一页**既不吃 keywords 也不吃 province**，
+        # 返的是站外广告默认流——搜「海洋能」能回 18 家义乌饰品厂/玩具厂，而且地址清一色
+        # 外省；那一轮 1688 入库的 91 条全部来自它（详情URL 尾部均为 `src=zhanwai`），
+        # 其中能按地址/公司名确认属广东的只有 12 条。它又是唯一一条不走类目护栏的渠道，
+        # 所以默认关掉（多平台适配器直接置 False）；保留开关供单独验证该页面是否已修。
+        self.sem_channel = True
         self.relevance_guard = True  # 主搜渠道类目相关性过滤：类目不符的公司不进联系方式页
         self.max_records = 0         # 采集到 N 条自动收尾（0=不限，低频实测/限量用）
+        # 省份精准采集：站方原生 `&province=<简体短名>` 参数（2026-11-04 共享 Chrome
+        # 探针 A/B：主搜 20/16 家重合仅 6，公司搜 17/20 家重合 3）。注意：探针只测过
+        # 主搜/公司搜两个渠道，站外 SEM 落地页实测不吃这个参数（见上 sem_channel 注），
+        # 所以拼参数只是一道提高命中率的优化，**不构成属地保证**：属地核验在适配器里
+        # 按地址/公司名逐条把关。空=全国不限；由 b2bcollect GUI 省份选择下发。
+        self.province = ""
+        self._pf_dropped = 0         # 属地明确外省丢弃计数（适配器核验；结束行如实汇报）
+        self._pf_unknown = 0         # 属地无法确认丢弃计数（同上，并回流待核实名单）
         self._filtered_count = 0     # 本轮类目过滤计数
         self.debug_collect = False   # 开发调参：记录类目过滤判定输入（不影响生产行为）
         self._guard_debug = []
@@ -177,7 +193,20 @@ class Ali1688Crawler:
         with self.results_lock:
             return [dict(r) for r in self.results]
 
+    def _apply_province_filter(self, rec):
+        """省份精准采集的入库关卡（基类默认不拦）。
+
+        基类只负责把 `&province=` 拼进搜索 URL（服务端筛），本地**不拿已选省份臆测填
+        所在区域**——历史上那句回填把 91 条各省公司全盖章成「广东」，用户在表里看到的
+        就是伪数据，连人工抽查都抽不出来（地址写着河北，区域写着广东，谁也不敢信）。
+        真正的属地核验由多平台适配器（b2bcollect site_adapters.Ali1688Site）覆写本方法：
+        它能 import 到 province_filter 词表；本文件要能给独立工具单用，不依赖那个模块。"""
+        return rec
+
     def _add_result(self, rec):
+        rec = self._apply_province_filter(rec)
+        if rec is None:
+            return
         with self.results_lock:
             self.results.append(rec)
         self._commit_to_store(rec)     # 到终态的公司写进种子库（临时失败不写，下轮重试）
@@ -883,15 +912,27 @@ class Ali1688Crawler:
                         "location": pos.group(1).strip() if pos else ""})
         return out
 
+    def _province_suffix(self):
+        """省份精准采集：站方原生 `&province=<UTF-8 百分号编码的简体短名>`（三个搜索
+        渠道同源，2026-11-04 探针 A/B 实锤服务端真过滤）。未选省返回空串。"""
+        pv = str(getattr(self, "province", "") or "").strip()
+        return f"&province={quote(pv)}" if pv else ""
+
     def _iter_keyword_offers(self, kw):
-        """遍历一个关键词的多页列表，逐条 yield offer（已按 memberId 去重）。"""
+        """遍历一个关键词的多页列表（站外 SEM 渠道），逐条 yield offer（已按 memberId 去重）。
+
+        旧版这一路是**没有任何相关性护栏**的：列表进多少家就写多少家进结果表（基类
+        `guard` 标记只有主搜会带）。实测代价就是那 91 条污染数据。现在与主搜一个口径：
+        卡片自带公司名/商品标题先过一道早过滤（不进详情，省请求），进联系方式页前
+        再带 `guard=True` 走详情类目复核；判不出信号时依旧 fail-open。"""
         stale_streak = 0
+        self._guard_kw = kw
         for page in range(1, self.max_pages + 1):
             if self._stop_requested:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = SEARCH_URL.format(kw=quote(kw), page=page)
+            url = SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
                 return
             html = self.driver.page_source
@@ -899,11 +940,20 @@ class Ali1688Crawler:
             if not offers:
                 self._log(f"  「{kw}」第 {page} 页无数据，停止翻页")
                 return
-            new = 0
+            new = skipped = 0
             for o in offers:
                 mid = str(o.get("memberId") or o.get("loginId") or o.get("company") or "")
                 cname = self._norm_name(o.get("company") or "")
-                if not mid or mid in self._seen_members or (cname and cname in self._seen_members):
+                if not mid or mid in self._seen_members or (cname and cname in self._seen_members) \
+                        or f"{kw}#{mid}" in self._seen_members:
+                    continue     # 第四个条件：同一个关键词下已判过「不相关」的，翻页时不重复统计
+                subject = o.get("subject") or o.get("simpleSubject") or ""
+                if self.relevance_guard and not self._list_relevant(o.get("company") or "", subject):
+                    # 卡片文本与关键词/预测类目零重叠：连详情页都不必进（不占全局已见，
+                    # 同一个公司对另一个关键词可能就是目标）
+                    skipped += 1
+                    self._early_skipped += 1
+                    self._seen_members.add(f"{kw}#{mid}")
                     continue
                 self._seen_members.add(mid)
                 if cname:
@@ -916,8 +966,10 @@ class Ali1688Crawler:
                        "memberId": mid,
                        "loginId": o.get("loginId") or "",
                        "price": o.get("price"),
-                       "subject": o.get("subject") or o.get("simpleSubject") or ""}
-            self._log(f"  「{kw}」第 {page} 页：{len(offers)} 条，新增公司 {new} 家")
+                       "subject": subject,
+                       "guard": True}   # 站外页结果参差，与主搜同样进详情前做类目复核
+            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            self._log(f"  「{kw}」第 {page} 页：{len(offers)} 条，新增公司 {new} 家{tail}")
             # 连续多页 0 新增即枯竭（主搜渠道跑过后尤其如此），别把页数预算耗在轮回的浅池上
             if new == 0:
                 stale_streak += 1
@@ -946,7 +998,7 @@ class Ali1688Crawler:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page)
+            url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
                 return
             entries = self._parse_company_page(self.driver.page_source)
@@ -1165,7 +1217,7 @@ class Ali1688Crawler:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page)
+            url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
                 return
             src = self.driver.page_source
@@ -1484,7 +1536,8 @@ class Ali1688Crawler:
         chans = []
         if self.main_channel:
             chans.append("主搜")
-        chans.append("商品SEM")
+        if self.sem_channel:
+            chans.append("商品SEM")
         if self.company_channel:
             chans.append("供应商")
         skip_note = f"，增量模式已带 {seeded} 家历史公司（本轮命中即跳过、不再重复请求）" if seeded else ""
@@ -1526,12 +1579,21 @@ class Ali1688Crawler:
                         self._emit("stats_signal",
                                    f"关键词 {ki}/{len(kws)}｜已采公司 {done}｜间隔 {self._current_delay:.1f}s")
                         self._sleep()
-                for offer in self._iter_keyword_offers(kw):
+                for offer in (self._iter_keyword_offers(kw) if self.sem_channel else ()):
                     if self._stop_requested:
                         break
                     while self._pause_requested and not self._stop_requested:
                         time.sleep(0.5)
                     rec = self._crawl_company(offer)
+                    # 站外渠道历史上不进这个分支（因为没有 guard），现在与主搜同口径：
+                    # 类目不符的只计数不入库，不拿垃圾商家撑行数。
+                    if rec.get("状态") == "类目不符(已过滤)":
+                        self._filtered_count += 1
+                        self._commit_to_store(rec)
+                        if self._filtered_count % 10 == 1:
+                            self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
+                                      f"（最近：{rec.get('公司名称') or str(rec.get('主营商品') or '')[:20]}）")
+                        continue
                     self._add_result(rec)
                     done += 1
                     self._emit("progress_signal", done, max(done, 1))
@@ -1578,6 +1640,10 @@ class Ali1688Crawler:
             self._save_seen_store()
         tail = (f"，另有 {self._filtered_count} 家类目不相关已过滤"
                 if self._filtered_count else "")
+        if getattr(self, "province", "") and (self._pf_dropped or getattr(self, "_pf_unknown", 0)):
+            tail += f"、{self._pf_dropped} 家非{self.province}已排除"
+            if getattr(self, "_pf_unknown", 0):
+                tail += f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
         early = (f"，列表页早过滤 {self._early_skipped} 家(未进详情即省请求)"
                  if self._early_skipped else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""

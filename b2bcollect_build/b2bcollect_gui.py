@@ -1,10 +1,11 @@
 """
 b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI）
 
-一个共享 Chrome、需浏览器的站各占一个标签并行采集：
-  · 关键词并行（6 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
-    顺企网 11467.com / 爱采购 b2b.aipage.com /
-    麦麦B2B maimaib2b.com（后四站纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
+一个共享 Chrome，需浏览器的站各占一个标签并行采集：
+  · 关键词并行（8 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
+    顺企网 11467.com / 爱采购 b2b.aipage.com / 麦麦B2B maimaib2b.com /
+    跨国采购网 globalimporter.net / 马可波罗 cn.makepolo.com
+    （除中国制造网外均纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
   · 名单驱动（企知道）：从「待采集公司名单」逐家补采，看门狗语义——名单空则休眠，
     关键词采集清洗掉的无联系方式废数据会自动回流到名单、唤醒企知道补采（变废为宝）。
 导入或粘贴一批关键词（或上传公司名单）→ 智能匹配行业列表页 → 进详情页取联系方式 →
@@ -30,13 +31,14 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
-    QSizePolicy, QGridLayout,
+    QSizePolicy, QGridLayout, QRadioButton,
 )
 
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
-from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP
+from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
 import customer_library_cleaner as _cleaner
 import keyword_expander as _kwexp
+import province_filter as _pfilter
 
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
 # done=✅绿粗「已完成」/ stopped=■橙粗「已停止」/ running=●蓝「进行中」
@@ -431,6 +433,60 @@ SITE_TIPS = {
               "通行证过期再被拦时，才临时借一个标签把页面摆到眼前（必要时你点一下验证框），"
               "过完自动接着跑。\n"
               "商家常把固话填进“手机”栏，工具按号码长相归回正确列，不会拿着区号当手机号。",
+    "globalimporter": "跨国采购网 www.globalimporter.net（外贸企业库）：关键词公司搜索"
+              "→列表页就把公司名/联系人/电话/主营产品直接写在页面上，所以一家只读一页、"
+              "不进公司详情，既快又省（实测一页 20 家，20 家写着联系人、19 家写着号码）。\n"
+              "防采：这个站对每个网络地址有当日限量（站方原话：超量后请 2 小时后再看）。"
+              "工具不会因此报错也不会当成“没有公司”，而是自己停下来等，到点接着跑；"
+              "期间其它站照常采，已采数据不丢。因为它限量里没有可人工点的验证框，"
+              "所以这种情况不会弹页面让你白等（提醒里会写明“等一会自动继续”）。\n"
+              "这个站的防护服务还会换着法子拦（另一种是一页“您的请求过于频繁”的告示），"
+              "工具也认得，同样归为“等一会”而不是“这个行业没公司”，不会把拦住的一页记成空数据。\n"
+              "它还有一种不是拦你，而是先要你“点个头”才给看：那一页上没内容，只写了一句"
+              "“按这个地址跳一下”。真人用浏览器打开时这一步是浏览器自动走的，所以从来没人"
+              "注意到它；工具一开始没走这一步，就在那儿白等了七分钟（2026-11-04 实测：走完之后"
+              "同一页马上给出 20 家公司）。现在这一步工具自己会走，你不用管，也不需要开网页。\n"
+              "真正要等的是另一件事：这个站限的是你这台机器当时的网络地址，不是工具的模样——"
+              "我们特意用真浏览器打开也一样只给那句“请求过于频繁”的告示，所以那种时候没有"
+              "“换个姿势立刻能过”的办法，只能等站点自己放行（期间别的站照常采、已采的不丢）。\n"
+              "个别商家把手机号拆成“区号-号码-尾号”写，工具会按规则拼回真实号码，"
+              "拼不回的宁可不存也不编造。",
+    "makepolo": "马可波罗 cn.makepolo.com（全行业企业库，量最大：一个关键词就有上百万条产品）："
+              "关键词产品搜索→按商铺去重成公司→每家读两页（它自己的产品页 + 联系方式页）"
+              "取齐公司名/联系人/手机/固话/邮箱/地址。同行找得齐：这个页上写的“主营”是一串"
+              "行业类目词（冷却塔、冷冻机、制冰机…），经常和搜索词不同字，所以工具把公司名字"
+              "也一起看着认（实测只认“主营”会漏掉四成同行，两家一起认就多找回了 25%）。\n"
+              "同一家在列表里往往挂好几个产品，工具会把这一家的几张卡并在一起认（实机有一家两张卡"
+              "分别写“其他机床附件”和“通用五金配件”，只看前一张就把它当成不相干砍掉了）；"
+              "同一类设备的其它叫法也认得——搜“数控机床”时，只写“车床/铣床/加工中心”的同行跟搜索词"
+              "一个字都不重样，工具按行业类目对照把它们收回来（实机两页砍掉的名单里就有 5 家这样的同行），"
+              "而“货运代理、滤芯、涂料”这类不相干的照样砍。砍掉的也只对当前这个词作废，换一个词还会"
+              "重新判一次，不会被永久漏掉。\n"
+              "手机号：这个站在联系方式页上把手机号画成一张小图片，但同一个号通常会在它"
+              "自己的产品页上直接写成文字——工具先看那处文字（实测一整轮 43 家里有 25 家这样拿到"
+              "手机号；把站方已经下架的 12 家剔掉，剩下 31 家活店里 25 家都有手机号），文字没有才动用自带的“看图识号”能力（本机识别、不联网、不花一分钱）"
+              "去读那张图；产品页那一页不给看时，还会换同一家公司的另一个产品页再试一轮"
+              "（实测近一半公司在列表里就不止一个产品，这一步不花额外的搜索流量）。"
+              "读不准的号码会按号码格式校验卡住，宁缺不假。还会顺手从三条路补手机："
+              "①商铺网址本身就是手机号 ②手机邮箱（如 138xxxx@139.com）的号码段前缀 ③页面少数商家明写。"
+              "站上不同时间给图多少不一样，不给图时这几条路仍能拿到号码；"
+              "长时间一张图都拿不到时，工具会自动停止白耗流量的图片请求，只走文字。\n"
+              "只收这家公司自己的号码：这个站在页面里挂了“同行企业电话”“联系商家”一类推荐位，"
+              "里面的号码是平台广告主的、并不属于这家公司（实测有两家毫不相干的公司挂着一模一样的"
+              "两个上海号码）。工具按“号码有没有写在这家公司自己的联系栏里”来认，"
+              "还盯住同一个号码挂在第几家店上——挂太多家就不入库，免得把别人的号码卖给你。\n"
+              "防采：识别到验证/限流插页即停手拉长间隔等恢复，绝不当空数据写库。\n"
+              "另外还有几件小事：①这个站把“传真”与“电话”分开写，工具会把传真单独认出来，"
+              "不会把传真机号码当电话入库（那样外呼打不通）；②少数公司的店铺在这个站上已经下架了"
+              "（它的全部页面都回一句“不给看”），工具会写成“商铺已关闭”，这是这家真的没公开联系方式，"
+              "不是工具没采到，过两轮就会不再重试；③有的商家在“联系人”那一栏把产品和人名连在一起写，"
+              "前面粘（“热处理备件杨经理”）后面粘（“田经理二手机床”）都实机抓到过，工具只在贴着人名两头时"
+              "把产品词切掉、只留“杨经理”“田经理”这种叫得出口的称呼；像“李总经理”这种本来就完整的职称不会"
+              "被切半截，切不出的宁可原样保留也绝不猜名字；"
+              "④随手填的坏邮箱（如 test@ 开头、或把 QQ 号抄进域名里的那种）发过去必然退信，工具宁可不存"
+              "也不猜一个地址出来，免得把你的邮件发到陌生人邮箱里；⑤有的商家把手机号的前缀当成区号写进“电话”栏"
+              "（如手机 19352178592 被写成“0193-52178592”），这种号看着像固话但全国没有这个区号、一定拨不通，"
+              "工具会对着真实长途区号表核一遍再决定入库，手机号仍留在手机那一列。",
     "1688": "1688 www.1688.com：关键词→商品/店铺搜索→公司详情页。需先登录（有登录限制，故默认不勾选）；"
             "勾选后会弹窗提示并可一键打开 1688 登录页，请先在浏览器里确认已登录再开始采集。\n"
             "与其它需浏览器的站共享同一个 Chrome（各占自己标签），绝不会另开浏览器。",
@@ -799,6 +855,59 @@ class YzdImportWorker(QThread):
             self.task_done.emit(name, imp, sav, fail, err)
         self.progress.emit(total, total, "导入结束")
         self.finished_all.emit(results, "")
+
+
+class ProvincePickerDialog(QDialog):
+    """「选择省份」弹窗：全国 31 省 + 港澳台，外加「全国（不限省份）」默认项。
+    单选；选中结果写 dialog.chosen（""=全国不限）。交互和 1688 登录弹窗一样：
+    界面上点按钮就弹出来，选完点确定回到主界面。"""
+
+    def __init__(self, current="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择采集省份")
+        self.chosen = ""
+        self._current = str(current or "")
+        self._init_ui()
+
+    def _init_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+        tip = QLabel("只采这个省份的企业：每个平台都会把采回来的记录按地址与公司名核一遍属地，"
+                      "支持地区筛选的网站额外再交给网站筛；页面上与公司名都看不出省份的，"
+                      "转企知道按工商地址反查。选「全国」则不限省份。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(8)
+        self._group = QButtonGroup(self)
+        self._radios = {}
+        items = [""] + _pfilter.PROVINCES
+        for i, pv in enumerate(items):
+            rb = QRadioButton(pv if pv else "全国（不限省份）")
+            if pv == self._current:
+                rb.setChecked(True)
+            self._group.addButton(rb)
+            self._radios[rb] = pv
+            grid.addWidget(rb, i // 6, i % 6)
+        if not self._current:
+            # 默认项兑底：上面没命中任何按钮时（理论上不会发生）仍勾全国
+            next(rb for rb, v in self._radios.items() if v == "").setChecked(True)
+        lay.addLayout(grid)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("确定")
+        bb.button(QDialogButtonBox.Cancel).setText("取消")
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _on_ok(self):
+        for rb, pv in self._radios.items():
+            if rb.isChecked():
+                self.chosen = pv
+                break
+        self.accept()
 
 
 class YzdProgressDialog(QDialog):
@@ -1256,6 +1365,7 @@ class MainWindow(QMainWindow):
         self._kw_source_file = ""
         self._co_source_file = ""   # 公司名单文件（企知道补采）
         self._opening_login = False  # 防重复点「打开企知道/1688」同时拉多个后台线程
+        self.selected_province = ""  # 省份精准采集：""=全国不限（「选择省份」弹窗设定）
         self._kw_expanded_text = ""  # 上次自动扩词写回的内容（同内容不再二次展开）
         self.session_dir = None
         self._first_start = None
@@ -1339,8 +1449,23 @@ class MainWindow(QMainWindow):
             "注意：解析结果由内置行业知识库生成，仅供参考，不一定完全符合你的需求，请检查后再采集。")
         hr.addWidget(self.btn_file); hr.addWidget(self.btn_paste)
         hr.addWidget(self.btn_parse); hr.addWidget(self.btn_smart)
+        # 省份精准采集：和 1688 登录一样点按钮弹窗；默认不选（全国不限）。
+        self.btn_province = QPushButton("选择省份")
+        self.btn_province.setToolTip(
+            "只采某个省份的企业数据。默认不选=全国都采。\n"
+            "・支持按地区筛选的网站（中国制造网 / 马可波罗 / 1688）：把省份交给网站筛，"
+            "采回来的每一条仍然用地址/公司名本地核一遍（网站筛不作为保证）；\n"
+            "・其余网站页面上没地区筛选：按页面上写的地区与公司名把关，不是所选省份的不入库；\n"
+            "・页面上与公司名都看不出省份的：不拍脑袋入库，转企知道按工商登记地址反查一次"
+            "（在本省就连联系方式一起补上，外省则丢弃）。\n"
+            "选好点「确定」，主界面上会显示当前选的是哪里。")
+        hr.addWidget(self.btn_province)
         hr.addStretch(1)
         v.addLayout(hr)
+        self.lbl_province = QLabel("🗺 采集范围：全国（不限省份）")
+        self.lbl_province.setStyleSheet(_muted_style())
+        self.lbl_province.setWordWrap(True)
+        v.addWidget(self.lbl_province)
         self.kw_text = QPlainTextEdit()
         self.kw_text.setPlaceholderText("每行一个关键词（也可用逗号/顿号分隔），例如：太阳能路灯、光伏储能电池、LED显示屏")
         self.kw_text.setMaximumHeight(96)
@@ -1386,7 +1511,7 @@ class MainWindow(QMainWindow):
         gb_site = QGroupBox("③ 采集平台（关键词并行）")
         gb_site.setToolTip(
             "任一站点命中防采验证都会弹窗提醒并由看门狗自动续采。\n"
-            "八方资源网 / 顺企网 / 爱采购 / 麦麦B2B 为纯 HTTP，不占浏览器标签"
+            "八方资源网 / 顺企网 / 爱采购 / 麦麦B2B / 跨国采购网 / 马可波罗 均为纯 HTTP，不占浏览器标签"
             "（看不到它们的标签是正常的，被反采质询时才会临时借一个标签过盾）；\n"
             "中国制造网 / 1688 各占一个浏览器标签。1688 需登录，默认不勾选。\n\n"
             + "\n\n".join(SITE_TIPS.get(s, "") for s in SITE_ORDER))
@@ -1606,6 +1731,7 @@ class MainWindow(QMainWindow):
         self.btn_paste.clicked.connect(self._on_paste)
         self.btn_parse.clicked.connect(self._on_parse)
         self.btn_smart.clicked.connect(self._on_smart_parse)
+        self.btn_province.clicked.connect(self._on_pick_province)
         self.btn_history.clicked.connect(self._on_history_tasks)
         self.btn_co_file.clicked.connect(self._on_import_company_file)
         self.btn_open_qzd.clicked.connect(lambda: self._open_site_login("qzd"))
@@ -1650,15 +1776,20 @@ class MainWindow(QMainWindow):
             return
         if not stats:
             return
-        keys = ("got", "ok", "pages", "listed", "no_contact", "failed", "early", "filtered")
-        tot = {k: sum(s[k] for s in stats.values()) for k in keys}
+        keys = ("got", "ok", "pages", "listed", "no_contact", "failed", "early", "filtered",
+                "pf_miss", "pf_unknown")
+        tot = {k: sum(s.get(k, 0) for s in stats.values()) for k in keys}
+        pf = (f"｜省份把关 外省 {tot['pf_miss']}·待核实 {tot['pf_unknown']}"
+              if (tot['pf_miss'] or tot['pf_unknown']) else "")
         self.lbl_board.setText(
             f"明细：成功 {tot['ok']}｜无联系方式 {tot['no_contact']}｜失败可重采 {tot['failed']}｜"
-            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条")
+            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条{pf}")
         self.lbl_board.setToolTip("\n".join(
-            f"{name}：采到 {s['got']} 家（成功 {s['ok']}）｜翻 {s['pages']} 页见 {s['listed']} 条｜"
-            f"无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜早过滤 {s['early']}｜"
-            f"详情不相关 {s['filtered']}" for name, s in stats.items()))
+            f"{name}：采到 {s.get('got', 0)} 家（成功 {s.get('ok', 0)}）｜翻 {s.get('pages', 0)} 页见 "
+            f"{s.get('listed', 0)} 条｜无联系方式 {s.get('no_contact', 0)}｜失败/可重采 "
+            f"{s.get('failed', 0)}｜早过滤 {s.get('early', 0)}｜详情不相关 {s.get('filtered', 0)}｜"
+            f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转企知道 {s.get('pf_unknown', 0)}"
+            for name, s in stats.items()))
         self.lbl_board.setVisible(True)
 
     def _render_stats(self, text, site_status=None):
@@ -1855,6 +1986,23 @@ class MainWindow(QMainWindow):
         self.timer_lbl.setText(f"⏱ {self._format_time(self._crawl_elapsed)}")
         self._update_bar()
 
+    def _on_pick_province(self):
+        """「选择省份」弹窗：选完回显到 lbl_province（小白也能一眼看清本次采哪里）。"""
+        dlg = ProvincePickerDialog(self.selected_province, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self.selected_province = dlg.chosen
+        self._refresh_province_label()
+        if self.selected_province:
+            self._on_log(f"🗺 采集范围已设为「{self.selected_province}」：开始采集后每个平台都会按这个省份把关")
+        else:
+            self._on_log("🗺 采集范围已改回「全国」：开始采集后不限省份")
+
+    def _refresh_province_label(self):
+        self.lbl_province.setText(
+            f"🗺 采集范围：{self.selected_province}（只采{self.selected_province}的企业）"
+            if self.selected_province else "🗺 采集范围：全国（不限省份）")
+
     def _start_timer(self):
         self._crawl_start_ts = time.time()
         self._crawl_elapsed = 0.0
@@ -1904,10 +2052,19 @@ class MainWindow(QMainWindow):
 
     def _on_parse(self):
         self._kw_raw = self.kw_text.toPlainText()
-        self.keywords = ParallelSession.parse_keywords(self.kw_text.toPlainText())
+        _junk = []
+        self.keywords = ParallelSession.parse_keywords(self._kw_raw, junk_out=_junk)
         self.lbl_kw.setText(f"识别到 {len(self.keywords)} 个关键词：" +
                             ("、".join(self.keywords[:12]) + ("…" if len(self.keywords) > 12 else "")
                              if self.keywords else "无"))
+        if _junk:
+            show = "、".join(k for k, _ in _junk[:6]) + ("…" if len(_junk) > 6 else "")
+            self._on_log(
+                f"🧹 已自动剔掉 {len(_junk)} 个不是关键词的碎片（{show}）。\n"
+                "   这些是行业报告里的小节标题、切坏的半截括号、机构名称，B2B 站内搜索"
+                "必然一条结果都搜不出来，却每个都要花掉真实请求；\n"
+                "   跨国采购网这类站更划算不起：同一个网络地址看约 50 个页面就要休息约 90 分钟，"
+                "留着这些碎片等于偷走一轮配额。界面上原来的输入没动，只是不拿去检索。")
         self._warn_abstract_keywords(self.keywords)
 
     # 环节/服务/流程类词（非具体产品词）：B2B 站内搜索几乎无商品与之对应，
@@ -2220,7 +2377,13 @@ class MainWindow(QMainWindow):
         self.session.configure(delay_between=self.spin_delay.value(),
                                max_pages=0,      # 不限页数：翻到没有新数据自然切下一个关键词
                                relevance_guard=self.chk_guard.isChecked(),
-                               incremental=self.chk_incr.isChecked())
+                               incremental=self.chk_incr.isChecked(),
+                               province=self.selected_province)
+        if self.selected_province:
+            self._on_log(f"🗺 本次按省份「{self.selected_province}」精准采集："
+                         "支持地区筛选的站交给网站筛、采回来的每条再按地址与公司名本地复核；"
+                         "其余站直接按页面标注地区与公司名把关，对不上的不入库；"
+                         "看不出省份的转企知道按工商地址反查后再定")
         if not self._first_start:
             self._first_start = datetime.now().strftime("%Y%m%d_%H%M%S")
             base = _tasks.tool_dir(self._get_desktop_dir()) if HAS_YZD else \
@@ -2453,7 +2616,8 @@ class MainWindow(QMainWindow):
             self.lbl_save_info.setText(f"🧼 上次清洗：{time.strftime('%H:%M:%S')}（入库 {len(clean_rows)} 条）→ {cl}")
             self.lbl_save_info.setVisible(True)
             self._on_log(f"🧼 已清洗 {len(rows)} 条 → 入库 {len(clean_rows)} 条｜{cl}")
-            tail = "，企知道通道会逐家补采。" if self.session.qzd_enabled else "（启用企知道补采后可被逐家补采）。"
+            tail = "，企知道通道会逐家补采。" if self.session._qzd_can_run() \
+                else "（企知道补采本轮未接上，下次任务会自动接续）。"
             QMessageBox.information(
                 self, "清洗完成",
                 f"原始 {len(rows)} 条已清洗，入库 {len(clean_rows)} 条。\n\n"
@@ -2502,7 +2666,8 @@ class MainWindow(QMainWindow):
                 "relevance_guard": bool(self.chk_guard.isChecked()),
                 "incremental": bool(self.chk_incr.isChecked()),
                 "background": bool(self.chk_bg.isChecked()),
-                "auto_keyword_expand": bool(self.chk_auto_kw.isChecked())}
+                "auto_keyword_expand": bool(self.chk_auto_kw.isChecked()),
+                "province": str(self.selected_province or "")}
 
     def _apply_params(self, params):
         if not isinstance(params, dict):
@@ -2516,6 +2681,9 @@ class MainWindow(QMainWindow):
                                 ("auto_keyword_expand", self.chk_auto_kw)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
+            # 省份精准采集：老快照没这个键，按「全国不限」处理
+            self.selected_province = str(params.get("province") or "")
+            self._refresh_province_label()
         except Exception:
             pass
 
@@ -2614,7 +2782,8 @@ class MainWindow(QMainWindow):
         try:
             tasks = [t for t in _tasks.load_tasks()
                      if t.get("status") in _tasks.RESUMABLE_STATUS
-                     and (t.get("keywords") or [])]
+                     and (t.get("keywords") or [])
+                     and self._session_folder_ok(str(t.get("folder") or ""))]
         except Exception:
             return
         if not tasks:
@@ -2634,6 +2803,16 @@ class MainWindow(QMainWindow):
         恢复完只等用户点「开始采集」——那时各站会跳过已跑完的关键词，从未采的继续。
         silent=True 用于启动自动回填：不打扰，只在日志和横幅里说明。"""
         folder = str(task.get("folder") or "")
+        if folder and not self._session_folder_ok(folder):
+            # 索引里混进非工具目录下的条目（离线测试造的临时任务）时，无论
+            # 启动回填还是手动选历史任务，都不许把它当会话目录接着写数据。
+            if silent:
+                self._on_log("↻ 上次任务的数据文件夹不在工具目录下，未自动回填：" + folder)
+            else:
+                QMessageBox.warning(self, "没法接着采",
+                                    f"这条任务的数据文件夹不在工具的采集目录里：\n{folder}\n\n"
+                                    "请重新点「开始新任务」采一批。")
+            return False
         if not folder or not os.path.isdir(folder):
             msg = (f"找不到上次的数据文件夹：\n{folder}\n\n"
                    "文件夹被删除或移动过就接不上了，请重新点「开始新任务」采一批。")
@@ -2653,6 +2832,19 @@ class MainWindow(QMainWindow):
         # 任务索引里的词兜底（老任务可能只有索引）。
         kws = [str(k).strip() for k in ((data.get("keywords") or task.get("keywords") or []))
                if str(k).strip()]
+        # 老进度文件里存的是当年那版解析器放行过的词，其中混着行业报告的文档碎片
+        # （'#### 【TOP3 核心装备'、'平台类】'、机构名……实机 92 个词里 15 个）。这条
+        # 回填路径不经过 parse_keywords，所以必须在这里按同一判据再洗一遍，否则新规则
+        # 对「继续上次任务」等于没装：碎片照样进下一轮，继续白烧跨国采购网那约 50 页配额。
+        # 抽验过碎片搜出来的东西：'平台类】' → 展览服务公司（主营「出口电商平台类展区」）、
+        # 机床量具厂（主营「铸铁平板平台类」）——是要清的噪音，不是多出来的数据。
+        _junk = [k for k in kws if CdpSiteCrawler._kw_junk_reason(k)]
+        if _junk:
+            kws = [k for k in kws if not CdpSiteCrawler._kw_junk_reason(k)]
+            show = "、".join(_junk[:6]) + ("…" if len(_junk) > 6 else "")
+            self._on_log(f"🧹 接着上次采之前，已剔掉 {len(_junk)} 个不是关键词的碎片"
+                         f"（{show}）：这些是报告标题/切坏的半截括号/机构名，站内搜索"
+                         "搜不出对口产品，却每个都要花真实请求。")
         if not kws:
             if silent:
                 return False
@@ -2856,10 +3048,29 @@ class MainWindow(QMainWindow):
     def _current_task_id(self):
         return Path(self.session_dir).name if self.session_dir else ""
 
+    def _session_folder_ok(self, folder):
+        """会话目录不变量：一次采集的数据夹必须是桌面工具目录
+        「B2B三站企业数据自动采集工具」的直接子目录——新建任务就是这么建的。
+        实机事故：离线测试在 /var/folders 临时目录造的假任务混进了正式任务
+        索引，启动回填选中它后，整轮真实采集（89 条）被写进了随系统清理的
+        临时目录。回填和登记两侧都按这条不变量把关，测试数据从此进不了真实链路。"""
+        if not HAS_YZD or not folder:
+            return bool(folder)
+        try:
+            base = _tasks.tool_dir(self._get_desktop_dir())
+            return Path(folder).resolve().parent == base.resolve()
+        except Exception:
+            return False
+
     def _register_task(self, status=None):
         """登记/刷新任务索引：除了名字和条数，还要存下「关键词、站点、参数」这份
         配置快照——没有它，关掉工具就什么都不剩，续采无从谈起。"""
         if not HAS_YZD or not self.session_dir:
+            return
+        if not self._session_folder_ok(self.session_dir):
+            # 见 _session_folder_ok：正常采集永远命中不了，只有离线测试或索引
+            # 被外部改坏时才会走到这里——宁可不登记，也不让假条目进用户的历史。
+            self._on_log(f"⚠ 数据文件夹不在工具目录下，本次不登记任务索引：{self.session_dir}")
             return
         try:
             tid = self._current_task_id()

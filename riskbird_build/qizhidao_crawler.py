@@ -646,6 +646,15 @@ class QiZhiDaoCrawler:
 
                 # 2. 调用 suggestPredict API 获取公司hash（不消耗搜索次数）
                 company_hash = self._get_company_hash(name)
+                if company_hash is None:
+                    # 链路异常（断网/浏览器没接上）：记「可重采」交回上层退回队首。
+                    # 用户口径「企知道都查不出的数据直接丢弃」针对的是真查过没有结果，
+                    # 网络断了没查成不在其列——混起来就是永久丢数据。
+                    why = str(getattr(self, "_hash_fail_reason", "") or "网络或浏览器异常")[:70]
+                    self._log(f"  ↻ 企知道这一家没查成（链路异常：{why}），不记「查不到」")
+                    result["错误"] = f"企知道链路异常（可重采）：{why}"
+                    result["可重采"] = True
+                    return result
                 if not company_hash:
                     self._log(f"  未找到公司: {name}")
                     result["错误"] = "未找到公司（suggestPredict 无结果）"
@@ -757,8 +766,14 @@ class QiZhiDaoCrawler:
             self._log(f"  _get_company_hash 异常: {e}")
             return self._get_hash_via_search(name)
 
-    def _get_hash_via_search(self, name: str) -> str:
-        """备用方案：通过搜索页获取公司hash（会消耗搜索次数）"""
+    def _get_hash_via_search(self, name: str):
+        """备用方案：通过搜索页获取公司hash（会消耗搜索次数）。
+
+        返回值有三种，上层要靠它分账：
+          非空字符串＝拿到 hash（查成了）；
+          ""        ＝搜索页正常打开但里面没有该公司链接（企知道真查不到）；
+          None      ＝链路根本没通（断网/浏览器掉线/页面加载失败），这一家压根没查过，
+                      绝不能与 "" 混为一谈——混了就等于把断网当成「这家公司不存在」。"""
         try:
             search_url = f"{self.BASE_URL}/check?searchKey={urllib.parse.quote(name)}&tagNum=1"
             self.driver.get(search_url)
@@ -776,8 +791,13 @@ class QiZhiDaoCrawler:
 
             return ""
         except Exception as e:
+            # 2026-11-04 09:35 实机：断网时这里抛 net::ERR_INTERNET_DISCONNECTED，
+            # 旧代码 return "" 与「真查不到」同形，「青岛太平洋海洋工程(深圳)有限公司」
+            # 就被记成「企知道查不到→永久丢弃」，而它只是那一刻没网。
+            why = str(e).splitlines()[0][:80] or type(e).__name__
+            self._hash_fail_reason = why
             self._log(f"  备用方案失败: {e}")
-            return ""
+            return None
 
     # ── 从详情页提取数据（NUXT + DOM 混合） ──
     def _extract_detail_data(self, result: dict) -> dict:
