@@ -92,7 +92,7 @@ class CrawlWorker(QThread):
 
 # ── 自动保存线程 ───────────────────────────────────────────────
 class AutoSaveWorker(QThread):
-    saved = pyqtSignal(str, int)   # 路径, 条数
+    saved = pyqtSignal(str, int, int)   # 路径, 原始条数, 国内手机条数
     failed = pyqtSignal(str)
 
     def __init__(self, crawler, rows, session_dir):
@@ -111,7 +111,10 @@ class AutoSaveWorker(QThread):
             # 清洗后入库（完全对齐《客户库数据导入模板.xlsx》）
             cl = ts_dir / "1688企业数据_清洗后入库数据.xlsx"
             self._write_cleaned(cl, self.rows)
-            self.saved.emit(str(raw), len(self.rows))
+            # 精细化：额外生成「国内只留手机号」文件，与导入客户库同一口径
+            cl_mobile = ts_dir / "1688企业数据_国内只留手机号.xlsx"
+            mobile_n = self._write_cn_mobile_file(cl_mobile, self.rows)
+            self.saved.emit(str(raw), len(self.rows), mobile_n)
         except PermissionError:
             self.failed.emit("文件正被 Excel/WPS 打开占用，本次自动保存跳过，关闭后下轮补上")
         except Exception as e:
@@ -136,6 +139,20 @@ class AutoSaveWorker(QThread):
         tmp = str(path) + ".tmp"
         _cleaner.write_clean_excel(clean_rows, tmp, template_path=template, log=lambda m: None)
         os.replace(tmp, str(path))
+
+    def _write_cn_mobile_file(self, path, rows):
+        """清洗 → 过滤中国手机号 → 写 18 列模板 Excel，返回写入行数。
+
+        与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+        自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。
+        """
+        clean_rows = self.crawler.clean_records(rows, log=lambda m: None)
+        mobile_rows = _yzd.filter_cn_mobile_rows(clean_rows, log=lambda m: None)
+        template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
+        tmp = str(path) + ".tmp"
+        _cleaner.write_clean_excel(mobile_rows, tmp, template_path=template, log=lambda m: None)
+        os.replace(tmp, str(path))
+        return len(mobile_rows)
 
 
 # ══════════════════════════════════════════════
@@ -264,6 +281,9 @@ class YzdImportWorker(QThread):
                 rows = self.crawler.clean_records(records, log=self.logged.emit)
                 # 批内去重：接口6 自身不做重复校验，同一批里完全一样的行只传一次
                 rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+                # 精细化导入：与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+                # 没有中国手机号的行不进客户库（固话/邮箱再多也不够格）
+                rows = _yzd.filter_cn_mobile_rows(rows, log=self.logged.emit)
             except Exception as e:
                 msg = f"清洗失败：{e}"
                 self.logged.emit(f"⚠ 「{name}」{msg}")
@@ -271,7 +291,7 @@ class YzdImportWorker(QThread):
                 self.task_done.emit(name, 0, 0, 0, msg)
                 continue
             if not rows:
-                msg = "清洗后没有可导入的记录"
+                msg = "清洗后没有含中国手机号的记录可导入"
                 self.logged.emit(f"⚠ 「{name}」跳过：{msg}")
                 results.append((name, 0, 0, 0, msg))
                 self.task_done.emit(name, 0, 0, 0, msg)
@@ -1136,8 +1156,9 @@ class MainWindow(QMainWindow):
             self._pending_save = False
             self.request_autosave()
 
-    def _on_saved(self, path, n):
-        self._on_log(f"💾 已自动保存 {n} 条 → {path}")
+    def _on_saved(self, path, n, mobile_n=0):
+        mobile_hint = f"（国内手机 {mobile_n} 条）" if mobile_n else ""
+        self._on_log(f"💾 已自动保存 {n} 条{mobile_hint} → {path}")
         # 条数跟着自动保存同步进任务索引，「导入其他」里的条数才不会是旧值
         if HAS_YZD and self._task_id:
             try:
@@ -1158,12 +1179,32 @@ class MainWindow(QMainWindow):
         ok = self.crawler.export_excel(path)
         if ok:
             cpath = str(Path(path).with_name(Path(path).stem + "_清洗后入库数据.xlsx"))
+            mpath = str(Path(path).with_name(Path(path).stem + "_国内只留手机号.xlsx"))
             try:
                 res = self.crawler.export_cleaned_excel(cpath)
             except Exception as e:
                 res = ""
                 self._on_log(f"清洗导出失败：{e}")
+            # 同步生成「国内只留手机号」文件
+            mobile_res = ""
             if res:
+                try:
+                    clean_rows = self.crawler.clean_records(rows, log=lambda m: None)
+                    mobile_rows = _yzd.filter_cn_mobile_rows(clean_rows, log=self._on_log)
+                    template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
+                    tmp = mpath + ".tmp"
+                    _cleaner.write_clean_excel(mobile_rows, tmp, template_path=template, log=lambda m: None)
+                    os.replace(tmp, mpath)
+                    mobile_res = mpath
+                except Exception as e:
+                    self._on_log(f"国内手机文件导出失败：{e}")
+            if res and mobile_res:
+                QMessageBox.information(
+                    self, "导出完成",
+                    f"原始明细：\n{path}\n\n"
+                    f"清洗后入库数据：\n{cpath}\n\n"
+                    f"国内只留手机号：\n{mobile_res}")
+            elif res:
                 QMessageBox.information(
                     self, "导出完成",
                     f"原始明细：\n{path}\n\n清洗后入库数据（对齐客户库模板）：\n{cpath}")

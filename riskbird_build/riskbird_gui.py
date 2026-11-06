@@ -48,6 +48,22 @@ except ImportError:
     HAS_CLEANER = False
 
 try:
+    import enhanced_cleaner as _enhanced
+    HAS_ENHANCED = True
+except ImportError:
+    # enhanced_cleaner 在 b2bcollect_build 目录下，riskbird 独立运行时可能找不到
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        if os.path.exists(os.path.join(_root, 'b2bcollect_build', 'enhanced_cleaner.py')):
+            sys.path.insert(0, os.path.join(_root, 'b2bcollect_build'))
+        import enhanced_cleaner as _enhanced
+        HAS_ENHANCED = True
+    except ImportError:
+        HAS_ENHANCED = False
+
+try:
     # 云展动力客户库对接（接口 3/4/5/6）+ 采集任务索引/绑定账号持久化
     import yzd_client as _yzd
     import task_registry as _tasks
@@ -413,10 +429,11 @@ class CompanyColumnDialog(QDialog):
 
 
 # ══════════════════════════════════════════
-#  自动保存的两份固定文件（与“导出 Excel”同效果，不分平台）
+#  自动保存的三份固定文件（与“导出 Excel”同效果，不分平台）
 # ══════════════════════════════════════════
 RAW_FILE_NAME = "企业数据_全部平台.xlsx"
 CLEAN_FILE_NAME = "清洗后客户库入库数据.xlsx"
+MOBILE_FILE_NAME = "企业数据_国内只留手机号.xlsx"
 
 # 统一表头：常用字段优先，其余按首次出现顺序补充
 _PREFERRED_HEADERS = [
@@ -543,10 +560,39 @@ def write_cleaned_excel(results: list, filepath: str, template_dirs=None, log=No
     return len(rows)
 
 
+def write_cn_mobile_excel(results: list, filepath: str, template_dirs=None, log=None) -> int:
+    """清洗 → 只留含中国手机号的行 → 写入库模板，返回写入行数。
+
+    与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+    自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。
+    """
+    log = log or _quiet_log
+    if not HAS_CLEANER:
+        log("⚠ 清洗模块未加载，跳过国内手机文件生成")
+        return 0
+    if not HAS_YZD:
+        log("⚠ 云展模块未加载，跳过国内手机文件生成")
+        return 0
+    rows = _cleaner.build_clean_rows(results, log=log)
+    rows = _yzd.filter_cn_mobile_rows(rows, log=log)
+    if not rows:
+        log("ℹ 清洗后没有含中国手机号的记录，国内手机文件未写入")
+    template = _cleaner.locate_template(start_dirs=[d for d in (template_dirs or []) if d])
+    tmp = f"{filepath}.tmp"
+    _drop_tmp(tmp)
+    try:
+        _cleaner.write_clean_excel(rows, tmp, template_path=template, log=log)
+        os.replace(tmp, filepath)
+    finally:
+        _drop_tmp(tmp)
+    log(f"✅ 国内只留手机号文件已保存 {len(rows)} 条 → {filepath}")
+    return len(rows)
+
+
 class AutoSaveWorker(QThread):
     """自动保存放后台线程写盘。
 
-    实测 480 条数据「合并 + 清洗 + 两份写盘」约 3.6 秒，放在 GUI 线程会让界面
+    实测 480 条数据「合并 + 清洗 + 三份写盘」约 4 秒，放在 GUI 线程会让界面
     每几十秒僵一下。写盘用的是一份 dict 快照（进线程前就拷好），之后不再碰爬虫对象。
     """
     logged = pyqtSignal(str)
@@ -580,7 +626,22 @@ class AutoSaveWorker(QThread):
             note = f"（{CLEAN_FILE_NAME} 被占用，本轮未更新）"
         except Exception as e:
             note = f"（清洗文件本轮未更新：{e}）"
-        self.finished_save.emit(True, f"已自动保存：原数据 {raw_n} 条 / 清洗后入库 {clean_n} 条{note}")
+
+        # 精细化：额外生成「国内只留手机号」文件，与导入客户库同一口径
+        mobile_path = os.path.join(self.folder, MOBILE_FILE_NAME)
+        mobile_n = 0
+        mobile_note = ""
+        try:
+            mobile_n = write_cn_mobile_excel(self.combined, mobile_path,
+                                             template_dirs=self.template_dirs,
+                                             log=self.logged.emit)
+        except PermissionError:
+            mobile_note = f"（{MOBILE_FILE_NAME} 被占用，本轮未更新）"
+        except Exception as e:
+            mobile_note = f"（国内手机文件本轮未更新：{e}）"
+        self.finished_save.emit(True,
+            f"已自动保存：原数据 {raw_n} 条 / 清洗后入库 {clean_n} 条 / 国内手机 {mobile_n} 条"
+            f"{note}{mobile_note}")
 
 
 # ══════════════════════════════════════════════
@@ -656,6 +717,48 @@ class ExternalCleanWorker(QThread):
             summary += f"\n\n被跳过：\n{skipped}"
         self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
         self.finished_clean.emit(True, summary)
+
+
+class EnhancedExternalCleanWorker(QThread):
+    """增强清洗：libphonenumber 深度解析电话 + 五层区域推断 → 输出三个文件。"""
+    logged = pyqtSignal(str)
+    finished_clean = pyqtSignal(bool, str)
+
+    def __init__(self, paths, output_dir):
+        super().__init__()
+        self.paths = list(paths or [])
+        self.output_dir = output_dir
+
+    def run(self):
+        try:
+            self._run_all()
+        except Exception as e:
+            self.finished_clean.emit(False, f"增强清洗异常：{e}")
+
+    def _run_all(self):
+        if not HAS_ENHANCED:
+            self.finished_clean.emit(False, "增强清洗模块未加载（enhanced_cleaner 导入失败）")
+            return
+        result, report = _enhanced.enhanced_clean_three_files(
+            self.paths, self.output_dir, log=self.logged.emit)
+        if not result:
+            self.finished_clean.emit(False, "增强清洗后没有可入库的记录")
+            return
+        bad = [r for r in report if r.get("error")]
+        files = "\n".join(
+            f"· {r['file']}（{r['sheet']}）：{r['rows']} 条" for r in report if not r.get("error"))
+        skipped = "\n".join(f"⚠ {r['file']}：{r['error']}" for r in bad)
+        matched = "；".join(
+            "，".join(r.get("identified") or []) for r in report if r.get("identified"))
+        self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
+        lines = ["增强清洗完成（libphonenumber + 五层区域推断）\n"]
+        for label in ("国内", "国内只留手机号", "国外"):
+            path, count = result.get(label, ("-", 0))
+            lines.append(f"  {label}：{count} 条 → {path}")
+        lines.append(f"\n读入的文件：\n{files or '· 无'}")
+        if skipped:
+            lines.append(f"\n被跳过：\n{skipped}")
+        self.finished_clean.emit(True, "\n".join(lines))
 
 
 # ══════════════════════════════════════════════
@@ -787,6 +890,9 @@ class YzdImportWorker(QThread):
                 rows = _cleaner.build_clean_rows(records, log=self.logged.emit)
                 # 批内去重：接口6 自己不做重复校验，同一批里完全一样的行只传一次
                 rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+                # 精细化导入：与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+                # 没有中国手机号的行不进客户库（固话/邮箱再多也不够格）
+                rows = _yzd.filter_cn_mobile_rows(rows, log=self.logged.emit)
             except Exception as e:
                 msg = f"清洗失败：{e}"
                 self.logged.emit(f"⚠ 「{name}」{msg}")
@@ -794,7 +900,7 @@ class YzdImportWorker(QThread):
                 self.task_done.emit(name, 0, 0, 0, msg)
                 continue
             if not rows:
-                msg = "清洗后没有可导入的记录"
+                msg = "清洗后没有含中国手机号的记录可导入"
                 self.logged.emit(f"⚠ 「{name}」跳过：{msg}")
                 results.append((name, 0, 0, 0, msg))
                 self.task_done.emit(name, 0, 0, 0, msg)
@@ -1545,7 +1651,7 @@ class MainWindow(QMainWindow):
             "列名对不上时按单元格内容猜，识别结果与未使用的列都会写进运行日志。\n"
             "自动剔除空公司名、完成电话/邮箱格式清洗与跨文件去重合并。\n"
             "电话只分类不删：识别到的号码全部拆进「手机号」「固话」两栏，一家几个都保留。")
-        self.clean_btn.clicked.connect(self._clean_external_data)
+        self.clean_btn.clicked.connect(self._on_clean_now)
         btn_row.addWidget(self.clean_btn)
 
         btn_row.addStretch()
@@ -2958,7 +3064,7 @@ class MainWindow(QMainWindow):
         self._autosave_worker = worker
         worker.start()
         if reason:
-            self._append_log(f"💾 自动保存（{reason}）：共 {len(combined)} 条原数据 → 两份文件")
+            self._append_log(f"💾 自动保存（{reason}）：共 {len(combined)} 条原数据 → 三份文件（原数据 + 清洗入库 + 国内手机）")
 
     def _on_autosave_finished(self, ok: bool, summary: str):
         self._append_log(("✅ " if ok else "⚠ ") + summary)
@@ -2975,11 +3081,12 @@ class MainWindow(QMainWindow):
 
     # ── 自动保存 ──────────────────────────────
     def _auto_save(self, reason: str = ""):
-        """自动保存 = 跟“导出 Excel”同效果：一次写两份文件，不再按平台分文件
+        """自动保存 = 跟“导出 Excel”同效果：一次写三份文件，不再按平台分文件
 
-        桌面会话文件夹里固定两个名字（反复覆盖，不堆文件）：
-          企业数据_全部平台.xlsx      原数据（三个平台合并）
-          清洗后客户库入库数据.xlsx  按入库模板清洗后的数据
+        桌面会话文件夹里固定三个名字（反复覆盖，不堆文件）：
+          企业数据_全部平台.xlsx          原数据（三个平台合并）
+          清洗后客户库入库数据.xlsx      按入库模板清洗后的数据
+          企业数据_国内只留手机号.xlsx    清洗后只含中国手机号的精细化子集
 
         并发：写盘放后台线程；上一轮还在写时只保留最后一次请求（而不是排队），
         这样“暂停/停止/采集完成”那一次必然落盘，也不会堆积重复写盘。"""
@@ -3020,12 +3127,15 @@ class MainWindow(QMainWindow):
             detail = " / ".join(f"{name} {len(c.results)} 条"
                                  for name, c in zip(self.PLATFORM_NAMES, self._all_crawlers))
             cleaned_path = self._export_cleaned_library(combined, path)
+            mobile_path = self._export_cn_mobile_library(combined, path)
             msg = (
                 f"已合并导出 {len(combined)} 条数据到:\n{path}\n\n"
                 f"{detail}"
             )
             if cleaned_path:
                 msg += f"\n\n已另存清洗后入库数据到:\n{cleaned_path}"
+            if mobile_path:
+                msg += f"\n\n已另存国内只留手机号数据到:\n{mobile_path}"
             QMessageBox.information(self, "导出成功", msg)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
@@ -3052,6 +3162,27 @@ class MainWindow(QMainWindow):
             self._append_log(f"⚠ 生成清洗后入库数据失败：{e}")
             return ""
 
+    def _export_cn_mobile_library(self, combined: list, merged_path: str) -> str:
+        """手动导出时另存一份带时间戳的国内只留手机号数据（与导入客户库同一口径）"""
+        if not HAS_CLEANER or not HAS_YZD:
+            return ""
+        merged_dir = os.path.dirname(merged_path) or "."
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mobile_path = os.path.join(merged_dir, f"国内只留手机号_{stamp}.xlsx")
+        try:
+            self._append_log("📱 开始生成国内只留手机号数据…")
+            if write_cn_mobile_excel(combined, mobile_path,
+                                     template_dirs=[merged_dir, self._get_last_import_dir()],
+                                     log=self._append_log):
+                return mobile_path
+            return ""
+        except PermissionError:
+            self._append_log("⚠ 国内手机文件正被 Excel/WPS 占用，本次未能写出")
+            return ""
+        except Exception as e:
+            self._append_log(f"⚠ 生成国内手机数据失败：{e}")
+            return ""
+
     def _get_last_import_dir(self) -> str:
         """返回最近一次选择文件所在目录，用于就近查找入库模板。"""
         files = getattr(self, "_excel_paths", None) or []
@@ -3062,6 +3193,59 @@ class MainWindow(QMainWindow):
         return write_merged_excel(results, filepath, log=self._append_log)
 
     # ── 清洗数据（其他渠道的名单 → 入库格式）──────
+    def _on_clean_now(self):
+        """「清洗数据」：直接选文件 → 选输出目录 → 增强清洗输出三文件（国内/国内手机/国外）。
+        不再弹模式选择对话框，用户只管上传文档即可。"""
+        if self._cleaning:
+            QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
+            return
+        if HAS_ENHANCED:
+            self._clean_external_enhanced()
+        else:
+            self._clean_external_data()
+
+    def _clean_external_enhanced(self):
+        """增强三文件清洗入口：多选文件 → 选输出目录 → 后台清洗 → 国内/国内手机/国外 三个文件"""
+        if not HAS_ENHANCED:
+            QMessageBox.warning(self, "提示", "增强清洗模块未加载，无法使用三文件拆分功能")
+            return
+        if self._cleaning:
+            QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要清洗的数据文件（可多选）", self._get_last_import_dir(),
+            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+        if not paths:
+            return
+        self._append_log(f"🧹 增强清洗：选中 {len(paths)} 个文件")
+        default_dir = os.path.dirname(paths[0]) or str(self._get_desktop_dir())
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "选择三文件输出目录（国内 / 国内只留手机号 / 国外）", default_dir)
+        if not output_dir:
+            self._append_log("已取消增强清洗（未选输出目录）")
+            return
+        import glob as _glob
+        existing = _glob.glob(os.path.join(output_dir, "清洗后_*_*.xlsx"))
+        if existing and QMessageBox.question(
+                self, "覆盖已有文件",
+                f"目标目录下已有 {len(existing)} 个清洗文件，确认覆盖？\n{output_dir}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            self._append_log("已取消增强清洗（不覆盖已有文件）")
+            return
+        self._cleaning = True
+        self.setEnabled(False)
+        prog = YzdProgressDialog(None, "正在增强清洗数据")
+        prog.set_text(f"正在清洗 {len(paths)} 个文件（libphonenumber 深度解析）…",
+                      "清洗在后台进行，请勿关闭程序。")
+        self._clean_progress = prog
+        prog.show()
+        worker = EnhancedExternalCleanWorker(paths, output_dir)
+        worker.logged.connect(self._append_log)
+        worker.finished_clean.connect(self._on_clean_finished)
+        self._clean_worker = worker
+        worker.start()
+
     def _clean_external_data(self):
         """「清洗数据」入口：多选外部表格 → 智能匹配列 → 清洗 → 写出入库格式文件"""
         if not HAS_CLEANER:

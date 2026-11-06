@@ -2,13 +2,13 @@
 
 职责：
   · mic / b2b168 / 顺企网(11467) / 爱采购(aipage) / 麦麦B2B(maimaib2b)
-    / 跨国采购网(globalimporter) / 马可波罗(makepolo)
-    / 1688 八个**关键词并行**采集器
+    / 跨国采购网(globalimporter) / 马可波罗(makepolo) / 世界工厂网(gongchang)
+    / 1688 九个**关键词并行**采集器
     ＋ 企知道(qzd) 一个**名单驱动**通道（从待采集公司名单逐家补采，看门狗语义：
     名单空则休眠，废数据回流后自动苏醒），按界面开关决定谁参与本轮；
   · crawl(keywords) 在**各自的线程**里并行推进各站点（裸 CDP 命令通道彼此独立，
     每条命令显式带本站标签 ws 地址，故各线程真并行、互不抢活动标签；
-    纯 HTTP 站 b2b168/11467/aipage/maimaib2b/globalimporter/makepolo 不占标签（其中两站被反采质询时才临时
+    纯 HTTP 站 b2b168/11467/aipage/maimaib2b/globalimporter/makepolo/gongchang 不占标签（其中两站被反采质询时才临时
     借一个标签过盾）；1688/企知道用 Selenium 附加同一
     共享 Chrome，各占自己的标签/窗口，绝不起第二个浏览器实例）；
   · 把各采集器的信号汇聚到 session 级信号，界面只连一处即可；
@@ -48,6 +48,7 @@ from aipage_crawler import AipageCrawler
 from maimaib2b_crawler import Maimaib2bCrawler
 from gi_crawler import GiCrawler
 from makepolo_crawler import MakepoloCrawler
+from gongchang_crawler import GongchangCrawler
 from pending_companies import PendingCompanyList, extract_company_names
 import site_adapters as _adapters
 
@@ -60,15 +61,15 @@ import site_adapters as _adapters
 #   b2b818 真实但易触发对端 WAF 出口 IP 封锁；qympw 名片库对深度工业词覆盖过薄——
 #   三者数据质量不达要求，已从工具移除，采集器文件一并删除）
 SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "maimaib2b",
-              "globalimporter", "makepolo"]
+              "globalimporter", "makepolo", "gongchang"]
 SITE_CLASSES = {"mic": MicCrawler, "b2b168": B2b168Crawler,
                 "11467": Qihuo11467Crawler, "aipage": AipageCrawler,
                 "maimaib2b": Maimaib2bCrawler, "globalimporter": GiCrawler,
-                "makepolo": MakepoloCrawler}
+                "makepolo": MakepoloCrawler, "gongchang": GongchangCrawler}
 SITE_NAMES = {"mic": "中国制造网", "b2b168": "八方资源网",
               "11467": "顺企网", "aipage": "爱采购",
               "maimaib2b": "麦麦B2B", "globalimporter": "跨国采购网",
-              "makepolo": "马可波罗"}
+              "makepolo": "马可波罗", "gongchang": "世界工厂网"}
 # Selenium 附加通道（共享同一 Chrome，各自管自己的标签/窗口）
 if _adapters.HAS_1688:
     SITE_ORDER.append("1688")
@@ -286,10 +287,15 @@ class ParallelSession:
             if max_records is not None:
                 c.max_records = int(max_records)
             if province is not None:
-                # 省份精准采集：参数直筛站拼进搜索 URL（各爬虫 build_search_url），
+                # 省份精准采集（支持多选）：参数直筛站拼进搜索 URL（各爬虫 build_search_url），
                 # 数据层站在 _add_result 入库关卡过滤（cdp_base._apply_province_filter）。
                 # 1688 适配器是独立基类，province 属性已在其 __init__ 里声明。
-                c.province = str(province or "").strip()
+                # 多省场景：列表转逗号分隔字符串下发，各爬虫 build_search_url 判断含逗号
+                # 时放弃 URL 参数、退回数据层过滤（trust-but-verify）。
+                if isinstance(province, (list, tuple)):
+                    c.province = ",".join(str(p).strip() for p in province if str(p).strip())
+                else:
+                    c.province = str(province or "").strip()
             # 属地判不出的公司名回流企知道待采名单（由工商登记反查一次属地）：
             # 入库关卡是 fail-closed（判不出就不入库，宁可少不可污），但这些公司大
             # 概率只是页面没写省份、实际就在目标省，直接丢是纯产能损失——企知道查
@@ -303,7 +309,10 @@ class ParallelSession:
             if delay_between is not None:
                 self.qzd.delay_between = max(0.8, float(delay_between) / 2)
             if province is not None:
-                self.qzd.province = str(province or "").strip()
+                if isinstance(province, (list, tuple)):
+                    self.qzd.province = ",".join(str(p).strip() for p in province if str(p).strip())
+                else:
+                    self.qzd.province = str(province or "").strip()
 
     def set_enabled(self, enabled):
         self.enabled = set(enabled or [])

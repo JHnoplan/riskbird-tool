@@ -70,10 +70,13 @@ MIC_EN = {
     "香港": "Hongkong", "澳门": "Macao", "台湾": "Taiwan",
 }
 # 参数直筛站（slug）：这些站选中省份后把省份拼进搜索 URL（服务端筛）
-PARAM_SITES = {"mic", "makepolo", "1688"}
+# gongchang：单省时用 areaid 参数（已实机核实），多省走数据层过滤
+PARAM_SITES = {"mic", "makepolo", "1688", "gongchang"}
 # 参数直筛站的本地核验强度（口径见模块 docstring ③）：
 #   lenient = 只砍 miss（确认外省）；strict = miss/unknown 都砍；未登记的参数站默认 strict。
-PARAM_VERIFY = {"mic": "lenient", "makepolo": "lenient", "1688": "strict"}
+# gongchang 用 lenient：站方 areaid 参数已核实有效，且公司名开头的地级市是强属地信号。
+PARAM_VERIFY = {"mic": "lenient", "makepolo": "lenient", "1688": "strict",
+                "gongchang": "lenient"}
 
 # ── 数据层匹配的属地词表：每省 = 短名 + 简称 + 全部地级行政区名 ──
 # 短名自带唯一性；单字简称（贵/广/黑）歧义大，一律不入表。
@@ -134,8 +137,26 @@ def _norm_variants(text):
     return raw, stripped
 
 
+def _parse_provinces(province):
+    """统一省份输入为列表：支持单省字符串、逗号分隔多省、列表。
+    空输入返回空列表（= 全国不限，调用方应跳过过滤）。"""
+    if isinstance(province, (list, tuple)):
+        return [str(p).strip() for p in province if str(p).strip()]
+    s = str(province or "").strip()
+    if not s:
+        return []
+    if "," in s:
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return [s]
+
+
 def match_province(province, text):
-    """返回 "match" / "miss" / "unknown"（口径见模块 docstring）。"""
+    """返回 "match" / "miss" / "unknown"（口径见模块 docstring）。
+    支持多省：province 可以是单省字符串、逗号分隔多省、或列表——
+    命中任一目标省即 match，全部未命中且有明确外省信号即 miss。"""
+    targets = _parse_provinces(province)
+    if not targets:
+        return "unknown"
     raw, stripped = _norm_variants(text)
     if not stripped:
         return "unknown"
@@ -145,11 +166,14 @@ def match_province(province, text):
             hits.add(pv)
     if not hits:
         return "unknown"
-    if hits == {province}:
+    # 多省场景：命中任一目标省即 match
+    if hits & set(targets):
         return "match"
-    if province not in hits and len(hits) == 1:
+    # 全部命中结果都不在目标省集合内 → 明确 miss
+    if len(hits) == 1:
         return "miss"
-    return "unknown"      # 跨省歧义（商会/办事处/多地经营等）：宁判不出，不误杀
+    # 多省命中但都不是目标省 → 跨省歧义，判 unknown
+    return "unknown"
 
 
 def param_value(site_slug, province, kind):
@@ -186,25 +210,49 @@ def record_region_text(rec):
 
 def judge_record(site_slug, province, rec):
     """省份精准采集的入库判定。返回 (verdict, keep)：
-    verdict ∈ match/miss/unknown，keep = 这条是否入库。"""
-    verdict = match_province(province, record_region_text(rec))
+    verdict ∈ match/miss/unknown，keep = 这条是否入库。
+    支持多省：province 可以是单省字符串、逗号分隔多省、或列表——
+    命中任一目标省即 match，按该站核验策略决定 keep。"""
+    targets = _parse_provinces(province)
+    if not targets:
+        return "unknown", True
+    text = record_region_text(rec)
+    # 逐省判定，取最优结果（任一 match 即 match，全部 miss 即 miss）
+    best_verdict = "unknown"
+    for pv in targets:
+        v = match_province(pv, text)
+        if v == "match":
+            best_verdict = "match"
+            break
+        if v == "miss" and best_verdict != "match":
+            best_verdict = "miss"
     if uses_param_filter(site_slug) and param_verify_policy(site_slug) == "lenient":
-        return verdict, verdict != "miss"
-    return verdict, verdict == "match"
+        return best_verdict, best_verdict != "miss"
+    return best_verdict, best_verdict == "match"
 
 
 def region_label(province, text):
     """从判定文本里摘出如实的属地短语：命中目标省就写「省＋可识别到的市」（广东·深圳），
     只命中省写「省」，判不出则返回空串。用于**核验通过后**回填所在区域，
-    与旧行为「拿已选省份臆测填空」的区别是：这里的值永远有页面证据支撑。"""
-    raw, stripped = _norm_variants(text)
-    if not raw or match_province(province, text) != "match":
+    与旧行为「拿已选省份臆测填空」的区别是：这里的值永远有页面证据支撑。
+    支持多省：province 可以是逗号分隔多省或列表，每个命中的省各出一个标签，
+    用「/」拼接（如「广东·深圳/浙江·杭州」）。"""
+    targets = _parse_provinces(province)
+    if not targets:
         return ""
-    city = ""
-    for c in _CITY_TABLE.get(province, []):
-        if len(c) < 2:
-            continue     # 单字简称（粤/苏/浙）不进标签：宁可只写到省，也不拿歧义字凑一个市名
-        pos = raw.find(c)
-        if pos >= 0 and (not city or pos < raw.find(city)):
-            city = c
-    return f"{province}·{city}" if city else province
+    raw, stripped = _norm_variants(text)
+    if not raw:
+        return ""
+    labels = []
+    for pv in targets:
+        if match_province(pv, text) != "match":
+            continue
+        city = ""
+        for c in _CITY_TABLE.get(pv, []):
+            if len(c) < 2:
+                continue     # 单字简称（粤/苏/浙）不进标签
+            pos = raw.find(c)
+            if pos >= 0 and (not city or pos < raw.find(city)):
+                city = c
+        labels.append(f"{pv}·{city}" if city else pv)
+    return "/".join(labels) if labels else ""

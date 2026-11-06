@@ -914,9 +914,12 @@ class Ali1688Crawler:
 
     def _province_suffix(self):
         """省份精准采集：站方原生 `&province=<UTF-8 百分号编码的简体短名>`（三个搜索
-        渠道同源，2026-11-04 探针 A/B 实锤服务端真过滤）。未选省返回空串。"""
+        渠道同源，2026-11-04 探针 A/B 实锤服务端真过滤）。未选省返回空串。
+        多省场景：URL 参数只能指向一个省，多省时放弃参数直筛，退回数据层过滤。"""
         pv = str(getattr(self, "province", "") or "").strip()
-        return f"&province={quote(pv)}" if pv else ""
+        if not pv or "," in pv:
+            return ""
+        return f"&province={quote(pv)}"
 
     def _iter_keyword_offers(self, kw):
         """遍历一个关键词的多页列表（站外 SEM 渠道），逐条 yield offer（已按 memberId 去重）。
@@ -1641,7 +1644,8 @@ class Ali1688Crawler:
         tail = (f"，另有 {self._filtered_count} 家类目不相关已过滤"
                 if self._filtered_count else "")
         if getattr(self, "province", "") and (self._pf_dropped or getattr(self, "_pf_unknown", 0)):
-            tail += f"、{self._pf_dropped} 家非{self.province}已排除"
+            pv_display = self.province if "," not in self.province else "目标省份"
+            tail += f"、{self._pf_dropped} 家非{pv_display}已排除"
             if getattr(self, "_pf_unknown", 0):
                 tail += f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
         early = (f"，列表页早过滤 {self._early_skipped} 家(未进详情即省请求)"

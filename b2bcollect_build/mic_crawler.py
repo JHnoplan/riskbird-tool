@@ -148,8 +148,9 @@ class MicCrawler(CdpSiteCrawler):
         # 省份精准采集：站方原生 comProvince 参数（2026-11-04 探针 A/B 实锤服务端真
         # 过滤：广东/浙江各 60 卡、与全国重合仅 2/60、两省交集 0）。英文值表见
         # province_filter.MIC_EN；无对应值时退回 nolimit 全国采，绝不带错参数。
+        # 多省场景：URL 参数只能指向一个省，多省时放弃参数直筛，退回数据层过滤。
         pv = getattr(self, "province", "")
-        if pv:
+        if pv and "," not in pv:
             en = _pf.param_value("mic", pv, "en")
             if en:
                 return url.replace("comProvince=nolimit", f"comProvince={en}")

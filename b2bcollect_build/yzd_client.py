@@ -218,6 +218,27 @@ def clamp_fields(row: dict, log=None) -> dict:
     return out
 
 
+def filter_cn_mobile_rows(rows: list, log=None) -> list:
+    """只保留「手机号」列含至少一条中国手机号的行（导入客户库精细化口径）。
+
+    与清洗数据「国内只留手机号」文件同一语义：云展国内客户库只关心中国手机号，
+    固话/邮箱/微信号再齐全、没有中国手机号的行也不上传，避免脏数据灌入客户库。
+    多号码逗号/顿号拼接的字段逐个拆出来校验，只要有一个命中 1[3-9]\\d{9} 就留。
+    """
+    log = log or (lambda _m: None)
+    out = []
+    dropped = 0
+    for row in (rows or []):
+        mobile = str(row.get("手机号") or "")
+        if any(PHONE_RE.search(t.strip()) for t in _CONTACT_SPLIT_RE.split(mobile) if t.strip()):
+            out.append(row)
+        else:
+            dropped += 1
+    if dropped:
+        log(f"📱 国内只留手机号：{len(rows)} 条 → {len(out)} 条（剔除 {dropped} 条无中国手机号的记录）")
+    return out
+
+
 def write_import_workbook(rows: list, file_path: str, log=None) -> int:
     """把清洗后的行写成云展接口6 专用的 9 列 Excel，返回写入行数
 

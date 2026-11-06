@@ -698,13 +698,14 @@ return '';})()"""
                     rec["所在区域"] = label
             return rec
         name = str(rec.get("公司名称") or rec.get("公司名") or "")[:24]
+        pv_display = pv if "," not in pv else "目标省份"  # 多省时显示「目标省份」而非列丼
         if verdict == "miss":
             self._pf_dropped += 1
-            tag = "站方筛漏了、本地按地址拦下" if _pf.uses_param_filter(slug) else "跳过非本省商家"
-            self._log(f"🗺 [{pv}] {tag}：{name}（{text.strip()[:36]}）")
+            tag = "站方筛漏了、本地按地址拦下" if _pf.uses_param_filter(slug) else "跳过非目标省份商家"
+            self._log(f"🗺 [{pv_display}] {tag}：{name}（{text.strip()[:36]}）")
             return None
         self._pf_unknown += 1
-        self._log(f"🗺 [{pv}] 页面与公司名都没写省份、无法确认，不入库：{name}")
+        self._log(f"🗺 [{pv_display}] 页面与公司名都没写省份、无法确认，不入库：{name}")
         self._sink_unverified(rec)
         return None
 
@@ -1105,14 +1106,19 @@ return '';})()"""
 
     # ── 拦截 / 验证码判定 + 防采看门狗 ────────────────────────
     # 全屏/弹层式验证码控件（滑块、人机验证）。只认「尺寸足够大且落在视口内」的已知控件：
-    # 商铺页自带的「采购询价」表单里也有验证码输入图（实测 gys 商铺页有 id=codeCaptcha 的
-    # img），拿选择器子串一刀切会把正常页误判成拦截页。
+    # 阈值 150×40 是为了容纳 Cloudflare Turnstile 嵌入式勾选框（实测 300×65）等小尺寸控件。
+    # 旧阈值 220×90 会把 Turnstile 漏检，导致页面被误判成「纯自动挑战页」而反复刷新，
+    # 把用户刚点的验证进度清零（2026-11-05 麦麦B2B/1688 复现）。
+    # 商铺页自带的「采购限价」表单里也有验证码输入图（实测 gys 商铺页有 id=codeCaptcha 的
+    # img），但那些 img 不会命中的 iframe/class 选择器，所以不会误判。
     CAPTCHA_WIDGET_JS = """(function(){
 function ok(e){if(!e)return false;var r=e.getBoundingClientRect();
-return r.width>=220&&r.height>=90&&r.bottom>0&&r.top<(window.innerHeight||900)*0.9;}
+return r.width>=150&&r.height>=40&&r.bottom>0&&r.top<(window.innerHeight||900)*0.9;}
 var s=['#tencent-captcha','.tcaptcha-container','.tcaptcha-body','.tcaptcha-transform',
 'iframe[src*="captcha"]','iframe[src*="verify"]','iframe[src*="challenge"]',
-'.geetest_panel','.geetest_holder','#geetest_wrap','.slider-verify','.verify-wrap'];
+'iframe[src*="turnstile"]','.cf-turnstile','#challenge-stage',
+'.geetest_panel','.geetest_holder','#geetest_wrap','.slider-verify','.verify-wrap',
+'.captcha-container','.captcha-box','#captcha-div','.nc-container'];
 for(var i=0;i<s.length;i++){try{var e=document.querySelector(s[i]);
 if(e&&ok(e))return s[i];}catch(x){}}
 return '';})()"""
@@ -2215,9 +2221,10 @@ return '';})()"""
             self._save_seen_store()
         tail = f"，另有 {self._filtered_count} 家不相关已过滤" if self._filtered_count else ""
         if self.province and (self._pf_dropped or self._pf_unknown):
-            tail += (f"、{self._pf_dropped} 家非{self.province}已排除"
+            pv_display = self.province if "," not in self.province else "目标省份"
+            tail += (f"、{self._pf_dropped} 家非{pv_display}已排除"
                      f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
-                     if self._pf_unknown else f"、{self._pf_dropped} 家非{self.province}已排除")
+                     if self._pf_unknown else f"、{self._pf_dropped} 家非{pv_display}已排除")
         early = f"，列表页早过滤 {self._early_skipped} 家" if self._early_skipped else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
         self._log(f"✅ {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家{early}{tail}{saved}")

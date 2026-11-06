@@ -185,13 +185,14 @@ if HAS_1688:
                 return rec
             full = str(rec.get("公司名称") or "").strip()
             name = full[:24]
+            pv_display = pv if "," not in pv else "目标省份"
             if verdict == "miss":
                 self._pf_dropped += 1
-                self._log(f"🗺 [{pv}] 站方 province 参数没筛住、本地按地址拦下："
+                self._log(f"🗺 [{pv_display}] 站方 province 参数没筛住、本地按地址拦下："
                           f"{name}（{text.strip()[:36]}）")
                 return None
             self._pf_unknown += 1
-            self._log(f"🗺 [{pv}] 页面与公司名都没写省份、无法确认，不入库：{name}")
+            self._log(f"🗺 [{pv_display}] 页面与公司名都没写省份、无法确认，不入库：{name}")
             sink = getattr(self, "province_unknown_sink", None)
             if callable(sink) and full:
                 try:
@@ -438,13 +439,14 @@ if HAS_QZD:
                             result["所在区域"] = label
                     return super()._add_result(result)
                 short = name[:24]
+                pv_display = pv if "," not in pv else "目标省份"
                 if verdict == "miss":
                     self._pf_dropped += 1
-                    self._log(f"🗺 [{pv}] 企知道查回的工商登记地址不属本省、不入库："
+                    self._log(f"🗺 [{pv_display}] 企知道查回的工商登记地址不属目标省份、不入库："
                               f"{short}（{text.strip()[:36]}）")
                 else:
                     self._pf_unknown += 1
-                    self._log(f"🗺 [{pv}] 工商地址也判不出属地、保守不入库：{short}")
+                    self._log(f"🗺 [{pv_display}] 工商地址也判不出属地、保守不入库：{short}")
                 return None
             return super()._add_result(result)
 

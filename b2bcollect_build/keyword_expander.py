@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""keyword_expander.py —— 「智能解析」的内置行业知识库。
+"""keyword_expander.py —— 「智能解析」的内置行业知识库 + DeepSeek API 兜底。
 
 背景：B2B 站内搜索按「具体产品/商品」匹配。用户手里拿到的往往是一份
 「行业报告目录 / 价值链环节名」（如「制冷与热泵核心部件」「过滤与净化材料」），
@@ -11,13 +11,15 @@
 再把「研发、咨询、招投标、物流、运维」这类**纯服务/流程词**（站内无商品对应）
 直接忽略，从而把关键词质量提升一个量级。
 
-设计取舍（用户已确认「内置行业知识库」路线）：
-  · 完全离线、无网络、无 API 密钥——打包成 exe / Mac app 拷到别的电脑即用；
-  · 结果确定、可复现，不会因联网/额度/隐私问题在现场掉链子；
+设计取舍（混合策略：离线优先 + API 兜底）：
+  · 离线知识库优先：快、稳、免费，覆盖已收录行业
+  · DeepSeek API 兜底：未命中时调用大模型动态扩展，需配置 API key
+  · 降级保护：API 失败/超时/无 key 时自动回退到纯离线模式，不阻断采集
   · 知识库按「类别名→产品词」组织，未收录的类别**原样保留**（不误删），
     需要覆盖新行业时只在 KNOWLEDGE_BASE 里加条目即可，无需改逻辑。
 """
 import re
+from typing import Optional
 
 # ── 知识库：每条 = (类别显示名, [识别用的特征短语], [展开出的具体产品词]) ──
 # 匹配规则：某输入片段只要**包含**任一特征短语即命中该条；命中多条时取
@@ -312,7 +314,7 @@ def _is_drop(seg):
     return any(m in seg for m in DROP_MARKS)
 
 
-def expand_keywords(text):
+def expand_keywords(text: str, use_deepseek: bool = True) -> dict:
     """智能解析主入口。
 
     返回 dict：
@@ -320,9 +322,10 @@ def expand_keywords(text):
       expanded   —— 命中知识库、被展开的输入片段 [(原片段, 类别名, 产品数), ...]
       kept       —— 未命中知识库、也不是服务词，原样保留的片段（多半本就是产品词）
       dropped    —— 被忽略的纯服务/流程词片段
+      deepseek   —— DeepSeek API 展开的结果 [(原片段, 产品数, 状态), ...]（仅 use_deepseek=True 时）
     """
     result, seen = [], set()
-    expanded, kept, dropped = [], [], []
+    expanded, kept, dropped, deepseek_results = [], [], [], []
 
     for seg in _segment(text):
         hit = _match_entry(seg)
@@ -339,18 +342,85 @@ def expand_keywords(text):
         elif _is_drop(seg):
             dropped.append(seg)
         else:
-            if seg not in seen:
-                seen.add(seg)
-                result.append(seg)
-            kept.append(seg)
+            # 离线知识库未命中，尝试 DeepSeek API 兜底
+            if use_deepseek and _should_try_deepseek(seg):
+                try:
+                    import deepseek_expander
+                    ds_keywords, ds_status = deepseek_expander.expand_with_deepseek(seg)
+                    if ds_keywords:
+                        added = 0
+                        for kw in ds_keywords:
+                            if kw not in seen:
+                                seen.add(kw)
+                                result.append(kw)
+                                added += 1
+                        deepseek_results.append((seg, added, ds_status))
+                    else:
+                        # API 失败/无 key/空结果，降级到原样保留
+                        if seg not in seen:
+                            seen.add(seg)
+                            result.append(seg)
+                        kept.append(seg)
+                        deepseek_results.append((seg, 0, ds_status))
+                except ImportError:
+                    # deepseek_expander 模块不存在（打包时漏了），降级到离线
+                    if seg not in seen:
+                        seen.add(seg)
+                        result.append(seg)
+                    kept.append(seg)
+                except Exception as e:
+                    # 任何异常都降级，不阻断采集
+                    if seg not in seen:
+                        seen.add(seg)
+                        result.append(seg)
+                    kept.append(seg)
+                    deepseek_results.append((seg, 0, f"error: {str(e)[:30]}"))
+            else:
+                # 不调用 DeepSeek（use_deepseek=False 或判定不需要）
+                if seg not in seen:
+                    seen.add(seg)
+                    result.append(seg)
+                kept.append(seg)
 
     # 词表总量上限：扩词必须有界。用户粘一整份行业目录进来时，无界展开会造出
     # 上千个词，一夜之间把请求量放大几十倍（防采风险 + 绝大部分词根本轮不到跑）。
     truncated = len(result) > MAX_KEYWORDS
     if truncated:
         result = result[:MAX_KEYWORDS]
-    return {"keywords": result, "expanded": expanded,
-            "kept": kept, "dropped": dropped, "truncated": truncated}
+    
+    output = {"keywords": result, "expanded": expanded,
+              "kept": kept, "dropped": dropped, "truncated": truncated}
+    if use_deepseek:
+        output["deepseek"] = deepseek_results
+    
+    return output
+
+
+def _should_try_deepseek(seg: str) -> bool:
+    """判定该片段是否值得调用 DeepSeek API。
+    
+    避免浪费 API 调用的场景：
+      · 已经是具体产品词（长度 2-4 字、不含"与/和/及"等连接词）
+      · 纯英文/数字（B2B 站内搜索以中文为主）
+      · 太短（<3 字，多半是缩写或误输入）
+    
+    5 字及以上的中文词组多半是抽象行业类别（如"智能制造装备""新能源材料"），
+    需要调用 DeepSeek API 展开成具体产品词。
+    """
+    # 太短不试
+    if len(seg) < 3:
+        return False
+    
+    # 纯英文/数字不试
+    if not re.search(r"[\u4e00-\u9fa5]", seg):
+        return False
+    
+    # 已经是具体产品词的特征：短（2-4 字）且不含连接词
+    # 5 字以上多半是抽象类别（如"智能制造装备""新能源材料"），需要展开
+    if len(seg) <= 4 and not re.search(r"[与和及]", seg):
+        return False
+    
+    return True
 
 
 # ── 高产词「同族近义词」派生 ──────────────────────────────────

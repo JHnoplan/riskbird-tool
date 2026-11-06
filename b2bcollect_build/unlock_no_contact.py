@@ -35,6 +35,8 @@ SITE_BY_SOURCE = {
     "顺企网": "11467",
     "爱采购": "aipage",
     "麦麦B2B": "maimaib2b",
+    "跨国采购网": "globalimporter",
+    "马可波罗": "makepolo",
     "中国制造网": "mic",
 }
 EMPTY = {"", "nan", "none", "null", "-", "无", "暂无", "未提供", "未公开", "不详"}

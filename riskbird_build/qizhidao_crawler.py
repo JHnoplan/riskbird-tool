@@ -656,8 +656,10 @@ class QiZhiDaoCrawler:
                     result["可重采"] = True
                     return result
                 if not company_hash:
-                    self._log(f"  未找到公司: {name}")
-                    result["错误"] = "未找到公司（suggestPredict 无结果）"
+                    # 两种方案都失败了，给出更准确的错误信息
+                    fail_reason = getattr(self, "_last_fail_reason", "suggestPredict 和备用搜索均无结果")
+                    self._log(f"  未找到公司: {name}（{fail_reason}）")
+                    result["错误"] = f"未找到公司（{fail_reason}）"
                     return result
 
                 # 3. 直接构造详情页URL并导航（零搜索次数）
@@ -741,11 +743,11 @@ class QiZhiDaoCrawler:
             api_result = self.driver.execute_script("return window.__suggestPredictResult;")
 
             if not api_result:
-                self._log(f"  suggestPredict 未拦截到响应，尝试备用方案...")
+                self._log(f"  ⚠ suggestPredict 未拦截到响应，尝试备用方案...")
                 return self._get_hash_via_search(name)
 
             if not api_result.get("success"):
-                self._log(f"  suggestPredict 失败: {api_result.get('msg', '')}")
+                self._log(f"  ⚠ suggestPredict 失败: {api_result.get('msg', '')}，尝试备用方案...")
                 return self._get_hash_via_search(name)
 
             # 提取公司hash
@@ -755,11 +757,13 @@ class QiZhiDaoCrawler:
                 # 优先精确匹配
                 for item in company_list:
                     if item.get("name") == name:
+                        self._log(f"  ✅ suggestPredict 精确匹配: {name[:30]}...")
                         return item.get("id", "")
                 # 否则取第一个
+                self._log(f"  ✅ suggestPredict 模糊匹配: {company_list[0].get('name', '')[:30]}...")
                 return company_list[0].get("id", "")
 
-            self._log(f"  suggestPredict 无结果，尝试备用方案...")
+            self._log(f"  ⚠ suggestPredict 无结果（返回 {len(company_list)} 家公司），尝试备用方案...")
             return self._get_hash_via_search(name)
 
         except Exception as e:
@@ -776,9 +780,18 @@ class QiZhiDaoCrawler:
                       绝不能与 "" 混为一谈——混了就等于把断网当成「这家公司不存在」。"""
         try:
             search_url = f"{self.BASE_URL}/check?searchKey={urllib.parse.quote(name)}&tagNum=1"
+            self._log(f"  备用方案: 打开搜索页 {search_url[:80]}...")
             self.driver.get(search_url)
             time.sleep(3)
 
+            # 检查页面是否真正加载完成（防止水合未完成就查找）
+            for wait in range(3):
+                ready_state = self.driver.execute_script("return document.readyState;")
+                body_len = len(self.driver.execute_script("return document.body.innerText;") or "")
+                if ready_state == "complete" and body_len > 500:
+                    break
+                time.sleep(1)
+            
             result_links = self.driver.find_elements(
                 By.XPATH, "//a[contains(@href,'/company/')]"
             )
@@ -786,9 +799,12 @@ class QiZhiDaoCrawler:
                 href = result_links[0].get_attribute("href") or ""
                 hash_match = re.search(r'/company/([a-f0-9]+)\.html', href)
                 if hash_match:
-                    self._log(f"  备用方案: 从搜索页获取hash")
+                    self._log(f"  ✅ 备用方案: 从搜索页获取hash（{len(result_links)} 个结果）")
                     return hash_match.group(1)
 
+            # 搜索页打开了但没找到公司链接
+            self._last_fail_reason = f"搜索页无该公司链接（可能真查不到或页面结构变化）"
+            self._log(f"  ❌ 备用方案: 搜索页未找到公司链接")
             return ""
         except Exception as e:
             # 2026-11-04 09:35 实机：断网时这里抛 net::ERR_INTERNET_DISCONNECTED，
@@ -796,7 +812,8 @@ class QiZhiDaoCrawler:
             # 就被记成「企知道查不到→永久丢弃」，而它只是那一刻没网。
             why = str(e).splitlines()[0][:80] or type(e).__name__
             self._hash_fail_reason = why
-            self._log(f"  备用方案失败: {e}")
+            self._last_fail_reason = f"搜索页打开失败（{why}）"
+            self._log(f"  ❌ 备用方案失败: {e}")
             return None
 
     # ── 从详情页提取数据（NUXT + DOM 混合） ──

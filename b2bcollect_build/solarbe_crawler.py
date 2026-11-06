@@ -112,6 +112,10 @@ class SolarbeCrawler(CdpSiteCrawler):
         self.max_pages = 0
         self._session = self._new_session()
         self._empty_streak = 0
+        # 已知「正文永久为空」的页（商铺已关/已注销）：命中就不再请求。
+        # 跟 _empty_streak 分开存是有意的：前者是「这一页没有」，后者是「现在拿不到页」。
+        self._blank_urls = set()
+        self._last_blank_page = False
 
     def _new_session(self):
         s = requests.Session()
@@ -149,12 +153,38 @@ class SolarbeCrawler(CdpSiteCrawler):
             pass
         return self._block_reason or "索比光伏网仍在限流状态"
 
+    def _control_ok(self):
+        """对照实测：拿一个已知正常时稳定返回 ~75KB 的页（空关键词搜索首页）探一刀，
+        用结果把「这一页本身就是空的」和「整个 IP 被限流」分开。
+        不花这一个请求做对照，就会把已注销商铺的空页误判成限流：全量脚本因此每轮
+        都在同样三家身上撞熔断、每轮只推进 1 片（2026-11-04 实测 bj1103、
+        hfgkjg3235、grandglow24 三家恒返回 200+0 字节，而同时刻别家 5.6KB 正常）。"""
+        try:
+            self._pace_before_request()
+            r = self._session.get(f"{SEARCH_URL}?kw=&catid=0&areaid=0&page=1", timeout=20)
+            return r.status_code == 200 and len(r.text or "") >= self.MIN_PAGE_CHARS
+        except Exception:
+            return False
+
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
     def _fetch(self, url, tries=4, ua=None, guarded=True):
         """桌面/手机两套 UA 共用一条会话：详情靠手机 UA 才拿得到明文联系方式。
-        200 但正文小于 MIN_PAGE_CHARS 是本站的异常形态（实测同一时刻别家正常），
-        先重建会话重试；连续多页都空才升格为 IP 级限流交看门狗，绝不静默当空数据。"""
+    
+        200 但正文小于 MIN_PAGE_CHARS 有两种完全不同的成因，处置也必须分开：
+          · 这家公司在名录里已被删除/关店 → 站方就是给一张 0 字节空页（换 UA、
+            换 http/https、隔几天再要都一样空）——终态，再重试只烧请求量；
+          · 出口 IP 被限流 → 一段时间内**所有**页都拿不到正文，等冷却才恢复。
+        旧实现把两者混为一谈：同一条 URL 的每次重试都往 _empty_streak 上加一笔
+        （tries=3 ⇒ 一家死页自己就能把计数顶到 3），当场升格成「IP 级限流」触发熔断。
+        现在改成：一条 URL 只记一笔，并用 _control_ok() 实测定性——对照页正常就把这一页
+        记进 _blank_urls（以后零请求直接跳过），对照页也不行才交看门狗等冷却。
+        两种情况都不静默把「拿不到页」当成「这一家没数据」。"""
         last = ""
+        self._last_blank_page = False
+        if url in self._blank_urls:
+            self._last_blank_page = True
+            return ""
+        blank_seen = False
         for i in range(max(1, tries)):
             try:
                 self._pace_before_request()
@@ -174,7 +204,7 @@ class SolarbeCrawler(CdpSiteCrawler):
                 if r.status_code == 404:
                     return ""
                 if r.status_code == 200:
-                    self._empty_streak += 1
+                    blank_seen = True
                     self._session.close()
                     self._session = self._new_session()
             except requests.exceptions.ConnectionError as e:
@@ -185,9 +215,16 @@ class SolarbeCrawler(CdpSiteCrawler):
                 last = str(e).splitlines()[0][:80]
             if i < tries - 1:
                 time.sleep(1.2 * (i + 1))
-        if self._empty_streak >= 3 and not self._block_reason:
-            self._block_reason = "站点连续返回空白页（IP 级限流，等冷却即可）"
-            self._block_kind = "ip"
+        if blank_seen:
+            # 一条 URL 跑完全程重试仍空，才记一笔（旧代码按重试次数累加，一家死页就能顶满 3）
+            self._empty_streak += 1
+            if self._control_ok():
+                self._blank_urls.add(url)
+                self._empty_streak = 0
+                self._last_blank_page = True
+            elif not self._block_reason:
+                self._block_reason = "站点连续返回空白页（IP 级限流，等冷却即可）"
+                self._block_kind = "ip"
         if guarded and self._block_reason:
             if self.handle_http_block(url):
                 self._block_reason = ""
@@ -292,15 +329,17 @@ class SolarbeCrawler(CdpSiteCrawler):
                     if key in self._seen_members or nkey in self._seen_members \
                             or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
                         continue
-                    self._seen_members.add(key)
-                    self._seen_members.add(nkey)
                     # 早过滤只看卡片的主营产品（拿不到就 fail-open），判定交给详情页复核
+                    # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                     if not self.is_relevant(kw, self.stub_relevance_text(e)):
                         skipped += 1
                         self._early_skipped += 1
+                        self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                         self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                                "公司名称": e["公司名称"], "memberId": mid})
                         continue
+                    self._seen_members.add(key)
+                    self._seen_members.add(nkey)
                     e["关键词"] = kw
                     new += 1
                     yielded += 1
@@ -338,7 +377,9 @@ class SolarbeCrawler(CdpSiteCrawler):
         rec["详情URL"] = url
         html = self._fetch(url, tries=3, ua=_UA_MOBILE)
         if not html:
-            rec["状态"] = "详情页导航失败"
+            # 空页分两种：这一家本身就是空的（终态，别再占下一轮的量）/ 拿不到页（瞬时，下轮重采）
+            rec["状态"] = ("无联系方式(商铺已清空)" if self._last_blank_page
+                          else "详情页导航失败")
             return rec
         if "公司不存在" in html:
             # 名录里已删除/改名的公司：终态，别再拿它占下一轮的采集量

@@ -418,8 +418,9 @@ class MakepoloCrawler(CdpSiteCrawler):
         # 省份精准采集：页面地区列表由 search_alljs 的 search_page() 拼 `&ae=<元素id>`，
         # id 就是省份拼音（注意山西 shanxi／陕西 shanxii）。2026-11-04 探针 A/B 实锤
         # 服务端真过滤（ae=guangdong 与全国结果集重合仅 2/26）。
+        # 多省场景：URL 参数只能指向一个省，多省时放弃参数直筛，退回数据层过滤。
         pv = getattr(self, "province", "")
-        if pv:
+        if pv and "," not in pv:
             ae = _pf.param_value("makepolo", pv, "pinyin")
             if ae:
                 return f"{url}&ae={ae}"

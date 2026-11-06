@@ -2,14 +2,14 @@
 b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI）
 
 一个共享 Chrome，需浏览器的站各占一个标签并行采集：
-  · 关键词并行（8 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
+  · 关键词并行（9 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
     顺企网 11467.com / 爱采购 b2b.aipage.com / 麦麦B2B maimaib2b.com /
-    跨国采购网 globalimporter.net / 马可波罗 cn.makepolo.com
+    跨国采购网 globalimporter.net / 马可波罗 cn.makepolo.com / 世界工厂网 qiye.gongchang.com
     （除中国制造网外均纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
   · 名单驱动（企知道）：从「待采集公司名单」逐家补采，看门狗语义——名单空则休眠，
     关键词采集清洗掉的无联系方式废数据会自动回流到名单、唤醒企知道补采（变废为宝）。
 导入或粘贴一批关键词（或上传公司名单）→ 智能匹配行业列表页 → 进详情页取联系方式 →
-边采边自动保存 → 导出「原始 + 清洗后入库」两份 Excel；支持断点续采、被验证码/风控拦截时
+边采边自动保存 → 导出「原始 + 清洗后入库 + 国内只留手机号」三份 Excel；支持断点续采、被验证码/风控拦截时
 弹窗等人工过验证后自动继续、导入云展动力客户库。
 
 运行：python b2bcollect_gui.py
@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
-    QSizePolicy, QGridLayout, QRadioButton,
+    QSizePolicy, QGridLayout, QRadioButton, QScrollArea,
 )
 
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
@@ -39,6 +39,12 @@ from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
 import customer_library_cleaner as _cleaner
 import keyword_expander as _kwexp
 import province_filter as _pfilter
+
+try:
+    import enhanced_cleaner as _enhanced
+    HAS_ENHANCED = True
+except ImportError:
+    HAS_ENHANCED = False
 
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
 # done=✅绿粗「已完成」/ stopped=■橙粗「已停止」/ running=●蓝「进行中」
@@ -487,6 +493,13 @@ SITE_TIPS = {
               "也不猜一个地址出来，免得把你的邮件发到陌生人邮箱里；⑤有的商家把手机号的前缀当成区号写进“电话”栏"
               "（如手机 19352178592 被写成“0193-52178592”），这种号看着像固话但全国没有这个区号、一定拨不通，"
               "工具会对着真实长途区号表核一遍再决定入库，手机号仍留在手机那一列。",
+    "gongchang": "世界工厂网 qiye.gongchang.com（全行业企业库）：关键词公司搜索→列表页取基本信息→"
+                "进店铺详情页补电话/邮箱/地址。纯 HTTP 不占浏览器标签。\n"
+                "列表页每页 20 家，每词最多 10 页（200 家），但电话覆盖率只有 28%，"
+                "所以工具会自动进每家店铺详情页补全联系方式（电话 100%、邮箱 60%、地址 20%）。\n"
+                "防采：连续请求过快会触发频控（返薄壳），工具自动重建会话并退避重试，已采数据不丢。\n"
+                "省份精准：选中一个省份时工具会把省份参数拼进搜索 URL（服务端筛），"
+                "选多个省时退回数据层核验（用公司名+地址判定属地）。",
     "1688": "1688 www.1688.com：关键词→商品/店铺搜索→公司详情页。需先登录（有登录限制，故默认不勾选）；"
             "勾选后会弹窗提示并可一键打开 1688 登录页，请先在浏览器里确认已登录再开始采集。\n"
             "与其它需浏览器的站共享同一个 Chrome（各占自己标签），绝不会另开浏览器。",
@@ -498,14 +511,22 @@ SITE_TIPS = {
 
 
 def build_stats_html(text, site_status=None):
-    """把状态行文本「已采 N 家　站名 x｜站名 y」渲染为带图标+着色的富文本。
+    """把状态行文本「已采 N 家 站名 x｜站名 y」渲染为带图标+着色的富文本。
+
+    紧凑徽章式布局（对齐 GitHub Actions / Jenkins 任务实况惯例）：
+      · 图标即状态（✅完成 / ●进行中 / ■停止），不再重复「·已完成」文字
+      · 按状态分组排列：进行中 → 已完成 → 已停止，视觉焦点在「还在跑的」
+      · 站名+数字紧凑拼接，站间用细竖线分隔
+      · 完整明细（含状态文字）挂 tooltip，鼠标悬停可读
     纯函数、无副作用，便于离线断言；无站点状态时原样返回纯文本（降级兼容）。"""
     status = site_status or {}
     if not status or "<" in (text or ""):
         return text or ""
-    head, _, tail = text.partition("　")
+    head, _, tail = text.partition(" ")
     palette = STATS_STYLE_DARK if _is_dark_theme() else STATS_STYLE
-    segs = []
+
+    # 解析各站数据：提取站名+数字
+    site_data = []
     for s in SITE_ORDER:
         name = SITE_NAMES.get(s)
         if not name or name not in tail:
@@ -514,12 +535,35 @@ def build_stats_html(text, site_status=None):
         j = tail.find("｜", i)
         raw = tail[i:j].strip() if j >= 0 else tail[i:].strip()
         st = status.get(s, "running")
+        # 从 raw 里提取站名后面的数字（如 "中国制造网 47" → "47"，"1688 36" → "36"）
+        after_name = raw[len(name):].strip()
+        num_m = re.search(r"(\d+)", after_name)
+        num = num_m.group(1) if num_m else "0"
+        site_data.append((s, name, num, st))
+
+    if not site_data:
+        return text
+
+    # 按状态分组排序：running 优先 → done → stopped
+    _st_order = {"running": 0, "done": 1, "stopped": 2}
+    site_data.sort(key=lambda x: _st_order.get(x[3], 1))
+
+    # 构建紧凑 HTML 段
+    segs = []
+    tooltip_parts = []
+    for s, name, num, st in site_data:
         color, icon = palette.get(st, palette["running"])
         mark = {"done": "已完成", "stopped": "已停止"}.get(st, "进行中")
-        # 终态整段加粗（扫一眼就能扫到），进行中保持常规字重避开视觉噪声
-        bold = "" if st == "running" else "font-weight:bold;"
-        segs.append(f'<span style="color:{color};{bold}">{icon} <b>{raw}</b>·{mark}</span>')
-    return f'{head}　{"｜".join(segs)}' if segs else text
+        # 紧凑格式：图标+站名+数字（不加粗，靠颜色区分）
+        segs.append(f'<span style="color:{color}">{icon}{name} {num}</span>')
+        tooltip_parts.append(f"{icon} {name} {num} {mark}")
+
+    # 用细竖线分隔，比 ｜ 更紧凑
+    _sep = ' <span style="color:#888">|</span> '
+    html = head + '  ' + _sep.join(segs)
+    # 完整明细挂 tooltip
+    _tip = '  ·  '.join(tooltip_parts)
+    return '<span title="' + _tip + '">' + html + '</span>'
 
 try:
     import yzd_client as _yzd
@@ -575,9 +619,9 @@ class CrawlWorker(QThread):
             self.session._log(f"❌ 采集线程异常：{e}")
 
 
-# ── 自动保存线程：各平台合并写「原始 + 清洗后入库」两份 ──────────────
+# ── 自动保存线程：各平台合并写「原始 + 清洗后入库 + 国内只留手机号」三份 ──────
 class AutoSaveWorker(QThread):
-    saved = pyqtSignal(str, int)   # 路径, 条数
+    saved = pyqtSignal(str, int, int)   # 路径, 原始条数, 国内手机条数
     failed = pyqtSignal(str)
 
     def __init__(self, session, rows, session_dir):
@@ -594,7 +638,10 @@ class AutoSaveWorker(QThread):
             self._write_raw(raw, self.rows)
             cl = ts_dir / "企业数据_清洗后入库数据.xlsx"
             self._write_cleaned(cl, self.rows)
-            self.saved.emit(str(raw), len(self.rows))
+            # 精细化：额外生成「国内只留手机号」文件，与导入客户库同一口径
+            cl_mobile = ts_dir / "企业数据_国内只留手机号.xlsx"
+            mobile_n = self._write_cn_mobile_file(cl_mobile, self.rows)
+            self.saved.emit(str(raw), len(self.rows), mobile_n)
         except PermissionError:
             self.failed.emit("文件正被 Excel/WPS 打开占用，本次自动保存跳过，关闭后下轮补上")
         except Exception as e:
@@ -621,6 +668,20 @@ class AutoSaveWorker(QThread):
         tmp = str(path) + ".tmp"
         _cleaner.write_clean_excel(clean_rows, tmp, template_path=template, log=lambda m: None)
         os.replace(tmp, str(path))
+
+    def _write_cn_mobile_file(self, path, rows):
+        """清洗 → 过滤中国手机号 → 写 18 列模板 Excel，返回写入行数。
+
+        与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+        自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。
+        """
+        clean_rows = self.session.clean_records(rows, log=lambda m: None)
+        mobile_rows = _yzd.filter_cn_mobile_rows(clean_rows, log=lambda m: None)
+        template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
+        tmp = str(path) + ".tmp"
+        _cleaner.write_clean_excel(mobile_rows, tmp, template_path=template, log=lambda m: None)
+        os.replace(tmp, str(path))
+        return len(mobile_rows)
 
 
 # ═══════════════════════════════════════════
@@ -697,6 +758,57 @@ class ExternalCleanWorker(QThread):
         if skipped:
             summary += f"\n\n被跳过：\n{skipped}"
         self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
+        self.finished_clean.emit(True, summary)
+
+
+# ═══════════════════════════════════════════
+#  增强三文件清洗（libphonenumber + 区域推断 → 国内/国内手机/国外）
+# ═══════════════════════════════════════════
+class EnhancedExternalCleanWorker(QThread):
+    """增强清洗：libphonenumber 深度解析电话 + 五层区域推断 → 输出三个文件。
+
+    与 ExternalCleanWorker 共用同一套列匹配/合并管线，只替换电话解析与区域判定环节。
+    输出：国内（全量）、国内只留手机号（至少一条中国手机号）、国外（境外记录）。
+    """
+    logged = pyqtSignal(str)
+    finished_clean = pyqtSignal(bool, str)
+
+    def __init__(self, paths, output_dir):
+        super().__init__()
+        self.paths = list(paths or [])
+        self.output_dir = output_dir
+
+    def run(self):
+        try:
+            self._run_all()
+        except Exception as e:
+            self.finished_clean.emit(False, f"增强清洗异常：{e}")
+
+    def _run_all(self):
+        if not HAS_ENHANCED:
+            self.finished_clean.emit(False, "增强清洗模块未加载（enhanced_cleaner 导入失败）")
+            return
+        result, report = _enhanced.enhanced_clean_three_files(
+            self.paths, self.output_dir, log=self.logged.emit)
+        if not result:
+            self.finished_clean.emit(False, "增强清洗后没有可入库的记录")
+            return
+        bad = [r for r in report if r.get("error")]
+        files = "\n".join(
+            f"· {r['file']}（{r['sheet']}）：{r['rows']} 条" for r in report if not r.get("error"))
+        skipped = "\n".join(f"⚠ {r['file']}：{r['error']}" for r in bad)
+        matched = "；".join(
+            "，".join(r.get("identified") or []) for r in report if r.get("identified"))
+        self.logged.emit(f"🧾 列匹配结果：{matched}" if matched else "🧾 本次没用到列名识别结果")
+
+        lines = ["增强清洗完成（libphonenumber + 五层区域推断）\n"]
+        for label in ("国内", "国内只留手机号", "国外"):
+            path, count = result.get(label, ("-", 0))
+            lines.append(f"  {label}：{count} 条 → {path}")
+        lines.append(f"\n读入的文件：\n{files or '· 无'}")
+        if skipped:
+            lines.append(f"\n被跳过：\n{skipped}")
+        summary = "\n".join(lines)
         self.finished_clean.emit(True, summary)
 
 
@@ -813,6 +925,9 @@ class YzdImportWorker(QThread):
             try:
                 rows = self.session.clean_records(records, log=self.logged.emit)
                 rows = _yzd.dedupe_rows(rows, log=self.logged.emit)
+                # 精细化导入：与「清洗数据」三份文件中的「国内只留手机号」同一口径，
+                # 没有中国手机号的行不进客户库（固话/邮箱再多也不够格）
+                rows = _yzd.filter_cn_mobile_rows(rows, log=self.logged.emit)
             except Exception as e:
                 msg = f"清洗失败：{e}"
                 self.logged.emit(f"⚠ 「{name}」{msg}")
@@ -820,7 +935,7 @@ class YzdImportWorker(QThread):
                 self.task_done.emit(name, 0, 0, 0, msg)
                 continue
             if not rows:
-                msg = "清洗后没有可导入的记录"
+                msg = "清洗后没有含中国手机号的记录可导入"
                 self.logged.emit(f"⚠ 「{name}」跳过：{msg}")
                 results.append((name, 0, 0, 0, msg))
                 self.task_done.emit(name, 0, 0, 0, msg)
@@ -858,43 +973,93 @@ class YzdImportWorker(QThread):
 
 
 class ProvincePickerDialog(QDialog):
-    """「选择省份」弹窗：全国 31 省 + 港澳台，外加「全国（不限省份）」默认项。
-    单选；选中结果写 dialog.chosen（""=全国不限）。交互和 1688 登录弹窗一样：
-    界面上点按钮就弹出来，选完点确定回到主界面。"""
+    """「选择省份」弹窗（多选版）：全国 31 省 + 港澳台，支持复选。
+    对齐大厂（淘宝/京东/美团）地址多选交互：
+      · 快捷操作：全选 / 清空 / 按大区一键选
+      · 滚动区域：34 个省级行政区分 6 列排布，不撑爆窗口
+      · 实时摘要：底部标签动态显示「已选 N 个省：广东、浙江…」「全国（不限省份）」
+    选中结果写 dialog.chosen_list（list）；空列表 = 全国不限。"""
 
-    def __init__(self, current="", parent=None):
+    # 大区快捷选择（对齐民政部行政区划分组，用户心智模型一致）
+    REGIONS = {
+        "华北": ["北京", "天津", "河北", "山西", "内蒙古"],
+        "东北": ["辽宁", "吉林", "黑龙江"],
+        "华东": ["上海", "江苏", "浙江", "安徽", "福建", "江西", "山东"],
+        "中南": ["河南", "湖北", "湖南", "广东", "广西", "海南"],
+        "西南": ["重庆", "四川", "贵州", "云南", "西藏"],
+        "西北": ["陕西", "甘肃", "青海", "宁夏", "新疆"],
+        "特区": ["香港", "澳门", "台湾"],
+    }
+
+    def __init__(self, current_list=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择采集省份")
-        self.chosen = ""
-        self._current = str(current or "")
+        self.setWindowTitle("选择采集省份（可多选）")
+        self.setMinimumWidth(560)
+        self.chosen_list = list(current_list or [])   # 返回给调用方的选中列表
+        self._checks = {}                             # {province_name: QCheckBox}
         self._init_ui()
 
+    # ── UI 构建 ───────────────────────────────────────────────
     def _init_ui(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 14)
         lay.setSpacing(10)
-        tip = QLabel("只采这个省份的企业：每个平台都会把采回来的记录按地址与公司名核一遍属地，"
-                      "支持地区筛选的网站额外再交给网站筛；页面上与公司名都看不出省份的，"
-                      "转企知道按工商地址反查。选「全国」则不限省份。")
+
+        # 说明文字
+        tip = QLabel("可多选省份，只采这些省份的企业。支持地区筛选的网站（中国制造网 / 马可波罗 / 1688）"
+                     "额外交给网站筛；其余网站按页面地址与公司名把关；看不出省份的转企知道按工商地址反查。"
+                     "不选 = 全国不限。")
         tip.setWordWrap(True)
+        tip.setStyleSheet(_muted_style())
         lay.addWidget(tip)
-        grid = QGridLayout()
+
+        # ── 快捷操作栏 ──
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        btn_all = QPushButton("全选")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none = QPushButton("清空")
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        quick.addWidget(btn_all)
+        quick.addWidget(btn_none)
+        quick.addSpacing(8)
+        quick.addWidget(QLabel("大区："))
+        for region_name, provinces in self.REGIONS.items():
+            btn = QPushButton(region_name)
+            btn.setToolTip(f"快速选择{region_name}地区：{'、'.join(provinces)}")
+            btn.clicked.connect(lambda checked, pvs=provinces: self._select_region(pvs))
+            quick.addWidget(btn)
+        quick.addStretch(1)
+        lay.addLayout(quick)
+
+        # ── 省份复选框滚动区域 ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(260)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        container = QWidget()
+        grid = QGridLayout(container)
         grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(8)
-        self._group = QButtonGroup(self)
-        self._radios = {}
-        items = [""] + _pfilter.PROVINCES
-        for i, pv in enumerate(items):
-            rb = QRadioButton(pv if pv else "全国（不限省份）")
-            if pv == self._current:
-                rb.setChecked(True)
-            self._group.addButton(rb)
-            self._radios[rb] = pv
-            grid.addWidget(rb, i // 6, i % 6)
-        if not self._current:
-            # 默认项兑底：上面没命中任何按钮时（理论上不会发生）仍勾全国
-            next(rb for rb, v in self._radios.items() if v == "").setChecked(True)
-        lay.addLayout(grid)
+        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(8, 4, 8, 4)
+        for i, pv in enumerate(_pfilter.PROVINCES):
+            cb = QCheckBox(pv)
+            if pv in self.chosen_list:
+                cb.setChecked(True)
+            cb.toggled.connect(self._update_summary)
+            self._checks[pv] = cb
+            grid.addWidget(cb, i // 6, i % 6)
+        scroll.setWidget(container)
+        lay.addWidget(scroll)
+
+        # ── 已选摘要 ──
+        self._summary = QLabel()
+        self._summary.setWordWrap(True)
+        self._summary.setStyleSheet("font-weight: bold; padding: 4px 0;")
+        lay.addWidget(self._summary)
+        self._update_summary()
+
+        # ── 确定 / 取消 ──
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("确定")
         bb.button(QDialogButtonBox.Cancel).setText("取消")
@@ -902,11 +1067,36 @@ class ProvincePickerDialog(QDialog):
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
+    # ── 交互方法 ──────────────────────────────────────────────
+    def _set_all(self, checked):
+        """全选 / 清空所有省份。"""
+        for cb in self._checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        self._update_summary()
+
+    def _select_region(self, provinces):
+        """大区快捷选择：清空其他，只选该大区内的省份（单选互斥，避免误叠加）。"""
+        for pv, cb in self._checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(pv in provinces)
+            cb.blockSignals(False)
+        self._update_summary()
+
+    def _update_summary(self):
+        """实时更新底部摘要标签（已选数量 + 省份名列表）。"""
+        selected = [pv for pv, cb in self._checks.items() if cb.isChecked()]
+        if not selected:
+            self._summary.setText("🗺 全国（不限省份）")
+            self._summary.setStyleSheet(_muted_style("font-weight: bold; padding: 4px 0;"))
+        else:
+            self._summary.setText(f"🗺 已选 {len(selected)} 个省：{'、'.join(selected)}")
+            self._summary.setStyleSheet(
+                f"color:{_accent_color()}; font-weight: bold; padding: 4px 0;")
+
     def _on_ok(self):
-        for rb, pv in self._radios.items():
-            if rb.isChecked():
-                self.chosen = pv
-                break
+        self.chosen_list = [pv for pv, cb in self._checks.items() if cb.isChecked()]
         self.accept()
 
 
@@ -1365,7 +1555,7 @@ class MainWindow(QMainWindow):
         self._kw_source_file = ""
         self._co_source_file = ""   # 公司名单文件（企知道补采）
         self._opening_login = False  # 防重复点「打开企知道/1688」同时拉多个后台线程
-        self.selected_province = ""  # 省份精准采集：""=全国不限（「选择省份」弹窗设定）
+        self.selected_provinces = []  # 省份精准采集（多选）：[]=全国不限（「选择省份」弹窗设定）
         self._kw_expanded_text = ""  # 上次自动扩词写回的内容（同内容不再二次展开）
         self.session_dir = None
         self._first_start = None
@@ -1449,16 +1639,16 @@ class MainWindow(QMainWindow):
             "注意：解析结果由内置行业知识库生成，仅供参考，不一定完全符合你的需求，请检查后再采集。")
         hr.addWidget(self.btn_file); hr.addWidget(self.btn_paste)
         hr.addWidget(self.btn_parse); hr.addWidget(self.btn_smart)
-        # 省份精准采集：和 1688 登录一样点按钮弹窗；默认不选（全国不限）。
+        # 省份精准采集（多选）：和 1688 登录一样点按钮弹窗；默认不选（全国不限）。
         self.btn_province = QPushButton("选择省份")
         self.btn_province.setToolTip(
-            "只采某个省份的企业数据。默认不选=全国都采。\n"
+            "可选多个省份，只采这些省份的企业数据。默认不选=全国都采。\n"
             "・支持按地区筛选的网站（中国制造网 / 马可波罗 / 1688）：把省份交给网站筛，"
             "采回来的每一条仍然用地址/公司名本地核一遍（网站筛不作为保证）；\n"
             "・其余网站页面上没地区筛选：按页面上写的地区与公司名把关，不是所选省份的不入库；\n"
             "・页面上与公司名都看不出省份的：不拍脑袋入库，转企知道按工商登记地址反查一次"
-            "（在本省就连联系方式一起补上，外省则丢弃）。\n"
-            "选好点「确定」，主界面上会显示当前选的是哪里。")
+            "（在目标省就连联系方式一起补上，外省则丢弃）。\n"
+            "支持全选/清空/大区快捷选择，选好点「确定」即可。")
         hr.addWidget(self.btn_province)
         hr.addStretch(1)
         v.addLayout(hr)
@@ -1509,26 +1699,39 @@ class MainWindow(QMainWindow):
         lay.addLayout(top)
 
         gb_site = QGroupBox("③ 采集平台（关键词并行）")
+        # 多平台合并显示：除 1688 需单独勾选（有登录限制）外，其余站统一归为「多平台」
+        _multi_slugs = [s for s in SITE_ORDER if s != "1688"]
+        _multi_names = " / ".join(SITE_NAMES.get(s, s) for s in _multi_slugs)
         gb_site.setToolTip(
+            f"多平台包含：{_multi_names}，勾选后全部同时启用。\n"
             "任一站点命中防采验证都会弹窗提醒并由看门狗自动续采。\n"
-            "八方资源网 / 顺企网 / 爱采购 / 麦麦B2B / 跨国采购网 / 马可波罗 均为纯 HTTP，不占浏览器标签"
-            "（看不到它们的标签是正常的，被反采质询时才会临时借一个标签过盾）；\n"
-            "中国制造网 / 1688 各占一个浏览器标签。1688 需登录，默认不勾选。\n\n"
+            "八方资源网 / 顺企网 / 爱采购 / 麦麦B2B / 跨国采购网 / 马可波罗 / 世界工厂网 "
+            "均为纯 HTTP，不占浏览器标签；\n"
+            "中国制造网占一个浏览器标签；1688 需登录，默认不勾选。\n\n"
             + "\n\n".join(SITE_TIPS.get(s, "") for s in SITE_ORDER))
         vs = QVBoxLayout(gb_site)
-        # 七个站一排会把名字挤掉，改成每行 4 个的网格（按 SITE_ORDER 顺序填）
         gs = QGridLayout()
         gs.setContentsMargins(0, 0, 0, 0)
         self.site_checks = {}
-        for i, slug in enumerate(SITE_ORDER):
-            chk = QCheckBox(SITE_NAMES[slug])
-            # 1688 有登录限制，默认不勾（勾选时弹窗提示登录）
-            chk.setChecked(slug != "1688")
-            chk.setToolTip(SITE_TIPS.get(slug, ""))
-            if slug == "1688":
-                chk.toggled.connect(lambda on, s=slug: self._on_site_toggled(s, on))
-            gs.addWidget(chk, i // 4, i % 4)
-            self.site_checks[slug] = chk
+        # 「多平台」复选框：一个视觉 checkbox 控制所有非 1688 站点
+        chk_multi = QCheckBox("多平台（8站）")
+        chk_multi.setChecked(True)
+        chk_multi.setToolTip(f"包含：{_multi_names}\n"
+                             "全部为纯 HTTP 采集，不占浏览器标签（被反采质询时临时借标签过盾）。\n"
+                             "勾选后 8 个平台同时并行采集。")
+        for s in _multi_slugs:
+            self.site_checks[s] = chk_multi     # 多个 slug 共享同一 checkbox
+        gs.addWidget(chk_multi, 0, 0)
+        # 1688 单独勾选（有登录限制，默认不勾）
+        if "1688" in [s for s in SITE_ORDER if s in self.site_checks or True]:
+            from parallel_session import SITE_CLASSES as _sc
+            if "1688" in _sc:
+                chk_1688 = QCheckBox("1688")
+                chk_1688.setChecked(False)
+                chk_1688.setToolTip(SITE_TIPS.get("1688", ""))
+                chk_1688.toggled.connect(lambda on: self._on_site_toggled("1688", on))
+                self.site_checks["1688"] = chk_1688
+                gs.addWidget(chk_1688, 0, 1)
         vs.addLayout(gs)
         lay.addWidget(gb_site)
 
@@ -1987,21 +2190,29 @@ class MainWindow(QMainWindow):
         self._update_bar()
 
     def _on_pick_province(self):
-        """「选择省份」弹窗：选完回显到 lbl_province（小白也能一眼看清本次采哪里）。"""
-        dlg = ProvincePickerDialog(self.selected_province, self)
+        """「选择省份」弹窗（多选）：选完回显到 lbl_province（一眼看清本次采哪些省）。"""
+        dlg = ProvincePickerDialog(self.selected_provinces, self)
         if dlg.exec_() != QDialog.Accepted:
             return
-        self.selected_province = dlg.chosen
+        self.selected_provinces = dlg.chosen_list
         self._refresh_province_label()
-        if self.selected_province:
-            self._on_log(f"🗺 采集范围已设为「{self.selected_province}」：开始采集后每个平台都会按这个省份把关")
+        if self.selected_provinces:
+            names = "、".join(self.selected_provinces)
+            self._on_log(f"🗺 采集范围已设为「{names}」（{len(self.selected_provinces)} 个省）："
+                         "开始采集后每个平台都会按这些省份把关")
         else:
             self._on_log("🗺 采集范围已改回「全国」：开始采集后不限省份")
 
     def _refresh_province_label(self):
-        self.lbl_province.setText(
-            f"🗺 采集范围：{self.selected_province}（只采{self.selected_province}的企业）"
-            if self.selected_province else "🗺 采集范围：全国（不限省份）")
+        if not self.selected_provinces:
+            self.lbl_province.setText("🗺 采集范围：全国（不限省份）")
+        elif len(self.selected_provinces) <= 3:
+            names = "、".join(self.selected_provinces)
+            self.lbl_province.setText(f"🗺 采集范围：{names}（只采这些省份的企业）")
+        else:
+            names = "、".join(self.selected_provinces[:3])
+            self.lbl_province.setText(
+                f"🗺 采集范围：已选 {len(self.selected_provinces)} 个省（{names}…）")
 
     def _start_timer(self):
         self._crawl_start_ts = time.time()
@@ -2378,9 +2589,10 @@ class MainWindow(QMainWindow):
                                max_pages=0,      # 不限页数：翻到没有新数据自然切下一个关键词
                                relevance_guard=self.chk_guard.isChecked(),
                                incremental=self.chk_incr.isChecked(),
-                               province=self.selected_province)
-        if self.selected_province:
-            self._on_log(f"🗺 本次按省份「{self.selected_province}」精准采集："
+                               province=self.selected_provinces)
+        if self.selected_provinces:
+            names = "、".join(self.selected_provinces)
+            self._on_log(f"🗺 本次按 {len(self.selected_provinces)} 个省「{names}」精准采集："
                          "支持地区筛选的站交给网站筛、采回来的每条再按地址与公司名本地复核；"
                          "其余站直接按页面标注地区与公司名把关，对不上的不入库；"
                          "看不出省份的转企知道按工商地址反查后再定")
@@ -2493,10 +2705,11 @@ class MainWindow(QMainWindow):
             self._pending_save = False
             self.request_autosave()
 
-    def _on_saved(self, path, n):
+    def _on_saved(self, path, n, mobile_n=0):
         now = time.strftime("%H:%M:%S")
-        self._on_log(f"💾 已自动保存 {n} 条 → {path}")
-        self.lbl_save_info.setText(f"💾 上次自动保存：{now}（{n} 条）→ {path}")
+        mobile_hint = f"（国内手机 {mobile_n} 条）" if mobile_n else ""
+        self._on_log(f"💾 已自动保存 {n} 条{mobile_hint} → {path}")
+        self.lbl_save_info.setText(f"💾 上次自动保存：{now}（原始 {n} 条{mobile_hint}）→ {path}")
         self.lbl_save_info.setVisible(True)
         if HAS_YZD and self._task_id:
             try:
@@ -2507,27 +2720,15 @@ class MainWindow(QMainWindow):
         self._persist_progress()
 
     def _on_clean_now(self):
-        """「清洗数据」：先选清洗对象——用户上传的任意 Excel/CSV（智能匹配列名洗成
-        入库模版格式），或本工具已采集的数据（原逻辑：两份表格+废数据回流）。"""
+        """「清洗数据」：直接选文件 → 选输出目录 → 增强清洗输出三文件（国内/国内手机/国外）。
+        不再弹模式选择对话框，用户只管上传文档即可。"""
         if getattr(self, "_cleaning", False):
             QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("选择清洗对象")
-        box.setText("要清洗哪种数据？")
-        btn_ext = box.addButton(
-            "清洗我上传的 Excel/CSV 表格\n（任何名单，智能匹配列名，按入库模版格式输出）",
-            QMessageBox.AcceptRole)
-        btn_session = box.addButton(
-            "清洗本工具已采集的数据\n（出原始+清洗入库两份，废数据回流补采）",
-            QMessageBox.ActionRole)
-        box.addButton("取消", QMessageBox.RejectRole)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked is btn_ext:
+        if HAS_ENHANCED:
+            self._clean_external_enhanced()
+        else:
             self._clean_external_data()
-        elif clicked is btn_session:
-            self._clean_session_data()
 
     def _clean_external_data(self):
         """外部表格清洗入口：多选任意 Excel/CSV → 后台智能清洗 → 写入库格式文件"""
@@ -2564,6 +2765,45 @@ class MainWindow(QMainWindow):
         prog.show()
         worker = ExternalCleanWorker(paths, out, template_dirs=[
             os.path.dirname(out), default_dir, str(Path.home() / "Downloads")])
+        worker.logged.connect(self._on_log)
+        worker.finished_clean.connect(self._on_external_clean_finished)
+        self._clean_worker = worker
+        worker.start()
+
+    def _clean_external_enhanced(self):
+        """增强三文件清洗入口：多选文件 → 选输出目录 → 后台清洗 → 国内/国内手机/国外 三个文件"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要清洗的数据文件（可多选）",
+            getattr(self, "_clean_last_dir", "") or str(self._get_desktop_dir()),
+            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+        if not paths:
+            return
+        self._clean_last_dir = os.path.dirname(paths[0]) or ""
+        self._on_log(f"🧹 增强清洗：选中 {len(paths)} 个文件")
+        default_dir = os.path.dirname(paths[0]) or str(self._get_desktop_dir())
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "选择三文件输出目录（国内 / 国内只留手机号 / 国外）", default_dir)
+        if not output_dir:
+            self._on_log("已取消增强清洗（未选输出目录）")
+            return
+        # 检查是否已有同名文件
+        import glob as _glob
+        existing = _glob.glob(os.path.join(output_dir, "清洗后_*_*.xlsx"))
+        if existing and QMessageBox.question(
+                self, "覆盖已有文件",
+                f"目标目录下已有 {len(existing)} 个清洗文件，确认覆盖？\n{output_dir}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            self._on_log("已取消增强清洗（不覆盖已有文件）")
+            return
+        self._cleaning = True
+        self.setEnabled(False)
+        prog = YzdProgressDialog(None, "正在增强清洗数据")
+        prog.set_text(f"正在清洗 {len(paths)} 个文件（libphonenumber 深度解析）…",
+                      "清洗在后台进行，请勿关闭程序。")
+        self._clean_progress = prog
+        prog.show()
+        worker = EnhancedExternalCleanWorker(paths, output_dir)
         worker.logged.connect(self._on_log)
         worker.finished_clean.connect(self._on_external_clean_finished)
         self._clean_worker = worker
@@ -2643,12 +2883,31 @@ class MainWindow(QMainWindow):
         ok = self.session.export_excel(path)
         if ok:
             cpath = str(Path(path).with_name(Path(path).stem + "_清洗后入库数据.xlsx"))
+            mpath = str(Path(path).with_name(Path(path).stem + "_国内只留手机号.xlsx"))
             try:
                 res = self.session.export_cleaned_excel(cpath)
             except Exception as e:
                 res = ""
                 self._on_log(f"清洗导出失败：{e}")
+            # 同步生成「国内只留手机号」文件
+            mobile_res = ""
             if res:
+                try:
+                    clean_rows = self.session.clean_records(rows, log=lambda m: None)
+                    mobile_rows = _yzd.filter_cn_mobile_rows(clean_rows, log=self._on_log)
+                    template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
+                    tmp = mpath + ".tmp"
+                    _cleaner.write_clean_excel(mobile_rows, tmp, template_path=template, log=lambda m: None)
+                    os.replace(tmp, mpath)
+                    mobile_res = mpath
+                except Exception as e:
+                    self._on_log(f"国内手机文件导出失败：{e}")
+            if res and mobile_res:
+                QMessageBox.information(self, "导出完成",
+                                        f"原始明细：\n{path}\n\n"
+                                        f"清洗后入库数据：\n{cpath}\n\n"
+                                        f"国内只留手机号：\n{mobile_res}")
+            elif res:
                 QMessageBox.information(self, "导出完成",
                                         f"原始明细：\n{path}\n\n清洗后入库数据（对齐客户库模板）：\n{cpath}")
             else:
@@ -2667,7 +2926,7 @@ class MainWindow(QMainWindow):
                 "incremental": bool(self.chk_incr.isChecked()),
                 "background": bool(self.chk_bg.isChecked()),
                 "auto_keyword_expand": bool(self.chk_auto_kw.isChecked()),
-                "province": str(self.selected_province or "")}
+                "province": list(self.selected_provinces or [])}
 
     def _apply_params(self, params):
         if not isinstance(params, dict):
@@ -2681,8 +2940,15 @@ class MainWindow(QMainWindow):
                                 ("auto_keyword_expand", self.chk_auto_kw)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
-            # 省份精准采集：老快照没这个键，按「全国不限」处理
-            self.selected_province = str(params.get("province") or "")
+            # 省份精准采集（多选）：老快照可能是字符串（单省）或列表（多选），统一兼容
+            pv_raw = params.get("province") or ""
+            if isinstance(pv_raw, list):
+                self.selected_provinces = [str(p) for p in pv_raw if str(p).strip()]
+            elif isinstance(pv_raw, str) and pv_raw.strip():
+                # 兼容老快照：单省字符串转列表
+                self.selected_provinces = [p.strip() for p in pv_raw.split(",") if p.strip()]
+            else:
+                self.selected_provinces = []
             self._refresh_province_label()
         except Exception:
             pass
