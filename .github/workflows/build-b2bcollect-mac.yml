@@ -9,6 +9,7 @@ on:
     branches: [ main ]
     paths:
       - 'b2bcollect_build/**'
+      - 'enf_clean/**'
   workflow_dispatch:
 
 jobs:
@@ -33,7 +34,7 @@ jobs:
       # .app 启动即 ModuleNotFoundError。
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pillow pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pillow pyinstaller phonenumbers pandas -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     - name: Download chromedriver (Stable mac-arm64)
       run: python .github/scripts/fetch_chromedriver_mac_arm64.py
@@ -44,7 +45,7 @@ jobs:
       # 路径分隔符用「:」，chromedriver 打进 _MEIPASS 根（chrome_driver.candidates frozen 首选位）。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import yzd_client --hidden-import task_registry --add-data "mk_phone_font.json:." --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import yzd_client --hidden-import task_registry --add-data "mk_phone_font.json:." --add-data "../enf_clean:enf_clean" --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
 
     - name: Zip app bundle (ditto preserves perms/attrs)
       run: ditto -c -k --keepParent b2bcollect_build/dist/B2bCollectTool.app B2bCollectTool_Mac_arm64.zip
