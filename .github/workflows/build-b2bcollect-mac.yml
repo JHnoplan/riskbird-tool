@@ -15,9 +15,6 @@ on:
 jobs:
   build:
     runs-on: macos-14
-    concurrency:
-      group: build-b2bcollect-mac-${{ github.ref }}
-      cancel-in-progress: true
 
     steps:
     - name: Checkout code
