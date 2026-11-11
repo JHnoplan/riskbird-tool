@@ -42,9 +42,12 @@ jobs:
       # pillow 不能省：马可波罗「号码图片码」识别引擎 mk_phone_ocr.py 顶层写了
       # `from PIL import Image`，而 parallel_session 是静态 import 这条链路的——缺 PIL
       # 不是马可波罗一个站降级，而是整个 exe 启动即 ModuleNotFoundError。
+      # xlrd 不能省：全盘扫描/导入历史数据要读旧版 .xls（本机实测就有一份 2019 展会
+      # 名单是 OLE 内容），缺它那份名单会被判「读不了」。它在源码里是函数内 try-import，
+      # 依赖分析口径一旦变化就会漏收，所以 pip 与 --hidden-import 两边都显式写上。
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pillow pyinstaller phonenumbers pandas -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pip install PyQt5 selenium openpyxl requests websocket-client beautifulsoup4 lxml pillow pyinstaller phonenumbers pandas xlrd -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     - name: Download chromedrivers (Stable + 2 previous majors, win64)
       # 复用 1688 工具同款脚本：下载最近 3 个大版本的 win64 驱动，按
@@ -57,6 +60,10 @@ jobs:
       # exe 启动即 ModuleNotFoundError）；pip 名≠import 名的两个名字都写
       # （websocket-client→websocket / websocket_client；beautifulsoup4→bs4；pillow→PIL）。
       # gys_crawler/solarbe_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
+      # 权限三件套必须一起写：access_guard（门禁+名单+设备绑定）、edition（能力矩阵，
+      # 界面每个入口都问它）、acl_admin_dialog（等级 0 的「权限管理」面板）。最后这个是
+      # 函数内延迟 import，界面对它做了「加载失败只提示不崩」的降级——漏收不会启动即崩，
+      # 而是管理员点开面板才发现少模块，这种失败最晚暴露、最难查，所以绝不靠运气。
       # 维护约定：每次给 b2bcollect_build/*.py 新增 import 或新增本地模块，必须把
       #   grep -hoE "^(import|from) [a-zA-Z_]+" *.py
       # 与下面两个清单逐行对一次，而不是凭记忆维护（新增采集站 gi_crawler /
@@ -65,7 +72,7 @@ jobs:
       # 不 --add-data 进包则打包版手机号识别永远拿不到字典。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import yzd_client --hidden-import task_registry --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4

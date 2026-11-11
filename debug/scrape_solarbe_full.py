@@ -99,7 +99,11 @@ c.incremental = False          # 台账走自己的 state 文件，不用工具�
 # 全库一万三千多家、两万次请求，把基线节奏放温和：实测 2s/请求在只跑列表时能扣住，
 # 列表+详情混着跑（本轮流水线）同一 IP 的请求量翻倍，15 分钟内被拦 9 次。
 # 看门狗自己会接着降速（6→30s），这里只是不把基线定在刚好触限的边缘。
-c.delay_between, c.jitter = 4.0, 2.0
+# 2026-11-04 复跑实测：4s 基线在 9 分钟内就被拦满 3 次触发熔断（一轮只推进 1 片），
+# 与其「快而被踢出来等半小时」，不如把基线交给外层哨兵按现场放行情况调，
+# 所以留出环境变量口子：SOLARBE_DELAY / SOLARBE_JITTER（不改源码就能降速）。
+c.delay_between = float(os.environ.get("SOLARBE_DELAY", "8.0"))
+c.jitter = float(os.environ.get("SOLARBE_JITTER", "3.0"))
 c._current_delay = c.delay_between
 
 
@@ -121,10 +125,25 @@ SEED_AREAID = None
 
 
 def init_paths():
-    global STATE_FILE, DETAIL_JSON, EXPORT_XLSX
+    """产出文件名按「台账起始日」钉死，不用进程启动日。
+
+    外层哨兵（debug/solarbe_sentinel.py）每轮都会重新起一次本脚本，用进程启动日的
+    话跨天就滚出 全量_20261105.xlsx / _20261106.xlsx 好几份——每份都是当时台账的全量
+    导出，内容越往后越全，但只能让人多找一个文件。台账的 started 才是这一次采集
+    任务真正的身份，所以从这里反推日期；没有台账（首次开跑）才用今天。"""
+    global STATE_FILE, DETAIL_JSON, EXPORT_XLSX, DAY
+    if SEED_AREAID is not None:
+        STATE_FILE = ROOT / "debug" / f"solarbe_full_state_{SEED_AREAID}.json"
+    try:
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(json.loads(STATE_FILE.read_text()).get("started") or ""))
+        if m:
+            DAY = "".join(m.groups())
+    except Exception:
+        pass                              # 台账还没建/读不动：维持今天
     if SEED_AREAID is None:
+        DETAIL_JSON = OUT_DIR / f"索比光伏网全量_{DAY}.json"
+        EXPORT_XLSX = OUT_DIR / f"索比光伏网全量_{DAY}.xlsx"
         return
-    STATE_FILE = ROOT / "debug" / f"solarbe_full_state_{SEED_AREAID}.json"
     DETAIL_JSON = OUT_DIR / f"索比光伏网试采{SEED_AREAID}_{DAY}.json"
     EXPORT_XLSX = OUT_DIR / f"索比光伏网试采{SEED_AREAID}_{DAY}.xlsx"
 

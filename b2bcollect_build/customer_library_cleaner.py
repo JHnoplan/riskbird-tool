@@ -53,6 +53,11 @@ SOURCE_FIELDS = {
     "微信号": ("微信号", "微信"),
     "官网": ("官网", "网址", "企业网址"),
     "地址": ("地址", "注册地址", "通信地址"),
+    "主营": ("主营", "主营产品", "主营商品", "经营范围"),
+    "行业": ("行业", "所属行业"),
+    "国家": ("国家",),
+    "经营模式": ("经营模式",),
+    "所在区域": ("所在区域", "区域"),
     "状态": ("状态",),
     "数据来源": ("数据来源",),
     "备注": ("备注",),
@@ -388,7 +393,8 @@ def _join_limited(values, limit=None, sep=","):
 
 
 def _remark(fields: dict, contact_ok: bool = False, fam: str = ""):
-    """备注：状态说明 + 官网 + 地址摘要（+ 外部数据自带的备注列），供外呼人员参考。
+    """备注：状态说明 + 官网 + 地址摘要 + 主营/行业/国家/经营模式（结构化字段显式写入，
+    不依赖备注透传，避免跨平台合并时信息丢失），供外呼人员参考。
 
     contact_ok：跨平台合并后已有电话/邮箱时，某一路源采集时写的「无电话(未公开)/
     无联系方式」已不成立，不再写进备注误导外呼（实测合并记录带电话仍残留此注）。"""
@@ -412,6 +418,17 @@ def _remark(fields: dict, contact_ok: bool = False, fam: str = ""):
         addr = _ADDR_BUTTON_RE.split(addr)[0].strip(" ：:，,、")
     if addr:
         pieces.append(f"地址:{addr[:50]}")
+    # ── 结构化字段显式写入备注（主营/行业/国家/经营模式/区域）──
+    # 跨平台合并后这些字段由 SOURCE_FIELDS 保留，不再依赖单路备注透传（透传时
+    # 只保留首个非空源的备注，其他源的结构化信息会被吞掉）。
+    for field_key, prefix in [("主营", "主营"), ("行业", "行业"),
+                               ("国家", "国家"), ("经营模式", "经营模式")]:
+        val = fields.get(field_key, "")
+        if val and f"{prefix}:" not in (fields.get("备注", "") or ""):
+            pieces.append(f"{prefix}:{val}")
+    region = fields.get("所在区域", "")
+    if region and "区域:" not in (fields.get("备注", "") or ""):
+        pieces.append(f"区域:{region}")
     own = fields.get("备注", "")
     if own:
         pieces.append(own)
@@ -423,11 +440,11 @@ def _remark(fields: dict, contact_ok: bool = False, fam: str = ""):
     borrowed = normalize_text(fields.get("岗位(跨站)", ""))
     if borrowed:
         pieces.append(f"岗位(跨站来源):{borrowed}")
-    # 岗位族：没有明写岗位列但旁证能归类时，给外呼一个可用的话术分支
+    # 岗位族：没有明写岗位但旁证能归类时，给外呼一个可用的话术分支
     if fam and not normalize_text(fields.get("岗位", "")):
         pieces.append(f"岗位族:{fam}")
     remark = " | ".join(pieces)
-    return remark[:180]
+    return remark[:300]
 
 
 def _position_family(position, email, company):
@@ -701,8 +718,9 @@ def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=pr
 # 实在对不上的列不隐式丢弃，在日志里逐列列出，用户能看到“没采哪些列”。
 
 # 对外清洗只关心这些规范字段（其余列一律归入「未识别」）
+# 主营/行业/国家：数据池标准 11 字段的一部分，导入时必须提取不能错乱
 EXTERNAL_FIELDS = ("公司名", "联系人", "岗位", "电话", "邮箱", "微信号",
-                   "官网", "地址", "状态", "数据来源", "备注")
+                   "官网", "主营", "行业", "国家", "地址", "状态", "数据来源", "备注")
 
 # 字段 → (强别名, 弱别名)：强别名归一化后包含即算高置信，弱别名只给低分
 EXTERNAL_ALIASES = {
@@ -722,6 +740,11 @@ EXTERNAL_ALIASES = {
     "微信号": (("微信号", "微信", "wechat", "weixin", "wx号", "wxid"), ()),
     "官网": (("公司网站", "企业网站", "官方网站", "官网网址", "公司网址", "企业网址",
                 "网址", "网站", "website", "url", "web"), ("官网", "站点")),
+    "主营": (("主营", "经营范围", "业务范围", "产品与服务", "经营产品", "business scope",
+              "main products", "main business", "products"),
+             ("产品", "业务")),
+    "行业": (("行业", "industry", "sector"), ("领域", "category")),
+    "国家": (("国家", "国别", "country", "nation"), ()),
     "地址": (("公司地址", "企业地址", "单位地址", "通信地址", "注册地址", "办公地址",
                 "详细地址", "联系地址", "地址", "address", "addr"),
              ("地区", "所在地", "所在区域", "区域")),
@@ -735,8 +758,8 @@ EXTERNAL_ALIASES = {
 # 这些列对入库没用（序号/注册资本/统一社会信用代码等），即使包含“名称/号码”也不给认
 EXTERNAL_IGNORE = ("序号", "编号", "行号", "水号", "税号", "统一社会信用代码", "信用代码",
                    "组织机构代码", "工商注册号", "注册资本", "实缴资本", "成立日期", "成立时间",
-                   "核准日期", "营业期限", "参保人数", "人员规模", "所属行业", "行业",
-                   "企业类型", "类型", "币种", "经营范围", "登记机关", "邮编", "邮政编码",
+                   "核准日期", "营业期限", "参保人数", "人员规模",
+                   "企业类型", "类型", "币种", "登记机关", "邮编", "邮政编码",
                    "postal", "zip", "传真", "fax", "qq", "二维码", "标签", "分组", "创建时间",
                    "更新时间", "修改时间", "操作人", "评分", "风险", "诉讼", "商标", "专利",
                    "登录密码", "账号密码", "附件", "图片")
@@ -867,6 +890,80 @@ def _is_status(v: str) -> bool:
     return True
 
 
+# 行业分类值（国民经济行业分类门类 + 常见行业词）。2~4 字纯中文行业名（"制造业"
+# "批发业"）会命中 _EXT_PERSON_RE 被抢成联系人——与状态/省市名同一类"短枚举值
+# 列"陷阱：新枚举字段必须同时给内容分并在人名判定里排除。
+_INDUSTRY_WORDS = frozenset(
+    "制造业 批发业 零售业 建筑业 采矿业 金融业 房地产 农业 林业 牧业 渔业 "
+    "教育 医疗 医药 卫生 体育 餐饮 住宿 物流 运输 旅游 新能源 新材料 "
+    "光伏 风电 储能 半导体 电子 通信 互联网 电商 人工智能 大数据 云计算 "
+    "机械 化工 化纤 纺织 服装 冶金 电力 环保 航空 航天 船舶 汽车 五金 "
+    "塑胶 包装 印刷 食品 饮料 矿产 石油 天然气".split()
+)
+_INDUSTRY_TAIL_RE = re.compile(
+    r"(?:业|服务|科技|贸易|制造|工程|设计|咨询|传媒|能源|环保|物流|电商|互联网|"
+    r"信息技术|电子|通信|医药|医疗|教育|金融|地产|建筑|化工|纺织|服装|机械|汽车|"
+    r"光伏|半导体|软件|生物|农业|矿产|石油|天然气)$"
+)
+
+
+def _is_industry(v: str) -> bool:
+    """是否是行业分类值：制造业 / 批发和零售业 / 信息技术服务业 / 新能源。"""
+    if not v or len(v) > 20:
+        return False
+    if v in _INDUSTRY_WORDS:
+        return True
+    return bool(_INDUSTRY_TAIL_RE.search(v))
+
+
+# 国家/地区名（中英文）。"中国""美国""Germany" 会命中 _EXT_PERSON_RE 被抢成联系人。
+_COUNTRY_NAMES = frozenset(
+    "中国 美国 英国 德国 法国 意大利 西班牙 荷兰 比利时 瑞士 瑞典 挪威 丹麦 芬兰 "
+    "波兰 捷克 奥地利 匈牙利 罗马尼亚 希腊 葡萄牙 爱尔兰 俄罗斯 乌克兰 土耳其 "
+    "日本 韩国 朝鲜 蒙古 印度 越南 泰国 缅甸 柬埔寨 老挝 马来西亚 新加坡 印尼 "
+    "菲律宾 巴基斯坦 孟加拉 斯里兰卡 尼泊尔 伊朗 伊拉克 沙特 阿联酋 卡塔尔 科威特 "
+    "以色列 约旦 埃及 利比亚 突尼斯 摩洛哥 阿尔及利亚 尼日利亚 南非 肯尼亚 加纳 "
+    "加拿大 墨西哥 巴西 阿根廷 智利 哥伦比亚 秘鲁 澳大利亚 新西兰 古巴".split()
+    + [
+        "china", "prc", "usa", "us", "uk", "uae", "united states",
+        "united kingdom", "united arab emirates", "germany", "france", "italy",
+        "spain", "netherlands", "belgium", "switzerland", "sweden", "norway",
+        "denmark", "finland", "poland", "czech", "austria", "hungary",
+        "romania", "greece", "portugal", "ireland", "russia", "ukraine",
+        "turkey", "japan", "korea", "south korea", "india", "vietnam",
+        "thailand", "myanmar", "cambodia", "malaysia", "singapore",
+        "indonesia", "philippines", "pakistan", "bangladesh", "iran", "iraq",
+        "saudi arabia", "qatar", "kuwait", "israel", "egypt", "nigeria",
+        "south africa", "kenya", "ghana", "canada", "mexico", "brazil",
+        "argentina", "chile", "colombia", "peru", "australia", "new zealand",
+        "taiwan", "hong kong", "macau",
+    ]
+)
+
+
+def _is_country(v: str) -> bool:
+    """是否是国家/地区名：中国 / 美国 / Germany / United States。"""
+    if not v:
+        return False
+    low = v.strip().lower()
+    return low in _COUNTRY_NAMES or v.strip() in _COUNTRY_NAMES
+
+
+def _is_product_desc(v: str) -> bool:
+    """主营/经营范围类值：4 字以上的业务描述（排除联系方式/公司名/人名等干扰值）。
+
+    主营值通常是"光伏组件、储能系统研发销售"这类长文本；人名（"王销售"）、
+    号码、邮箱、公司名都不是主营。
+    """
+    if not v or len(v) < 4:
+        return False
+    if _is_phone(v) or _is_email(v) or _is_url(v) or _is_company(v):
+        return False
+    if _is_person(v) or _is_address(v):
+        return False
+    return True
+
+
 def _is_person(v: str) -> bool:
     if not v or not _EXT_PERSON_RE.match(v):
         return False
@@ -875,6 +972,10 @@ def _is_person(v: str) -> bool:
     # 中国省市名不是人名（实测「省份」列填「海南」「广东」被 _EXT_PERSON_RE 的 2 字中文
     # 匹配当成联系人，客户名称整列变成省份名）
     if v.strip() in _CN_PROVINCE_CITY_NAMES:
+        return False
+    # 行业/国家枚举值（"制造业""中国""Germany"）不是人名，
+    # 否则行业/国家列被抢成联系人
+    if _is_industry(v) or _is_country(v):
         return False
     return True
 
@@ -929,6 +1030,15 @@ def content_score(field: str, values: list) -> float:
         # 状态列的表头「状态」只是弱别名（39 分够不到 40 的录用线），全靠内容把它认领，
         # 否则这一列会被「存续」像人名这点抢去当联系人。
         return 100 * _ratio(values, _is_status)
+    if field == "主营":
+        # 主营是长文本业务描述（"光伏组件、储能系统研发销售"），弱表头（"产品"39 分）
+        # 要靠内容越过录用线；同时防止主营列被联系人内容分抢走
+        return 100 * _ratio(values, _is_product_desc)
+    if field == "行业":
+        # 行业枚举值（"制造业"）像人名，必须靠内容分把列认领回去
+        return 100 * _ratio(values, _is_industry)
+    if field == "国家":
+        return 100 * _ratio(values, _is_country)
     # 岗位/微信号/备注/数据来源靠内容猜不出来，只看表头
     return 0.0
 
@@ -1106,17 +1216,122 @@ def _read_csv_tables(path: str):
 
 
 def read_tables(path: str):
-    """读外部数据文件 → [(工作表名, [[单元格, …], …])]，支持 .xlsx/.xlsm/.csv（.xls 不支持）"""
+    """读外部数据文件 → [(工作表名, [[单元格, …], …])]，.xlsx/.xlsm/.xls/.csv 全支持。
+
+    分派看**字节头**而不是扩展名（本机实测缺陷：「2019年上海展客户整理.xlsx」是
+    WPS 存的旧版 OLE 文档，后缀却写着 .xlsx）——按后缀走 openpyxl 会抛 BadZipFile，
+    整份名单被当成「文件读不了」丢掉；按字节头走才可能读得出来。
+    """
     if not path or not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在：{path}")
+    kind = excel_kind(path)
+    if kind == XLS_KIND:
+        return read_xls_tables(path)
+    if kind == XLSX_KIND:
+        return _read_openpyxl_tables(path)
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".xls":
-        raise ValueError(f"旧版 .xls 格式读不了：{os.path.basename(path)}\n"
-                        f"请先用 Excel/WPS 另存为 .xlsx 再清洗")
-    if ext == ".csv":
-        return _read_csv_tables(path)
-    if ext not in (".xlsx", ".xlsm"):
-        raise ValueError(f"不支持的文件类型：{ext or '无后缀'}（只支持 .xlsx / .xlsm / .csv）")
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        # 后缀是 Excel、字节头既不是 zip 也不是 OLE：文件已损坏，或被存成 HTML/纯文本
+        # 冒充表格。这种绝不能当 CSV 硬读（读出来是一堆 <td> 标签，列匹配全废），
+        # 也不能交给 openpyxl 抛英文栈，必须在这里就报清楚、让用户去源头另存
+        raise ValueError(f"文件损坏或不是真正的 Excel（扩展名与实际格式不符）："
+                        f"{os.path.basename(path)}\n"
+                        f"请用 Excel/WPS 打开后另存为 .xlsx 再导入")
+    return _read_csv_tables(path)
+
+
+# 字节头判据：OLE 复合文档 = Excel 97-2003 的 .xls；PK\3\4 = zip 容器 = xlsx/xlsm
+_XLS_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_ZIP_MAGIC = b"PK\x03\x04"
+XLS_KIND = "xls"
+XLSX_KIND = "xlsx"
+CSV_KIND = "csv"
+UNKNOWN_KIND = "unknown"      # 两头判据都不像：连后缀兜底都不给，见 excel_kind
+
+
+def excel_kind(path: str) -> str:
+    """按**字节头**判文件真实格式 → ``xls`` / ``xlsx`` / ``unknown``。
+
+    刻意不按后缀兜底：后缀是 Excel 而字节头既不是 OLE 也不是 zip 的文件，判成
+    Excel 只会让 openpyxl 抛一句英文栈；判成 ``unknown`` 才能由 ``read_tables``
+    明确告诉用户「扩展名与实际格式不符，请另存」。历史上这里就是丢数据的源头：
+    真 .xls 写着 .xlsx → 按后缀走 openpyxl → BadZipFile → 整份名单被当坏文件丢掉。
+    认不出字节头（读不到、空文件、纯文本）也返回 ``unknown``，由调用方按后缀决定
+    是报错还是按 CSV 读，判格子的动作只在这一处。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return UNKNOWN_KIND
+    if head.startswith(_XLS_OLE_MAGIC):
+        return XLS_KIND
+    if head.startswith(_ZIP_MAGIC):
+        return XLSX_KIND
+    return UNKNOWN_KIND
+
+
+def _xls_cell_text(xlrd, book, sheet, row, col) -> str:
+    """.xls 单元格 → 文本，与 openpyxl 分支同口径（数字不写成 1.38e+10，日期取年月日）。
+
+    手机号在老 Excel 里几乎都是数字单元格，直接 str() 会拿到科学计数法断号，
+    所以数字仍然交给同一个 ``_cell_text`` 展开。
+    """
+    ctype = sheet.cell_type(row, col)
+    if ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+        return ""
+    if ctype == xlrd.XL_CELL_ERROR:
+        return ""          # #N/A、#VALUE! 是公式错误码，不是数据
+    value = sheet.cell_value(row, col)
+    if ctype == xlrd.XL_CELL_DATE:
+        try:
+            dt = xlrd.xldate_as_datetime(value, book.datemode)
+            if dt.hour or dt.minute or dt.second:
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return _cell_text(value)
+    return _cell_text(value)
+
+
+def read_xls_tables(path: str):
+    """旧版 .xls（OLE 复合文档）→ 与 ``read_tables`` 完全同形的结果。
+
+    用 xlrd（2.x 只支持 .xls，正好是需要的那一半；装了 pandas 的环境通常带着它）。
+    打包态万一缺了这个模块，给出的是「另存为 .xlsx」这条用户能自助的错，而不是崩栈。
+    """
+    try:
+        import xlrd
+    except ImportError as e:
+        raise ValueError(f"读旧版 .xls 需要 xlrd 模块（当前环境没有：{e}）\n"
+                        f"请改用 Excel/WPS 把文件另存为 .xlsx 后再导入")
+    try:
+        book = xlrd.open_workbook(path, on_demand=True)
+    except Exception as e:
+        raise ValueError(f"旧版 .xls 读不了：{os.path.basename(path)}（{str(e).splitlines()[0][:80]}）\n"
+                        f"请用 Excel/WPS 打开后另存为 .xlsx 再导入")
+    tables = []
+    try:
+        for sheet in book.sheets():
+            rows = []
+            for r in range(sheet.nrows):
+                row = [_xls_cell_text(xlrd, book, sheet, r, c)
+                       for c in range(sheet.ncols)]
+                if any(row):
+                    rows.append(row)
+            # 与 openpyxl 分支同一道门槛：至少「表头 + 一行数据」才算一张可用的表
+            if len(rows) >= 2:
+                tables.append((sheet.name, rows))
+    finally:
+        try:
+            book.release_resources()
+        except Exception:
+            pass
+    return tables
+
+
+def _read_openpyxl_tables(path: str):
+    """现代 Excel（zip 容器）→ (表名, 行列表)。"""
     from openpyxl import load_workbook
 
     wb = load_workbook(path, data_only=True)

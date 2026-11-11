@@ -106,7 +106,7 @@ def detect_cdp(execute_js, extra_markers=None):
 
 def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
                  max_wait: int = 1800, interval: int = 5, first_wait: int = 25,
-                 ready=None, heal=None, heal_every: int = 30) -> bool:
+                 ready=None, heal=None, heal_every: int = 30, revive=None) -> bool:
     """被拦截（或平台在限流）时原地等恢复。返回 True 表示确实可以继续采，False 表示该结束本轮。
 
     log:            写日志的回调（str）
@@ -116,11 +116,15 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
     ready:          能力探针（返回 bool）。给了就必须真正拿得动数据才算恢复：
                     平台限流常常不弹验证页，只看页面签名会「1 秒即判定已解除」，
                     于是同一家在死页面上反复空转，日志一直报「限制」却始终不前进。
-    heal:           返回 bool 的自愈回调（如把会话切到已经验证通过的标签页 /
-                    重刷当前标签）。验证页挂在别的标签时，本会话标签会一直被判
-                    拦截而死等到超时，所以每隔 heal_every 秒主动试一次。
-                    探针失败（页面签名正常但拿不到数据）时也照样试：过完验证码
-                    最常见的是本标签停在验证回跳页/组件已死，不重刷就一直拿不到数据。
+    heal:           **只许做非破坏性动作**（如把会话切到已经验证通过的另一个标签）。
+                    验证页还挂在屏幕上时会照样调用它，所以这里绝对不能导航/刷新：
+                    用户正拖到一半的滑块被刷一下，挑战直接作废、从头再来（2026-11-11
+                    用户实机反馈）。每隔 heal_every 秒试一次。
+    revive:         破坏性自愈（把本标签导航回首页 / 整页重刷），**只在验证签名已经
+                    消失、但 ready 探针仍拿不到数据时**才调用。过完验证码最常见的是
+                    本标签停在验证回跳页/组件已死，不重刷就一直拿不到数据（这条是
+                    2026-11-09 实测结论，与上一条不冲突：一个管"人正在点"，一个管"人点完了")。
+                    不给时退回 heal，保持老调用方行为不变。
     """
     if emit_blocked:
         try:
@@ -154,7 +158,7 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
             except Exception:
                 fixed = False
             if fixed:
-                log("   已尝试自愈（回到可用页面/换回正常标签），重新检查拦截状态…")
+                log("   已尝试自愈（换回已验证通过的标签，不刷新页面），重新检查拦截状态…")
                 still = probe()
         if not still:
             if ready is None:
@@ -167,14 +171,15 @@ def wait_unblock(reason, log, emit_blocked, is_stopped, probe,
             if works:
                 log(f"✅ 平台已恢复，能正常拿到数据（等待约 {waited} 秒），继续采集")
                 return True
-            if need_heal:
-                # 验证页没了但探针还是拿不到数据：把标签重刷回可用状态再试，
-                # 而不是只当“还在限流”干等到超时
+            # 验证页没了但探针还是拿不到数据：把标签重刷回可用状态再试，而不是只当
+            # “还在限流”干等到超时。这一步只在签名消失后进行（见 docstring revive）。
+            act = revive if revive is not None else heal
+            if act is not None and waited >= heal_every:
                 try:
-                    healed = bool(heal())
+                    revived = bool(act())
                 except Exception:
-                    healed = False
-                if healed:
+                    revived = False
+                if revived:
                     log("   页面正常但还拿不到数据，已重刷标签重新检查…")
             if not said_throttle:
                 log("   验证页已经没了，但平台仍然不给数据（这是限流不是验证），继续退避等待…")

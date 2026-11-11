@@ -17,7 +17,9 @@ b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI
 import os
 import re
 import sys
+import json
 import time
+import hashlib
 import zipfile
 import threading
 from pathlib import Path
@@ -34,17 +36,36 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QGridLayout, QRadioButton, QScrollArea,
 )
 
-from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES
+from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
+                              LIST_CHANNEL_SLUGS, STATS_LABELS, STATUS_ORDER, QZD_SLUG)
 from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
 import customer_library_cleaner as _cleaner
 import keyword_expander as _kwexp
 import province_filter as _pfilter
+# 交付档位（对内 full / 对外精简版）的唯一真源：界面上「哪些入口存在」全部由它投影，
+# 不在几十个按钮上各写一遍 if lite（那样必然漏入口，见 edition.py 模块头）。
+import edition
 
 try:
     import enhanced_cleaner as _enhanced
     HAS_ENHANCED = True
 except ImportError:
     HAS_ENHANCED = False
+
+try:
+    from pool_dialogs import (SyncDialog, SearchDialog, ImportPreviewDialog,
+                              LocalScanDialog, SyncWorker)
+    from data_pool import DataPoolManager
+    from oss_pool_client import OSSPoolError
+    HAS_POOL = True
+except ImportError:
+    HAS_POOL = False
+
+try:
+    import access_guard as _access_guard
+    HAS_ACL_GUARD = True
+except ImportError:
+    HAS_ACL_GUARD = False
 
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
 # done=✅绿粗「已完成」/ stopped=■橙粗「已停止」/ running=●蓝「进行中」
@@ -507,6 +528,18 @@ SITE_TIPS = {
            "拿工商详情/联系方式。需登录（点右侧「打开企知道」按钮先登录）。\n"
            "看门狗：名单空则休眠零占用，关键词采集清洗掉的无联系方式废数据自动回流入列后自动苏醒补采；"
            "采过/查不到的公司名会从名单剔除，避免重复采集。",
+    "riskbird": "风鸟 www.riskbird.com：**名单驱动**通道（与企知道/爱企查共用同一份待采名单）。"
+           "默认走搜索结果列表页拿 1 电话 1 邮箱，命中本地 30 天卡片缓存的公司不发请求；"
+           "列表额度撞墙后自动降级用补全接口登记线索，还可用剩余的详情额度逐家补全。\n"
+           "需登录（点「打开风鸟」按钮）。当天额度用尽时这一路会自动让路（不报错、不白烧请求），"
+           "名单原样留着，明天或额度恢复后重新开始任务会自动接续。\n"
+           "与另外两路共享同一个 Chrome（只占自己一个标签），绝不另开浏览器、也不关别人的标签。",
+    "aiqicha": "爱企查 aiqicha.baidu.com（百度旗下企业工商信息）：**名单驱动**通道（与企知道/风鸟共用同一份名单）。"
+           "按公司名逐家查联想→详情页，拿工商登记地址/法定代表人/电话/邮箱；"
+           "工商登记地址是全体系最硬的属地证据，选省份时按它把关，对不上的不入库。\n"
+           "需登录（点「打开爱企查」按钮）。被拦或掉登录时这一路限时等人工（不会拖满半小时），"
+           "到点自动让路，未查的公司全部留在名单里下次接续。\n"
+           "同窗共享 Chrome 只占自己一个标签，不碰别的平台的页面。",
 }
 
 
@@ -522,13 +555,28 @@ def build_stats_html(text, site_status=None):
     status = site_status or {}
     if not status or "<" in (text or ""):
         return text or ""
-    head, _, tail = text.partition(" ")
+    # 总量前缀与各路之间是**全角空格**（parallel_session 发的就是「已采 N 家　站名 x｜…」）。
+    # 早先按半角空格切，head 只剩「已采」两个字，「1072 家」连同分隔符一起被吞——
+    # 看板上恰恰最需要那个总数（2026-11-10 回归脚本抓到，实机同样存在）。
+    head, sep, tail = text.partition("　")
+    if not sep:
+        head, _s, tail = text.partition(" ")
     palette = STATS_STYLE_DARK if _is_dark_theme() else STATS_STYLE
 
-    # 解析各站数据：提取站名+数字
+    # 解析各路数据：提取路名+数字。名单补采通道（企知道/风鸟/爱企查）也必须在这里
+    # 解析——过去只遍历 SITE_ORDER，「风鸟补采 12」这种段落在富文本渲染时被整段丢掉，
+    # 日志里看得见、看板上一片空白，三平台并行时用户完全无法判断哪一路出了数。
+    #
+    # 档位不显示的名单通道在这里剔一次：状态行是编排层按**通道注册表**拼的，不受档位
+    # 影响；界面没有那一路的勾选框，看板却报「风鸟补采 N 家」，等于凭空把隐藏的功能
+    # 喊了出来。判据仍走 edition，不在渲染函数里另写一份 lite 常量。
+    _hidden_ch = set(LIST_CHANNEL_SLUGS) - set(
+        edition.visible_list_channels(LIST_CHANNEL_SLUGS, QZD_SLUG))
     site_data = []
-    for s in SITE_ORDER:
-        name = SITE_NAMES.get(s)
+    for s in STATUS_ORDER:
+        if s in _hidden_ch:
+            continue
+        name = STATS_LABELS.get(s)
         if not name or name not in tail:
             continue
         i = tail.index(name)
@@ -560,7 +608,7 @@ def build_stats_html(text, site_status=None):
 
     # 用细竖线分隔，比 ｜ 更紧凑
     _sep = ' <span style="color:#888">|</span> '
-    html = head + '  ' + _sep.join(segs)
+    html = head + '　' + _sep.join(segs)
     # 完整明细挂 tooltip
     _tip = '  ·  '.join(tooltip_parts)
     return '<span title="' + _tip + '">' + html + '</span>'
@@ -1007,7 +1055,8 @@ class ProvincePickerDialog(QDialog):
 
         # 说明文字
         tip = QLabel("可多选省份，只采这些省份的企业。支持地区筛选的网站（中国制造网 / 马可波罗 / 1688）"
-                     "额外交给网站筛；其余网站按页面地址与公司名把关；看不出省份的转企知道按工商地址反查。"
+                     "额外交给网站筛；其余网站按页面地址与公司名把关；看不出省份的转名单补采通道"
+                     "（企知道 / 风鸟 / 爱企查）按工商地址反查。"
                      "不选 = 全国不限。")
         tip.setWordWrap(True)
         tip.setStyleSheet(_muted_style())
@@ -1534,14 +1583,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         # 标题只写工具名：平台清单在面板「③ 采集平台」里已逐站列出，
         # 塞进标题栏会被系统截断，反而看不清。
-        self.setWindowTitle("B2B 多平台企业数据自动采集工具")
+        # 档位后缀由 edition 投影：一是让外部用户知道自己拿的是精简版（不制造「功能
+        # 怎么都消失了」的错觉），二是让我在验收时能一眼确认「现在跑的确实是丐版」——
+        # 没有可辨识标记，就无法证明看到的界面是哪一个档位。
+        # 工具名单独存一份：等级变更后界面形态会变（全功能号被降到受限档 = 精简版
+        # 那一组能力），标题必须跟着重投影，不能只在构造时定一次就再也不过问。
+        self._base_title = "B2B 多平台企业数据自动采集工具"
+        self.setWindowTitle(self._base_title + edition.title_suffix())
         # 小屏自适应：初始高度绝不超出可用屏高。写死尺寸在 13 寸笔电上会把
         # 底部日志裁到屏幕外（就是「输出日志看不到、得把窗口拉大」的另一半原因）。
         self.setMinimumSize(880, 620)
         try:
             avail = QApplication.primaryScreen().availableGeometry()
-            self.resize(min(1000, max(880, avail.width() - 120)),
-                        min(720, max(620, avail.height() - 120)))
+            self.resize(min(1120, max(880, avail.width() - 100)),
+                        min(940, max(640, avail.height() - 80)))
         except Exception:
             self.resize(1000, 720)
         self.session = ParallelSession()
@@ -1553,10 +1608,25 @@ class MainWindow(QMainWindow):
         self.keywords = []
         self._kw_raw = ""        # 用户原始输入（智能展开前），续采与任务快照回溯用
         self._kw_source_file = ""
-        self._co_source_file = ""   # 公司名单文件（企知道补采）
-        self._opening_login = False  # 防重复点「打开企知道/1688」同时拉多个后台线程
+        self._co_source_file = ""   # 公司名单文件（企知道/风鸟/爱企查补采）
+        # 防重复点「打开 XX」：按平台各记一路，三平台并行时可以连着点（后台线程互不干扰）
+        self._opening_logins = set()
         self.selected_provinces = []  # 省份精准采集（多选）：[]=全国不限（「选择省份」弹窗设定）
         self._kw_expanded_text = ""  # 上次自动扩词写回的内容（同内容不再二次展开）
+        # 「自动扩词」的**生效值**（不是控件状态）：对外档位没有勾选框，读控件会直接
+        # AttributeError；把状态存成数据，控件在不在都由同一份判据说话。
+        self._auto_expand = edition.auto_expand_default()
+        # 后台静默同步数据池的在途状态（只有对外档位会走到，内部版走弹窗）：
+        # worker 只允许一个在跑，跑完期间又采集完成时把最新一份挂到 pending 排队。
+        self._silent_worker = None
+        self._silent_pending = False
+        # 当前这一批被提交的指纹：只有上传成功才并进台账，失败的一律留给下次重试
+        self._silent_keys_batch = set()
+        # 本批结果是否已落账（信号回调与退出等待两处都可能落，谁先到算谁的）
+        self._silent_committed = False
+        # worker 报告的结果副本（DirectConnection 在上传线程里写）：关闭窗口时排队信号
+        # 可能永远不跑，退出路径就靠它知道这批到底传成了什么样；None = 还没结果。
+        self._silent_result = None
         self.session_dir = None
         self._first_start = None
         if HAS_YZD:
@@ -1573,7 +1643,19 @@ class MainWindow(QMainWindow):
         self._task_id = ""
         # 防采/验证码人工提醒弹窗（非模态，全局唯一）：只在被拦时存在，过验后关闭
         self._block_alert = None
+        # ── 权限相关的界面状态（能力位→控件的唯一登记表）──
+        # 入口的创建由 edition 投影决定；这份表只是记下「哪个入口是哪条能力位画的」，
+        # 等级在运行中被管理员改动时才有地方把多余的入口收掉。收不掉的（对话框里的
+        # 勾选项、名单通道勾选）由**动作层的运行时复核**兜住，不靠控件可见性讲安全。
+        self._acl_gated = {}
+        self._acl_caps = {}              # 建界面那一刻的能力位快照
+        self._acl_pending = False        # 已收口、等待重启彻底生效（只提示一次）
+        self._acl_stopped = False        # 被顶号后已走过优雅停止，不重复触发
+        self._acl_restart_asked = False  # 等级变更的重启询问只问一次（不成骚扰）
+        self._acl_revoked_box_shown = False   # 顶号模态只弹一次（弹窗期间心跳仍在跑）
+        self._relaunch_pending = None    # 落盘链路走完才拉起新实例
         self._build_ui()
+        self._acl_caps = edition.caps_snapshot()
         self._connect_signals()
         self._refresh_yzd_status()
         # 自动保存双触发：①每满 AUTOSAVE_EVERY 条（见 _on_progress，采集驱动即时落盘）；
@@ -1591,9 +1673,108 @@ class MainWindow(QMainWindow):
         self._crawl_elapsed = 0.0
         self._hold_from = 0.0
         self._held_seconds = 0.0
+        # 权限心跳：60 秒一次。采集是长任务，用户跑起来就不会再点按钮，只靠点击路径
+        # 校验的话，被别的机器顶掉的本机还能继续跑几十分钟——心跳是这件事的保底。
+        # 间隔与 access_guard 的缓存 TTL 同源（CACHE_TTL_SECONDS），心跳不会额外出网，
+        # 它只是把「本来就该刷新的那次」提前安排下来。
+        self._acl_timer = QTimer(self)
+        self._acl_timer.timeout.connect(self._acl_heartbeat)
+        if HAS_ACL_GUARD:
+            self._acl_timer.start(max(15_000, int(_access_guard.CACHE_TTL_SECONDS * 1000)))
+            # 心跳只是保底，它交出的顶号事件是**上一轮**刷新落下的：被顶掉的机器最坏
+            # 要空跑两拍（120 秒）才停手。刷新一落地就有 refreshed 叫醒界面，把这段
+            # 延迟压到零。QueuedConnection 不是可选项：发射点是后台刷新线程（含
+            # refresh_blocking 起的线程），而处理体要弹模态框并走停止链路，直连等于把
+            # 模态框嵌进别人的调用栈（点击路径就是嵌套事件循环）。
+            self._acl_refreshed_slot = self._on_acl_refreshed
+            _access_guard.get_guard().refreshed.connect(
+                self._acl_refreshed_slot, Qt.QueuedConnection)
+            # 开机权威解析（prefetch_authoritative）若恰在「prefetch 超时返回」与
+            # 「连接 refreshed 信号」之间才把后台线程收尾并把等级写成 pro，这个事件
+            # 会在没人监听时发出——界面就停在按丐版建的形态且不再被叫醒（心跳最快 15s）。
+            # 补一次 1.5s 的轻量收口：只比对当前 edition 与已建入口，不额外出网，把这种
+            # 「其实已确认、却被建窄了」的情况当场用横幅 + 一键重启补齐完整入口。
+            QTimer.singleShot(1500, self._acl_startup_reconcile)
         # 打开工具就接上次的任务：关键词、平台勾选、参数、采到哪儿一并回填（静默）。
         # 延到事件循环开始再做：读回上次数据要一两秒，卡在构造里窗口会先白屏。
         QTimer.singleShot(0, self._restore_last_task)
+        # 窗口最小宽的校准留到首次显示：那时视口宽度才是真的（见 showEvent /
+        # _apply_width_floor），构造阶段量出来的是默认尺寸，算出来的闸口是假的。
+        self._width_floor_done = False
+
+    def showEvent(self, ev):
+        """首次显示校准一次窗口最小宽，之后交给 Qt 自己维持，不再干预用户拖窗口。"""
+        super().showEvent(ev)
+        if not self._width_floor_done:
+            self._width_floor_done = True
+            try:
+                self._apply_width_floor()
+            except Exception:
+                pass          # 校准失败最多回到「窄窗裁切」的老行为，绝不能挡住窗口显示
+
+    def _apply_width_floor(self):
+        """把窗口最小宽抬到「本次真正建出来的配置内容」所需宽度，杜绝窄窗裁切。
+
+        配置区横向滚动是关掉的（不想让「开始采集」这种主按钮要左右拖才看到），而 Qt 在
+        widgetResizable + 横向关闭下的行为是「内容按其最小宽排开，视口外的部分直接裁掉」，
+        不是自动换行。窗口最小宽过去写死 880，实测 pro + 等级 0 的配置内容最小宽 1079：
+        窗口落在 880~1079 这段时，行尾的「搜索采购商」「权限管理」被裁掉——按钮确实建出来了、
+        也确实 isVisible，却看不见也点不到（等级 0 的管理员会直接被自己的面板锁在外面）。
+
+        余量全部**实测**，不拼常数：窗口宽减视口宽就是边距加边框加当前那条竖向滚动条，
+        竖向滚动条此刻没出现时再预留一条的宽度（macOS 上它是 overlay，预留了也只是宽几像素，
+        反过来漏算就会正好裁掉行尾几像素——「按钮在界面上但差 11px 点不到」是最难复现的
+        一类投诉）。档位/等级投影出的控件少，内容最小宽就小（lite 实测 867），丐版用户的
+        小窗口依旧合法——判定只看内容量，不写 if lite。
+        """
+        sa = getattr(self, "_cfg_scroll", None)
+        if sa is None or sa.widget() is None:
+            return
+        content = max(sa.widget().minimumSizeHint().width(), sa.widget().sizeHint().width())
+        if content <= 0:
+            return
+        bar = sa.verticalScrollBar()
+        reserve = 0 if (sa.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+                          or bar.isVisible()) else bar.sizeHint().width()
+        chrome = max(0, self.width() - sa.viewport().width()) + reserve
+        need = content + chrome + 2                     # 2px：四舍五入与字体度量的余量
+        # 上限是可用屏宽：小屏笔电上「窗口最小宽 1128、屏幕只有 1024」会让窗口伸出屏幕，
+        # 右侧照样看不见——只是换了个更难查的原因。真装不下时把横向滚动还回去：
+        # 宁可要一条看得见的横向滚动条，也不要一个看不见又点不到的按钮。
+        cap = int(self._width_floor_cap() or 0)
+        if cap and need > cap:
+            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            need = cap
+        self.setMinimumWidth(max(self.minimumWidth(), need))
+        if self.width() < self.minimumWidth():
+            self.resize(self.minimumWidth(), self.height())   # 已经太窄就当场撑开，不留裁切
+
+    def _width_floor_cap(self) -> int:
+        """最小宽的天花板：可用屏宽。单独成方法只为可测（离线用例顶掉它验退路）。"""
+        return QApplication.primaryScreen().availableGeometry().width()
+
+    def _acl_reg(self, cap, *widgets):
+        """把「按某条能力位创建的入口」登记进来，供等级变动时收口。
+
+        登记表是必需的而不是多余的：控件一旦建好就再也问不到「当初为什么建它」，
+        而在每个 handler 里各写一遍 if 正是这套改造要避免的老路。
+        """
+        for w in widgets:
+            if w is not None:
+                self._acl_gated.setdefault(cap, []).append(w)
+
+    def _acl_gate(self, allowed: bool, label: str) -> bool:
+        """动作层的权限复核（返回 True 才继续）。
+
+        控件层的「不创建」只在**建界面那一刻**有效：等级是之后才判定/改动的，
+        收口也只是 setVisible(False)。凡「建得比判定早」的入口都必须在这里再问一次，
+        否则「藏住入口」只做了一半——另一半是：既然能勾上，就得真能跑。
+        """
+        if allowed:
+            return True
+        self._on_log(f"ℹ 「{label}」不在当前账号的权限范围内，本次操作已取消"
+                     "（权限等级已变更时，重启工具后入口才会消失）")
+        return False
 
     def _get_desktop_dir(self):
         desktop = Path.home() / "Desktop"
@@ -1619,84 +1800,190 @@ class MainWindow(QMainWindow):
         lay.setSpacing(10)
         self.setCentralWidget(root)
 
+        # ── 配置区（①关键词 ②名单 ③平台 ④参数 动作按钮 客户库）统一放进可滚动容器 ──
+        # 为什么是"滚动"而不是"压缩"（2026-11-11 实测总根因）：本机 2560x1600 Retina
+        # 逻辑分辨率 1280x800、可用高度约 775，按屏幕自适应出来的窗口只有 650 上下；
+        # 而配置＋状态＋日志各行的自然最小高度合计 909。窗口比内容矮一截时 Qt 不是裁掉
+        # 底部，而是把没设硬最小值的控件一路压扁——关键词输入框被压到 10 像素、按钮文字
+        # 截成「入关键词文」，正是用户反馈「这块排版不优雅」的账。密集配置面板的业界统一
+        # 做法就是让配置区自己滚，把进度条/状态行/输出日志钉在下方常驻：挂机采集时用户
+        # 盯的是那三样，绝不能被滚走。
+        cfg_body = QWidget()
+        cfg = QVBoxLayout(cfg_body)
+        cfg.setContentsMargins(0, 0, 0, 0)
+        cfg.setSpacing(10)
+
         # ── 顶部双输入区：左＝关键词（5 平台并行搜索），右＝公司名单（企知道补采）──
+        # 名单补采通道在界面上的可见集合由档位投影（对外只留企知道），整段只算这一次：
+        # ① 的省份说明文案、② 的按钮与勾选框、日志看板的状态行都读这同一份集合。
+        # 各处各自数一遍，迟早会出现「② 藏住了、① 的 tooltip 还在报平台名」这种
+        # 文字先交底、按钮白藏的情况。
+        # 不显示的通道**不可能被勾上**，而「未勾选＝本轮不跑」是编排层既有语义，
+        # 所以这里完全不碰通道注册表与台账：功能一行没删，放开档位即恢复显示。
+        _vis_slugs = edition.visible_list_channels(LIST_CHANNEL_SLUGS, QZD_SLUG)
+        _multi_ch = len(_vis_slugs) > 1
+        _vis_names = " / ".join(SITE_NAMES.get(s, s) for s in _vis_slugs)
+        # 存成属性：校验提示（_on_start）在布局之外，也得报同一份平台名。
+        # 那里的文案如果各写一遍平台清单，就会出现在丐版里点名隐藏平台的风险。
+        self._list_vis_slugs = _vis_slugs
+        self._list_vis_names = _vis_names
         top = QHBoxLayout()
         top.setSpacing(10)
 
         gb_kw = QGroupBox("① 关键词（5 平台并行搜索）")
-        gb_kw.setToolTip("上传文档或直接粘贴，自动识别多个关键词（换行/逗号/顿号分隔）。")
+        gb_kw.setToolTip("上传文档或直接在框里粘贴（点进框按 Ctrl+V），自动识别多个关键词（换行/逗号/顿号分隔）。")
         v = QVBoxLayout(gb_kw)
+        v.setSpacing(8)
+        # 排版（2026-11-11 按用户实机反馈重排）：这一行只留三个「对关键词文本做动作」的
+        # 按钮。「从剪贴板粘贴」去掉了——粘贴本来就是文本框自带的本事（点进去 Ctrl+V），
+        # 单占一个按钮位反而让五个词挤在一行，小屏上直接被削成「入关键词文」。
         hr = QHBoxLayout()
+        hr.setSpacing(8)
         self.btn_file = QPushButton("导入关键词文件")
         self.btn_file.setToolTip("支持 txt / csv / xlsx / docx / md，自动识别里面的关键词。")
-        self.btn_paste = QPushButton("从剪贴板粘贴")
         self.btn_parse = QPushButton("解析关键词")
+        self.btn_parse.setToolTip("把框里的词按换行/逗号/顿号拆开去重，算出这次要搜的关键词（不解析也能直接开始采集）。")
         self.btn_smart = QPushButton("智能解析")
         self.btn_smart.setToolTip(
             "把「行业类别名」自动展开成一批「具体产品词」，帮你采到更多数据。\n"
             "例：「制冷与热泵核心部件」→ 制冷压缩机、冷凝器、蒸发器、膨胀阀、热泵机组……\n"
             "纯服务/流程词（研发、咨询、招投标、物流、运维等）会自动忽略，因为站内搜索没有对应商品。\n"
             "注意：解析结果由内置行业知识库生成，仅供参考，不一定完全符合你的需求，请检查后再采集。")
-        hr.addWidget(self.btn_file); hr.addWidget(self.btn_paste)
-        hr.addWidget(self.btn_parse); hr.addWidget(self.btn_smart)
+        for _b in (self.btn_file, self.btn_parse, self.btn_smart):
+            # 三个按钮按字体实测算出同一个最小宽度：一样宽看着才不散；策略取 Minimum，
+            # 意思是「布局你绝不能压得我比这更窄」——文字被截断的老问题就此断根，
+            # 而不是靠猜一个像素值（换系统字体又会截）。
+            _w = max(_b.fontMetrics().horizontalAdvance("导入关键词文件"),
+                     _b.fontMetrics().horizontalAdvance(_b.text())) + 24
+            _b.setMinimumWidth(_w)
+            _b.setMinimumHeight(30)
+            _b.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            hr.addWidget(_b)
+        hr.addStretch(1)
+        v.addLayout(hr)
         # 省份精准采集（多选）：和 1688 登录一样点按钮弹窗；默认不选（全国不限）。
+        # 「当前范围」与「改范围」是同一件事的两半，所以并到一行：左边一句话读范围，
+        # 右边一个按钮改范围；不再像以前那样按钮孤零零吊在关键词框下面找不到归属。
         self.btn_province = QPushButton("选择省份")
+        # 第三行列出的是「看不出省份时数据去哪」，通道名必须跟 ② 显示的集合一致：
+        # 这里自己写死「企知道 / 风鸟 / 爱企查」，丐版就成了按钮藏好、tooltip 还在
+        # 报名字的泄露点。「勾了哪路走哪路」只在真有多路时才有意义。
         self.btn_province.setToolTip(
             "可选多个省份，只采这些省份的企业数据。默认不选=全国都采。\n"
             "・支持按地区筛选的网站（中国制造网 / 马可波罗 / 1688）：把省份交给网站筛，"
             "采回来的每一条仍然用地址/公司名本地核一遍（网站筛不作为保证）；\n"
             "・其余网站页面上没地区筛选：按页面上写的地区与公司名把关，不是所选省份的不入库；\n"
-            "・页面上与公司名都看不出省份的：不拍脑袋入库，转企知道按工商登记地址反查一次"
+            "・页面上与公司名都看不出省份的：不拍脑袋入库，转名单补采通道"
+            f"（{_vis_names}"
+            + ("，勾了哪路走哪路" if _multi_ch else "")
+            + "）按工商登记地址反查一次"
             "（在目标省就连联系方式一起补上，外省则丢弃）。\n"
             "支持全选/清空/大区快捷选择，选好点「确定」即可。")
-        hr.addWidget(self.btn_province)
-        hr.addStretch(1)
-        v.addLayout(hr)
+        self.btn_province.setMinimumHeight(30)
+        self.btn_province.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.lbl_province = QLabel("🗺 采集范围：全国（不限省份）")
         self.lbl_province.setStyleSheet(_muted_style())
+        # 折行是底线：解析完可能拼出「采集范围：广东、江苏、浙江…」长串，不折行会把
+        # 窗口最小宽度顶宽，小屏上得横向拖动才能看到「开始采集」。
         self.lbl_province.setWordWrap(True)
-        v.addWidget(self.lbl_province)
+        self.lbl_province.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # 硬底线一行：折行的 QLabel 在窗口偏矮时会被布局一路压到 1 像素高（看不见字），
+        # 给个 minimumHeight 就锁死「至少看得见」。
+        self.lbl_province.setMinimumHeight(self.lbl_province.fontMetrics().height())
+        hrp = QHBoxLayout()
+        hrp.setSpacing(8)
+        hrp.addWidget(self.lbl_province, 1)
+        hrp.addWidget(self.btn_province)
+        v.addLayout(hrp)
         self.kw_text = QPlainTextEdit()
-        self.kw_text.setPlaceholderText("每行一个关键词（也可用逗号/顿号分隔），例如：太阳能路灯、光伏储能电池、LED显示屏")
-        self.kw_text.setMaximumHeight(96)
+        self.kw_text.setPlaceholderText(
+            "每行一个关键词（也可用逗号/顿号分隔），例如：太阳能路灯、光伏储能电池、LED显示屏\n"
+            "有现成的词表想贴进来：点这个框按 Ctrl+V 就行，贴完点「解析关键词」")
+        self.kw_text.setMinimumHeight(76)      # 3 行硬底线：任何窗口高度都不许压成一条缝
+        self.kw_text.setMaximumHeight(120)     # 最多 5 行：再高就该用「导入关键词文件」
         v.addWidget(self.kw_text)
         self.lbl_kw = QLabel("识别到 0 个关键词")
         self.lbl_kw.setStyleSheet(_muted_style())
         # 解析完会拼出「识别到 12 个关键词：A、B、C…」长串：不折行就会把窗口
         # 最小宽度顶宽，小屏上直接得横向拖动才能看到开始采集按钮。
         self.lbl_kw.setWordWrap(True)
+        self.lbl_kw.setMinimumHeight(self.lbl_kw.fontMetrics().height())
         v.addWidget(self.lbl_kw)
         top.addWidget(gb_kw, 3)
 
-        gb_co = QGroupBox("② 公司名单（企知道逐家补采·可选）")
+        # 标题口径跟着可见通道走（_vis_slugs 在上面算一次，此处只读）：只剩企知道时
+        # 还写「三平台」，就是先用文字把隐藏的功能告诉用户，再去藏按钮——顺序错了。
+        gb_co = QGroupBox("② 公司名单（"
+                         + ("三平台" if _multi_ch else SITE_NAMES.get(QZD_SLUG, "企知道"))
+                         + "逐家补采）")
         gb_co.setToolTip(
-            "可选：上传一份公司名文件（xlsx/csv/txt，有一列是公司名即可），企知道会逐家模拟人工查询补采。\n"
+            "可选：上传一份公司名文件（xlsx/csv/txt，有一列是公司名即可），"
+            + ("勾选的平台逐家" if _multi_ch else "由企知道逐家")
+            + "模拟人工查询补采。\n"
+            "只选名单、不填关键词也能点「开始采集」——就是「按公司名精准找联系方式」的用法。\n"
+            + ("勾了几个平台，同一份名单就每个平台都从第 1 家查到最后 1 家（不是几个平台分摊这份名单）；\n"
+               if _multi_ch else "")
+            + "采完自动按公司名合并到同一个文件：多个手机号/邮箱等取并集、用英文逗号分隔。\n"
             "开始采集后任务文件夹里会生成「待采集公司名单.xlsx」（与原数据/清洗入库数据同层级）；\n"
-            "关键词采集清洗掉的无联系方式废数据会自动回流进这份名单、被企知道补采（变废为宝）。\n"
+            "关键词采集清洗掉的无联系方式废数据会自动回流进这份名单、被补采（变废为宝）。\n"
             "采过/查不到的公司名会自动剔除，不重复采集。")
         vc = QVBoxLayout(gb_co)
         hc = QHBoxLayout()
         self.btn_co_file = QPushButton("选择公司名单文件")
         self.btn_co_file.setToolTip("选择需补采的公司名文件（xlsx/csv/txt，自动识别公司名列）。")
-        self.btn_open_qzd = QPushButton("打开企知道")
-        self.btn_open_qzd.setToolTip("企知道需登录后才能补采。点此在共享浏览器打开企知道首页，请完成登录。")
-        hc.addWidget(self.btn_co_file); hc.addWidget(self.btn_open_qzd)
+        hc.addWidget(self.btn_co_file)
+        # 「打开 XX」只给本机真正可用的平台生成按钮：缺采集器的机器上留一个点了必失败的
+        # 按钮比少一个按钮更糟（不可用清单由 bind_pending 明确播报，不会静默少跑一路）。
+        self.login_buttons = {}
+        for _slug in _vis_slugs:
+            if _slug not in self.session.channels:
+                continue
+            _btn = QPushButton(f"打开{SITE_NAMES[_slug]}")
+            _btn.setToolTip(f"{SITE_NAMES[_slug]}需登录后才能补采。"
+                            f"点此在共享浏览器打开{SITE_NAMES[_slug]}首页，请完成登录。")
+            self.login_buttons[_slug] = _btn
+            hc.addWidget(_btn)
         hc.addStretch(1)
         vc.addLayout(hc)
         self.lbl_co = QLabel("未选择公司名单（可选：不传也能靠废数据回流自动补采）")
         self.lbl_co.setStyleSheet(_muted_style())
         self.lbl_co.setWordWrap(True)
+        self.lbl_co.setMinimumHeight(self.lbl_co.fontMetrics().height())
         vc.addWidget(self.lbl_co)
-        self.chk_waste = QCheckBox("启用企知道补采（废数据自动回流·挂机过夜推荐）")
-        self.chk_waste.setChecked(True)
-        self.chk_waste.setToolTip(
-            "勾选后：① 上传的公司名单会逐家补采；② 关键词采集清洗掉的无联系方式废数据自动回流名单并被补采。\n"
-            "企知道通道为看门狗语义——名单为空时休眠、零资源占用；有数据才附加浏览器查询。\n"
-            "需先登录企知道（点「打开企知道」）。不勾则废数据仍会累积进名单表，供下次开启时使用。")
-        vc.addWidget(self.chk_waste)
-        top.addWidget(gb_co, 2)
+        # 三路勾选框：企知道默认勾（保持老习惯），风鸟/爱企查默认不勾（按需再开）。
+        # 三路跑的是同一份名单，取消勾选只是本轮不再去查，已补到的结果照样进产出文件。
+        # 档位不显示的通道**不创建控件**（不是建好再 setVisible(False)）：隐藏控件仍会
+        # 留在 Tab 焦点顺序里，用键盘能选中、能空格勾选——那就是没隐藏。
+        self.chk_list = {}
+        for _slug in _vis_slugs:
+            if _slug not in self.session.channels:
+                continue
+            _name = SITE_NAMES[_slug]
+            _chk = QCheckBox(f"{_name}补采" + ("（废数据自动回流·挂机过夜推荐）"
+                                             if _slug == QZD_SLUG else "（同步·与企知道同一份名单）"))
+            _chk.setChecked(_slug == QZD_SLUG)
+            _chk.setToolTip(
+                f"勾选后：① 上传的公司名单会由{_name}逐家补采；"
+                "② 关键词采集清洗掉的无联系方式废数据自动回流名单并被补采。\n"
+                # 机制说明与「③ 采集平台」面板同源（SITE_TIPS 一份文字两处用），
+                # 另起一份字典迟早会有一处改了另一处没改。
+                + SITE_TIPS.get(_slug, ""))
+            self.chk_list[_slug] = _chk
+            vc.addWidget(_chk)
+        # 历史引用名：界面旧代码与既有回归断言都认 chk_waste（企知道那一路）
+        self.chk_waste = self.chk_list.get(QZD_SLUG)
+        # 企知道以外那几路是 list_all_channels 画的：等级被下调后要收口的就是它们
+        # （企知道两档都有，不属于任何「多余入口」）。
+        for _slug, _chk in self.chk_list.items():
+            if _slug != QZD_SLUG:
+                self._acl_reg(edition.CAP_LIST_ALL_CHANNELS, _chk)
+        # AlignTop：本区自然高度比 ① 矮（尤其对外档只剩一路勾选框）。不加对齐时
+        # QHBoxLayout 会把 ② 一路拉到与 ① 同高，多出来的高度全被那句 wordWrap 说明
+        # 文字吃掉——文字占 155 像素高却只写了一行，中间一片空白，看上去像界面坏了。
+        # 对齐后 ② 收到自己该有的高度，空白留在两块之外，两档都一样整齐。
+        top.addWidget(gb_co, 2, Qt.AlignTop)
 
-        lay.addLayout(top)
+        cfg.addLayout(top)
 
         gb_site = QGroupBox("③ 采集平台（关键词并行）")
         # 多平台合并显示：除 1688 需单独勾选（有登录限制）外，其余站统一归为「多平台」
@@ -1733,7 +2020,7 @@ class MainWindow(QMainWindow):
                 self.site_checks["1688"] = chk_1688
                 gs.addWidget(chk_1688, 0, 1)
         vs.addLayout(gs)
-        lay.addWidget(gb_site)
+        cfg.addWidget(gb_site)
 
         gb_p = QGroupBox("④ 采集参数")
         # 分区标题只留短句，三个开关的机制差异集成交互说明挂在分区本身：
@@ -1775,14 +2062,53 @@ class MainWindow(QMainWindow):
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
         hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr); hp.addWidget(self.chk_bg)
         hp.addStretch(1)
-        self.btn_clear_seen = QPushButton("清空历史种子库")
-        self.btn_clear_seen.setToolTip("删除各站跨运行去重记录，让下次对同一批关键词从头重采。")
-        hp.addWidget(self.btn_clear_seen)
+        # 「清空历史种子库」是内部运维入口（一把删光跨运行去重成果，下轮全量重请反而
+        # 抬高防封风险）。对外档位不创建该按钮；复位对话框里的同名勾选项一并撤掉——
+        # 只藏按钮、留第二条入口，等于没藏。
+        self.btn_clear_seen = None
+        if edition.clear_seen_visible():
+            self.btn_clear_seen = QPushButton("清空历史种子库")
+            self.btn_clear_seen.setToolTip("删除各站跨运行去重记录，让下次对同一批关键词从头重采。")
+            hp.addWidget(self.btn_clear_seen)
+            self._acl_reg(edition.CAP_CLEAR_SEEN, self.btn_clear_seen)
         vp.addLayout(hp)
-        lay.addWidget(gb_p)
+        # 第二行：自动扩词 + 历史任务（从操作行迁入，和采集参数放一起更合理）
+        # 对外档位两个入口都不显示，这时**整行不加入布局**：只把控件藏掉会留下一条
+        # 高度空档，用户说不出哪里不对、只会觉得界面莫名其妙空了一块。
+        hp2 = QHBoxLayout()
+        self.chk_auto_kw = None
+        self.btn_history = None
+        if edition.auto_expand_visible():
+            self.chk_auto_kw = QCheckBox("自动扩词")
+            self.chk_auto_kw.setChecked(self._auto_expand)
+            self.chk_auto_kw.setToolTip(
+                "点「开始采集」时自动把「暖通空调与制冷设备」这类行业类别名展开成一批具体产品词\n"
+                "（制冷压缩机、冷凝器、工业冷水机……）。\n"
+                "原因：站内搜索只认产品名，类别名不是商品，实测一个词只能翻出十几家还混着无关商家，\n"
+                "挂一天也只有几百条。展开后的词会写回关键词框，可随时删改；\n"
+                "不想要就取消勾选，完全按你填的词采。")
+            # 勾选状态落成数据而不是只存在控件里：续采快照、开始采集前的判据都读它，
+            # 档位切换（控件在/不在）不该让这些读取点各写一份兜底。
+            self.chk_auto_kw.toggled.connect(self._set_auto_expand)
+            hp2.addWidget(self.chk_auto_kw)
+            self._acl_reg(edition.CAP_AUTO_EXPAND_UI, self.chk_auto_kw)
+        if edition.history_visible():
+            self.btn_history = QPushButton("历史任务")
+            self.btn_history.setToolTip(
+                "列出以前采过的任务：关键词、平台勾选、采集间隔、采到哪儿都记着。\n"
+                "选中一条点「接着采」→ 点「开始采集」就从上次停下的地方继续，\n"
+                "已采完的关键词自动跳过，数据仍写进同一个文件夹（不会盖掉已采的）。")
+            self.btn_history.setMinimumHeight(30)
+            if self.chk_auto_kw is not None:
+                hp2.addSpacing(16)
+            hp2.addWidget(self.btn_history)
+            self._acl_reg(edition.CAP_HISTORY_TASKS, self.btn_history)
+        if self.chk_auto_kw is not None or self.btn_history is not None:
+            hp2.addStretch(1)
+            vp.addLayout(hp2)
+        cfg.addWidget(gb_p)
 
         hb = QHBoxLayout()
-        self.btn_open = QPushButton("打开浏览器")
         self.btn_start = QPushButton("开始采集")
         self.btn_pause = QPushButton("暂停")
         self.btn_stop = QPushButton("停止")
@@ -1798,44 +2124,63 @@ class MainWindow(QMainWindow):
         self.btn_reset.setToolTip(
             "换一批关键词从零重采时用：清空本次已采数据、各站进度账目、进度条/计时/看板，\n"
             "并释放当前数据文件夹——下次点「开始采集」会新建一个以时间戳命名的文件夹保存新数据。\n"
-            "复位前先把剩余数据同步落盘（不满一个自动保存批次的尾部也不丢）。\n"
-            "跨运行历史种子库默认保留（省请求=防封），需要连去重记录一起清就在对话框里勾选。")
+            "复位前先把剩余数据同步落盘（不满一个自动保存批次的尾部也不丢）。"
+            # 最后一句在讲复位对话框里的「同时清空历史种子库」勾选项。对外档位没有这个
+            # 勾选项（也没有那个按钮），文案却先一步把能力说出来了——入口藏住、话没藏住。
+            + ("\n跨运行历史种子库默认保留（省请求=防封），需要连去重记录一起清就在对话框里勾选。"
+               if edition.clear_seen_visible() else ""))
         # 主操作唯一化：只有「开始采集」吃强调色，其余保持默认样式（满屏彩色=没有重点）；
         # 按「准备 / 跑 / 产出」三组拉开间距，一眼能看出动作顺序。
         self.btn_start.setObjectName("primary")
         self.btn_start.setMinimumWidth(120)
-        # 自动扩词开关 / 历史任务入口放在操作行：这一行左右两簇中间原本空着
-        # 300 多像素，挂在这里既不用给关键词区加行（加了会把窗口撑爆、
-        # 反而把关键词框压成一行），又和「开始采集」「开始新任务」挨着好理解。
-        self.chk_auto_kw = QCheckBox("自动扩词")
-        self.chk_auto_kw.setChecked(True)
-        self.chk_auto_kw.setToolTip(
-            "点「开始采集」时自动把「暖通空调与制冷设备」这类行业类别名展开成一批具体产品词\n"
-            "（制冷压缩机、冷凝器、工业冷水机……）。\n"
-            "原因：站内搜索只认产品名，类别名不是商品，实测一个词只能翻出十几家还混着无关商家，\n"
-            "挂一天也只有几百条。展开后的词会写回关键词框，可随时删改；\n"
-            "不想要就取消勾选，完全按你填的词采。")
-        self.btn_history = QPushButton("历史任务")
-        self.btn_history.setToolTip(
-            "列出以前采过的任务：关键词、平台勾选、采集间隔、采到哪儿都记着。\n"
-            "选中一条点「接着采」→ 点「开始采集」就从上次停下的地方继续，\n"
-            "已采完的关键词自动跳过，数据仍写进同一个文件夹（不会盖掉已采的）。")
-        for b in (self.btn_open, self.btn_start, self.btn_pause, self.btn_stop,
+        for b in (self.btn_start, self.btn_pause, self.btn_stop,
                   self.btn_clean, self.btn_export, self.btn_reset):
             b.setMinimumHeight(36)
-        hb.addWidget(self.btn_open)
+        hb.addWidget(self.btn_start)
         hb.addSpacing(14)
-        for b in (self.btn_start, self.btn_pause, self.btn_stop):
+        for b in (self.btn_pause, self.btn_stop):
             hb.addWidget(b)
         hb.addSpacing(14)
-        hb.addWidget(self.chk_auto_kw)
         hb.addStretch(1)
-        hb.addWidget(self.btn_history)
-        hb.addSpacing(14)
         for b in (self.btn_clean, self.btn_export, self.btn_reset):
             hb.addWidget(b)
+        # ── 数据池按钮（导入历史 + 扫描本地 + 同步 + 搜索）──
+        # 对外档位整组**不创建**：这四个入口一旦画出来就说不清了——灰着的按钮同样告诉
+        # 用户「本来有这件事」，而 Tab 键还能逐个走过去。数据链路本身不关（采集完成后
+        # 由 _silent_pool_sync 后台同步），关掉的只是「让人知道有这功能」的那一层。
+        self.btn_pool_import = None
+        self.btn_pool_scan = None
+        self.btn_pool_sync = None
+        self.btn_pool_search = None
+        if edition.pool_ui_visible():
+            hb.addSpacing(14)
+            self.btn_pool_import = QPushButton("导入历史数据")
+            self.btn_pool_import.setToolTip("选择本地 Excel/CSV 文件，自动转换后批量上传到团队数据池。\n适合把以前采集的大量数据一次性导入，不用就浪费了。")
+            self.btn_pool_import.setMinimumHeight(36)
+            self.btn_pool_sync = QPushButton("同步数据池")
+            self.btn_pool_sync.setToolTip("把本次采集数据上传到团队共享数据池，供所有人搜索使用。")
+            self.btn_pool_sync.setMinimumHeight(36)
+            self.btn_pool_search = QPushButton("搜索采购商")
+            self.btn_pool_search.setToolTip("从团队数据池智能搜索下游采购商，支持 DeepSeek 语义匹配。")
+            self.btn_pool_search.setMinimumHeight(36)
+            self.btn_pool_scan = QPushButton("扫描本地表格")
+            self.btn_pool_scan.setToolTip(
+                "全盘扫描本机 Excel/CSV，逐个判断能不能入池，出清单给你勾选后再上传。\n"
+                "已传过的内容、同系列旧快照、说明文档类表格会自动分开标注。")
+            self.btn_pool_scan.setMinimumHeight(36)
+            if not HAS_POOL:
+                self.btn_pool_import.setEnabled(False)
+                self.btn_pool_sync.setEnabled(False)
+                self.btn_pool_search.setEnabled(False)
+                self.btn_pool_scan.setEnabled(False)
+            hb.addWidget(self.btn_pool_import)
+            hb.addWidget(self.btn_pool_scan)
+            hb.addWidget(self.btn_pool_sync)
+            hb.addWidget(self.btn_pool_search)
+            self._acl_reg(edition.CAP_POOL_UI, self.btn_pool_import, self.btn_pool_scan,
+                          self.btn_pool_sync, self.btn_pool_search)
         self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
-        lay.addLayout(hb)
+        cfg.addLayout(hb)
 
         self.auto_import_check = QCheckBox("采集完自动导入云展客户库")
         self.auto_import_check.setToolTip(
@@ -1845,9 +2190,12 @@ class MainWindow(QMainWindow):
 
         # 绑定状态 + 自动导入勾选 + 两个动作合并成一行，不再各占一块（省下一行高度给日志）
         yzd_group = QGroupBox("云展动力客户库")
+        # 措辞避开了「历史任务」这四个字：那是对内才有的续采入口（④ 里按档位投影），
+        # 而这里讲的是导入弹窗里「挑以前采过的哪几个任务一起导入」。两个功能同名不同事，
+        # 用同一个词会让外部用户以为界面还少了一个叫「历史任务」的东西。
         yzd_group.setToolTip(
             "把本次采到的企业按联系人口径清洗后导入云展动力客户库指定分组。\n"
-            "需先绑定云展动力账号；手动点「导入客户库」可选分组和历史任务，"
+            "需先绑定云展动力账号；手动点「导入客户库」可选分组、也能挑以前采过的任务一起导入，"
             "勾选「采集完自动导入」则先选一个分组、跑完自动上传并在日志提示结果。\n"
             "手动点「停止」不触发自动导入（中途停手的数据不会静默上传）。")
         yl = QHBoxLayout(yzd_group)
@@ -1867,11 +2215,58 @@ class MainWindow(QMainWindow):
         self.import_yzd_btn.setMinimumHeight(30)
         self.import_yzd_btn.clicked.connect(self._open_yzd_import)
         yl.addWidget(self.import_yzd_btn)
-        lay.addWidget(yzd_group)
+        # ── 管理员专属：本机权限自查 + 权限管理入口 ──
+        # 只有「构建 pro 且账号等级 0」才**创建**这两个控件（不是建好再藏）：外部用户
+        # 拿到包也翻不出「原来还能管别人」。等级 1/2 的账号界面上不出现任何等级字样——
+        # 权限模型是他们看不见的东西，看得见的只有能用的功能。
+        # 状态徽章留给管理员是有用处的：改完名单得有个地方一眼确认「本机现在按哪档跑」。
+        self.acl_status_lbl = None
+        self.btn_acl_admin = None
+        if edition.acl_admin_visible():
+            self.acl_status_lbl = QLabel("")
+            self.acl_status_lbl.setFont(_yzd_font(10))
+            self.acl_status_lbl.setStyleSheet(_muted_style())
+            yl.addSpacing(12)
+            yl.addWidget(self.acl_status_lbl)
+            self.btn_acl_admin = QPushButton("权限管理")
+            self.btn_acl_admin.setMinimumHeight(30)
+            self.btn_acl_admin.setToolTip(
+                "查看白名单与每个账号的权限等级、各自绑定在哪台设备上；\n"
+                "加账号/改等级/强制解绑（踢下线）。改动写入 OSS 名单，\n"
+                "本机立即生效，其他设备的工具最迟 60 秒内生效。")
+            self.btn_acl_admin.clicked.connect(self._open_acl_admin)
+            yl.addWidget(self.btn_acl_admin)
+            self._acl_reg(edition.CAP_ACL_ADMIN, self.btn_acl_admin, self.acl_status_lbl)
+        cfg.addWidget(yzd_group)
+
+        # 配置区→滚动容器：窗口不够高时滚配置，绝不把输入框压扁（详见上面 cfg 的注释）。
+        # 富余高度按 3:2 分给「配置区 : 日志」——大屏上配置一屏看全，小屏上两者各留底线。
+        cfg_scroll = QScrollArea()
+        cfg_scroll.setWidgetResizable(True)
+        cfg_scroll.setFrameShape(QFrame.NoFrame)
+        cfg_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 横向一定不滚，所以配置区的自然宽度就是内容宽度：窗口再窄也只竖着滚，
+        # 不会出现「按钮行要左右拖才能看到开始采集」这种二次伤害。
+        cfg_scroll.setMinimumHeight(180)       # 配置可视区底线：再矮就只能挪窗口了
+        cfg_scroll.setWidget(cfg_body)
+        lay.addWidget(cfg_scroll, 3)
+        # 配置区滚动容器留一份引用：首次显示时按它的真实视口宽度校准窗口最小宽
+        # （见 _apply_width_floor）。这里不直接算，是因为构造阶段视口宽度还不是最终值。
+        self._cfg_scroll = cfg_scroll
 
         self.banner = QLabel("")
         self.banner.setVisible(False)
         self.banner.setWordWrap(True)
+        # 横幅要能带一个可点的动作（「重启工具现在生效」这类），所以显式打开链接交互：
+        # 后台事件一律不许弹模态（offscreen 直接卡死、正采集时抢焦点），但「用户该做一件事」
+        # 的情形又不能只写在日志里等人自己翻——一条带按钮的横幅才是两边都成立的解。
+        # Qt5 里没有 Qt::LinksInteractive（那是 Qt6 才加的标志位），等价写法是下面这两个
+        # 「可点/可用键盘触发」的链接标志；顺手保留鼠标选中，方便用户把提示原文复制出来问。
+        self.banner.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+            | Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard)
+        self.banner.setOpenExternalLinks(False)   # href 以 # 开头，全部走下面的槽
+        self.banner.linkActivated.connect(self._on_banner_link)
         lay.addWidget(self.banner)
 
         prog_row = QHBoxLayout()
@@ -1916,7 +2311,7 @@ class MainWindow(QMainWindow):
         # 累积会让文档越来越大、每次 append 重排越来越慢、内存持续上涨。
         # 设最大块数：只保留最近 N 行，超出自动从头丢弃，渲染/内存恒定。
         self.log.document().setMaximumBlockCount(3000)
-        lay.addWidget(self.log, 1)
+        lay.addWidget(self.log, 2)
 
     def _connect_signals(self):
         s = self.session.signals
@@ -1931,21 +2326,31 @@ class MainWindow(QMainWindow):
         if hasattr(s, "login_required_signal"):
             s.login_required_signal.connect(lambda m: self._on_log("🔐 " + m))
         self.btn_file.clicked.connect(self._on_import_file)
-        self.btn_paste.clicked.connect(self._on_paste)
         self.btn_parse.clicked.connect(self._on_parse)
         self.btn_smart.clicked.connect(self._on_smart_parse)
         self.btn_province.clicked.connect(self._on_pick_province)
-        self.btn_history.clicked.connect(self._on_history_tasks)
+        # 入口控件按档位创建，这里（以及后面所有使用点）只问「控件在不在」。
+        # 分工是刻意的：**创建点问档位，使用点问对象**——这样以后再加一档、或某个
+        # 入口换名字，使用点不会因为记错档位判据而漏改（漏改的表现是启动即崩）。
+        if self.btn_history is not None:
+            self.btn_history.clicked.connect(self._on_history_tasks)
         self.btn_co_file.clicked.connect(self._on_import_company_file)
-        self.btn_open_qzd.clicked.connect(lambda: self._open_site_login("qzd"))
-        self.btn_open.clicked.connect(self._on_open_browser)
+        # 三路补采平台的「打开 XX」按钮逐个接线（本机可用的才有按钮，也就不会点到 None）
+        for _slug, _btn in self.login_buttons.items():
+            _btn.clicked.connect(lambda _c=False, s=_slug: self._open_site_login(s))
         self.btn_start.clicked.connect(self._on_start)
         self.btn_pause.clicked.connect(self._on_pause)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_clean.clicked.connect(self._on_clean_now)
         self.btn_export.clicked.connect(self._on_export)
-        self.btn_clear_seen.clicked.connect(self._on_clear_seen_store)
+        if self.btn_clear_seen is not None:
+            self.btn_clear_seen.clicked.connect(self._on_clear_seen_store)
         self.btn_reset.clicked.connect(self._on_reset_task)
+        if HAS_POOL and self.btn_pool_import is not None:
+            self.btn_pool_import.clicked.connect(self._on_pool_import)
+            self.btn_pool_scan.clicked.connect(self._on_pool_scan)
+            self.btn_pool_sync.clicked.connect(self._on_pool_sync)
+            self.btn_pool_search.clicked.connect(self._on_pool_search)
 
     def _on_log(self, msg):
         self.log.append(msg)
@@ -1957,13 +2362,28 @@ class MainWindow(QMainWindow):
         seconds = int(max(0, seconds))
         return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
-    def _update_bar(self, prefix="采集中"):
+    def _update_bar(self, prefix=None):
         pct = getattr(self, "_bar_pct", 0)
         cur = getattr(self, "_bar_companies", 0)
         self.progress.setValue(pct)
+        if prefix is None:
+            # 纯名单模式（没关键词、只勾了补采平台）时写「采集中」用户会以为在搜关键词，
+            # 进度也确实一直不动（2026-11-11 实机反馈「跑了 14 分钟还是 0%」）：
+            # 名字按本轮实际干的活来，数字改由三路台账驱动（见 session.list_progress）。
+            prefix = "名单补采中" if getattr(self, "_bar_list_only", False) else "采集中"
+        unit = ""
+        if getattr(self, "_bar_list_on", False):
+            try:
+                ld, lt = self.session.list_progress()
+            except Exception:
+                ld = lt = 0
+            if lt:
+                # 「家次」＝家数 × 路数：三路共用同一份名单，每一路都要从第 1 家查到
+                # 最后一家，只看「已采多少家」看不出这一路其实才起步。
+                unit = f"｜名单 {ld}/{lt} 家次"
         # 时间只给右侧独立计时器显示：旧版进度条文本里也嵌一份⏱，同一屏出现两个
         # 不同数值的时间（一个是累计耗时、一个是刷新时刻），看着像数据对不上。
-        self.progress.setFormat(f"{prefix} {pct}%｜已采 {cur} 家")
+        self.progress.setFormat(f"{prefix} {pct}%｜已采 {cur} 家{unit}")
 
     def _on_kw_progress(self, _slug, done_units, total_units):
         self._bar_pct = int(done_units / total_units * 100) if total_units else 0
@@ -1991,7 +2411,7 @@ class MainWindow(QMainWindow):
             f"{name}：采到 {s.get('got', 0)} 家（成功 {s.get('ok', 0)}）｜翻 {s.get('pages', 0)} 页见 "
             f"{s.get('listed', 0)} 条｜无联系方式 {s.get('no_contact', 0)}｜失败/可重采 "
             f"{s.get('failed', 0)}｜早过滤 {s.get('early', 0)}｜详情不相关 {s.get('filtered', 0)}｜"
-            f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转企知道 {s.get('pf_unknown', 0)}"
+            f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转名单补采 {s.get('pf_unknown', 0)}"
             for name, s in stats.items()))
         self.lbl_board.setVisible(True)
 
@@ -2016,6 +2436,17 @@ class MainWindow(QMainWindow):
 
     def _hide_banner(self):
         self.banner.setVisible(False)
+
+    def _on_banner_link(self, link: str):
+        """横幅里那条链接的唯一入口：以 # 开头的动作都在这里分派。
+
+        做成「用户点一下才发生」而不是「后台自己弹」，是为了同时满足两件事：
+        提示必须在场（不然没人知道要重启），打断必须零次（不然正跑的任务被 modal
+        事件循环卡在中间，offscreen 测试还会直接永久挂住）。
+        """
+        if link == "#acl-restart":
+            self._acl_prompt_restart()
+        # 其余未知动作静默忽略：横幅文案由别处拼装，将来加新链接不该在这里炸界面
 
     def _on_blocked(self, reason):
         """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（等待不计入采集耗时）。
@@ -2255,12 +2686,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"读取文件出错：{e}")
 
-    def _on_paste(self):
-        t = QApplication.clipboard().text()
-        if t:
-            self.kw_text.appendPlainText(t)
-            self._on_parse()
-
     def _on_parse(self):
         self._kw_raw = self.kw_text.toPlainText()
         _junk = []
@@ -2341,12 +2766,34 @@ class MainWindow(QMainWindow):
             self._on_log(f"   ・已忽略（纯服务/流程词，站内无对应商品）：{'、'.join(rep['dropped'])}")
         self._on_log(f"⚠ {self._SMART_HINT}")
 
-    # ── 公司名单（企知道补采）/ 登录页 ───────────────────
+    # ── 公司名单（企知道 / 风鸟 / 爱企查 补采）/ 登录页 ───────────────────
+    def _list_want_slugs(self):
+        """界面上勾选的补采平台 slug（按注册表顺序，本机没有的平台不可能被勾上）。
+        三路跑同一份名单：这里返回几个，就有几条看门狗各自从名单第 1 家查到最后一家。
+
+        这里必须再过一遍**当前生效**的可见集合，不能只信控件状态：控件是建界面那一刻
+        按当时的等级画的，而等级要拉到名单才知道。只靠「不创建」收口，就等于承认权限
+        判定是一次性快照——账号等级被下调后，旧控件里勾着的风鸟照样会跑起来。
+        """
+        _vis = set(edition.visible_list_channels(LIST_CHANNEL_SLUGS, QZD_SLUG))
+        out, dropped = [], []
+        for slug in LIST_CHANNEL_SLUGS:
+            chk = self.chk_list.get(slug)
+            if chk is None or not chk.isChecked():
+                continue
+            (out if slug in _vis else dropped).append(slug)
+        if dropped:
+            # 不声不响少跑一路是最难查的那种不一致：勾着却没跑，用户只能猜
+            self._on_log("ℹ 按当前账号权限，本次不走这些名单补采平台："
+                         + "、".join(SITE_NAMES.get(s, s) for s in dropped)
+                         + "（重启工具后勾选框也会消失）")
+        return out
+
     def _on_import_company_file(self):
         """选择需补采的公司名文件：先预览识别到多少家（真正入列在开始采集时
         由 session.bind_pending 完成，那里才知道任务文件夹）。"""
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择公司名单文件", "", "支持的文件 (*.xlsx *.xlsm *.csv *.txt);;所有文件 (*)")
+            self, "选择公司名单文件", "", "支持的文件 (*.xlsx *.xlsm *.xls *.csv *.txt);;所有文件 (*)")
         if not path:
             return
         self._co_source_file = path
@@ -2359,10 +2806,13 @@ class MainWindow(QMainWindow):
             self._on_log(f"⚠ 公司名单预览失败：{str(e).splitlines()[0][:120]}")
         if n > 0:
             self.lbl_co.setText(f"已选择：{fname}（识别到 {n} 家公司，开始采集后写入待采名单）")
-            self._on_log(f"📋 已选择公司名单：{fname}，识别到 {n} 家公司")
-            # 传了名单就是想用企知道补采：自动勾上补采开关（免用户漏勾）
-            if not self.chk_waste.isChecked():
-                self.chk_waste.setChecked(True)
+            self._on_log(f"📋 已选择公司名单：{fname}，识别到 {n} 家公司"
+                         f"｜勾选了哪几个补采平台，就有几路各自从第 1 家查到第 {n} 家")
+            # 传了名单就是想补采：一个平台都没勾时自动勾上默认那一路（免用户漏勾）
+            if not self._list_want_slugs():
+                default = self.chk_list.get(QZD_SLUG) or next(iter(self.chk_list.values()), None)
+                if default is not None:
+                    default.setChecked(True)
         elif n == 0:
             self.lbl_co.setText(f"已选择：{fname}（未识别到公司名，请确认有一列是公司名）")
             self._on_log(f"⚠ {fname} 里没识别到公司名（需有一列是公司名）")
@@ -2385,13 +2835,16 @@ class MainWindow(QMainWindow):
             self._open_site_login("1688")
 
     def _open_site_login(self, slug):
-        """打开 1688/企知道 登录页：附加浏览器有网络 IO，一律走后台线程，
-        绝不在主线程同步启动（否则窗口会「未响应」）。回控只走信号/主线程轮询。"""
-        if getattr(self, "_opening_login", False):
+        """打开 1688 / 企知道 / 风鸟 / 爱企查 登录页：附加浏览器有网络 IO，一律走后台线程，
+        绝不在主线程同步启动（否则窗口会「未响应」）。回控只走信号/主线程轮询。
+
+        防重复点按平台各记各的：三平台并行时用户会连着点三个按钮，用一把全局锁会把
+        后两个点击静默吞掉（用户看到的是「点了没反应」）。"""
+        if slug in self._opening_logins:
             return
         label = SITE_NAMES.get(slug, slug)
-        self._opening_login = True
-        btn = self.btn_open_qzd if slug == "qzd" else None
+        self._opening_logins.add(slug)
+        btn = self.login_buttons.get(slug)
         if btn:
             btn.setEnabled(False)
         self._on_log(f"正在打开{label}登录页（首次会拉起共享浏览器，请稍候）…")
@@ -2403,51 +2856,21 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.session._log(f"⚠ 打开{label}失败：{str(e).splitlines()[0][:120]}")
             finally:
-                self._opening_login = False
+                self._opening_logins.discard(slug)
 
         threading.Thread(target=task, daemon=True).start()
 
         def poll():
-            if getattr(self, "_opening_login", False):
+            if slug in self._opening_logins:
                 QTimer.singleShot(400, poll)
             elif btn:
                 btn.setEnabled(True)
         QTimer.singleShot(400, poll)
 
-    # ── 浏览器 ─────────────────────────────────────────────────
-    def _on_open_browser(self):
-        if getattr(self, "_opening_browser", False):
-            return
-        enabled = self._enabled_sites()
-        if not enabled:
-            QMessageBox.information(self, "提示", "请至少勾选一个采集站点。")
-            return
-        self.session.set_enabled(enabled)
-        self._opening_browser = True
-        self.btn_open.setEnabled(False)
-        self._on_log("正在启动共享浏览器（需浏览器的站点各占一个标签）…")
-
-        def task():
-            try:
-                ok = self.session.start_browser(headed=True)
-                if ok:
-                    self.session._log("✅ 共享浏览器已就绪，可点「开始采集」")
-                else:
-                    self.session._log("⚠ 浏览器启动失败，请确认已安装 Google Chrome 后重试")
-            finally:
-                self._opening_browser = False
-
-        threading.Thread(target=task, daemon=True).start()
-
-        def poll():
-            if getattr(self, "_opening_browser", False):
-                QTimer.singleShot(500, poll)
-            else:
-                self.btn_open.setEnabled(True)
-        QTimer.singleShot(500, poll)
-
     # ── 采集控制 ───────────────────────────────────────────────
     def _on_clear_seen_store(self):
+        if not self._acl_gate(edition.clear_seen_visible(), "清空历史种子库"):
+            return
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "提示", "采集进行中，请先停止后再清空种子库。")
             return
@@ -2504,13 +2927,19 @@ class MainWindow(QMainWindow):
                "当前内存里没有已采数据（本次无需落盘）。\n复位会清空各站进度账目并释放当前数据文件夹，\n"
                "下次点「开始采集」会新建一个时间戳文件夹。\n\n请勾选额外项：")
         dv.addWidget(QLabel(tip))
-        chk_seen = QCheckBox("同时清空历史种子库（跨运行去重记录一起清，同一批关键词也彻底从头重采）")
-        chk_seen.setToolTip("不勾：新关键词仍从零开文件夹、进度归零，但老关键词已采过的商家仍会命中跳过（省请求=防封）。\n"
-                            "勾选：完全当全新任务，所有商家重新请求一遍（短时间重请会抬高防采风险）。")
+        # 复位对话框里的「同时清空历史种子库」是被隐藏按钮的**第二条入口**：只撤工具栏
+        # 那个按钮、把这里留着打勾，一样能清光去重记录，还顺带把这个名词教给了用户。
+        # 所以两处必须一起撤，判据也共用同一个 edition 能力位。
+        chk_seen = None
+        if edition.clear_seen_visible():
+            chk_seen = QCheckBox("同时清空历史种子库（跨运行去重记录一起清，同一批关键词也彻底从头重采）")
+            chk_seen.setToolTip("不勾：新关键词仍从零开文件夹、进度归零，但老关键词已采过的商家仍会命中跳过（省请求=防封）。\n"
+                                "勾选：完全当全新任务，所有商家重新请求一遍（短时间重请会抬高防采风险）。")
         chk_kw = QCheckBox("同时清空关键词输入框（换一批关键词时用）")
         chk_log = QCheckBox("同时清空日志区")
         for c in (chk_seen, chk_kw, chk_log):
-            dv.addWidget(c)
+            if c is not None:
+                dv.addWidget(c)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("确认开始新任务")
         bb.button(QDialogButtonBox.Cancel).setText("取消")
@@ -2522,7 +2951,7 @@ class MainWindow(QMainWindow):
 
         if total:
             self._final_save_sync()
-        if chk_seen.isChecked():
+        if chk_seen is not None and chk_seen.isChecked():
             self.session.clear_seen_store()
             self._on_log("🧹 历史种子库已清空（各平台跨运行去重记录全部删除）")
         self.session.reset_results()
@@ -2541,6 +2970,10 @@ class MainWindow(QMainWindow):
         self._last_autosave_bucket = 0
         self._bar_pct = 0
         self._bar_companies = 0
+        # 进度条口径跟着「下一次开始采集」重新判定：复位后若还留着上一轮的名单标记，
+        # 待机文本就会写着「名单补采中」而实际什么都没跑。
+        self._bar_list_on = False
+        self._bar_list_only = False
         self._manual_stop = False
         self._paused = False
         self._held_seconds = 0.0
@@ -2571,17 +3004,54 @@ class MainWindow(QMainWindow):
         if not self.keywords:
             self._on_parse()
         has_co = bool(self._co_source_file)
-        want_qzd = self.chk_waste.isChecked()
-        # 关键词、公司名单、废数据补采三者全空才无事可做（允许“只跑企知道名单”模式）
-        if not self.keywords and not has_co and not want_qzd:
-            QMessageBox.information(self, "提示", "请先输入/导入关键词，或选择公司名单文件。")
+        want_slugs = self._list_want_slugs()
+        list_names = "、".join(SITE_NAMES.get(s, s) for s in want_slugs)
+        # 三种用法都必须能启动：①只关键词 ②只公司名单（精准按名查联系方式，用户反馈需求）
+        # ③两者都有。三者全空才是真的无事可做。
+        if not self.keywords and not has_co and not want_slugs:
+            QMessageBox.information(self, "提示",
+                                    "请先输入/导入关键词，或选择公司名单文件"
+                                    "（只选名单也能采集：勾上的补采平台会逐家按公司名查联系方式）。")
             return
         enabled = self._enabled_sites()
-        if not enabled and not want_qzd:
+        if not self.keywords and not want_slugs:
+            # 只跑名单时补采平台就是主任务：一个都没勾等于没有执行者（不能空跑一轮）
+            # 平台名必须取 ``_list_vis_names``（档位在界面上显示的那几路）：这条提示在
+            # 丐版也会弹（用户取消勾选企知道就能触发），照内部版点名「风鸟 / 爱企查」
+            # 就等于把藏起来的平台又念了一遍——而那两个平台在界面上连个影子都没有。
+            QMessageBox.information(self, "提示",
+                                    "没有填关键词，本次只按公司名单采集：请至少勾选一个"
+                                    f"名单补采平台（{self._list_vis_names}）。")
+            return
+        if not enabled and not want_slugs:
             QMessageBox.information(self, "提示", "请至少勾选一个采集平台。")
             return
         if self.worker and self.worker.isRunning():
             return
+        # 自动启动浏览器（原「打开浏览器」按钮功能，现在集成到开始采集里）
+        self._on_log("正在启动共享浏览器…")
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("启动浏览器中…")
+        browser_ok = [False]
+
+        def _start_browser_bg():
+            try:
+                browser_ok[0] = self.session.start_browser(headed=True)
+            except Exception:
+                browser_ok[0] = False
+
+        t = threading.Thread(target=_start_browser_bg, daemon=True)
+        t.start()
+        t.join(timeout=30)
+        if not browser_ok[0]:
+            self.btn_start.setEnabled(True)
+            self.btn_start.setText("开始采集")
+            QMessageBox.warning(self, "浏览器启动失败",
+                                "共享浏览器未能启动，请确认已安装 Google Chrome。\n"
+                                "如果 Chrome 正在运行，请关闭后重试。")
+            return
+        self._on_log("✅ 共享浏览器已就绪")
+        self.btn_start.setText("开始采集")
         # 自动扩词：行业类别名 → 具体产品词（放在开始采集前，用户不用记着先点「智能解析」）
         self._auto_expand_on_start()
         self.session.set_enabled(enabled)
@@ -2595,7 +3065,7 @@ class MainWindow(QMainWindow):
             self._on_log(f"🗺 本次按 {len(self.selected_provinces)} 个省「{names}」精准采集："
                          "支持地区筛选的站交给网站筛、采回来的每条再按地址与公司名本地复核；"
                          "其余站直接按页面标注地区与公司名把关，对不上的不入库；"
-                         "看不出省份的转企知道按工商地址反查后再定")
+                         "看不出省份的转名单补采通道按工商地址反查后再定")
         if not self._first_start:
             self._first_start = datetime.now().strftime("%Y%m%d_%H%M%S")
             base = _tasks.tool_dir(self._get_desktop_dir()) if HAS_YZD else \
@@ -2604,11 +3074,12 @@ class MainWindow(QMainWindow):
         # 进度台账与数据 Excel 同文件夹：拷走整个文件夹就把「采到哪儿」一起带走了
         self.session.set_task_folder(self.session_dir)
         # 绑定待采集公司名单（任务文件夹里生成「待采集公司名单.xlsx」，与原数据/清洗入库同层级）：
-        # 上传名单入列 + 清洗废数据持续回流；want_qzd=界面“启用企知道补采”开关。
+        # 上传名单入列 + 清洗废数据持续回流；want_slugs=界面勾选的补采平台（可多路）。
         try:
-            qzd_on, _added = self.session.bind_pending(self.session_dir, self._co_source_file, want_qzd)
+            _started, _added = self.session.bind_pending(self.session_dir, self._co_source_file,
+                                                         want_slugs=want_slugs)
         except Exception as e:
-            qzd_on = False
+            _started = False
             self._on_log(f"⚠ 待采名单绑定失败（不影响关键词采集）：{str(e).splitlines()[0][:120]}")
         self._register_task(_tasks.TASK_STATUS_RUNNING)
         self._paused = False
@@ -2619,12 +3090,26 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self._bar_pct = 0
         self._bar_companies = 0
+        # 进度条口径交给本轮实际干的活：只跑名单时前缀写「名单补采中」，
+        # 另外把三路台账的「家次」一起显示（家数×路数），不然用户看不到分母只能猜。
+        self._bar_list_on = bool(want_slugs)
+        self._bar_list_only = bool(want_slugs) and not self.keywords
         self._last_autosave_bucket = 0
         self._start_timer()
         self._update_bar()
-        _sites = "、".join(SITE_NAMES[s] for s in enabled) if enabled else "无关键词平台"
-        _tail = "｜企知道名单补采已启用" if qzd_on else ""
-        self._on_log(f"▶ 开始采集：{_sites}｜{len(self.keywords)} 个关键词{_tail}")
+        _sites = ("、".join(SITE_NAMES[s] for s in enabled) if enabled else "无关键词平台") \
+            if self.keywords else "只按公司名单查号"
+        _kw_note = f"{len(self.keywords)} 个关键词" if self.keywords else "未填关键词（精准查号模式）"
+        # 以会话里真正启用的那几路为准报尾串：勾了但本机没有采集器的平台不能算「已启用」
+        _on = self.session.enabled_list_slugs()
+        if _on:
+            _tail = ("｜" + "、".join(SITE_NAMES[s] for s in _on)
+                     + " 名单补采已启用（同一份名单，每一路都从第 1 家查到最后一家）")
+        elif list_names:
+            _tail = f"｜⚠ 勾选的补采平台（{list_names}）本机不可用，本轮不补采"
+        else:
+            _tail = ""
+        self._on_log(f"▶ 开始采集：{_sites}｜{_kw_note}{_tail}")
         self.worker = CrawlWorker(self.session, self.keywords)
         self.worker.start()
         self.request_autosave()
@@ -2664,16 +3149,31 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_pause.setText("暂停")
         self._stop_timer()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
+        stopped = bool(getattr(self, "_manual_stop", False))
+        self._manual_stop = False
         total = len(self.session.snapshot_results())
-        self.progress.setFormat(f"完成｜共 {total} 家｜耗时 {self._format_time(self._crawl_elapsed)}")
+        # 收尾口径（2026-11-11 实机反馈「风鸟和爱企查好像停止运行了」）：名单还有家次
+        # 没查完时**绝不**画满 100%，否则同一屏上「进度条满了」和「名单还剩 52 家」
+        # 两张嘴各说各话，用户只能靠猜。跑干净了才给 100%。
+        try:
+            ld, lt = self.session.list_progress()
+        except Exception:
+            ld = lt = 0
+        left = max(0, int(lt) - int(ld))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100 if not left else min(99, int(getattr(self, "_bar_pct", 0))))
+        tail = f"｜共 {total} 家｜耗时 {self._format_time(self._crawl_elapsed)}"
+        if left:
+            # 一路在跑时「家次」＝家数，两路以上才叫家次：口径跟着本轮实际勾选的路数走
+            unit = "家" if len(self.session.enabled_list_slugs()) <= 1 else "家次"
+            self.progress.setFormat(f"{'已停止' if stopped else '本轮结束'}｜"
+                                    f"名单还剩 {left} {unit}未查（重新开始任务自动接续）{tail}")
+        else:
+            self.progress.setFormat(f"{'已停止' if stopped else '完成'}{tail}")
         self._refresh_board()
         self._hide_banner()
         self._close_block_alert()   # 停止/完成都要收掉验证弹窗，不然留着会误导用户还在等
         self.request_autosave()
-        stopped = bool(getattr(self, "_manual_stop", False))
-        self._manual_stop = False
         self._finish_task(_tasks.TASK_STATUS_STOPPED if stopped else _tasks.TASK_STATUS_DONE,
                           len(self.session.snapshot_results()))
         # 收尾把「关键词 + 采到哪儿」写回任务文件夹与索引，下次打开直接接着采
@@ -2683,6 +3183,19 @@ class MainWindow(QMainWindow):
             self._maybe_auto_import("采集完成")
         # 每词产出反馈闭环：把本轮证明高产的词派生同族近义词补进词表（要用户再点开始才采）
         self._boost_high_yield()
+        # 采集完成后的数据池动作，两条档位走两条路（互斥性写在 edition 的能力矩阵里，
+        # 不在这里 if/else 兜运气）：内部版照旧弹窗问一句；对外版不打扰用户，后台只把
+        # 这次新出来的记录传进去。
+        #
+        # 触发点与内部版**完全一致**：手动「停止」也算一轮结束（既有 _prompt_pool_sync
+        # 就是这个位置）。这与云展「停止不静默导入」的口径不同，是刻意的——外部用户
+        # 大量是手动停手，若停止就不同步，等于把大部分产出挡在池子外面。
+        # 要改成「只有跑完才传」只需把下面整块挪进上面的 `if not stopped:` 里。
+        if HAS_POOL and total > 0:
+            if edition.silent_sync_enabled():
+                self._silent_pool_sync()
+            elif edition.prompt_sync_enabled():
+                self._prompt_pool_sync(total)
 
     # ── 自动保存 / 导出 ────────────────────────────────────────
     def request_autosave(self):
@@ -2735,7 +3248,7 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择要清洗的数据文件（可多选）",
             getattr(self, "_clean_last_dir", "") or str(self._get_desktop_dir()),
-            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+            "表格文件 (*.xlsx *.xlsm *.xls *.csv);;Excel (*.xlsx *.xlsm *.xls);;CSV (*.csv);;所有文件 (*)")
         if not paths:
             return
         self._clean_last_dir = os.path.dirname(paths[0]) or ""
@@ -2775,7 +3288,7 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择要清洗的数据文件（可多选）",
             getattr(self, "_clean_last_dir", "") or str(self._get_desktop_dir()),
-            "表格文件 (*.xlsx *.xlsm *.csv);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;所有文件 (*)")
+            "表格文件 (*.xlsx *.xlsm *.xls *.csv);;Excel (*.xlsx *.xlsm *.xls);;CSV (*.csv);;所有文件 (*)")
         if not paths:
             return
         self._clean_last_dir = os.path.dirname(paths[0]) or ""
@@ -2856,8 +3369,11 @@ class MainWindow(QMainWindow):
             self.lbl_save_info.setText(f"🧼 上次清洗：{time.strftime('%H:%M:%S')}（入库 {len(clean_rows)} 条）→ {cl}")
             self.lbl_save_info.setVisible(True)
             self._on_log(f"🧼 已清洗 {len(rows)} 条 → 入库 {len(clean_rows)} 条｜{cl}")
-            tail = "，企知道通道会逐家补采。" if self.session._qzd_can_run() \
-                else "（企知道补采本轮未接上，下次任务会自动接续）。"
+            # 「会逐家补采」只能承诺给真的还在跑的那些路：三路各自的熔断状态是独立的
+            _who = "、".join(SITE_NAMES[s] for s in self.session.enabled_list_slugs())
+            _can = self.session._list_can_run()
+            tail = (f"，{_who}会逐家补采。" if _can and _who
+                    else "（补采通道本轮没接上，下次任务会自动接续）。")
             QMessageBox.information(
                 self, "清洗完成",
                 f"原始 {len(rows)} 条已清洗，入库 {len(clean_rows)} 条。\n\n"
@@ -2914,18 +3430,516 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "导出完成",
                                         f"原始明细已导出（无满足入库条件的数据）：\n{path}")
 
+    # ── 数据池：同步 / 搜索 ──────────────────────────────────
+
+    def _pool_records(self):
+        """本次采集结果 → 数据池标准记录（手动同步与后台静默**共用这一个漏斗**）。
+
+        返回 ``(records, reason)``：records 非空时 reason 为 None；否则 reason 是
+        ``"no_rows"`` / ``"no_valid"`` / 一个异常。**怎么把空结果告诉用户由调用方决定**
+        （内部版弹窗、对外版静默写日志），判据本身只有一份。
+
+        两条入口绝不各写一遍转换：各写一份的结局必然是一边漏掉
+        ``raw_record_to_standard`` 的号码拆分，传进池子的不再是同一种数据——而池子里
+        看不出这种差别，只有半年后搜索的人发现某列全空时才暴露。
+        """
+        rows = self.session.snapshot_results()
+        if not rows:
+            return [], "no_rows"
+        try:
+            records = []
+            for row in rows:
+                # 使用 raw_record_to_standard 直接转换原始记录（保留所有字段）
+                rec = DataPoolManager.raw_record_to_standard(row)
+                if rec:
+                    records.append(rec)
+        except Exception as e:
+            return [], e
+        if not records:
+            return [], "no_valid"
+        return records, None
+
+    def _on_pool_sync(self):
+        """「同步数据池」：把本次采集数据上传到团队 OSS 数据池。"""
+        if not self._acl_gate(edition.pool_ui_visible(), "同步数据池"):
+            return
+        if not HAS_POOL:
+            QMessageBox.warning(self, "模块缺失", "数据池模块未加载，无法使用此功能。")
+            return
+        records, reason = self._pool_records()
+        if not records:
+            if isinstance(reason, Exception):
+                self._on_log(f"❌ 同步数据池失败: {reason}")
+                QMessageBox.critical(self, "同步失败", str(reason))
+            elif reason == "no_rows":
+                QMessageBox.information(self, "无数据", "还没有采集到数据，请先完成采集。")
+            else:
+                QMessageBox.information(self, "无有效记录",
+                                        "本次采集数据中没有可同步的有效记录。")
+            return
+        try:
+            dlg = SyncDialog(records, parent=self)
+            dlg.exec_()
+        except Exception as e:
+            self._on_log(f"❌ 同步数据池失败: {e}")
+            QMessageBox.critical(self, "同步失败", str(e))
+
+    # ── 后台静默同步数据池（对外档位；界面无感，磁盘留痕）──────────────────
+    #
+    # 设计约束，四条都不可让：
+    #   ① 口径同源——与手动同步共用 _pool_records 与 SyncWorker/upload_session，
+    #      清洗、有效性门禁、分片、原子写一个都不绕过；
+    #   ② 只传增量——上传层是 append-only 且不去重，没有本地指纹台账的话，
+    #      每天挂机跑一轮就会把同一批几千家重复灌进池子；
+    #   ③ 绝不出声——不弹窗、不提问、不写界面日志区（写了就等于告诉用户有这么件事）；
+    #   ④ 必须留证据——只「不出声」而什么都不记，外部用户说「我的数据没进池」时只能猜。
+    #      留痕落在 silent_sync.log，界面永远看不到它。
+    # 台账只在上传**成功**后写；失败不写 ⇒ 下次采集完成自动重试。
+
+    SILENT_LOG_TAIL = 200          # 留痕文件超限时只保留最后这么多行
+
+    def _silent_paths(self):
+        """(台账, 留痕) 两个文件路径；目录建不出来时返回 (None, None)。"""
+        try:
+            cache = Path(DataPoolManager._default_cache_dir())
+        except Exception:
+            # 兜底路径同样要过一遍档位投影：写死桌面的话，丐版就在这个异常分支上
+            # 又给用户造出一个叫「数据池缓存」的桌面文件夹——正是主路径要避免的事。
+            cache = Path(edition.pool_cache_dir(
+                str(Path(self._get_desktop_dir()) / "数据池缓存")))
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None, None
+        return cache / "silent_sync_ledger.json", cache / "silent_sync.log"
+
+    def _silent_log(self, text):
+        """静默同步留痕：只写磁盘。任何异常都吞掉——留痕失败不能连累采集主流程。"""
+        _, path = self._silent_paths()
+        if path is None:
+            return
+        try:
+            if path.exists():
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if len(lines) > 2000:
+                    path.write_text("\n".join(lines[-self.SILENT_LOG_TAIL:]) + "\n",
+                                    encoding="utf-8")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _silent_key(rec):
+        """一条记录在台账里的身份：**公司归一名 + 全部联系方式**（取不到返回 None）。
+
+        为什么不能只按公司名：同一家公司这次没有号码、下次补到了手机号，那是必须
+        重传的新信息；只按公司名去重会把它永久当成「传过了」，池子里就永远停在最早
+        那份残缺联系方式。为什么不把地址/主营也放进指纹：它们对下游的价值远低于联系
+        方式，放进去会让每次采集都重传大半数据，台账等于没有。
+        联系方式**排序去重**后拼接：同一批号码换个顺序不该被当成新记录。
+        """
+        parts = [str(rec.get("company_norm") or "").strip()]
+        if not parts[0]:
+            return None            # 没有归一名就定不了身份，宁可当新记录传，不写错指纹
+        for field in ("mobiles", "landlines", "emails", "wechats"):
+            vals = {str(v).strip() for v in (rec.get(field) or []) if str(v).strip()}
+            parts.append(",".join(sorted(vals)))
+        parts.append(str(rec.get("website") or "").strip().lower())
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:24]
+
+    def _silent_ledger(self):
+        """读台账 → (已传过的指纹集合, 路径)。
+
+        读不懂 / 不存在一律返回空集合：方向必须是这样——**宁可重传一遍（多占存储，
+        读取端合并幂等，不产生脏数据），不可漏传**（漏传是外部用户的数据永远进不了池）。
+        """
+        path, _ = self._silent_paths()
+        if path is None:
+            return set(), None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            keys = data.get("keys") if isinstance(data, dict) else None
+            return {str(k) for k in (keys or [])}, path
+        except Exception:
+            return set(), path
+
+    @staticmethod
+    def _silent_ledger_write(path, keys):
+        """原子写台账（临时文件 + replace）：读到半截 JSON 就等于下次全部重传。"""
+        if path is None:
+            return False
+        tmp = path.with_name(path.name + ".part")
+        try:
+            tmp.write_text(json.dumps({
+                "version": 1,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(keys),
+                "keys": sorted(keys),
+            }, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return False
+
+    def _silent_pool_sync(self):
+        """采集完成后把这次**新出来**的记录静默传到数据池。"""
+        if self._silent_worker is not None and self._silent_worker.isRunning():
+            # 上一批还在路上：只记一个「待重试」标记，回来时用**最新**的内存数据重算
+            # 增量（队列里塞旧记录会让它按旧口径上传，而这段时间又采到了一批新的）。
+            self._silent_pending = True
+            self._silent_log("上一批仍在上传，本次排队到它结束后重算增量")
+            return
+        records, reason = self._pool_records()
+        if not records:
+            if isinstance(reason, Exception):
+                self._silent_log(f"跳过（记录转换失败，下次采集会再试）：{reason}")
+            else:
+                self._silent_log(f"跳过（{'本次没有采集结果' if reason == 'no_rows' else '没有可同步的有效记录'}）")
+            return
+        known, ledger_path = self._silent_ledger()
+        fresh, fresh_keys, dup = [], set(), 0
+        for rec in records:
+            k = self._silent_key(rec)
+            if k is None:
+                fresh.append(rec)                      # 定不了身份：照传，但不进台账
+                continue
+            if k in known:
+                dup += 1
+                continue
+            known.add(k)                               # 同一批里同公司同行号只传一次
+            fresh_keys.add(k)
+            fresh.append(rec)
+        if not fresh:
+            self._silent_log(f"跳过：{len(records)} 条记录的内容与以前传过的完全相同")
+            return
+        self._silent_keys_batch = fresh_keys
+        self._silent_committed = False      # 新一批：落账标记复位
+        self._silent_result = None          # 上一批的结果不许串到这一批
+        self._silent_log(f"开始上传 {len(fresh)} 条"
+                         f"（本次共 {len(records)} 条，{dup} 条内容与已传过的相同）")
+        w = SyncWorker(fresh)
+        # 两条连接各有用处：Direct 那份只是把结果抄在属性上（在上传线程里同步跑，
+        # 做的事足够小才敢这么干），保证窗口正在关闭时也能拿到真实成败；
+        # 排队那份才是正常的落账与续跑入口。
+        w.finished.connect(self._silent_capture, Qt.DirectConnection)
+        w.finished.connect(self._on_silent_sync_finished)
+        self._silent_worker = w
+        try:
+            w.start()
+        except Exception as e:
+            # 线程起不来（极少见，通常是解释器正在退出）：不记台账、不打扰用户，
+            # 下次采集完成自然重试。这里必须留一行，否则连「试过一次」都查不到。
+            self._silent_worker = None
+            self._silent_log(f"启动上传线程失败（下次采集完成会自动再试）：{e}")
+
+    def _silent_capture(self, success, message):
+        """把 worker 报的成败抄成属性（DirectConnection，在上传线程内同步执行）。
+
+        这个槽**只许赋值**：不碰控件、不写盘、不弹窗。跨线程跑的东西一旦多做一件事，
+        就会在关闭窗口的竞态里变成难以复现的崩溃；而这一句赋值换来的，是退出路径上
+        终于能知道「这批到底传成什么样」。
+        """
+        self._silent_result = (bool(success), str(message))
+
+    def _silent_commit(self, success, message):
+        """把这一批的结果落账落盘。幂等且有防重入标记，允许两处调用（信号回调 / 退出等待）。
+
+        为什么要有第二个调用点：关闭窗口时主线程在 ``wait()`` 上阻塞，worker 的
+        ``finished`` 是排队信号，事件循环可能就此结束、回调根本不跑——那样这批就白传了
+        （台账没记，下次开机整套重传一遍）。退出路径必须自己把账补上。
+        """
+        if self._silent_committed:
+            return
+        self._silent_committed = True
+        if success:
+            known, ledger_path = self._silent_ledger()
+            known |= self._silent_keys_batch or set()
+            ok = self._silent_ledger_write(ledger_path, known)
+            # 台账里记的是「这批内容传过了」。上传前清洗按门禁剔除的行也算传过——
+            # 它们不会因为重传就变成有效数据，不记的话每次采集都白跑一趟网络。
+            self._silent_log(f"完成：{message}"
+                             + ("" if ok else "（台账没写成，下次会把这批再传一遍）"))
+        else:
+            self._silent_log(f"失败（不重试到界面，下次采集完成会自动再试）：{message}")
+
+    def _on_silent_sync_finished(self, success, message):
+        w, self._silent_worker = self._silent_worker, None
+        self._silent_commit(success, message)
+        if w is not None:
+            w.deleteLater()
+        if self._silent_pending:
+            self._silent_pending = False
+            self._silent_pool_sync()
+
+    def _on_pool_search(self):
+        """「搜索采购商」：打开数据池搜索对话框。"""
+        if not self._acl_gate(edition.pool_ui_visible(), "搜索采购商"):
+            return
+        if not HAS_POOL:
+            QMessageBox.warning(self, "模块缺失", "数据池模块未加载，无法使用此功能。")
+            return
+        try:
+            dlg = SearchDialog(parent=self)
+            dlg.exec_()
+        except Exception as e:
+            self._on_log(f"❌ 打开搜索对话框失败: {e}")
+            QMessageBox.critical(self, "搜索失败", str(e))
+
+    def _on_pool_import(self):
+        """「导入历史数据」：多选文件/压缩包 → 列映射预览确认 → 上传到数据池。"""
+        if not self._acl_gate(edition.pool_ui_visible(), "导入历史数据"):
+            return
+        if not HAS_POOL:
+            QMessageBox.warning(self, "模块缺失", "数据池模块未加载，无法使用此功能。")
+            return
+        import shutil
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择历史数据（可按住 Cmd 多选，也可直接选压缩包）", "",
+            "Excel/CSV/压缩包 (*.xlsx *.xlsm *.xls *.csv *.zip *.tar.gz *.tgz *.tar);;所有文件 (*)",
+        )
+        if not files:
+            return
+        staging = None
+        try:
+            from data_pool import expand_import_files
+            self._on_log(f"📂 展开选择的 {len(files)} 个文件…")
+            # 压缩包解到临时目录（staging），与直接选的文件走同一条链路
+            pairs, skipped, staging = expand_import_files(files)
+            for name, reason in skipped:
+                self._on_log(f"⚠ 跳过 {name}：{reason}")
+            if not pairs:
+                detail = "\n".join(f"· {n}：{r}" for n, r in skipped[:8])
+                QMessageBox.information(
+                    self, "没有可导入的文件",
+                    "选中的内容里没有找到能导入的 Excel/CSV 文件。\n\n"
+                    + (detail + "\n\n" if detail else "")
+                    + "支持：.xlsx / .xlsm / .csv 文件，或里面装着"
+                      "这些文件的压缩包（zip / tar.gz 等）。")
+                return
+            self._import_pairs_to_pool(pairs, pre_skipped=skipped)
+        except Exception as e:
+            self._on_log(f"❌ 导入历史数据失败: {e}")
+            QMessageBox.critical(self, "导入失败", str(e))
+        finally:
+            # 解压出来的临时文件在预览/读取全部结束后统一清理
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    # ── 本地台账（内容指纹 → 是否已经入过池）──────────────────────
+
+    def _ledger(self):
+        """台账句柄；模块不可用返回 None（本次不记账，功能照常可用）。"""
+        try:
+            from local_scan import Ledger
+            return Ledger().load()
+        except Exception as e:
+            self._on_log(f"⚠ 本地台账不可用，本次不记录已导入文件：{e}")
+            return None
+
+    def _ledger_items(self, led, pairs):
+        """给每个待处理文件算内容指纹，产出可记账的项（改过才重算，其余命中缓存）。
+
+        指纹是**内容**的指纹：文件改名、换目录、另存一份副本都不影响结果，
+        所以手动导入过的表格，之后全盘扫描同样认成「这份内容已经传过」——
+        两个入口共用一份台账是刻意的，各记各的就会各传各的。
+        """
+        out = []
+        if led is None:
+            return out
+        for path, display in pairs:
+            try:
+                st = os.stat(path)
+                fp, _cached = led.fp_for(path, st.st_size, int(st.st_mtime))
+            except Exception:
+                continue
+            out.append({"path": path, "display": display, "fp": fp,
+                        "size": st.st_size, "mtime": int(st.st_mtime),
+                        "rows_kept": 0, "rows_in": 0, "kept": 0, "in": 0})
+        return out
+
+    def _import_pairs_to_pool(self, pairs, pre_skipped=None):
+        """一批表格 → 列映射确认 → 逐文件读取 → 同步上传 → 台账回写。
+
+        「导入历史数据」和「扫描本地表格」两条入口都走这里：同一套列映射确认、
+        同一套清洗口径、同一个上传对话框。两条路各写一份判据必然会出现
+        「扫描入口传得进去、手动入口传不进去」这类说不清的分叉。
+
+        台账记账的三条硬规矩：
+          · 逐文件记录真实 kept/in，只给 kept>0 的文件写「已入库」；
+          · 上传没成功（取消/失败/没点开始同步）一律不记账，下次照旧列出；
+          · 扫出来「像有数据」但权威链路真读一条都留不下的，按不合格记账，
+            免得下次扫描再把它当成待入库反复误导用户。
+        """
+        if not pairs:
+            return
+        led = self._ledger()
+        try:
+            from data_pool import DataPoolManager
+            # 第一步：批量列映射预览（自动识别 + 可修正 + 公司名必选校验）。
+            # 大厂 ETL 的 schema mapping 确认思想：错列在入库前拦截，
+            # 而不是入库后靠用户发现数据不对再返工
+            preview_dlg = ImportPreviewDialog(pairs, parent=self)
+            if preview_dlg.exec_() != QDialog.Accepted:
+                return
+            override_all = preview_dlg.get_mapping_override() or {}
+            skip_paths = preview_dlg.get_skipped_files()
+            # 第二步：逐文件按最终映射读取汇总（单个文件读失败不拖垮整批）
+            records = []
+            n_files = 0
+            failed = []
+            try:
+                from ingest_cleaning import merge_reports
+            except Exception:
+                # 模块缺失时不阻塞导入：报告合并不了就不传，
+                # 同步对话框会自己按同一口径预演一遍（结果一致）
+                merge_reports = None
+            batch_report: dict = {}
+            per_file = {it["path"]: it for it in self._ledger_items(led, pairs)}
+            empty_kept = []
+            for path, display in pairs:
+                if path in skip_paths:
+                    continue
+                it = per_file.get(path)
+                try:
+                    self._on_log(f"📂 读取: {display}")
+                    rep: dict = {}
+                    recs = DataPoolManager.read_records_from_excel(
+                        path, mapping_override=override_all.get(path),
+                        report_out=rep)
+                    if it is not None:
+                        it["kept"] = it["rows_kept"] = int(rep.get("kept") or len(recs))
+                        it["in"] = it["rows_in"] = int(rep.get("in") or len(recs))
+                    # 每个文件的清洗明细逐份进日志（出问题能定位到文件），
+                    # 界面上只给一份合并汇总（用户读十几遍同样字段没有意义）
+                    if rep:
+                        if merge_reports is not None:
+                            merge_reports(batch_report, rep)
+                        self._on_log(
+                            f"  🧪 {display}：读取 {rep.get('in', 0)} → "
+                            f"可入库 {rep.get('kept', 0)}，剔除 {rep.get('dropped', 0)}")
+                    if recs:
+                        records.extend(recs)
+                        n_files += 1
+                    elif it is not None:
+                        # 扫描说「这文件有救」，权威链路真读一条都留不下：
+                        # 以权威口径为准记进台账，下次不再重复评估、也不再
+                        # 在清单里把它当成待入库（这才是「预估与实际一致」）
+                        empty_kept.append(it)
+                except Exception as e:
+                    failed.append((display, str(e).splitlines()[0][:120]))
+            if led is not None and empty_kept:
+                try:
+                    from local_scan import ST_INVALID
+                    led.mark_skipped(empty_kept, ST_INVALID,
+                                     "按权威入库链路真读后没有一条可入库记录"
+                                     "（多为说明文档/接口文档/纯名单类表格）")
+                    self._on_log(f"🧾 {len(empty_kept)} 个文件整表真读后无可入库数据，"
+                                 f"已按不合格记入台账")
+                except Exception:
+                    pass
+            if not records:
+                QMessageBox.information(self, "没有读到数据",
+                    "按当前勾选和列映射，没有读取到任何有效记录。\n"
+                    "请重新导入，在预览界面确认文件勾选和「公司名」列的映射。\n\n"
+                    + (f"读不了的文件：{len(failed)} 个（详见日志）" if failed else ""))
+                return
+            # 读不了/被跳过的文件汇总给用户确认（部分成功也要先说清楚）
+            problems = failed + list(pre_skipped or [])
+            if problems:
+                detail = "\n".join(f"· {n}：{r}" for n, r in problems[:8])
+                more = (f"\n……等共 {len(problems)} 个"
+                        if len(problems) > 8 else "")
+                reply = QMessageBox.question(
+                    self, "部分文件没能导入",
+                    f"能导入的：{n_files} 个文件，共 {len(records)} 条记录。\n\n"
+                    f"下面这些读不了，会先跳过：\n{detail}{more}\n\n"
+                    f"继续上传能导入的部分吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if reply != QMessageBox.Yes:
+                    return
+            dlg = SyncDialog(records, parent=self,
+                             title_prefix=f"导入历史数据（{n_files} 个文件）",
+                             cleaning_report=batch_report or None)
+            dlg.exec_()
+            # ── 台账记账：只有真的传成功的那几个文件才写「已入库」──
+            if led is None:
+                return
+            if not dlg.uploaded_ok:
+                self._on_log("ℹ 本次没有成功上传，台账不记账（下次扫描还会照常列出这些文件）")
+                return
+            ok_paths = [it for it in per_file.values() if it["kept"] > 0]
+            if not ok_paths:
+                return
+            marked = led.mark_ingested(ok_paths, batch=dlg.uploaded_batch)
+            self._on_log(f"🧾 本地台账记 {marked} 个文件为已入库"
+                         f"（上传 {dlg.uploaded_kept} 条，下次扫描自动跳过这些内容）")
+        except Exception as e:
+            self._on_log(f"❌ 导入历史数据失败: {e}")
+            QMessageBox.critical(self, "导入失败", str(e))
+
+    def _on_pool_scan(self):
+        """「扫描本地表格」：全盘扫描 → 清单勾选 → 走与手动导入完全同一条链路。"""
+        if not self._acl_gate(edition.pool_ui_visible(), "扫描本地表格"):
+            return
+        if not HAS_POOL:
+            QMessageBox.warning(self, "模块缺失", "数据池模块未加载，无法使用此功能。")
+            return
+        try:
+            dlg = LocalScanDialog(parent=self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            items = dlg.selected_items or []
+            if not items:
+                return
+            self._on_log(f"🔎 扫描清单确认：{len(items)} 个文件待入库")
+            # 包内成员往下传的是**逻辑位置**（``包名/包内目录/表名.xlsx``）而不是光一个
+            # 文件名：列映射预览里两个包里同名的表必须能区分开，且这与手动导入展开
+            # 压缩包时的展示口径一致（同一个意思在两条路上只有一种说法）。
+            pairs = [(it["path"], it.get("logical") or it["display"])
+                     for it in items]
+            self._import_pairs_to_pool(pairs)
+        except Exception as e:
+            self._on_log(f"❌ 扫描本地表格失败: {e}")
+            QMessageBox.critical(self, "扫描失败", str(e))
+
+    def _prompt_pool_sync(self, total: int):
+        """采集完成后弹出提示：是否同步到数据池？（计划三.4）"""
+        reply = QMessageBox.question(
+            self,
+            "同步到数据池",
+            f"本次采集完成，共 {total} 条记录。\n\n是否同步到团队数据池？\n"
+            "（同步后其他同事可以搜索到你采集的数据）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._on_pool_sync()
+
     # ── 云展动力：任务登记 / 绑定 / 导入 ───────────────────────
     # ── 自动扩词 / 历史任务续采（任务 = 配置快照 + 关键词级游标）────
     # 对齐大厂批量采集的通用做法：把「一次采集」当成可恢复的任务对象，而不是一次性
     # 进程。配置快照决定下次打开显示什么，关键词级游标决定从哪儿继续，条目级去重
     # 键（各站历史种子库）保证绝不重复烧请求。
+    def _set_auto_expand(self, on):
+        """扩词生效值的唯一写入口：控件在就同步控件，控件不在（对外档位）只写数据。
+        读侧一律走 ``self._auto_expand``，没有第二个来源。"""
+        self._auto_expand = bool(on)
+        w = self.chk_auto_kw
+        if w is not None and w.isChecked() != self._auto_expand:
+            w.setChecked(self._auto_expand)   # toggled 会回调本方法，值相同即止
+
     def _params_snapshot(self):
         """采集参数快照：续采时照原样恢复，不该让用户为接着采再调一遍参数。"""
         return {"delay_between": float(self.spin_delay.value()),
                 "relevance_guard": bool(self.chk_guard.isChecked()),
                 "incremental": bool(self.chk_incr.isChecked()),
                 "background": bool(self.chk_bg.isChecked()),
-                "auto_keyword_expand": bool(self.chk_auto_kw.isChecked()),
+                "auto_keyword_expand": bool(self._auto_expand),
                 "province": list(self.selected_provinces or [])}
 
     def _apply_params(self, params):
@@ -2936,10 +3950,13 @@ class MainWindow(QMainWindow):
                 self.spin_delay.setValue(float(params["delay_between"]))
             for key, widget in (("relevance_guard", self.chk_guard),
                                 ("incremental", self.chk_incr),
-                                ("background", self.chk_bg),
-                                ("auto_keyword_expand", self.chk_auto_kw)):
+                                ("background", self.chk_bg)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
+            # 扩词单独走 _set_auto_expand：控件在就顺带勾回界面，控件不在（对外档位）
+            # 也要把生效值恢复出来——快照里记着什么就照用什么，不能让 None 控件吃掉它。
+            if "auto_keyword_expand" in params:
+                self._set_auto_expand(params["auto_keyword_expand"])
             # 省份精准采集（多选）：老快照可能是字符串（单省）或列表（多选），统一兼容
             pv_raw = params.get("province") or ""
             if isinstance(pv_raw, list):
@@ -2956,8 +3973,11 @@ class MainWindow(QMainWindow):
     def _auto_expand_on_start(self):
         """点「开始采集」前自动展开关键词。
         只在勾选「自动扩词」且真展开出新词时改词表，改完写回输入框——用户看得见
-        改成什么了，随时能删改；不想要就取消勾选，完全按原词采。"""
-        if not self.chk_auto_kw.isChecked():
+        改成什么了，随时能删改；不想要就取消勾选，完全按原词采。
+        判据读 ``self._auto_expand`` 而不是读勾选框：对外档位没有那个勾选框，但扩词
+        本身照旧生效（隐藏的是入口，不是产出口径；行为与提示必须一致，不能悄悄改词
+        却不写回，那会让「框里 1 个词、实际跑 30 个词」变成无从核对的现象）。"""
+        if not self._auto_expand:
             return
         raw = self.kw_text.toPlainText()
         if not raw.strip():
@@ -2993,7 +4013,14 @@ class MainWindow(QMainWindow):
         if rep_.get("truncated"):
             self._on_log(f"   ↳ 词表已达单次上限（{len(kws)} 个）自动收住："
                          "先采完这批再补下一批更安全（一次灌上千个词会把请求量放大几十倍）。")
-        self._on_log("   ↳ 不想自动换词：取消勾选「自动扩词」，就按你填的原词采。")
+        # 这一句在告诉用户「怎么关掉换词」。对外档位没有那个勾选框，照原样说出来就是
+        # 在日志里报一个界面上不存在的控件——按钮藏得再好，日志一句话就把功能交底了。
+        # 所以文案跟着 ``auto_expand_visible()`` 走：有勾选框就教怎么取消，没有就给一条
+        # 用户真能做的替代动作（自己把类别名写成产品名），不编一个不存在的开关。
+        if edition.auto_expand_visible():
+            self._on_log("   ↳ 不想自动换词：取消勾选「自动扩词」，就按你填的原词采。")
+        else:
+            self._on_log("   ↳ 想只按自己填的词采：把行业类别名改成具体产品名再点开始采集。")
 
     def _boost_high_yield(self, min_yield=20):
         """产出反馈闭环：把本轮净新增 ≥ min_yield 家的高产词，按同族派生一批近义词
@@ -3040,6 +4067,25 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_log(f"⚠ 采集进度保存失败（不影响本次数据）：{str(e).splitlines()[0][:100]}")
         self._register_task(status)
+
+    def _restore_site_checks(self, sites):
+        """按任务快照恢复「③ 采集平台」勾选态：这是**程序在恢复状态**，不是用户点了勾选框。
+
+        1688 的 toggled 上挂着「先去登录」模态弹窗，恢复期间必须屏蔽信号：否则每次启动
+        接着上次任务都会被顺手弹一次（用户什么都没点就被打断），而自动化/offscreen 下这个
+        模态框会永久卡住整个回填流程（实测启动停在 _restore_task 里出不来）。
+        空 sites 保持界面现状不动（老任务快照没记站点时不能把平台全关掉）。
+        """
+        if not sites:
+            return
+        for _chk in self.site_checks.values():
+            _chk.blockSignals(True)
+        try:
+            for slug, chk in self.site_checks.items():
+                chk.setChecked(slug in sites)
+        finally:
+            for _chk in self.site_checks.values():
+                _chk.blockSignals(False)
 
     def _restore_last_task(self):
         """启动自动回填：取最近一条「能接着采」的任务，静默恢复关键词/参数/进度。"""
@@ -3125,9 +4171,7 @@ class MainWindow(QMainWindow):
         self._kw_expanded_text = chr(10).join(kws)
 
         sites = [s for s in ((data.get("sites") or task.get("sites") or [])) if s in self.site_checks]
-        if sites:
-            for slug, chk in self.site_checks.items():
-                chk.setChecked(slug in sites)
+        self._restore_site_checks(sites)
         self._apply_params(task.get("params") or {})
 
         resumed = self.session.apply_progress() if data else 0
@@ -3152,6 +4196,8 @@ class MainWindow(QMainWindow):
 
     def _on_history_tasks(self):
         """历史任务列表：选中一条 →「接着采」恢复关键词与进度（数据写回原文件夹）。"""
+        if not self._acl_gate(edition.history_visible(), "历史任务"):
+            return
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "提示",
                                     "采集进行中。请先点「停止」并等日志出现「采集完成/已停止」"
@@ -3395,6 +4441,252 @@ class MainWindow(QMainWindow):
             self.yzd_status_lbl.setText("未绑定云展动力账号")
             self.yzd_status_lbl.setStyleSheet(_status_badge_style("neutral"))
             self.bind_yzd_btn.setText("绑定云展动力账号")
+        self._refresh_acl_status()
+
+    # ── 权限：状态徽章 / 心跳 / 顶号收尾 / 等级收口 ──────────────────────────
+
+    def _refresh_acl_status(self):
+        """管理员徽章：本机跑在哪一档、是不是该账号当前的绑定设备。
+
+        只给等级 0 的账号看（控件本身就是按能力位创建的，其他档位根本没有这块）。
+        这条信息对管理员是**取证**用的：改完名单要能一眼确认生效了没有，否则只能靠
+        「点一下按钮看会不会被拦」猜，而猜的过程恰好会把人误导到点击路径的缓存上。
+        """
+        lbl = getattr(self, "acl_status_lbl", None)
+        if lbl is None or not HAS_ACL_GUARD:
+            return
+        try:
+            guard = _access_guard.get_guard()
+            phone = guard.account()
+            lv = guard.level()
+            parts = [f"权限：{edition.level_label(lv)}"]
+            if not phone:
+                parts.append("未绑定账号")
+            else:
+                # wait=False：徽章不是用户点出来的，绝不能替它把 UI 线程按住 3 秒等网络
+                ok, reason = guard.check(wait=False)
+                parts.append("本机 ✓" if ok else "本机 ✕")
+                if not ok:
+                    tip = (reason or "").splitlines()[0][:60]
+                    parts.append(tip)
+                    self.acl_status_lbl.setStyleSheet(_status_badge_style("error"))
+                else:
+                    self.acl_status_lbl.setStyleSheet(_status_badge_style("ok"))
+            lbl.setText("｜".join(parts))
+            lbl.setToolTip("当前账号在 OSS 白名单里的等级，以及本机是不是它的绑定设备。\n"
+                           + ("判定：" + (reason or "正常") if phone else "尚未绑定云展动力账号"))
+        except Exception as e:
+            lbl.setText(f"权限：自查失败（{type(e).__name__}）")
+
+    def _acl_heartbeat(self):
+        """60 秒一次的保底：催一次刷新，再交出上一轮已经落下的顶号事件。
+
+        这里调 ``tick()``（会安排后台刷新）而不是直接读信箱，为的就是信号万一没接上
+        ——比如守卫模块加载失败、或者刷新那一刻界面正忙——心跳还能兜第二次。
+        """
+        if not HAS_ACL_GUARD:
+            return
+        try:
+            self._on_acl_event(_access_guard.get_guard().tick())
+        except Exception as e:
+            # 心跳本身出问题绝不能拖垮采集，也绝不能被吞掉——它悄悄停摆就等于
+            # 顶号检测失效，而那只能由下一次心跳的日志发现
+            self._on_log(f"⚠ 权限心跳异常（不影响已在跑的采集）：{type(e).__name__}: {e}")
+
+    def _on_acl_refreshed(self):
+        """后台刷新一结束就叫醒：刚被顶号的机器不必干等下一拍心跳。
+
+        信号只负责唤醒，不带结论——结论仍然由 ``take_revoked()`` 这一份一次性信箱
+        交出。所以心跳与信号两条路同时到达也只弹一次：后到的那次取到的是空串。
+        """
+        if not HAS_ACL_GUARD:
+            return
+        try:
+            self._on_acl_event(_access_guard.get_guard().take_revoked())
+        except Exception as e:
+            self._on_log(f"⚠ 权限刷新回调异常（不影响已在跑的采集）：{type(e).__name__}: {e}")
+
+    def _acl_startup_reconcile(self):
+        """开机 1.5s 的一次轻量收口（配合 prefetch_authoritative 的建界面即定档）。
+
+        只处理「事件已经在信箱里、但发出那一刻信号还没连上」的竞态：取一次顶号信箱、
+        再按当前 edition 与已建入口比对收口。绝不在这里再发一次网络请求——权威判定
+        开机已经做过，这里纯粹是把可能漏听的结论捡回来。
+        """
+        if not HAS_ACL_GUARD:
+            return
+        try:
+            self._on_acl_event(_access_guard.get_guard().take_revoked())
+        except Exception as e:
+            self._on_log(f"⚠ 开机权限收口异常（不影响已在跑的采集）：{type(e).__name__}: {e}")
+
+    def _on_acl_event(self, msg: str):
+        """顶号与等级变更的统一处理体（心跳、refreshed 信号共用同一份逻辑）。
+
+        顺序不能反：先把「停止收尾」做完再收口界面，否则一边在收尾落盘、一边把
+        正在用的入口隐藏掉，日志里会出现两套互相解释不了的动作。
+        """
+        if msg:
+            self._on_acl_revoked(msg)
+        self._acl_sync_level()
+        self._refresh_acl_status()
+
+    def _on_acl_revoked(self, reason):
+        """被顶号的收尾：干净停手 → 落盘 → 说清楚为什么、下一步怎么办。
+
+        顺序很重要。硬杀进程最省事，代价是那一批数据停在半路（用户视角就是
+        「软件把我的活干了一半扔了」）；只弹窗不停手更糟——它还会继续跑十几分钟。
+        所以走既有的「停止 → _on_finished → 自动保存 → 进度落盘」那条链路。
+        """
+        self._on_log("⛔ " + reason.replace("\n", " "))
+        try:
+            if (self.worker and self.worker.isRunning()) or self._paused:
+                self._manual_stop = True
+                self.session.stop_crawl()
+                self._on_log("已按停止流程收尾：本轮数据与进度照常落盘，不会丢。")
+        except Exception as e:
+            self._on_log(f"⚠ 收尾停止失败（请手动点「停止」）：{type(e).__name__}")
+        self._acl_stopped = True
+        self._refresh_acl_status()
+        # 模态只弹一次：这是唯一「必须让用户当场知道」的权限事件（活已经停了，不弹窗
+        # 就是莫名其妙）。但弹窗打开期间心跳仍在跑（模态是嵌套事件循环，定时器照发），
+        # 万一这期间又来一条事件，第二第三个同样的框叠上去只会让人分不清哪次是哪个号——
+        # 后续事件走界面日志那行（上面已 ⛔ 记过），不再重复拦窗口。
+        if self._acl_revoked_box_shown:
+            return
+        self._acl_revoked_box_shown = True
+        QMessageBox.warning(self, "本机使用权限已中止", reason)
+
+    def _acl_sync_level(self):
+        """等级变了就当场收口：多出来的入口立刻隐掉，缺的入口提示重启补齐。
+
+        这里必须存在而不能只依赖建界面时的投影：等级是拉到名单之后才知道的，
+        开机第一屏永远可能是「按上一份副本/默认档」建的。收口解决「已经摆出来的
+        不该有」，重启解决「本该有的没建出来」——两者都不能省。
+        """
+        cur = edition.caps_snapshot()
+        if cur == self._acl_caps:
+            return
+        lost = [c for c, v in self._acl_caps.items() if v and not cur.get(c)]
+        gained = [c for c, v in cur.items() if v and not self._acl_caps.get(c)]
+        for cap in lost:
+            for w in self._acl_gated.get(cap, []):
+                w.setVisible(False)
+        for cap in gained:
+            for w in self._acl_gated.get(cap, []):
+                w.setVisible(True)
+        self._acl_caps = cur
+        # 标题跟着生效档位重新投影：降到受限档后界面就是「精简版那一组能力」，标题还
+        # 写着全功能版，用户会以为是功能坏了；反过来外部用户看到无后缀的标题，会以为
+        # 拿到的是完整版并向你要更新。文案与入口必须由同一份投影给出（见 edition 第 5 条）。
+        new_title = self._base_title + edition.title_suffix()
+        if new_title != self.windowTitle():
+            self.setWindowTitle(new_title)
+        # 收不掉的那一类：控件当初压根没创建（构建时等级不够），显示不出来
+        need_restart = bool(lost) or any(not self._acl_gated.get(c) for c in gained)
+        if not need_restart:
+            self._on_log(f"ℹ 权限等级已更新，界面无需调整（{'、'.join(gained)} 已恢复显示）")
+            return
+        self._acl_pending = True
+        self._on_log("ℹ 账号权限等级已变更，多余入口已当场收起；缺失的入口需要重启工具才会补齐。")
+        # 这里绝不能再弹 QMessageBox.question：这条链路是后台刷新/心跳唤醒的，
+        # 弹窗等于「用户什么都没点，界面自己蹦出一个必须回答的框」——正跑着采集时
+        # 它会用嵌套事件循环把主线程接管过去（心跳、进度、停止全在模态里排队），
+        # offscreen 回归里更是直接永久挂住（实测把整批拖死 600s 被 SIGABRT）。
+        # 提示改在横幅上给一个可点的「重启工具现在生效」，问不问由用户决定。
+        self._show_banner(
+            "权限等级已变更：多余入口已收起，重启工具后界面才会完整对齐。"
+            '<a href="#acl-restart">重启工具现在生效</a>',
+            "#fff3cd", "#7a5a00")
+
+    def _acl_prompt_restart(self) -> bool:
+        """问一次要不要重启，返回 True = 已安排重启。同一进程只问一次，
+        不然每次心跳都弹一回就成了骚扰（用户拒了之后就靠横幅与日志提示）。
+
+        调用点只有一个：横幅上那条「重启工具现在生效」链接（用户主动点击）。
+        后台链路一律不许走到这里——判据由 debug/edition_offline_test.py 钉住。
+        """
+        if getattr(self, "_acl_restart_asked", False):
+            return False
+        self._acl_restart_asked = True
+        ret = QMessageBox.question(
+            self, "权限等级已变更",
+            "当前账号的权限等级与界面已建好的入口不一致：\n"
+            "· 多出来的入口已经当场收起，用不了；\n"
+            "· 本该有却没建出来的入口，需要重启工具才会出现。\n\n"
+            "现在重启吗？（会先把本轮数据与进度落盘，再退出、再自动打开）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            self._relaunch_tool()
+            return True
+        return False
+
+    def _relaunch_tool(self):
+        """安全收尾后重开一个实例：先走 closeEvent 那条落盘链路，再起新进程。
+
+        为什么用「延时拉起 + 自己退出」而不是 os.execv：execv 会把进程原地换掉，
+        closeEvent（停止采集、等静默上传、进度落盘、关浏览器）一次都不会跑——
+        那正是最不能省的一部分。
+        """
+        cmd = self._relaunch_command()
+        if not cmd:
+            QMessageBox.information(self, "需要手动重启",
+                                    "没能确定本工具的启动方式，请直接关掉窗口再重新打开一次。")
+            return
+        self._relaunch_pending = cmd
+        self.close()          # closeEvent 真退出时才把新进程拉起来
+
+    def _relaunch_command(self):
+        """新实例怎么启动：冻结态直接起自身可执行文件，源码态起解释器 + 本脚本。"""
+        try:
+            if getattr(sys, "frozen", False):
+                return [sys.executable]
+            return [sys.executable, str(Path(__file__).resolve())]
+        except Exception:
+            return None
+
+    def _spawn_relaunch(self):
+        """closeEvent 收尾之后调用：等旧进程把 Chrome/端口/文件句柄释放干净再起新的。
+
+        延时是必需的，不是保守：共享 Chrome 只有一个调试端口，两个实例同时抢的结果
+        是新实例启动失败，用户看到的是「重启了一下工具打不开了」。
+        """
+        cmd = getattr(self, "_relaunch_pending", None)
+        if not cmd:
+            return
+        self._relaunch_pending = None
+        import subprocess
+        cwd = str(Path(__file__).resolve().parent)
+        try:
+            if sys.platform.startswith("win"):
+                args = " ".join(f'"{c}"' for c in cmd)
+                subprocess.Popen(f'start "" /min cmd /c "timeout /t 2 >nul & {args}"',
+                                 shell=True, cwd=cwd)
+            else:
+                import shlex
+                text = "sleep 2; " + " ".join(shlex.quote(c) for c in cmd)
+                subprocess.Popen(["sh", "-c", text], cwd=cwd, start_new_session=True)
+        except Exception as e:
+            self._on_log(f"⚠ 自动重启失败（请手动重新打开工具）：{type(e).__name__}")
+
+    def _open_acl_admin(self):
+        """权限管理面板（只有等级 0 的账号能看到这个入口）。"""
+        if not edition.acl_admin_visible():
+            QMessageBox.information(self, "提示", "当前账号没有权限管理入口。")
+            return
+        if not HAS_ACL_GUARD:
+            QMessageBox.warning(self, "提示", "权限模块未加载，无法管理白名单")
+            return
+        try:
+            from acl_admin_dialog import AclAdminDialog
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"权限管理面板加载失败：{type(e).__name__}: {e}")
+            return
+        dlg = AclAdminDialog(self)
+        dlg.exec_()
+        # 面板里可能改过名单/等级/绑定：回来先按新结果把自己重算一遍（含徽章与收口）
+        self._refresh_acl_status()
+        self._acl_sync_level()
 
     def _bind_yzd_account(self):
         if not HAS_YZD:
@@ -3424,7 +4716,34 @@ class MainWindow(QMainWindow):
             self._yzd_phone = msg
             saved = _tasks.save_account(msg)
             self._on_log(f"✅ 已绑定云展动力账号：{msg}" + ("" if saved else "（本地保存失败，下次启动需重新绑定）"))
-            QMessageBox.information(self, "绑定成功", f"已绑定云展动力账号：{msg}")
+            # 单点登录第二重：绑定即认领——把「这个账号 = 这台机器」写到 OSS 上。
+            # 顺序不能反：先认领再判定，否则刚绑完的人会被自己的设备校验挡在门外
+            # （远端还没有分片，判定只能回来说「正在校验本机设备绑定」）。
+            acl_msg = ""
+            if HAS_ACL_GUARD and saved:
+                try:
+                    _guard = _access_guard.get_guard()
+                    _guard.invalidate()
+                    claimed, claim_msg = _guard.claim_device(msg)
+                    self._on_log(("🔗 " if claimed else "⚠ ") + f"设备登记：{claim_msg}")
+                    if claimed:
+                        self._acl_stopped = False
+                    _guard.refresh_blocking(timeout=6.0)
+                    _allowed, _reason = _guard.check()
+                    if _allowed:
+                        acl_msg = "\n该账号已获得使用权限，本机已登记为当前使用设备。"
+                    elif claimed:
+                        # 认领成功却被名单挡下：说清楚是哪一重拦的，别让人去查网络
+                        acl_msg = f"\n{_reason}"
+                    else:
+                        acl_msg = f"\n{claim_msg}\n{_reason}"
+                    # 等级与界面不一致时（换了个不同等级的账号）当场收口 + 提示重启
+                    self._acl_sync_level()
+                except Exception as e:
+                    self._on_log(f"⚠ 设备登记异常：{type(e).__name__}: {e}")
+            elif HAS_ACL_GUARD and not saved:
+                acl_msg = "\n⚠ 账号没能保存到本地，权限校验仍按上一个号走；请重新绑定。"
+            QMessageBox.information(self, "绑定成功", f"已绑定云展动力账号：{msg}" + acl_msg)
         else:
             self._on_log(f"⚠ 绑定云展账号失败：{msg}")
             QMessageBox.warning(self, "绑定失败", msg)
@@ -3638,16 +4957,50 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "请等一下", "正在导入云展客户库，请等导入完成后再关闭程序。")
             ev.ignore()
             return
+        # 断开 refreshed 连接：守卫是进程级单例，比本窗口活得久。窗口析构后后台线程
+        # 再发一次信号，排队的槽调用就落在一个已经销毁的 QObject 上。心跳定时器挂在
+        # 自己（窗口）身上、随窗口析构自动停；信号连接挂在单例上，必须自己摘掉。
+        if HAS_ACL_GUARD:
+            try:
+                _access_guard.get_guard().refreshed.disconnect(self._acl_refreshed_slot)
+            except Exception:
+                pass
         try:
             self.session.stop_crawl()
             if self.autosave and self.autosave.isRunning():
                 self.autosave.wait(3000)
+            # 静默上传还在路上时先等它把这片写完：upload_session 是「临时 key → copy →
+            # delete」的原子写，中途被强杀最多在池子里留一个临时对象，不会写坏池子里的数据。
+            # 但等这几秒能让这批内容正常落进台账；不等就是「其实传上去了、本地却记成没传」，
+            # 下次开机整套重传——传上去的东西收不回来，只能白占存储。
+            #
+            # 落账必须在主线程这里补做：finished 是排队信号，事件循环就此结束的话不会跑。
+            # 但**只能照 worker 自己报的结果落**：拿不到结果（还在跑、或被 terminate）就
+            # 一律不记——把「不确定」写成「已传过」，这批数据就再也没有重试的机会了。
+            w = self._silent_worker
+            if w is not None and w.isRunning():
+                if not w.wait(8000):
+                    w.terminate()
+                    w.wait(1000)
+                if self._silent_result is not None:
+                    ok, msg = self._silent_result
+                    self._silent_commit(ok, msg + "（关闭窗口时补记）")
+                else:
+                    self._silent_log("退出时这一批没有拿到上传结果，"
+                                     "本批不记台账（下次采集完成会整批重试）")
             # 退出前留一份「关键词 + 进度」，下次打开工具自动回填并可续采
             self._persist_progress()
             self.session.close_browser()
         except Exception:
             pass
         super().closeEvent(ev)
+        # 权限等级变更后的自动重启：必须排在上面那整条落盘链路**之后**。
+        # 放在 closeEvent 开头会变成「新进程已经起来、旧进程还没把 Chrome 和
+        # 这批数据放下来」，两个实例抢同一个调试端口，谁都不确定谁能活下来。
+        if not ev.isAccepted():
+            self._relaunch_pending = None
+        else:
+            self._spawn_relaunch()
 
 
 def _app_stylesheet():
@@ -3710,7 +5063,25 @@ def main():
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())
+        # 双重验证守卫（QApplication 级 eventFilter：主窗口与所有对话框的
+        # 按钮点击都会先过「已绑定云展账号 + OSS 白名单」两道校验）
+        if HAS_ACL_GUARD:
+            _access_guard.install(app)
+            # 建界面**之前**做一次**权威**身份判定：每次开机都联网查 OSS，据此决定第一屏
+            # 是完整版还是丐版。为什么不能再像旧版那样只读本地副本（prefetch_local）：
+            # 副本可能是「这个号还没被删除/降级时」的旧等级——只信副本，被管理员删掉的号
+            # 下次开机照样按旧等级摆出全套入口，正是「被删除的账号还能使用」。
+            # 判定口径：OSS 拿到名单且本号在里面→按真实等级建（0/1完整、2丐版）；
+            # 拿不到/超时/未绑定/不在名单→一律按丐版建（宁严勿宽，与 check() 同源）。
+            # 高权限号若因这次断网先起了丐版，联网后由后台刷新确认真实等级，再走
+            # _acl_sync_level 的「横幅 + 一键重启」补齐完整版入口（建好的界面长不出新按钮）。
+            _access_guard.prefetch_authoritative()
         w = MainWindow()
+        if not HAS_ACL_GUARD:
+            try:
+                w._on_log("⚠ 权限校验模块（access_guard）未加载，本次运行不做白名单拦截")
+            except Exception:
+                pass
         w.show()
     except Exception as e:
         _fatal_log(e)
@@ -3719,7 +5090,27 @@ def main():
         except Exception:
             pass
         raise
-    sys.exit(app.exec_())
+    try:
+        rc = app.exec_()
+    finally:
+        # ── 有序收尾：窗口 → 守卫 → QApplication ─────────────────────────────
+        # 不写这一段的话，退出时谁先被销毁由解释器收尾的 GC 顺序决定，而那个顺序是
+        # 反的：模块级全局（守卫单例）比 main 的帧活得久，QApplication 的 wrapper 先析构
+        # 时 PyQt 还会遍历剩下所有 wrapper——撞上一个 C++ 侧已随 app 销毁的对象就是
+        # 退出 SIGSEGV（线上实测抓到过这条栈）。用户侧的表现是「关工具弹一次系统崩溃
+        # 报告」，顺带最后一次自动保存可能没落盘。所以趁 app 还活着，先把窗口和守卫拆掉。
+        try:
+            if w.isVisible():          # 关窗口退出时 closeEvent 已经跑过，不再补第二次
+                w.close()
+        except Exception:
+            pass
+        if HAS_ACL_GUARD:
+            try:
+                _access_guard.shutdown(app)
+            except Exception:
+                pass
+        w = None
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

@@ -701,12 +701,40 @@ class Ali1688Crawler:
                 pass
             self._timeout_set = True
         backoff = (2, 5, 10, 15)
+        waited_for_captcha = False  # 标记是否已经等人机验证通过（防重复刷新验证码）
         for i in range(tries):
             try:
                 # _ensure_tab 也放进 try：浏览器被关/崩溃时它访问 window_handles 会抛
                 # invalid session id，若留在 try 外会冒泡出 crawl 直接把采集线程打崩。
                 self._ensure_tab()
-                self.driver.get(url)
+                # 【大厂思想】如果刚等完人工过码，先检查当前页是否已在目标URL；
+                # 若不在才导航一次（绝不循环重试，否则每次导航都触发新验证码）。
+                if waited_for_captcha:
+                    cur_url = (self.driver.current_url or "").lower()
+                    target_lower = url.lower().split("?")[0]  # 忽略查询参数做前缀比对
+                    if cur_url.startswith(target_lower) or target_lower in cur_url:
+                        # 已在目标页（验证码自动跳转了），无需再导航
+                        self._log(f"   ✅ 过码后已在目标页，无需重复导航")
+                        time.sleep(0.8)
+                        return True
+                    else:
+                        # 还在验证码页或别的页，导航到目标URL一次
+                        self._log(f"   🔄 过码后未自动跳转，导航到目标页一次…")
+                        self.driver.get(url)
+                        time.sleep(1.5)
+                        self._prune_to_own_tab()
+                        block = self._detect_block()
+                        if block:
+                            # 又触发了新验证码 → 说明用户还没过完，继续等
+                            if not self._wait_unblock(block):
+                                return False
+                            # 再次过码后直接返回（不再循环）
+                            self._log(f"   ✅ 二次过码完成，继续采集")
+                            return True
+                        else:
+                            return True
+                else:
+                    self.driver.get(url)
             except Exception as e:
                 # 只记录首行，避免 chromedriver 巨长堆栈刷屏；含超时/断网等
                 msg = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
@@ -728,8 +756,11 @@ class Ali1688Crawler:
             self._prune_to_own_tab()
             block = self._detect_block()
             if block:
+                waited_for_captcha = True  # 标记：已进入人工过码流程
                 if not self._wait_unblock(block):
                     return False
+                # 【关键修复】过码成功后不再 continue 重试导航（那会触发新验证码），
+                # 而是进入下一轮循环，由上方 waited_for_captcha 分支处理
                 continue
             return True
         return False
@@ -750,6 +781,51 @@ class Ali1688Crawler:
         return any(k in m for k in cls.SESSION_DEAD_MARKS)
 
     # ── 拦截 / 登录 判定 ───────────────────────────────────────
+    # JS 探测验证码模态弹窗：1688 的滑块验证是盖在正常页面上的 overlay，
+    # URL/标题/正文都与正常搜索页一致，旧三层检测全部漏判。
+    # 本脚本扫描 iframe 源、模态容器、关键文案三维度，命中任一即判拦截。
+    _CAPTCHA_OVERLAY_JS = """(function(){
+        // 1. 扫描 iframe：验证码通常嵌在跨域 iframe 里
+        var iframes = document.querySelectorAll('iframe');
+        for (var i = 0; i < iframes.length; i++) {
+            var src = (iframes[i].src || '').toLowerCase();
+            if (src.indexOf('captcha') >= 0 || src.indexOf('verify') >= 0
+                || src.indexOf('sufei') >= 0 || src.indexOf('nocaptcha') >= 0
+                || src.indexOf('alibaba') >= 0 || src.indexOf('1688') >= 0
+                || src.indexOf('wappass') >= 0 || src.indexOf('challenge') >= 0) {
+                return 'iframe:' + src.slice(0, 60);
+            }
+        }
+        // 2. 扫描已知验证码容器选择器
+        var selectors = ['#nc_mask', '#nc_1_n1z', '.nc-container', '#baxia-dialog',
+                         '.baxia-dialog', '#captcha-modal', '.captcha-modal',
+                         '[class*="captcha"]', '[class*="verify"]', '[class*="sufei"]',
+                         '[class*="nc_"]', '[id*="captcha"]', '[id*="verify"]'];
+        for (var j = 0; j < selectors.length; j++) {
+            try {
+                var els = document.querySelectorAll(selectors[j]);
+                for (var k = 0; k < els.length; k++) {
+                    var r = els[k].getBoundingClientRect();
+                    // 可见且尺寸合理（不是 display:none 的隐藏元素）
+                    if (r.width >= 100 && r.height >= 50
+                        && r.bottom > 0 && r.top < (window.innerHeight || 900)) {
+                        return 'dom:' + selectors[j];
+                    }
+                }
+            } catch(e) {}
+        }
+        // 3. 扫描页面文案：模态弹窗里的关键文字
+        var bodyText = document.body ? document.body.innerText : '';
+        var markers = ['正在加载验证码', '拖动滑块', '请按住滑块', '滑动验证',
+                       '人机验证', '安全验证', '请完成验证', '反馈码'];
+        for (var m = 0; m < markers.length; m++) {
+            if (bodyText.indexOf(markers[m]) >= 0) {
+                return 'text:' + markers[m];
+            }
+        }
+        return '';
+    })()"""
+
     def _detect_block(self):
         if self.driver is None:
             return ""
@@ -771,6 +847,14 @@ class Ali1688Crawler:
             body = ""
         if len(body) < 300 and any(m in body for m in ("滑动验证", "拖动滑块", "验证码", "访问过于频繁")):
             return "页面被 1688 风控拦截（滑块/访问频繁）"
+        # 【关键修复 2026-11-07】第四层：JS 探测验证码模态弹窗（overlay）
+        # 1688 的滑块验证盖在正常搜索页上，URL/标题/正文均正常，前三层全漏判。
+        try:
+            overlay = self.driver.execute_script(self._CAPTCHA_OVERLAY_JS)
+            if overlay:
+                return f"页面出现验证码弹窗（{overlay}），请在 Chrome 里手动过验证"
+        except Exception:
+            pass
         return ""
 
     def _register_block(self):
@@ -1712,17 +1796,26 @@ class Ali1688Crawler:
         landlines = [self._norm_landline(x) for x in re.split(r"[/、,;]", r.get("电话") or "") if x.strip()]
         phones = " ; ".join([m.strip() for m in mobiles] + [l for l in landlines if l])
         status = r.get("状态") or ""
+        remark = ""
+        if r.get("关键词"):
+            remark += "关键词:" + r["关键词"]
+        # 主营/行业/国家/经营模式/区域/官网 已由结构化字段传递，_remark() 显式写入备注
         return {
             "公司名": r.get("公司名称") or "",
             "联系人": r.get("联系人") or "",
+            "岗位": r.get("岗位") or "",
             "电话": phones,
             "邮箱": r.get("邮箱") or "",
             "地址": r.get("地址") or "",
-            "官网": r.get("店铺URL") or "",
+            "官网": r.get("店铺URL") or r.get("详情URL") or "",
+            "主营": r.get("主营商品") or r.get("主营产品") or "",
+            "行业": r.get("行业") or "",
+            "国家": r.get("国家") or "",
+            "经营模式": r.get("经营模式") or "",
+            "所在区域": r.get("所在区域") or "",
             "数据来源": "1688",
             "状态": "" if status == "成功" else status,
-            "备注": ("主营:" + r["主营商品"] if r.get("主营商品") else "") +
-                    ("｜关键词:" + r["关键词"] if r.get("关键词") else ""),
+            "备注": remark,
         }
 
     @staticmethod

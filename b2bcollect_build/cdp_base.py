@@ -1052,8 +1052,10 @@ return '';})()"""
 
     def _goto(self, url, expect_domain=None, tries=3):
         """导航到 url，回读 location 断言域名命中才算成功；命中拦截则等人工过验证。
-        标签/浏览器死掉则自愈重取标签续采，绝不让异常冒泡崩掉采集线程。"""
+        标签/浏览器死掉则自愈重取标签续采，绝不让异常冒泡崩掉采集线程。
+        【关键】过码后绝不重复导航（每次导航都触发新验证码），先检查当前页是否已在目标URL。"""
         backoff = (1.5, 3, 6)
+        waited_for_captcha = False  # 标记是否已经等人机验证通过（防重复刷新验证码）
         for i in range(tries):
             if self._stop_requested:
                 return False
@@ -1061,7 +1063,20 @@ return '';})()"""
                 if not self._ws_url():
                     if not self.ensure_tab():
                         raise RuntimeError("no tab")
-                self._cdp_navigate(url)
+                # 【大厂思想】如果刚等完人工过码，先检查当前页是否已在目标URL；
+                # 若不在才导航一次（绝不循环重试，否则每次导航都触发新验证码）。
+                if waited_for_captcha:
+                    cur_url = (self._current_url() or "").lower()
+                    target_lower = url.lower().split("?")[0]
+                    if target_lower in cur_url:
+                        self._log(f"   ✅ 过码后已在目标页，无需重复导航")
+                        time.sleep(0.5)
+                    else:
+                        self._log(f"   🔄 过码后未自动跳转，导航到目标页一次…")
+                        self._cdp_navigate(url)
+                        time.sleep(1.0)
+                else:
+                    self._cdp_navigate(url)
             except Exception as e:
                 msg = str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__
                 if self._session_dead(msg):
@@ -1080,8 +1095,10 @@ return '';})()"""
                 self._mark_activity()
                 block = self._detect_block()
                 if block:
+                    waited_for_captcha = True
                     if not self._wait_unblock(block):
                         return False
+                    # 过码后不再 continue 重试导航（那会触发新验证码）
                     continue
                 if i < tries - 1:
                     time.sleep(backoff[min(i, len(backoff) - 1)])
@@ -1092,8 +1109,10 @@ return '';})()"""
                 return False
             block = self._detect_block()
             if block:
+                waited_for_captcha = True
                 if not self._wait_unblock(block):
                     return False
+                # 过码后不再 continue 重试导航（那会触发新验证码）
                 continue
             self._mark_activity()
             return True
@@ -1111,17 +1130,34 @@ return '';})()"""
     # 把用户刚点的验证进度清零（2026-11-05 麦麦B2B/1688 复现）。
     # 商铺页自带的「采购限价」表单里也有验证码输入图（实测 gys 商铺页有 id=codeCaptcha 的
     # img），但那些 img 不会命中的 iframe/class 选择器，所以不会误判。
-    CAPTCHA_WIDGET_JS = """(function(){
-function ok(e){if(!e)return false;var r=e.getBoundingClientRect();
-return r.width>=150&&r.height>=40&&r.bottom>0&&r.top<(window.innerHeight||900)*0.9;}
-var s=['#tencent-captcha','.tcaptcha-container','.tcaptcha-body','.tcaptcha-transform',
-'iframe[src*="captcha"]','iframe[src*="verify"]','iframe[src*="challenge"]',
-'iframe[src*="turnstile"]','.cf-turnstile','#challenge-stage',
-'.geetest_panel','.geetest_holder','#geetest_wrap','.slider-verify','.verify-wrap',
-'.captcha-container','.captcha-box','#captcha-div','.nc-container'];
-for(var i=0;i<s.length;i++){try{var e=document.querySelector(s[i]);
-if(e&&ok(e))return s[i];}catch(x){}}
-return '';})()"""
+    # 上面那段控件探测要拆成两份清单，否则「绝不刷新」与「替用户点一下」互相打架：
+    # 腾讯云/极验这类滑块要人亲手拖，算「禁区控件」；Cloudflare 自家的 Turnstile 勾选框
+    # 却是可以代点的（点了就自动过），它必须留在「插页」判定之内，否则
+    # _refresh_stalled_challenge 的点击分支永远走不到，2026-11-03 那次修复就白做了
+    # （2026-11-05 抬高控件门槛时正是这样把点击通路弄死的）。
+    _HUMAN_CAPTCHA_SELECTORS = [
+        '#tencent-captcha', '.tcaptcha-container', '.tcaptcha-body', '.tcaptcha-transform',
+        'iframe[src*="captcha"]', 'iframe[src*="verify"]',
+        '.geetest_panel', '.geetest_holder', '#geetest_wrap', '.slider-verify',
+        '.verify-wrap', '.captcha-container', '.captcha-box', '#captcha-div', '.nc-container']
+    _CF_CAPTCHA_SELECTORS = [
+        'iframe[src*="challenge"]', 'iframe[src*="turnstile"]',
+        '.cf-turnstile', '#challenge-stage']
+
+    @staticmethod
+    def _captcha_probe_js(selectors):
+        _js = ["(function(){",
+               "function ok(e){if(!e)return false;var r=e.getBoundingClientRect();",
+               "return r.width>=150&&r.height>=40&&r.bottom>0&&r.top<(window.innerHeight||900)*0.9;}"]
+        _js.append("var s=[" + ",".join("'" + x + "'" for x in selectors) + "];")
+        _js.append("for(var i=0;i<s.length;i++){try{var e=document.querySelector(s[i]);")
+        _js.append("if(e&&ok(e))return s[i];}catch(x){}}")
+        _js.append("return '';})()")
+        return "\n".join(_js)
+
+    CAPTCHA_WIDGET_JS = _captcha_probe_js(_CF_CAPTCHA_SELECTORS + _HUMAN_CAPTCHA_SELECTORS)
+    # 只有「要人亲手拖/点才能过、且刷新会把进度清零」的控件才算这一份
+    HUMAN_CAPTCHA_JS = _captcha_probe_js(_HUMAN_CAPTCHA_SELECTORS)
 
     def _detect_block(self):
         """以「URL 特征 + 标题特征 + 正文异常小」为判据，绝不对整页正文做关键词匹配
@@ -1275,11 +1311,13 @@ return '';})()"""
                             "checking your browser", "__cf_chl", "cf-chl", "challenge-solving")
 
     def _auto_challenge_page(self):
-        """标签当前是否停在「纯自动挑战页」：只有转圈动画、没有任何可点控件的插页。
-        这种页面人做不了任何动作，刷新是唯一能推进的操作；而带滑块/验证码控件的页面
-        一律不算——那种页面一刷新就把用户正在拖的滑块重置掉了（绝对不行）。"""
+        """标签当前是否停在「靠机器自己就能跑完的挑战插页」上（可自动过、也可代点）。
+        页面摆着要人亲手拖的滑块/图形码时一律不算：那种页面一刷新就把用户正在拖的
+        滑块重置掉（绝对不行）。Cloudflare 的 Turnstile 勾选框仍算插页——它由
+        _refresh_stalled_challenge 里「按坐标替用户点一次、绝不刷新」那条通路处理，
+        控件清单里把它和滑块分开，正是为了让这两条通路都活着。"""
         try:
-            if self._eval(self.CAPTCHA_WIDGET_JS):
+            if self._eval(self.HUMAN_CAPTCHA_JS):
                 return False
             text = ((self._current_url() or "") + " " + (self._title() or "")).lower()
             if any(m in text for m in self.AUTO_CHALLENGE_MARKS):
@@ -2004,7 +2042,7 @@ return '';})()"""
             "failed": self.stat_failed,
             "got": len(self.results),
             "pf_miss": self._pf_dropped,        # 省份把关：确认外省已排除
-            "pf_unknown": self._pf_unknown,     # 省份把关：属地未标注已排除（已转企知道反查）
+            "pf_unknown": self._pf_unknown,     # 省份把关：属地未标注已排除（已转名单补采反查）
             "kw_yield": dict(self.kw_yield),
         }
 
@@ -2080,10 +2118,15 @@ return '';})()"""
 
     def restore_progress(self, snap):
         """把上次任务的关键词进度装回来：已跑完的词直接跳过，净新增接着累加。
-        同时打开 resume 标记——crawl() 不再清空台账，否则一进循环就把刚恢复的进度抹了。"""
+        同时打开 resume 标记——crawl() 不再清空台账，否则一进循环就把刚恢复的进度抹了。
+        【关键修复 2026-11-07】只恢复「有产出」的关键词为 done；零产出关键词
+        （被验证码挡住/登录失败/解析空）释放出来让续采自动重试，否则进度文件里
+        的历史脏数据会让 1688/麦麦B2B 整轮 0 条后续采永久跳过。"""
         snap = snap or {}
         self.kw_yield = {str(k): int(v or 0) for k, v in (snap.get("yield") or {}).items()}
-        self._kw_done = {str(k) for k in (snap.get("done") or [])}
+        # 只恢复 yield > 0 的关键词为 done；零产出的释放出来让续采重试
+        self._kw_done = {str(k) for k in (snap.get("done") or [])
+                         if self.kw_yield.get(str(k), 0) > 0}
         self.resume = bool(self._kw_done or self.kw_yield)
         return self.resume
 
@@ -2205,14 +2248,14 @@ return '';})()"""
             if not self._stop_requested:
                 # 跑完一轮才记「已跑过」；中途被停止/暂停掉开的词下次重来，
                 # 重复条目由种子库兜住（种子库会一直留着），不会多烧请求。
-                # 但“一页都没取到”不能算跑完：那不是「这个词没公司」，而是根本没和站上
-                # 说上话（被防采拦、会话断、或列表取页链路没接上）。旧实现连这种也记
-                # 「已跑完」，2026-11-02 麦麦B2B 就是十个关键词全被标成跑完、净产出 0，
-                # 用户再点续采全部被跳过，看到的就永远是「只有这一家 0 条成功」。
-                if self.stat_pages > pages_before or self.kw_yield.get(kw, 0) > yield_before:
+                # 【大厂思想】只记「有产出」的词为 done；零产出词（被拦/解析失败/本页无数据）
+                # 一律不记，下次续采自动重来。旧条件 stat_pages > pages_before 会把
+                # 「翻了页但一家没出」（验证码挡住/页面解析空）也记成 done，导致
+                # 1688/麦麦B2B 整轮 0 条后续采永久跳过这些词（2026-11-07 修复）。
+                if self.kw_yield.get(kw, 0) > yield_before:
                     self._kw_done.add(kw)
                 else:
-                    self._log(f"⚠ 「{kw}」一页都没取到（被拦或链路没通），本轮不记「已跑完」，下次自动重来")
+                    self._log(f"⚠ 「{kw}」无新增产出（被拦/链路未通/本页无数据），不记「已跑完」，下次自动重来")
             if self.incremental:
                 self._save_seen_store()
             self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
@@ -2322,9 +2365,11 @@ return '';})()"""
         tels = [x for x in re.split(r"[/、,;]", r.get("电话") or "") if x.strip()]
         phones = " ; ".join([m.strip() for m in mobiles] + [t.strip() for t in tels if t.strip()])
         status = r.get("状态") or ""
-        remark = ("主营:" + r["主营产品"] if r.get("主营产品") else "")
+        remark = ""
         if r.get("关键词"):
-            remark += ("｜" if remark else "") + "关键词:" + r["关键词"]
+            remark += "关键词:" + r["关键词"]
+        # 主营/行业/国家/经营模式/区域/官网 已由结构化字段传递，_remark() 显式写入备注
+        # （不再在备注里重复，避免跨平台合并时结构化信息被单路备注覆盖而丢失）
         return {
             "公司名": r.get("公司名称") or "",
             "联系人": r.get("联系人") or "",
@@ -2333,6 +2378,11 @@ return '';})()"""
             "邮箱": r.get("邮箱") or "",
             "地址": r.get("地址") or "",
             "官网": r.get("公司网址") or r.get("详情URL") or "",
+            "主营": r.get("主营产品") or r.get("主营商品") or "",
+            "行业": r.get("行业") or r.get("所属行业") or "",
+            "国家": r.get("国家") or "",
+            "经营模式": r.get("经营模式") or "",
+            "所在区域": r.get("所在区域") or "",
             "数据来源": r.get("数据来源") or self.PLATFORM_NAME,
             "状态": "" if status == "成功" else status,
             "备注": remark,

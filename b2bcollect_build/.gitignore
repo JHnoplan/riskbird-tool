@@ -9,3 +9,8 @@ __pycache__/
 b2bcollect_data/
 *.out
 *.log
+
+# 本地密钥与缓存（含 DeepSeek API Key，绝不入库；打包态运行时从本机
+# config.json / 环境变量解析，源码仓库里永远不该出现真实密钥）
+config.json
+deepseek_cache.json

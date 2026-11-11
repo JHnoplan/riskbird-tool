@@ -9,7 +9,8 @@
   · 待采集公司名单三台账：bind 建表 / seed 入列 / add_waste 回流 / pop 记 tried /
     mark_result 记 collected / requeue 回队首 / 探针跳过已采；
   · 公司名识别（无表头 txt / 字面表头 txt / 带表头 xlsx / 多列无表头）；
-  · GUI 默认态：1688 不勾、其余勾、补采开关默认勾、清洗按钮存在、主按钮样式。
+  · GUI 默认态：1688 不勾、其余勾、企知道补采默认勾（风鸟/爱企查默认不勾且各自有
+    「打开 XX」按钮与勾选框）、看板三路补采计数都能渲染、清洗按钮存在、主按钮样式。
 
 运行：.venv/bin/python test_integration_offline.py   （GUI 段无 PyQt5 时自动跳过）
 """
@@ -482,18 +483,96 @@ def test_gui_defaults():
     for s in SITE_ORDER:
         if s != "1688":
             assert w.site_checks[s].isChecked() is True, f"{s} 应默认勾选"
-    for attr in ("btn_file", "btn_paste", "btn_parse", "btn_smart", "kw_text", "lbl_kw",
-                 "btn_co_file", "btn_open_qzd", "lbl_co", "chk_waste",
-                 "btn_clean", "btn_open", "btn_start", "btn_pause", "btn_stop",
+    for attr in ("btn_file", "btn_parse", "btn_smart", "btn_province", "kw_text", "lbl_kw",
+                 "btn_co_file", "lbl_co",
+                 "btn_clean", "btn_start", "btn_pause", "btn_stop",
                  "btn_export", "btn_reset", "progress", "log"):
         assert hasattr(w, attr), f"缺控件 {attr}"
-    assert w.chk_waste.isChecked() is True, "补采开关默认应勾选"
+    # 关键词区排版（2026-11-11 用户实机反馈）：①「从剪贴板粘贴」按钮要彻底消失——
+    # 粘贴本就是文本框自带能力（Ctrl+V），多一个按钮位反而把五个词挤一行；②文字不许
+    # 被截断（当时截成「入关键词文」）。断言只看 minimumWidth 与 sizePolicy，因为它们
+    # 才是「布局无权压窄」的契约，不依赖窗口有没有 show、换字体也照样成立。
+    assert not hasattr(w, "btn_paste"), "「从剪贴板粘贴」按钮应已去掉（改用 Ctrl+V）"
+    assert not hasattr(w, "_on_paste"), "_on_paste 随按钮一起删掉，留着就是死代码坑"
+    _kw_btns = (w.btn_file, w.btn_parse, w.btn_smart)
+    _widths = set()
+    for _b in _kw_btns:
+        _need = _b.fontMetrics().horizontalAdvance(_b.text())
+        assert _b.minimumWidth() >= _need, (
+            f"{_b.text()} 会被截断：minimumWidth {_b.minimumWidth()} < 文字 {_need}")
+        assert _b.sizePolicy().horizontalPolicy() == _b.sizePolicy().Minimum, (
+            f"{_b.text()} 的横向策略应是不许压窄（Minimum）")
+        _widths.add(_b.minimumWidth())
+    assert len(_widths) == 1, f"三个动作按钮宽度不一致，排版会看着散：{_widths}"
+    # 排版总根因（2026-11-11 实测）：本机 Retina 逻辑 1280x800，可用高度 ~775，自适应
+    # 出来的窗口只有 650 上下，而配置＋状态＋日志各行自然最小高合计 909。窗口比内容矮时
+    # Qt 不裁底部，而是把没设硬最小值的控件一路压扁——关键词框只剩 10 像素、说明行 1 像素。
+    # 修法是密集面板的业界统一做法：配置区自己滚，进度/状态/日志常驻下方。
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QScrollArea, QFrame
+    _p = w.kw_text.parent()
+    while _p is not None and not isinstance(_p, QScrollArea):
+        _p = _p.parent()
+    assert _p is not None, "关键词输入框必须在可滚动配置区里（否则窗口一矮就被压扁）"
+    assert _p.widgetResizable() and _p.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff, (
+        "配置区要纵向滚动、横向绝不滚动（横滚会把「开始采集」按钮挪到看不见）")
+    assert _p.frameShape() == QFrame.NoFrame, "滚动容器不该再画一圈边框，界面会显得框中有框"
+    assert w.kw_text.minimumHeight() >= 72, (
+        f"关键词框没有硬底线，窗口一矮就被压扁：{w.kw_text.minimumHeight()}")
+    assert w.kw_text.maximumHeight() >= w.kw_text.minimumHeight()
+    for _lb in (w.lbl_kw, w.lbl_province, w.lbl_co):
+        assert _lb.minimumHeight() >= _lb.fontMetrics().height(), (
+            f"{_lb.objectName() or type(_lb).__name__} 说明行没锁「至少一行」，会压成看不见")
+    assert w.log.minimumHeight() >= 180, "输出日志的硬性最小高是小屏底线，不能被配置区挤掉"
+    # 窗口拖到允许的最小值时，输入框与日志仍必须拿到各自的下限
+    _geo0 = (w.width(), w.height())
+    w.resize(w.minimumWidth(), w.minimumHeight())
+    w.show()
+    app.processEvents()
+    assert w.kw_text.height() >= w.kw_text.minimumHeight(), (
+        f"最小窗口下关键词框被压扁：{w.kw_text.height()}")
+    assert w.log.height() >= w.log.minimumHeight(), f"最小窗口下日志被挤掉：{w.log.height()}"
+    w.resize(*_geo0)
+    app.processEvents()
+    # 启动回填绝不许弹模态：1688 的 toggled 挂着「先去登录」提示，程序化恢复勾选态时
+    # 弹出来＝用户什么都没点就被打断（offscreen 下还会永久卡死启动流程）。
+    _pops = []
+    _real_info = g.QMessageBox.information
+    g.QMessageBox.information = staticmethod(lambda *a, **k: (_pops.append(a), 0)[1])
+    try:
+        w._restore_site_checks(list(SITE_ORDER))
+        assert not _pops, f"程序化恢复勾选态弹了 {len(_pops)} 个模态框（该屏蔽信号）"
+        assert w.site_checks["1688"].isChecked() is True, "回填要把 1688 恢复成上次的勾选态"
+        w._restore_site_checks([s for s in SITE_ORDER if s != "1688"])
+        assert w.site_checks["1688"].isChecked() is False
+        w._restore_site_checks([])          # 老快照没记站点：不许把平台全关掉
+        assert any(c.isChecked() for c in w.site_checks.values())
+    finally:
+        g.QMessageBox.information = _real_info
+        w.site_checks["1688"].setChecked(False)
+    # 三平台名单补采：勾选框与「打开 XX」按钮都按通道注册表生成。
+    # 界面里硬编码只画企知道一个框，风鸟/爱企查就在界面上根本不存在，用户无从勾选。
+    from parallel_session import LIST_CHANNEL_SLUGS, QZD_SLUG
+    assert set(w.chk_list) == set(LIST_CHANNEL_SLUGS), (set(w.chk_list), LIST_CHANNEL_SLUGS)
+    assert set(w.login_buttons) == set(LIST_CHANNEL_SLUGS)
+    assert w.chk_list[QZD_SLUG].isChecked() is True, "企知道补采应默认勾选"
+    assert w.chk_list[QZD_SLUG] is w.chk_waste, "chk_waste 是历史引用名，须与企知道同一控件"
+    for slug in LIST_CHANNEL_SLUGS:
+        if slug != QZD_SLUG:
+            assert w.chk_list[slug].isChecked() is False, f"{slug} 应默认不勾（默认还是选企知道）"
+            btn = w.login_buttons[slug]
+            assert f"打开{SITE_NAMES[slug]}" in btn.text(), btn.text()
+    assert w._list_want_slugs() == [QZD_SLUG], w._list_want_slugs()
     assert w.btn_start.objectName() == "primary", "开始采集应为主按钮样式"
-    # 状态行富文本（含 1688）仍可渲染
-    html = g.build_stats_html("已采 5 家　中国制造网 3｜1688 2",
-                              {"mic": "done", "1688": "running"})
+    # 状态行富文本：关键词各站 + 三路补采都要出现在看板里。
+    # 只遍历 SITE_ORDER 会把「风鸟补采 2」整段丢掉——日志看得见、看板一片空白。
+    txt = ("已采 5 家　中国制造网 3｜1688 2｜企知道补采 4｜风鸟补采 2｜爱企查补采 1")
+    html = g.build_stats_html(txt, {"mic": "done", "1688": "running"})
     assert "<span" in html and "1688" in html
-    ok("GUI 默认态：1688 不勾 / 补采默认勾 / 控件齐全 / 状态行含 1688")
+    for label in ("企知道补采", "风鸟补采", "爱企查补采"):
+        assert label in html, f"看板缺「{label}」"
+    ok("GUI 默认态：1688 不勾 / 企知道补采默认勾且风鸟爱企查默认不勾 / 三平台打开按钮与"
+       "勾选框同源注册表 / 控件齐全 / 看板三路补采计数与 1688 一并渲染")
 
 
 def main():

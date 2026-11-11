@@ -18,11 +18,13 @@ from parallel_session import ParallelSession
 ok = 0
 
 
-def check(name, cond):
+def check(name, cond, extra=""):
     global ok
-    assert cond, f"FAIL: {name}"
-    ok += 1
-    print(f"  ✓ {name}")
+    if cond:
+        ok += 1
+        print(f"  ✓ {name}")
+        return
+    raise AssertionError(f"FAIL: {name}{('：' + extra) if extra else ''}")
 
 
 class FakeResp:
@@ -425,5 +427,107 @@ check("自动保存的清洗表走统一入库口径",
       "clean_records" in inspect.getsource(gui.AutoSaveWorker._write_cleaned))
 check("云展导入上传的数据走同一入库口径（四项全空不进后台客户库）",
       "clean_records" in inspect.getsource(gui.YzdImportWorker))
+
+# ══════════════════════════════════════════════════════════
+# 6) heal / revive 二分纪律：人正在拖滑块的那段时间里绝不刷页面
+#    （2026-11-11 用户实机反馈：手动过验证时被工具刷了一下，挑战作废、从头再来）
+#    同时锁住爱企查那条 RecursionError：子类 _wait_unblock 回调 limited、limited 再
+#    回调子类的 _wait_unblock，两条路互相指回去＝爆栈，实机就是爱企查停摆的头号根因。
+# ══════════════════════════════════════════════════════════
+import site_adapters as _ad          # 预热 sys.path（riskbird_build 的模块靠它挂进来）
+import block_guard as bg
+
+_bg_time = bg.time                    # 只换 block_guard 自己看到的 time，不动全局
+
+
+class _Instant:
+    def __init__(self):
+        self.ticks = 0
+
+    def sleep(self, _s):
+        self.ticks += 1               # wait_unblock 按 1 秒步进，这里 0 成本推进
+
+    def time(self):
+        return 1_000_000.0 + self.ticks
+
+
+bg.time = _Instant()
+try:
+    # A) 验证页从头挂到尾：非破坏的 heal 可以试，会刷页面的 revive 一次都不许动
+    _heals, _revives, _at = [], [], []
+
+    def _probeA():
+        _at.append(bg.time.ticks)     # 记下每次探测的"秒针位置"，用来验节奏
+        return "仍在验证页"
+
+    _resA = bg.wait_unblock(
+        "需要安全验证", lambda m: None, None, lambda: False, _probeA,
+        max_wait=120, interval=15, first_wait=15,
+        heal=lambda: (_heals.append(1) or False), heal_every=60,
+        revive=lambda: (_revives.append(1) or True))
+    _gaps = [_at[i + 1] - _at[i] for i in range(len(_at) - 1)]
+    check("验证页挂着期间绝不触发 revive（破坏性自愈会把用户拖到一半的滑块刷作废）",
+          _revives == [])
+    check("验证页挂着期间仍按 heal_every 试过非破坏自愈（换回已验证标签，不动页面）",
+          len(_heals) >= 1, str(len(_heals)))
+    check("稳态探测节奏正好是下发的 interval（15 秒一跳：既不是 1 秒狂探、也不是忘了探）",
+          _resA is False and set(_gaps[-7:]) == {15}, str(_gaps[:12]))
+
+    # B) 签名已消失但能力探针还是拿不到数据：这时才允许把标签重刷回可用状态
+    _heals2, _revives2 = [], []
+    bg.wait_unblock(
+        "需要安全验证", lambda m: None, None, lambda: False, lambda: "",
+        max_wait=120, interval=15, first_wait=15, ready=lambda: False,
+        heal=lambda: (_heals2.append(1) or False), heal_every=60,
+        revive=lambda: (_revives2.append(1) or True))
+    check("签名消失＋ready 探针失败 → revive 被调用（过完码停在回跳页不重刷就拿不到数据）",
+          len(_revives2) >= 1, str(len(_revives2)))
+    check("给了 revive 就不再拿 heal 当破坏性自愈用（两条职责不混用）", _heals2 == [])
+
+    # C) 签名消失且能力实测通过：既不 heal 也不 revive，立刻放行
+    _heals3, _revives3 = [], []
+    _resC = bg.wait_unblock(
+        "需要安全验证", lambda m: None, None, lambda: False, lambda: "",
+        max_wait=120, interval=15, first_wait=15, ready=lambda: True,
+        heal=lambda: (_heals3.append(1) or True), heal_every=60,
+        revive=lambda: (_revives3.append(1) or True))
+    check("过完验证且实测能拿数据：立即返回 True 且不动任何页面",
+          _resC is True and not _heals3 and not _revives3)
+
+    # D) 向后兼容：不传 revive 的老调用方（风鸟/企知道单平台路径）行为不变
+    _heals4, _revives4 = [], []
+    bg.wait_unblock("需要安全验证", lambda m: None, None, lambda: False, lambda: "",
+                    max_wait=60, interval=15, first_wait=15, ready=lambda: False,
+                    heal=lambda: (_heals4.append(1) or False), heal_every=30)
+    check("老调用方不传 revive 时仍退回 heal（未给 revive 不改变原有语义）",
+          len(_heals4) >= 1)
+
+    # E) 爱企查通道：limited → 基类等待 这条链不许再互相指回去（RecursionError 实锤复发防护）
+    aqc = object.__new__(_ad.AiqichaSite)     # 不跑 __init__：那会去连真实 Chrome
+    aqc._stop_requested = False
+    aqc._log = lambda m: None
+    aqc._emit_blocked = lambda m: None
+    aqc._emit_cleared = lambda m: None
+    aqc._detect_block = lambda: "爱企查：需要安全验证"    # 一直没过验证
+    aqc._heal_block = lambda: False
+    aqc._revive_after_block = lambda: False
+    aqc.handoff = None
+    aqc._blocked_at = 0.0
+    aqc._cooldown_until = 0.0
+    aqc._unknown_streak = 0
+    aqc.block_wait_limit = 600
+    aqc.block_probe_interval = _ad.LIST_BLOCK_PROBE_INTERVAL
+    aqc.block_heal_every = _ad.LIST_BLOCK_HEAL_EVERY
+    _rec = None
+    try:
+        _lim = aqc._wait_unblock_limited("爱企查：需要安全验证", max_wait=120)
+    except RecursionError as e:               # 2026-11-11 实机就是这个把这一路打死的
+        _lim, _rec = False, e
+    check("爱企查 limited→_wait_unblock→block_guard 这条链动态跑通、不爆栈（RecursionError 根因已除）",
+          _rec is None and _lim is False, str(_rec))
+    check("爱企查通道级等待走 super()，拿的是实例下发的 15 秒只读节奏",
+          aqc.block_probe_interval == 15 and aqc.block_heal_every == 60)
+finally:
+    bg.time = _bg_time
 
 print(f"\n全部 {ok} 项断言通过 ✅")

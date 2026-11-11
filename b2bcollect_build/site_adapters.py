@@ -100,6 +100,124 @@ try:
 except Exception as _e:
     print(f"[site_adapters] ⚠ 企知道适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
 
+HAS_RB = False
+HAS_AQC = False
+RiskBirdCrawlerV2 = None
+AiQiChaCrawlerV2 = None
+
+try:
+    import riskbird_crawler_v2 as _rb_mod
+    RiskBirdCrawlerV2 = _rb_mod.RiskBirdCrawlerV2
+    HAS_RB = True
+except Exception as _e:
+    print(f"[site_adapters] ⚠ 风鸟适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+
+try:
+    import aiqicha_crawler_v2 as _aqc_mod
+    AiQiChaCrawlerV2 = _aqc_mod.AiQiChaCrawlerV2
+    HAS_AQC = True
+except Exception as _e:
+    print(f"[site_adapters] ⚠ 爱企查适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+
+
+# ── 名单通道产出契约 ───────────────────────────────────────────
+# 三个平台（企知道 / 风鸟 / 爱企查）各自的状态词表完全不同（「未找到」/「查询失败」/
+# 「额度用尽待重试」/「拦截未解除」/「跳转失败」…），但它们共用同一套待采名单台账与同
+# 一块看板。所以把「这一家到底算查到 / 查不到 / 根本没查成」的判定收进各适配器自己的
+# classify()，编排层只认下面这套中性结论——平台差异不再往编排层漏。
+#
+# classify() 只可能返回 HIT / MISSING / RETRY / SHELL / BLOCKED / QUOTA / THROTTLE；
+# FOUND 与 DROPPED 是**编排层**在过完属地关卡（_add_result 是否真进表）之后才产生的
+# 账目结论：适配器不知道关卡会不会拦，硬猜就会出现「看板说查到、原始表里没这条」。
+OUTCOME_HIT = "hit"              # 平台查到了内容（进不进表由属地关卡定）
+OUTCOME_FOUND = "found"          # 查到并入库（记 collected，结果进合并文件）
+OUTCOME_MISSING = "missing"      # 平台确实查不到（记 tried、按约定丢弃）
+OUTCOME_RETRY = "retry"          # 链路异常＝根本没查成（回队首、不记 tried）
+OUTCOME_SHELL = "shell"          # 空壳＝登录态掉线的假成功（回队首 + 重过登录门）
+OUTCOME_BLOCKED = "blocked"      # 被平台拦截等人工（回队首 + 本路让路，别烧名单）
+OUTCOME_DROPPED = "dropped"      # 查到但被属地关卡拦下（记 tried，账目算「查过未入库」）
+OUTCOME_QUOTA = "quota"          # 平台当日额度用尽（回队首 + 本路休眠，明天接续）
+OUTCOME_THROTTLE = "throttle"    # 频率限流（回队首 + 连续多家则本路休眠）
+
+OUTCOME_LABELS = {
+    OUTCOME_HIT: "查到内容", OUTCOME_FOUND: "查到", OUTCOME_MISSING: "查不到",
+    OUTCOME_RETRY: "没查成(链路)", OUTCOME_SHELL: "空壳(登录)", OUTCOME_BLOCKED: "被拦截",
+    OUTCOME_DROPPED: "属地拦下", OUTCOME_QUOTA: "额度用尽", OUTCOME_THROTTLE: "频率限流",
+}
+# 「这一家根本没查成」：一律回队首、不记 tried——误记就是把数据永久丢掉（用户要求
+# 「不要有任何遗漏」），而重复查一次的代价只是几条请求。
+OUTCOME_NOT_QUERIED = (OUTCOME_RETRY, OUTCOME_SHELL, OUTCOME_BLOCKED,
+                       OUTCOME_QUOTA, OUTCOME_THROTTLE)
+
+# ── 名单通道「等人过验证」的统一口径（2026-11-11 用户实机反馈定）────────────
+# 用户原话：看门狗发现出现验证时，每隔 15 秒判断是否过了验证，过了就继续采集，没过
+# 继续监测，期间不要刷新——人在拖滑块时被刷一下，挑战直接作废、又得从头过一遍。
+# 三条通道共用同一组常量，避免出现「企知道 5 秒、风鸟 30 秒、爱企查 15 秒」这种
+# 同一件事三套节奏的口径分叉。
+LIST_BLOCK_PROBE_INTERVAL = 15    # 只读轮询间隔（读 URL/标题/正文长度，不发采集请求）
+LIST_BLOCK_HEAL_EVERY = 60        # 每 60 秒试一次非破坏性自愈（换回已验证通过的标签）
+# 转入「持续监测」后的心跳：每这么久报一次还在盯，避免日志看起来像卡死
+LIST_BLOCK_WATCH_HEARTBEAT = 300
+# 一轮监测的最长时长：断路器一直停在 OPEN 不看门就是僵尸态（人早走了，界面还挂着
+# 「等待验证」、这一轮永远收不了尾）。60 分钟足够人吃个饭回来接着过验证；到点记一轮，
+# 轮次用尽（parallel_session._list_block_cycles）才如实结束本路。
+LIST_BLOCK_WATCH_ROUND_MAX = 3600
+
+
+def _shell_check(result):
+    """「查到一家但什么都没拿到」＝未登录时的假成功，不能当查到、也不能当查不到丢掉。
+    判据来自 block_guard（三个平台共用同一套字段口径），导入失败时保守判 False。
+
+    block_guard 的空壳键只看 法定代表人/注册资本/地址（工商三件套），而本体系的最终
+    目的是联系方式：已拿到手机号/邮箱的记录就算工商字段全缺也是有效产出，判成空壳会
+    白烧请求、并把这一路推向「连续 3 家空壳 → 通道休眠」——风鸟列表卡片与爱企查小公司
+    详情页都实测存在这种「只有电话、没有工商块」的页面。所以这里加一条联系方式逃生门。
+    """
+    if not isinstance(result, dict):
+        return True
+    if any(str(result.get(k) or "").strip() for k in ("电话", "邮箱", "手机号")):
+        return False
+    try:
+        import block_guard
+        return bool(block_guard.is_shell_record(result))
+    except Exception:
+        return False
+
+
+def _pf_admit(crawler, result, err=""):
+    """名单通道共用的属地关卡 + 原始表可读性回填（企知道/风鸟/爱企查一套口径）。
+
+    工商登记地址是全体系最硬的属地证据，所以名单通道必须自己把关：它不参与关键词
+    并行、也不经过 cdp_base 的漏斗，不拦就会把外省公司放进「清洗后入库数据」。
+    err 非空＝这一家本来就没查到内容：线索照旧进表（不含联系方式，不会污染数据；
+    把它们拦在外面反而让「为什么没补到」在原始表里查无对证）。
+    返回 True＝可以进表。"""
+    name = str(result.get("公司名") or result.get("公司名称") or "").strip()
+    pv = str(getattr(crawler, "province", "") or "").strip()
+    if not err:
+        # 原始表表头只有「公司名称」：名单通道记录只带「公司名」的话这一列会整列空白
+        result.setdefault("公司名称", name)
+    if not pv or err:
+        return True
+    text = _pf.record_region_text(result)
+    verdict, keep = _pf.judge_record(crawler.PLATFORM_SLUG, pv, result)
+    if keep:
+        if not str(result.get("所在区域") or "").strip():
+            label = _pf.region_label(pv, text)
+            if label:
+                result["所在区域"] = label
+        return True
+    short = name[:24]
+    pv_display = pv if "," not in pv else "目标省份"
+    if verdict == "miss":
+        crawler._pf_dropped += 1
+        crawler._log(f"🗺 [{pv_display}] {crawler.PLATFORM_NAME}查回的工商登记地址不属目标省份、"
+                     f"不入库：{short}（{text.strip()[:36]}）")
+    else:
+        crawler._pf_unknown += 1
+        crawler._log(f"🗺 [{pv_display}] 工商地址也判不出属地、保守不入库：{short}")
+    return False
+
 
 # ── 信号扩展：session._wire_signals 要连 kw_progress_signal（原 1688 信号类没有，
 #    而 _wire_signals 是一整个 try 块，缺一个属性会连累后面的 crawl_finished 也连不上）──
@@ -352,7 +470,7 @@ if HAS_1688:
                     "early": self._early_skipped, "filtered": self._filtered_count,
                     "no_contact": no_contact, "failed": failed, "got": len(self.results),
                     "pf_miss": self._pf_dropped,      # 省份把关：确认外省已排除
-                    "pf_unknown": self._pf_unknown}   # 省份把关：属地未标注（已转企知道反查）
+                    "pf_unknown": self._pf_unknown}   # 省份把关：属地未标注已排除（宁可少不可污）
 
         def reset_run_state(self):
             with self.results_lock:
@@ -392,6 +510,8 @@ if HAS_QZD:
         PLATFORM_SLUG = "qzd"
         PLATFORM_NAME = "企知道"
         NEEDS_BROWSER = True
+        LIST_CHANNEL = True         # 名单驱动通道（不参与关键词并行）
+        MIN_DELAY = 0.8             # 企知道走 suggestPredict 接口，比列表页/详情页轻得多
 
         def __init__(self, port=9255):
             super().__init__()
@@ -413,40 +533,22 @@ if HAS_QZD:
             self._pf_dropped = 0
             self._pf_unknown = 0
             self.delay_between = 1.5  # 名单逐家查：比原工具略放缓，挂机过夜稳字当头
+            self.block_wait_limit = 600   # 等人工过码上限（见 _wait_unblock）
+            # 等验证节奏与另两路一致（15 秒只读轮询）：三路并行时用户在任意一路过
+            # 验证，都不该被另一路的刷新打断；本通道不给 heal/revive（见基类注释）。
+            self.block_probe_interval = LIST_BLOCK_PROBE_INTERVAL
 
         # ── 省份关卡（名单通道的入库漏斗）───────────────────
         def _add_result(self, result):
             """企知道结果进表前过一遍属地：登记地址不在本省就不入库。
             查不到/查询失败的记录照旧进：它们是「未找到」台账线索、不含联系方式，
             不会污染数据；因判不出属地而丢线索反而适得其反。
-            同时修一个原始表可读性问题：企知道记录只带「公司名」键，而原始表
-            表头只有「公司名称」（现场取证：2 条企知道记录的公司名称列全空白），
-            这里顺带补上「公司名称」与有证据的「所在区域」。"""
+            关卡本体在模块级 _pf_admit：风鸟/爱企查接入后三平台共用同一套判据，
+            避免「同一个省口径在三条通道里长出不一致的细节」。"""
             if not isinstance(result, dict):
                 return super()._add_result(result)
             err = str(result.get("错误") or "").strip()
-            name = str(result.get("公司名") or "").strip()
-            pv = str(getattr(self, "province", "") or "").strip()
-            if not err:
-                result.setdefault("公司名称", name)
-            if pv and not err:
-                text = _pf.record_region_text(result)
-                verdict, keep = _pf.judge_record(self.PLATFORM_SLUG, pv, result)
-                if keep:
-                    if not str(result.get("所在区域") or "").strip():
-                        label = _pf.region_label(pv, text)
-                        if label:
-                            result["所在区域"] = label
-                    return super()._add_result(result)
-                short = name[:24]
-                pv_display = pv if "," not in pv else "目标省份"
-                if verdict == "miss":
-                    self._pf_dropped += 1
-                    self._log(f"🗺 [{pv_display}] 企知道查回的工商登记地址不属目标省份、不入库："
-                              f"{short}（{text.strip()[:36]}）")
-                else:
-                    self._pf_unknown += 1
-                    self._log(f"🗺 [{pv_display}] 工商地址也判不出属地、保守不入库：{short}")
+            if not _pf_admit(self, result, err):
                 return None
             return super()._add_result(result)
 
@@ -465,12 +567,37 @@ if HAS_QZD:
                 return False
             return self.driver is not None
 
+        def is_attached(self):
+            """名单通道是否已接上浏览器：看门狗懒附加的幂等判据（编排层不猜各平台细节）。"""
+            return getattr(self, "driver", None) is not None
+
         def login_state(self):
             """(state, detail)：state ∈ ok / need_login / unknown（block_guard 口径）。"""
             try:
                 return self.check_login()
             except Exception as e:
                 return "unknown", str(e).splitlines()[0][:80]
+
+        # ── 产出分类（三平台共用台账的翻译层）──────────────────
+        def classify(self, result):
+            """企知道回执 → 中性结论。基类用「错误」+「可重采」两个键表达全部异常语义：
+            可重采＝链路异常（断网/浏览器掉线）＝根本没查成 → 回队首不记 tried；
+            不可重采的「未找到」＝平台确实没有这家公司 → 记 tried 后丢弃（用户约定）。
+            查到的内容一律回 HIT：进不进表要过完属地关卡才知道（见 OUTCOME_* 契约）。"""
+            err = str((result or {}).get("错误") or "").strip()
+            if err:
+                if (result or {}).get("可重采"):
+                    return OUTCOME_RETRY, err[:70]
+                return OUTCOME_MISSING, err[:70]
+            if _shell_check(result):
+                return OUTCOME_SHELL, "详情字段全空（多为登录态失效）"
+            return OUTCOME_HIT, ""
+
+        def _wait_unblock(self, reason, max_wait=None):
+            """三通道并行后，等人工过码必须有上限：一路死等 30 分钟只会把整份名单
+            卡在这一家上（其余两路不受影响，但这一路当晚就废了）。"""
+            cap = int(getattr(self, "block_wait_limit", 600) or 600)
+            return super()._wait_unblock(reason, min(int(max_wait or cap), cap))
 
         # ── 清洗契约 ───────────────────────────────────────────
         def _to_cleaner_record(self, r):
@@ -501,6 +628,12 @@ if HAS_QZD:
                 "数据来源": "企知道",
                 "状态": status,
                 "备注": "｜".join(remark_bits),
+                # 结构化字段必须独立成键（理由见 _base_cleaner_record 的注释）：
+                # 「所在区域」是属地关卡回填的，跨平台合并时它就是外呼备注里的区域线索。
+                "微信号": r.get("微信") or r.get("微信号") or "",
+                "行业": r.get("所属行业") or r.get("行业") or "",
+                "主营": r.get("经营范围") or r.get("主营") or "",
+                "所在区域": r.get("所在区域") or "",
             }
 
         # ── 账目 ──────────────────────────────────────────────
@@ -550,3 +683,646 @@ if HAS_QZD:
                 pass
             self.driver = None
             self._own_handle = None
+
+
+class _ListChannelBase:
+    """风鸟/爱企查 作为「名单通道」接进 b2bcollect 的公共契约（与 QizhidaoSite 同一套口径）。
+
+    三平台能并行的前提是对编排层说同一种话，这里只补四件平台无关的事：
+      ① 属地关卡：查回的结果进表前过模块级 _pf_admit（与企知道同一个函数，口径不可能分叉）；
+      ② 账目：bump_stat / stats 十键 + reset_run_state，看板与结束日志三平台一套；
+      ③ classify：把各平台五花八门的状态词翻译成中性 OUTCOME_*（词表由子类声明）；
+      ④ 清洗契约：_to_cleaner_record 产出 cdp_base 十字键，跨平台合并在清洗层完成。
+    浏览器接入方式差得太远（风鸟 Selenium、爱企查裸 CDP），attach 与独占标签各自实现。
+    """
+
+    PLATFORM_SLUG = ""
+    PLATFORM_NAME = ""
+    NEEDS_BROWSER = True
+    LIST_CHANNEL = True
+    # 名单逐家查询的采集间隔安全下限：风鸟两次列表页导航最小 2 秒（min_interval），
+    # 低于它就是自己撞「操作过于频繁」；爱企查每家要过联想＋详情页两次导航，同理。
+    MIN_DELAY = 2.0
+
+    # ── 状态词表（子类按平台实际词表覆写；判定顺序见 classify）──
+    OK_STATUS_WORDS = ("成功",)                                  # 明确的成功标记，不是异常
+    QUOTA_STATUS_WORDS = ("额度用尽", "额度已用完")                 # 当日额度墙：本路休眠
+    THROTTLE_STATUS_WORDS = ("访问频繁", "操作过于频繁", "频率受限")
+    BLOCKED_STATUS_WORDS = ("拦截未解除", "安全验证", "滑动验证")
+    RETRY_STATUS_WORDS = ("失败", "浏览器错误", "跳转失败", "会话", "无法恢复")
+    MISSING_STATUS_WORDS = ("未找到", "查无")
+
+    def _init_list_channel(self, delay=1.5, block_wait=600):
+        """名单通道公共字段初始化（子类在 super().__init__() 之后调用一次）。"""
+        self.province = ""
+        self._pf_dropped = 0
+        self._pf_unknown = 0
+        self._stat_queried = 0
+        self._stat_found = 0
+        self._stat_missing = 0
+        self.block_wait_limit = int(block_wait)
+        # 等人工过验证的统一节奏（三条通道一套口径，见模块常量注释）：15 秒只做一次
+        # 只读轮询、60 秒才试一次不打断人工的自愈；验证页挂着期间绝不发导航/刷新命令。
+        self.block_probe_interval = LIST_BLOCK_PROBE_INTERVAL
+        self.block_heal_every = LIST_BLOCK_HEAL_EVERY
+        self.delay_between = float(delay)
+        self.pin_tab_id = ""
+        self._seen_store = {}         # 名单通道无种子库（防重复由待采台账负责）
+
+    # ── 状态取值 ──────────────────────────────────────────────
+    def _record_status(self, result):
+        """(状态, 错误)：风鸟/爱企查把结论写在「状态」，企知道写在「错误」。"""
+        return (str((result or {}).get("状态") or "").strip(),
+                str((result or {}).get("错误") or "").strip())
+
+    def _status_is_error(self, st):
+        """「状态」这个词到底是不是异常结论。
+
+        风鸟的「状态」一栏兼职装工商经营状态（在营/存续/注销），爱企查成功时写「成功」，
+        直接当错误串用会把一条好数据误判成线索行；只有命中本平台异常词表才算异常。"""
+        if not st or st in self.OK_STATUS_WORDS:
+            return False
+        words = (self.QUOTA_STATUS_WORDS + self.THROTTLE_STATUS_WORDS +
+                 self.BLOCKED_STATUS_WORDS + self.RETRY_STATUS_WORDS +
+                 self.MISSING_STATUS_WORDS)
+        return any(w in st for w in words)
+
+    # ── 属地关卡（与企知道同一个函数）──────────────────────────
+    def _add_result(self, result):
+        if not isinstance(result, dict):
+            return super()._add_result(result)
+        st, err = self._record_status(result)
+        hint = err or (st if self._status_is_error(st) else "")
+        if not _pf_admit(self, result, hint):
+            return None
+        return super()._add_result(result)
+
+    # ── 产出分类 ──────────────────────────────────────────────
+    def classify(self, result):
+        """一条回执 → 中性结论 (outcome, reason)。
+
+        判定顺序很关键：额度/限流/拦截/链路异常都排在「未找到」之前——把平台当日
+        额度用完误判成「这家公司查不到」，等于第二天额度恢复了也永远找不回这家。"""
+        st, err = self._record_status(result)
+        text = f"{st} {err}".strip()
+        for words, outcome in ((self.QUOTA_STATUS_WORDS, OUTCOME_QUOTA),
+                               (self.THROTTLE_STATUS_WORDS, OUTCOME_THROTTLE),
+                               (self.BLOCKED_STATUS_WORDS, OUTCOME_BLOCKED),
+                               (self.RETRY_STATUS_WORDS, OUTCOME_RETRY),
+                               (self.MISSING_STATUS_WORDS, OUTCOME_MISSING)):
+            if any(w in text for w in words):
+                return outcome, text[:70]
+        if _shell_check(result):
+            return OUTCOME_SHELL, "详情字段全空（多为登录态失效）"
+        return OUTCOME_HIT, ""
+
+    # ── 登录态 ────────────────────────────────────────────────
+    def is_attached(self):
+        """名单通道是否已接上浏览器：看门狗懒附加的幂等判据（编排层不猜各平台细节）。"""
+        return getattr(self, "driver", None) is not None
+
+    def login_state(self):
+        """(state, detail)：state ∈ ok / need_login / unknown（block_guard 口径）。"""
+        try:
+            state, detail = self.check_login()
+        except Exception as e:
+            return "unknown", str(e).splitlines()[0][:80]
+        # 三个平台的 check_login 都走 block_guard.login_state，返回 missing 表示
+        # 「读到了 Cookie 但没有登录标识」＝需要登录；unknown 交给空壳门兜底。
+        return ("need_login", detail) if state == "missing" else (state, detail)
+
+    # ── 账目 ──────────────────────────────────────────────────
+    def bump_stat(self, found=None, missing=None):
+        """通道侧每查完一家回填：found=查到并入库，missing=平台查不到（按约定丢弃）。"""
+        self._stat_queried += 1
+        if found:
+            self._stat_found += 1
+        elif missing:
+            self._stat_missing += 1
+
+    def stats(self):
+        return {"pages": 0, "listed": self._stat_queried, "ok": self._stat_found,
+                "early": 0, "filtered": 0, "no_contact": self._stat_missing,
+                "failed": max(0, self._stat_queried - self._stat_found - self._stat_missing),
+                "got": len(self.results),
+                "pf_miss": self._pf_dropped, "pf_unknown": self._pf_unknown}
+
+    def reset_run_state(self):
+        with self.results_lock:
+            self.results = []
+        self._stat_queried = 0
+        self._stat_found = 0
+        self._stat_missing = 0
+        self._pf_dropped = 0
+        self._pf_unknown = 0
+        self._stop_requested = False
+        self._pause_requested = False
+        self._crawling = False
+        self._shell_streak = 0
+        self._shell_gate_passed = False
+        return True
+
+    def clear_seen_store(self):
+        return True     # 名单通道无跨运行种子库（防重复由 PendingCompanyList 三台账负责）
+
+    def _base_cleaner_record(self, r, source_label):
+        """三平台共用的十字键映射（法定代表人进「联系人」，cleaner 的 make_row 会按
+        联系人→法定代表人→公司名 兜底并补岗位）。"""
+        st, err = self._record_status(r)
+        status = err or (st if self._status_is_error(st) else "")
+        bits = []
+        for label, key in (("注册资本", "注册资本"), ("成立", "成立日期"),
+                           ("信用代码", "统一社会信用代码"), ("采集路径", "采集路径"),
+                           ("疑似匹配", "疑似匹配")):
+            v = str(r.get(key) or "").strip()
+            if v:
+                bits.append(f"{label}:{v}")
+        biz = str(r.get("经营状态") or "").strip() or (
+            st if st and st not in self.OK_STATUS_WORDS and not self._status_is_error(st) else "")
+        if biz:
+            bits.insert(0, "工商状态:" + biz)
+        # 行业/主营/所在区域必须走独立键、不能塞备注透传：merge_records 对「备注」
+        # 只取首个非空，跨平台合并时后一路的这些结构化信息会被前一路的备注整条盖掉
+        # （历史上就是这么把主营/区域洗没的），而 _remark 会自己把它们组装进外呼备注。
+        out = {
+            "公司名": str(r.get("公司名") or r.get("公司名称") or "").strip(),
+            "联系人": str(r.get("法定代表人") or "").strip(),
+            "岗位": "",
+            "电话": str(r.get("电话") or "").strip(),
+            "邮箱": str(r.get("邮箱") or "").strip(),
+            "微信号": str(r.get("微信") or r.get("微信号") or "").strip(),
+            "地址": str(r.get("地址") or r.get("通信地址") or r.get("注册地址") or "").strip(),
+            "官网": str(r.get("官网") or "").strip(),
+            "数据来源": source_label,
+            "状态": status,
+            "备注": "｜".join(bits),
+            "行业": str(r.get("所属行业") or r.get("行业") or "").strip(),
+            "主营": str(r.get("经营范围") or r.get("主营") or "").strip(),
+            "所在区域": str(r.get("所在区域") or "").strip(),
+        }
+        return out
+
+
+if HAS_RB:
+    from selenium.webdriver.chrome.options import Options as _SeleniumOptions
+    from selenium.webdriver.support.ui import WebDriverWait as _WebDriverWait
+
+    class RiskbirdSite(_ListChannelBase, RiskBirdCrawlerV2):
+        """风鸟 → b2bcollect 名单通道适配器（与企知道/爱企查共用同一份待采名单）。
+
+        原工具里的风鸟是**独占浏览器**的：start_browser 一上来就 pkill 掉机器上所有
+        Chrome（含我们的共享 9255）、chromedriver 也一起杀，随后把用户 Chrome 配置目录
+        整份拷到 /tmp 另起实例，首页导航时还会「关闭除第一个外的所有标签」——那是别人
+        （mic/1688/企知道/爱企查）正在用的标签。这四条与「一个共享 Chrome、各站只碰自己
+        标签」的体系纪律正面冲突，所以整段覆写成企知道同款 debuggerAddress 附加模式；
+        采集逻辑（列表页优先、额度自适应、补全接口降级、卡片缓存）一行不动全部继承。
+        """
+
+        PLATFORM_SLUG = "riskbird"
+        PLATFORM_NAME = "风鸟"
+
+        # 风鸟状态词表（实测常量：STATUS_NO_MATCH/QUOTA/FUZZY_QUOTA/THROTTLE + "失败: xxx"）
+        QUOTA_STATUS_WORDS = ("额度用尽", "额度已用完")
+        THROTTLE_STATUS_WORDS = ("访问频繁", "操作过于频繁", "频率受限")
+        BLOCKED_STATUS_WORDS = ("拦截未解除",)      # 风鸟侧的验证/限流在平台层已归入「访问频繁」
+        RETRY_STATUS_WORDS = ("失败", "会话", "无法恢复", "浏览器")
+        MISSING_STATUS_WORDS = ("未找到",)
+        OK_STATUS_WORDS = ()
+
+        def __init__(self, port=9255):
+            super().__init__()
+            self.attach_port = int(port)
+            self.shared_session = True      # 本适配器永远附加共享 Chrome，绝不另起实例
+            self._own_handle = None
+            self._own_window_type = "tab"   # 与企知道同居一个窗口的一个标签（见 QizhidaoSite 注释）
+            self._init_list_channel(delay=1.5)
+            # Cookie / 30 天列表缓存必须落在跨运行稳定的可写目录：基类写死在包内
+            # riskbird_data/，打包态那是 _MEIPASS 临时目录——每次启动丢登录、每天白烧额度。
+            try:
+                self._data_dir = _qzd_mod._stable_data_dir()
+                self._cookie_file = self._data_dir / "cookies.json"
+                self._cache_file = self._data_dir / "风鸟列表缓存.json"
+            except Exception:
+                pass
+            self._load_card_cache()         # 命中缓存的公司不消耗当日模糊查询次数
+
+        # ── 独占标签管理（共享 Chrome 纪律）───────────────────
+        def _ensure_own_tab(self) -> bool:
+            """保证本会话的当前标签仍是自己的那个（平台偶尔弹新标签也不能跑偏）。"""
+            if self.driver is None:
+                return False
+            try:
+                if self.driver.current_window_handle == self._own_handle:
+                    return True
+                handles = self.driver.window_handles
+                if self._own_handle not in handles:
+                    self.driver.switch_to.new_window(self._own_window_type)
+                    self._own_handle = self.driver.current_window_handle
+                    self._log("  原标签已被关闭，风鸟重新开一个独占标签")
+                    self._goto_homepage_verified()
+                    return True
+                self.driver.switch_to.window(self._own_handle)
+                return True
+            except Exception:
+                return False
+
+        def _close_own_tab(self):
+            """只关自己的标签，共享 Chrome 与别人的标签一个都不碰。"""
+            try:
+                if self.driver is not None and self._own_handle:
+                    handles = self.driver.window_handles
+                    if self._own_handle in handles:
+                        if self.driver.current_window_handle != self._own_handle:
+                            self.driver.switch_to.window(self._own_handle)
+                        self.driver.close()
+            except Exception:
+                pass
+
+        def start_browser(self, headed: bool = True, attach_port: int = None):
+            """附加到共享 Chrome 并开一个独占标签（覆写基类的 pkill + 独占实例）。"""
+            with self._browser_lock:
+                if self.driver is not None:
+                    return True
+                port = int(attach_port or self.attach_port)
+                if not _sc.is_alive(port):
+                    self._log("❌ 共享浏览器未就绪，风鸟通道无法附加")
+                    return False
+                opts = _SeleniumOptions()
+                opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+                # 附加模式下 chromedriver 不接受 excludeSwitches/useAutomationExtension；
+                # 驱动必须先用本地的，否则打包态会走 Selenium Manager 联网查版本（卡顿元凶）
+                try:
+                    # 借风鸟模块自己的 chrome_driver（本目录没这份副本，且它的
+                    # 驱动查找/回退逻辑与 riskbird_build 保持同一套）
+                    self.driver = _rb_mod.chrome_driver.create(opts, self._log, ports=[port])
+                except Exception as e:
+                    self._log(f"❌ 风鸟附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                    self.driver = None
+                    return False
+                self.attach_port = port
+                self.shared_session = True
+                try:
+                    self.driver.switch_to.new_window(self._own_window_type)
+                    self._own_handle = self.driver.current_window_handle
+                except Exception as e:
+                    self._log(f"❌ 风鸟开独占标签失败：{str(e).splitlines()[0][:120]}")
+                    self.driver = None
+                    return False
+                try:
+                    self.driver.execute_cdp_cmd(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"})
+                except Exception:
+                    pass
+                self.wait = _WebDriverWait(self.driver, 15)
+                try:
+                    self.driver.set_page_load_timeout(30)
+                    self.driver.set_script_timeout(20)
+                except Exception:
+                    pass
+                self._log(f"已附加共享浏览器（端口 {port}），风鸟独占标签 "
+                          f"{str(self._own_handle)[:8]}")
+                self._goto_homepage_verified()
+                return True
+
+        def _goto_homepage_verified(self) -> bool:
+            """把自己的标签导航到风鸟首页（基类版本会关掉除第一个外的全部标签＝误关别站）。"""
+            if not self._ensure_own_tab():
+                return False
+            domain = self.BASE_URL.split("//")[-1].split("/")[0]
+            for attempt in range(3):
+                try:
+                    cur = self.driver.current_url or ""
+                except Exception:
+                    cur = ""
+                if domain in cur:
+                    return True
+                try:
+                    self.driver.get(self.BASE_URL)
+                    time.sleep(2)
+                except Exception:
+                    time.sleep(1)
+                try:
+                    if domain in (self.driver.current_url or ""):
+                        return True
+                except Exception:
+                    pass
+                self._log(f"  风鸟首页导航未生效（第{attempt + 1}次），重试…")
+            self._log(f"  ⚠ 未能自动打开 {domain}，请手动在浏览器访问")
+            return False
+
+        def _restart_browser(self, headed: bool = True):
+            """会话崩溃时的复位：基类版本会重走 pkill 全部 Chrome，这里只重建自己的标签。"""
+            self._log("⚠️ 风鸟浏览器会话已断开，正在复位自己的标签…")
+            self._close_own_tab()
+            try:
+                if self.driver is not None:
+                    self.driver.quit()     # 附加模式：只结束本 chromedriver 会话
+            except Exception:
+                pass
+            self.driver = None
+            self._own_handle = None
+            time.sleep(2)
+            if self.start_browser(headed=headed, attach_port=self.attach_port):
+                self._log("✅ 风鸟会话已复位")
+                return True
+            self._log("❌ 风鸟会话复位失败（共享浏览器可能已关闭）")
+            return False
+
+        # ── 拦截与登录 ────────────────────────────────────────
+        def _detect_block(self):
+            """只看自己这个标签是不是验证页（基类没有这套，共享浏览器里绝不能扫别人的页）。"""
+            if self.driver is None:
+                return ""
+            if not self._ensure_own_tab():
+                return ""
+            try:
+                import block_guard
+                return block_guard.detect_selenium(self.driver)
+            except Exception:
+                return ""
+
+        def _wait_unblock(self, reason, max_wait=None):
+            cap = int(getattr(self, "block_wait_limit", 600) or 600)
+            wait = min(int(max_wait or cap), cap)
+            try:
+                import block_guard
+                # heal 只做不打断人工的动作（把焦点认领回自己的标签，不导航不刷新）；
+                # 导航回首页属破坏性动作，挪到 revive——验证页还挂着时绝不触发，
+                # 否则用户正拖到一半的滑块会被刷掉、挑战作废重来（2026-11-11 用户反馈）。
+                ok = block_guard.wait_unblock(
+                    reason, self._log, self._emit_blocked,
+                    lambda: self._stop_requested, self._detect_block,
+                    max_wait=wait,
+                    interval=int(getattr(self, "block_probe_interval", 15) or 15),
+                    heal=self._ensure_own_tab,
+                    heal_every=int(getattr(self, "block_heal_every", 60) or 60),
+                    revive=self._goto_homepage_verified)
+            except Exception:
+                return False
+            if ok:
+                self._emit_cleared(reason)
+            return bool(ok)
+
+        # ── 通道入口 ──────────────────────────────────────────
+        def attach(self):
+            if not _sc.is_alive(self.attach_port):
+                self._log("❌ 共享浏览器未就绪，风鸟通道暂缓启动")
+                return False
+            if self.driver is not None and self._ensure_own_tab():
+                return True
+            return bool(self.start_browser(headed=True, attach_port=self.attach_port))
+
+        def search_company(self, name):
+            """查一家之前先把标签认领回来：上一家如果让平台弹了新标签，基类的 driver.get
+            就会打在别人的页面上（共享浏览器里这是最贵的一类串台事故）。"""
+            self._ensure_own_tab()
+            return super().search_company(name)
+
+        def close_tab(self):
+            self._close_own_tab()
+            try:
+                if self.driver is not None:
+                    self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+            self._own_handle = None
+
+        def close_browser(self):
+            """基类版本会 driver.quit()（附加模式下等于只结束本会话），统一走 close_tab。"""
+            self.close_tab()
+
+        # ── 账目 / 清洗 ───────────────────────────────────────
+        def reset_run_state(self):
+            super().reset_run_state()
+            # 基类这些状态原本由 crawl() 开头重置，而本工具走的是名单通道循环、
+            # 不调 crawl()：不在此复位就会带着昨天的「额度已用完」判定整轮不进详情页。
+            self._detail_used = 0
+            self._quota_blocked = False
+            self._budget_warned = False
+            self._fuzzy_blocked = False
+            self._fuzzy_warned = False
+            self._throttle_hits = 0
+            self._backoff = 0
+            self._last_nav_ts = 0.0
+            self.search_calls = 0
+            self.pending_retry = []
+            self.pending_detail = []
+            return True
+
+        def _to_cleaner_record(self, r):
+            """风鸟记录 → 十字键（数据来源固定「风鸟」，跨平台合并靠它认亲）。"""
+            return self._base_cleaner_record(r, self.PLATFORM_NAME)
+
+
+if HAS_AQC:
+
+    class _BlockWaitSentinel:
+        """只为借用 AiQiChaCrawlerV2 里「有移交对象 → 等人工限时」这条判据。
+
+        爱企查原实现：handoff is None（单平台跑）时被拦/未登录会原地等满 30 分钟；
+        三平台并行时这一路死等没有意义——另外两路各走各的名单，本路让路比卡住好。
+        give_up 是空实现：本工具的名单是三平台共享的一份 master，企知道/风鸟本来就会
+        各自从头把整份名单跑一遍，不存在「把剩余名单移交别的平台」这件事。
+        """
+
+        def give_up(self, companies, why=""):
+            return 0
+
+        def pending(self):
+            return []
+
+        def finish(self):
+            return None
+
+        def wait_for(self, seconds, should_stop=None):
+            return False
+
+
+    class AiqichaSite(_ListChannelBase, AiQiChaCrawlerV2):
+        """爱企查 → b2bcollect 名单通道适配器（裸 CDP，天然可挂共享 Chrome）。
+
+        原工具里它已经是「双标签并行」的实现（attach=True 时不启动、不关闭任何 Chrome，
+        只开一个自己的独占标签，每条 CDP 命令都显式带上自己的 ws），这套机制与本体系
+        的共享浏览器纪律一致，因此这里几乎不需要覆写浏览器逻辑，只补三件事：
+          ① 挂到 9255（而不是它自己的 9233，避免同机再起一个 Chrome）；
+          ② 独占标签丢失时**绝不**回退去扫全局标签（会拿到企知道/mic 的页面）；
+          ③ 注入 handoff 哨兵把「等人工」压到 block_wait_limit，并统一产出契约。
+        """
+
+        PLATFORM_SLUG = "aiqicha"
+        PLATFORM_NAME = "爱企查"
+
+        # 爱企查状态词表（search_company 实测出口）
+        OK_STATUS_WORDS = ("成功",)
+        QUOTA_STATUS_WORDS = ("额度",)
+        THROTTLE_STATUS_WORDS = ("访问频繁", "操作过于频繁")
+        BLOCKED_STATUS_WORDS = ("拦截未解除",)
+        RETRY_STATUS_WORDS = ("浏览器错误", "跳转失败", "失败")
+        MISSING_STATUS_WORDS = ("未找到",)
+
+        def __init__(self, port=9255):
+            super().__init__(debug_port=int(port))
+            self._init_list_channel(delay=2.0)
+            self.handoff = _BlockWaitSentinel()     # 见类注释③：让「等人工」有上限
+            self.diag_dir = None
+            # Cookie 落跨运行稳定目录（基类写死包内 riskbird_data/，打包态会随临时目录消失）
+            try:
+                self._data_dir = _qzd_mod._stable_data_dir()
+                self._cookie_file = self._data_dir / "aiqicha_cookies.json"
+            except Exception:
+                pass
+
+        # ── 独占标签 ──────────────────────────────────────────
+        def open_own_tab(self) -> bool:
+            """先试「同一个窗口里新开标签」，实在不行才退回基类的独立窗口。
+
+            基类优先 newWindow 是因为原工具只有两个会话、都要保持可见；本工具是
+            「一个共享 Chrome 窗口 + 每站一个标签」，三条名单通道再各开一个窗口就变成
+            四个窗口，最小化/前置时永远有一个杵在最前。共享 Chrome 启动时已带
+            --disable-*-throttling 系列开关，同窗后台标签不会被节流，标签形式才自洽。
+            """
+            target_id = None
+            try:
+                ver = _aqc_mod.requests.get(f"{self.base_url}/json/version", timeout=5).json()
+                bws = ver.get("webSocketDebuggerUrl")
+            except Exception:
+                bws = None
+            if bws:
+                for params in ({"url": self.BASE_URL}, {"url": self.BASE_URL, "newWindow": True}):
+                    try:
+                        r = self._send_command(bws, "Target.createTarget", params)
+                        target_id = (r.get("result") or {}).get("targetId")
+                        if target_id:
+                            break
+                    except Exception:
+                        target_id = None
+            if not target_id:
+                return super().open_own_tab()       # 兜底走原实现（含 /json/new 那条路）
+            self.pin_tab_id = target_id
+            self._log(f"已占用爱企查独占标签 {str(target_id)[:8]}")
+            for _ in range(8):
+                time.sleep(1)
+                try:
+                    ws = self._get_ws_url()
+                    cur = self._execute_js(ws, "(function() { return window.location.href; })()") if ws else ""
+                    if cur and "aiqicha" in str(cur):
+                        self._wait_page_hydrated(ws, 15)
+                        self._log("爱企查页面已打开")
+                        return True
+                except Exception:
+                    pass
+            self._log("⚠ 爱企查页面未确认打开，将继续尝试")
+            return True
+
+        def _get_or_create_homepage_tab(self):
+            """标签被关掉时重建自己的独占标签。
+
+            基类兜底是「遍历全局标签找一个爱企查首页标签」，在共享 Chrome 里这一步
+            可能拿到用户自己开的、甚至上一轮残留的爱企查标签，随后 pin_tab_id 仍是空，
+            于是每条 CDP 命令都落到 tabs[0]（通常是 mic/1688 的页面）——典型串台事故。
+            """
+            if self.pin_tab_id:
+                ws = self._get_ws_url()
+                if ws:
+                    return ws
+                self.pin_tab_id = None
+                self._log("  爱企查标签已不存在，重新开一个独占标签")
+            return self.open_own_tab() and self._get_ws_url()
+
+        # ── 通道入口 ──────────────────────────────────────────
+        def attach(self):
+            if not _sc.is_alive(self.debug_port):
+                self._log("❌ 共享浏览器未就绪，爱企查通道暂缓启动")
+                return False
+            if self.pin_tab_id and self._get_ws_url():
+                return True
+            try:
+                return bool(self.start_browser(headed=True, attach=True))
+            except Exception as e:
+                self._log(f"❌ 爱企查附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                return False
+
+        def is_attached(self):
+            """爱企查走裸 CDP（基类 self.driver 恒为 None），「接上了」= 自己的标签还在。"""
+            return bool(self.pin_tab_id) and bool(self._get_ws_url())
+
+        def search_company(self, name):
+            """查之前先认领回自己的标签（同风鸟：平台弹新标签不能带跑这一路）。"""
+            if not (self.pin_tab_id and self._get_ws_url()):
+                self.open_own_tab()
+            return super().search_company(name)
+
+        # 等人工过验证**不再在这里覆写**：历史缺陷是这里写成
+        # `return self._wait_unblock_limited(reason)`，而基类 _wait_unblock_limited
+        # 又会回调 self._wait_unblock(...)，子类把这个名字覆盖了 → 两个方法互相调用
+        # 直到 RecursionError。实机表现为「每次进入等验证都直接爆栈」，用户手工过完
+        # 验证工具也永远看不见（2026-11-11 日志「maximum recursion depth exceeded」
+        # ＋「⏱ 拦截已持续 10 分钟以上无人处理」）。节奏改由实例属性
+        # block_probe_interval / block_heal_every 统一设定，走基类一条实现。
+
+        def _wait_unblock(self, reason, max_wait=None):
+            """通道顶部撞墙的限时等待：与另两路同一口径（block_wait_limit 秒）。
+
+            返回 False 不代表放弃这一家，而是交给编排层的持续监测
+            （parallel_session._watch_block_cleared：零采集请求、每 15 秒只读探测、
+            不刷新页面，用户过完验证自动接着采这一家）。不在这里死等 30 分钟，
+            是为了让「已盯 N 分钟」的心跳和轮次记账只长在一个地方。
+            **绝不允许**写成 ``return self._wait_unblock_limited(...)``：基类
+            _wait_unblock_limited 会回调 self._wait_unblock，子类再覆写回去就是
+            2026-11-11 实机 RecursionError 的根因。limited 那套只服务 search_company
+            内部撞墙（带 block_wait_limit 与名单移交语义），与这里是两条独立入口。
+            """
+            cap = int(getattr(self, "block_wait_limit", 600) or 600)
+            return bool(super()._wait_unblock(reason, min(int(max_wait or cap), cap)))
+
+        def close_tab(self):
+            try:
+                self.close_browser()     # attach_mode 下只关自己那一个标签
+            except Exception:
+                pass
+            self.pin_tab_id = None
+
+        # ── 账目 / 清洗 ───────────────────────────────────────
+        def reset_run_state(self):
+            ok = super().reset_run_state()
+            self._blocked_at = 0.0
+            self._unknown_streak = 0
+            self._evidence_dumped = False
+            self._cooldown_until = 0.0
+            return ok
+
+        def _to_cleaner_record(self, r):
+            """爱企查记录 → 十字键（「成功」这个状态标记不进「状态」列，否则清洗
+            报告里会出现一堆假异常行）。"""
+            return self._base_cleaner_record(r, self.PLATFORM_NAME)
+
+
+# ── 名单通道注册表（企知道排第一：它是默认勾选的那一路）──────────
+LIST_CHANNEL_SLUGS = ("qzd", "riskbird", "aiqicha")
+LIST_CHANNEL_AVAILABLE = {"qzd": HAS_QZD, "riskbird": HAS_RB, "aiqicha": HAS_AQC}
+# 平台中文名唯一来源是待采台账模块（pending_companies.CHANNEL_LABELS）：名单 xlsx 的
+# 状态列名、台账分段键、界面勾选框文字与采集器 PLATFORM_NAME 必须同源，否则
+# 「界面上叫风鸟、原始表里写 riskbird、台账里另一套」这类对不上账的口径分叉。
+from pending_companies import CHANNEL_LABELS as LIST_CHANNEL_LABELS  # noqa: E402
+
+
+def build_list_channels(port=9255, slugs=None):
+    """按需创建名单通道 {slug: 实例}：只建本机可用的平台。
+
+    三平台共用同一份待采名单（PendingCompanyList 的 master），各自有独立游标，
+    所以「100 家名单」= 每家平台都从第 1 家跑到第 100 家；采完在清洗层按公司名
+    合并成一份文件，手机号/邮箱取并集（英文逗号分隔）。
+    """
+    out = {}
+    for slug in (slugs or LIST_CHANNEL_SLUGS):
+        if slug == "qzd" and HAS_QZD:
+            out[slug] = QizhidaoSite(port=port)
+        elif slug == "riskbird" and HAS_RB:
+            out[slug] = RiskbirdSite(port=port)
+        elif slug == "aiqicha" and HAS_AQC:
+            out[slug] = AiqichaSite(port=port)
+    return out
+
+

@@ -274,6 +274,15 @@ def _fields(entry):
 
 _PRODUCTS_BY_NAME = {e[0]: e[2] for e in KNOWLEDGE_BASE}
 
+# 知识库已收录的「产品词」全集：产品词命中特征短语时**不再二次展开**（原子
+# 处理）。否则用户把展开结果粘回来再点一次，产品词会被当成类别名逐轮膨胀
+# （实测 71→95→94：既发散又不收敛，还撞 MAX_KEYWORDS）。类别名本身不参与
+# 原子判定——用户手输精确类别名时必须正常展开。
+_KNOWN_PRODUCTS = set()
+for _e in KNOWLEDGE_BASE:
+    _KNOWN_PRODUCTS.update(_e[2])
+_KNOWN_PRODUCTS.difference_update(_PRODUCTS_BY_NAME.keys())
+
 
 def _match_entry(seg):
     """返回该片段命中的知识库条目（最长特征短语优先）；未命中返回 None。"""
@@ -326,10 +335,12 @@ def expand_keywords(text: str, use_deepseek: bool = True) -> dict:
     """
     result, seen = [], set()
     expanded, kept, dropped, deepseek_results = [], [], [], []
+    ds_pending: List[str] = []          # 待批量 AI 展开的未命中片段
+    segs = list(_segment(text))
 
-    for seg in _segment(text):
+    for seg in segs:
         hit = _match_entry(seg)
-        if hit:
+        if hit and seg not in _KNOWN_PRODUCTS:
             name = hit[0]
             products = _related_products(hit)
             added = 0
@@ -339,48 +350,49 @@ def expand_keywords(text: str, use_deepseek: bool = True) -> dict:
                     result.append(p)
                     added += 1
             expanded.append((seg, name, added))
-        elif _is_drop(seg):
+        elif not hit and _is_drop(seg):
             dropped.append(seg)
         else:
-            # 离线知识库未命中，尝试 DeepSeek API 兜底
-            if use_deepseek and _should_try_deepseek(seg):
-                try:
-                    import deepseek_expander
-                    ds_keywords, ds_status = deepseek_expander.expand_with_deepseek(seg)
-                    if ds_keywords:
-                        added = 0
-                        for kw in ds_keywords:
-                            if kw not in seen:
-                                seen.add(kw)
-                                result.append(kw)
-                                added += 1
-                        deepseek_results.append((seg, added, ds_status))
-                    else:
-                        # API 失败/无 key/空结果，降级到原样保留
-                        if seg not in seen:
-                            seen.add(seg)
-                            result.append(seg)
-                        kept.append(seg)
-                        deepseek_results.append((seg, 0, ds_status))
-                except ImportError:
-                    # deepseek_expander 模块不存在（打包时漏了），降级到离线
-                    if seg not in seen:
-                        seen.add(seg)
-                        result.append(seg)
-                    kept.append(seg)
-                except Exception as e:
-                    # 任何异常都降级，不阻断采集
-                    if seg not in seen:
-                        seen.add(seg)
-                        result.append(seg)
-                    kept.append(seg)
-                    deepseek_results.append((seg, 0, f"error: {str(e)[:30]}"))
-            else:
-                # 不调用 DeepSeek（use_deepseek=False 或判定不需要）
-                if seg not in seen:
-                    seen.add(seg)
-                    result.append(seg)
-                kept.append(seg)
+            # 走到这里两种情况：①未命中知识库的普通片段 ②命中的已知产品词
+            # （原子保留，正是二次展开收敛的关键）。未命中的不再逐片段调
+            # API（旧实现 70 个词 = 70 次调用，词表 81→200 撞上限截断），
+            # 而是排队到循环结束后一次性批量交给 DeepSeek；已知产品词
+            # 不送 AI（它们本就是展开产物，再送 AI 会逐轮膨胀破坏收敛）。
+            if not hit and use_deepseek and seg not in _KNOWN_PRODUCTS \
+                    and _should_try_deepseek(seg):
+                ds_pending.append(seg)
+            if seg not in seen:
+                seen.add(seg)
+                result.append(seg)
+            kept.append(seg)
+
+    # ── DeepSeek 批量兜底（至多一次 API 调用，产出有界）──
+    # 硬界与 prompt 约定同源（单批 5-20 词）：保证「二次展开至多再 +20」
+    # 的收敛不变量不依赖模型自觉，代码层兜底
+    if ds_pending:
+        try:
+            import deepseek_expander
+            ds_keywords, ds_status = deepseek_expander.expand_with_deepseek(
+                "\n".join(ds_pending))
+            added = 0
+            for kw in ds_keywords or []:
+                if added >= 20:
+                    break
+                if kw not in seen:
+                    seen.add(kw)
+                    result.append(kw)
+                    added += 1
+            for seg in ds_pending:
+                deepseek_results.append((seg, added if seg == ds_pending[0] else 0,
+                                         ds_status))
+        except ImportError:
+            # deepseek_expander 模块不存在（打包时漏了），降级到离线
+            for seg in ds_pending:
+                deepseek_results.append((seg, 0, "module_missing"))
+        except Exception as e:
+            # 任何异常都降级，不阻断采集
+            for seg in ds_pending:
+                deepseek_results.append((seg, 0, f"error: {str(e)[:30]}"))
 
     # 词表总量上限：扩词必须有界。用户粘一整份行业目录进来时，无界展开会造出
     # 上千个词，一夜之间把请求量放大几十倍（防采风险 + 绝大部分词根本轮不到跑）。

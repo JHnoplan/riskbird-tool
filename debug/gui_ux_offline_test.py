@@ -130,8 +130,24 @@ check("④ 站点说明提为模块常量且覆盖全部在采站（qzd 是额�
 # 采集参数区：从 3 行压到 1 行
 gb_p = groups["④ 采集参数"]        # ③ 让给了「采集平台」（站点勾选提为独立分区）
 rows = [gb_p.layout().itemAt(i) for i in range(gb_p.layout().count())]
-check("④ 采集参数区只剩 1 行控件",
-      len([r for r in rows if r.layout()]) == 1, str(len(rows)))
+_lrows = [r for r in rows if r.layout()]
+
+
+def _widgets(row):
+    lay = row.layout()
+    return {lay.itemAt(i).widget() for i in range(lay.count())
+            if lay.itemAt(i).widget() is not None}
+
+
+# 行数从「必须 1 行」改成「最多 2 行且每行放什么」：自动扩词/历史任务后来从操作行
+# 迁到了这里，硬要求 1 行只会逼人把有用控件塞回按钮那一排（更挤）。
+check("④ 采集参数区不超过 2 行控件", len(_lrows) <= 2, str(len(_lrows)))
+check("④ 第一行是采集间隔与三个开关",
+      _widgets(_lrows[0]) >= {w.spin_delay, w.chk_guard, w.chk_incr, w.chk_bg},
+      sorted(type(x).__name__ for x in _widgets(_lrows[0])))
+check("④ 第二行只有自动扩词与历史任务",
+      _widgets(_lrows[1]) == {w.chk_auto_kw, w.btn_history},
+      sorted(type(x).__name__ for x in _widgets(_lrows[1])))
 check("④ 页数说明并入采集间隔 tooltip（不新开控件）",
       "翻页一律不限制" in w.spin_delay.toolTip())
 

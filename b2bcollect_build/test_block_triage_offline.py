@@ -518,6 +518,10 @@ class FakeSessionMini:
 
     def __init__(self, crawlers):
         self.crawlers = crawlers
+        # 真实 ParallelSession 必有 channels（三路名单通道）：_pick_site 现在把
+        # 风鸟/爱企查也纳入「打开网站让我看一眼 / 马上重测」的可选对象，
+        # 假会话必须带上这个字段，否则接口漂移只能在真机上才暴露。
+        self.channels = {}
         self.brought = None
 
     def _log(self, m):

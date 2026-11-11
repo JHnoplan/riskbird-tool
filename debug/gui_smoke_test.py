@@ -20,18 +20,42 @@ import b2bcollect_gui as gui
 ok = 0
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
+    # detail 只在失败时打印：断言挂了要一眼看到实际值（如弹窗文案长什么样），
+    # 而不是让人回去翻代码猜是哪一段文案变了。
     global ok
-    assert cond, f"FAIL: {name}"
+    assert cond, f"FAIL: {name}" + (f"  实际={detail}" if detail else "")
     ok += 1
     print(f"  ✓ {name}")
 
 
 app = QApplication.instance() or QApplication([])
+# 立刻拆掉「恢复上次任务」这颗定时炸弹：MainWindow 里挂的是
+# QTimer.singleShot(0, self._restore_last_task)，只在第一次跑事件循环时才触发，而它会
+# 把 session_dir / session.set_task_folder 改指用户桌面上正在跑的真实任务文件夹，
+# 还会把真实已采数据 seed 进本窗口的内存。测试后面的保存就会把 3 条假记录写进用户
+# 的真实原始表（2026-11-04 实测：真把用户 1689 行的表覆盖成 3 行，靠工具自身内存
+# 回写才在 90 秒内恢复）。定时任务里存的是构造时就绑好的绑定方法，事后改
+# w._restore_last_task 已经拦不住，只能把它的任务索引入参（load_tasks）先空掉。
+if gui.HAS_YZD:
+    _load_tasks_real = gui._tasks.load_tasks
+    gui._tasks.load_tasks = lambda *a, **k: []
+# 沙箱（2026-11-04 实机事故）：测试收尾的 _register_task 曾把 folder 在 /var/folders
+# 的假任务写进用户桌面真实 _采集任务索引.json，用户打开工具续采后真实数据被写进了
+# 临时目录。现在把 GUI 的桌面目录改指临时区：任务索引/账号文件全落沙箱，
+# 测试怎么跑都污染不了真实历史（GUI 侧另有会话目录守卫兜底）。
+tmp = Path(tempfile.mkdtemp(prefix="b2b_gui_smoke_"))
+_desk = tmp / "Desktop"
+_desk.mkdir(parents=True, exist_ok=True)
+gui.MainWindow._get_desktop_dir = lambda self: _desk
 w = gui.MainWindow()
 w.show()        # offscreen 下窗口不会真上屏，但必须 show 才能让子控件 isVisible 生效
+app.processEvents()          # 把那颗 singleShot(0) 在这里放掉：已被上面堵死，不会再指回真实任务夹
 
-tmp = Path(tempfile.mkdtemp(prefix="b2b_gui_smoke_"))
+# 会话目录必须挂在沙箱工具目录下：GUI 的会话目录不变量守卫（_session_folder_ok）
+# 只认工具目录直接子目录，测试自造的会话夹也要遵守同一条约定，断言才和真实链路一致。
+sess = (gui._tasks.tool_dir(_desk) if gui.HAS_YZD
+        else _desk / "B2B多平台企业数据自动采集工具") / "20261028_160000"
 
 # 站点与数据目录就位：结果表与种子库全部改指临时目录——绝不写用户桌面的历史
 # 文件夹，也不跟用户正跑着的 GUI 争同一份 seen_store（并发下它一直在写）
@@ -47,7 +71,8 @@ for c in w.session.crawlers.values():
     c._seen_store = json.loads(SEEN_FIXTURE)
 seen_dir = w.session.crawlers["11467"]._seen_store_path
 seen_bytes = seen_dir.read_bytes()
-w.session_dir = str(tmp / "20261028_160000")
+sess.mkdir(parents=True, exist_ok=True)
+w.session_dir = str(sess)
 w._first_start = "20261028_160000"
 
 # 三条记录：两条有联系方式，一条四项全空（必须从清洗后表里被剔掉，但留在原始表）
@@ -66,9 +91,9 @@ for rec in SAMPLES:
 # ══ ① 收尾保存：原始全量 + 清洗后按新口径剔除 ══
 check("界面：三条记录进入内存结果", len(w.session.snapshot_results()) == 3)
 saved = w._final_save_sync()
-raw_p = tmp / "20261028_160000" / gui._tasks.RAW_FILE_NAME if gui.HAS_YZD else \
-    tmp / "20261028_160000" / "企业数据_原始.xlsx"
-clean_p = tmp / "20261028_160000" / "企业数据_清洗后入库数据.xlsx"
+raw_p = sess / gui._tasks.RAW_FILE_NAME if gui.HAS_YZD else \
+    sess / "企业数据_原始.xlsx"
+clean_p = sess / "企业数据_清洗后入库数据.xlsx"
 check("收尾保存成功落盘（停止后不满一个自动保存批次的数据不丢）", saved and raw_p.exists())
 wb = load_workbook(raw_p, read_only=True)
 ws = wb.worksheets[0]
@@ -87,6 +112,12 @@ check("有手机号那条仍在（不误杀）", any("甲乙" in n for n in name
 # ══ ②③ 被拦提醒：横幅 + 独立弹窗 + 计时接管；解除后全部收起 ══
 # 拦截分型（网站拦 IP vs 可人工过验证）走两套文案，而且必须是没技术背景也看得懂的大白话
 from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP
+
+# 建窗口时挂的恢复提示已被上面堵掉；这里再跑一次事件循环，把其它待办
+# 定时器（后台化、计时等）冲干净，后面的横幅断言才不会被子控件的异步刷新盖掉。
+app.processEvents()
+check("横幅没被「已接上次的任务」占位（测试数据不会写进用户真实任务夹）",
+      "已接上次的任务" not in w.banner.text())
 
 check("初始没有提醒弹窗", w._block_alert is None)
 w._on_blocked(BLOCK_TAG_IP + "八方资源网：站点返回 HTTP 502（IP 级限流/冷却，非验证码）")
@@ -164,9 +195,28 @@ check("解除后计时交还给采集耗时", w._hold_from == 0.0)
 w._show_banner("测试残留", "#fff", "#000")
 w._on_blocked(BLOCK_TAG_IP + "顺企网：HTTP 429（IP 级限流/冷却，非验证码）")
 app.processEvents()
-w._on_finished()
+# 采集收尾会问「要不要同步到数据池」——那是**模态**弹窗，offscreen 下真 exec_ 就是
+# 永久挂住（2026-11-10 回归批跑正是卡在这一步 20 多分钟）。这里必须替用户作答，
+# 而且必须答「否」：答「是」会让一个自称离线的冒烟测试真的往团队池上传数据。
+_asked, _synced = [], []
+_real_question, _real_sync = QMessageBox.question, w._on_pool_sync
+# 记下「标题 + 正文」两段：标题写着干什么（同步到数据池），正文写着几条，
+# 只看其中一段迟早被文案微调骗过去。
+QMessageBox.question = staticmethod(
+    lambda *a, **k: _asked.append("｜".join(str(x) for x in a[1:3])) or QMessageBox.No)
+w._on_pool_sync = lambda *a, **k: _synced.append(1)
+try:
+    w._on_finished()
+finally:
+    QMessageBox.question = _real_question
+    w._on_pool_sync = _real_sync
 check("结束/停止同样收回提醒弹窗与横幅（不留挂着误导用户）",
       w._block_alert is None and w.banner.isVisible() is False)
+_all_ask = " ".join(_asked)
+check("采到数据才问「同步到数据池」（绝不静默上传）", "同步到数据池" in _all_ask, _asked)
+check("问的时候报明本次条数",
+      str(len(w.session.snapshot_results())) in _all_ask, _asked)
+check("用户答「否」就一步都不做（不碰 OSS）", _synced == [])
 
 # ══ ④ 开始新任务：对话框可确认，复位彻底但不碰历史去重成果 ══
 accepted_box = {}
@@ -259,6 +309,11 @@ check("勾选后五站去重磁盘文件确实删除（下轮对同一批关键�
       not seen_dir.exists() or list(seen_dir_tmp.glob("seen_store_*.json")) == [])
 check("勾选后内存去重条目一并清空", w.session.crawlers["11467"]._seen_store == {})
 check("清空种子库仍不动已采的结果表文件", raw_p.exists() and clean_p.exists())
+
+# 收尾自检：整个测试过程中 session_dir 只能落在临时目录里（曾有过一次它被启动
+# 恢复逻辑改指回用户真实任务夹，把真实原始表覆盖成 3 行假记录）
+check("全程 session_dir 只在临时目录里（没被改指回用户真实任务夹）",
+      w.session_dir is None or str(w.session_dir).startswith(str(tmp)))
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n全部 {ok} 项断言通过 ✅")

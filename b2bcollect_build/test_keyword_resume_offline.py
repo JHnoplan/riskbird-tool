@@ -155,7 +155,10 @@ c4._iter_keyword = lambda kw: (_ for _ in ()).throw(
     RuntimeError("no tab：列表一页都取不到")) if kw == "坏词" else iter(())
 c4.crawl(["坏词", "空词"])
 check("一页都没取到的词不记「已跑完」（下次续采自动重来）", "坏词" not in c4._kw_done)
-check("这种情形会如实提醒而不是静默", any("一页都没取到" in m and "坏词" in m for m in logs_c2))
+# 2026-11-07 起口径升级：不只「一页都没取到」，零新增产出的词（被拦/解析空/本页无
+# 数据）统统不记 done 并如实提醒——断言按新生产文案校「提醒存在且不静默」
+check("这种情形会如实提醒而不是静默",
+      any("无新增产出" in m and "坏词" in m and "不记「已跑完」" in m for m in logs_c2))
 
 
 c5 = _wire_fake(B2b168Crawler(), [])
@@ -169,8 +172,11 @@ def _empty_but_paged(kw):
 
 c5._iter_keyword = _empty_but_paged
 c5.crawl(["真没结果的词"])
-check("取到页但确实一家没有的词仍记「已跑完」（下次不再白烧请求）",
-      c5._kw_done == {"真没结果的词"})
+# 2026-11-07 口径：done 只认「净新增产出」，不再认「取到过页」。翻了页但一家没出
+# 很可能是验证码挡住/解析空（1688/麦麦B2B 整轮 0 条被永久跳过的事故根因），宁可
+# 续采重跑几页（种子库兜底去重、不多入库），也不能把疑似被拦的词错标成跑完。
+check("取到页但零新增的词也不记「已跑完」（续采宁多烧几页也不永久跳过）",
+      c5._kw_done == set())
 
 
 class StubNoLedger:
@@ -214,10 +220,15 @@ s._kw_ledger["aipage"] = {"yield": {}, "done": ["A词", "B词"]}
 check("无台账通道续采只跑剩下的词",
       s._pending_keywords(stub, ["A词", "B词", "C词"]) == ["C词"])
 s._merge_site_progress(stub, ["C词"])
-check("无台账通道跑完后按子集推 done", "C词" in s._kw_ledger["aipage"]["done"])
+# 2026-11-07 口径：适配器（无台账）路径也不再把本轮子集无条件推 done——
+# 零产出即不记；历史 done 里零产出的词（A/B 词）也会被释放出来续采重试
+check("无台账通道零产出不推 done，历史零产出 done 同步释放",
+      s._kw_ledger["aipage"]["done"] == [])
 stub.results = [{"关键词": "C词", "公司名称": "X"}]
 s._merge_site_progress(stub, ["C词"])
-check("无台账通道每词条数按 results 回算", s._kw_ledger["aipage"]["yield"].get("C词") == 1)
+check("无台账通道每词条数按 results 回算，有产出才推 done",
+      s._kw_ledger["aipage"]["yield"].get("C词") == 1
+      and s._kw_ledger["aipage"]["done"] == ["C词"])
 
 check("save_progress 原子写盘成功", s.save_progress() is True)
 check("无 .tmp 残留", not (pf / (_tasks.PROGRESS_FILENAME + ".tmp")).exists())
@@ -287,6 +298,9 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 
 app = QApplication.instance() or QApplication(sys.argv)   # 先有 QApplication 才能造控件
+# 勾上 1688 会弹「需要先登录」提示（生产真实行为）；offscreen 没人按按钮，
+# 把 information 桩成「取消」（不弹不阻塞、也不会去开浏览器）
+gui.QMessageBox.information = staticmethod(lambda *a, **k: gui.QMessageBox.Cancel)
 gui.MainWindow._get_desktop_dir = lambda self: desk
 w = gui.MainWindow()
 check("多了「历史任务·接着上次采」按钮", hasattr(w, "btn_history"))
@@ -319,10 +333,11 @@ w._first_start = "20261030_130000"
 w._kw_raw = CUSTOMER_KW
 w.keywords = ["A词", "B词", "C词"]
 w.kw_text.setPlainText("\n".join(w.keywords))
-w.site_checks["b2b168"].setChecked(True)
-for _slug, _chk in w.site_checks.items():      # 只留八方，验证站点快照能存能恢复
-    _chk.setChecked(_slug == "b2b168")
-w.session.set_enabled(["b2b168"])              # 等价于 _on_start 里那行 set_enabled
+# 2026-11 新 UI：八方/顺企网等 8 站共享一个「多平台」勾选框，能单独选/不选的只
+# 剩 1688（登录限制站）——站点快照用例改用 1688 验证「能存能恢复」。
+for _slug, _chk in w.site_checks.items():
+    _chk.setChecked(_slug == "1688")
+w.session.set_enabled(["1688"])                # 等价于 _on_start 里那行 set_enabled
 w.spin_delay.setValue(8.0)
 w.session.set_task_folder(str(sess_folder))
 # 台账由爬虫自己记（会话落盘前会从各爬虫同步，手改会话台账会被盖回）
@@ -334,7 +349,7 @@ check("任务索引记下关键词与参数，状态停在「已停止」",
       saved["keywords"] == ["A词", "B词", "C词"]
       and saved["status"] == _tasks.TASK_STATUS_STOPPED
       and saved["params"]["delay_between"] == 8.0
-      and saved["sites"] == ["b2b168"])
+      and saved["sites"] == ["1688"])
 
 # 上次数据装成 Excel：续采必须把它装回内存，否则自动保存全量覆写会盖掉
 from openpyxl import Workbook
@@ -346,18 +361,21 @@ ws.append(["A词", "上次采到的公司", "13700000000", SITE_NAMES["b2b168"],
 ws.append(["B词", "上次采到的公司2", "13700000001", SITE_NAMES["b2b168"], "成功"])
 wb.save(str(sess_folder / _tasks.RAW_FILE_NAME))
 
-w.site_checks["11467"].setChecked(True)        # 故意改乱，验证恢复会照上次设回去
+w.site_checks["11467"].setChecked(True)        # 故意改乱：多平台打开…
+w.site_checks["1688"].setChecked(False)        # …1688 关掉，验证恢复会照上次设回去
 ok_restore = w._restore_task(saved)
 check("恢复任务成功", ok_restore is True)
 check("关键词框回填成上次的词", w.kw_text.toPlainText().splitlines() == ["A词", "B词", "C词"])
-check("平台勾选按上次恢复", w.site_checks["b2b168"].isChecked()
+check("平台勾选按上次恢复", w.site_checks["1688"].isChecked()
       and not w.site_checks["11467"].isChecked())
 check("数据仍指向同一个任务文件夹", w.session_dir == str(sess_folder))
 check("游标接回爬虫（A 词已跑完）",
       w.session.crawlers["b2b168"]._kw_done == {"A词"}
       and w.session.crawlers["b2b168"].resume is True)
-check("上次已采的 2 条装回内存（自动保存不会盖掉它们）",
-      any(r.get("公司名称") == "上次采到的公司" for r in w.session.snapshot_results()))
+# 快照口径只看当轮 enabled 通道（本条任务快照站点是 1688，八方不在其中），
+# 所以按通道内存断言「装回来了」——真正开采时 _on_start 会按恢复后的勾选重设 enabled。
+check("上次已采的 2 条装回通道内存（自动保存不会盖掉它们）",
+      any(r.get("公司名称") == "上次采到的公司" for r in w.session.crawlers["b2b168"].results))
 # 高产词派生：把台账换成真实产出，验证只给高产词派生同族词
 w.keywords = ["工业冷水机", "新风机"]
 w.session._kw_ledger = {"b2b168": {"yield": {"工业冷水机": 723, "新风机": 3}, "done": []}}

@@ -167,12 +167,18 @@ class QiZhiDaoCrawler:
             return ""
         return block_guard.detect_selenium(self.driver)
 
-    def _wait_unblock(self, reason: str, max_wait: int = 1800) -> bool:
-        """被拦截时原地等人工验证，不推进名单、不写入空记录"""
+    def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = None) -> bool:
+        """被拦截时原地等人工验证，不推进名单、不写入空记录
+
+        interval 由通道侧设定（三平台并行时统一 15 秒只读轮询），不传沿用 5 秒老节奏。
+        本通道刻意不给 heal/revive：企知道的验证页只有本标签一份，任何导航都可能把
+        用户正拖到一半的滑块刷掉，所以这里只读页面签名、绝不动页面。
+        """
         ok = block_guard.wait_unblock(
             reason, self._log, self._emit_blocked,
             lambda: self._stop_requested, self._detect_block,
             max_wait=max_wait,
+            interval=int(interval or getattr(self, "block_probe_interval", 5) or 5),
         )
         if ok:
             self._emit_cleared(reason)
@@ -639,12 +645,8 @@ class QiZhiDaoCrawler:
                 # 双标签并行：确保操作的是自己的标签
                 self._ensure_own_tab()
 
-                # 1. 确保在首页（获取cookies/session）
-                if 'qizhidao.com' not in (self.driver.current_url or ''):
-                    self.driver.get(self.BASE_URL)
-                    time.sleep(2)
-
-                # 2. 调用 suggestPredict API 获取公司hash（不消耗搜索次数）
+                # 1. 调用 suggestPredict API 获取公司hash（不消耗搜索次数）
+                #    内部会自行动导航到首页 + WebDriverWait 等水合完成
                 company_hash = self._get_company_hash(name)
                 if company_hash is None:
                     # 链路异常（断网/浏览器没接上）：记「可重采」交回上层退回队首。
@@ -662,14 +664,14 @@ class QiZhiDaoCrawler:
                     result["错误"] = f"未找到公司（{fail_reason}）"
                     return result
 
-                # 3. 直接构造详情页URL并导航（零搜索次数）
+                # 2. 直接构造详情页URL并导航（零搜索次数）
                 detail_url = f"https://qiye.qizhidao.com/company/{company_hash}.html"
                 self._log(f"  直接跳详情: {detail_url}")
                 result["搜索结果URL"] = detail_url
                 self.driver.get(detail_url)
                 time.sleep(3)
 
-                # 4. 从 NUXT 数据 + DOM 提取全部字段
+                # 3. 从 NUXT 数据 + DOM 提取全部字段
                 result = self._extract_detail_data(result)
                 return result
 
@@ -693,77 +695,176 @@ class QiZhiDaoCrawler:
 
         return result
 
-    def _get_company_hash(self, name: str) -> str:
-        """通过拦截页面自身的 suggestPredict 请求获取公司hash ID（不消耗搜索次数）"""
-        try:
-            # 每次都导航到首页（确保拦截器干净、session有效）
-            self.driver.get(self.BASE_URL)
-            time.sleep(2)
+    def _wait_page_hydrated(self, timeout=10):
+        """等待 SPA 页面水合完成（readyState + 正文规模双判据）
 
-            # 注入 XHR 响应拦截器（必须在输入前注入）
-            self.driver.execute_script("""
-                window.__suggestPredictResult = null;
-                
-                var origXHROpen = XMLHttpRequest.prototype.open;
-                var origXHRSend = XMLHttpRequest.prototype.send;
-                
-                XMLHttpRequest.prototype.open = function(method, url) {
-                    this._url = url;
-                    return origXHROpen.apply(this, arguments);
-                };
-                
-                XMLHttpRequest.prototype.send = function() {
-                    var self = this;
-                    if (self._url && self._url.includes('suggestPredict')) {
-                        self.addEventListener('load', function() {
-                            try {
-                                window.__suggestPredictResult = JSON.parse(self.responseText);
-                            } catch(e) {}
-                        });
-                    }
-                    return origXHRSend.apply(this, arguments);
-                };
-            """)
+        企知道是 NUXT.js 重 SPA，driver.get() 返回后 DOM 可能尚未挂载，
+        固定 sleep 在并行抢资源时不够——用可观测指标判定而非拍脑袋秒数。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                ready = self.driver.execute_script("return document.readyState;")
+                body_len = len(
+                    self.driver.execute_script("return document.body.innerText;") or ""
+                )
+                if ready == "complete" and body_len > 500:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
 
-            # 在搜索框中输入公司名（触发 suggestPredict API）
-            search_input = self.driver.find_element(By.XPATH, "//input[@type='text']")
-            search_input.click()
+    def _find_search_input_safe(self, timeout=8):
+        """安全查找搜索框：多选择器回退 + WebDriverWait 显式等待 + 防 stale。
+
+        返回 WebElement；超时抛 TimeoutException。
+        超时预算：策略 1（WebDriverWait）最多用 timeout/2，
+                  策略 2（轮询）用剩余时间，总耗时 ≤ timeout。
+        """
+        selectors = [
+            (By.XPATH, "//input[@type='text']"),
+            (By.CSS_SELECTOR, "input[type='text']"),
+            (By.CSS_SELECTOR, "input.search-input"),
+            (By.CSS_SELECTOR, "input[placeholder]"),
+        ]
+        t_wait = max(timeout // 2, 3)          # 策略 1 时间上限
+        t_poll = timeout - t_wait               # 策略 2 剩余时间
+
+        # 策略 1：WebDriverWait 等可点击（最可靠）
+        for by, sel in selectors[:2]:
+            try:
+                return WebDriverWait(self.driver, t_wait).until(
+                    EC.element_to_be_clickable((by, sel))
+                )
+            except (TimeoutException, NoSuchElementException,
+                    StaleElementReferenceException):
+                continue
+
+        # 策略 2：轮询 + 全选择器扫描
+        deadline = time.time() + t_poll
+        while time.time() < deadline:
+            for by, sel in selectors:
+                try:
+                    els = self.driver.find_elements(by, sel)
+                    if els and els[0].is_displayed() and els[0].is_enabled():
+                        return els[0]
+                except (NoSuchElementException, StaleElementReferenceException):
+                    continue
             time.sleep(0.3)
-            search_input.clear()
-            
-            # 逐字输入（模拟真实用户，触发自动补全API）
-            for char in name:
-                search_input.send_keys(char)
-                time.sleep(0.08)
-            
-            # 等待 API 响应
-            time.sleep(3)
+        raise TimeoutException(f"搜索框未找到（已尝试 {len(selectors)} 种选择器）")
 
-            # 获取拦截到的 suggestPredict 结果
-            api_result = self.driver.execute_script("return window.__suggestPredictResult;")
+    def _get_company_hash(self, name: str) -> str:
+        """通过拦截页面自身的 suggestPredict 请求获取公司hash ID（不消耗搜索次数）
 
-            if not api_result:
-                self._log(f"  ⚠ suggestPredict 未拦截到响应，尝试备用方案...")
-                return self._get_hash_via_search(name)
+        【修复 2026-11-07】原 driver.get() 后固定 sleep(2) 在 SPA 并行场景下
+        不够水合，导致 StaleElementReferenceException / NoSuchElementException。
+        改为：① WebDriverWait 显式等待页面水合 ② 多选择器回退找搜索框
+        ③ 整链路最多重试 3 次（递增退避），彻底消灭「元素还没出来就操作」的时序缺陷。
+        """
+        try:
+            for attempt in range(3):
+                try:
+                    # 1. 导航到首页（确保拦截器干净、session 有效）
+                    self.driver.get(self.BASE_URL)
 
-            if not api_result.get("success"):
-                self._log(f"  ⚠ suggestPredict 失败: {api_result.get('msg', '')}，尝试备用方案...")
-                return self._get_hash_via_search(name)
+                    # 2. 显式等待 SPA 水合完成（替代固定 sleep 2s）
+                    if not self._wait_page_hydrated(timeout=10):
+                        self._log(f"  ⚠ 首页水合超时（attempt {attempt+1}/3），重试...")
+                        time.sleep(2 * (attempt + 1))   # 递增退避 2/4/6 s
+                        continue
 
-            # 提取公司hash
-            data = api_result.get("data", {})
-            company_list = data.get("list", [])
-            if company_list:
-                # 优先精确匹配
-                for item in company_list:
-                    if item.get("name") == name:
-                        self._log(f"  ✅ suggestPredict 精确匹配: {name[:30]}...")
-                        return item.get("id", "")
-                # 否则取第一个
-                self._log(f"  ✅ suggestPredict 模糊匹配: {company_list[0].get('name', '')[:30]}...")
-                return company_list[0].get("id", "")
+                    # 3. 注入 XHR 响应拦截器（必须在输入前注入）
+                    self.driver.execute_script("""
+                        window.__suggestPredictResult = null;
 
-            self._log(f"  ⚠ suggestPredict 无结果（返回 {len(company_list)} 家公司），尝试备用方案...")
+                        var origXHROpen = XMLHttpRequest.prototype.open;
+                        var origXHRSend = XMLHttpRequest.prototype.send;
+
+                        XMLHttpRequest.prototype.open = function(method, url) {
+                            this._url = url;
+                            return origXHROpen.apply(this, arguments);
+                        };
+
+                        XMLHttpRequest.prototype.send = function() {
+                            var self = this;
+                            if (self._url && self._url.includes('suggestPredict')) {
+                                self.addEventListener('load', function() {
+                                    try {
+                                        window.__suggestPredictResult = JSON.parse(self.responseText);
+                                    } catch(e) {}
+                                });
+                            }
+                            return origXHRSend.apply(this, arguments);
+                        };
+                    """)
+
+                    # 4. 安全查找搜索框（WebDriverWait + 多选择器回退）
+                    search_input = self._find_search_input_safe(timeout=8)
+
+                    # 5. 点击 → 清空 → 逐字输入（模拟真实用户，触发 suggestPredict）
+                    search_input.click()
+                    time.sleep(0.3)
+                    search_input.clear()
+
+                    for char in name:
+                        search_input.send_keys(char)
+                        time.sleep(0.08)
+
+                    # 6. 等待 API 响应
+                    time.sleep(3)
+
+                    # 7. 获取拦截到的 suggestPredict 结果
+                    api_result = self.driver.execute_script(
+                        "return window.__suggestPredictResult;"
+                    )
+
+                    if not api_result:
+                        self._log(f"  ⚠ suggestPredict 未拦截到响应，尝试备用方案...")
+                        return self._get_hash_via_search(name)
+
+                    if not api_result.get("success"):
+                        self._log(
+                            f"  ⚠ suggestPredict 失败: {api_result.get('msg', '')}，"
+                            f"尝试备用方案..."
+                        )
+                        return self._get_hash_via_search(name)
+
+                    # 8. 提取公司 hash
+                    data = api_result.get("data", {})
+                    company_list = data.get("list", [])
+                    if company_list:
+                        # 优先精确匹配
+                        for item in company_list:
+                            if item.get("name") == name:
+                                self._log(f"  ✅ suggestPredict 精确匹配: {name[:30]}...")
+                                return item.get("id", "")
+                        # 否则取第一个
+                        self._log(f"  ✅ suggestPredict 模糊匹配: {company_list[0].get('name', '')[:30]}...")
+                        return company_list[0].get("id", "")
+
+                    self._log(
+                        f"  ⚠ suggestPredict 无结果（返回 {len(company_list)} 家公司），"
+                        f"尝试备用方案..."
+                    )
+                    return self._get_hash_via_search(name)
+
+                except StaleElementReferenceException:
+                    self._log(f"  ⚠ 元素引用失效（页面仍在渲染），重试 attempt {attempt+1}/3...")
+                    time.sleep(2 * (attempt + 1))
+                    continue
+
+                except NoSuchElementException:
+                    self._log(f"  ⚠ 搜索框未找到（SPA 未就绪），重试 attempt {attempt+1}/3...")
+                    time.sleep(2 * (attempt + 1))
+                    continue
+
+                except TimeoutException:
+                    self._log(f"  ⚠ 等待搜索框超时（{attempt+1}/3），尝试备用方案...")
+                    return self._get_hash_via_search(name)
+
+            # 3 次重试均因 stale / missing element 失败
+            self._log(f"  ⚠ _get_company_hash 重试 3 次均失败，转备用方案...")
             return self._get_hash_via_search(name)
 
         except Exception as e:
