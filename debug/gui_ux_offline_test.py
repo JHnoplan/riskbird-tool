@@ -5,6 +5,7 @@
 ③ 看板由 5 行压成 1 行、次要文字按深浅主题自适应（根治「已采 xxx 家下方空一块把日志挤出屏幕」）
 ④ 界面整洁化：长说明进 tooltip、参数区 1 行、主按钮唯一、日志给死最小高度
 """
+import inspect
 import io
 import os
 import re
@@ -173,5 +174,126 @@ check("④ 全局样式边框走 palette()，跟随系统深浅色",
 # 源码级红线：不再允许任何写死的次要灰/提醒红字面量
 hard = re.findall(r'setStyleSheet\("color: #(666|999|333|c62828)[^"]*"\)', SRC)
 check("④ 全文件零残留写死次要色（13 处已全部改为主题自适应）", not hard, str(hard))
+
+# ── ⑤ 绑定弹窗诚实化：标题与正文必须同源，失败绝不允许顶着「绑定成功」出门 ──
+# 实机缺陷（用户截图）：绑定等级 2 账号时设备登记连不上 OSS，弹窗标题仍是
+# 「绑定成功」、正文却是「设备登记失败」——成功弹窗只应属于整条链路都成功。
+_bd = gui.MainWindow._bind_result_dialog
+t, b, warn = _bd("13800000000", True, True, "", True, "")
+check("⑤ 全链路成功才配「绑定成功」标题（信息脸）",
+      t == "绑定成功" and not warn and "已获得使用权限" in b, (t, b))
+t, b, warn = _bd("13800000000", True, False, "无法连接权限服务器，设备登记失败",
+                 False, "无法连接权限服务器，请检查网络后重试")
+check("⑤ 设备登记失败：标题降级为「账号已绑定，设备登记未完成」（警示脸）",
+      "绑定成功" not in t and "设备登记未完成" in t and warn, (t, b))
+check("⑤ 网络型失败必须承诺自动补齐并给手动重试出口（与自愈路径同源）",
+      "自动" in b and "绑定云展动力账号" in b and "无法连接权限服务器" in b, b)
+t, b, warn = _bd("13800000000", True, False, "本机设备登记被另一台设备抢先（机房本），请稍后重试",
+                 False, "正在校验本机设备绑定")
+check("⑤ 被抢先绝不承诺自动补齐：分片还在别人手里，自愈永远不会触发",
+      "抢先" in t and "自动" not in b and "再点一次" in b, (t, b))
+t, b, warn = _bd("13800000000", True, True, "", False, "当前账号无使用权限，请联系管理员获得使用权限")
+check("⑤ 登记好了但不在名单：指向管理员而不是让人白查网络",
+      "未获得使用权限" in t and "白名单" in b and "网络" not in b, (t, b))
+t, b, warn = _bd("13800000000", False, True, "", True, "")
+check("⑤ 账号没落盘=「绑定未完成」：saved=False 必须排在成功分支之前判定",
+      t == "绑定未完成" and warn and "重新绑定" in b, (t, b))
+_bsrc = inspect.getsource(gui.MainWindow._on_bind_finished)
+_bcode = "\n".join(l for l in _bsrc.splitlines() if not l.strip().startswith("#"))
+check("⑤ 弹窗文案唯一口径：_on_bind_finished 只许走 _bind_result_dialog，"
+      "不许再就地拼「绑定成功」字面量（异常分支也在函数内，天然覆盖旧漏点）",
+      "_bind_result_dialog" in _bcode and "绑定成功" not in _bcode, _bsrc[:200])
+
+# ── ⑥ 「登记成功但没被放行」的下一步必须按 reason 分类 ──────────
+# 顺着 ⑤ 追出来的第二个同类缺陷：check() 的 reason 有八种来源，旧口径不分青红皂白
+# 一句「请联系管理员将该账号加入白名单」——可其中「连不上服务器」「还在确认」
+# 「号在另一台机器上」三类找管理员完全没用，指错方向要用户和管理员一起买单。
+_ttl = int(getattr(getattr(gui, "_access_guard", None), "CACHE_TTL_SECONDS", 60) or 60)
+_den = gui.MainWindow._acl_denial
+t, adv = _den("无法连接权限服务器，请检查网络后重试；仍无法使用请联系管理员")
+check("⑥ 连不上服务器＝「还在确认中」，不叫人去找管理员加白名单",
+      "确认中" in t and "白名单" not in adv and "自动" in adv, (t, adv))
+check("⑥ 自动确认的时间必须与 CACHE_TTL_SECONDS 同源（写死数字会在改常量后变成假承诺）",
+      str(_ttl) in adv, adv)
+t, adv = _den("该云展账号当前绑定在另一台设备上（张三的 MacBook），本机还没有使用权限。")
+check("⑥ 号在另一台机器：标题如实说清，且不重复 reason 已给出的操作指引",
+      "另一台设备" in t and adv == "", (t, adv))
+t, adv = _den("该云展账号的设备绑定已被解除（管理员解绑）。\n请点「绑定云展动力账号」重新登记本机后继续使用。")
+check("⑥ 被解绑：交给 reason 自带的「重新绑定」指引，不再叠加无关建议",
+      "重新确认" in t and adv == "", (t, adv))
+t, adv = _den("当前账号无使用权限，请联系管理员获得使用权限")
+check("⑥ 真·不在白名单才指向管理员", "未获得使用权限" in t and "白名单" in adv, (t, adv))
+t, adv = _den("绑定的云展账号格式有误，请重新绑定")
+check("⑥ 账号格式问题：让用户重绑，而不是找管理员",
+      "核对" in t and "绑定云展动力账号" in adv and "管理员" not in adv, (t, adv))
+check("⑥ denial 的每一种标题都不得冒充成功",
+      all("绑定成功" not in _den(r)[0] for r in (
+          "", "无法连接权限服务器", "当前账号无使用权限，请联系管理员获得使用权限",
+          "正在校验本机设备绑定，请稍候重试", "权限校验异常，请重试", "该云展账号当前绑定在另一台设备上（X）")),
+      [_den(r)[0] for r in ("", "无法连接权限服务器", "无使用权限")])
+_ddsrc = inspect.getsource(gui.MainWindow._bind_result_dialog)
+_ddcode = "\n".join(l for l in _ddsrc.splitlines() if not l.strip().startswith("#"))
+check("⑥ 下一步口径唯一化：_bind_result_dialog 只许走 _acl_denial，"
+      "不许再就地写「白名单」这类结论（否则新增的 reason 又会落到旧的一句流于形式的指引）",
+      "_acl_denial" in _ddcode and "白名单" not in _ddcode, _ddsrc[:160])
+
+# ── ⑦ 认领失败也必须分类：不能对「自愈永不触发」的两类承诺自动补齐 ──
+# 只有远端确实还没有分片时，_on_shard_absent → _auto_enroll 才会自动补登记；
+# 「被抢先」与「防顶号冷却」两类分片在别人手里，承诺自动补齐 = 引导用户干等。
+_cf = gui.MainWindow._claim_failure
+_cool = ("该账号刚在另一台设备上绑定过；为防止两台设备互相顶号，"
+         "请 59 秒后再认领本机，或联系管理员确认设备归属")
+t, b = _cf("13800000000", _cool)
+check("⑦ 防顶号冷却：如实说明只能手动重试，绝不承诺自动抢回",
+      "冷却" in t and "不会自动" in b and "手动重试" in b, (t, b))
+t, b = _cf("13800000000", "本机设备登记被另一台设备抢先（李四的电脑），请稍后重试")
+check("⑦ 被抢先：标题点名抢先，指向本机再点一次顶回",
+      "抢先" in t and "顶回当前设备" in b and "不会自动" not in b, (t, b))
+t, b = _cf("13800000000", "无法连接权限服务器，设备登记失败")
+check("⑦ 网络型失败：自动补齐＋「号在别人手上仍需手动」的条件都写清（不片面承诺）",
+      "自动补齐" in b and "另一台设备" in b and "绑定云展动力账号" in b, b)
+t, b = _cf("13800000000", "手机号格式有误，无法登记设备")
+check("⑦ 手机号格式：让用户核对重绑，不提自动也不提管理员",
+      "设备登记未完成" in t and "核对手机号" in b and "自动" not in b, (t, b))
+check("⑦ 四种认领失败各有各的标题，且都不许冒充成功",
+      len({_cf("13800000000", m)[0] for m in
+           (_cool, "本机设备登记被另一台设备抢先（X），请稍后重试",
+            "无法连接权限服务器，设备登记失败", "设备登记写入失败：OSSPoolError")}) == 3
+      and all("绑定成功" not in _cf("13800000000", m)[0] for m in
+              (_cool, "抢先", "无法连接权限服务器", "手机号格式有误，无法登记设备")),
+      [_cf("13800000000", m)[0] for m in (_cool, "抢先", "无法连接权限服务器")])
+_cfcode = "\n".join(l for l in inspect.getsource(gui.MainWindow._bind_result_dialog).splitlines()
+                    if not l.strip().startswith("#"))
+check("⑦ 认领失败口径唯一化：_bind_result_dialog 只许走 _claim_failure，"
+      "不许就地残留「抢先」分支（否则新增文案又会退回一句通用承诺）",
+      "_claim_failure" in _cfcode and "抢先" not in _cfcode, _cfcode[:160])
+
+# ── ⑧ 落盘失败＝整个绑定作废：内存身份不许先于磁盘切换 ──────────
+# access_guard 判定权限时读的是磁盘上的绑定账号（task_registry.load_account）。
+# 旧写法先改 self._yzd_phone 再存盘，存盘失败就留下两个身份：界面/云展功能按新号，
+# 权限守卫按旧号——旧号的授权会被新号白拿，且比「绑定失败」本身难查得多。
+t, b, warn = _bd("13900000000", False, True, "", True, "")
+check("⑧ saved=False 文案必须说「本次绑定没有生效」，不再承诺「重启后会丢失」"
+      "（身份已回滚，那句会描述一个不存在的情况）",
+      t == "绑定未完成" and "没有生效" in b and "重启后会丢失" not in b, (t, b))
+t, b, warn = _bd("13900000000", False, True, "", True, "", acl=False)
+check("⑧ 权限层没加载时同一结论同一口径（两条 saved=False 分支不能一个更新一个陈旧）",
+      t == "绑定未完成" and "没有生效" in b, (t, b))
+check("⑧ saved=False 与登记成败无关：claim_ok 停在默认 True 也不能被读成成功",
+      _bd("13900000000", False, True, "", True, "")[2] is True
+      and _bd("13900000000", True, True, "", True, "")[2] is False)
+_bidx = _bcode.find("self._yzd_phone = msg")
+check("⑧ 内存身份只在落盘成功后切换：self._yzd_phone = msg 必须被 if saved 罩住",
+      _bidx > 0 and "if saved" in _bcode[max(0, _bidx - 60):_bidx], _bcode[:260])
+check("⑧ 日志标记与结论同源：保存失败时不许再打 ✅（同一缺陷在日志里的翻版）",
+      '"✅ " if saved else "⚠ "' in _bcode, _bcode[:200])
+
+# ── ⑨ 结论必须落在正文首行：macOS 上弹窗标题栏可能根本不显示 ──────
+# 既往实机取证：QMessageBox 在 macOS 常以 sheet 呈现，windowTitle() getter 恒返回
+# 空串。⑤~⑦ 把标题改诚实了，可如果标题看不见，用户读到的正文首行仍是
+# 「已绑定云展动力账号」——读起来还是成功。所以结论必须同时是正文的第一行。
+check("⑨ 成功/失败两条弹窗路径都把结论写在正文首行（不依赖标题栏可见）",
+      'f"{title}\\n\\n{body}"' in _bcode and "绑定失败\\n\\n" in _bcode,
+      _bcode[-420:])
 
 print(f"\n全部通过：{ok} 项")

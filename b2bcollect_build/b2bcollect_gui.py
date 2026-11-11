@@ -4710,43 +4710,157 @@ class MainWindow(QMainWindow):
         self._yzd_worker.finished_bind.connect(self._on_bind_finished)
         self._yzd_worker.start()
 
+    # 权限校验没通过时的「标题 + 下一步」口径。check() 的 reason 有八种来源
+    # （不在白名单 / 连不上服务器 / 还没来得及回读 / 号在另一台机器 / 被解绑 /
+    # 账号格式 / 校验异常 / 顶号），把它们笼统写成「请联系管理员加白名单」是错的：
+    # 其中三类根本不需要人介入，等一次自动刷新就好；两类的答案是「本机再点一次绑定」。
+    # 指错方向的代价由用户和管理员两边一起付——与「绑定成功」弹窗是同一类缺陷。
+    @staticmethod
+    def _acl_denial(reason):
+        """返回 (标题, 追加的下一步)；下一步为空表示 reason 自己已经说清楚了。"""
+        r = reason or ""
+        if "白名单" in r or "无使用权限" in r:
+            return ("账号已绑定，但未获得使用权限",
+                    "请联系管理员将该账号加入白名单。")
+        if "另一台设备" in r or "新设备使用" in r:
+            # reason 原文已带「点『绑定云展动力账号』即可登记到本机」，不再重复一遍
+            return ("账号已绑定，但使用权限在另一台设备上", "")
+        if "解除" in r:
+            return ("账号已绑定，设备登记需重新确认", "")
+        if "格式有误" in r or "请先绑定" in r:
+            return ("账号已绑定，但账号信息需要核对",
+                    "请再点一次「绑定云展动力账号」确认手机号无误。")
+        # 「无法连接权限服务器」「正在校验本机设备绑定，请稍候重试」「权限校验异常」
+        # 都落在这一支：机器侧已经登记成功，缺的只是一次成功的远端确认。时间必须
+        # 照实写，而且直接取那个真正的节拍常量：写死数字的话，哪天调了常量这句
+        # 承诺就悄悄变成假的（这正是本次要消灭的「提示与实际不符」）。
+        _pace = max(1, int(getattr(_access_guard, "CACHE_TTL_SECONDS", 60) or 60))
+        return ("账号已绑定，权限还在确认中",
+                "本机设备已经登记好，这一步不用你做什么：连回权限服务器后工具会"
+                f"自动完成确认（每 {_pace} 秒校验一次），确认后如需完整功能会提示"
+                "重启生效。")
+
+    # 认领（把「这个号 = 这台机器」写上 OSS）失败的下一步口径。
+    # 为什么必须分类：只有「远端确实还没有这个号的分片」那几类，才存在
+    # ``_on_shard_absent`` → ``_auto_enroll`` 这条自动补登记的路；而「被抢先」和
+    # 「防顶号冷却」两类，分片好端端地在别人手里，自愈永远不会触发——对它们承诺
+    # 「工具会自动继续登记」就是把用户引到一个根本不会发生的结果上。
+    @staticmethod
+    def _claim_failure(phone, claim_msg):
+        m = claim_msg or ""
+        if "抢先" in m:
+            return ("设备登记被另一台设备抢先",
+                    f"账号已绑定：{phone}\n{m}\n"
+                    "这通常发生在两台机器几乎同时绑定的时候；稍后请再点一次"
+                    "「绑定云展动力账号」，本机就会顶回当前设备。")
+        if "再认领本机" in m or "刚在另一台设备" in m:
+            return ("设备登记被防顶号冷却拦住",
+                    f"账号已绑定：{phone}\n{m}\n"
+                    "这一步只能由你手动重试：冷却是专门拦住两台设备互相顶号的，"
+                    "工具不会自动替你抢回来。等提示的秒数过后再点一次"
+                    "「绑定云展动力账号」即可。")
+        if "格式有误" in m:
+            return ("账号已绑定，设备登记未完成",
+                    f"已绑定云展动力账号：{phone}\n设备登记未成功：{m}\n"
+                    "请重新点一次「绑定云展动力账号」核对手机号。")
+        # 连不上服务器 / 写入失败 / 回读校验失败：远端多半还没有这个号的分片，网络
+        # 恢复后那次刷新会自动补登记。但「读不到绑定状态」也可能分片其实属于别人，
+        # 所以自动承诺之外必须留一个说清条件的手动出口。
+        return ("账号已绑定，设备登记未完成",
+                f"已绑定云展动力账号：{phone}\n设备登记未成功：{m}\n"
+                "账号已经保存好了，不用重新输入：网络恢复后工具会自动补齐这台设备"
+                "的登记；要是这个号还挂在另一台设备上，则需要你再点一次"
+                "「绑定云展动力账号」把它顶回本机。")
+
+    @staticmethod
+    def _bind_result_dialog(phone, saved, claim_ok, claim_msg, allowed, reason,
+                            acl=True):
+        """绑定结果弹窗的唯一口径（标题与正文必须同源，绝不允许互相矛盾）。
+
+        旧版无论设备登记成没成都顶着「绑定成功」四个字，正文里却夹着
+        「设备登记失败」——大厂口径里成功弹窗的成立条件是**整条链路都成功**；
+        只要有一环没成，标题就必须如实降级，并且当场给出下一步。
+        具体每一类失败该说什么、能不能承诺自动补齐，分别由 _acl_denial（设备登记
+        成了但没被放行）与 _claim_failure（登记本身没成）定口径——它们的判据不同，
+        能兑现的下一步也完全不同，不能共用一句流于形式的建议。
+        返回 (标题, 正文, 是否警示脸)。
+        """
+        if not acl:
+            # 权限层没加载（如离线测试夹具）：没有设备登记环节，绑定本身就是全部
+            if not saved:
+                return ("绑定未完成",
+                        f"账号 {phone} 没能保存到本地，本次绑定没有生效"
+                        "（界面与权限判定都仍按之前记录的账号）。\n"
+                        "请检查磁盘是否可写（桌面目录能否新建文件），然后重新绑定一次。", True)
+            return "绑定成功", f"已绑定云展动力账号：{phone}", False
+        # 「没保存」必须排在成功分支之前：saved=False 时后面的环节根本没跑，
+        # claim_ok/allowed 还停在默认值，顺序反了就会把没落盘的账号吹成绑定成功。
+        if not saved:
+            return ("绑定未完成",
+                    f"账号 {phone} 没能保存到本地，本次绑定没有生效"
+                    "（界面与权限判定都仍按之前记录的账号），设备登记也未进行。\n"
+                    "请检查磁盘是否可写（桌面目录能否新建文件），然后重新绑定一次。", True)
+        if claim_ok and allowed:
+            return ("绑定成功",
+                    f"已绑定云展动力账号：{phone}\n"
+                    "本机已登记为当前使用设备，该账号已获得使用权限。", False)
+        if claim_ok and not allowed:
+            # 登记好了却没被放行：拦下它的可能是名单、网络、另一台机器、被解绑或
+            # 账号本身，这几种情况的下一步完全不同，按 reason 分类给准确指引
+            title, advice = MainWindow._acl_denial(reason)
+            body = (f"已绑定云展动力账号：{phone}\n"
+                    f"本机已登记为当前使用设备，但权限校验未通过：{reason}")
+            return (title, body + (f"\n{advice}" if advice else ""), True)
+        title, body = MainWindow._claim_failure(phone, claim_msg)
+        return (title, body, True)
+
     def _on_bind_finished(self, ok, msg):
         self.bind_yzd_btn.setEnabled(HAS_YZD)
         if ok:
-            self._yzd_phone = msg
             saved = _tasks.save_account(msg)
-            self._on_log(f"✅ 已绑定云展动力账号：{msg}" + ("" if saved else "（本地保存失败，下次启动需重新绑定）"))
+            # 内存身份只在落盘成功时才切换：绑定账号的唯一事实来源是磁盘
+            # （access_guard 直接 task_registry.load_account），先改内存就会出现
+            # 「界面与云展功能是新号、权限判定按旧号」的两个身份——比绑定失败本身
+            # 难查得多，而且旧号的授权会被新号白拿。存不上就整体作废这次绑定。
+            if saved:
+                self._yzd_phone = msg
+            # 日志标记也必须与结论同源：✅ 配「不生效」正是本次弹窗缺陷在日志里的翻版
+            self._on_log(("✅ " if saved else "⚠ ") + f"绑定云展动力账号 {msg}：" +
+                         ("已保存" if saved else "本地保存失败，本次绑定不生效"))
             # 单点登录第二重：绑定即认领——把「这个账号 = 这台机器」写到 OSS 上。
             # 顺序不能反：先认领再判定，否则刚绑完的人会被自己的设备校验挡在门外
             # （远端还没有分片，判定只能回来说「正在校验本机设备绑定」）。
-            acl_msg = ""
-            if HAS_ACL_GUARD and saved:
-                try:
-                    _guard = _access_guard.get_guard()
-                    _guard.invalidate()
-                    claimed, claim_msg = _guard.claim_device(msg)
-                    self._on_log(("🔗 " if claimed else "⚠ ") + f"设备登记：{claim_msg}")
-                    if claimed:
-                        self._acl_stopped = False
-                    _guard.refresh_blocking(timeout=6.0)
-                    _allowed, _reason = _guard.check()
-                    if _allowed:
-                        acl_msg = "\n该账号已获得使用权限，本机已登记为当前使用设备。"
-                    elif claimed:
-                        # 认领成功却被名单挡下：说清楚是哪一重拦的，别让人去查网络
-                        acl_msg = f"\n{_reason}"
-                    else:
-                        acl_msg = f"\n{claim_msg}\n{_reason}"
-                    # 等级与界面不一致时（换了个不同等级的账号）当场收口 + 提示重启
-                    self._acl_sync_level()
-                except Exception as e:
-                    self._on_log(f"⚠ 设备登记异常：{type(e).__name__}: {e}")
-            elif HAS_ACL_GUARD and not saved:
-                acl_msg = "\n⚠ 账号没能保存到本地，权限校验仍按上一个号走；请重新绑定。"
-            QMessageBox.information(self, "绑定成功", f"已绑定云展动力账号：{msg}" + acl_msg)
+            claimed, claim_msg, allowed, reason = True, "", True, ""
+            if HAS_ACL_GUARD:
+                if saved:
+                    try:
+                        _guard = _access_guard.get_guard()
+                        _guard.invalidate()
+                        claimed, claim_msg = _guard.claim_device(msg)
+                        self._on_log(("🔗 " if claimed else "⚠ ") + f"设备登记：{claim_msg}")
+                        if claimed:
+                            self._acl_stopped = False
+                        _guard.refresh_blocking(timeout=6.0)
+                        allowed, reason = _guard.check()
+                        # 等级与界面不一致时（换了个不同等级的账号）当场收口 + 提示重启
+                        self._acl_sync_level()
+                    except Exception as e:
+                        # 异常也是一次失败的登记：必须进弹窗口径。旧版在这里只记
+                        # 日志、弹窗照旧「绑定成功」——同一个缺陷的第二个入口。
+                        claimed, claim_msg = False, f"登记过程出错（{type(e).__name__}）"
+                else:
+                    claim_msg = "账号没能保存到本地，未进行设备登记"
+            title, body, warn = self._bind_result_dialog(
+                msg, saved, claimed, claim_msg, allowed, reason,
+                acl=HAS_ACL_GUARD)
+            # 结论必须同时出现在正文首行：macOS 上 QMessageBox 常以 sheet 呈现，
+            # 标题栏根本看不到（实测 windowTitle() getter 还恒返回空串），只把结论
+            # 写进标题等于没写——那正是本次缺陷「标题说成功、正文说失败」的镜像面。
+            (QMessageBox.warning if warn else QMessageBox.information)(
+                self, title, f"{title}\n\n{body}")
         else:
             self._on_log(f"⚠ 绑定云展账号失败：{msg}")
-            QMessageBox.warning(self, "绑定失败", msg)
+            QMessageBox.warning(self, "绑定失败", f"绑定失败\n\n{msg}")
         self._refresh_yzd_status()
 
     def _open_yzd_import(self):

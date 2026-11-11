@@ -942,8 +942,28 @@ return '';})()"""
         return any(k in m for k in SESSION_DEAD_MARKS)
 
     # ── 标签固定（每站只用一个标签，绝不新建）─────────────────
+    def _tab_needed(self):
+        """本站当前是否真的依赖共享 Chrome 标签（单一判据：要不要，或手里已经拿着）。
+        需要浏览器的站恒为真；纯 HTTP 站平时恒为假，只有「已为过验证借到一枚标签」
+        （顺企网/麦麦B2B 的降级取页模式）时才为真。刻意只看 pin_tab_id 这个硬事实，
+        不看 _borrowed_tab 这类可能被别处清标签却忘了复位的意图标志。"""
+        return bool(getattr(self, "NEEDS_BROWSER", True) or self.pin_tab_id)
+
     def ensure_tab(self, log=None):
-        """取得/复用本站独占标签（import 延迟以避免循环依赖）。返回是否成功。"""
+        """取得/复用本站独占标签（import 延迟以避免循环依赖）。返回是否成功。
+
+        纯 HTTP 站（NEEDS_BROWSER=False）平时不占标签：这条门放在基类而不是靠
+        每个站点自己覆写空壳——覆写会漏（世界工厂网就漏过一次：共享 Chrome 没跑
+        时 ensure_tab 真去抢标签而失败），而「不弹浏览器」是类不变量，不是站点偏好。
+        显式例外有两条：open_verify_page 的「借页给人过验证」和借到标签后的自愈路径，
+        它们直取 _acquire_tab 本体，因为那一刻要的是标签本身。
+        """
+        if not self._tab_needed():
+            return True
+        return self._acquire_tab(log)
+
+    def _acquire_tab(self, log=None):
+        """真正去共享 Chrome 要一个标签（常规门与借页路径共用的本体）。"""
         import shared_chrome as sc
         try:
             tab, pin = sc.acquire_tab(self.port, self.BASE_URL or "about:blank",
@@ -959,6 +979,11 @@ return '';})()"""
     def start_browser(self, headed=True):
         """保证共享 Chrome 在跑并取得本站标签，然后导航到首页建立会话。幂等。"""
         import shared_chrome as sc
+        # 同一类不变量的第三处（ensure_tab / try_restore_session / 这里）：纯 HTTP 站
+        # 平时既不需要标签，就更不该被这一句把共享 Chrome 拉起来。靠每个站点各自覆写
+        # 空壳是防不住的（世界工厂网就漏覆写过），门放在基类。
+        if not self._tab_needed():
+            return True
         if not sc.is_alive(self.port):
             if not sc.ensure_shared_chrome(self._log, self.port, headed):
                 return False
@@ -978,6 +1003,10 @@ return '';})()"""
             pass
         self.pin_tab_id = ""
         self._ws_cache = ""
+        # 标签已经收回，「临时借来过验证」这个状态也必须一起落地：留着它，下一轮
+        # 就会拿着一个已经不存在的标签去关页/等自愈（见 _release_verify_tab）。
+        self._borrowed_tab = False
+        return None
 
     def _is_session_alive(self):
         try:
@@ -988,12 +1017,20 @@ return '';})()"""
     def try_restore_session(self):
         """标签/浏览器被关后自愈：确保 Chrome 在跑、重取本站标签。"""
         import shared_chrome as sc
+        # 纯 HTTP 站平时不碰浏览器，也就没有会话可自愈，更不许把共享 Chrome 拉起来
+        # 陪跑（与 ensure_tab 同一类不变量，判据统一走 _tab_needed）。但它一旦为过验证
+        # 借过标签（顺企网/麦麦B2B 的降级取页模式），就真依赖那枚标签 —— 此时若不
+        # 重取，_fetch_via_tab 会因 pin_tab_id 为空每页静默返回空串，整轮白跑到超时。
+        if not self._tab_needed():
+            return True
         self.pin_tab_id = ""
         self._ws_cache = ""
         if not sc.is_alive(self.port):
             if not sc.ensure_shared_chrome(self._log, self.port, True):
                 return False
-        return self.ensure_tab()
+        # 走 _acquire_tab 本体而非 ensure_tab：后者对纯 HTTP 站有道「平时不占标签」的门，
+        # 而能走到这里说明确实需要一枚新标签（浏览器站常规自愈 / 纯 HTTP 站借页后自愈）。
+        return self._acquire_tab()
 
     # ── 导航（Page.navigate + 回读 location 断言 + 就绪判据）───
     def _cdp_navigate(self, url):
@@ -1282,9 +1319,10 @@ return '';})()"""
                     not sc.ensure_shared_chrome(self._log, self.port, True):
                 self._log("⚠ 无法启动共享浏览器，只能干等站点限流自行冷却")
                 return False
-            # 纯 HTTP 站（如八方）把 ensure_tab 覆盖成了空壳（采集不需要标签），
-            # 但“借页给人看”必须真有一个标签，所以这里明确走基类实现。
-            if not CdpSiteCrawler.ensure_tab(self):
+            # 「借页给人看」必须真有一个可见标签，所以这里绕过 ensure_tab 的
+            # NEEDS_BROWSER 门、直取 _acquire_tab 本体：纯 HTTP 站平时不占标签，
+            # 但此刻要的是标签本身。需要浏览器的站则复用自己那枚（acquire_tab 幂等）。
+            if not CdpSiteCrawler._acquire_tab(self):
                 return False
             if not getattr(self, "NEEDS_BROWSER", True):
                 self._borrowed_tab = True

@@ -374,6 +374,97 @@ def test_two_new_sites():
        "页数硬上限与请求预算生效")
 
 
+# ── 6.8 「纯 HTTP 站零标签 / 借页必真取标签」基类不变量 ──────────
+def test_pure_http_tab_gate():
+    """钉住 cdp_base 的标签门（世界工厂网缺陷的回归闸口）。
+
+    旧写法是每个纯 HTTP 站各自覆写 ensure_tab 空壳，漏一个就在「共享 Chrome 没跑」
+    时真去抢标签而失败（gongchang 漏过一次）。现在门在基类，判据统一为 _tab_needed：
+      · 平时：一个字节都不碰浏览器（不抢标签、不拉 Chrome）；
+      · 为过验证借页时：必须真拿到标签（open_verify_page 绕过门直取 _acquire_tab）——
+        这条是修门时最容易顺手改坏的反向缺陷；
+      · 借到标签后：自愈路径必须真重取标签，不能被门短路成「报告成功但手里没标签」。
+    """
+    import inspect
+    import sys as _sys
+    import types
+    from cdp_base import CdpSiteCrawler
+    from parallel_session import SITE_CLASSES
+
+    real = _sys.modules.get("shared_chrome")
+    fake = types.ModuleType("shared_chrome")
+    touch = []
+
+    def _mk(name, ret=None):
+        def f(*a, **kw):
+            touch.append(name)
+            return ret
+        return f
+
+    fake.is_alive = _mk("is_alive", True)
+    fake.ensure_shared_chrome = _mk("launch_chrome", True)
+    fake.acquire_tab = _mk("acquire_tab", ({"id": "TAB1", "webSocketDebuggerUrl": "ws://fake/1"}, "TAB1"))
+    fake.close_tab = _mk("close_tab")
+    fake.release_tabs = _mk("release_tabs")
+    fake.show_tab = _mk("show_tab")
+    fake.get_version = _mk("get_version", {})
+    _sys.modules["shared_chrome"] = fake
+    try:
+        # ① 平时：纯 HTTP 站（且故意用没覆写 ensure_tab 的世界工厂网当探针）零触碰。
+        # start_browser 显式驱动基类实现：gongchang 自己那个空壳正好是「漏覆写」的替身，
+        # 只测空壳就等于没测门。
+        gc = SITE_CLASSES["gongchang"]()
+        touch.clear()
+        assert gc.NEEDS_BROWSER is False and gc.pin_tab_id == ""
+        assert gc.ensure_tab() is True and gc.try_restore_session() is True
+        assert CdpSiteCrawler.start_browser(gc) is True
+        assert touch == [], f"纯 HTTP 站平时不该碰浏览器，却触碰了 {touch}"
+        assert gc.pin_tab_id == "", "被门短路时不应留下任何标签归属"
+
+        # ② 需要浏览器的站：门必须放行，且真把标签拿回来并记下归属
+        gc.NEEDS_BROWSER = True
+        touch.clear()
+        assert gc.ensure_tab() is True
+        assert "acquire_tab" in touch and gc.pin_tab_id == "TAB1" and gc._ws_cache == "ws://fake/1"
+
+        # ③ 借页路径：纯 HTTP 站为过人工验证必须真借一枚标签（绕过门走本体）
+        gc.NEEDS_BROWSER = False
+        gc.pin_tab_id, gc._ws_cache, gc._borrowed_tab = "", "", False
+        gc._cdp_navigate = lambda url: touch.append(("navigate", url)) or True
+        gc._wait_ready = lambda *a, **kw: True
+        gc._show_tab_window = lambda: touch.append("show")
+        touch.clear()
+        assert gc.open_verify_page("https://qiye.gongchang.com/") is True
+        assert "acquire_tab" in touch, "借页必须真取标签：被 ensure_tab 的门短路就是静默失败"
+        assert gc.pin_tab_id == "TAB1" and gc._borrowed_tab is True
+
+        # ④ 借到标签后：自愈要真重取（判据是「手里有没有标签」，不是「平时要不要」）
+        touch.clear()
+        assert gc.try_restore_session() is True and "acquire_tab" in touch
+
+        # ⑤ 归还与收工都要把「借过」这个意图一起清掉，否则下一轮会去关一枚不存在的标签
+        gc._release_verify_tab()
+        assert gc.pin_tab_id == "" and gc._borrowed_tab is False
+        gc.pin_tab_id, gc._borrowed_tab = "TAB1", True
+        gc.close_browser()
+        assert gc.pin_tab_id == "" and gc._ws_cache == "" and gc._borrowed_tab is False
+
+        # ⑥ 源码闸口：借页与自愈只许走本体 _acquire_tab，不许再走带门的 ensure_tab
+        for fn in (CdpSiteCrawler.open_verify_page, CdpSiteCrawler.try_restore_session):
+            body = "\n".join(l for l in inspect.getsource(fn).splitlines()
+                             if not l.strip().startswith("#"))
+            assert "_acquire_tab(" in body and "ensure_tab(" not in body, \
+                f"{fn.__name__} 又走回带 NEEDS_BROWSER 门的 ensure_tab，纯 HTTP 站会静默拿不到标签"
+
+        # ⑦ 门与本体必须分离：本体绝不重复判门（否则借页路径被自己短路）
+        body = "\n".join(l for l in inspect.getsource(CdpSiteCrawler._acquire_tab).splitlines()
+                         if not l.strip().startswith("#"))
+        assert "NEEDS_BROWSER" not in body, "_acquire_tab 本体里不许再判 NEEDS_BROWSER"
+    finally:
+        _sys.modules["shared_chrome"] = real
+    ok("纯 HTTP 站标签门：平时零触碰、借页真取标签、借后自愈重取、归还即清标志")
+
+
 # ── 6.7 世界工厂网 离线契约 ────────────────────────────────────
 def test_gongchang_site():
     from parallel_session import SITE_CLASSES
@@ -590,6 +681,7 @@ def main():
         except AssertionError as e:
             print(f"  ⚠️  test_smart_expand 跳过（deepseek 缓存漂移，与本次集成无关）：{str(e)[:80]}")
         test_two_new_sites()
+        test_pure_http_tab_gate()
         test_gongchang_site()
         test_gui_defaults()
     print(f"\n全部通过：{len(PASS)} 组断言")

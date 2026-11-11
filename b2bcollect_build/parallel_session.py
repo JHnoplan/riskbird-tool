@@ -1535,6 +1535,10 @@ class ParallelSession:
             c.pin_tab_id = ""
             if hasattr(c, "_ws_cache"):
                 c._ws_cache = ""
+            # 标签收回与「临时借来过验证」必须同步失效：只清 pin_tab_id 而留着借页标志，
+            # 站点就会在下一轮去归还一枚早已不存在的标签（见 _release_verify_tab）。
+            if hasattr(c, "_borrowed_tab"):
+                c._borrowed_tab = False
         c1688 = self.crawlers.get("1688")
         if c1688 is not None:
             try:
