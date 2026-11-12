@@ -107,6 +107,47 @@ _HISTORY_MAX = 10                       # 换绑轨迹最多留几条（管理�
 # 合成状态标记：远端分片不存在、但本机曾经认领过 = 被解绑，必须走显式重新绑定
 RELEASED_STATE = "released"
 
+# ── 时间基准：进程内用单调时钟，落盘时间戳要防「落在将来」 ──────────────────
+# 为什么这件事值得单独立一节：本轮出问题的机器恰恰是**时钟不靠谱**的那批（系统
+# 「自动设置时间」被关掉、主板电池没电、虚拟机长时间挂起后恢复）。这类机器上，用
+# 墙上时钟算「距上次刷新过了 60 秒没有」会长出三种只在它们身上出现的病症：
+#   · 时间被往回调（NTP 纠正 / 用户手动改）之后，上一次刷新的时刻跑到将来去了，
+#     差值永远是负数 → 缓存被判定成**永远新鲜**，后台再也不刷新，被管理员删掉的
+#     账号在这台机器上能一路用到进程结束；
+#   · 有界等待 while time.time() < deadline 同理会从 3 秒变成**几小时的界面卡死**；
+#   · 磁盘副本的「最长 7 天」也一样失效，断网时照信一份不知道多老的名单。
+# 收口办法：进程内的新鲜度与等待一律用 time.monotonic()（它的语义本来就是「过了
+# 多久」，对改系统时间免疫）；必须跨进程比较的落盘时间戳仍用墙上时钟，但落在将来
+# 的时间戳按**不可信**处理（等同于最旧）——宁严勿宽。口径对齐 JWT 的 iat/nbf 容忍
+# 窗口与主流云 SDK 的时钟偏差处理：允许几秒抖动，不允许拿一个未来越过所有上限。
+CLOCK_FUTURE_TOLERANCE_SECONDS = 120.0    # 落盘时间戳最多允许超前这么久
+_MONO_NEVER = float("-inf")               # 「一次都没成功过」的单调时钟哨兵
+_STALE = float("inf")                     # 「时间戳不可信」= 按最旧处理
+
+
+def _mono_age(since: float) -> float:
+    """进程内距上次成功过去了多久（单调时钟，不受改系统时间影响）。"""
+    return time.monotonic() - since
+
+
+def _stamp_age(ts) -> float:
+    """落盘时间戳距今多久（秒）；不可信（缺失 / 非数 / 落在将来）时返回 _STALE。
+
+    返回 _STALE 而不是抛错：调用方的判据一律是「比上限还旧就丢掉」，不可信的时间戳
+    应当走同一条 fail-closed 分支，而不是把一次权限刷新带崩。
+    """
+    try:
+        value = float(ts or 0)
+    except (TypeError, ValueError):
+        return _STALE
+    if value <= 0:
+        return _STALE
+    delta = time.time() - value
+    if delta < -CLOCK_FUTURE_TOLERANCE_SECONDS:
+        return _STALE
+    return max(0.0, delta)
+
+
 LEVEL_ADMIN = _ed.LEVEL_ADMIN
 LEVEL_FULL = _ed.LEVEL_FULL
 LEVEL_LITE = _ed.LEVEL_LITE
@@ -131,15 +172,116 @@ def _now_text() -> str:
 # 三份文件各自只有一个写者（名单副本 / 设备指纹 / 认领记录），所以都不需要
 # 读-改-写合并；合成一份大文件反而会因为「刷新名单时把认领记录覆盖掉」出事故。
 
+# 首选落点写不进去时的备用落点：与丐版同一个应用数据目录，但不和数据池混在一起
+BACKUP_STATE_SUBDIR = "acl"
+
+# 本地状态读写中如实记下的问题（只有路径与异常类型，绝不带文件内容）：断网时
+# 「沿用上一次的身份等级」全靠磁盘副本，它落不下去必须让自检看得见。
+_STATE_PROBLEMS: List[str] = []
+# 一次运行只认一个落点（键 = 首选路径原文）：三份文件散在两个目录，比统一退到
+# 备用目录更糟——那会出现「名单副本在桌面、认领记录在备用目录」的拼接状态。
+_STATE_DIR_CACHE: Dict[str, Path] = {}
+
+
+def state_problems() -> List[str]:
+    """本地状态读写发现的问题（给 --acl-doctor 与日志读，界面无需再判一次）。"""
+    return list(_STATE_PROBLEMS)
+
+
+def _note_state_problem(text: str) -> None:
+    if text and text not in _STATE_PROBLEMS:
+        _STATE_PROBLEMS.append(text)
+
+
+def _note_untrusted_stamp(what: str) -> None:
+    """把「本地状态里的时间戳不可信」写进自检可见的问题清单。
+
+    丢弃一份不可信的副本是 fail-closed 的正确方向，但**安静地**丢弃就是又一轮
+    「用户被降级、界面上一个字都不提」：管理员照着提示去查网络、查白名单，而真正的
+    原因是这台电脑的系统时间被改过（先快后正、或者手动调过）。写日志不如写清单——
+    清单会被 --acl-doctor 原样打出来，远程排障只要那一份输出就够。
+    """
+    _note_state_problem(
+        f"{what}里的时间戳不可信（缺失、非数字或落在将来 = 这台电脑的系统时间被改过），"
+        f"已按最旧处理：断网期间这台机器会退回丐版")
+
+
+def _forget_state_dir() -> None:
+    """忘掉已解析的落点，下一次重新判定。
+
+    落点在**正常情况**下一次进程只定一次：`_state_file` 会在能力检查、认领、刷新
+    这些路径上被反复调用，每次都去桌面上写删一个探针文件，在漫游用户目录/网络盘的
+    机器上就是实打实的拖慢。但「真写失败」是这条判定唯一的凭据失效的信号——那一刻
+    起缓存的结论已经不被事实支持了，必须重新判一次：这样桌面被安全软件临时拦住、
+    稍后又放开的机器能自己回到首选目录，而不是整个进程都留在备用目录里。
+    """
+    _STATE_DIR_CACHE.clear()
+
+
+def _writable(path: Path) -> Optional[bool]:
+    """True/False = 探针结论；None = 探针模块本身没了（此时不下任何结论）。
+
+    判据复用 tool_config.probe_writable：「目录在不在」与「写不写得进去」是两件
+    事，两处各写一份迟早对不上，而对不上时看到假阳性的永远是远程排障的人。
+    """
+    try:
+        from tool_config import probe_writable
+    except Exception:
+        return None
+    return probe_writable(path)
+
+
+def _preferred_state_dir() -> Path:
+    """档位投影后的首选落点（pro 在桌面数据池缓存目录，lite 在应用数据目录）。"""
+    default = Path.home() / "Desktop" / "数据池缓存"
+    return Path(_ed.pool_cache_dir(str(default)))
+
+
+def _backup_state_dir() -> Path:
+    return _ed.app_data_dir() / BACKUP_STATE_SUBDIR
+
+
 def _state_dir() -> Path:
-    """权限本地状态目录：与数据池缓存同目录，但**按构建档位**投影。
+    """权限本地状态目录：与数据池缓存同目录、按构建档位投影，且必须**真写得进去**。
 
     外部用户的桌面上不该出现一个「数据池缓存」文件夹，里面还躺着
     .acl_cache.json 这种一眼就能看出「有白名单机制」的文件——路径判定同样
     只放在 edition 模块里，不在这里写 if lite。
+
+    为什么还要多走一次写探针：首选落点在**用户桌面**，而「桌面上写不进东西」在真实
+    机器上很常见——桌面被同步盘重定向、被安全软件的文件夹保护拦着、公司策略把用户目录
+    挂成只读。开发机一切正常，外部机器上三份文件一份也落不下去：断网时读不到上一次的
+    身份等级（只能退回丐版）、被顶号后的冷却时间归零，而界面上一个字都不提。
+    「静默失败 + 只在开发机成立」正是本轮缺陷的形状，所以这里宁可多探一次，也要把问题
+    记进 :func:`state_problems` 让自检看得见。
     """
-    default = Path.home() / "Desktop" / "数据池缓存"
-    return Path(_ed.pool_cache_dir(str(default)))
+    want = _preferred_state_dir()
+    key = str(want)
+    hit = _STATE_DIR_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    ok_want = _writable(want)
+    if ok_want:
+        chosen = want
+    else:
+        backup = _backup_state_dir()
+        ok_backup = _writable(backup)
+        if ok_want is None:
+            # 探针模块自己都没了：不拿猜测定落点，也不凭空报一个故障（产物本来就是
+            # 坏的，这一点由 --acl-doctor 的模块类退出码说，比这里准确得多）
+            chosen = want
+        elif ok_backup:
+            chosen = backup
+            _note_state_problem(f"权限本地状态首选目录不可写（{want}），改用备用目录：{backup}")
+        else:
+            # 两处都落不下去：留在首选路径（与修之前一致），但把后果写在问题清单里，
+            # 具体哪份文件没落地由 _write_json 的失败记录补上。
+            chosen = want
+            _note_state_problem(f"权限本地状态目录不可写（{want}），备用目录同样不可写："
+                                f"断网时无法沿用上一次的身份等级")
+    _STATE_DIR_CACHE[key] = chosen
+    return chosen
 
 
 def _state_file(name: str) -> Path:
@@ -167,19 +309,27 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data) -> bool:
-    """临时文件 + 原子替换：断电也不会留下半个坏 JSON。"""
+    """临时文件 + 原子替换：断电也不会留下半个坏 JSON。
+
+    失败绝不静默：返回值给调用方判断，同时记一条进 :func:`state_problems`。这三份
+    文件是断网时唯一能用的身份凭据，「写失败但没人知道」和这次的「读不到密钥但说成
+    网络问题」是同一类缺陷——症状轻，查起来最费时间。
+    """
     tmp = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
         return True
-    except Exception:
+    except Exception as e:
         try:
             if tmp.exists():
                 tmp.unlink()
         except Exception:
             pass
+        _note_state_problem(f"写入 {path.name} 失败（{type(e).__name__}: "
+                            f"{str(e)[:120]}），目录 {path.parent}")
+        _forget_state_dir()      # 写失败 = 落点判定的凭据没了，下一次重新判定
         return False
 
 
@@ -348,10 +498,17 @@ def _reclaim_blocked(phone: str) -> float:
     「刚能用又被踢」的抖动里，管理员也查不出到底是谁在用。从没被顶过的机器
     （新设备第一次认领）不受这个限制，正常换机不额外等待。
     """
-    ts = float(_claim_of(phone).get("kicked_ts") or 0)
-    if not ts:
+    raw = _claim_of(phone).get("kicked_ts")
+    if not raw:
         return 0.0
-    return max(0.0, RECLAIM_COOLDOWN_SECONDS - (time.time() - ts))
+    age = _stamp_age(raw)     # 脏值（非数字、缺失）也在里面按不可信处理，不许抛错
+    if age == _STALE:
+        # 时间戳落在将来 = 这台机器的时钟被动过。照走一整段冷却：既不给人「把钟
+        # 拨回去就能立刻抢回来」的空子，也不会算出几小时几天的荒唐等待（那种数字
+        # 写在界面上，用户只会当成工具坏了）。
+        return float(RECLAIM_COOLDOWN_SECONDS)
+    return max(0.0, min(RECLAIM_COOLDOWN_SECONDS,
+                        RECLAIM_COOLDOWN_SECONDS - age))
 
 
 # ── 名单解析 ────────────────────────────────────────────────────────────────
@@ -494,13 +651,18 @@ class AccessGuard(QObject):
         self._grants_declared = False                # 名单里有没有等级字段
         self._binding: Optional[dict] = None         # 该账号当前的设备分片
         self._binding_phone = ""                     # 这份分片是为哪个号读的
-        self._acl_at = 0.0                           # 名单最近成功时刻
-        self._bind_at = 0.0                          # 绑定状态最近成功时刻
-        self._fetched_at = 0.0                       # =min(_acl_at,_bind_at)
+        self._acl_at = _MONO_NEVER                   # 名单最近成功时刻
+        self._bind_at = _MONO_NEVER                  # 绑定状态最近成功时刻
+        self._fetched_at = _MONO_NEVER               # =min(_acl_at,_bind_at)
         self._disk_loaded = False                    # 磁盘副本只尝试加载一次
+        # 权限服务可达性结论：kind ∈ unknown/ok/credential/module/other/network。
+        # 默认 unknown（还没试过），check() 在没试过时会先做一次廉价探测，
+        # 这样「包里没带密钥」第一次点击就能说清是哪一类，而不是永远套网络文案。
+        self._service_kind = "unknown"
+        self._service_detail = ""
         self._inflight = False                       # 后台刷新去重（含冷启动窗口）
         self._enrolling: set = set()                 # 自动登记在途的账号（去重）
-        self._last_toast = 0.0
+        self._last_toast = _MONO_NEVER
         self._revoked = ""                           # 待交出去的顶号事件（一次性）
         self._revoked_latched = False                # 本轮掉线是否已经报过
         self._account_reader = None                  # 测试注入点：绑定账号读取函数
@@ -517,11 +679,194 @@ class AccessGuard(QObject):
 
     @staticmethod
     def _build_client():
+        client, _kind, _detail = AccessGuard._client_probe()
+        return client
+
+    def _acquire_client(self, client=None):
+        """``(client, kind, detail)``：先走可被替换的 ``_build_client``，失败才补分类。
+
+        为什么不是直接用 ``_client_probe()``：``_build_client`` 是本类**唯一**的客户端
+        构造入口，离线测试与内部夹具都顶掉它（实例级与类级两种）。分类探测绕开它，
+        「跑一遍测试」就会变成「拿真实密钥连一遍生产 OSS」。成功路径不多花任何一次
+        凭证解析；失败路径多出的那一次只读配置、不出网。
+        """
+        if client is not None:
+            return client, "ok", ""
+        built = self._build_client()
+        if built is not None:
+            return built, "ok", ""
+        _probe, kind, detail = self._client_probe()
+        return None, kind, detail
+
+    @staticmethod
+    def _client_probe():
+        """构造 OSS 客户端，并把失败原因**分类**交出去。
+
+        返回 ``(client 或 None, kind, detail)``，kind ∈ ok / module / credential / other。
+
+        为什么必须分类（2026-11 外部机器全员丐版）：过去这里是一个
+        ``except Exception: return None``，把「这个包压根没带密钥」「包里缺依赖」
+        「网络不通」三种完全不同的故障压成同一个 None，上层只能统一说成
+        「无法连接权限服务器，请检查网络后重试」。于是发包侧漏配凭证这种**构建期
+        就能查出来**的缺陷，被文案一路推给终端用户的网络和管理员的白名单，
+        谁都不会去查那个真正的地方（打包工作流）。分类是把这个缺陷从
+        「不可诊断」变成「一句话可诊断」的前提。
+        """
         try:
-            from oss_pool_client import OSSPoolClient
-            return OSSPoolClient()
-        except Exception:
-            return None
+            from oss_pool_client import OSSPoolClient, OSSCredentialError
+        except Exception as e:
+            return None, "module", (
+                f"权限模块加载失败（{type(e).__name__}: "
+                f"{str(e).splitlines()[0][:120]}）")
+        try:
+            return OSSPoolClient(), "ok", ""
+        except OSSCredentialError as e:
+            return None, "credential", str(e)
+        except Exception as e:
+            return None, "other", (
+                f"{type(e).__name__}: {str(e).splitlines()[0][:120]}")
+
+    @classmethod
+    def _must_client(cls, client=None):
+        """管理入口专用：拿到可用的 OSS 客户端，拿不到就抛**分类过**的异常。
+
+        校验路径（check/claim）失败可以退成「暂时不给用」，管理路径不行：
+        操作的人就是管理员本人，一句「初始化失败（缺少密钥或依赖模块）」把
+        三种故障写成一件事，等于让人对着猜。分类后的信息直接指向该改的地方。
+        """
+        if client is not None:
+            return client
+        own = cls._build_client()
+        if own is not None:
+            return own
+        _probe, kind, detail = cls._client_probe()
+        raise RuntimeError(cls._admin_client_failure(kind, detail))
+
+    @staticmethod
+    def _admin_client_failure(kind: str, detail: str = "") -> str:
+        head = {
+            "credential": ("权限服务凭证不可用：本机没有 OSS 密钥"
+                           "（安装包应由 CI 注入 config.json，开发态应配置 "
+                           "config.json 或 OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET）"),
+            "module": "权限服务模块加载失败：安装包缺依赖或文件损坏",
+            "other": "权限服务客户端构造失败",
+        }.get(kind, "权限服务客户端不可用")
+        return f"{head}｜{detail}".strip("｜") if detail else head
+
+    # 各类故障对应的用户口径：判据与下一步必须同源，否则就是把人往错的方向引。
+    _UNREACHABLE_TEXT = {
+        "credential": (
+            "这个版本的工具没有带上权限服务凭证，这不是你的网络问题，不用检查网络。"
+            "属发包环节漏配：请向开发者索取最新版本的安装包（开发者处理办法见 "
+            "workflow 的 OSS Secret 注入步骤）。"),
+        "module": (
+            "权限服务模块没能加载（安装包缺依赖或文件损坏），不是你的网络问题。"
+            "请重新下载最新安装包，或向开发者反馈。"),
+        "other": (
+            "权限服务返回异常，暂时无法确认本机使用权限。请稍后重试；"
+            "持续如此请把本条提示反馈给开发者。"),
+        "denied": (
+            "权限服务拒绝了本次访问：密钥已失效，或这把密钥的权限范围里没有"
+            "权限名单这条路径。这不是你的网络问题，也不用改白名单——需要开发者"
+            "检查随包密钥与 RAM 权限策略。"),
+        "clock": (
+            "这台电脑的系统时间与标准时间相差太大，权限服务按防盗用规则拒绝了"
+            "本次请求。这不是网络问题，也不是账号问题：把系统的「自动设置时间」"
+            "打开就能恢复。"),
+        "tls": (
+            "这台电脑到权限服务之间的加密连接被中途拦下了（常见于安全软件的网页"
+            "过滤、公司代理或不受信任的根证书）。这不是网络不通，跟账号也没有"
+            "关系：浏览器能打开网页，工具照样连不上。"),
+        "network": (
+            "无法连接权限服务器，请检查网络后重试；仍无法使用请联系管理员"),
+    }
+
+    # 「这条 reason 属于哪一类故障」的反查表。界面拿到的是文案字符串，要按类别
+    # 决定「能不能承诺自动补齐」就必须先把它归一次类。
+    # 为什么表放在这里而不是界面里：文案和归类同源才不会脱节——归类关键词写在
+    # 界面里，改一句文案就会悄悄改掉一条分支（这是上一轮「提示与实际不符」的
+    # 同款结构问题）。
+    _REASON_MARKERS = {
+        "credential": ("没有带上权限服务凭证", "权限服务凭证不可用"),
+        "module": ("权限服务模块没能加载", "权限服务模块加载失败"),
+        "denied": ("权限服务拒绝了本次访问",),
+        "clock": ("系统时间与标准时间相差太大",),
+        "tls": ("加密连接被中途拦下",),
+        "other": ("权限服务返回异常", "权限服务客户端构造失败"),
+    }
+
+    # 每一类故障「下一步该做什么」。判据与下一步必须成对出现：只说「连不上」
+    # 而不说该谁去做什么，用户就只能试网络、管理员就只能翻名单。
+    SERVICE_NEXT_STEP = {
+        "credential": (
+            "这一类不会自己变好：凭证是打包时注入的，本地改网络、重新绑定、"
+            "加白名单都不起作用。请换用最新版本的安装包；开发者处理办法见 "
+            "workflow 的 OSS Secret 注入步骤与 --acl-doctor 产物自检。"),
+        "module": (
+            "这一类也不会自己变好：请重新下载完整安装包（文件损坏或被安全软件"
+            "拦截都会导致模块加载失败），仍不行就把本条提示反馈给开发者。"),
+        "denied": (
+            "这一类要找开发者：随包密钥已失效，或它的 RAM 权限范围里没有权限"
+            "名单那条路径。改白名单没有用——请求根本没被服务接受。"),
+        "clock": (
+            "这一类在这台电脑上就能修好，不用换包也不用找开发者：打开系统的"
+            "「自动设置时间」（Windows：设置 → 时间和语言 → 立即同步；"
+            "macOS：系统设置 → 通用 → 日期与时间）后重新打开工具。"),
+        "tls": (
+            "这一类也在电脑上解决，账号侧什么都用不着做：\n"
+            "· 装了带「网页过滤 / HTTPS 扫描」的安全软件，或走公司代理：临时关掉"
+            "该扫描，或请 IT 给 *.aliyuncs.com 放行（代理例外 + 受信任证书）；\n"
+            "· 上面都不是：请把这条提示原样反馈给开发者——安装包缺可信根证书也是"
+            "这个形态，需要开发者重新发包。"),
+        "other": (
+            "请先稍后重试一次；持续出现请把本条提示的原文反馈给开发者，"
+            "这类故障需要在服务端排查，本地不需要改动。"),
+    }
+
+    @classmethod
+    def classify_reason(cls, reason: str) -> str:
+        """把一条 reason 文案归回故障类别，认不出来返回空串。"""
+        r = reason or ""
+        for kind, marks in cls._REASON_MARKERS.items():
+            if any(mark in r for mark in marks):
+                return kind
+        return ""
+
+    def service_status(self) -> Tuple[str, str]:
+        """最近一次权限服务可达性结论：``(kind, detail)``。
+
+        界面、自检、CLI 都读这一个口径，不许各自再猜一次。kind 为 ``ok`` 表示
+        最近一次刷新真的从远端拿到了名单。
+        """
+        with self._lock:
+            return self._service_kind, self._service_detail
+
+    @classmethod
+    def _unreachable_text(cls, kind: str) -> str:
+        """类别 → 用户口径的一句话（认不出的类别按网络类兜底，绝不空手而归）。"""
+        return cls._UNREACHABLE_TEXT.get(kind or "network",
+                                         cls._UNREACHABLE_TEXT["network"])
+
+    def _unreachable_reason(self) -> str:
+        """把「拉不到名单」翻译成按故障分类的一句话。
+
+        还没试过（unknown）时先做一次**不出网**的本地探测：构造客户端只做
+        「模块能不能 import、密钥能不能解析」两件事，微秒级。这一步是整条链路
+        的关键——没有它，「包里没带凭证」这种必然失败的情况会永远显示成
+        「请检查网络」，因为网络确实没坏，只是根本没资格出网。
+        """
+        with self._lock:
+            kind = self._service_kind
+        if kind == "unknown":
+            _c, kind, detail = self._acquire_client()
+            if _c is not None:
+                kind = "network"      # 客户端能建起来，才谈得上是网络问题
+                detail = ""
+            self._set_service(kind, detail)
+        # credential 这一类在开发态与打包态的处理人不同（本机没配 / 发包漏注入），
+        # 但两边都不该被说成网络问题；具体是谁的活儿由文案里那句「处理办法见
+        # workflow」自己交代，不在这里再分叉一次
+        return self._unreachable_text(kind)
 
     def _bound_phone(self) -> str:
         reader = self._account_reader
@@ -529,6 +874,50 @@ class AccessGuard(QObject):
         return _normalize_account(phone or "")
 
     # ── 名单 + 绑定状态获取与缓存 ──
+
+    def _set_service(self, kind: str, detail: str = ""):
+        with self._lock:
+            self._service_kind = kind
+            self._service_detail = detail or ""
+
+    @staticmethod
+    def _classify_oss_error(err) -> Tuple[str, str]:
+        """把一次 OSS 读失败归到「用户该往哪查」的类别上。
+
+        网络类（超时/连不上/DNS）与凭证类（403、签名不符、密钥失效）在协议层
+        完全不同，却常常被一起写成「连不上服务器」。前者该让用户看网络，后者
+        该让开发者看密钥与 RAM 权限策略——归错类的代价是两边互相指。
+
+        时间偏差单独一类（而且必须排在 403 之前判）：OSS 把请求时刻算进签名，
+        本机时钟偏出 15 分钟会被回一个**和密钥失效同样形态的 403**。客户端平时
+        会按服务端时间自愈重签（见 oss_pool_client._send），走到这里说明自愈没成
+        功。这种故障用户自己就能修（校准时间），把它说成「找开发者换密钥」会让
+        两边各自空跑一轮。
+        """
+        m = str(err or "")
+        low = m.lower()
+        if any(k in low for k in ("requesttimetooskewed", "difference between the request time",
+                                  "时间偏差", "系统时间")):
+            return "clock", m
+        # 加密连接被中途拦下（安全软件网页过滤 / 公司代理 / 不受信任的根证书 / 打包
+        # 态缺可信证书）：请求根本没到达 OSS，却常被写成「连不上服务器，请检查网络」
+        # ——而它的修法与网络通不通毫无关系（浏览器能打开网页，工具照样连不上）。
+        # 排在 denied 之前判：这类失败一个 HTTP 状态码都没有，绝不该被认成密钥问题。
+        if any(k in low for k in ("ssl", "tls", "certificate", "handshake",
+                                  "cert_verify_failed", "unable to get local issuer",
+                                  "self signed", "wrong version number")):
+            return "tls", m
+        if any(k in low for k in ("signaturedoesnotmatch", "invalidaccesskeyid",
+                                  "accessdenied", "invalidauthorization")) \
+                or "403" in m or "签名" in m or "密钥" in m:
+            return "denied", m
+        if any(k in low for k in ("nosuchkey", "not found", "不存在")):
+            return "network", m
+        if any(k in low for k in ("timeout", "timed out", "connection",
+                                  "unreachable", "getaddrinfo",
+                                  "temporary failure", "name resolution")):
+            return "network", m
+        return "other", m
 
     def _fetch(self) -> bool:
         """一次刷新同时取回「名单+等级」和「本机绑定状态」。
@@ -539,9 +928,15 @@ class AccessGuard(QObject):
         """
         try:
             from oss_pool_client import OSSPoolError
-            client = self._build_client()
+            client, kind, detail = self._acquire_client()
             if client is None:
+                # 客户端压根构造不出来：这从来不是网络抖动，先于任何出网动作把
+                # 类别记下来，第一次点击就能把「包里没带密钥」和「网络不通」分开
+                self._set_service(kind, detail)
                 return False
+            # 构造成功但还没出网：此刻的默认结论是「网络类」，一旦真拿到名单就改 ok
+            self._set_service("network", "最近一次出网未取回远端名单")
+
             phone = self._bound_phone()
 
             ok_acl = False
@@ -556,16 +951,19 @@ class AccessGuard(QObject):
                     client.upload_json_atomic(ACL_KEY, _new_document(DEFAULT_GRANTS))
                     doc, _ = client.download_json(ACL_KEY)
                 else:
+                    k, d = self._classify_oss_error(e)
+                    self._set_service(k, d)
                     doc = None
             if doc is not None:
                 accounts = _parse_accounts(doc)
                 grants, declared = _parse_grants(doc)
                 ok_acl = True
+                self._set_service("ok", "")
                 with self._lock:
                     self._accounts = accounts
                     self._grants = grants or {}
                     self._grants_declared = declared
-                    self._acl_at = time.time()
+                    self._acl_at = time.monotonic()
                 self._write_disk({"accounts": accounts, "grants": grants or {},
                                   "grants_declared": declared, "phone": phone})
 
@@ -593,7 +991,7 @@ class AccessGuard(QObject):
                     with self._lock:
                         self._binding = binding
                         self._binding_phone = phone
-                        self._bind_at = time.time()
+                        self._bind_at = time.monotonic()
 
             with self._lock:
                 self._fetched_at = min(self._acl_at, self._bind_at)
@@ -656,10 +1054,12 @@ class AccessGuard(QObject):
         obj = _read_json(_cache_file(), None)
         if not isinstance(obj, dict):
             return
-        try:
-            if time.time() - float(obj.get("fetched_at", 0)) > DISK_MAX_AGE_SECONDS:
-                return
-        except (TypeError, ValueError):
+        # 时间戳不可信（缺失/非数/落在将来）时 _stamp_age 给 _STALE，同样走这条
+        # return：一份「不知道什么时候写的」副本不足以在断网时撑起完整功能。
+        age = _stamp_age(obj.get("fetched_at", 0))
+        if age > DISK_MAX_AGE_SECONDS:
+            if age == _STALE:
+                _note_untrusted_stamp("本地权限名单副本")
             return
         accounts = [a for a in _parse_accounts(obj) if a]
         if not accounts:
@@ -759,10 +1159,10 @@ class AccessGuard(QObject):
         rec = _claim_of(phone)
         if not rec.get("session"):
             return None
-        try:
-            if time.time() - float(rec.get("claimed_ts") or 0) > DISK_MAX_AGE_SECONDS:
-                return None
-        except (TypeError, ValueError):
+        age = _stamp_age(rec.get("claimed_ts"))
+        if age > DISK_MAX_AGE_SECONDS:
+            if age == _STALE:
+                _note_untrusted_stamp("本机认领记录")
             return None
         if str(rec.get("device_id") or "") != device_id():
             return None
@@ -801,7 +1201,7 @@ class AccessGuard(QObject):
 
         with self._lock:
             accounts = self._accounts
-            fresh = (time.time() - self._fetched_at) < self._ttl
+            fresh = _mono_age(self._fetched_at) < self._ttl
         if accounts is None:
             self._load_disk_once()
             with self._lock:
@@ -810,22 +1210,25 @@ class AccessGuard(QObject):
             # 冷启动：有界等待一次拉取结果，超时先拒绝（不弹窗报错，下次点击重试）
             self._start_refresh()
             if wait:
-                deadline = time.time() + FIRST_FETCH_WAIT_SECONDS
-                while time.time() < deadline:
+                deadline = time.monotonic() + FIRST_FETCH_WAIT_SECONDS
+                while time.monotonic() < deadline:
                     time.sleep(0.05)
                     with self._lock:
                         accounts = self._accounts
                     if accounts is not None:
                         break
         if accounts is None:
-            return False, "无法连接权限服务器，请检查网络后重试；仍无法使用请联系管理员"
+            # 按故障分类给一句话：过去这里写死「请检查网络」，于是「安装包没带
+            # 密钥」这种必然失败的情况也会让用户去查路由器（2026-11 外部机器
+            # 全员丐版就是这样被误诊成网络问题的）。
+            return False, self._unreachable_reason()
         if not fresh:
             # ``fresh`` 是函数开头取的旧值：冷启动那一次有界等待**本身就是这次刷新**，
             # 不再重读就会紧接着多起一轮「名单+分片」——每次开机第一下点击都要跑两遍，
             # 更麻烦的是两轮并发写同一份判定结果，后收尾的那轮会拿刚读到的旧结论把
             # 前一轮刚落下的顶号事件清掉（离线测试实机复现过）。
             with self._lock:
-                fresh = (time.time() - self._fetched_at) < self._ttl
+                fresh = _mono_age(self._fetched_at) < self._ttl
         if not fresh:
             self._start_refresh()
         if phone not in {a for a in accounts}:
@@ -842,14 +1245,14 @@ class AccessGuard(QObject):
 
         # 第三重：本机必须是该账号当前的绑定设备
         with self._lock:
-            bind_fresh = (time.time() - self._bind_at) < self._ttl
+            bind_fresh = _mono_age(self._bind_at) < self._ttl
         binding = self._binding_for(phone)
         if binding is None and not bind_fresh:
             # 设备状态一次都没出网确认过：有界等一次刷新，等不到就下轮再来
             self._start_refresh()
             if wait:
-                deadline = time.time() + FIRST_FETCH_WAIT_SECONDS
-                while time.time() < deadline:
+                deadline = time.monotonic() + FIRST_FETCH_WAIT_SECONDS
+                while time.monotonic() < deadline:
                     time.sleep(0.05)
                     binding = self._binding_for(phone)
                     if binding is not None:
@@ -884,7 +1287,7 @@ class AccessGuard(QObject):
         没能处理时的第二次机会。返回值非空即「本机刚被顶掉」。
         """
         with self._lock:
-            fresh = (time.time() - self._fetched_at) < self._ttl
+            fresh = _mono_age(self._fetched_at) < self._ttl
         if not fresh:
             self._start_refresh()
         return self.take_revoked()
@@ -913,9 +1316,9 @@ class AccessGuard(QObject):
     def invalidate(self):
         """强制下次 check 重新出网拉取（绑定成功、管理员改名单后调用）。"""
         with self._lock:
-            self._fetched_at = 0.0
-            self._acl_at = 0.0
-            self._bind_at = 0.0
+            self._fetched_at = _MONO_NEVER
+            self._acl_at = _MONO_NEVER
+            self._bind_at = _MONO_NEVER
 
     def refresh_blocking(self, timeout: float = 5.0) -> bool:
         """同步刷新一次（限时）：绑定流程的成功收尾用，确保点完绑定
@@ -959,9 +1362,12 @@ class AccessGuard(QObject):
         phone = _normalize_account(phone)
         if not phone or not _MOBILE_RE.match(phone):
             return False, "手机号格式有误，无法登记设备", None
-        own = client if client is not None else self._build_client()
+        own, kind, detail = self._acquire_client(client)
         if own is None:
-            return False, "无法连接权限服务器，设备登记失败", None
+            # 设备登记失败也必须分类：包里没带密钥时，「请检查网络」会把用户
+            # 引去查路由器，而真正要修的是打包工作流（2026-11 外部机器全员丐版）
+            self._set_service(kind, detail)
+            return False, f"设备登记失败：{self._unreachable_reason()}", None
 
         from oss_pool_client import OSSPoolError
         if prev_hint is None:
@@ -1026,7 +1432,7 @@ class AccessGuard(QObject):
         with self._lock:
             self._binding = back
             self._binding_phone = phone
-            self._bind_at = time.time()
+            self._bind_at = time.monotonic()
             self._fetched_at = min(self._acl_at, self._bind_at)
             self._revoked = ""
             self._revoked_latched = False
@@ -1050,9 +1456,7 @@ class AccessGuard(QObject):
         调用方拿到的一定是可以直接读写的结构，不必各自再解析一遍原始 JSON。
         """
         from oss_pool_client import OSSPoolError
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         try:
             doc, _ = own.download_json(ACL_KEY)
         except OSSPoolError as e:
@@ -1084,9 +1488,7 @@ class AccessGuard(QObject):
         ``drop_accounts`` 是删除账号用的：只从 accounts 里减不够，因为 grants 也会被
         并进来，「删掉的号还留在 grants 里」等于没删。所以最终集合一律再减一次。
         """
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         version = int(doc.get("version") or 0)
         drop = {_normalize_account(a) for a in (drop_accounts or [])}
         accounts = sorted((set(doc.get("accounts") or []) | set(grants)
@@ -1105,9 +1507,7 @@ class AccessGuard(QObject):
         只给号码不给等级时：已有等级沿用，新号取最保守那一档——管理员忘了写
         等级，后果是「这个号先按受限版用」，而不是「这个号把内部功能全看到了」。
         """
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         doc, version = cls.load_document(own)
         grants = dict(doc["grants"])
         wanted: Dict[str, int] = {}
@@ -1130,9 +1530,7 @@ class AccessGuard(QObject):
     @classmethod
     def set_levels(cls, entries: List[str], client=None) -> dict:
         """批量改等级：``手机号=等级``。号码必须已在名单里（不在就先 --add）。"""
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         doc, _ = cls.load_document(own)
         grants = dict(doc["grants"])
         changed: Dict[str, int] = {}
@@ -1167,9 +1565,7 @@ class AccessGuard(QObject):
            只能回 OSS 控制台手工改文件。
         """
         from oss_pool_client import OSSPoolError
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         doc, _ = cls.load_document(own)
         targets: List[str] = []
         for raw in phones:
@@ -1250,9 +1646,7 @@ class AccessGuard(QObject):
     def list_devices(cls, phones: Optional[List[str]] = None, client=None) -> List[dict]:
         """列出各账号当前绑定的设备（管理员查「谁在多处用同一个号」）。"""
         from oss_pool_client import OSSPoolError
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         if phones is None:
             phones = cls.load_document(own)[0]["accounts"]
         out: List[dict] = []
@@ -1291,9 +1685,7 @@ class AccessGuard(QObject):
         删掉而不是改写，是为了让被踢的机器不会把「分片还在、只是换了机器」
         误读成自己的会话；分片不存在会走自动登记分支，语义最干净。
         """
-        own = client if client is not None else cls._build_client()
-        if own is None:
-            raise RuntimeError("OSS 客户端初始化失败（缺少密钥或依赖模块）")
+        own = cls._must_client(client)
         own.delete_key(cls._bind_key(phone))
         get_guard().invalidate()
         return True
@@ -1408,8 +1800,17 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
         declared = guard._grants_declared
     phone = guard._bound_phone()
     if accounts is None or not phone or phone not in accounts:
-        _ed.set_account_level(LEVEL_LITE, phone,
-                              reason="开机未确认到本号的有效名单，按丐版起界面")
+        # 定档口径不变（一律丐版，fail-closed 是安全边界），但**原因**必须落到
+        # 分类口径上：这条 reason 会进 edition，被横幅/日志原样带出来。过去它写成
+        # 「未确认到有效名单」，用户看到的第一屏就是丐版，却没有任何一处告诉他
+        # 「这个包压根没带权限凭证」——于是整批外部机器只能靠截图互相猜。
+        if accounts is None:
+            why = guard._unreachable_reason()
+        elif not phone:
+            why = "本机还没有绑定云展动力账号"
+        else:
+            why = f"账号 {phone} 不在本次拉取的名单里"
+        _ed.set_account_level(LEVEL_LITE, phone, reason=f"开机按丐版起界面：{why}")
         return LEVEL_LITE
     level = resolve_level(phone, grants, declared)
     _ed.set_account_level(level, phone, reason=f"开机 OSS 权威等级 {level}")
@@ -1528,7 +1929,7 @@ def eventFilter(self, obj, event):
 
 def _notify(self, reason: str, widget):
     """拒绝提示：非阻塞 Toast 优先，4 秒防抖；无 Toast 能力时降级弹窗。"""
-    now = time.time()
+    now = time.monotonic()        # 防抖是「隔了多久」，用单调时钟才不会被改时间卡住
     if now - self._last_toast < _TOAST_INTERVAL:
         return
     self._last_toast = now
@@ -1553,6 +1954,213 @@ AccessGuard._EXEMPT_TEXTS = _EXEMPT_TEXTS
 AccessGuard._is_exempt = _is_exempt
 AccessGuard.eventFilter = eventFilter
 AccessGuard._notify = _notify
+
+
+# ── 产物自检（发包门禁）────────────────────────────────────────────────────
+# 为什么必须有这一步：本轮「外部机器全员丐版」的根因不是某行代码写错，而是
+# 「产物到底能不能连上权限服务」这件事**从来没有被验证过一次**。开发机上恰好
+# 能从本机 iOS 工程读到密钥，源码怎么跑都通；打包机上没有那份文件，于是发出去
+# 的每个包都缺凭证。在开发机测一百遍也测不出这种缺陷。
+# 做法对齐容器/桌面软件交付里的 smoke test：构建完立刻**拿产物自己**做一次真连
+# 自检，不通就不许发货。退出码分类，让 CI 与人都能一眼看出该修哪一层。
+
+DOCTOR_EXIT_OK = 0
+DOCTOR_EXIT_CREDENTIAL = 2
+DOCTOR_EXIT_MODULE = 3
+DOCTOR_EXIT_DENIED = 4
+DOCTOR_EXIT_NETWORK = 5
+DOCTOR_EXIT_OTHER = 6
+DOCTOR_EXIT_CLOCK = 7
+DOCTOR_EXIT_TLS = 8
+
+_DOCTOR_KIND_CODE = {
+    "credential": DOCTOR_EXIT_CREDENTIAL,
+    "module": DOCTOR_EXIT_MODULE,
+    "denied": DOCTOR_EXIT_DENIED,
+    "network": DOCTOR_EXIT_NETWORK,
+    "other": DOCTOR_EXIT_OTHER,
+    # 时钟偏差单独一个码：CI 的 runner 时间是同步好的，红在这里基本只可能是
+    # 「产物里的自愈逻辑没生效」，与「密钥不对」是两个完全不同的排查方向
+    "clock": DOCTOR_EXIT_CLOCK,
+    # 加密连接被拦也单独一个码：CI 上出现它 = 构建环境的证书链/代理与 OSS 不通，
+    # 该修的是构建机网络策略，而不是发包用的密钥
+    "tls": DOCTOR_EXIT_TLS,
+}
+
+DOCTOR_LOG_NAME = "acl_doctor.txt"
+
+
+def doctor_lines() -> Tuple[int, List[str]]:
+    """执行一次自检，返回 ``(退出码, 报告行)``。
+
+    只读不写：绝不在自检里播种名单或改绑定状态——CI 里跑一次自检不应该改变线上
+    数据。输出全部走返回值，由调用方决定往哪儿落。
+    """
+    out: List[str] = []
+    code = DOCTOR_EXIT_OK
+
+    def say(line: str = ""):
+        out.append(str(line))
+
+    try:
+        import tool_config
+        frozen = tool_config.is_frozen()
+    except Exception as e:                      # 自检模块自己没了也是发包级问题
+        return DOCTOR_EXIT_MODULE, [
+            "❌ acl-doctor：tool_config 模块缺失",
+            f"   · {type(e).__name__}: {e}",
+            "   · 说明打包清单没收到这个模块，产物读不到任何配置。",
+        ]
+    say(f"acl-doctor 形态={'打包' if frozen else '源码'}  "
+        f"python={sys.version.split()[0]}  platform={sys.platform}")
+    say(f"   · 配置候选：{tool_config.describe()}")
+
+    # 0) 「配了但配不全」这一类：半份密钥比没配更难查——它会让某一级被整级跳过，
+    #    而界面上看到的症状和「没配」一模一样。这一行就是为了让它在报告里现形。
+    try:
+        for w in tool_config.warnings():
+            say(f"⚠️ acl-doctor：{w}")
+    except Exception:
+        pass
+
+    # 1) 凭证：能不能拿到、从哪一级拿到（只报来源，绝不报值）
+    try:
+        from oss_pool_client import credential_origin
+        origin = credential_origin()
+    except Exception as e:
+        say(f"   · OSS 凭证来源：无法判定（{type(e).__name__}: {e}）")
+        origin = "未知"
+    say(f"   · OSS 凭证来源：{origin}")
+
+    client, kind, detail = AccessGuard._client_probe()
+    if client is None:
+        code = _DOCTOR_KIND_CODE.get(kind, DOCTOR_EXIT_OTHER)
+        say(f"❌ acl-doctor：权限服务客户端构造失败（类别={kind}）")
+        say(f"   · {detail}")
+        say(f"   · 用户侧口径：{AccessGuard._unreachable_text(kind)}")
+        say("   · 这一步不通，外部机器就会永远按丐版起界面——不许发货。")
+        return code, out
+    say(f"   · 客户端可构造：bucket={client.bucket} endpoint={client.endpoint}")
+
+    # 2) 真连一次：读权限名单（只读，绝不播种、绝不改写）
+    try:
+        doc, _etag = client.download_json(ACL_KEY)
+    except Exception as e:
+        # 凭证类异常在这里也可能二次出现（构造时没暴露、请求时才炸），统一走
+        # _classify_oss_error：它认得出「密钥失效/没权限」与「连不上」的区别
+        k, d = AccessGuard._classify_oss_error(e)
+        code = _DOCTOR_KIND_CODE.get(k, DOCTOR_EXIT_OTHER)
+        say(f"❌ acl-doctor：权限名单读取失败（类别={k}）")
+        say(f"   · {type(e).__name__}: {str(e).splitlines()[0][:200]}")
+        say(f"   · 用户侧口径：{AccessGuard._unreachable_text(k)}")
+        if "不存在" in str(e):
+            say("   · 名单文件还没播种过：首次使用会自动建，本次判为通过。")
+            return DOCTOR_EXIT_OK, out
+        return code, out
+    accounts = _parse_accounts(doc)
+    grants, declared = _parse_grants(doc)
+    say(f"   · 名单读到 {len(accounts)} 个账号"
+        f"  version={doc.get('version') if isinstance(doc, dict) else '?'}"
+        f"  等级字段={'已声明' if declared else '未声明'}")
+    if not accounts:
+        say("⚠️ acl-doctor：名单是空的，任何人都会被判成丐版（不算发包失败）。")
+
+    # 3) 本机身份链路：绑定号 → 等级 → 设备分片（打包机上没有绑定记录，属正常）
+    #    直接读磁盘上的绑定账号，不建守卫单例：自检可能在 QApplication 之前跑
+    phone = _normalize_account(AccessGuard._load_bound_account() or "")
+    say(f"   · 本机绑定账号：{phone or '（未绑定）'}")
+    if phone:
+        if phone in accounts:
+            lv = resolve_level(phone, grants, declared)
+            say(f"   · 该号等级：{lv}（{LEVEL_NAMES.get(lv)}）")
+        else:
+            say("   · 该号不在名单里 → 本机开机就是丐版（名单问题，不是发包问题）")
+        try:
+            shard, _ = client.download_json(AccessGuard._bind_key(phone))
+            dev = (shard or {}).get("device_id") if isinstance(shard, dict) else None
+            same = str(dev or "") == device_id()
+            say(f"   · 远端设备：{dev or '（无记录）'}  与本机一致={same}")
+        except Exception as e:
+            say(f"   · 远端设备记录读不到：{type(e).__name__}: "
+                f"{str(e).splitlines()[0][:120]}")
+
+    # 4) 其它同类密钥与可写性：这两项不影响门禁结论，但都是本轮缺陷的同族
+    try:
+        ds_src = tool_config.source_for("deepseek_api_key")
+        say(f"   · DeepSeek 密钥：{ds_src}"
+            + ("（未配置 → 扩展词功能会静默降级为纯离线）" if ds_src == "未配置"
+               else ""))
+    except Exception:
+        pass
+    try:
+        # 时钟校正：OSS 签名对请求时刻敏感，本机时间偏太远会被回 403（形态与密钥
+        # 失效一模一样）。客户端会按服务端时间自愈重签，这一行就是把它已经做过的事
+        # 如实写出来——没有这行，「校过时差的机器上通、其它机器不通」又是一次盲查。
+        from oss_pool_client import clock_offset_text
+        say(f"   · 时钟校正：{clock_offset_text()}")
+    except Exception:
+        pass
+    try:
+        # 两个目录都要报：三份 .acl_*.json 落在 _state_dir()（按档位投影的缓存目录），
+        # 本报告自己落在 tool_config.state_dir()。以前只报后者，等于自检指着
+        # 「一个没被用上的地方」说这里没问题——报告说的必须就是实际用的那一个。
+        say(f"   · 权限状态目录：{_state_dir()}")
+    except Exception as e:
+        say(f"⚠️ 权限状态目录不可用：{type(e).__name__}: {e}")
+    try:
+        say(f"   · 自检报告目录：{tool_config.state_dir()}")
+    except Exception as e:
+        say(f"⚠️ 自检报告目录不可用：{type(e).__name__}: {e}")
+    # 本地状态读写的问题（目录不可写、落盘失败）：不影响门禁结论——凭证与网络都通
+    # 的包发出去是能用的，但这些问题必须在这一份报告里看得见，否则下次远程排障
+    # 又是「用户说不好用、开发者说我这头全绿」。
+    try:
+        for p in state_problems():
+            say(f"⚠️ acl-doctor：{p}")
+    except Exception:
+        pass
+
+    say("✅ acl-doctor：权限服务连通且名单可读" if code == DOCTOR_EXIT_OK
+        else f"❌ acl-doctor：未通过（退出码 {code}）")
+    return code, out
+
+
+def run_doctor(write_log: bool = True) -> int:
+    """打印自检报告并返回退出码。
+
+    ``write_log``：打包成 ``--windowed`` 的产物在 Windows 上**没有控制台**
+    （``sys.stdout`` 是 None，``print`` 会静默什么也不做），所以报告除了打屏还
+    必须落一份到包外的状态目录，CI 与远程排障才有东西可看。
+    """
+    code, lines = doctor_lines()
+    text = "\n".join(lines)
+    printed = False
+    try:
+        if sys.stdout is not None:
+            print(text)
+            printed = True
+    except Exception:
+        printed = False
+    if write_log:
+        # 无控制台（Windows --windowed 产物里 sys.stdout 是 None，print 静默失效）
+        # 时必须另有一处能拿到报告，否则 CI 的门禁只剩一个数字，失败原因永远查不到。
+        try:
+            import tool_config
+            path = tool_config.state_dir() / DOCTOR_LOG_NAME
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text + "\n", encoding="utf-8")
+            if not printed:
+                try:
+                    sys.__stderr__.write(text + "\n")
+                except Exception:
+                    pass
+                print(f"acl-doctor 报告已写入：{path}")
+        except Exception as e:
+            try:
+                print(f"⚠️ acl-doctor 报告落盘失败：{type(e).__name__}: {e}")
+            except Exception:
+                pass
+    return int(code)
 
 
 # ── 管理员命令行 ──
@@ -1593,6 +2201,9 @@ def _cli(argv: Optional[List[str]] = None):
     ap.add_argument("--whoami", action="store_true", help="看本机设备身份与认领状态")
     ap.add_argument("--claim", nargs="?", default=None, const="",
                     help="把本机登记为该账号的当前设备（不带号码=用已绑定账号）")
+    ap.add_argument("--doctor", action="store_true",
+                    help="产物自检：只读地验证凭证链与权限服务真连，退出码分类"
+                         "（0 通过 / 2 缺凭证 / 3 缺模块 / 4 被拒 / 5 网络 / 6 其它）")
     args = ap.parse_args(argv)
 
     # 参数组合校验：--force 只在移除时有意义，别让它默默被忽略（管理员以为生效了）
@@ -1606,6 +2217,18 @@ def _cli(argv: Optional[List[str]] = None):
                         ("--remove", args.remove), ("--kick", args.kick)):
         if _val is not None and not _val:
             ap.error(f"{_flag} 至少要带一个参数")
+
+    if args.doctor:
+        # 自检是**只读**动作，和任何写操作混在一起时结论就不可信了（比如同一次
+        # 调用里先改了名单，自检读到的就是刚写下去的东西），所以必须单独跑。
+        if (args.add or args.set_level or args.remove or args.kick
+                or args.claim is not None):
+            ap.error("--doctor 只读，不能与 --add/--set-level/--remove/--kick/"
+                     "--claim 同时使用")
+        code = run_doctor()
+        if code != DOCTOR_EXIT_OK:
+            sys.exit(code)
+        return
 
     if args.add:
         res = AccessGuard.add_accounts(args.add)

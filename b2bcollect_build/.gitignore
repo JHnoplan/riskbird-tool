@@ -14,3 +14,7 @@ b2bcollect_data/
 # config.json / 环境变量解析，源码仓库里永远不该出现真实密钥）
 config.json
 deepseek_cache.json
+
+# --acl-doctor 在源码态把报告落在模块目录（打包态落在包外 b2bcollect_state/），
+# 它是每次自检都会重写的产物，入库只会让提交面变脏
+acl_doctor.txt

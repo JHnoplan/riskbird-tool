@@ -449,17 +449,20 @@ class CompanyMatcher:
 
     @staticmethod
     def _load_api_key() -> str:
-        """复用 deepseek_expander 的 config.json 读取逻辑。"""
+        """取 DeepSeek 密钥：口径唯一，交给 deepseek_expander（内部走统一配置链）。
+
+        这里不再自己拼一次 ``dirname(__file__)/config.json``：同一件事两处各读各的，
+        打包态就会出现「一处读得到、一处读不到」的分裂行为——外部机器上扩展词静默
+        失效正是这个形状。兜底同样只允许走 tool_config 这一条统一链。
+        """
         try:
             from deepseek_expander import load_api_key
             return load_api_key() or ""
-        except ImportError:
+        except Exception:
             pass
-        # 兜底直接读 config.json
-        cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
         try:
-            cfg = json.load(open(cfg_path, encoding="utf-8"))
-            return (cfg.get("deepseek_api_key") or "").strip()
+            import tool_config
+            return tool_config.get("deepseek_api_key")
         except Exception:
             return ""
 

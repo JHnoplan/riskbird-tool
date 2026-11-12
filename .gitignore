@@ -1,0 +1,77 @@
+# 根 .gitignore —— 这份文件之前一直不存在，于是「密钥/临时物不会被误提交」这件事
+# 完全靠人记住：本仓库有 146 个受版本管理的文件，而工作区里有几十 GB 的采集产物、
+# 截图、虚拟环境和真实密钥文件。只要有一次 `git add -A`，.venv 或 .gh_token 就会
+# 进历史——历史里的密钥是删不掉的，只能作废重发。这一层是防呆，不是整理。
+#
+# 原则：只拦「可再生」和「不该外传」两类；采集到的数据、模板、脚本一律不拦，
+# 以免把用户真正要保存的东西挡在提交外面。
+
+# ── 凭证与本机配置（绝不入库；密钥值的唯一合法归宿是 Actions Secrets）────────
+.gh_token
+*.token
+*_token
+.env
+.env.*
+*_secret*.json
+secrets.json
+config.json
+deepseek_cache.json
+.m
+*.p12
+*.mobileprovision
+*.pem
+*.key
+
+# ── Python / 虚拟环境 / 构建中间物 ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+ocr_env/
+new_ocr_env/
+clean_ocr_env/
+models/
+.pytest_cache/
+build/
+dist/
+*.spec
+*.manifest
+
+# ── 编辑器与系统 ─────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# ── 运行产物：日志、进度、调试输出（每次跑都会重写，入库只会让 diff 变噪音）──
+*.log
+*.out
+*.progress
+progress.json
+*_progress.json
+*_state.json
+*_run.log
+debug/regression_logs/
+debug/fixtures/
+tmp/
+
+# ── 一次性调试抓图/抓页（体积大、可重抓；正式模板目录 *_templates/ 不在其列）──
+adb_screenshots/
+adb_pt_screenshots/
+adb_final_screenshots/
+android_screenshots/
+direct_screenshots/
+debug_images/
+debug_ocr/
+debug_screenshots/
+digit_debug/
+ocr_debug/
+ocr_screenshots/
+ocr_pos_screenshots/
+test_ocr/
+test_screenshots/
+xiaohongshu_recordings/
+ci_dl/
+qizhidao_gui_state.json

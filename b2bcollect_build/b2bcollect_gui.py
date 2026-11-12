@@ -4719,6 +4719,25 @@ class MainWindow(QMainWindow):
     def _acl_denial(reason):
         """返回 (标题, 追加的下一步)；下一步为空表示 reason 自己已经说清楚了。"""
         r = reason or ""
+        # 权限服务本身没配好（包里没带密钥 / 模块缺失 / 密钥被拒）：这一类**永远不会
+        # 等一次刷新就好**，必须排在所有分支最前面。除了「下一步」不同，顺序还决定
+        # 一件更糟的事——被拒的文案里带着「不用改白名单」，如果先过白名单分支，
+        # 就会把人精确地引到那句正在否认的动作上。
+        try:
+            kind = _access_guard.AccessGuard.classify_reason(r)
+        except Exception:
+            kind = ""
+        if kind:
+            title = {
+                "credential": "账号已绑定，但这个安装包没带权限凭证",
+                "module": "账号已绑定，但权限模块没能加载",
+                "denied": "账号已绑定，但权限服务拒绝了访问",
+                "clock": "账号已绑定，但这台电脑的系统时间不准",
+                "tls": "账号已绑定，但这台电脑的加密连接被拦截了",
+                "other": "账号已绑定，但权限服务返回异常",
+            }.get(kind, "账号已绑定，但权限服务不可用")
+            advice = _access_guard.AccessGuard.SERVICE_NEXT_STEP.get(kind, "")
+            return (title, advice)
         if "白名单" in r or "无使用权限" in r:
             return ("账号已绑定，但未获得使用权限",
                     "请联系管理员将该账号加入白名单。")
@@ -4748,6 +4767,18 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _claim_failure(phone, claim_msg):
         m = claim_msg or ""
+        # 服务侧压根没配好（缺凭证/缺模块/密钥被拒）时，远端根本写不进去，
+        # 后面那句「网络恢复后自动补齐登记」就是一个永远不会兑现的承诺——
+        # 所以这个分支必须在自动补齐承诺之前，且不能与冷却/抢先共用文案。
+        try:
+            kind = _access_guard.AccessGuard.classify_reason(m)
+        except Exception:
+            kind = ""
+        if kind:
+            # 标题与「下一步」都直接取 _acl_denial 的口径：这两条路撞的是同一个
+            # 故障，只是发现时机不同；各写一份标题迟早会互相矛盾（本轮修的正是这个）。
+            title, advice = MainWindow._acl_denial(m)
+            return (title, f"已绑定云展动力账号：{phone}\n{m}\n{advice}")
         if "抢先" in m:
             return ("设备登记被另一台设备抢先",
                     f"账号已绑定：{phone}\n{m}\n"
@@ -5173,7 +5204,30 @@ def _fatal_log(exc):
             continue
 
 
+def _acl_doctor_entry() -> int:
+    """产物自检入口的收口：把「模块没打进包」也当成一种自检失败，而不是崩栈。
+
+    这一步在打包态最可能遇到的失败恰恰是「依赖缺失」（本轮修的正是发包漏配凭证
+    与它同族的漏收模块）。让它返回分类退出码，CI 才有稳定可判的口径。
+    """
+    if not HAS_ACL_GUARD:
+        print("❌ acl-doctor：权限模块（access_guard）没能加载，"
+              "说明打包清单漏收依赖——这本身就是发包缺陷")
+        return 3
+    try:
+        return int(_access_guard.run_doctor())
+    except Exception as e:
+        print(f"❌ acl-doctor 自身异常：{type(e).__name__}: {e}")
+        return 6
+
+
 def main():
+    # 产物自检（发包门禁）：必须在 QApplication 之前分派。两个原因：
+    # ① CI runner 上常常根本没有可用的图形会话，建 QApplication 会先炸在显示上，
+    #    而它要验证的只是「这个包能不能连上权限服务」，与界面无关；
+    # ② 自检必须在**产物自己**里跑——开发机跑通的永远是源码，不是发货的那个包。
+    if "--acl-doctor" in sys.argv[1:]:
+        sys.exit(_acl_doctor_entry())
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())

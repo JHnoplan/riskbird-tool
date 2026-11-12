@@ -63,11 +63,15 @@ class FakeClient:
     测试看着像覆盖了、其实一条判定都没跑到。
     """
 
-    def __init__(self, accounts=None, fail=False, missing=False, grants=None):
+    def __init__(self, accounts=None, fail=False, missing=False, grants=None,
+                 fail_msg=None):
         self.calls = 0
         self.accounts = accounts if accounts is not None else ["15088131371"]
         self.grants = grants            # None = 名单里根本没有等级字段（旧版）
         self.fail = fail
+        # 故障文案可指定：5xx（服务端异常）与超时（网络）在分类上是两类，
+        # 都写成同一句话就等于放弃了这次修复要守住的区分
+        self.fail_msg = fail_msg
         self.missing = missing       # 首次 download 抛"不存在"→ 触发播种分支
         self.uploaded = None
         self.shards: dict = {}          # phone → 设备分片（后写覆盖 = 顶号）
@@ -83,7 +87,7 @@ class FakeClient:
         self.calls += 1
         # 用真实 OSSPoolError：走生产代码的 except 分支（错误口径同源）
         if self.fail:
-            raise OSSPoolError("下载失败 HTTP 500")
+            raise OSSPoolError(self.fail_msg or "下载失败 HTTP 500")
         if key == ag.ACL_KEY:
             if self.missing:
                 self.missing = False    # 播种后重读可成功
@@ -202,10 +206,21 @@ def test_check():
     ok, _ = g3.check()
     _assert(not ok, "OSS 故障 + 副本里无此号 → 仍按名单拒绝（副本不放宽边界）")
 
-    # 网络失败 + 从未成功 → 严格阻断（fail-closed）
+    # 远端故障 + 从未成功 → 严格阻断（fail-closed），且文案按故障类别分开说
+    # 1) 真·网络故障：还是那句「检查网络」，并承诺下次自动确认
+    g = _make_guard(account="15088131371", client=FakeClient(
+        fail=True, fail_msg="HTTPSConnectionPool: Read timed out"))
+    ok, reason = g.check()
+    _assert(not ok and "权限服务器" in reason and "检查网络" in reason,
+            "从未成功拉取 + 网络超时 → 严格阻断，并如实叫人查网络")
+    # 2) 服务端 5xx：不是用户的网络，也不该被说成网络
     g = _make_guard(account="15088131371", client=FakeClient(fail=True))
     ok, reason = g.check()
-    _assert(not ok and "权限服务器" in reason, "从未成功拉取 + 网络故障 → 严格阻断")
+    _assert(not ok, "从未成功拉取 + 服务端 500 → 同样严格阻断（安全边界不分类别）")
+    _assert("检查网络" not in reason,
+            f"服务端异常不许被说成用户的网络问题（实际：{reason[:60]}）")
+    _assert(AccessGuard.classify_reason(reason) == "other",
+            "5xx 归到 other 类，界面按这一类决定下一步")
 
     # 名单文件不存在 → 自动播种初始名单
     client = FakeClient(missing=True, accounts=["15088131371"])
@@ -225,7 +240,10 @@ def test_check():
     g = _make_guard(account="15088131371", client=client, ttl=0.2)
     ok, _ = g.check()
     _assert(ok, "TTL 过期前放行")
-    g._fetched_at = time.time() - 1.0
+    # 把「上次成功」推回 1 秒前制造过期。必须和守卫用同一个时钟基准：写
+    # time.time() 的话这行在单调时钟下等于「远在将来」= 永远新鲜，测试会绿着
+    # 什么都不测（这类假绿正是本轮在产物上反复撞到的形状）。
+    g._fetched_at = time.monotonic() - 1.0
     t0 = time.time()
     ok, _ = g.check()
     elapsed = time.time() - t0

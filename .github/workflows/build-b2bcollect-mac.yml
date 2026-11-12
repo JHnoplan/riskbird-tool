@@ -3,18 +3,28 @@ name: Build B2bCollectTool Mac App
 # b2bcollect 工具的 macOS 云端打包（与 build-b2bcollect.yml 的 Windows 打包互相独立）。
 # macos-14 是 Apple Silicon（arm64）runner：本仓库开发机是 Intel，打不出 M 芯片原生机，
 # 必须借云端 arm64 环境。PyQt5 5.15.11+/lxml 均有 arm64 wheel，selenium 纯 Python，可直接装。
-# paths 故意不含 workflow 文件自身：改 yml 不触发，需要时手动 Run workflow（workflow_dispatch）。
+#
+# 随包凭证（与 Windows 版 build-b2bcollect.yml 完全同口径，2026-11 外部机器全员
+# 丐版的直接根因）：config.json 在 .gitignore 里，仓库里永远没有它，打包机上也没有
+# 开发机那份 iOS 工程常量文件 —— 于是发出去的每个 .app 都读不到权限服务凭证，
+# 外部机器一律被判精简版。现在构建前用 Actions Secrets 现写 config.json 随包分发，
+# 打包后立刻用**产物自己**跑一次 --acl-doctor 真连自检，缺密钥或自检不通就构建失败。
 on:
   push:
     branches: [ main ]
     paths:
       - 'b2bcollect_build/**'
+      - '.github/workflows/build-b2bcollect-mac.yml'
       - 'enf_clean/**'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
+    # 与 Windows 版一致：同一工具的新提交自动取消仍在排队的旧构建
+    concurrency:
+      group: build-b2bcollect-mac-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
     - name: Checkout code
@@ -24,6 +34,16 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
+    - name: Write bundled config.json from Secrets
+      # 密钥值只经 env 传进进程，脚本绝不打印；缺 OSS 两个 Secret 当场失败。
+      shell: bash
+      env:
+        OSS_AK_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        OSS_AK_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      run: |
+        python .github/scripts/inject_build_config.py
 
     - name: Install dependencies
       # 清单与 Windows 版 build-b2bcollect.yml 逐行对齐；pillow 是马可波罗图片码
@@ -43,7 +63,24 @@ jobs:
       # 路径分隔符用「:」，chromedriver 打进 _MEIPASS 根（chrome_driver.candidates frozen 首选位）。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --add-data "mk_phone_font.json:." --add-data "../enf_clean:enf_clean" --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
+        # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
+        [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json:." --add-data "mk_phone_font.json:." --add-data "../enf_clean:enf_clean" --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
+
+    - name: Artifact doctor gate (B2bCollectTool.app --acl-doctor)
+      # 发包门禁：**用产物自己**验证「这个 .app 能不能连上权限服务」，放在打成
+      # zip 之前——不通就不许有制品可下。直接调 .app 里的可执行文件：它走的才是
+      # 打包态真实凭证链（随包 config.json）与真实 frozen 判定，源码跑通不代表它通。
+      shell: bash
+      run: |
+        b2bcollect_build/dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool --acl-doctor
+        rc=$?
+        log=b2bcollect_build/dist/b2bcollect_state/acl_doctor.txt
+        [ -f "$log" ] && cat "$log" || true
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::产物自检未通过（退出码 $rc）：这个包发出去只会是精简版，禁止上传"
+        fi
+        exit "$rc"
 
     - name: Zip app bundle (ditto preserves perms/attrs)
       run: ditto -c -k --keepParent b2bcollect_build/dist/B2bCollectTool.app B2bCollectTool_Mac_arm64.zip

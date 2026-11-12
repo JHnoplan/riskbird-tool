@@ -40,6 +40,7 @@ b2bcollect_build/test_keyword_resume_offline.py
 b2bcollect_build/test_access_guard_offline.py
 b2bcollect_build/test_acl_levels_offline.py
 b2bcollect_build/test_export_scope_offline.py
+b2bcollect_build/test_frozen_delivery_offline.py
 b2bcollect_build/test_gui_store_offline.py
 b2bcollect_build/test_ingest_store_offline.py
 b2bcollect_build/test_list_channels_offline.py

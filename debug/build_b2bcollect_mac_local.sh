@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# b2bcollect 工具的 macOS 本地打包（一键、带产物自检门禁）。
+#
+# 为什么要这么个脚本（2026-11 外部机器全员精简版的教训）：
+#   云端 workflow 是主打包路径，但「本机现在就要一个能跑的包」这件事一直没人管：
+#   以前靠手敲 pyinstaller，参数散在 yml 里，敲漏一项就少一层，而少的那一项
+#   （随包 config.json）在症状上表现为「别人电脑上全是精简版」，本机却一切正常。
+#   本脚本与 .github/workflows/build-b2bcollect-mac.yml **同口径**：同样三道门，
+#   同样一份 hidden-import/datas 清单，跑完必须产物自己通过 --acl-doctor。
+#
+# 三道门（任何一道不过就没有包，不会有半成品）：
+#   1) 随包凭证：用运行时同一条解析链现写 b2bcollect_build/config.json；
+#   2) 构建前硬门：config.json 不在位就中止（防止把「没带凭证」的包发出去）；
+#   3) 构建后自检：拿 **产物自己** 跑 --acl-doctor 真连权限服务，不通就报错退出。
+#
+# 用法：bash debug/build_b2bcollect_mac_local.sh
+#   可选环境变量：PY=python 解释器（默认 .venv/bin/python）
+#                 B2B_LOCAL_KEEP_OLD=1 保留旧 dist/B2bCollectTool.app（默认覆盖）
+set -euo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+ROOT="$PWD"
+PY=${PY:-.venv/bin/python}
+[ -x "$PY" ] || PY=$(command -v python3)
+echo "· 解释器：$PY"
+
+# ── 1) 随包凭证：与 CI 的 inject_build_config.py 同一个脚本、同一份键名契约 ──
+"$PY" .github/scripts/inject_build_config.py --from-local
+
+# ── 2) chromedriver：打进包根（chrome_driver.candidates 的 frozen 首选位）──
+#     找不到只警告不拦停：驱动缺失运行时会用 Selenium Manager 现下，症状是「首次
+#     启动慢一点」，与「没带凭证 = 全员精简版」不是一个量级，不该混成同一道门。
+DRIVER=""
+for c in "$ROOT/mac_driver/chromedriver" \
+         "$ROOT/riskbird_build/chromedriver-mac-x64/chromedriver"; do
+  if [ -f "$c" ]; then DRIVER="$c"; break; fi
+done
+DRIVER_ARG=()
+if [ -n "$DRIVER" ]; then
+  echo "· 内置驱动：$DRIVER"
+  DRIVER_ARG=(--add-data "$DRIVER:.")
+else
+  echo "⚠️  没找到本机 chromedriver（mac_driver/ 或 riskbird_build/chromedriver-mac-x64/），"
+  echo "    本次包不含内置驱动，首次使用浏览器功能时会自动下载。"
+fi
+
+# ── 3) 构建 ──
+cd b2bcollect_build
+if [ ! -f config.json ]; then
+  echo "❌ b2bcollect_build/config.json 不存在（第 1 步没成功），不许出包"
+  exit 1
+fi
+
+EXE_ARGS=()
+if [ "${B2B_LOCAL_KEEP_OLD:-}" != "1" ]; then
+  EXE_ARGS=(--noconfirm)
+fi
+
+# 参数与 build-b2bcollect-mac.yml 逐条对齐（pip 名≠import 名的两个都写）。
+# 差异只有一处：CI 用 arm64 runner 下载 arm64 驱动，本机用本机架构的驱动。
+"$PY" -m PyInstaller --clean "${EXE_ARGS[@]+"${EXE_ARGS[@]}"}" --windowed \
+  --name B2bCollectTool \
+  --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 \
+  --collect-submodules PIL \
+  --hidden-import requests --hidden-import websocket --hidden-import websocket_client \
+  --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome \
+  --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler \
+  --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler \
+  --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr \
+  --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies \
+  --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler \
+  --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner \
+  --hidden-import enf_clean.normalize --hidden-import enf_clean.phone \
+  --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd \
+  --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry \
+  --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher \
+  --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition \
+  --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest \
+  --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender \
+  --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge \
+  --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config \
+  --add-data "config.json:." --add-data "mk_phone_font.json:." \
+  --add-data "../enf_clean:enf_clean" \
+  --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" \
+  --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" \
+  --add-data "../riskbird_build/block_guard.py:riskbird_build" \
+  --add-data "../riskbird_build/chrome_driver.py:riskbird_build" \
+  "${DRIVER_ARG[@]+"${DRIVER_ARG[@]}"}" \
+  b2bcollect_gui.py
+
+# ── 4) 产物自检门禁：跑的是 .app 里的可执行文件，不是源码 ──
+#     只有它才同时具备「打包态 frozen 判定」与「随包 config.json」这两个真实条件。
+APP="dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool"
+if [ ! -x "$APP" ]; then
+  echo "❌ 产物没生成到位：$APP"
+  exit 1
+fi
+echo "· 产物自检：$APP --acl-doctor"
+set +e
+"$APP" --acl-doctor
+RC=$?
+set -e
+LOG="dist/b2bcollect_state/acl_doctor.txt"
+[ -f "$LOG" ] && cat "$LOG" || true
+if [ "$RC" -ne 0 ]; then
+  echo "❌ 产物自检未通过（退出码 $RC，报告见上）：这个包发出去只会是精简版，别外发"
+  exit "$RC"
+fi
+echo "✅ 打包完成并通过产物自检：$(pwd)/dist/B2bCollectTool.app"

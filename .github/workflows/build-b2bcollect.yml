@@ -11,11 +11,20 @@ name: Build B2bCollectTool EXE
 #     与 1688 工具一样需内置驱动——旧注释「不依赖 selenium」是错的。
 #   · site_adapters 跨目录引用的 4 个源文件与驱动，一并通过 --add-data 打进包；
 #     frozen 运行时由 site_adapters 从 sys._MEIPASS 解析这些外部模块树。
+#
+# 随包凭证（2026-11 外部机器全员丐版的直接根因）：
+#   config.json 在 .gitignore 里（密钥绝不入仓库），所以**仓库里永远没有**它；
+#   而打包机上也不存在开发机那份 iOS 工程文件。两者叠加的结果是：发出去的每个
+#   包都读不到权限服务凭证，外部机器一律被判成精简版。因此这里必须在构建前用
+#   Actions Secrets 现写一份 config.json 再 --add-data 进包，并且构建完立刻拿
+#   **产物自己**跑一次 --acl-doctor 真连自检；缺 Secret 或自检不通一律构建失败
+#   ——宁可发不出包，也不发一个只能丐版的包。
 on:
   push:
     branches: [ main ]
     paths:
       - 'b2bcollect_build/**'
+      - '.github/workflows/build-b2bcollect.yml'
       - 'enf_clean/**'
   workflow_dispatch:  # 允许在 Actions 页面手动只打包这个工具
 
@@ -35,6 +44,19 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
+    - name: Write bundled config.json from Secrets
+      # 随包凭证注入：值只从 Secrets 经 env 传进进程，绝不 echo、绝不进产物清单之外
+      # 的地方（跑完这一步后 config.json 就在 runner 的临时工作区里，随 job 结束销毁）。
+      # 缺 OSS 两个 Secret 时**当场失败**：过去正因为这里什么都没有，漏配凭证才会一路
+      # 变成一个「能跑但所有人都是精简版」的包发出去。
+      shell: bash
+      env:
+        OSS_AK_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        OSS_AK_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      run: |
+        python .github/scripts/inject_build_config.py
 
     - name: Install dependencies
       # 裸 CDP 链路（requests / websocket-client，bs4 用 lxml 解析器）＋
@@ -72,7 +94,26 @@ jobs:
       # 不 --add-data 进包则打包版手机号识别永远拿不到字典。
       run: |
         cd b2bcollect_build
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
+        [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+
+    - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
+      # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，
+      # 不通就不许有制品可下。必须走 --windowed 的 exe，所以用 Start-Process -Wait
+      # 拿退出码（GUI 子系统程序在 shell 里不会被自然等待，这是 Windows 上的老坑）；
+      # 报告同时落在包外状态目录 acl_doctor.txt，失败时把原文打出来供远程排障。
+      shell: pwsh
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool.exe"
+        $p = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -Wait -PassThru
+        $log = "b2bcollect_build\dist\b2bcollect_state\acl_doctor.txt"
+        if (Test-Path $log) { Get-Content $log }
+        Write-Host "acl-doctor exit code = $($p.ExitCode)"
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::产物自检未通过（退出码 $($p.ExitCode)）：这个包发出去只会是精简版，禁止上传"
+          exit $p.ExitCode
+        }
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v4
