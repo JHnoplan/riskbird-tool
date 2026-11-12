@@ -5,19 +5,26 @@
 #   云端 workflow 是主打包路径，但「本机现在就要一个能跑的包」这件事一直没人管：
 #   以前靠手敲 pyinstaller，参数散在 yml 里，敲漏一项就少一层，而少的那一项
 #   （随包 config.json）在症状上表现为「别人电脑上全是精简版」，本机却一切正常。
-#   本脚本与 .github/workflows/build-b2bcollect-mac.yml **同口径**：同样五道门，
-#   同样一份 hidden-import/datas 清单，跑完必须产物自己通过 --acl-doctor 与 --ui-smoke。
+#   本脚本与 .github/workflows/build-b2bcollect-mac.yml **同口径**：同样一份
+#   hidden-import/datas 清单，跑完必须产物自己通过 --acl-doctor 与 --ui-smoke，
+#   最后还要真双击一次、由产物自己记账证明界面交出去了（判据不看屏幕，见第 6 步）。
 #
-# 五道门（任何一道不过就没有包，不会有半成品）：
-#   0) 打包清单硬门：三处入口的 --add-data/--hidden-import 与 site_adapters 的清单
-#      逐项对拍，缺一项就中止（少一个文件不会报错、只会少一个平台）；
-#   1) 随包凭证：用运行时同一条解析链现写 b2bcollect_build/config.json；
-#   2) 构建前硬门：config.json 不在位就中止（防止把「没带凭证」的包发出去）；
-#   3) 构建后自检：拿 **产物自己** 跑 --acl-doctor 真连权限服务并验采集通道完整性，
-#      不通就报错退出；
-#   4) 只读包窗口冒烟：把 .app 拷一份改成只读再跑 --ui-smoke，复现 Gatekeeper 转置
-#      （App Translocation）那一类「双击没界面」的现场——doctor 刻意不碰 Qt，这一段
-#      不补上就永远是「CI 全绿、用户开不了」。
+# 步骤（编号与正文一一对应；标「门」的那几步任何一道不过就没有包，不会有半成品）：
+#   0) 打包清单硬门【门】：三处入口的 --add-data/--hidden-import 与 site_adapters 的
+#      清单逐项对拍，缺一项就中止（少一个文件不会报错、只会少一个平台）；
+#   1) 随包凭证【门】：用运行时同一条解析链现写 b2bcollect_build/config.json，
+#      不在位就中止（防止把「没带凭证」的包发出去 = 别人电脑上全是精简版）；
+#   2) chromedriver：打进包根（chrome_driver.candidates 的 frozen 首选位）——
+#      这一步找不到只警告不拦停，理由见那一段；
+#   3) 构建：PyInstaller 一次成型；
+#   4) 产物自检门禁【门】：跑的是 .app 里的可执行文件、不是源码，--acl-doctor 真连
+#      权限服务并验采集通道完整性，不通就报错退出；
+#   5) 只读包窗口冒烟【门】：把 .app 拷一份改成只读再跑 --ui-smoke，复现 Gatekeeper
+#      转置（App Translocation）那一类「双击没界面」的现场——doctor 刻意不碰 Qt，
+#      这一段不补上就永远是「CI 全绿、用户开不了」；
+#   6) 真双击 + 启动台账【门】：走 open（与用户双击同源）起一次，只认产物自己写进
+#      launch_history.log 的那一行 shown。数窗口在锁屏/远程会话下对所有进程都报 0，
+#      它只能当附加信息、不能当交付判据（离线套件 W 节把这一道门的每条判据都跑了正反）。
 #
 # 用法：bash debug/build_b2bcollect_mac_local.sh
 #   可选环境变量：PY=python 解释器（默认 .venv/bin/python）
@@ -207,55 +214,153 @@ if [ "$BEFORE" != "$AFTER" ]; then
 fi
 echo "✅ 只读包窗口冒烟通过：界面建得出、崩溃日志一份都没有、包内一字节没多"
 
-# ── 最后一步：真按用户那一次双击验一遍（走 launchd，不走 shell 直接 exec）────────
+# ── 6) 最后一步：真按用户那一次双击验一遍（走 launchd，不走 shell 直接 exec）────
 # 上面所有环节都是 QT_QPA_PLATFORM=offscreen 的仿真，它能证明「代码路径不写包」，
-# 却证明不了「这台机器的窗口服务器今天给用户摆得出界面」。本轮就吃过这个亏：连着两次
-# 「0 窗口、CPU 冻结」看着像产物挂了，真原因是我自己攒下的那批僵死子进程把 syspolicyd
-# 的 exec 评估队列堵死——**观测手段污染了被测对象**，而且污染的是交付判断。
-# 所以这一步有四条纪律：
+# 却证明不了「这台机器今天给用户摆得出界面」。这一步的判据换过两次，两次都撞在
+# 「观测手段自己不可靠」上（2026-11-12、11-13 本机实测）：
+#   · 第一坑：连着两次「0 窗口、CPU 冻结」看着像产物挂了，真原因是我自己攒下的那批
+#     僵死子进程把 syspolicyd 的 exec 评估队列堵死——**观测手段污染了被测对象**；
+#   · 第二坑：锁屏与远程会话下 System Events 对**每一个**进程都报 0 窗口（同一时刻连
+#     Qoder、Safari 也数不出），产物明明活着、窗口明明在，门禁却只能判红。
+# 结论：窗口有没有交出去，只有进程自己说得出真话。判据因此换成产物写的启动台账
+# （b2bcollect_gui._launch_record，行格式 时间|pid|阶段|细节）；数窗口降级成附加信息：
+# 数得出就一并印出来给人核对，数不出不判红。
+# 五条纪律：
 #   ① 用 open（launchd 那条路），与用户双击同源；shell 直接 exec 走的是另一套评估。
-#   ② 数窗口只用 /usr/bin/osascript（Apple 平台签名），不依赖任何第三方解释器——
-#      堵死的时候恰好只有这一类二进制还能跑。
-#   ③ 有边界地等（macOS 没有 timeout 命令，用轮次 + sleep 自己数）。
-#   ④ 收尾把这个实例连同它带出来的子进程一起收干净，绝不留孤儿：今天这批孤儿就是把
+#   ② 台账落点问产物自己（--state-dir），绝不在 shell 里重抄候选链——重抄就是第二份
+#      真源，改了 tool_config 忘了改这里，门禁会去读一个不存在的路径再判一场莫名其妙的红。
+#      文件名与阶段名这两个字面量由离线套件 W 节对着 Python 常量逐字对拍。
+#   ③ 只认**本次新出现**的 shown 记录：open 对已在跑的旧实例只是把它唤到前台，那份字节
+#      不是刚打出来的产物，把它当通过就是「为了绿灯而少验」（旧写法正是这么写的）。
+#   ④ 有边界地等（macOS 没有 timeout 命令，用轮次 + sleep 自己数），子进程一律带超时。
+#   ⑤ 收尾把这个实例连同它带出来的子进程一起收干净，绝不留孤儿：今天这批孤儿就是把
 #      机器堵死的那批孤儿。
 APP_LIVE="dist/B2bCollectTool.app"
+APP_BIN="$APP_LIVE/Contents/MacOS/B2bCollectTool"
+LEDGER_NAME="launch_history.log"      # 与 b2bcollect_gui.LAUNCH_LOG_NAME 同一份名字
+LEDGER_STAGE="shown"                  # 与 b2bcollect_gui.LAUNCH_STAGE_SHOWN 同一个阶段
 BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
 # 时间戳落在 dist/（工作区内，沙箱允许写；不在 .app 里面，免得自己污染自己写的探针）。
 STAMP_FILE="dist/.open_gate.stamp"
 : > "$STAMP_FILE"
-/usr/bin/open "$APP_LIVE" || { echo "❌ open 都没发出去（这一步连双击都模拟不了）"; exit 1; }
-LIVE_PID=""
-_i=0
-while [ $_i -lt 40 ]; do
-  _i=$((_i + 1))
-  sleep 2
-  for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
-    case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac      # 只看这次新起的
-    _w=$(/usr/bin/osascript -e "tell application \"System Events\" to tell (first process whose unix id is $_p) to get count of windows" 2>/dev/null || true)
-    case "$_w" in '' | *[!0-9]*) continue ;; esac
-    if [ "$_w" -ge 1 ]; then LIVE_PID=$_p; echo "· 窗口数得出：pid ${_p}，窗口 ${_w} 个（第 ${_i} 次轮询）"; break; fi
-  done
-  [ -n "$LIVE_PID" ] && break
-done
-if [ -z "$LIVE_PID" ]; then
-  # 分第二种现实再决定红不红：`open` 对「已经在跑的单机应用」只是把它唤到前台，压根不会
-  # 有新 pid。这时候数得出现有实例的窗口就是**通过了**（用户那一次双击要看到的就是界面），
-  # 硬要按「没有新 pid」判红，就是逼人在验收前先把正在用的工具关掉——那是为了绿灯而折腾用户。
-  for _p in ${BEFORE_PIDS:-}; do
-    _w=$(/usr/bin/osascript -e "tell application \"System Events\" to tell (first process whose unix id is $_p) to get count of windows" 2>/dev/null || true)
-    case "$_w" in '' | *[!0-9]*) continue ;; esac
-    if [ "$_w" -ge 1 ]; then
-      LIVE_PID=$_p
-      echo "✅ 真双击路径验过：open 唤的是已在跑的实例（pid ${_p}，窗口 ${_w} 个），没有新进程"
-      break
+
+# 有边界地跑一个子进程：$1=秒上限，其余是命令；超时按 124 收（与 GNU timeout 同口径）。
+# 为什么连「取个路径」这种秒回的事也要包一层：本机已实证过两次，被堵死的 exec 评估队列
+# 能让任何一次新 exec 永远排不上队，那时整条交付链跟着挂住、日志里一行结论都留不下——
+# 与 doctor、ui-smoke 各自立看门狗是同一条理由。
+_run_bounded() {
+  local _limit=$1 _pid="" _rc=0 _i=0
+  shift
+  "$@" & _pid=$!
+  while [ $_i -lt $((_limit * 2)) ]; do
+    _i=$((_i + 1))
+    sleep 0.5
+    if ! kill -0 "$_pid" 2>/dev/null; then
+      wait "$_pid"
+      return $?
     fi
   done
+  kill -TERM "$_pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$_pid" 2>/dev/null || true
+  wait "$_pid" 2>/dev/null || true
+  return 124
+}
+
+# 台账落点：由产物自己回答（纪律②）。输出落在 dist/ 下，跟着本步一起删掉。
+STATE_OUT="dist/.state_dir.out"
+_rc=0
+_run_bounded 20 "$APP_BIN" --state-dir > "$STATE_OUT" 2>&1 || _rc=$?
+if [ "$_rc" = 124 ]; then
+  echo "❌ 产物取台账落点 20 秒没返回（--state-dir）：连一个路径都给不出，这份包别外发"
+  exit 1
+fi
+if [ "$_rc" -ne 0 ]; then
+  echo "❌ 产物不认 --state-dir（退出码 ${_rc}）：$(cat "$STATE_OUT" 2>/dev/null)"
+  exit 1
+fi
+# 格式依据：这个开关只 print 一行绝对路径（_state_dir_entry 里唯一那次 print），取末行
+# 既容得下它前面可能多出来的告警行，也不会因为话术改动而拿错字段。
+STATE_DIR=$(tail -1 "$STATE_OUT")
+rm -f "$STATE_OUT"
+if [ -z "$STATE_DIR" ]; then
+  echo "❌ --state-dir 给了空路径：台账落点问不出来，这一步就没有判据"
+  exit 1
+fi
+LEDGER="$STATE_DIR/$LEDGER_NAME"
+echo "· 启动台账：$LEDGER"
+
+# 台账里「已经报过 shown」的 pid 集合（本轮 open 之前先拍一份，之后只认新出现的）
+_shown_pids() {
+  [ -f "$LEDGER" ] || return 0
+  # 格式依据：台账行由 _launch_record 写死成「时间|pid|阶段|细节」，四个字段以 | 分隔。
+  # 这里按第 3 列比阶段、取第 2 列当 pid，不数空格也不按行号——改了行格式必须同时改
+  # 这里（离线套件 W 节把两边逐字对拍，防止「门禁读的是想象中的字段」）。
+  awk -F'|' -v s="$LEDGER_STAGE" '$3 == s { print $2 }' "$LEDGER" | tr '\n' ' '
+}
+BEFORE_SHOWN=$(_shown_pids)
+/usr/bin/open "$APP_LIVE" || { echo "❌ open 都没发出去（这一步连双击都模拟不了）"; exit 1; }
+# 台账里找「本次新出现的 shown pid」：快照之前就有的一律不算，报过 shown 却已经退出的
+# 也不算（记完就崩的进程，用户看到的仍然是没界面）。
+_find_shown() {
+  for _p in $(_shown_pids); do
+    case " ${BEFORE_SHOWN:-} " in *" $_p "*) continue ;; esac
+    kill -0 "$_p" 2>/dev/null || continue
+    LIVE_PID=$_p
+    return 0
+  done
+  return 1
+}
+LIVE_PID=""
+_i=0
+while [ $_i -lt 10 ]; do
+  _i=$((_i + 1))
+  sleep 2
+  _find_shown || true
+  [ -n "$LIVE_PID" ] && break
+done
+if [ -z "$LIVE_PID" ] && [ -n "${BEFORE_PIDS:-}" ]; then
+  # 桌面上已经有一份在跑的旧实例：`open` 只把它唤到前台，新字节压根起不来。这一步要验的
+  # 正是刚打出来的这个包，所以换 `open -n` 强制起一份；验完只收自己起的这一个，绝不动
+  # 旧实例（别人可能正在采集）。两种起法都在台账里留下自己的 pid，判据不受影响。
+  echo "· 已有实例在跑（pid ${BEFORE_PIDS}）：open 唤不到新字节，改用 open -n 单独起一份刚打出来的产物"
+  /usr/bin/open -n "$APP_LIVE" || { echo "❌ open -n 都没发出去"; exit 1; }
+  _i=0
+  while [ $_i -lt 40 ]; do
+    _i=$((_i + 1))
+    sleep 2
+    _find_shown || true
+    [ -n "$LIVE_PID" ] && break
+  done
+fi
+if [ -n "$LIVE_PID" ]; then
+  echo "✅ 真双击路径验过：产物自己记到 ${LEDGER_STAGE}（pid ${LIVE_PID}，第 ${_i} 次轮询）"
+  # 数窗口这一段现在只是附加信息：数得出最好（人眼能核对），数不出说明的是这台机器的
+  # 会话状态（锁屏、远程），不是产物的状态——拿它当判据就是让交付结论跟着屏幕走。
+  _w=$(/usr/bin/osascript -e "tell application \"System Events\" to tell (first process whose unix id is $LIVE_PID) to get count of windows" 2>/dev/null || true)
+  case "$_w" in
+    '' | *[!0-9]*) echo "   （窗口数这次数不出：锁屏或远程会话下 System Events 对所有进程都报空，不作判据）" ;;
+    *) echo "   窗口数：${_w} 个" ;;
+  esac
 fi
 if [ -z "$LIVE_PID" ]; then
-  echo "❌ 40 次×2 秒都数不出一个窗口：用户点开就是看不到界面。先分清两种成因——"
-  echo "   ①进程状态是 U（不可中断等待）多半是这台机器的 exec 评估/磁盘被堵住，不是包坏了；"
-  echo "   ②进程在跑却没窗口，才是产物或启动路径的问题。两者的修法完全相反。"
+  # 数不出窗口不再等于失败（那是这台机器的会话状态），但**台账里没有本次的 shown**
+  # 一定是失败：台账是产物自己写的，它说没走到那一步，就是没走到。三种成因分开说，
+  # 因为修法完全相反：
+  echo "❌ 40 次×2 秒都没等到本次的 ${LEDGER_STAGE} 记录。判据不看屏幕，只看这份台账——"
+  echo "   台账（${LEDGER}）最近 6 条："
+  if [ -f "$LEDGER" ]; then
+    tail -6 "$LEDGER" | sed 's/^/     /'
+  else
+    echo "     （文件不存在：这台机器上一次台账都没落过盘，产物连第一步都没走到）"
+  fi
+  echo "   ①有 begin 没 shown：走到建界面就断了，堆栈在崩溃日志里（_fatal_log_dirs 那两处）；"
+  echo "   ②连 begin 都没有，两种现实长得一样，先看有没有那份崩溃日志："
+  echo "     · 有日志＝崩在 import（台账这一段还没轮到它写），按日志里的栈修；"
+  echo "     · 没日志＝本次根本没有新进程起来（上面有旧实例时脚本已经自己换过 open -n"
+  echo "       强制起新字节，仍然起不来就是产物或系统这一侧的问题；旧写法会把「唤到前台"
+  echo "       的旧实例」当通过，那是「为了绿灯而少验」：验的是上一次那个包）；"
+  echo "   ③进程在但状态是 U（不可中断等待）：这台机器的 exec 评估/磁盘被堵住，不是包坏了。"
   pgrep -ax B2bCollectTool 2>/dev/null | head -5 || true
   # 格式依据（本机 2026-11-13 实测）：`ps -axo pid,stat,command` 的第二列就是 STAT，僵死
   # 进程在那里印 U（那次把这台机器拖死的一整排进程就是 U 态）。老写法是 `grep -c "U"`，
@@ -271,7 +376,7 @@ if [ -n "${GREW:-}" ]; then
   echo "   只读卷里的 OSError 30）：$(printf '%s\n' "$GREW")"
   exit 1
 fi
-echo "✅ 真双击路径验过：窗口建得出、包内一字节没多（${APP_LIVE}）"
+echo "✅ 包内一字节没多（${APP_LIVE}）：台账落在包外的 ${STATE_DIR}"
 # 收尾：只收这次新起的实例和它的子进程，绝不动交付前就在跑的那些（别人可能正在用）。
 for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
   case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac

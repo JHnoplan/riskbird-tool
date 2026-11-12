@@ -60,6 +60,12 @@
   U. 窗口冒烟门禁：--ui-smoke 让**产物自己**把界面真建一遍，三处打包入口都跑它，
      Mac 那两处还跑在只读副本上（App Translocation 现场）；正例退 0、反例退非零并
      留下崩溃日志——doctor 不碰 Qt，「CI 全绿、用户双击没界面」这一类只能由这条拦
+  V. 运行形态开关的存取纪律：不许用位置元组存/还 sys.frozen 那组开关（还原错一位
+     红的是隔了一整节的邻居，报的还是与产品毫不相干的栈）
+  W. 启动台账与「真双击」判据：窗口有没有交出去由进程自己记账（时间|pid|阶段|细节），
+     落点问产物（--state-dir），门禁按 pid+阶段 取字段；数窗口在锁屏/远程会话下对
+     所有进程都报 0，只能当附加信息。「唤旧实例也算通过」那种绿法必须判红——它验的
+     是上一份字节
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -4586,6 +4592,211 @@ def test_window_smoke_gate():
             "整步删掉时切出来的是空段（判据靠 step 名字定位，改名也要能被看见）")
 
 
+# ── W. 启动台账与「真双击」判据 ──────────────────────────────────────────────
+# 这一条管的是**交付判断本身**可不可信。本机打包脚本最后那一步原来靠 System Events
+# 数窗口，而 2026-11-13 本机实测：锁屏与远程会话下它对每一个进程都报 0 窗口（同一时刻
+# 连 Qoder、Safari 也数不出）——观测手段在最需要它的场合恰好是瞎的，产物明明活着、窗口
+# 明明在，门禁却只能判红。反过来，旧写法为了消这个红又允许「open 唤到前台的旧实例」算
+# 通过，那验的是上一份字节，是另一种更坏的红法（它看起来完全成功）。两种毛病同一个根：
+# 让别人的状态替产物作证。现在判据由进程自己记账，落点问产物，数窗口只作附加信息。
+LEDGER_LOCAL_SH = Path("debug") / "build_b2bcollect_mac_local.sh"
+LEDGER_HEAD_MARK = "最后一步：真按用户那一次双击验一遍"
+
+
+def _ledger_region(text: str) -> str:
+    """本机脚本里「真双击」那一步**会被执行**的行（注释整行剔掉）。
+
+    判据只看代码骨架：那一段的注释里正写着「数窗口不作判据」这类解释，拿原文去判
+    就会把「说明了为什么不能这么写的行」当成违规行——下一来的人为了变绿会删注释，
+    那是抹掉下次排查最需要的上下文（与 _code_only 配成一对）。
+    """
+    out, started = [], False
+    for ln in text.splitlines():
+        if LEDGER_HEAD_MARK in ln:
+            started = True
+            continue
+        if started and not ln.strip().startswith("#"):
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _ledger_problems(region: str) -> list:
+    """「真双击」那一步够不够格当交付判据。返回问题清单，空 = 合格。"""
+    out = []
+    if not region.strip():
+        return [f"本机脚本里没有「{LEDGER_HEAD_MARK}」那一步（用户那一次双击压根没验）"]
+    if "--state-dir" not in region:
+        out.append("台账落点没问产物（--state-dir）：在 shell 里重算候选链就是第二份真源，"
+                   "改了 tool_config 忘了改这里，门禁会去读一个不存在的路径再判一场莫名其妙的红")
+    if "state_dir_candidates" in region or '/.b2bcollect/' in region:
+        out.append("shell 自己算了一遍状态目录（落点必须由产物回答；两处各算迟早漂）")
+    # 台账是产物写的文件，取值必须按字段：按行号或整行匹配的话，改一处话术门禁就安静地
+    # 读错字段（第 14 条硬门管的是外部工具输出，这一条管的是自家产物留下的机器可读文件）。
+    if not re.search(r"awk -F'\|'.*\$3 == .*print \$2", region):
+        out.append("台账不是按 | 分字段取的（时间|pid|阶段|细节 取第 3 列比阶段、第 2 列当 pid）")
+    snap, opened = region.find("BEFORE_SHOWN="), region.find("/usr/bin/open")
+    if not (0 <= snap < opened):
+        out.append("没在 open 之前拍一份 shown 快照：旧实例留下的记录会让这一步绿在上一份字节上")
+    if "kill -0" not in region:
+        out.append("没验那个 pid 还活着：记过 shown 之后崩掉的进程不能算通过")
+    if "-ge 1" in region:
+        out.append("数窗口又被拿来当判据（锁屏/远程会话下 System Events 对所有进程都报空，"
+                   "那种场合它一个字也证不了；数得出就印出来给人看，数不出不判红）")
+    if "_run_bounded() {" not in region:
+        out.append("边界函数没定义（每个调用点自己等一遍，等法还各写各的）")
+    # 判的是「这一次调用被包在边界里」，不是「文中有 _run_bounded 这个词」：只看词的话，
+    # 把调用改回裸 exec、只留下函数定义，这条门就空转了。
+    if not re.search(r"_run_bounded\s+\d+\s+.*--state-dir", region):
+        out.append("问产物落点这一步没有边界（exec 评估队列被堵死时整条交付链跟着挂住，"
+                   "日志里一行结论都留不下——与 doctor、ui-smoke 各立看门狗同一条理由）")
+    if 'find "$APP_LIVE" -newer' not in region:
+        out.append("没查真跑起来那一会儿往不往应用包里写东西（Mac 只读转置卷的 OSError 30 "
+                   "在本机双击这条路上就拦不住了）")
+    return out
+
+
+def test_launch_ledger_gate():
+    print("\n═══ W. 启动台账：窗口有没有交出去，由进程自己说，不由屏幕状态说 ═══")
+    import b2bcollect_gui as _gui
+
+    # 1) 常量侧：shell 里那两处字面量必须与 Python 同一份（漂了就是读不存在的字段）
+    local_sh = (_REPO / LEDGER_LOCAL_SH).read_text(encoding="utf-8")
+    _assert_eq(_gui.LAUNCH_LOG_NAME, "launch_history.log", "台账文件名只有一份写法")
+    _assert_eq(_gui.LAUNCH_STAGE_SHOWN, "shown", "台账阶段名只有一份写法")
+    for _lit in (f'LEDGER_NAME="{_gui.LAUNCH_LOG_NAME}"',
+                 f'LEDGER_STAGE="{_gui.LAUNCH_STAGE_SHOWN}"'):
+        _assert(_lit in local_sh,
+                f"本机脚本里的 {_lit} 与 Python 常量逐字一致（各写一份迟早对不上字段）")
+
+    # 2) 开关侧：--state-dir 认得出、不与自检同族、分派最早
+    _assert_eq(_gui.STATE_DIR_FLAG, "--state-dir", "取落点的开关写法（门禁抄的是同一个字符串）")
+    _assert_eq(_gui._doctor_request([_gui.STATE_DIR_FLAG]), (False, []),
+               "--state-dir 既不被当成自检开关，也不进「像自检却认不出」那份清单"
+               "（判错的方向很坏：门禁拿不到路径，却看见工具安静地弹出界面）")
+    msrc = _code_only(_gui.main)
+    _assert("STATE_DIR_FLAG in sys.argv" in msrc and "_state_dir_entry()" in msrc,
+            "main() 里真的分派到落点查询（只有函数没有分派＝门开着没人走）")
+    _assert(0 <= msrc.index("_state_dir_entry()") < msrc.index("_acl_doctor_entry()"),
+            "落点查询排在自检之前：取一个路径不该依赖这台机器连不连得上权限服务")
+    for _st in ("LAUNCH_STAGE_BEGIN", "LAUNCH_STAGE_SHOWN", "LAUNCH_STAGE_FAIL"):
+        _assert(f"_launch_record({_st}" in msrc,
+                f"main() 记了 {_st}：只记 shown 就分不出「压根没起来」和「起来到一半」")
+    _assert(0 < msrc.index("_launch_record(LAUNCH_STAGE_BEGIN")
+            < msrc.index("QApplication(sys.argv)")
+            < msrc.index("_launch_record(LAUNCH_STAGE_SHOWN"),
+            "begin 在建 QApplication 之前、shown 在 show() 之后：两条之间夹的正是"
+            "「用户看不看得到界面」那一段")
+    _assert("_launch_record(" not in _code_only(_gui._ui_smoke_entry),
+            "冒烟不写台账：它验的是「窗口建得出」这条代码路径，写进台账会让门禁把 CI "
+            "的自检当成用户那一次双击")
+
+    # 3) 行为侧：真写一行、写不进去不抛异常只报信、超长自动截断、落点绝不在包内
+    root = Path(tempfile.mkdtemp(prefix="ledger_"))
+    saved_env = {k: os.environ.get(k) for k in ("B2B_STATE_DIR",)}
+    old_home = Path.home
+    try:
+        Path.home = lambda *a, **k: root
+        os.environ["B2B_STATE_DIR"] = str(root / "state")
+        with _source_form():
+            _gui._launch_record(_gui.LAUNCH_STAGE_BEGIN, "frozen=否 platform=test")
+            p = _gui._launch_log_path()
+            _assert(p.is_file(), f"记一笔就有一行落在 {_gui.LAUNCH_LOG_NAME}（实际路径={p}）")
+            _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN, "frozen=否 platform=test")
+            fields = p.read_text(encoding="utf-8").splitlines()[-1].split("|")
+            _assert_eq(len(fields), 4, f"行格式固定四段（实际={fields}）")
+            _assert_eq(fields[1], str(os.getpid()), "第 2 段是 pid：门禁按 pid 认「本次那一个」")
+            _assert_eq(fields[2], _gui.LAUNCH_STAGE_SHOWN, "第 3 段是阶段：门禁按阶段认走到哪")
+
+            # 截断：台账每行都重写一遍整份文件，不封顶就是拿用户的磁盘换一个取证功能
+            p.write_text("\n".join(f"t|{i}|begin|x" for i in range(_gui.LAUNCH_LOG_MAX_LINES + 60))
+                         + "\n", encoding="utf-8")
+            _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN)
+            kept = p.read_text(encoding="utf-8").splitlines()
+            _assert_eq(len(kept), _gui.LAUNCH_LOG_MAX_LINES,
+                       f"超过上限就丢最老的（实际留了 {len(kept)} 行，上限 {_gui.LAUNCH_LOG_MAX_LINES}）")
+            _assert_eq(kept[-1].split("|")[2], _gui.LAUNCH_STAGE_SHOWN, "截断不丢刚记的那一行")
+
+            # 写不进去：绝不抛异常，但必须把这件事说出来——静默失败会让「没记过这条」和
+            # 「这台机器写不进」两件事长成一个样，本轮 Mac 的 OSError 30 撞的正是这一族。
+            ro = root / "ro_state"
+            ro.mkdir()
+            os.environ["B2B_STATE_DIR"] = str(ro)
+            os.chmod(ro, 0o500)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN, "只读落点")
+                _assert("写不进去" in buf.getvalue(),
+                        f"写不进去要当场说清（实际输出={buf.getvalue()!r}）")
+            finally:
+                os.chmod(ro, 0o700)
+            os.environ["B2B_STATE_DIR"] = str(root / "state")
+
+        # 落点纪律：打包态这条记录绝不允许落在应用包里（Mac 转置只读卷会当场 OSError 30，
+        # Windows onefile 会落在退出即删的 _MEI 目录，等于每次归零）。
+        app = root / "B2bCollectTool.app"
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        (macos / "B2bCollectTool").write_text("MZ", encoding="utf-8")
+        with _sys(platform="darwin", frozen=True, executable=str(macos / "B2bCollectTool")):
+            lp = _gui._launch_log_path()
+            _assert(not tc.inside_app_bundle(lp.parent),
+                    f"Mac .app 打包态台账落在包外（实际={lp}）")
+            _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN, "打包态仿真")
+            _assert(lp.is_file(), f"打包态这一行也真写得出去（实际={lp}）")
+        with _sys(platform="win32", frozen=True, _MEIPASS=str(root / "MEI"),
+                  executable=str(root / "B2bCollectTool.exe")):
+            _assert(str(root / "MEI") not in str(_gui._launch_log_path()),
+                    f"Windows 打包态台账不进 _MEIPASS（实际={_gui._launch_log_path()}）")
+    finally:
+        Path.home = old_home
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(root, ignore_errors=True)
+
+    # 4) 入口侧：本机脚本那一步的判据齐全，且每种「顺手改回去」都各自点名
+    region = _ledger_region(local_sh)
+    _assert(bool(region), "本机脚本里认得出真双击那一段")
+    _assert_eq(_ledger_problems(region), [], "本机脚本的真双击判据齐全")
+    _assert("count of windows" in region,
+            "数窗口仍留在脚本里作附加信息（全删掉就没人告诉运维「这台机器现在能不能看见界面」）")
+
+    def _drop(text, *needles):
+        return "\n".join(ln for ln in text.splitlines()
+                         if not any(n in ln for n in needles))
+
+    # 老写法整段回灌：按窗口数放行 + 唤旧实例也算通过，必须各判红一次
+    _old_way = ('  _w=$(/usr/bin/osascript -e "..." 2>/dev/null || true)\n'
+                '  if [ "$_w" -ge 1 ]; then LIVE_PID=$_p; break; fi\n')
+    _assert(any("数窗口" in p for p in _ledger_problems(region + "\n" + _old_way)),
+            "把窗口数改回判据必须判红——那正是本机实测数不出的一种绿法")
+    _assert(any("拍一份 shown 快照" in p for p in
+                _ledger_problems(_drop(region, "BEFORE_SHOWN="))),
+            "快照那行被摘掉必须判红（旧实例的记录会让这一步绿在上一份字节上）")
+    _assert(any("还活着" in p for p in _ledger_problems(_drop(region, "kill -0"))),
+            "不验 pid 存活必须判红（记过 shown 之后崩掉的过程不能算通过）")
+    _assert(any("按 | 分字段" in p for p in
+                _ledger_problems(region.replace("""awk -F'|' -v s="$LEDGER_STAGE" '$3 == s { print $2 }'""",
+                                                 """grep shown"""))),
+            "取值改回整行 grep 必须判红（改一处话术门禁就安静地读错字段）")
+    _assert(any("问产物" in p for p in _ledger_problems(_drop(region, "--state-dir"))),
+            "落点不问产物必须判红")
+    _assert(any("自己算了一遍状态目录" in p for p in
+                _ledger_problems(region + '\nLEDGER="$HOME/.b2bcollect/b2bcollect_state/launch_history.log"\n')),
+            "shell 里重抄候选链必须判红（第二份真源）")
+    _assert(any("没有边界" in p for p in _ledger_problems(_drop(region, "_run_bounded 20"))),
+            "取落点不带边界必须判红")
+    _assert(any("边界函数没定义" in p for p in _ledger_problems(_drop(region, "_run_bounded() {"))),
+            "只留下调用、把边界函数删掉同样要判红（判的是这一次调用真被包住，不是文中有这个词）")
+    _assert(any("应用包" in p for p in _ledger_problems(_drop(region, 'find "$APP_LIVE" -newer'))),
+            "包内写入那项检查被摘掉必须判红（Mac 只读卷的根因就靠它）")
+    _assert(_ledger_problems("") and LEDGER_HEAD_MARK in _ledger_problems("")[0],
+            "整段被删掉时要点名「这一步压根不存在」（空串不能被当成合格）")
+
+
 def _switches_state() -> dict:
     """运行形态开关的当前值（None = 这一项没拨过）。"""
     return {k: getattr(sys, k, None) for k in _SYS_SNAPSHOT}
@@ -4619,6 +4830,7 @@ SECTIONS = (
     test_app_translocation_relocation, test_path_discipline_gate,
     test_switch_discipline_gate,
     test_window_smoke_gate,
+    test_launch_ledger_gate,
 )
 
 

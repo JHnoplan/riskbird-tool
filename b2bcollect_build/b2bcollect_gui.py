@@ -178,6 +178,64 @@ try:
 except ImportError:
     HAS_TOOL_CONFIG = False
 
+# ── 启动台账：每一次「打开工具」都留下一行进程自己说得出真话的证据 ─────────────
+# 文件名与行格式只许有一份写法：交付门禁、离线测试、远程支持三方读的都是这一份。
+LAUNCH_LOG_NAME = "launch_history.log"
+LAUNCH_LOG_MAX_LINES = 400          # 只留最近这些条：磁盘写满本身也是另一类交付事故
+# 阶段名同时写进台账和门禁判据，两处必须一起改
+LAUNCH_STAGE_BEGIN = "begin"        # 参数分派完、准备建界面
+LAUNCH_STAGE_SHOWN = "shown"        # 窗口已经 show 出去
+LAUNCH_STAGE_FAIL = "fail"          # 建界面这条路上抛异常（堆栈另有崩溃日志）
+
+
+def _launch_log_path() -> Path:
+    """启动台账的落点：只许问 :func:`tool_config.state_file`（落点纪律见那个函数）。
+
+    tool_config 自己没加载上时退回用户目录那一级固定落点——报信的路径不能依赖
+    正在被报信的模块，和 ``_fatal_log_dirs`` 写字面量 ``.b2bcollect`` 是同一条理由。
+    """
+    if HAS_TOOL_CONFIG:
+        try:
+            return _tool_config.state_file(LAUNCH_LOG_NAME)
+        except Exception:
+            pass
+    return Path.home() / ".b2bcollect" / "b2bcollect_state" / LAUNCH_LOG_NAME
+
+
+def _launch_record(stage: str, extra: str = "") -> None:
+    """记一行「这个 pid 走到了 <stage>」。**永不抛异常**：台账自己把程序带崩，
+    等于把要留的证据和这次启动一起弄丢。
+
+    为什么非有它不可（2026-11-13 本机实测）：交付门禁原先用 System Events 数窗口，
+    而锁屏和远程会话下它对**每一个**进程都报 0——同一时刻连 Qoder、Safari 都数不出
+    窗口，观测手段在最需要它的场合恰好是瞎的。那一刻「产物起来了却没界面」和「界面
+    好好的但没人看得见」从外面永远分不开，只有进程自己说得出真话。判据因此换成两段：
+    ①门禁问产物 ``--state-dir`` 拿到台账落点（落点由产物回答，不在 shell 里重抄候选链）；
+    ②按 **pid + 阶段** 认这一行。数窗口降级成附加信息：数得出就一并印出来，数不出不判红。
+    行格式固定 ``时间|pid|阶段|细节``，字段以 | 分隔——门禁按字段取值，不读话术。
+    多实例同时启动时以最后写入为准：台账是给「这一次到底起来没有」作证的，不是审计流水。
+    """
+    line = (f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
+            f"|{os.getpid()}|{stage}|{extra}")
+    try:
+        p = _launch_log_path()
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []                    # 第一次启动、或上一份根本不存在
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join((lines + [line])[-LAUNCH_LOG_MAX_LINES:]) + "\n",
+                     encoding="utf-8")
+    except Exception as e:
+        # 写不进去也必须说得出：静默失败会让「台账没记过这一条」和「这台机器写不进
+        # 台账」两件事长成一个样——本轮 Mac 的 OSError 30 撞的正是这一族。
+        try:
+            print(f"⚠ 启动台账写不进去（{type(e).__name__}: {e}），本次运行不留 {stage} 记录",
+                  flush=True)
+        except Exception:
+            pass
+
+
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
 # done=✅绿粗「已完成」/ stopped=■橙粗「已停止」/ running=●蓝「进行中」
 # 字形选高覆盖度的 ✅/●/■（避开 ⏳ 这类小字号下会糊成方块的 emoji）
@@ -6442,7 +6500,39 @@ def _ui_smoke_entry() -> int:
                 pass
 
 
+# 状态目录查询开关：与 doctor / ui-smoke 同族（都是「门禁要的、与界面无关的一步」）。
+# 刻意不含 doctor、不以 --acl 开头，理由与 UI_SMOKE_FLAG 完全一样：写错分派方向就会
+# 让调用方拿不到路径、却看见工具安静地弹出一个界面。
+STATE_DIR_FLAG = "--state-dir"
+
+
+def _state_dir_entry() -> int:
+    """只打印持久状态目录的绝对路径，别的一概不做。
+
+    两个用途：①交付门禁（本机打包脚本「真双击」那一步）要知道启动台账落在哪——
+    落点必须由**产物自己**回答，绝不在 shell 里重抄一遍候选链：重抄就是第二份真源，
+    哪天改了 tool_config 忘了改 shell，门禁会去读一个不存在的路径，然后判一场莫名其妙的红；
+    ②用户报障时「日志在哪个文件夹」当场就能给一句真话，不用人猜。
+    不建 QApplication、不联网、不建窗口：这一步在 CI 上也必须秒回（与 doctor 同规矩）。
+    """
+    if HAS_TOOL_CONFIG:
+        try:
+            _tool_config.force_utf8_stdout()
+            print(_tool_config.state_dir(), flush=True)
+            return 0
+        except Exception as e:
+            print(f"❌ 取状态目录失败：{type(e).__name__}: {e}", flush=True)
+            return 1
+    print("❌ tool_config 没加载上，给不出状态目录（这本身就是「发包漏收模块」一族的故障）",
+          flush=True)
+    return 1
+
+
 def main():
+    # 状态目录查询排在自检之前：它只要一个路径，连权限服务都不必碰。放在后面就会被
+    # doctor 的联网判定拖慢，门禁取落点这一步也不该依赖「这台机器连得上 OSS」。
+    if STATE_DIR_FLAG in sys.argv[1:]:
+        sys.exit(_state_dir_entry())
     # 产物自检（发包门禁）：必须在 QApplication 之前分派。两个原因：
     # ① CI runner 上常常根本没有可用的图形会话，建 QApplication 会先炸在显示上，
     #    而它要验证的只是「这个包能不能连上权限服务」，与界面无关；
@@ -6476,6 +6566,12 @@ def main():
         # 说清楚而不是悄悄多等：真到超时说明前任卡在收尾里，此时继续启动是对的
         # （宁可两个实例并存几秒让用户能操作，也不要一个永远不出现的窗口）。
         print(f"ℹ 上一个实例（PID={previous_pid}）在限定时间内没退出，本实例直接启动")
+    # 台账先记一笔 begin：从这里往后的任何失败都能被「begin 有、shown 没有」这个缺口
+    # 解释——门禁与远程支持因此分得出「压根没起来」和「起来了但没走到 show」，两种成因
+    # 的修法完全相反（前者查进程/权限，后者查界面代码与落盘）。
+    _launch_note = (f"frozen={'是' if getattr(sys, 'frozen', False) else '否'}"
+                    f" platform={sys.platform}")
+    _launch_record(LAUNCH_STAGE_BEGIN, _launch_note)
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())
@@ -6499,8 +6595,12 @@ def main():
             except Exception:
                 pass
         w.show()
+        # 交付门禁只认这一行：窗口是不是真交出去了，由进程自己说，不由外面的观测手段猜
+        # （数窗口在锁屏/远程会话下对所有进程都报 0，那种场合它一个字也证不了）。
+        _launch_record(LAUNCH_STAGE_SHOWN, _launch_note)
     except Exception as e:
         _fatal_log(e)
+        _launch_record(LAUNCH_STAGE_FAIL, f"{_launch_note} {type(e).__name__}")
         try:
             _fatal_paths = [str(d / FATAL_LOG_NAME) for d in _fatal_log_dirs()]
             QMessageBox.critical(
