@@ -308,9 +308,28 @@ def in_work_tree() -> bool:
 
 
 def _path_set(cmd: list) -> set:
-    """跑一条 git 列文件的命令，把输出收成路径集合（失败返回空集）。"""
-    rc, out = _git(*cmd)
-    return set(out.splitlines()) if rc == 0 else set()
+    """跑一条 git 列文件的命令，按 **NUL** 拆分收成路径集合（失败返回空集）。
+
+    必须加 `-z`：git 默认把非 ASCII 的文件名八进制转义并套上引号
+    （``"\\345\\220\\257\\345\\212\\250….bat"``），那种字符串和任何真实路径都对不上，
+    于是每一个中文名文件都被判成「从未被 git 跟踪」。本仓库真有中文名启动脚本，离线
+    回归里那条「HEAD 清单里没有反斜杠」的断言就是被抓了个正着之后补上的。
+    调用方给的 cmd 不必自己带 -z，这里统一加。
+    """
+    rc, raw = _git_raw(*cmd, "-z")
+    if rc != 0:
+        return set()
+    names = raw.decode("utf-8", "surrogateescape").split("\0")
+    return {n for n in names if n}
+
+
+def _git_raw(*args) -> tuple:
+    """二进制版 _git：-z 的输出里有 NUL，text=True 会把换行处理搅进来。"""
+    try:
+        r = subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True)
+    except OSError:
+        return -1, b""
+    return r.returncode, r.stdout
 
 
 _INDEX, _HEAD = {}, {}
@@ -331,11 +350,26 @@ def _tracked_sets() -> tuple:
     return _INDEX["files"], _HEAD["files"]
 
 
+def _rel_posix(path: Path):
+    """仓库相对路径的 **git 写法**：分隔符永远是 `/`。仓库外返回 None。
+
+    这一行归一不是洁癖，是 2026-11-12 Windows 构建实机踩出来的：`git ls-files` 与
+    `git ls-tree` 在任何平台上都输出正斜杠，而 Windows 上 `str(Path(...))` 给的是反斜杠。
+    两边直接比对的结果是**每一个进包文件都被判成「从未被 git 跟踪」**——门禁在 Mac 上
+    全绿、在 Windows 上把整条清单刷成红，那是门禁自己坏了，比没有门禁更糟（人会直接把
+    这一步跳过）。判据跨平台可比，前提是先把说法统一到 git 那一边。
+    """
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        text = str(path).replace("\\", "/")
+        return None if text.startswith("/") else text
+
+
 def tracked_state(path: Path) -> str:
     """`ok` 在提交里 / `staged` 只 add 没提交 / `missing` 压根没被跟踪。"""
-    try:
-        rel = str(path.relative_to(ROOT))
-    except ValueError:
+    rel = _rel_posix(path)
+    if rel is None:
         return "ok"                       # 仓库外的路径不归这条判据管
     index, head = _tracked_sets()
     if rel in head:
@@ -376,17 +410,27 @@ def _junk(p: Path) -> bool:
 # 入口文本自己，不另立清单（另立一份就会和入口漂移）。
 REF_PATTERNS = (r"\.github/scripts/[\w.\-]+\.(?:py|sh)",
                 r"b2bcollect_build/installer/[\w.\-]+",
+                r"installer[/\\][\w.\-]+",
                 r"debug/build_b2bcollect_mac_local\.sh")
 
 
 def referenced_inputs(text: str) -> list:
-    """从入口文本里扫出仓库内的构建期文件（只回报磁盘上真存在的那些）。"""
+    """从入口文本里扫出仓库内的构建期文件（只回报磁盘上真存在的那些）。
+
+    同一个相对写法可能在两种基准下成立：workflow 里 `cd b2bcollect_build` 之后写的
+    `installer/x.nsi`，与本目录无关的 `.github/scripts/x.py` 则从仓库根算。两种基准都试，
+    命中哪一种算哪一种——只认一种的话，另一种就是「文件在、判据看不见」的静默漏检。
+    Windows 的 yml 里路径还可能写成反斜杠，所以先归一再拼路径。
+    """
     out = []
     for pat in REF_PATTERNS:
         for m in re.finditer(pat, text):
-            p = ROOT / m.group(0)
-            if p.is_file() and p not in out:
-                out.append(p)
+            rel = m.group(0).replace("\\", "/")
+            for base in (ROOT, BUILD_DIR):
+                p = base / rel
+                if p.is_file() and p not in out:
+                    out.append(p)
+                    break
     return out
 
 
@@ -413,8 +457,7 @@ def check_tracked(add_data: list, text: str = "") -> list:
             state = tracked_state(f)
             if state == "ok":
                 continue
-            rel = f.relative_to(ROOT)
-            problems.append(f"{_state_hint(str(rel), state)}"
+            problems.append(f"{_state_hint(_rel_posix(f), state)}"
                             f"（它随 --add-data {src} 进包）")
     # 本目录模块：--hidden-import 只保证「登记了」，磁盘上有没有、提交没提交是另一件事。
     # 漏提交一个新的 b2bcollect_build/*.py 时，PyInstaller 会报一句谁也看不懂的
@@ -423,13 +466,13 @@ def check_tracked(add_data: list, text: str = "") -> list:
         p = BUILD_DIR / f"{name}.py"
         state = tracked_state(p)
         if p.exists() and state != "ok":
-            problems.append(_state_hint(f"{p.relative_to(ROOT)}", state)
+            problems.append(_state_hint(_rel_posix(p), state)
                             + f"（它是本地模块 {name}，靠 --hidden-import 进包）")
     # 入口引用的构建期脚本：没有它们，连这道门禁本身都跑不起来。
     for p in referenced_inputs(text):
         state = tracked_state(p)
         if state != "ok":
-            problems.append(_state_hint(str(p.relative_to(ROOT)), state)
+            problems.append(_state_hint(_rel_posix(p), state)
                             + "（入口命令直接引用它）")
     return problems
 

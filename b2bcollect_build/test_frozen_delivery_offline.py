@@ -2010,6 +2010,39 @@ def test_packaging_manifest_gate():
     _assert(any(".github/scripts/" in str(p) for p in
                 gate.referenced_inputs(gate.CALLERS["Mac workflow"].read_text(encoding="utf-8"))),
            "入口引用的构建期脚本被扫进第 7 条的范围（缺一个连门禁自己都跑不起来）")
+    # 分隔符：git 在任何平台都输出正斜杠，而 Windows 上 str(Path(...)) 给的是反斜杠。
+    # 两边直接比对的结果是 2026-11-12 那次 Windows 构建里**每一个**进包文件都被判成
+    # 「从未被 git 跟踪」——门禁自己坏了，比没有门禁更糟。Mac 上复现不出来，所以这里
+    # 用「源码文本 + 嵌套路径」两条一起钉住：前者防写法改回去，后者防判据只测过顶层。
+    gate_src = (gate.ROOT / ".github" / "scripts" /
+                "check_packaging_manifest.py").read_text(encoding="utf-8")
+    _assert("path.relative_to(ROOT).as_posix()" in gate_src,
+            "_rel_posix 用 as_posix 归一分隔符（不写归一，Windows runner 上整条清单全红）")
+    _assert("rel = _rel_posix(path)" in gate_src,
+            "tracked_state 只比归一后的路径，不拿 str(Path) 去撞 git 的输出")
+    _assert_eq(gate._rel_posix(gate.BUILD_DIR / "site_adapters.py"),
+               "b2bcollect_build/site_adapters.py",
+               "比对用的说法与 git 一致（子目录也要是正斜杠）")
+    _index, _head = gate._tracked_sets()
+    _assert(all("\\" not in x for x in _head),
+            "git 列出来的路径里没有反斜杠（这条就是上面那处归一的现实依据）")
+    # 同一次实跑里抓出来的第二个坑：git 默认把非 ASCII 文件名八进制转义再套引号，
+    # 那种字符串跟任何真实路径都对不上，于是每个中文名文件都被判成「没提交」。
+    # 判据跨平台的另一半含义是**跨文件名**，所以这里直接拿仓库里真有的中文名文件验。
+    cjk = next((x for x in sorted(_head) if not x.isascii()), "")
+    _assert(cjk, f"仓库里确实有非 ASCII 路径，下面这条不是空跑（HEAD 清单 {len(_head)} 项）")
+    _assert_eq(gate.tracked_state(gate.ROOT / cjk), "ok",
+               f"中文名文件也认得（不加 -z 拆 NUL 就会被 git 的转义说法骗过去）：{cjk}")
+    sub = gate.BUILD_DIR / "zz_gate_probe_pkg"
+    sub.mkdir(exist_ok=True)
+    nested = sub / "mod.py"
+    nested.write_text("# 分隔符探针，跑完即删\n", encoding="utf-8")
+    try:
+        _assert_eq(gate.tracked_state(nested), "missing",
+                   "子目录里未跟踪的文件也认得（分隔符判错的话这条在 Windows 上是唯一漏网）")
+    finally:
+        nested.unlink(missing_ok=True)
+        sub.rmdir()
     # 真清单实跑：三处入口的进包输入此刻都必须已在提交里（这条红＝现在推上去 CI 必红）
     _assert_eq(gate.check_tracked(
         [gate._split_add_data(t) for t in gate._flag_values(
