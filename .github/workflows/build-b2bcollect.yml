@@ -365,6 +365,30 @@ jobs:
         # 版本对不上就不出包：宁可没有安装包，也绝不静默降级成「只发一个 zip 却告诉
         # 用户这就是交付物」（那种降级只有用户会发现）。
         [ -n "${NSIS_PINNED:-}" ] || { echo "::error::上一步没把钉住的 NSIS 版本号传下来（GITHUB_ENV 里的 NSIS_PINNED 是空的）：包能编出来，但说不清它和校验过的那份编译器是不是同一个，这种交付物不发"; exit 1; }
+        # 版本号必须是四段纯数字（VIProductVersion 只认 X.X.X.X）。2026-11-12 云端就是
+        # 栽在这句上：`/DVER4="1.$APP_VERSION.0"` 拼出来是三段，makensis 报
+        # 「invalid VIProductVersion format」直接 abort —— 编译器、自检、冒烟全绿，最后
+        # 一步没有安装包。这里不再「拼了就算」：先把 run_number 拆成两个 16 位字段
+        # （版本号要能唯一且单调递增，直接放进一段迟早超过 65535 被编译器拒掉），
+        # 再按编译器自己的口径验一遍格式，验不过就不开建。
+        # 注意这句为什么不用 ${APP_VERSION:-（空）}：把非 ASCII 写进参数展开的默认值里，
+        # bash 3.2 的词法扫描会在右花括号前认错（报 unexpected EOF looking for matching `"'），
+        # 整步连第一行都跑不到。哪一个字节会带跑解析器没人记得住，所以这一段现在由
+        # 「shell 语法硬门」（check_packaging_manifest.py 第 11 条）交给 bash -n 自己判。
+        AV_SHOW="$APP_VERSION"
+        [ -n "$AV_SHOW" ] || AV_SHOW="（空）"
+        case "${APP_VERSION:-}" in
+          ''|*[!0-9]*) echo "::error::APP_VERSION 必须是纯数字（它要参与拼 VIProductVersion 的四段版本号），实际拿到「${AV_SHOW}」；拼错的版本号 makensis 只回一句 invalid format 就 abort，交付里根本没有安装包"; exit 1 ;;
+        esac
+        VER4="1.$((APP_VERSION / 65536)).$((APP_VERSION % 65536)).0"
+        if [ "$APP_VERSION" -ge 4294967296 ]; then
+          echo "::error::run_number 已经到 ${APP_VERSION}，四段版本号（每段 16 位）装不下了：这一步不能悄悄放过，否则 makensis 收下一个它编不了的版本号，交付里根本没有安装包"
+          exit 1
+        fi
+        if ! [[ "$VER4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::拼出来的版本号「${VER4}」不是 makensis 要的 X.X.X.X（这一步自己算错了，别等编译器报）"; exit 1
+        fi
+        echo "· 版本：显示 1.${APP_VERSION} / 文件属性 ${VER4}（四段，每段都在 16 位范围内）"
         # 禁掉 Git Bash 的「参数看着像路径就改写」：/DB2B_ROOT=... 这种 NSIS 定义被改写成
         # C:/Program Files/Git/DB2B_ROOT=... 之后编译器只会回一句 Usage；而日志文件名里
         # 带反斜杠时 GNU 工具还会给整行输出加转义前缀（上一节 sha256 就是栽在这上面）。
@@ -377,7 +401,7 @@ jobs:
         # 但 pipefail 会把「tee 成功」和「编译器失败」搅在一起，所以显式取 PIPESTATUS[0]，
         # 并在这个区间里关掉 -e——否则编译器一非零，下面那行判据压根执行不到。
         set +e
-        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="1.$APP_VERSION.0" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG"
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG"
         NSIS_RC=${PIPESTATUS[0]}
         set -e
         if [ "$NSIS_RC" -ne 0 ]; then

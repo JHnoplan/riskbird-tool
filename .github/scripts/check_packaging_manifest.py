@@ -52,6 +52,11 @@
      里登记理由）：`import yzd_client` 拿到的是哪一份由 sys.path 顺序决定，内容分叉
      等于「按加载顺序挑一份实现」。本轮实测到的正是没登记的代价——两处上传侧修复
      只落在 riskbird 那份 yzd_client 里，产物生效的却是 b2bcollect 那份旧实现。
+ 11 交付链上每一段手写 shell 能不能被 **bash 自己的解析器**读懂（bash -n，只解析不
+     执行）：第 9 条那种正则只能覆盖「已经想到的写法」。本轮实测的那条是
+     `${APP_VERSION:-（空）」`——右花括号前是全角标点时 bash 3.2 直接解析失败，整步
+     在 `set -e`、判据、日志统统出场之前就死在语法错误上，症状与「机器没配好」一模一样。
+     判据交给解析器，覆盖面就不依赖有人记得住哪几个字节会带跑词法扫描。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -63,6 +68,7 @@ import argparse
 import ast
 import hashlib
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -722,6 +728,153 @@ def check_script_hygiene() -> list:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# 第 11 条：交付链上的每一段 shell 都得过**真解析器**（bash -n），不能只靠正则列举雷区。
+#
+# 为什么第 9 条那种正则不够：2026-11-12 给 NSIS 步骤加版本号判据时，写下
+#   echo "...实际拿到「${APP_VERSION:-（空）」」..."
+# 这句在 bash 3.2 的词法扫描里直接解析失败（报 unexpected EOF while looking for
+# matching `"'），整步连第一行都跑不到。它和第 9 条管的是同一族坑（中文与变量写法的
+# 接缝），但触发点是**字节级**的：实测 `${V:-空}`、`${V:-（空）}`、`${V:-x」}` 全都正常，
+# 只有 `）」}` 这一种组合会把解析器带跑——这种清单没人记得住，也不该靠人记住。
+# 更糟的是它发生在**执行之前**：`set -e`、判据、日志统统没有机会出场，CI 上只剩一句
+# 语法错误。所以这一条把脚本原样交给 bash 自己判，判据的覆盖面等于解析器的覆盖面。
+#
+# 范围：四个 workflow 里每一个真正交给 bash 执行的 run 步（pwsh 步另由离线测试 M 节
+# 按 PowerShell 口径判），加交付链上手写的每一份 .sh。漏切一种写法=这条门在那种写法
+# 上是空的，所以这里同时判「切出来的块数」与「文件里 run: 的总数」对不对得上。
+# ---------------------------------------------------------------------------
+
+STEP_HEAD = re.compile(r"^\s*-\s+(?:name|uses):")
+STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$")
+RUN_BLOCK_KEY = re.compile(r"^(\s*)run:\s*([|>][-+\d]*)\s*$")
+RUN_INLINE_KEY = re.compile(r"^(\s*)run:\s*(\S.*)$")
+ANY_RUN_KEY = re.compile(r"^\s*run:\s*")
+SHELL_KEY = re.compile(r"^\s*shell:\s*(\w+)")
+RUNS_ON = re.compile(r"^\s*runs-on:\s*[\w-]*windows[\w-]*", re.M)
+GH_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
+
+# 判据覆盖的文件。登记在表里的东西不在位就响：一条静默不跑的判据比没有判据更危险
+# （会让人以为这一项被验过）。workflow 全收：另外两条（1688、riskbird）虽然不走
+# b2bcollect 的清单，但 shell 语法坏掉的代价一模一样。
+WORKFLOWS = tuple(f".github/workflows/{n}" for n in (
+    "build-b2bcollect.yml", "build-b2bcollect-mac.yml",
+    "build-1688.yml", "build-riskbird.yml"))
+SHELL_SOURCES = tuple(list(HYGIENE_SCRIPTS) + ["debug/build_b2bcollect_mac_local.sh"])
+
+
+def workflow_default_shell(text: str) -> str:
+    """这个 workflow 里没写 `shell:` 的 run 步由谁执行。
+
+    GitHub 的口径：作业级 defaults.run.shell 优先，否则是 runner 默认——Windows 上
+    是 pwsh，macOS/Ubuntu 上是 bash。判错默认值会把 bash 步当 pwsh 步放过（或反过来，
+    拿 bash 去解析 PowerShell 脚本，得到一条永远修不掉的假红）。
+    """
+    m = re.search(r"^\s*defaults:\s*\n\s*run:\s*\n\s*shell:\s*(\w+)", text, re.M)
+    if m:
+        return m.group(1)
+    return "pwsh" if RUNS_ON.search(text) else "bash"
+
+
+def run_blocks_in_workflow(text: str) -> list:
+    """切出 workflow 里每一段 run 脚本：[(步名, 起始行号, 执行它的 shell, 脚本)]。
+
+    三处容易切错、切错了就等于门是空的：
+    · 块标量的缩进由**第一个非空行**决定，不是 `run:` 的缩进 +2（本机两份 workflow
+      恰好都是 +2，照 +2 写死的话，下次有人多缩一级就整段漏判）；
+    · `run: 一行写完` 也得收（只认 `run: |` 的话，这种步压根不进判据）；
+    · `${{ ... }}` 是 Actions 在交给 bash 之前就替换掉的表达式，原样喂给解析器只会
+      得到一句与真 bug 无关的语法错，所以先替换成占位符再判。
+    """
+    lines = text.splitlines()
+    default = workflow_default_shell(text)
+    heads = [i for i, ln in enumerate(lines) if STEP_HEAD.match(ln)]
+    out = []
+    for idx, start in enumerate(heads):
+        region = lines[start:heads[idx + 1] if idx + 1 < len(heads) else len(lines)]
+        name_m = STEP_NAME.match(region[0])
+        name = name_m.group(1) if name_m else f"(第 {start + 1} 行的步)"
+        shells = [m.group(1) for ln in region if (m := SHELL_KEY.match(ln))]
+        shell = shells[-1] if shells else default      # 一步里多个 shell: 时以最后一个为准
+        for j, ln in enumerate(region):
+            block, inline = RUN_BLOCK_KEY.match(ln), RUN_INLINE_KEY.match(ln)
+            if block:
+                key_indent, strip, body, p = len(block.group(1)), None, [], j + 1
+                while p < len(region):
+                    raw = region[p]
+                    if raw.strip():
+                        cur = len(raw) - len(raw.lstrip())
+                        if cur <= key_indent:
+                            break
+                        if strip is None:
+                            strip = cur
+                        body.append(raw[strip:])
+                    else:
+                        body.append("")
+                    p += 1
+                script = "\n".join(body)
+            elif inline:
+                script = inline.group(2).strip()
+            else:
+                continue
+            out.append((name, start + j + 1, shell,
+                        GH_EXPRESSION.sub("GH_EXPR", script)))
+    return out
+
+
+def check_shell_parse(script: str, bash: str) -> list:
+    """把一段 bash 脚本原样交给 `bash -n`：只解析、不执行，所以不会有副作用。"""
+    proc = subprocess.run([bash, "-n"], input=script, capture_output=True, text=True)
+    if proc.returncode == 0:
+        return []
+    return [(proc.stderr or proc.stdout or "").strip().replace("\n", " | ")]
+
+
+def check_shell_syntax(workflows: tuple = None, sources: tuple = None) -> list:
+    """交付链上所有手写 shell 的语法判据（真解析器，不看内容长什么样）。
+
+    两份清单做成参数是为了**判据自己可被反向对照**：离线测试要能拿一份「故意写着
+    `${V:-（空）」` 的假 workflow」喂进来，要求这一条必须报红。写死路径的判据只能
+    验「现在没坏」，验不出「坏了会不会响」——后者才是这条门的全部价值。
+    """
+    workflows = WORKFLOWS if workflows is None else workflows
+    sources = SHELL_SOURCES if sources is None else sources
+    bash = shutil.which("bash")
+    if not bash:
+        # 这条判据的存在意义是「拦在开建之前」。这台机器上没有 bash 就静默放行，
+        # 等于在最需要它的环境（Windows 开发机直构）里把门拆了——必须响。
+        return [f"找不到 bash，第 11 条没法执行（{len(workflows)} 份 workflow + "
+                f"{len(sources)} 份脚本全部未判）：装 Git Bash 后重跑这一步"]
+    problems = []
+    for rel in sources:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        for msg in check_shell_parse(path.read_text(encoding="utf-8", errors="replace"),
+                                     bash):
+            problems.append(f"{rel}：{msg}")
+    for rel in workflows:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        blocks = run_blocks_in_workflow(text)
+        total = sum(1 for ln in text.splitlines() if ANY_RUN_KEY.match(ln))
+        # 切少了=有 run 步没被判到；切多了=步边界认错了。两种都要响：
+        # 「门看起来在跑、实际漏了这一步」比直接报错更难被发现。
+        if len(blocks) != total:
+            problems.append(f"{rel}：文件里有 {total} 个 run 步，只切出 {len(blocks)} 段"
+                            f"（切漏=那几步的语法没人判，切多=判错了东西）")
+        for name, lineno, shell, script in blocks:
+            if shell != "bash":
+                continue          # pwsh 步由离线测试 M 节按 PowerShell 口径判：本机没有 pwsh
+            for msg in check_shell_parse(script, bash):
+                problems.append(f"{rel} 第 {lineno} 行「{name}」：{msg}")
+    return problems
+
+
 def check_caller(label: str, text: str, externals: tuple, modules: list,
                  with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
@@ -850,6 +1003,19 @@ def main(argv=None) -> int:
     else:
         print(f"✅ 交付链 shell 脚本：{len(HYGIENE_SCRIPTS)} 份文案卫生合格")
 
+    # 交付链上所有手写 shell 的语法（第 11 条）：判据是 bash 自己的解析器，
+    # 不是又一条「我猜到了哪几种写法会坏」的正则。
+    syntax = check_shell_syntax()
+    if syntax:
+        bad += 1
+        print("❌ 交付链 shell 语法不合格（语法坏掉的步骤连第一行都跑不到，判据和日志都没机会出场）：")
+        for p in syntax:
+            print(f"   · {p}")
+            print(f"::error::shell 语法：{p}")
+    else:
+        print(f"✅ 交付链 shell 语法：{len(SHELL_SOURCES)} 份脚本 + "
+              f"{len(WORKFLOWS)} 份 workflow 里的 bash 步全部通过 bash -n")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -874,7 +1040,7 @@ def main(argv=None) -> int:
               f"功能，所以这一步不放行就不许开建。")
         return 1
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
-          "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案")
+          "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器")
     return 0
 
 

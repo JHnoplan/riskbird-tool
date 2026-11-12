@@ -206,8 +206,19 @@ Section "Uninstall"
         ; 数据有可能落在个人目录里的这一级（安装目录被安全软件挡着写时会自动退到
         ; 这里）。卸载程序**不碰**它：那里可能有别的工具的数据，删错的代价远大于
         ; 多留一个目录；只把位置说清楚，用户想清自己清。
-        IfFileExists "$HOME\.b2bcollect\*.*" 0 no_home_data
-            DetailPrint "个人目录里还留着 $HOME\.b2bcollect（本工具与它共用，卸载未删除）"
-        no_home_data:
+        ;
+        ; 个人目录在 NSIS 里叫 $PROFILE —— NSIS 没有 $HOME：写成 $HOME 时 makensis 只
+        ; 给一句 warning 6000「unknown variable」然后当空串处理，安装包照样出得来、
+        ; 卸载照样成功，但那句「数据还留在个人目录」永远不打印（2026-11-12 云端日志
+        ; 里就是这么一条静默的 warning）。$PROFILE 万一为空（服务上下文、老系统）就
+        ; 退回注册表里的 USERPROFILE，两句都是同一个口径：运行期用的是 Path.home()。
+        StrCpy $8 "$PROFILE"
+        StrCmp $8 "" use_reg_profile check_personal_data
+        use_reg_profile:
+            ReadRegStr $8 HKCU "Volatile Environment" "USERPROFILE"
+        check_personal_data:
+        IfFileExists "$8\.b2bcollect\*.*" 0 no_personal_data
+            DetailPrint "个人目录里还留着 $8\.b2bcollect（本工具与它共用，卸载未删除）"
+        no_personal_data:
         DetailPrint "卸载完成"
 SectionEnd

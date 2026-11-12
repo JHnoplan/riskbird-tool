@@ -2011,6 +2011,100 @@ def test_workflow_shell_syntax():
             "本机脚本失败分支把退出码印得出来（${RC} 而不是 $RC）")
     _assert("退出码 ${rc}）" in mac, "Mac workflow 自检门禁的失败文案同理")
 
+    # 4-b) 第 11 条：交付链上每一段 shell 都得过 **bash 自己的解析器**。上面 4) 那种正则
+    #    只能覆盖「已经想到的写法」，而本轮真坏掉的那句是字节级的意外：
+    #    `${APP_VERSION:-（空）」}` ——右花括号前一个全角标点把 bash 3.2 的词法扫描带跑，
+    #    整步在 `set -e`、判据、日志统统出场之前就死在语法错误上（云端表现为「这一步只有一
+    #    行 bash: -c: line N: unexpected EOF」）。判据交给解析器之后，覆盖面等于解析器的
+    #    覆盖面，不再依赖哪个人记得住哪几个组合会踩雷。
+    _assert_eq(g.check_shell_syntax(), [],
+               "交付链 shell 语法：登记表里每份脚本 + 四个 workflow 的每个 bash 步都过 bash -n")
+
+    # 判据必须**可被反向对照**：塞一段语法坏掉的脚本进假 workflow 要响，合法写法要不响。
+    # 夹具用「哪种 bash 都判得出错」的写法（缺 fi 的 if、没闭合的引号）——本轮那句
+    # `${APP_VERSION:-（空）」}` 只在 bash 3.2 上炸，拿它当反向对照会得到一条
+    # 「本机红、别人绿」的判据，那和没有判据一样。它在这条链上的位置由下面两条产品侧
+    # 断言钉住：坏写法不许回来，而它要保护的那段版本号判据不许被整段删掉当修法。
+    def _wf(script_body: str, runner: str = "windows-latest", shell: str = "bash",
+            indent: int = 8) -> str:
+        step_shell = f"\n{' ' * 6}shell: {shell}" if shell else ""
+        body = "\n".join(" " * indent + ln if ln.strip() else ""
+                         for ln in script_body.rstrip("\n").splitlines())
+        return (f"jobs:\n  b:\n    runs-on: {runner}\n    steps:\n"
+                f"    - name: 被测的那一步{step_shell}\n      run: |\n{body}\n")
+
+    _NO_FI = 'if [ -x "$MAKENSIS" ]; then\n    echo ok\n'      # 缺 fi：任何 bash 都判语法错
+    _DEEP_BODY = 'if [ -x "$MAKENSIS" ]; then\n    echo ok\nfi'
+    _FIXTURES = {
+        "debug/zz_wf_bad_default.yml": _wf(_NO_FI, runner="macos-latest", shell=""),
+        "debug/zz_wf_bad_explicit.yml": _wf(_NO_FI),
+        "debug/zz_wf_good.yml": _wf('AV="$APP_VERSION"\n'
+                                    '[ -n "$AV" ] || AV="（空）"\n'
+                                    'echo "实际拿到「${AV}」"'),
+        "debug/zz_wf_pwsh.yml": _wf('if (-not (Test-Path $exe)) { throw "没有产物" }',
+                                    shell="pwsh"),
+        "debug/zz_wf_inline.yml": ("jobs:\n  b:\n    runs-on: windows-latest\n    steps:\n"
+                                   "    - name: 一行写完的 run\n      shell: bash\n"
+                                   '      run: echo "没闭合的引号\n'),
+        "debug/zz_wf_deep_indent.yml": _wf(_DEEP_BODY, indent=10),
+        "debug/zz_wf_expr.yml": ("jobs:\n  b:\n    runs-on: windows-latest\n    steps:\n"
+                                 "    - name: Actions 表达式\n      shell: bash\n"
+                                 "      run: |\n        echo \"v=${{ github.run_number }}\"\n"),
+        "debug/zz_wf_orphan.yml": "run: |\n    echo ok\njobs: {}\n",
+    }
+    for _rel, _src in _FIXTURES.items():
+        (_REPO / _rel).write_text(_src, encoding="utf-8")
+    try:
+        for _rel in ("debug/zz_wf_bad_default.yml", "debug/zz_wf_bad_explicit.yml",
+                     "debug/zz_wf_inline.yml"):
+            _got = g.check_shell_syntax(workflows=(_rel,), sources=())
+            _assert(len(_got) == 1 and "unexpected" in _got[0],
+                    f"反向对照：{_rel} 那种写法必须被判红（判不住=这条门是空的）（实际={_got}）")
+        _assert_eq(g.check_shell_syntax(workflows=("debug/zz_wf_good.yml",), sources=()), [],
+                   "反向对照：同一位置换成合法写法就放行（否则这条门只会一直响）")
+        # 只有真被 bash 解析过才算「判过了」：切错块（把 pwsh 步喂给 bash、或整段漏切）
+        # 两种都会让上面两条红/绿互换，所以下面三组钉住切块本身。
+        _blocks = g.run_blocks_in_workflow(_FIXTURES["debug/zz_wf_pwsh.yml"])
+        _assert_eq([(n, s) for n, _, s, _b in _blocks], [("被测的那一步", "pwsh")],
+                   "pwsh 步按 pwsh 登记（拿 bash 判它只会得到一条修不掉的假红）")
+        _assert_eq(g.check_shell_syntax(workflows=("debug/zz_wf_pwsh.yml",), sources=()), [],
+                   "pwsh 步不交给 bash 判（Windows runner 的 run 步默认就是 pwsh）")
+        _blocks = g.run_blocks_in_workflow(_FIXTURES["debug/zz_wf_deep_indent.yml"])
+        _assert_eq([b.splitlines() for _, _, _, b in _blocks],
+                   [_DEEP_BODY.splitlines()],
+                   "块标量的缩进按第一个非空行算（写死 +2 的话，多缩一级的整段会漏判）")
+        _blocks = g.run_blocks_in_workflow(_FIXTURES["debug/zz_wf_expr.yml"])
+        _assert("${{ " not in _blocks[0][3] and "GH_EXPR" in _blocks[0][3],
+                f"Actions 表达式先换成占位符再判（原样喂给 bash 判的就不是 CI 跑的那份字节）")
+        _got = g.check_shell_syntax(workflows=("debug/zz_wf_orphan.yml",), sources=())
+        _assert(any("只切出" in p for p in _got),
+                f"反向对照：切漏 run 步必须当场响（静默漏切=那条门根本没在跑）（实际={_got}）")
+        _assert_eq(g.check_shell_syntax(workflows=(), sources=("debug/这个文件不存在.sh",)),
+                   ["debug/这个文件不存在.sh 不在位（登记了却读不到，这条判据正在空转）"],
+                   "反向对照：登记表里的脚本不在位要响，不许静默跳过")
+    finally:
+        for _rel in _FIXTURES:
+            (_REPO / _rel).unlink(missing_ok=True)
+    # 本轮那一处的两头：坏写法不在交付链上，且它保护的那段判据还在（把整段删掉也能
+    # 让上面所有条变绿，那种「修法」必须被这一条抓住）。读的是**切出来的要执行的字节**，
+    # 不是整个文件：注释里留着「为什么不用这种写法」是有意写下的解释，不该被判成违规。
+    _win_exe = g._strip_comments("\n".join(b for _, _, s, b in g.run_blocks_in_workflow(win)
+                                            if s == "bash"))
+    _assert(len(_win_exe) > 2000 and 'MAKENSIS' in _win_exe,
+            f"从真 workflow 切出来的 bash 字节非空（切空了下面两条就是空的；实得 {len(_win_exe)} 字符）")
+    _assert("${APP_VERSION:-（空）" not in _win_exe,
+            "要执行的脚本里没有 ${VAR:-中文} 这种把非 ASCII 写进参数展开的写法")
+    _assert("AV_SHOW=" in _win_exe and 'VER4="1.$((APP_VERSION / 65536))' in _win_exe,
+            "版本号那一段（空值兜底 + 两个 16 位字段）仍在案——修语法不是把判据删掉")
+    # 登记表本身也要在案：新增 workflow 忘了登记=那条流水线的 shell 没人判，
+    # 而磁盘上明明有文件，看上去像「都验过了」。
+    _wf_on_disk = {p.relative_to(_REPO).as_posix()
+                   for p in (_REPO / ".github" / "workflows").glob("*.yml")}
+    _assert_eq(sorted(_wf_on_disk - set(g.WORKFLOWS)), [],
+               f".github/workflows 里每个 workflow 都在第 11 条的登记表里（共 {len(g.WORKFLOWS)} 份）")
+    for _rel in g.SHELL_SOURCES:
+        _assert((_REPO / _rel).is_file(), f"第 11 条登记的脚本在位：{_rel}")
+
     # 5b) 同一份判据盖住交付链上另外几份手写 shell 脚本（派发云打包、取制品、轮询 CI、
     # 批跑回归）。它们坏的时候恰好都是「排障现场最该看见那个数字」的时刻。登记表里的
     # 脚本不在位或没提交也要红——一条静默不跑的判据比没有判据更危险（会让人以为验过）。
@@ -2235,11 +2329,15 @@ def test_workflow_shell_syntax():
         _assert(need in gate_script, f"版本判据保留了 {need}（缺一样就是判据少一个方向）")
 
     def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10",
-                            pipefail: bool = True, crlf: bool = False):
+                            pipefail: bool = True, crlf: bool = False,
+                            app_version: str = "999", script: str = ""):
         """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
 
-        假 makensis 只干三件事：印横幅（或不印）、把两个交付文件名落出来、按指定码退出。
-        判据读的是它自己的那套 shell 语义，与被编的东西无关——这正是能本机复现的部分。
+        假 makensis 干四件事：按真编译器的口径验 `/DVER4=` 是不是 X.X.X.X、印横幅
+        （或不印）、把两个交付文件名落出来、按指定码退出。2026-11-12 那次云端红就
+        停在第一件事：makensis 报「invalid VIProductVersion format」直接 abort，前面
+        所有步骤全绿。判据读的是它自己的那套 shell 语义，与被编的东西无关——这正是
+        能本机复现的部分，所以把编译器的这条行为也一起搬进假编译器。
         crlf=True 按 Windows 编译器的实际输出给行尾：判据取到的那行会带一个尾随 \\r，
         「在本机换行下绿、到 Windows 换行下红」正是这一段最可能被漏掉的那半个坑。
         """
@@ -2249,14 +2347,22 @@ def test_workflow_shell_syntax():
             eol = r"\r\n" if crlf else r"\n"
             head = (f'printf "{banner}{eol}"\n' if banner
                     else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
-            stub.write_text("#!/bin/sh\n" + head
+            stub.write_text("#!/bin/sh\n"
+                            # 与真实 makensis 同口径：VIProductVersion 必须是四段数字
+                            'for a in "$@"; do case "$a" in /DVER4=*) '
+                            'v=${a#/DVER4=}; '
+                            'echo "$v" | grep -qE "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" || '
+                            '{ echo "Error: invalid VIProductVersion format, should be X.X.X.X"; '
+                            'echo "Error - aborting creation process"; exit 1; }; ;; esac; done\n'
+                            + head
                             + ": > B2bCollectToolSetup.exe\n"
                               ": > B2bCollectTool_Win_portable.zip\n"
                               f"exit {stub_rc}\n", encoding="utf-8")
             stub.chmod(0o755)
             env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
-                       RUNNER_TEMP=str(root), APP_VERSION="999", WIN_ROOT=str(root))
-            cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + ["-c", gate_script]
+                       RUNNER_TEMP=str(root), APP_VERSION=app_version, WIN_ROOT=str(root))
+            cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + \
+                  ["-c", script or gate_script]
             proc = subprocess.run(cmd, cwd=str(root), env=env,
                                   capture_output=True, text=True)
             return proc.returncode, _redact(proc.stdout + proc.stderr)
@@ -2285,6 +2391,29 @@ def test_workflow_shell_syntax():
     for _tag, (_rc, _out) in _bad.items():
         _assert(_rc != 0 and _needles[_tag] in _out and "✅" not in _out,
                 f"反例·{_tag}：必须非零退出、说清后果、且不印成功话术（rc={_rc}，尾部 {_out[-120:]}）")
+
+    # 5-e-ii) 版本号那四个数字。2026-11-12 的 Windows 红法：PyInstaller、产物自检、窗口
+    #   冒烟全部通过，最后一步 makensis 回一句「invalid VIProductVersion format,
+    #   should be X.X.X.X」就 abort —— 旧拼法 `/DVER4="1.$APP_VERSION.0"` 凑出来的是
+    #   三段。这种红只在编译器那一步出现，本机没有 makensis，所以把这条口径搬进假
+    #   编译器：拿本轮真实用过的那句拼法喂它，必须被拒；现在这句对任意 run_number
+    #   都拼得出合法版本（含会撑爆单个 16 位字段的大数，那种直接在开建前停下来说话）。
+    legacy = gate_script.replace('/DVER4="$VER4"', '/DVER4="1.$APP_VERSION.0"')
+    _assert(legacy != gate_script,
+            "安装步骤里找得着那句 makensis 调用（找不着=这段判据在跟着代码一起漂）")
+    _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, script=legacy)
+    _assert(_rc != 0 and "invalid VIProductVersion" in _out and "✅" not in _out,
+            f"反向对照：本轮那种三段版本号必须被编译器拒掉（rc={_rc}，尾部 {_out[-120:]}）")
+    for _tag, _av in (("常规 run_number", "999"), ("跨过 16 位边界", "65536"),
+                      ("七位数", "1234567")):
+        _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, app_version=_av)
+        _assert_eq(_rc, 0, f"{_tag}（APP_VERSION={_av}）也要拼得出合法版本号（尾部 {_out[-110:]}）")
+    for _tag, _av, _said in (("非数字", "1.2.3-beta", "必须是纯数字"),
+                             ("空值", "", "必须是纯数字"),
+                             ("大到四段装不下", "5000000000", "装不下")):
+        _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, app_version=_av)
+        _assert(_rc != 0 and _said in _out and "✅" not in _out,
+                f"反例·{_tag}的 APP_VERSION：不开建就停下来说清后果（rc={_rc}，尾部 {_out[-110:]}）")
 
     # 5-f) 注解必须是「本步 shell 打出来的单行文本」。跨行或引号没闭合，GitHub 不认这条
     # ::error::，于是失败原因静默消失，屏幕上只剩一个说不清的退出码——本轮写上面那段时就
@@ -2905,6 +3034,126 @@ def test_windows_onedir_delivery():
             f"说明书里的崩溃日志名与界面落盘用的是同一个名字（{_gui.FATAL_LOG_NAME}）")
     _assert("App Translocation" in guide and "应用程序" in guide,
             "说明书 Mac 那节仍在讲只读副本这件事（界面横幅的出口要有文字版可对）")
+
+    # 7) 安装脚本里每一个 $变量 都必须是 NSIS 真认得的那个。拼错时 makensis 只给一句
+    #    warning 6000「unknown variable …ignoring」，然后把它当空串：安装包照样出、
+    #    卸载照样成功，而那句「数据还留在个人目录」永远不会打印——2026-11-12 云端日志
+    #    里躺着的正是这样一条静默 warning（写成了 $HOME，NSIS 的个人目录是 $PROFILE）。
+    #    这一类和「绿得没意义」同源：编译器不报错的缺陷只能靠判据抓，靠构建结果抓不到。
+    #
+    #    白名单必须**说清来源**，不然会退化成两种坏结果：内置变量漏登记（$SMPROGRAMS
+    #    那种，判据报假红，门会被当噪音关掉），或把「其实在别处定义」的名字也报出来
+    #    （${B2B_ROOT} 由命令行 /D 注入、${GetSize} 来自 !include 的库）。所以四路来源
+    #    分开登记、分开解释：内置变量表、本文件 !define/Var、命令行注入、已登记的库宏。
+    _NSIS_VARS = {
+        # 路径与进程类
+        "INSTDIR", "EXEDIR", "CMDLINE", "NOW", "OPTIONS", "PLUGINSDIR", "OUTDFILE",
+        "WINDIR", "WINDOWS", "SYSDIR", "SYSTEM", "SYSTEM32", "SYSTEMARM64",
+        "PROGRAMFILES", "PROGRAMFILES32", "PROGRAMFILES64",
+        "COMMONFILES", "COMMONFILES32", "COMMONFILES64", "PROGRAMDATA",
+        # 个人与公共目录类（个人目录只有 $PROFILE——NSIS 没有 $HOME）
+        "PROFILE", "DESKTOP", "APPDATA", "LOCALAPPDATA", "COMMONAPPDATA",
+        "FAVORITES", "COMMONFAVORITES", "HISTORY", "RECENT", "SENDTO", "STARTUP",
+        "LOCALSTARTUP", "NETHOOD", "TEMPLATES", "COMMONTEMPLATES",
+        "DOCUMENTS", "COMMONDOCUMENTS", "MUSIC", "COMMONMUSIC", "PICTURES",
+        "COMMONPICTURES", "VIDEOS", "COMMONVIDEOS", "RESOURCEDATA",
+        "PROGRAMS", "SMPROGRAMS", "COMMONPROGRAMS", "STARTMENU", "COMMONSTARTMENU",
+        # 界面、字体、注册表句柄与寄存器变量
+        "HWND", "HWNDPARENT", "CONTROL", "FONT", "OUTDFONT", "LANGUAGE",
+        "ADMIN", "POWERUSER", "GUEST",
+    } | {f"R{i}" for i in range(10)}
+
+    # !include 的库里定义的宏：本机没有 NSIS 头文件可读，「哪个库提供哪些宏」就必须在案。
+    # 用了没登记的宏会红，措辞直接说下一步（补这张表）——宁可响一声让人补表，也不能
+    # 反过来放开：${} 一律放行等于任何拼错的宏名都不判，那这条门就是空的。
+    _NSIS_LIB_MACROS = {
+        "FileFunc.nsh": {"GetSize", "GetFileTime", "GetDrives", "GetParameters"},
+        "LogicLib.nsh": {"If", "ElseIf", "Else", "EndIf", "Unless", "AndIf", "OrIf",
+                         "While", "Do", "Loop", "Select", "Case", "Switch"},
+        "WinVer.nsh": {"AtLeastWin7", "AtLeastWin10", "IsWin10", "IsWow64"},
+        "MUI2.nsh": set(),          # MUI 走 !insertmacro，正文里不用 ${}
+    }
+
+    # 只能由命令行注入、且 CI 必须真的注入的名字。漏一个，.nsi 不会报错，只会退到
+    # !ifndef 里的兜底值（版本 0.0 / 1.0.0.0、!cd 不生效）——那是另一份「编得出来、
+    # 装得上、版本信息与字节对不上」的安装包，和本轮 VIProductVersion 同一族。
+    _NSIS_CI_DEFINES = {"B2B_ROOT": "b2bcollect_build 的绝对路径（!cd 的基准）",
+                        "APP_VERSION": "显示版本号 1.<run_number>（Name 里那一段）",
+                        "VER4": "文件属性四段版本号（makensis 只认 X.X.X.X）"}
+
+    def _nsi_var_problems(text: str, cmdline=frozenset()) -> list:
+        """$NAME 要在内置变量表里；${NAME} 要来自本文件 !define、命令行 /D 或已登记的库宏。"""
+        defined = set(re.findall(r"!define\s+(\w+)", text)) | set(
+            re.findall(r"^\s*Var\s+(?:/\w+\s+)?(\w+)", text, re.M))
+        lib_macros, unknown_libs = set(), []
+        for inc in re.findall(r'!include\s+"([^"]+)"', text):
+            key = inc.split("/")[-1]
+            if key in _NSIS_LIB_MACROS:
+                lib_macros |= _NSIS_LIB_MACROS[key]
+            else:
+                unknown_libs.append(key)
+        known_braces = defined | set(cmdline) | lib_macros
+        lib_hint = "、".join(sorted(_NSIS_LIB_MACROS))
+        out = []
+        for ln, raw in enumerate(text.splitlines(), 1):
+            if raw.strip().startswith((";", "#")):
+                continue                       # 注释里写的是「曾经错成什么」，不是要执行的
+            for m in re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*)", raw):
+                name = m.group(1)
+                if name in _NSIS_VARS or name in defined:
+                    continue
+                out.append(f"第 {ln} 行 ${name}：NSIS 认不出这个变量"
+                           f"（编译器只报 warning 6000 并当空串，那句话永远打印不出来）")
+            for m in re.finditer(r"\$\{(\w+)\}", raw):
+                if m.group(1) in known_braces:
+                    continue
+                extra = (f"；本文件还 !include 了未登记的库 {'/'.join(unknown_libs)}"
+                         f"（它的宏要补进 _NSIS_LIB_MACROS 才认）" if unknown_libs else "")
+                out.append(f"第 {ln} 行 ${{{m.group(1)}}}：既不在本文件 !define/Var 里，"
+                           f"也不在命令行 /D 注入的名字里，也不在已登记的库宏（{lib_hint}）"
+                           f"里{extra}——宏名拼错时 NSIS 不展开它，只给一句 warning")
+        return out
+
+    _nsi_cmdline = set(re.findall(r"/D([A-Za-z_]\w*)=", win))
+    _assert_eq(_nsi_var_problems(nsi, _nsi_cmdline), [],
+               "安装脚本里没有拼错的 NSIS 变量（个人目录是 $PROFILE，没有 $HOME）")
+    _assert_eq(_nsi_var_problems('IfFileExists "$HOME\\.b2bcollect\\*.*" 0 done\n'
+                                 'DetailPrint "$NOPE_DIR"\nDetailPrint "${NOPE_MACRO}"\n',
+                                 {"B2B_ROOT"}),
+               ["第 1 行 $HOME：NSIS 认不出这个变量（编译器只报 warning 6000 并当空串，"
+                "那句话永远打印不出来）",
+                "第 2 行 $NOPE_DIR：NSIS 认不出这个变量（编译器只报 warning 6000 并当空串，"
+                "那句话永远打印不出来）",
+                "第 3 行 ${NOPE_MACRO}：既不在本文件 !define/Var 里，也不在命令行 /D 注入的"
+                "名字里，也不在已登记的库宏（FileFunc.nsh、LogicLib.nsh、MUI2.nsh、"
+                "WinVer.nsh）里——宏名拼错时 NSIS 不展开它，只给一句 warning"],
+               "反向对照：本轮那种 $HOME 与拼错的宏名都必须被抓出来（抓不住=这条门是空的）")
+    _assert_eq(_nsi_var_problems('!include "FileFunc.nsh"\n!define FOO "x"\n'
+                                 'Var /GLOBAL Bar\nDetailPrint "${FOO} ${GetSize}" '
+                                 '"$INSTDIR $PROFILE $SMPROGRAMS $R3"\n',
+                                 {"BAR2"}), [],
+               "反向对照：内置变量、本文件定义过的名字、命令行注入、已登记的库宏都不误报"
+               "（误报的门会被当噪音关掉）")
+    _assert_eq(_nsi_var_problems('; 旧写法是 "$HOME"，NSIS 认不出来\n'), [],
+               "反向对照：注释里的错写法不算（否则解释 bug 的那行自己被当成 bug）")
+    _odd = _nsi_var_problems('!include "WeirdLib.nsh"\nDetailPrint "${Whatever}"\n')
+    _assert(len(_odd) == 1 and "未登记的库 WeirdLib.nsh" in _odd[0],
+            "反向对照：没登记的库里的宏必须红，并且要说清去补哪张表"
+            f"（放行=任何 ${{}} 都不判）（实际={_odd}）")
+
+    for _dn, _why in sorted(_NSIS_CI_DEFINES.items()):
+        _assert(f"/D{_dn}=" in win,
+                f"workflow 的 makensis 命令必须注入 {_dn}（{_why}；少注入一个就退到 .nsi 的"
+                f" !ifndef 兜底值，那种安装包编得出来、装得上，只有版本信息与字节对不上）")
+        _assert(f"${{{_dn}}}" in nsi,
+                f".nsi 必须真的用到 {_dn}（不用却还注入=上面那条判据在空转）")
+
+    # 8) 个人目录这件事，脚本与说明书还要说的是同一个地方：运行期退回的是
+    #    Path.home()/.b2bcollect（NSIS 侧就是 $PROFILE），说明书指错目录的话，用户
+    #    卸载后去找日志会一无所获。
+    _assert("$PROFILE" in nsi, "卸载脚本用 $PROFILE 指个人目录（与运行期 Path.home() 同一处）")
+    _assert(".b2bcollect" in nsi and ".b2bcollect" in guide,
+            "个人目录那一级的名字在安装脚本与说明书里是同一个（两边各写一份迟早对不上）")
 
 
 def test_state_file_never_relative_cwd():
