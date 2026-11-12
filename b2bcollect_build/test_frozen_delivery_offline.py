@@ -3161,7 +3161,10 @@ def _install_nsi(asm, drop=(), dup=None, extra=None, abort=True, goto=None,
         items.append((dup, "同一项验第二遍"))
     entries = ['    CreateShortCut "$SMPROGRAMS\\x.lnk" "$INSTDIR\\x.exe"',
                '    WriteUninstaller "$INSTDIR\\uninstall.exe"']
-    clean_line = f'    RMDir /r {clean}' if clean else None
+    # 引号必须是 NSIS 的写法：判据认的是 `RMDir /r "路径"`，夹具拼成不带引号的话，
+    # 「合格的树」会红成「没清旧运行时」，而那六个反例也会全部红成同一句指错方向的话
+    # ——一轮里七条红指向同一个夹具笔误，这种红最费人。
+    clean_line = f'    RMDir /r "{clean}"' if clean else None
     copy_in = ['    File /r "dist\\*.*"']
     if clean_line:
         # 默认排在 File **之前**：先清旧运行时，再铺这一版的（排在后面等于把刚拷好的删掉）
