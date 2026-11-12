@@ -2105,6 +2105,153 @@ def test_workflow_shell_syntax():
     for _rel in g.SHELL_SOURCES:
         _assert((_REPO / _rel).is_file(), f"第 11 条登记的脚本在位：{_rel}")
 
+    # 4-c) 第 12 条：交付链脚本的**编码**不许交给环境决定。上面 4-b) 那条判据上线当天
+    #      就在云端炸出一条形态全新的红：Windows runner 上 `input=<str>` 在**写 stdin
+    #      那一刻**抛 UnicodeEncodeError（'charmap'＝控制台代码页 cp1252），构建前硬门
+    #      自己炸在打包之前，症状与「被判的脚本有问题」一模一样。本机是 UTF-8，这类缺陷
+    #      在本机永远复现不出来——所以光有静态判据不够，还要一条**行为仿真**：把解释器
+    #      放进一个窄代码页（US-ASCII）的子进程里跑这条判据，要求它既不抛异常，也还能
+    #      给出正确的红与绿；同时要求「旧写法」在那个环境里**确实会抛**，否则这个夹具
+    #      只是在自我表扬（有人关掉 locale 强制、或换一台 UTF-8 镜像，它就变成空跑）。
+    _assert_eq(g.check_text_io_encoding(), [],
+               "交付链那份判据现在一条都不报（报了就说明有人在 Windows runner 上会把"
+               "门禁炸成一条 UnicodeError，而门禁的结论会被这条异常整个盖掉）")
+    _assert(len(g.io_scripts()) >= 5,
+            f"扫描是按目录枚举的，真找到 {len(g.io_scripts())} 份脚本（找空了下面所有条都是空的）")
+
+    _IO_FIXTURES = {
+        # a) 本轮云端那条红的最小复现：input 给 str + text=True 且没有 encoding
+        "debug/zz_io_input_str.py":
+            "import subprocess\n"
+            "subprocess.run(['bash', '-n'], input='echo 中文\\n', text=True)\n",
+        # b) 只缺 encoding 的解码半边：git 关掉 core.quotePath 之后输出中文文件名
+        "debug/zz_io_text_noenc.py":
+            "import subprocess\n"
+            "r = subprocess.run(['git', 'ls-files'], capture_output=True, text=True)\n"
+            "print(r.stdout)\n",
+        # c) 写对了：显式 encoding + errors
+        "debug/zz_io_ok.py":
+            "import subprocess\n"
+            "r = subprocess.run(['git', 'ls-files'], capture_output=True, text=True,\n"
+            "                   encoding='utf-8', errors='replace')\n"
+            "print(r.stdout)\n",
+        # d) 中文进控制台却没修编码（✅ 那一类）
+        "debug/zz_io_print_noop.py":
+            "print('✅ 交付链编码合格')\n",
+        # e) 修好了，而且修在第一次打印之前
+        "debug/zz_io_print_fixed.py":
+            "import sys\n"
+            "sys.stdout.reconfigure(encoding='utf-8')\n"
+            "print('✅ 交付链编码合格')\n",
+        # f) 修晚了：第一句中文已经抛过才算
+        "debug/zz_io_print_late.py":
+            "import sys\n"
+            "print('❌ 门禁失败')\n"
+            "sys.stdout.reconfigure(encoding='utf-8')\n",
+        # g) 只盯 print 会漏的那一半：中文的 SystemExit 消息也是往 stderr 写
+        "debug/zz_io_systemexit.py":
+            "import sys\n"
+            "sys.exit('Stable 通道没有 mac-arm64 chromedriver，检查网络')\n",
+        # h) 全 ASCII 的脚本不需要修编码（不跟着报，门才不会沦为噪音）
+        "debug/zz_io_ascii_only.py":
+            "import subprocess\n"
+            "print('saved chromedriver')\n"
+            "subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True)\n",
+        # i) 判据自己也吃语法错误：读不懂必须响，不能当成「没问题」
+        "debug/zz_io_broken.py": "def (\n",
+    }
+    for _rel, _src in _IO_FIXTURES.items():
+        (_REPO / _rel).write_text(_src, encoding="utf-8")
+    try:
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_input_str.py",))
+        _assert(len(_got) == 2 and any("input= 给的是 str" in p for p in _got)
+                and any("text=True 却没写 encoding" in p for p in _got),
+                f"反向对照：本轮云端那种 input=<str> 要同时被抓两次（写法与解码）（实际={_got}）")
+        _assert(any("encoding=\"utf-8\", errors=\"replace\"" in p for p in _got),
+                "报错文案要直接给出下一步（补哪两个参数），不要让人回去读判据源码")
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_text_noenc.py",))
+        _assert(len(_got) == 1 and "text=True 却没写 encoding" in _got[0],
+                f"反向对照：text=True 不写 encoding 单独也能被抓到（实际={_got}）")
+        _assert_eq(g.check_text_io_encoding(paths=("debug/zz_io_ok.py",)), [],
+                   "反向对照：显式写了 encoding 就放行（否则这条门只会一直响）")
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_print_noop.py",))
+        _assert(len(_got) == 1 and "reconfigure" in _got[0],
+                f"反向对照：中文进控制台却没修编码要红（实际={_got}）")
+        _assert_eq(g.check_text_io_encoding(paths=("debug/zz_io_print_fixed.py",)), [],
+                   "反向对照：修在第一次打印之前就放行")
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_print_late.py",))
+        _assert(len(_got) == 1 and "第一次中文写控制台" in _got[0],
+                f"反向对照：修晚了同样红——顺序才是这件事的实质（实际={_got}）")
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_systemexit.py",))
+        _assert(len(_got) == 1,
+                f"反向对照：中文的 sys.exit 消息也算往控制台写（只盯 print 会放过它，"
+                f"而那常常正是门禁唯一要说清原因的一句）（实际={_got}）")
+        _assert_eq(g.check_text_io_encoding(paths=("debug/zz_io_ascii_only.py",)), [],
+                   "反向对照：全 ASCII 的脚本不要求修编码（误报的门会被当噪音关掉）")
+        _got = g.check_text_io_encoding(paths=("debug/zz_io_broken.py",))
+        _assert(len(_got) == 1 and "语法读不懂" in _got[0],
+                f"反向对照：读不懂的脚本要响，不能当成合格（实际={_got}）")
+        _assert_eq(g.check_text_io_encoding(paths=("debug/这个文件不存在.py",)),
+                   ["debug/这个文件不存在.py 不在位（登记了却读不到，这条判据正在空转）"],
+                   "反向对照：登记表里的脚本不在位要响，不许静默跳过")
+    finally:
+        for _rel in _IO_FIXTURES:
+            (_REPO / _rel).unlink(missing_ok=True)
+
+    # 行为仿真：真的开一个窄代码页的解释器，把判据放进去跑。上面那些夹具判的是
+    # 「写法」，这一条判的是「换一种环境以后这条门还会不会说话」。
+    _narrow_probe = (
+        "import locale, sys\n"
+        "sys.path.insert(0, '.github/scripts')\n"
+        "import check_packaging_manifest as g\n"
+        "good = 'echo \"实际拿到「${AV}」\"\\n'\n"
+        "bad = 'if [ -x \"$X\" ]; then\\n    echo 中文\\n'\n"
+        "try:\n"
+        "    a = g.check_shell_parse(good, 'bash')\n"
+        "    b = g.check_shell_parse(bad, 'bash')\n"
+        "except Exception as e:\n"
+        "    print('EXC %s' % type(e).__name__)\n"
+        "    raise SystemExit(1)\n"
+        "print('ENC %s GOOD %d BAD %d' % (locale.getpreferredencoding(False), len(a), len(b)))\n"
+    )
+    _old_probe = (
+        "import subprocess\n"
+        "try:\n"
+        "    subprocess.run(['bash', '-n'], input='echo 中文\\n', text=True)\n"
+        "    print('OLD no raise')\n"
+        "except UnicodeEncodeError:\n"
+        "    print('OLD raised UnicodeEncodeError')\n"
+    )
+    _narrow_env = dict(os.environ)
+    for _k in ("PYTHONLOADING", "LC_CTYPE", "LANGUAGE"):
+        _narrow_env.pop(_k, None)
+    # 两个都要给：只关 PEP 538 的 locale 强制还不够——关掉之后解释器会**自动**进入
+    # PEP 540 的 UTF-8 模式，preferredencoding 照样是 UTF-8，这个夹具就白搭了。
+    # 上一轮就是这么空的：断言拿到 'utf-8'，窄环境压根没起来。
+    _narrow_env.update({"LC_ALL": "C", "LANG": "C",
+                        "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+    _nr = subprocess.run([sys.executable, "-c", _narrow_probe], cwd=str(_REPO),
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", env=_narrow_env)
+    _old = subprocess.run([sys.executable, "-c", _old_probe], cwd=str(_REPO),
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", env=_narrow_env)
+    _assert("OLD raised UnicodeEncodeError" in _old.stdout,
+            f"夹具本身要先被验住：窄环境下旧写法（input=<str>）确实当场抛 UnicodeEncodeError"
+            f"（不抛就说明这台机器没模拟出 Windows 那半个环境，下面两条就是空跑）"
+            f"（实际 stdout={_old.stdout.strip()!r} stderr={_old.stderr.strip()[-160:]!r}）")
+    _fields = _nr.stdout.split()
+    _assert(len(_fields) >= 6 and _fields[0] == "ENC",
+            f"窄环境那一跑要有结论可读（没读到就先看 stderr——那正是这一条要抓的故障）"
+            f"（实际 stdout={_nr.stdout.strip()!r} stderr={_nr.stderr.strip()[-160:]!r}）")
+    _assert("utf" not in _fields[1].lower(),
+            f"窄环境确实生效：preferredencoding 不是 UTF-8（实际={_fields[1]!r}）")
+    _assert_eq(_fields[2:], ["GOOD", "0", "BAD", "1"],
+               "字节进出的判据在窄代码页里既不抛异常、给的红绿也一个不差"
+               f"（抛了就复现云端那条：构建前硬门自己炸在打包之前；实际 stdout={_nr.stdout.strip()!r} "
+               f"stderr={_nr.stderr.strip()[-160:]!r}）")
+
+
     # 5b) 同一份判据盖住交付链上另外几份手写 shell 脚本（派发云打包、取制品、轮询 CI、
     # 批跑回归）。它们坏的时候恰好都是「排障现场最该看见那个数字」的时刻。登记表里的
     # 脚本不在位或没提交也要红——一条静默不跑的判据比没有判据更危险（会让人以为验过）。
@@ -2848,6 +2995,46 @@ def _win_assembler():
     return _WIN_ASM_MOD
 
 
+# 合格的那一份卸载段只在下面这几行常量里定义一次
+_UN_ASK = ('MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 '
+            '"是否连登录状态和缓存一起删？选「否」保留数据" IDNO keep_data')
+_UN_ASK_NO_DEF = ('MessageBox MB_YESNO|MB_ICONQUESTION '
+                  '"是否连登录状态和缓存一起删？选「否」保留数据" IDNO keep_data')
+_UN_TAIL = ["uninstall_tail:", 'Delete "$DESKTOP\\x.lnk"', 'DeleteRegKey HKCU "Key"']
+
+
+def _uninstall_nsi(runtime_dirs, ask=_UN_ASK, dirs=None, inst=True, goto=None,
+                   keep=None, tail=_UN_TAIL, header=()):
+    """按**分支**拼一份卸载段：默认拼出来的是合格那一份。
+
+    每个参数只覆盖一条分支的一处，反例才能做到「只差一处」。整份 .nsi 抄九遍的话，
+    改一处要改九处，迟早有一份反例悄悄变成正例——那比没有反例更坏，因为看上去验过了。
+    """
+    _dirs = list(runtime_dirs) if dirs is None else list(dirs)
+    lines = list(header) + [ask]
+    for d in _dirs:
+        lines.append(f'RMDir /r "$INSTDIR\\{d}"')
+    if inst:
+        lines.append('RMDir /r "$INSTDIR"')
+    lines += (list(goto) if goto is not None else ["Goto uninstall_tail"])
+    lines.append("keep_data:")
+    lines += (list(keep) if keep is not None else [
+        'DetailPrint "已保留登录状态与采集数据：$INSTDIR"', 'RMDir "$INSTDIR"'])
+    lines += list(tail)
+    return ('Section "Uninstall"\n'
+            + "\n".join("    " + ln for ln in lines) + "\nSectionEnd\n")
+
+
+def _stub_nsi_text() -> str:
+    """合成产物树里那份 .nsi：既然叫「合格的树」，卸载分支也得跟着合格。
+
+    不在这里复制仓库里的真脚本——真文件合规与否由 O 组单独判；这里的职责只是给装配
+    脚本一个「除了被测那一项以外全都合格」的输入，好让失败一定指向被测的那一项。
+    """
+    return ('Unicode true\nName "B2B"\n'
+            + _uninstall_nsi(_win_assembler().RUNTIME_DIRS))
+
+
 def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
     """搭一棵**合成**的 onedir 产物树：指定项可以缺席，用来验校验器自己判得对不对。"""
     app = root / "dist" / _win_assembler().APP_DIR_NAME
@@ -2873,7 +3060,8 @@ def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
     for rel in (asm.NSI_PATH, asm.GUIDE_SRC):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(asm.BOM + "合成桩\n".encode("utf-8"))
+        target.write_bytes(asm.BOM + ("合成桩\n" if rel == asm.GUIDE_SRC
+                                      else _stub_nsi_text()).encode("utf-8"))
     if stale_onefile:
         (root / "dist" / asm.EXE_NAME).write_text("MZ", encoding="utf-8")
     for name in runtime_dirs:
@@ -3154,6 +3342,107 @@ def test_windows_onedir_delivery():
     _assert("$PROFILE" in nsi, "卸载脚本用 $PROFILE 指个人目录（与运行期 Path.home() 同一处）")
     _assert(".b2bcollect" in nsi and ".b2bcollect" in guide,
             "个人目录那一级的名字在安装脚本与说明书里是同一个（两边各写一份迟早对不上）")
+
+    # 9) 卸载段的「保留数据」分支必须**真的保留数据**。这一条不是防想象中的错：本轮读
+    #    这份脚本时读到的就是旧写法——两条选项最后都走到同一句 RMDir /r "$INSTDIR"，
+    #    于是问句里那句「选『否』（推荐）：保留 b2bcollect_data / b2bcollect_state /
+    #    riskbird_data」是空的，选保留也照样被递归删掉。编译器不报（语法完全合法）、
+    #    卸载退出码 0、DetailPrint 里那句「已保留」也照样打印，症状要等下次重装、
+    #    登录状态全没了才浮现——而那时没人会怀疑到卸载脚本少了一个分支跳转。
+    #    另一处同类：MessageBox 不带 MB_DEFBUTTON2 时默认焦点在**第一个按钮**（=「是，
+    #    连数据一起删」），一路回车下去就把数据删了，和说明书那句「默认保留」正好相反。
+    #    判据实现在 .github/scripts/package_win_artifacts.py（CI 在 makensis 之前跑），
+    #    这里钉住它的**分支归属**判定与接线，不留第二份规矩。
+    _un = []
+    with _hush():
+        asm.check_installer_uninstall(nsi, _un)
+    _assert_eq(_un, [], "真安装脚本的卸载分支合格：保留分支不递归删、全删分支逐个点名、"
+                        "默认焦点在「否」、两条分支各有归宿")
+    _assert('Goto uninstall_tail' in nsi and 'RMDir "$INSTDIR"' in nsi,
+            "两条分支各走各的：全删分支显式跳转，保留分支只用不带 /r 的 RMDir"
+            "（不带 /r 才会在目录还剩用户数据时停下）")
+    _assert("MB_DEFBUTTON2" in nsi,
+            "问句的默认焦点落在「否」（=保留），说明书那句「默认保留」才有代码撑着")
+
+    # 反例逐条只差一处（见 _uninstall_nsi 的参数分工）：每个参数都判**具体那条消息**，
+    # 只要求条数与关键词同时成立——「有条红」不等于「红在对的地方」。
+    _RD = asm.RUNTIME_DIRS
+    _cases = [
+        ("旧写法：两条分支汇到同一句递归删除",
+         _uninstall_nsi(_RD, ask=_UN_ASK_NO_DEF, inst=False, goto=[],
+                        keep=['RMDir /r "$INSTDIR"']),
+         ["递归删除 $INSTDIR", "MB_DEFBUTTON2", "没有 Goto"]),
+        ("保留分支里换成 Delete /r 也一样是删数据",
+         _uninstall_nsi(_RD, keep=['Delete /r "$INSTDIR\\riskbird_data"']),
+         ["递归删除 $INSTDIR\\riskbird_data", "没有 DetailPrint"]),
+        ("全删分支少列一个数据目录",
+         _uninstall_nsi(_RD, dirs=tuple(_RD[1:])),
+         [f'没有 RMDir /r "$INSTDIR\\{_RD[0]}"']),
+        ("全删分支末尾不跳转，直接落进保留分支",
+         _uninstall_nsi(_RD, goto=[]),
+         ["没有 Goto"]),
+        ("跳转目标落进保留分支内部（往回跳）",
+         _uninstall_nsi(_RD, goto=["Goto keep_data"]),
+         ["跳转目标必须落在两条"]),
+        ("跳转目标压根没有这个标号",
+         _uninstall_nsi(_RD, goto=["Goto uninstall_end"]),
+         ["在卸载段里不存在"]),
+        ("根本没问用户就删数据",
+         _uninstall_nsi(_RD, ask='DetailPrint "直接删"'),
+         ["没有任何「要不要连登录状态和缓存一起删」的问句"]),
+        ("问了两遍，分支归属不再唯一",
+         _uninstall_nsi(_RD, ask=_UN_ASK, header=[_UN_ASK_NO_DEF.replace("IDNO keep_data",
+                                                                        "IDNO keep_other")]),
+         ["条带 IDNO 跳转的问句"]),
+        ("IDNO 跳到不存在的标号",
+         _uninstall_nsi(_RD, ask=_UN_ASK.replace("keep_data", "keep_gone")),
+         ["没有这个标号 keep_gone"]),
+        ("卸载段整块没了",
+         'Section "Install"\n    File x\nSectionEnd\n',
+         ['没有 Section "Uninstall"']),
+    ]
+    for _label, _text, _needles in _cases:
+        _p = []
+        with _hush():
+            asm.check_installer_uninstall(_text, _p)
+        _assert(_p, f"反向对照：{_label} 必须报红（报不出来=这条门在这一类改动上是空的）")
+        for _n in _needles:
+            _assert(any(_n in x for x in _p),
+                    f"反向对照：{_label} 要红在正确的地方——消息里得出现「{_n}」（实际={_p}）")
+
+    # 注释里写「旧写法长什么样」不该被判成违规：解释这个 bug 的那一行本身就带着坏写法，
+    # 判据读的是要执行的字节。这一条不设防的话，第一条诚实的注释会让整道门永远响。
+    _p = []
+    with _hush():
+        asm.check_installer_uninstall(_uninstall_nsi(
+            _RD, header=['; 旧写法是 RMDir /r "$INSTDIR"，两个选项都走到同一句递归删除']), _p)
+    _assert_eq(_p, [], "反向对照：注释里的旧写法不算违规（真脚本里就留着这样一行解释）")
+
+    # 接线：判据不能只是「一个函数存在」，CI 那一步真会因为它而不发包。行为验证——
+    # 把合成产物树里那份 .nsi 换成旧写法，装配脚本必须非零退出**且不产出 zip**。
+    _bad_root = Path(tempfile.mkdtemp(prefix="windist_uninstall_"))
+    _fake_dist(_bad_root)
+    (_bad_root / asm.NSI_PATH).write_bytes(
+        asm.BOM + _uninstall_nsi(_RD, ask=_UN_ASK_NO_DEF, inst=False, goto=[],
+                                 keep=['RMDir /r "$INSTDIR"']).encode("utf-8"))
+    _rc = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
+                             "package_win_artifacts.py"), "--root", str(_bad_root)],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", cwd=str(_REPO))
+    _assert(_rc.returncode != 0 and "递归删除 $INSTDIR" in (_rc.stdout + _rc.stderr),
+            f"反向对照：旧写法在安装包编译之前就被装配那一步拦下，消息说清是哪一句"
+            f"（rc={_rc.returncode} out尾部={_rc.stdout[-200:]!r}）")
+    _assert(not (_bad_root / asm.PORTABLE_NAME).exists(),
+            "拦下来时连绿色版 zip 都不产出：产物有问题还继续装配，正是「CI 绿、用户拿坏包」的形状")
+    _good_root = Path(tempfile.mkdtemp(prefix="windist_uninstall_ok_"))
+    _fake_dist(_good_root)
+    _rc2 = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
+                              "package_win_artifacts.py"), "--root", str(_good_root)],
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", cwd=str(_REPO))
+    _assert_eq(_rc2.returncode, 0,
+               f"同一棵树只把 .nsi 换成合格那份就必须通过（不通过=这条门一直响）"
+               f"（out尾部={_rc2.stdout[-200:]!r}）")
 
 
 def test_state_file_never_relative_cwd():

@@ -11,8 +11,19 @@ import io
 import json
 import os
 import stat
+import sys
 import urllib.request
 import zipfile
+
+# 与 .github/scripts 里另外几份同源：控制台编码必须由脚本自己写定，不能交给环境代码页。
+# 这里第一处就要用到——下面那句 print 里有「→」，SystemExit 的消息整句是中文：英文
+# Windows 镜像（cp1252）上写出的当下就抛 UnicodeEncodeError，「下载失败」这句唯一的
+# 结论会被那条异常盖掉。本机（UTF-8）永远复现不出来，所以由第 12 条硬门在构建前判。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 BASE = ("https://googlechromelabs.github.io/chrome-for-testing/"
         "last-known-good-versions-with-downloads.json")

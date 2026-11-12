@@ -20,6 +20,10 @@
        UTF-8 读脚本，否则按系统代码页解释——英文 Windows 的 runner 是 cp1252，
        中文界面文字全部变乱码，而构建照样「成功」。这种「只在产物里暴露的成功」
        必须由脚本而不是人眼来拦。
+    4) 卸载段那条「保留数据」的分支必须**真的只删程序文件**（见 check_installer_uninstall）。
+       2026-11-12 读这份脚本时发现：两个选项最后都走到同一句 ``RMDir /r "$INSTDIR"``，
+       于是「选『否』保留 b2bcollect_data」这句承诺是空的。编译器与卸载日志都无从反映，
+       只有下次重装时用户才发现登录状态没了。
 
 用法（CI 在 b2bcollect_build 目录下调用，也可从仓库根调用，路径按参数给）：
     python .github/scripts/package_win_artifacts.py --root b2bcollect_build
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -125,6 +130,140 @@ def check_bom(path: Path, label: str, problems: list) -> None:
                         "英文 Windows 上中文全部变乱码，而构建照样报成功")
 
 
+# ── 卸载脚本的结构判据（正则在下面几条常量里，判定逻辑全在函数内）──────────
+# NSIS 的注释行（整行以 ; 或 # 开头）。必须剔掉再判：解释这个 bug 的那行注释里
+# 就写着旧的错误写法，不剔掉的话「说明为什么不能这样写」自己被当成「这样写了」。
+NSIS_COMMENT = re.compile(r"^\s*[;#]")
+NSIS_UNINSTALL_SECTION = re.compile(r'^\s*Section\s+(?:/\w+\s+)*"Uninstall"\s*$')
+NSIS_SECTION_END = re.compile(r"^\s*SectionEnd\b")
+# 卸载段里唯一那条「问用户要不要连数据一起删」的问句：IDNO 跳到保留分支的标号。
+NSIS_ASK = re.compile(r'MessageBox\s+(?P<flags>[^\s"]+)\s+"(?P<msg>[^"]*)"'
+                      r'\s+IDNO\s+(?P<label>\w+)')
+NSIS_LABEL = re.compile(r"^\s*(?P<label>\w+):\s*$")
+NSIS_GOTO = re.compile(r"^\s*Goto\s+(?P<target>\w+)")
+# 递归删除：/r 会把整棵树连带里面的用户数据一起带走，只允许出现在「全删」分支。
+NSIS_RECURSIVE = re.compile(r'(?:RMDir|Delete)\s+/r\s+"(?P<path>[^"]+)"')
+NSIS_DETAILPRINT = re.compile(r"^\s*DetailPrint\b")
+
+
+def _nsis_label_of(line: str):
+    """这一行如果是标号（``keep_data:``）就返回它的名字，否则返回 None。"""
+    m = NSIS_LABEL.match(line)
+    return m.group("label") if m else None
+
+
+def _nsis_uninstall_body(lines: list) -> tuple:
+    """返回 (卸载段正文下标列表, 起始行号)。找不到时返回 (None, 0)。"""
+    for i, ln in enumerate(lines):
+        if NSIS_UNINSTALL_SECTION.match(ln):
+            body = []
+            for j in range(i + 1, len(lines)):
+                if NSIS_SECTION_END.match(lines[j]):
+                    break
+                body.append(j)
+            return body, i + 1
+    return None, 0
+
+
+def check_installer_uninstall(text: str, problems: list) -> None:
+    """卸载段的「保留数据」分支必须真的保留数据——这是本轮读脚本读出来的真缺陷。
+
+    旧写法长这样（两条分支汇到同一句递归删除）：
+
+        MessageBox MB_YESNO "……选「否」保留 b2bcollect_data / ……" IDNO keep_data
+            RMDir /r "$INSTDIR\\b2bcollect_data"
+            ……
+        keep_data:
+            RMDir /r "$INSTDIR"          ← 选「否」也走到这里，刚承诺保留的目录被整体删掉
+
+    编译器不会报（语法完全合法），卸载不会报（退出码 0），DetailPrint 里那句
+    「已保留……」也照样打印——它承诺的东西在它自己后面就被删掉了。用户只在下次
+    重装时才发现这几个月白干，而那时没人会怀疑到卸载脚本。所以这一条必须在 makensis
+    之前拦住：判据只看**分支归属**（一行代码在哪条分支里），不看它写得多像样。
+    """
+    lines = text.splitlines()
+    body, start = _nsis_uninstall_body(lines)
+    if body is None:
+        _fail(problems, '安装脚本里没有 Section "Uninstall"：控制面板那句「卸载」'
+                        "就没有卸载逻辑可执行，安装包不能发")
+        return
+    code = [k for k in body if not NSIS_COMMENT.match(lines[k])]
+
+    asks = [(k, NSIS_ASK.search(lines[k])) for k in code]
+    asks = [(k, m) for k, m in asks if m]
+    if not asks:
+        _fail(problems, f"卸载段（第 {start} 行起）没有任何「要不要连登录状态和缓存一起删」"
+                        "的问句：运行期数据是用户几个月的劳动成果，绝不允许静默删除，"
+                        "必须先问、再按用户的选择分支")
+        return
+    if len(asks) > 1:
+        _fail(problems, f"卸载段有 {len(asks)} 条带 IDNO 跳转的问句（第 "
+                        f"{[k + 1 for k, _ in asks]} 行）：分支归属变得不确定，"
+                        "一条问句配一条保留分支就够")
+        return
+    ask_k, ask = asks[0]
+    if "MB_DEFBUTTON2" not in ask.group("flags"):
+        _fail(problems, f"第 {ask_k + 1} 行那条问句没带 MB_DEFBUTTON2：NSIS 的 MessageBox "
+                        "默认焦点在**第一个按钮**（=「是，连数据一起删」），一路回车下去就"
+                        "把用户数据删了，与问句里那句「选『否』（推荐）」互相矛盾")
+    label = ask.group("label")
+
+    label_k = next((k for k in code if k > ask_k and _nsis_label_of(lines[k]) == label), None)
+    if label_k is None:
+        _fail(problems, f"第 {ask_k + 1} 行 IDNO 跳到标号 {label}，卸载段里没有这个标号 "
+                        f"{label}（makensis 会报 unknown label，安装包编不出来）")
+        return
+    del_branch = [k for k in code if ask_k < k < label_k]        # 用户选「是」：连数据全删
+    # 保留分支到下一个标号为止（后面是两条分支共用的收尾清理，不属于任何一条分支）
+    keep_end = next((k for k in code if k > label_k and _nsis_label_of(lines[k])),
+                    body[-1] + 1)
+    keep_branch = [k for k in code if label_k < k < keep_end]
+
+    for name in RUNTIME_DIRS:
+        want = f'$INSTDIR\\{name}'
+        if not any(m.group("path") == want for k in del_branch
+                   for m in NSIS_RECURSIVE.finditer(lines[k])):
+            _fail(problems, f"「连数据一起删」那条分支里没有 RMDir /r \"{want}\"："
+                            "用户明确选了全删，磁盘上却会留下这个数据目录"
+                            "（这种漏法没有症状，只有下次重装时才被发现）")
+
+    if not any(m.group("path") == "$INSTDIR" for k in del_branch
+               for m in NSIS_RECURSIVE.finditer(lines[k])):
+        _fail(problems, '「连数据一起删」那条分支最后没有 RMDir /r "$INSTDIR"：'
+                        "程序文件已删净但空目录留着，下次安装还会撞在那个残骸上")
+    gotos = [m for m in (NSIS_GOTO.search(lines[k]) for k in del_branch) if m]
+    if not gotos:
+        _fail(problems, "「连数据一起删」那条分支末尾没有 Goto：它会直接落进保留分支，"
+                        "两条分支的执行内容变成同一段，用户在问句里选了什么都不算数")
+    elif len(gotos) > 1:
+        _fail(problems, f"全删分支里有 {len(gotos)} 条 Goto：分支归属不再唯一，"
+                        "收尾只留一条跳转就够了")
+    else:
+        target = gotos[0].group("target")
+        # 在**整段**里找这个标号，而不是只在 label 之后找：`Goto keep_data` 那种往回跳
+        # 在 NSIS 里语法完全合法（makensis 不会报），但它的语义正是「跳回保留分支内部」
+        # ——把全删分支又接回它刚跳开的那一段。只往后找会把它当成「标号不存在」，
+        # 报一条让人去补标号的错词，根因就被指错了。
+        tk = next((k for k in body if _nsis_label_of(lines[k]) == target), None)
+        if tk is None:
+            _fail(problems, f"全删分支 Goto 的标号 {target} 在卸载段里不存在"
+                            "（makensis 会报 unknown label，安装包编不出来）")
+        elif tk < keep_end:
+            _fail(problems, f"全删分支 Goto 到第 {tk + 1} 行的 {target}：跳转目标必须落在两条"
+                            "分支**之外**的收尾处，落进保留分支（或往回跳进它）等于又绕回删除逻辑")
+
+    for k in keep_branch:
+        for m in NSIS_RECURSIVE.finditer(lines[k]):
+            if m.group("path").startswith("$INSTDIR"):
+                _fail(problems, f"第 {k + 1} 行在「保留数据」分支里递归删除 {m.group('path')}"
+                                "：用户选了「否」，这句会把上面刚承诺保留的登录状态、"
+                                "缓存与采集进度一起带走（本轮实测到的正是这一条）")
+    if not any(NSIS_DETAILPRINT.search(lines[k]) and "$INSTDIR" in lines[k]
+               for k in keep_branch):
+        _fail(problems, "「保留数据」分支没有 DetailPrint 打印 $INSTDIR：卸载日志里必须"
+                        "写明数据留在哪，否则用户找日志只能靠猜，界面这句话也无人可对")
+
+
 def prune_runtime(app: Path, problems: list) -> int:
     """删掉 dist 里由产物自检**运行出来**的那几个数据目录，返回删掉的个数。"""
     removed = 0
@@ -192,6 +331,13 @@ def main(argv=None) -> int:
     check_bom(root / NSI_PATH, "NSIS 安装脚本", problems)
     guide = root / GUIDE_SRC
     check_bom(guide, "使用说明", problems)
+
+    # 卸载分支的结构性检查紧随编码检查之后：这一步排在 makensis 之前（见 workflow
+    # 「Package Windows artifacts」），所以「保留数据那一支其实会删数据」这种缺陷到不了
+    # 编译，更到不了用户机器。文件本身缺席时不重复报（上面 check_bom 已经点了名）。
+    nsi_path = root / NSI_PATH
+    if nsi_path.is_file():
+        check_installer_uninstall(nsi_path.read_text(encoding="utf-8-sig"), problems)
 
     # 校验不过就到此为止：绝不在「产物本身有问题」之后还继续生成 zip——那种情况下
     # 生成出来的正是一个「CI 全绿、用户拿到坏包」的包（本轮两个根因共同的样子）。

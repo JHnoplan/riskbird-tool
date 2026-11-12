@@ -183,7 +183,11 @@ Section "Uninstall"
 
         ; 运行期数据（登录 Cookie、列表缓存、任务进度、自检报告）就在安装目录里，
         ; 但它是用户这几个月的劳动成果：**绝不允许静默删掉**。问一次，默认保留。
-        MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除登录状态、缓存与采集进度数据？$\n$\n· 选「否」（推荐）：保留 $INSTDIR 下的 b2bcollect_data / b2bcollect_state / riskbird_data，以后重装会自动接着用，登录状态不用重新过一遍；$\n· 选「是」：连同这些目录一起清除，无法恢复。" IDNO keep_data
+        ; MB_DEFBUTTON2 不是装饰：NSIS 的 MessageBox 不写这一位时，默认选中的是**第一个
+        ; 按钮**（也就是「是，连数据一起删」），一路回车下去就把数据删了——跟这句
+        ; 「默认保留」正好相反。把焦点放到「否」上，才让「不选就等于同意」这件事成立。
+        MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时删除登录状态、缓存与采集进度数据？$\n$\n· 选「否」（推荐）：保留 $INSTDIR 下的 b2bcollect_data / b2bcollect_state / riskbird_data，以后重装会自动接着用，登录状态不用重新过一遍；$\n· 选「是」：连同这些目录一起清除，无法恢复。" IDNO keep_data
+        ; ↓ 只有这一条分支（用户明确选了「是」）才允许递归删除。
         RMDir /r "$INSTDIR\b2bcollect_data"
         RMDir /r "$INSTDIR\b2bcollect_state"
         RMDir /r "$INSTDIR\riskbird_data"
@@ -192,9 +196,21 @@ Section "Uninstall"
         ; 留着它是因为「用户选了全删、结果磁盘上还剩一个数据目录」这种漏法没有症状，
         ; 只有下次重装时才会被发现——而那时没人会想起是卸载脚本少写一行。
         RMDir /r "$INSTDIR\ali1688_data"
-    keep_data:
         RMDir /r "$INSTDIR"
-
+        Goto uninstall_tail
+    keep_data:
+        ; 这一分支里**绝不出现 RMDir /r "$INSTDIR"**。旧写法是两个选项走到同一句递归
+        ; 删除上：选「否」也照删，上面那句「保留 b2bcollect_data / b2bcollect_state /
+        ; riskbird_data」当场变成空话。这类缺陷最坏的地方是没有症状——卸载照样「成功」、
+        ; 卸载日志照样漂亮，用户要到下一次重装登录状态全没了才知道，而那时没人会去想
+        ; 是卸载脚本少写了一个分支跳转。
+        ;
+        ; 不带 /r 的 RMDir 只在目录**已经空了**的时候才删：程序文件（exe、_internal、
+        ; 使用说明、uninstall.exe）在上面已经删净，目录真空了就顺手移除，还剩用户数据
+        ; 就原样留着。行为跟着用户的选择不跑，也不会因为保守一点而留下垃圾目录。
+        DetailPrint "已保留登录状态与采集数据：$INSTDIR"
+        RMDir "$INSTDIR"
+    uninstall_tail:
         Delete "$DESKTOP\${APP_NAME}.lnk"
         Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
         Delete "$SMPROGRAMS\${APP_NAME}\使用说明.lnk"

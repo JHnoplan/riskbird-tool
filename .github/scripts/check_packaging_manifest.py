@@ -57,6 +57,12 @@
      `${APP_VERSION:-（空）」`——右花括号前是全角标点时 bash 3.2 直接解析失败，整步
      在 `set -e`、判据、日志统统出场之前就死在语法错误上，症状与「机器没配好」一模一样。
      判据交给解析器，覆盖面就不依赖有人记得住哪几个字节会带跑词法扫描。
+ 12 交付链上的 Python 脚本（.github/scripts/*.py，Windows runner 上也会执行的那批）与
+     子进程/控制台之间的编码是不是**由脚本自己写定**：第 11 条上线当天就在云端炸出这条——
+     `subprocess.run(..., input=<str>, text=True)` 在本机（UTF-8）全绿，上了 Windows
+     runner 在**写 stdin 那一刻**抛 UnicodeEncodeError（'charmap'，即控制台代码页 cp1252），
+     构建前硬门自己炸在打包之前。同一族的另一半是往控制台写中文：本机复现不出来，症状却
+     与「脚本内容有问题」一模一样。凡是「按环境决定编码」的地方，换一台镜像就换一种结果。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -311,10 +317,16 @@ def check_trigger_dirs(text: str, add_data: list) -> list:
 
 
 def _git(*args) -> tuple:
-    """跑 git，返回 (退出码, stdout)。git 不可用时返回 (-1, "")，调用方自己决定算不算错。"""
+    """跑 git，返回 (退出码, stdout)。git 不可用时返回 (-1, "")，调用方自己决定算不算错。
+
+    encoding 必须写死：Windows runner 上 text=True 若不指定编码，Python 按**环境代码页**
+    解码（英文镜像 cp1252）。这里取的都是 rev-parse 一类 ASCII 输出，看着没事，可只要
+    有人把 `core.quotePath` 关掉（中文文件名不再八进制转义），同一句就会在解码那一刻抛
+    UnicodeDecodeError——门禁的结论被这条异常盖掉，症状与「仓库坏了」一模一样。
+    """
     try:
-        r = subprocess.run(["git", *args], cwd=str(ROOT),
-                           capture_output=True, text=True)
+        r = subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
     except OSError:
         return -1, ""
     return r.returncode, r.stdout.strip()
@@ -823,11 +835,21 @@ def run_blocks_in_workflow(text: str) -> list:
 
 
 def check_shell_parse(script: str, bash: str) -> list:
-    """把一段 bash 脚本原样交给 `bash -n`：只解析、不执行，所以不会有副作用。"""
-    proc = subprocess.run([bash, "-n"], input=script, capture_output=True, text=True)
+    """把一段 bash 脚本原样交给 `bash -n`：只解析、不执行，所以不会有副作用。
+
+    两头都必须显式按字节走，不能用 `text=True`。2026-11-12 云端第一个红就是这条判据
+    自己带回来的：Windows runner 上 Python 给子进程用的默认编码是控制台代码页（cp1252），
+    而被判的脚本里全是中文文案——`input=<str>` 在写 stdin 那一刻抛 UnicodeEncodeError，
+    构建前硬门自己炸在打包之前。本机（UTF-8 环境）永远复现不出来，症状与「脚本内容有问题」
+    一模一样。判据读的是要被执行的字节，那就连编码都不该交给环境决定。
+    """
+    proc = subprocess.run([bash, "-n"], input=script.encode("utf-8"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode == 0:
         return []
-    return [(proc.stderr or proc.stdout or "").strip().replace("\n", " | ")]
+    err = (proc.stderr.decode("utf-8", errors="replace")
+           or proc.stdout.decode("utf-8", errors="replace")).strip()
+    return [err.replace("\n", " | ")]
 
 
 def check_shell_syntax(workflows: tuple = None, sources: tuple = None) -> list:
@@ -872,6 +894,156 @@ def check_shell_syntax(workflows: tuple = None, sources: tuple = None) -> list:
                 continue          # pwsh 步由离线测试 M 节按 PowerShell 口径判：本机没有 pwsh
             for msg in check_shell_parse(script, bash):
                 problems.append(f"{rel} 第 {lineno} 行「{name}」：{msg}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# 第 12 条：交付链上的 Python 脚本，跟子进程与控制台之间的编码必须由脚本自己写定。
+#
+# 为什么单独立一条（2026-11-12 云端第二个红，由第 11 条自己带回来）：
+#   `subprocess.run([bash, "-n"], input=<str>, text=True)` 在本机（UTF-8）跑得好好的，
+#   上了 Windows runner 当场抛 UnicodeEncodeError: 'charmap' codec can't encode
+#   characters in position 15-16——栈停在 subprocess._stdin_write，也就是**写 stdin
+#   那一刻**。原因是 Windows 上 Python 给子进程用的默认编码是控制台代码页（英文 runner
+#   是 cp1252），而被判的 shell 脚本里全是中文文案。构建前硬门自己炸在打包之前，症状与
+#   「脚本内容有问题」一模一样，排查方向会被带去查第 11 条判出来的东西。
+#
+#   同一族的另一半是往控制台打印：本轮之前已经有一条门在管「第一次打印之前先修编码」，
+#   但它只盯着四个入口。这里把它推广到**在 Windows runner 上也会执行的那整批脚本**
+#   （.github/scripts/*.py，按目录枚举而不是手抄清单——新增一份就自动进判据，
+#   「登记表漏登记新脚本」本身就是这一族缺陷的形状）。
+#
+# 三条子判据（都能被反向对照，见离线回归 M 节）：
+#   a) text=True / universal_newlines=True 却没写 encoding → 红：解码子进程输出时
+#      按环境代码页，读到 UTF-8 字节（git 关掉 core.quotePath 就会输出中文文件名）
+#      直接 UnicodeDecodeError；
+#   b) input= 给的是 str 字面量 → 红：写进子进程 stdin 时按环境编码，中文一进去就抛；
+#   c) 脚本里有往控制台写的非 ASCII 文本（print / sys.stdout.write / sys.exit(msg) /
+#      raise SystemExit(msg)），却没有在任何一句之前 reconfigure(encoding=) → 红。
+#      中文的 SystemExit 消息尤其要紧：那常常是门禁**唯一要说清失败原因**的那一句。
+# ---------------------------------------------------------------------------
+
+IO_SCRIPTS_DIR = ".github/scripts"
+SUBPROC_FUNCS = {"run", "Popen", "check_output", "check_call", "getoutput"}
+
+
+def io_scripts() -> tuple:
+    """枚举交付链上会在 Windows runner 上也执行的 Python 脚本（相对仓库根）。"""
+    d = ROOT / IO_SCRIPTS_DIR
+    if not d.is_dir():
+        return ()
+    return tuple(sorted(f"{IO_SCRIPTS_DIR}/{p.name}" for p in d.glob("*.py")))
+
+
+def _call_target(node: ast.Call) -> str:
+    """取被调函数的名字：``subprocess.run`` 与 ``run`` 都算 subprocess.run。"""
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        base = f.value.id if isinstance(f.value, ast.Name) else ""
+        if base in ("subprocess", ""):
+            return f.attr
+        return ""
+    return f.id if isinstance(f, ast.Name) else ""
+
+
+def _kwarg(node: ast.Call, name: str):
+    for k in node.keywords:
+        if k.arg == name:
+            return k.value
+    return None
+
+
+def _is_true(node) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _has_non_ascii(node) -> bool:
+    try:
+        return any(ord(ch) > 127 for ch in ast.unparse(node))
+    except Exception:
+        return True          # 读不懂就当有非 ASCII：宁可响一声让人来看，不要静默放行
+
+
+def _console_writer(node: ast.Call) -> bool:
+    """这一句会不会把文本送到控制台？print / sys.stdout.write / sys.exit(msg) /
+    raise SystemExit(msg) 都算——后两种常被当成「只是退出」，可 Python 打印那条消息
+    走的正是 stderr，编码问题一分不少。只盯 print 的判据会放过中文的 SystemExit 消息，
+    而那恰好是门禁**唯一要说清失败原因**的那一句。
+    """
+    f = node.func
+    if isinstance(f, ast.Name):
+        return f.id in ("print", "SystemExit")
+    if isinstance(f, ast.Attribute):
+        base = f.value
+        if f.attr == "write":
+            # sys.stderr.write(...) 与 sys.stdout.write(...)
+            return (isinstance(base, ast.Attribute) and base.attr in ("stdout", "stderr")
+                    and isinstance(base.value, ast.Name) and base.value.id == "sys")
+        if f.attr == "exit":
+            return isinstance(base, ast.Name) and base.id == "sys"
+    return False
+
+
+def check_text_io_encoding(paths: tuple = None) -> list:
+    """交付链 Python 脚本的子进程/控制台编码判据（返回问题清单，空=合格）。
+
+    paths 做成参数是为了让判据自己可被反向对照：离线测试要能喂一份「故意写 text=True
+    不写 encoding」的假脚本，要求这一条必须报红。
+    """
+    paths = io_scripts() if paths is None else paths
+    problems = []
+    for rel in paths:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        src = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(src, filename=str(path))
+        except SyntaxError as e:
+            problems.append(f"{rel} 第 {e.lineno} 行语法读不懂（{e.msg}）："
+                            "第 12 条在它上面没跑，这份脚本连 CI 都进不去")
+            continue
+        reconf = [n.lineno for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "reconfigure"
+                  and _kwarg(n, "encoding") is not None]
+        writes = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and _console_writer(n) and _has_non_ascii(n)]
+        if writes and not reconf:
+            first = min(n.lineno for n in writes)
+            problems.append(
+                f"{rel} 第 {first} 行起有 {len(writes)} 处往控制台写中文/符号，却没有任何"
+                "一处 reconfigure(encoding=\"utf-8\")：Windows runner 的控制台代码页"
+                "（英文镜像 cp1252）会在那一句写出的当下抛 UnicodeEncodeError，"
+                "门禁的结论反而被这条异常盖掉（本机 UTF-8 永远复现不出来）")
+        elif writes and min(reconf) > min(n.lineno for n in writes):
+            problems.append(
+                f"{rel}：reconfigure 在第 {min(reconf)} 行，但第一次中文写控制台在第 "
+                f"{min(n.lineno for n in writes)} 行——编码要在**第一次写控制台之前**定好，"
+                "晚一步那一句就已经抛了")
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call) or _call_target(n) not in SUBPROC_FUNCS:
+                continue
+            loc = f"{rel} 第 {n.lineno} 行 subprocess.{_call_target(n)}"
+            text_kw = _kwarg(n, "text")
+            uni_kw = _kwarg(n, "universal_newlines")
+            enc = _kwarg(n, "encoding")
+            if (_is_true(text_kw) or _is_true(uni_kw)) and enc is None:
+                problems.append(
+                    f"{loc} 用 text=True 却没写 encoding：子进程输出一律按**环境代码页**解码，"
+                    "Windows runner 是 cp1252，读到 UTF-8 字节（比如 git 输出中文文件名）"
+                    "就 UnicodeDecodeError；写 encoding=\"utf-8\", errors=\"replace\"，"
+                    "或者干脆按字节读再自己 decode")
+            inp = _kwarg(n, "input")
+            if isinstance(inp, ast.Constant) and isinstance(inp.value, str):
+                problems.append(
+                    f"{loc} 的 input= 给的是 str：写进子进程 stdin 时按环境编码，"
+                    "内容里只要有一个中文就当场 UnicodeEncodeError（本轮云端那条红就停在这里）。"
+                    "改成字节：input=\"...\".encode(\"utf-8\") 并把 text=True 去掉")
+            elif inp is not None and (_is_true(text_kw) or _is_true(uni_kw)) and enc is None:
+                problems.append(
+                    f"{loc} 往子进程写数据（input=）却只写了 text=True：编码交给环境代码页，"
+                    "换一台镜像就换一种编码。显式写 encoding=")
     return problems
 
 
@@ -1016,6 +1188,20 @@ def main(argv=None) -> int:
         print(f"✅ 交付链 shell 语法：{len(SHELL_SOURCES)} 份脚本 + "
               f"{len(WORKFLOWS)} 份 workflow 里的 bash 步全部通过 bash -n")
 
+    # 交付链 Python 脚本与子进程/控制台之间的编码（第 12 条）：本机是 UTF-8，Windows
+    # runner 的控制台代码页是 cp1252——凡是把编码交给环境决定的写法，都在这里拦一次，
+    # 而不是等它在云端炸开一条看不到根因的 UnicodeError。
+    enc = check_text_io_encoding()
+    if enc:
+        bad += 1
+        print("❌ 交付链 Python 脚本的编码没有写死（换一台镜像换一种结果）：")
+        for p in enc:
+            print(f"   · {p}")
+            print(f"::error::子进程与控制台编码：{p}")
+    else:
+        print(f"✅ 交付链 Python 脚本编码：{len(io_scripts())} 份脚本"
+              f"（{IO_SCRIPTS_DIR}/*.py）的 input/text/encoding 与控制台写入都写定了 UTF-8")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -1040,7 +1226,8 @@ def main(argv=None) -> int:
               f"功能，所以这一步不放行就不许开建。")
         return 1
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
-          "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器")
+          "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
+          "交付链脚本的编码都写死在脚本里")
     return 0
 
 
