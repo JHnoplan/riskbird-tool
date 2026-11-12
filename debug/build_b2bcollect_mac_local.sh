@@ -206,4 +206,83 @@ if [ "$BEFORE" != "$AFTER" ]; then
   exit 1
 fi
 echo "✅ 只读包窗口冒烟通过：界面建得出、崩溃日志一份都没有、包内一字节没多"
+
+# ── 最后一步：真按用户那一次双击验一遍（走 launchd，不走 shell 直接 exec）────────
+# 上面所有环节都是 QT_QPA_PLATFORM=offscreen 的仿真，它能证明「代码路径不写包」，
+# 却证明不了「这台机器的窗口服务器今天给用户摆得出界面」。本轮就吃过这个亏：连着两次
+# 「0 窗口、CPU 冻结」看着像产物挂了，真原因是我自己攒下的那批僵死子进程把 syspolicyd
+# 的 exec 评估队列堵死——**观测手段污染了被测对象**，而且污染的是交付判断。
+# 所以这一步有四条纪律：
+#   ① 用 open（launchd 那条路），与用户双击同源；shell 直接 exec 走的是另一套评估。
+#   ② 数窗口只用 /usr/bin/osascript（Apple 平台签名），不依赖任何第三方解释器——
+#      堵死的时候恰好只有这一类二进制还能跑。
+#   ③ 有边界地等（macOS 没有 timeout 命令，用轮次 + sleep 自己数）。
+#   ④ 收尾把这个实例连同它带出来的子进程一起收干净，绝不留孤儿：今天这批孤儿就是把
+#      机器堵死的那批孤儿。
+APP_LIVE="dist/B2bCollectTool.app"
+BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
+# 时间戳落在 dist/（工作区内，沙箱允许写；不在 .app 里面，免得自己污染自己写的探针）。
+STAMP_FILE="dist/.open_gate.stamp"
+: > "$STAMP_FILE"
+/usr/bin/open "$APP_LIVE" || { echo "❌ open 都没发出去（这一步连双击都模拟不了）"; exit 1; }
+LIVE_PID=""
+_i=0
+while [ $_i -lt 40 ]; do
+  _i=$((_i + 1))
+  sleep 2
+  for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
+    case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac      # 只看这次新起的
+    _w=$(/usr/bin/osascript -e "tell application \"System Events\" to tell (first process whose unix id is $_p) to get count of windows" 2>/dev/null || true)
+    case "$_w" in '' | *[!0-9]*) continue ;; esac
+    if [ "$_w" -ge 1 ]; then LIVE_PID=$_p; echo "· 窗口数得出：pid ${_p}，窗口 ${_w} 个（第 ${_i} 次轮询）"; break; fi
+  done
+  [ -n "$LIVE_PID" ] && break
+done
+if [ -z "$LIVE_PID" ]; then
+  # 分第二种现实再决定红不红：`open` 对「已经在跑的单机应用」只是把它唤到前台，压根不会
+  # 有新 pid。这时候数得出现有实例的窗口就是**通过了**（用户那一次双击要看到的就是界面），
+  # 硬要按「没有新 pid」判红，就是逼人在验收前先把正在用的工具关掉——那是为了绿灯而折腾用户。
+  for _p in ${BEFORE_PIDS:-}; do
+    _w=$(/usr/bin/osascript -e "tell application \"System Events\" to tell (first process whose unix id is $_p) to get count of windows" 2>/dev/null || true)
+    case "$_w" in '' | *[!0-9]*) continue ;; esac
+    if [ "$_w" -ge 1 ]; then
+      LIVE_PID=$_p
+      echo "✅ 真双击路径验过：open 唤的是已在跑的实例（pid ${_p}，窗口 ${_w} 个），没有新进程"
+      break
+    fi
+  done
+fi
+if [ -z "$LIVE_PID" ]; then
+  echo "❌ 40 次×2 秒都数不出一个窗口：用户点开就是看不到界面。先分清两种成因——"
+  echo "   ①进程状态是 U（不可中断等待）多半是这台机器的 exec 评估/磁盘被堵住，不是包坏了；"
+  echo "   ②进程在跑却没窗口，才是产物或启动路径的问题。两者的修法完全相反。"
+  pgrep -ax B2bCollectTool 2>/dev/null | head -5 || true
+  # 格式依据（本机 2026-11-13 实测）：`ps -axo pid,stat,command` 的第二列就是 STAT，僵死
+  # 进程在那里印 U（那次把这台机器拖死的一整排进程就是 U 态）。老写法是 `grep -c "U"`，
+  # 数的是「整行里出现过一个大写 U」——路径里随便一个 U 都算，念出来的数字毫无意义。
+  # 所以按字段取，并且只报条数与几个 pid：这一步是给人分成因的，不是判据。
+  /bin/ps -axo pid,stat,command 2>/dev/null | awk '$2 ~ /^U/ { n++; if (n <= 3) print "     U 态：" $1 " " $3 }
+    END { print "   STAT 首字母为 U（不可中断等待）的进程：" n + 0 " 个" }' || true
+  exit 1
+fi
+GREW=$(find "$APP_LIVE" -newer "$STAMP_FILE" 2>/dev/null | head -3)
+if [ -n "${GREW:-}" ]; then
+  echo "❌ 真跑起来的那一会儿往应用包里写了东西（用户机器上这就是 App Translocation"
+  echo "   只读卷里的 OSError 30）：$(printf '%s\n' "$GREW")"
+  exit 1
+fi
+echo "✅ 真双击路径验过：窗口建得出、包内一字节没多（${APP_LIVE}）"
+# 收尾：只收这次新起的实例和它的子进程，绝不动交付前就在跑的那些（别人可能正在用）。
+for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
+  case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
+  for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -TERM "$_c" 2>/dev/null || true; done
+  kill -TERM "$_p" 2>/dev/null || true
+done
+sleep 3
+for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
+  case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
+  for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -KILL "$_c" 2>/dev/null || true; done
+  kill -KILL "$_p" 2>/dev/null || true
+done
+echo "✅ 验证用的实例已收干净（不留孤儿进程——本轮把机器堵死的就是孤儿）"
 echo "✅ 打包完成并通过产物自检：$(pwd)/dist/B2bCollectTool.app"

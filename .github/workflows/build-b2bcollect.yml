@@ -258,6 +258,12 @@ jobs:
         URLS="https://downloads.sourceforge.net/project/nsis/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip
         https://sourceforge.net/projects/nsis/files/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip/download"
         sha256() {
+          # 格式依据：这里取的不是「sha256sum/certutil 各自行文里的第几列」，而是 SHA-256
+          # 摘要的**定义**——十六进制表示恒为 64 个 hex 字符。所以两条分支同一条规矩：整段
+          # 输出里扫 64 位 hex，谁的话术变了都取不到值（取不到就是空串，下面按不等处理）。
+          # 反面写法是 `| awk '{print $1}'` 或 `sed -n 2p`：certutil 除了哈希还会印一句
+          # 「CertUtil: -hashfile command completed successfully.」，按行号/字段切就有机会
+          # 切到那句话上，而本机没有 certutil，这种红只能在云端第一次出现。
           # 只从**内容**算哈希，别让文件名参与输出。这不是洁癖：Git Bash 里 $RUNNER_TEMP
           # 是 `D:\a\...\_temp` 这种带反斜杠的 Windows 路径，而 GNU coreutils 的规定是
           # 「文件名里含反斜杠或换行时，整行输出前面加一个 \\ 作为转义标记」，于是

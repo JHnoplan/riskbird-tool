@@ -2252,6 +2252,83 @@ def test_workflow_shell_syntax():
                f"stderr={_nr.stderr.strip()[-160:]!r}）")
 
 
+    # 4-d) 第 14 条：按外部工具的文本输出取值的那句 grep 必须带出处。这一条防的不是
+    # 「判据写错」，是「判据按想象中的格式写」——2026-11-13 云端那次红（makensis 自报
+    # MakeNSIS v3.10，判据却去找 Nullsoft Install System）的代价是一整个交付没有安装包，
+    # 而本机同一套测试**全绿**：仿真假编译器印的就是判据想要的那句假话。
+    # 所以这条门两头都要跑：不带出处必须响、带证据要放行、自家 printf 搬进 grep 的那些
+    # **不许**算违规（算进去只会逼人为了消红写一个假出处，那正是它要防的动作）。
+    # 判据的地基是「这句 shell 里的 grep 从谁手里拿字节」，也就是 _shell_segments 的切分：
+    # 切分错了它会安静地一条不报（全绿但没有门），所以切分本身也要被钉住。
+    _P_PROV = {
+        "取外部文件不写出处": 'BANNER=$(grep -haoE "(MakeNSIS|Nullsoft Install System) '
+                             'v[0-9][0-9.]*" "$LOG" 2>/dev/null | head -1 || true)\n',
+        "外部命令的管道不写出处": 'certutil -hashfile "$(cygpath -w "$1")" SHA256 '
+                              '| grep -oE "[0-9a-fA-F]{64}" | head -1 || true\n',
+        "反斜杠续行把文件参数推到下一行": 'grep -E "FAIL" \\\n    "$LOG"\n',
+    }
+    for _tag, _src in _P_PROV.items():
+        _got = g.check_external_output_provenance(workflows=(), sources=(), texts=(("夹具", _src),))
+        _assert_eq(len(_got), 1, f"反向对照·{_tag}：这一句必须在案（判不住=这条门是空的）"
+                                 f"（实际={_got}）")
+        _assert("查不到这批字节的出处" in _got[0], f"反向对照·{_tag}：报的话要说清缺的是出处")
+    _P_OK = {
+        "带 run/job 号出处": "# 证据：run 43271171596 / job 131367773604 编译日志第 924 行原字节\n"
+                            + _P_PROV["取外部文件不写出处"],
+        # 「格式依据」是给那种「取值不依赖工具话术」的地方开的口：SHA-256 的十六进制恒为
+        # 64 位，这种取值不需要日志样本，但需要有人把「为什么不用猜」写下来。
+        "带格式依据": "# 格式依据：SHA-256 的十六进制表示按定义恒为 64 个 hex 字符\n"
+                     + _P_PROV["外部命令的管道不写出处"],
+        "自家 printf 搬进 grep": 'last=$(printf \'%s\\n\' "$out" | grep -E "PASS|FAIL|通过|失败|_OK"'
+                                ' | tail -1)\n',
+        "同句里两个 grep 都读自家文案": 'nfail=$(printf \'%s\\n\' "$out"'
+                                        ' | grep -oE "[0-9]+ 失败" | tail -1'
+                                        ' | grep -oE "[0-9]+" | tail -1)\n',
+        "嵌在引号里的命令替换也算自家文案": 'printf \'SKIP %s\\n\' "$f" "$(printf \'%s\\n\' "$out"'
+                                            ' | grep \'SKIP-FIXTURE\' | head -1)"\n',
+        "注释里演示坏写法": "# 老写法 grep -haoE \"Nullsoft Install System v\" \"$LOG\" 已被证明是猜的\n"
+                            'BANNER=x\n',
+    }
+    for _tag, _src in _P_OK.items():
+        _got = g.check_external_output_provenance(workflows=(), sources=(), texts=(("夹具", _src),))
+        _assert_eq(_got, [], f"正例·{_tag}：不该响（响了人们就会去写假出处）")
+    # 切分的地基：`grep -E "PASS|FAIL"` 里那个 `|` 是模式的一部分，`$( … | … )` 才是交接点。
+    # 少切一刀=「grep 没有上游」，多切一刀=「凭空多出一个上游」，两种都会让上面那两组红绿互换。
+    _segs = g._shell_segments('last=$(printf \'%s\\n\' "$out" | grep -E "PASS|FAIL|通过" | tail -1)')
+    _assert_eq(_segs, ['last=', 'printf \'%s\\n\' "$out"', 'grep -E "PASS|FAIL|通过"', 'tail -1'],
+               "引号内的 | 不当管道、$( 与 ) 当交接点（切错了这条门就只会指错方向）")
+    _assert_eq(g._shell_segments('grep -c "a|b" "$F" && echo ok'), ['grep -c "a|b" "$F"', 'echo ok'],
+               "`&&` 也切，但模式里的 | 不切")
+    # 窗口有上限：出处必须**就近**。文件顶上留一句「实测过」不该给下面 200 行的取值当免检牌。
+    _near = "".join(f"step_{i}=1\n" for i in range(10))
+    _assert_eq(g.check_external_output_provenance(
+        workflows=(), sources=(),
+        texts=(("夹具", _near + "# 证据：run 43271171596 原字节\n"
+                + _P_PROV["取外部文件不写出处"]),)),
+        [], f"出处在窗口内（{g.PROVENANCE_LOOKBACK} 行以内）时放行")
+    _far = "".join(f"step_{i}=1\n" for i in range(g.PROVENANCE_LOOKBACK + 2))
+    _got = g.check_external_output_provenance(
+        workflows=(), sources=(),
+        texts=(("夹具", "# 证据：run 43271171596 原字节\n" + _far
+                + _P_PROV["取外部文件不写出处"]),))
+    _assert_eq(len(_got), 1, f"隔了 {g.PROVENANCE_LOOKBACK + 2} 行以上的出处不算出处（实际={_got}）")
+    # 真交付链必须绿：上面那一整组只证明「判据会说话」，这一条才证明「现在没坏」。
+    _assert_eq(g.check_external_output_provenance(), [],
+               "交付链 shell：按外部工具输出取值的 grep 全部带出处（run/job 号 / 原字节 / 格式依据）")
+    # 真 workflow 里那两处哈希取值就是这条门的靶子：把注释整段拿掉必须响。判「注释存在」
+    # 没用——那正是第 14 条要防的形状（话写了，取值还是猜的）；响的是**取值那一句**。
+    _prov_step = [b for n, _s, sh, b in g.run_blocks_in_workflow(win)
+                  if sh == "bash" and "Provision NSIS" in n]
+    _assert_eq(len(_prov_step), 1, f"切得到 NSIS 那一步（实得 {len(_prov_step)} 段）")
+    _naked = "\n".join(l for l in _prov_step[0].splitlines() if not l.strip().startswith("#"))
+    _got = g._provenance_sites(_naked)
+    _assert_eq([("sha256sum" if "sha256sum" in s else "certutil" if "certutil" in s else "?")
+                for _no, s in _got], ["sha256sum", "certutil"],
+               f"删掉解释就当场响：两处哈希取值靠的是那段注释里的依据（实际={_got}）")
+    for _rel in g.SHELL_SOURCES:
+        _assert((_REPO / _rel).is_file(), f"第 14 条登记的脚本在位：{_rel}")
+
+
     # 5b) 同一份判据盖住交付链上另外几份手写 shell 脚本（派发云打包、取制品、轮询 CI、
     # 批跑回归）。它们坏的时候恰好都是「排障现场最该看见那个数字」的时刻。登记表里的
     # 脚本不在位或没提交也要红——一条静默不跑的判据比没有判据更危险（会让人以为验过）。

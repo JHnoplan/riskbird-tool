@@ -68,6 +68,14 @@
      反向那一半——构建命令明明把文件放进了包，装配校验却不知道它存在，于是它哪天没下载
      成功、被装配步骤剔掉、布局改了名，check_layout 一声不响、安装包照样出。本轮实测漏
      登记的是 block_guard.py / chrome_driver.py / drivers（内置 chromedriver 多版本目录）。
+ 14 交付链 shell 里凡是**按外部工具的文本输出取值**的地方——`grep "模式" "$某文件`（读别人
+     落下的文件）或 `某工具 … | grep -oE "模式"`（读别人的管道）——近旁必须写明那批字节的
+     出处：一次真实运行的 run/job 号、原字节样本、「实测」，或一句「格式依据＝这个取值不
+     依赖那个工具的话术」。2026-11-13 云端那次红不是编译器坏、也不是判据逻辑坏，是判据按
+     **想象中的** makensis 横幅格式取版本——而本机同一套测试全绿，因为仿真的假编译器印的
+     正是那句假话。格式无穷，猜是猜不完的；能落地的纪律是「猜过一次就要留下证据，改的人
+     先看见证据」。自家 `printf`/`echo` 搬进 grep 的那些不算：那是同仓自己印的文案，改了
+     打印那一行当场就红，不需要出处（把它也算进来只会逼人写假出处）。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -903,6 +911,222 @@ def check_shell_syntax(workflows: tuple = None, sources: tuple = None) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 第 14 条：从**别的工具留下的那份输出**里按文本取值的那一句 grep，必须就近写明
+# 这批字节的出处（一次真实运行的 run/job 号，或「原字节 / 实测 / 真字节」样本）。
+#
+# 2026-11-13 凌晨云端那次红给了这一族坑一个此前没见过的形状：判据没错、编译器没错、
+# 114MB 安装包也真编出来了，最后死在「makensis 的横幅长什么样」这句**想象**上——脚本
+# 去找 "Nullsoft Install System v…"，而那台 NSIS 3.10 自报的是
+# "MakeNSIS v3.10 - Copyright 1999-2023 Contributors"。代价不是少一行日志，是整条
+# Windows 交付没有安装包。
+# 更值得堵的其实是第二半：本机这一整段**全绿**——仿真的假编译器印的就是判据想要的那句
+# 假话，判据与证据两头抄的是同一个想象。「多想到一种写法」堵不住这类坑（写法无穷），
+# 能堵的是纪律：**对外部工具的文本输出做格式假设时，假设的出处必须写在旁边**，让下一个
+# 人改判据之前先看见那批真字节是从哪一次真实运行里取的。没有出处的格式假设一律红。
+#
+# 触发形状只有两种，判据都是同一句话：「喂给 grep 的那批字节不是这条 shell 自己写的」。
+#   ① grep 拿一个带变量的引号路径当**文件参数**——`grep -haoE "模式" "$LOG"`，读的是别的
+#      工具落下来的那份输出；
+#   ② grep 读管道，而喂它的是别的命令——`certutil … | grep -oE "[0-9a-fA-F]{64}"` 那种，
+#      字节同样是别人产的。
+# 刻意不算的一种：喂它的是自家 `printf`/`echo`。批跑脚本里 `printf '%s\n' "$out" |
+# grep -E "PASS|FAIL"` 那一族读的是同仓自己印的文案，格式由打印它的那一行决定，改了
+# 当场就红，不需要出处；把这种也算进来，只会逼人为了消红去写一个假出处——那正是这条
+# 门要防的动作，第一天就不能自己示范。
+# 判不到的形状也写在这里，免得这条门给人「所有取值都被管住了」的错觉：不带引号的字面
+# 路径（`grep x /etc/os-release`）、以及 awk/sed/cut 按列取值，都不在这一条的视野里。
+#
+# 同一族在**运行期**的清点结果（2026-11-13 全仓扫过一遍，结论记在这儿而不是只写在对话里）：
+#   · b2bcollect_build/access_guard.py `_raw_machine_id()`：从 `ioreg` 输出里取
+#     IOPlatformUUID——取不到就退到「随机 UUID 落盘」，坏消息是重新授权一次，不是崩；
+#   · riskbird_build/chrome_driver.py `chrome_major()/driver_version()`：从
+#     `--version` / PowerShell ProductVersion 里取第一段数字，取不到返回空串，只影响
+#     驱动候选的**排序**，不影响有没有驱动可用；
+#   · riskbird_build/chrome_driver.py `classify_driver_error()`：认的是 chromedriver 报错
+#     原文里的两句关键字——措辞改了只会把 version 误分成 connect（多试一轮 + 日志说得
+#     不够准），不会把一个能用的驱动判成坏的。
+# 这三处都不在交付链上，也不符合「想象错一次就没有交付」的代价形状，所以**不**纳入本条
+# 的红；纳进来只会让维护者为了消红去给运行期代码写假出处。要动它们的时候，判据是「取值
+# 失败会不会让功能消失」，不是「有没有按行号切」。
+# ---------------------------------------------------------------------------
+PROVENANCE_GREP = re.compile(r"(?:^|[\s;&|`(])grep(?:\s|$)")
+# 引号包起来的一串（模式或参数）；单双引号都算，取值假设最常写在双引号里
+PROVENANCE_QUOTED = re.compile(r'"[^"]*"|\'[^\']*\'')
+# 一个以变量开头的引号参数："$LOG" / "${LOG}" / "$(/bin/x)"
+PROVENANCE_VARARG = re.compile(r'^"?\$\{?[A-Za-z_(!]')
+# 上游命令里出现这两个词就当那是自家文案（放在引号里的 "echo" 会被误判成自家文案，
+# 那种漏判写在上面那段注释里，不假装不存在）
+PROVENANCE_OWN_FEEDER = re.compile(r"(?:^|[\s;&|`(])(?:printf|echo)(?:\s|$)")
+# 出处的三种可接受形态：一次真实云构建的编号 / 贴过真实字节 / 显式声明这里取值不靠猜
+PROVENANCE_BASIS = re.compile(r"(?:run|job)\s+\d{6,}|原字节|实测|真字节|格式依据")
+# 回看窗口。为什么不是「紧邻的注释块」：NSIS 那两处哈希取值共用同一段解释（一个函数、
+# 两条分支），中间还夹着 `if command -v` 与 `else` 两行代码，紧邻注释块判据会把第二处
+# 判成没出处。为什么不是无限回看：窗口一大，文件顶上随便一句「实测过」就能给全文件的
+# 取值当免检牌——那就不再是出处，是护身符。24 行的代价是「隔了半屏的注释仍然算」，
+# 比逼人在每一行上面重抄一遍假出处便宜，也比无限回看可信。
+PROVENANCE_LOOKBACK = 24
+
+
+def _shell_segments(stmt: str) -> list:
+    """把一句 shell 切成「一条条命令」，分隔符只认**引号外**的 `|`/`||`/`&&`/`;`/换行。
+
+    两处必须做对，否则判据从第一步就开始指错方向：
+    · `grep -E "PASS|FAIL|通过|失败"` 里的 `|` 是模式的一部分，切开了就等于凭空多出一个
+      「上游」；单引号里的 `$(` 也是字面量（`printf '%s\\n'` 那种），不能当子命令起点。
+    · `$(printf '%s\\n' "$out" | grep -c .)` 这种嵌在引号里的命令替换，**要**切：那才是
+      grep 真正的上游。所以扫描栈里区分三种状态——在双引号里、在单引号里、在 `$(…)` 里。
+    """
+    segs, buf, stack = [], [], []
+
+    def flush():
+        text = "".join(buf).strip()
+        if text:
+            segs.append(text)
+        del buf[:]
+
+    i, n = 0, len(stmt)
+    while i < n:
+        ch = stmt[i]
+        top = stack[-1] if stack else ""
+        if top == "'":                       # 单引号里一切都是字面量
+            buf.append(ch)
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if ch == "\\" and top != "`":        # 转义：连同下一个字符一起原样带走
+            buf.append(stmt[i:i + 2])
+            i += 2
+            continue
+        if ch in "\"'":
+            # 同种引号再出现一次是**闭合**（shell 里引号不嵌套）。写成无脑 push 的话，
+            # `printf '%s\n' "$out" | grep …` 从第一个闭合引号起就永远在「引号内」，
+            # 整行切不开、grep 没有上游——这条门会安静地不判任何东西，还全绿。
+            if top == ch:
+                stack.pop()
+            else:
+                stack.append(ch)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "$" and stmt[i + 1:i + 2] == "(":
+            stack.append("(")                # 子命令里的引号与分隔符是另一套
+            flush()
+            i += 2
+            continue
+        if ch == ")" and top == "(":
+            stack.pop()
+            flush()
+            i += 1
+            continue
+        if top in ("", "("):
+            if stmt[i:i + 2] in ("||", "&&"):
+                flush()
+                i += 2
+                continue
+            if ch in "|;&\n":
+                flush()
+                i += 1
+                continue
+        buf.append(ch)
+        i += 1
+    flush()
+    return segs
+
+
+def _grep_takes_value(seg: str) -> bool:
+    """这一段里的 grep 是否带「变量指着的那份文件」当参数（第一个引号参数是模式）。"""
+    m = PROVENANCE_GREP.search(seg)
+    if not m:
+        return False
+    args = [s for s in PROVENANCE_QUOTED.findall(seg[m.end():])
+            if not s.lstrip("\"'").startswith("-")]       # --include="*.py" 是开关不是文件
+    return any(PROVENANCE_VARARG.match(s) for s in args[1:])
+
+
+def _provenance_sites(text: str) -> list:
+    """[(行号, 那一句)]：按外部工具的文本输出取值的 grep，且附近没写明这批字节的出处。"""
+    lines = text.splitlines()
+    # 反斜杠续行先并成一条逻辑行：`grep -E "x" \` 换行 `    "$LOG"` 是一句话，
+    # 拆开判就等于没判（文件参数在下一行，上一行看着像「只是模式」）。
+    logical, buf, start = [], "", 1
+    for no, ln in enumerate(lines, 1):
+        stripped = ln.strip()
+        if not buf:
+            start = no
+        if stripped.startswith("#"):
+            continue                       # 注释里写的正是「哪种写法是猜的」，不是违规现场
+        if stripped.endswith("\\"):
+            buf += " " + stripped[:-1]
+            continue
+        logical.append((start, (buf + " " + stripped).strip()))
+        buf = ""
+    if buf.strip():
+        logical.append((start, buf.strip()))
+    out = []
+    for start, stmt in logical:
+        segs = _shell_segments(stmt)
+        # 一句里可能有不止一个 grep（`… | grep -oE "…失败" | tail -1 | grep -oE "[0-9]+"`
+        # 就是批跑脚本里的原话），只判第一个的话，后面那个取值假设可以随便改而没人响。
+        hits = [i for i, s in enumerate(segs) if PROVENANCE_GREP.search(s)]
+        if not hits:
+            continue
+        offending = False
+        for i in hits:
+            feeders = segs[:i]
+            takes_file = _grep_takes_value(segs[i])
+            if not takes_file and any(PROVENANCE_OWN_FEEDER.search(f) for f in feeders):
+                continue                   # 自家 printf/echo 搬来的文案，格式由同仓那行决定
+            if not (takes_file or feeders):
+                continue                   # 既没读变量里的文件，管道上游也没别的工具
+            offending = True
+            break
+        if not offending:
+            continue
+        lookback = "\n".join(lines[max(0, start - 1 - PROVENANCE_LOOKBACK):start - 1])
+        if PROVENANCE_BASIS.search(lookback):
+            continue                       # 出处在案：这一句是按真字节写的，改的人能看见
+        out.append((start, stmt))
+    return out
+
+
+def check_external_output_provenance(workflows: tuple = None, sources: tuple = None,
+                                     texts: tuple = ()) -> list:
+    """交付链 shell 里「对外部工具输出格式的假设」必须带出处。
+
+    workflows/sources 与第 11 条同口径（登记表可整体替换，方便反向对照）；texts 是
+    内存里的 [(标签, 脚本)]，离线测试拿它喂「同一句 grep，带出处 / 不带出处」这一对，
+    不必为了判一次去动真文件。写死路径的判据只能验「现在没坏」，验不出「坏了会响」。
+    """
+    workflows = WORKFLOWS if workflows is None else workflows
+    sources = SHELL_SOURCES if sources is None else sources
+    corpus = []
+    for rel in sources:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                    # 不在位由第 11 条点名，这里不重复报
+        corpus.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+    for rel in workflows:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for name, start, shell, script in run_blocks_in_workflow(
+                path.read_text(encoding="utf-8", errors="replace")):
+            if shell != "bash":
+                continue
+            corpus.append((f"{rel} 第 {start} 行「{name}」", script))
+    corpus.extend(texts)
+    problems = []
+    for label, script in corpus:
+        for lineno, stmt in _provenance_sites(script):
+            problems.append(
+                f"{label} 第 {lineno} 行的 grep 按外部工具的文本输出取值，却查不到这批字节的"
+                f"出处（往上 {PROVENANCE_LOOKBACK} 行内补一句注释，写明 run/job 号、原字节"
+                f"样本，或「格式依据」＝这个取值不依赖那个工具的话术）：{stmt[:140]}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
 # 第 12 条：交付链上的 Python 脚本，跟子进程与控制台之间的编码必须由脚本自己写定。
 #
 # 为什么单独立一条（2026-11-12 云端第二个红，由第 11 条自己带回来）：
@@ -1290,6 +1514,20 @@ def main(argv=None) -> int:
     else:
         print(f"✅ 交付链 shell 语法：{len(SHELL_SOURCES)} 份脚本 + "
               f"{len(WORKFLOWS)} 份 workflow 里的 bash 步全部通过 bash -n")
+
+    # 对外部工具文本输出的格式假设必须带出处（第 14 条）：第 11 条管「这段 shell 能不能
+    # 被解析」，管不到「解析出来的那个值是不是按想象中的格式取的」——后者本轮在云端红过
+    # 一次，而且本机全绿着红的那一次，代价是一整个交付没有安装包。
+    prov = check_external_output_provenance()
+    if prov:
+        bad += 1
+        print("❌ 交付链 shell 里有按外部工具输出取值的 grep 没写明这批字节的出处"
+              "（想象中的格式=迟早把编好的产物拦在门外）：")
+        for p in prov:
+            print(f"   · {p}")
+            print(f"::error::外部输出格式出处：{p}")
+    else:
+        print("✅ 外部工具输出格式假设：每一处按文本取值的地方都在近旁写明了那批字节的来源")
 
     # 交付链 Python 脚本与子进程/控制台之间的编码（第 12 条）：本机是 UTF-8，Windows
     # runner 的控制台代码页是 cp1252——凡是把编码交给环境决定的写法，都在这里拦一次，
