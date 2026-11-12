@@ -2160,18 +2160,22 @@ def test_workflow_shell_syntax():
     for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1", 'grep -oE "Nullsoft Install System'):
         _assert(need in gate_script, f"版本判据保留了 {need}（缺一样就是判据少一个方向）")
 
-    def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10", pipefail: bool = True):
+    def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10",
+                            pipefail: bool = True, crlf: bool = False):
         """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
 
         假 makensis 只干三件事：印横幅（或不印）、把两个交付文件名落出来、按指定码退出。
         判据读的是它自己的那套 shell 语义，与被编的东西无关——这正是能本机复现的部分。
+        crlf=True 按 Windows 编译器的实际输出给行尾：判据取到的那行会带一个尾随 \\r，
+        「在本机换行下绿、到 Windows 换行下红」正是这一段最可能被漏掉的那半个坑。
         """
         root = Path(tempfile.mkdtemp(prefix="b2b_nsis_gate_"))
         try:
             stub = root / "makensis"
-            stub.write_text("#!/bin/sh\n"
-                            + (f'echo "{banner}"\n' if banner
-                               else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
+            eol = r"\r\n" if crlf else r"\n"
+            head = (f'printf "{banner}{eol}"\n' if banner
+                    else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
+            stub.write_text("#!/bin/sh\n" + head
                             + ": > B2bCollectToolSetup.exe\n"
                               ": > B2bCollectTool_Win_portable.zip\n"
                               f"exit {stub_rc}\n", encoding="utf-8")
@@ -2189,6 +2193,8 @@ def test_workflow_shell_syntax():
     _assert_eq(_ok_rc, 0, f"正例：横幅与钉住版本一致时放行（输出尾部 {_ok_out[-90:]}）")
     _assert("✅ 安装包出自" in _ok_out,
             "放行时把这个安装包出自哪个编译器念进日志（可追溯性写在交付当场，不靠事后翻 CI）")
+    _crlf_rc, _crlf_out = _run_installer_gate("Nullsoft Install System v3.10", 0, crlf=True)
+    _assert_eq(_crlf_rc, 0, f"正例·Windows 行尾：横幅带 \\r 也放行（输出尾部 {_crlf_out[-90:]}）")
     _bad = {
         "版本不是钉住的那个": _run_installer_gate("Nullsoft Install System v3.08", 0),
         "连 -V4 都不印横幅": _run_installer_gate("", 0),
