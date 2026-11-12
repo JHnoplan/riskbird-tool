@@ -35,6 +35,7 @@
 """
 import json
 import os
+import plistlib
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -267,6 +268,16 @@ def source_for(key: str) -> str:
 
 _STATE_DIR_ENV_VAR = "B2B_STATE_DIR"
 
+# 持久状态容器的目录名：所有「按文件名落盘的运行期数据」共用这一级（缓存、审计日志、
+# 列映射历史、自检报告）。写成常量而不是散落字面量，是为了让 state_file 的退路也能
+# 引用同一个名字——退路和主路各写一份时，改一处就会让两条路落到不同目录。
+STATE_DIR_NAME = "b2bcollect_state"
+
+# Gatekeeper App Translocation 的路径标记：真实形态是
+#   /private/var/folders/<xx>/<yy>/T/AppTranslocation/<UUID>/d/X.app/Contents/MacOS/...
+# 这段是系统造的、只有只读挂载才会出现的路径，比「app 在不在 /Applications」硬得多。
+_TRANSLOCATION_MARK = "/AppTranslocation/"
+
 
 def probe_writable(d: Path) -> bool:
     """mkdir 后真写一个探针文件再删掉：目录「存在」与「可写」是两件事。
@@ -286,51 +297,386 @@ def probe_writable(d: Path) -> bool:
         return False
 
 
-def _app_sibling_dir() -> Optional[Path]:
-    """Mac .app 形态下的「包旁」目录：X.app 同级，用户看得见也写得进去。"""
+def app_translocated() -> bool:
+    """Mac 专属：本工具是不是正被 Gatekeeper 从只读随机路径转置运行。
+
+    判据取自 ``AppTranslocation/<44位 UUID>/d/`` 这一段真实路径，不猜「app 在不在
+    /Applications」——只有这一段能证明当前进程真的活在只读挂载上。
+
+    为什么值得单独问一次（2026-11-12 实机崩溃日志）：被隔离过的 .app 双击打开时，
+    macOS 把它挂到一个一次性随机目录上运行，包内整棵树**只读**。那时候任何「照着
+    __file__ 往包里写东西」的代码都会抛 ``OSError: [Errno 30] Read-only file system``，
+    而用户看到的只是「双击没反应」或一个启动错误框。落点策略（:func:`state_dir` 与
+    riskbird_build/runtime_paths.py）已经保证自己不写包内，这里再把这个**运行形态**
+    说出来：界面与自检报告都要能区分「装好了在用」和「还压在压缩里跑」。
+    """
+    if not sys.platform.startswith("darwin") or not is_frozen():
+        return False
+    return _TRANSLOCATION_MARK in str(getattr(sys, "_MEIPASS", "")) or \
+        _TRANSLOCATION_MARK in str(getattr(sys, "executable", ""))
+
+
+def app_bundle_dir() -> Optional[Path]:
+    """当前运行中的 ``X.app`` 目录；非 .app 形态、非 Mac、源码态返回 None。"""
+    if not sys.platform.startswith("darwin"):
+        return None
     ed = exe_dir()
-    if ed is None or not sys.platform.startswith("darwin"):
+    if ed is None:
         return None
     try:
-        if ed.parent.parent.name.endswith(".app"):
-            return ed.parent.parent.parent
+        for parent in ed.parents:
+            if parent.name.endswith(".app"):
+                return parent
     except Exception:
         return None
     return None
 
 
+def _app_sibling_dir() -> Optional[Path]:
+    """Mac .app 形态下的「包旁」目录：X.app 同级，用户看得见也写得进去。"""
+    app = app_bundle_dir()
+    return app.parent if app is not None else None
+
+
+def inside_app_bundle(path) -> bool:
+    """这个路径是不是落在应用包**内部**（Mac 的 ``X.app`` 这一棵树里）。
+
+    落点口径必须按**形态**回答，不能按「写探针会不会碰巧成功」回答：.app 只有在被
+    Gatekeeper 转置时整卷才只读；用户从下载目录双击一份**没被隔离**的 app 时，包内
+    是写得进去的——那时候「exe 同级」（``Contents/MacOS``）这一级就会把审计日志、
+    自检报告、列映射历史统统塞进应用包里。后果不是崩溃，而是三件更难查的事：
+      · 覆盖升级 app 时，这些运行期数据跟着一起没了；
+      · 拖进废纸篓卸载时，用户几个月的历史一起消失；
+      · 哪天这份 app 被转置了，同一份数据会突然从原来的位置「消失」，用户看到的
+        就是「登录状态没保住 / 报错日志找不到了」。
+    ``riskbird_build/runtime_paths.candidate_dirs`` 早就按形态排除了这一级；本模块
+    此前只排除了「随包内置」那一级，两条口径并不一致——同一个工具的两半数据因此
+    会落在两个不同目录里（2026-11-12 全局自审发现并修齐）。
+    """
+    app = app_bundle_dir()
+    if app is None:
+        return False
+    try:
+        p = Path(str(path))
+        # 两边都 resolve 之后再比：``app_bundle_dir`` 走过 ``resolve()``，而传进来的
+        # 候选常常是没走过的那一份（``sys._MEIPASS``、``Path(__file__)`` 的历史值都是
+        # 软链名）。macOS 上 ``/var`` 正是 ``/private/var`` 的软链——不统一就会在
+        # **App Translocation 的真实现场**把包内判成包外，这条纪律恰好就在最需要它的
+        # 那台机器上失效（本轮加产物自检门禁时实测到的，见离线测试 T 节）。
+        try:
+            p = p.resolve()
+        except Exception:
+            pass
+        return app in p.parents or app == p
+    except Exception:
+        return False
+
+
+# ── Mac：把「下载目录里双击打开」变成「从应用程序文件夹打开」────────────────
+# Gatekeeper 的 App Translocation 只对「带隔离属性、又不在应用程序文件夹里」的 app
+# 生效，处置办法历来只有一个：把 .app 移进「应用程序」再从那里打开。说明书里写这句
+# 话，多数人不会去做；界面上给一次点击才做得完（Obsidian、Cursor 这类桌面工具都是
+# 「替用户搬一次家」而不是「教用户搬一次家」）。但替人搬家必须有硬边界，越界就会变成
+# 损坏用户数据的新缺陷，所以这里把边界写死成四条：
+#   · 只在用户自己的几个目录里找（下载/桌面/文稿/家目录，深度一层），绝不全盘搜索；
+#   · 只认 **CFBundleIdentifier 与运行中这份完全相同**的那份——名字相同不是证据，
+#     同名不同产品在这台机器上太常见了；
+#   · 目标位置已经有同名 .app 时绝不动手（无论是别人的软件还是旧版安装），
+#     版本不一致也只报现状，不覆盖、不删除；
+#   · 只有同卷 rename（瞬时）才由工具代做；跨卷复制、需要管理员授权这类必须有人
+#     盯着的情形一律原样退回，交回给访达去做——它有进度条也会问密码，我们自己搬则
+#     会把界面卡死十几秒，看起来像崩了。
+_APPS_DIR_NAME = "Applications"
+_APP_SOURCE_SUBDIRS = ("Downloads", "Desktop", "Documents")
+
+
+def bundle_id_of(app_dir) -> str:
+    """读 ``X.app/Contents/Info.plist`` 里的 CFBundleIdentifier；读不到返回空串。
+
+    空串就是「没法证明」，调用方必须按「不能动手」处理——把它当「都一样」是拿猜测
+    当证据，正是本轮要根治的那种「看起来合理、换台机器就错」的判定。
+    """
+    try:
+        with (Path(app_dir) / "Contents" / "Info.plist").open("rb") as fh:
+            return str(plistlib.load(fh).get("CFBundleIdentifier") or "")
+    except Exception:
+        return ""
+
+
+def bundle_version_of(app_dir) -> str:
+    """同一个 Info.plist 里的短版本号；读不到返回空串（用途见 :func:`bundle_id_of`）。"""
+    try:
+        with (Path(app_dir) / "Contents" / "Info.plist").open("rb") as fh:
+            return str(plistlib.load(fh).get("CFBundleShortVersionString") or "")
+    except Exception:
+        return ""
+
+
+def _bundle_executable_of(app_dir: Path, fallback: str = "") -> str:
+    """可执行文件名：优先按 Info.plist 的 CFBundleExecutable，退回当前进程自己的名字。"""
+    try:
+        with (app_dir / "Contents" / "Info.plist").open("rb") as fh:
+            value = str(plistlib.load(fh).get("CFBundleExecutable") or "")
+        if value:
+            return value
+    except Exception:
+        pass
+    return fallback
+
+
+def _applications_dir(home: Path) -> Path:
+    """搬家目标：系统「应用程序」优先，写不进去退用户级 ``~/Applications``。
+
+    两级都试过才承认「写不进去」：企业配发、非管理员的 Mac 上 ``/Applications``
+    根本不给普通用户写，而 ``~/Applications`` 是 macOS 自己支持的应用程序位置。
+    """
+    for cand in (Path("/" + _APPS_DIR_NAME), home / _APPS_DIR_NAME):
+        if probe_writable(cand):
+            return cand
+    return Path("/" + _APPS_DIR_NAME)
+
+
+def _app_source_roots(home: Path) -> List[Path]:
+    """搜寻源目录的有界清单：下载/桌面/文稿 + 家目录本身，深度一层。"""
+    roots = [home / name for name in _APP_SOURCE_SUBDIRS]
+    roots.append(home)
+    return roots
+
+
+def app_migration_plan(app=None, home=None, apps_dir=None,
+                       platform=None) -> Dict[str, object]:
+    """「把这份 .app 移进应用程序文件夹」这件事的可行性判定（只查，绝不动磁盘）。
+
+    判定与执行分成两个函数，是为了让这条最容易出事的链路可以离线跑真目录验：搬家这个
+    动作一旦判错，代价是用户机器上一个坏掉的 app，而它在开发机上永远测不出来（开发机
+    早就装在 /Applications 里了，压根不转置）。
+
+    返回 ``{"status", "source", "dest", "dest_exe", "detail"}``。status 取值即界面话术
+    的分支，每一种都说得出一句人话；``dest_exe`` 只在 ready 时有值（新位置的可执行文件，
+    重启链路直接用它，不需要再去猜 app 内部结构）。
+
+    ``home`` / ``apps_dir`` / ``platform`` 三个入参是给离线测试的：默认取本机，测试传
+    合成目录，于是同一条判定在 Linux/Windows 的 CI 上也能按 darwin 口径跑。
+    """
+    out: Dict[str, object] = {"status": "", "source": None, "dest": None,
+                              "dest_exe": None, "detail": ""}
+    plat = sys.platform if platform is None else str(platform)
+    if not plat.startswith("darwin"):
+        out.update(status="not_mac", detail="只有 macOS 才会被隔离成只读副本")
+        return out
+    app_path = Path(str(app)) if app is not None else app_bundle_dir()
+    if app_path is None:
+        out.update(status="no_bundle", detail="当前运行的不是一个 .app 包")
+        return out
+    home_path = Path(home) if home is not None else Path.home()
+    apps = Path(apps_dir) if apps_dir is not None else _applications_dir(home_path)
+    dest = apps / app_path.name
+    out["dest"] = dest
+
+    if _TRANSLOCATION_MARK not in str(app_path):
+        # 已经在正常形态下运行：这一步无事可做（界面也不会给出这个按钮）。
+        out.update(status="not_translocated", detail="本次不是从只读副本启动的")
+        return out
+
+    our_id = bundle_id_of(app_path)
+    if dest.exists():
+        same_id = bool(our_id) and bundle_id_of(dest) == our_id
+        if same_id and bundle_version_of(dest) == bundle_version_of(app_path):
+            out.update(status="already_installed",
+                       detail=f"「应用程序」里已经有同一份：{dest}")
+        else:
+            # 同名不同物、或版本对不上：绝不覆盖、绝不删除，交回给访达让用户自己决定
+            out.update(status="name_taken",
+                       detail=f"「应用程序」里已有一个同名但不同版本/不同产品的包：{dest}")
+        return out
+    if not our_id:
+        out.update(status="unknown_identity",
+                   detail="读不到本程序的包标识，无法证明找到的那份就是它")
+        return out
+
+    found: List[Path] = []
+    seen = set()
+    for root in _app_source_roots(home_path):
+        cand = root / app_path.name
+        try:
+            if not cand.is_dir():
+                continue
+            # 只排掉系统造的只读挂载（转置副本自己就在里面），不排 /Volumes：
+            # 从 DMG 直接运行的场景很常见，那份也确实「就是它」——只是搬不动，
+            # 由 mover 按跨卷退回，比在这里悄悄判成「找不到」更容易把人指到对的方向。
+            if _TRANSLOCATION_MARK in str(cand):
+                continue
+            if bundle_id_of(cand) != our_id:
+                continue
+            key = str(cand.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(cand)
+        except OSError:
+            # 家目录里可能挂着坏掉的软链/网络卷：一个候选读不到不影响其它候选，
+            # 但绝不能让它在界面上变成「没找到」，也不能让整条判定抛异常。
+            continue
+
+    if not found:
+        out.update(status="no_source",
+                   detail=f"在 {'、'.join(r.name for r in _app_source_roots(home_path))} "
+                          f"里没找到同一份 {app_path.name}")
+        return out
+    if len(found) > 1:
+        out.update(status="ambiguous",
+                   detail="找到多份同一程序的副本，不替你猜要搬哪一个："
+                          + "、".join(str(p) for p in found))
+        return out
+
+    src = found[0]
+    exe_name = _bundle_executable_of(
+        src, fallback=Path(str(sys.executable)).name)
+    out.update(status="ready", source=src,
+               dest_exe=(dest / "Contents" / "MacOS" / exe_name) if exe_name else None,
+               detail="")
+    return out
+
+
+def move_app_bundle(source, dest) -> Tuple[bool, str]:
+    """执行 :func:`app_migration_plan` 判好的那一步：同卷 rename，瞬时完成。
+
+    刻意只用 ``os.rename``：同卷改名不复制、不占空间、不留半个副本；跨卷会抛 EXDEV，
+    权限不足会抛 EACCES/EPERM —— 这两种都**不该由工具闷头做**（复制几百 MB 会把界面
+    卡死，要管理员授权则必须有人输密码），所以原样把原因退回，让界面把人交给访达。
+    """
+    source, dest = Path(str(source)), Path(str(dest))
+    if dest.exists():
+        return False, "目标位置已经有一个同名程序，不覆盖它"
+    try:
+        os.rename(str(source), str(dest))
+        return True, ""
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def reveal_in_finder(paths) -> bool:
+    """在访达里打开这些目录（macOS 的 ``open``）。永不抛异常：这是提醒，不是流程。"""
+    if not sys.platform.startswith("darwin"):
+        return False
+    import subprocess
+    ok = False
+    for p in [x for x in paths if x]:
+        try:
+            subprocess.run(["/usr/bin/open", str(p)], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+            ok = True
+        except Exception:
+            continue
+    return ok
+
+
+def state_dir_candidates(subdir: str = "") -> List[Path]:
+    """状态目录的候选链（按优先级，不保证可写、也不保证存在）。
+
+    口径与 ``riskbird_build/runtime_paths.candidate_dirs`` 完全一致，两处必须一起改。
+    把「候选链」单独暴露出来的理由：``数据不进应用包`` 这条纪律**不许靠权限碰运气**来
+    验证——整包可写的机器上（用户从下载目录双击一份没被 Gatekeeper 隔离的 app），写探针
+    在包内那一级会成功，旧实现照样把审计日志与自检报告塞进包里。候选链摊开之后，离线
+    测试就能按**形态**逐条断言「一处都不在 .app 内部」，这句话在任何权限组合下都成立。
+    """
+    name = STATE_DIR_NAME
+    if subdir:
+        name = os.path.join(name, subdir)
+    if not is_frozen():
+        return [_MODULE_DIR / subdir] if subdir else [_MODULE_DIR]
+    cands: List[Path] = []
+    sib = _app_sibling_dir()
+    if sib is not None:
+        cands.append(sib / name)
+    ed = exe_dir()
+    # .app 形态下「exe 同级」就是 Contents/MacOS＝包内：按形态排除，
+    # 不等写探针去碰运气（口径见 :func:`inside_app_bundle`）。
+    if ed is not None and not inside_app_bundle(ed):
+        cands.append(ed / name)
+    cands.append(Path.home() / USER_CONFIG_DIR_NAME / name)
+    import tempfile
+    cands.append(Path(tempfile.gettempdir()) / name)
+    return cands
+
+
 def state_dir(subdir: str = "") -> Path:
     """持久可写状态目录（缓存、自检报告这类非会话产物）。
 
-    候选链：环境变量 > 包旁（Mac .app）> exe 同级 > 用户目录 ~/.b2bcollect >
-    系统临时目录；开发态直接用模块目录，避免历史缓存搬家。每个候选都过写探针。
+    候选链：环境变量 > 包旁（Mac .app）> exe 同级（.app 形态下这一级就是包内，已按
+    形态排除）> 用户目录 ~/.b2bcollect > 系统临时目录；开发态直接用模块目录，避免历史
+    缓存搬家。每个候选都过写探针，逐条口径见 :func:`state_dir_candidates`。
     """
-    name = "b2bcollect_state"
-    if subdir:
-        name = os.path.join(name, subdir)
     env_dir = str(os.environ.get(_STATE_DIR_ENV_VAR) or "").strip()
     if env_dir:
         return Path(env_dir) / (subdir or "")
-
-    cands: List[Path] = []
-    if is_frozen():
-        sib = _app_sibling_dir()
-        if sib is not None:
-            cands.append(sib / name)
-        ed = exe_dir()
-        if ed is not None:
-            cands.append(ed / name)
-        cands.append(Path.home() / USER_CONFIG_DIR_NAME / name)
-        import tempfile
-        cands.append(Path(tempfile.gettempdir()) / name)
-    else:
-        return _MODULE_DIR / (subdir or "") if subdir else _MODULE_DIR
-
-    for d in cands:
+    for d in state_dir_candidates(subdir):
         if probe_writable(d):
             return d
-    fallback = Path.home() / USER_CONFIG_DIR_NAME / name
-    return fallback
+    # 全链路都写不进去（极端环境）：仍报用户目录那一级，由调用方的写失败播报去说这件事
+    name = STATE_DIR_NAME
+    if subdir:
+        name = os.path.join(name, subdir)
+    return Path.home() / USER_CONFIG_DIR_NAME / name
+
+
+def user_state_dir() -> Path:
+    """用户目录里那一级的状态目录（:func:`state_dir` 的最后一条退路）。
+
+    单独提供是给「tool_config 自己都没加载成功」那种病态包用的退路：那里只能退回
+    这个**与本机无关**的固定落点，绝不能退回当前工作目录（见 :func:`state_file`）。
+    """
+    return Path.home() / USER_CONFIG_DIR_NAME / STATE_DIR_NAME
+
+
+def state_file(name: str) -> Path:
+    """持久状态文件的唯一落点：``state_dir() / name``，并确保父目录存在。
+
+    为什么值得专门有一个函数：历史上有两个默认值写成 ``"audit.log"`` /
+    ``"mapping_history.json"``（注释还写着「与程序同目录」），实际是**相对当前工作
+    目录**——而打包态的 CWD 由「谁把进程拉起来」决定：访达双击是 ``/``，重启链路是
+    exe 同级，命令行则是用户当时站在哪。同一个文件因此可能落到四个地方：Mac 转置
+    副本下写 ``/`` 直接 PermissionError（被 except 吞掉＝审计日志静默消失），
+    Windows onefile 下写进退出即删的 _MEI 目录（＝每次归零）。落点只许问一处，
+    调用方只报文件名——这条纪律由离线测试逐字钉住。
+    """
+    d = state_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # 目录建不出来（首选写不进去时 state_dir 已经退到用户目录，走到这里
+        # 说明连用户目录都不行）：仍然返回路径，由调用方的写失败播报去说这件事
+        pass
+    return d / name
+
+
+def config_save_target() -> Optional[Path]:
+    """「保存配置」这一步会落在哪一处（只判定、不落盘；自检与离线测试都问它）。
+
+    单独公开出来有两个理由：
+      · 判据只有一份。:func:`save_config` 里那串排除规则如果被自检或测试另抄一遍，
+        抄的那一份就会漏改（本轮 Mac 崩溃的同族缺陷正是「一条纪律在三处各有实现」）；
+      · 产物自检必须是**只读**的：它要能回答「用户现在点保存会写到哪」，却不能真的
+        去改任何一份配置。返回 None 表示链条里没有一处可写落点。
+    """
+    for label, path in config_candidates():
+        try:
+            # 打包态的「随包内置」是临时解压目录（Windows onefile 每次退出即删，
+            # Mac 转置后只读）：往它里面写等于「保存成功但下次开机没了」，
+            # 这一级只许读、不许作为保存落点。
+            if label == "随包内置" and is_frozen():
+                continue
+            # 同一条纪律的另一半：Mac .app 的「程序同级」＝Contents/MacOS，也在包内。
+            # 读它可以（多一处兼容形态），写它不行——理由见 :func:`inside_app_bundle`。
+            if is_frozen() and inside_app_bundle(path):
+                continue
+            if path.is_file() and probe_writable(path.parent):
+                return path
+        except Exception:
+            continue
+    user = user_config_file()
+    return user if probe_writable(user.parent) else None
 
 
 def save_config(values: dict) -> Tuple[bool, str]:
@@ -340,24 +686,9 @@ def save_config(values: dict) -> Tuple[bool, str]:
     有配置文件的机器上改配置，就应该改那一份（不然会凭空多出第二份互相矛盾的
     配置）；否则写到用户目录这一级。绝不允许「界面点保存 → 静默失败」。
     """
-    target: Optional[Path] = None
-    for label, path in config_candidates():
-        try:
-            # 打包态的「随包内置」是临时解压目录（Windows onefile 每次退出即删，
-            # Mac 转置后只读）：往它里面写等于「保存成功但下次开机没了」，
-            # 这一级只许读、不许作为保存落点。
-            if label == "随包内置" and is_frozen():
-                continue
-            if path.is_file() and probe_writable(path.parent):
-                target = path
-                break
-        except Exception:
-            continue
+    target = config_save_target()
     if target is None:
-        user = user_config_file()
-        if not probe_writable(user.parent):
-            return False, "用户目录不可写，配置未保存"
-        target = user
+        return False, "用户目录不可写，配置未保存"
     cfg: dict = {}
     try:
         if target.is_file():

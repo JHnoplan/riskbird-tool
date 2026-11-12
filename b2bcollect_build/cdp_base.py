@@ -25,12 +25,18 @@ import sys
 import json
 import time
 import random
+import tempfile
 import threading
 from pathlib import Path
 
 import requests
 
 import province_filter as _pf
+# 落点口径共用一份：「这段路径在不在应用包内」这个问题只许有一处回答（tool_config）。
+# 本模块以前自己写的是 ``exe_dir.parent.parent.name.endswith(".app")``——那是把
+# Contents/MacOS 的深度写死在代码里，PyInstaller 布局一变（风鸟那一路的实际数据目录
+# 就在 Contents/Frameworks 下）就会把包内当成包外，同族缺陷就又活一份。
+import tool_config as _tc
 
 try:
     import websocket  # websocket-client
@@ -829,20 +835,30 @@ return '';})()"""
 
     @staticmethod
     def _stable_data_dir():
-        """数据目录必须跨运行持久且可写。PyInstaller onefile 下 __file__ 指向每次变、
-        退出即删的 _MEIxxxx，故打包运行用 exe 同级目录，开发用模块目录，再回退用户主目录。
-        Mac .app 双击启动时 exe 在 Contents/MacOS 里，数据改放 .app 旁边的可见目录：
-        既不塞胖应用包，Gatekeeper 只读转置（App Translocation）下也会落到回退位置。"""
+        """持久数据目录：跨运行不丢、**绝不落在应用包内部**，且永不抛异常。
+
+        PyInstaller onefile 下 ``__file__`` 指向每次变、退出即删的 ``_MEIxxxx``，故打包
+        运行用 exe 同级目录，开发用模块目录。Mac 的 .app 形态下「exe 同级」正好是
+        ``Contents/MacOS``＝包内，按**形态**改放 .app 旁边的可见目录：既不塞胖应用包，
+        Gatekeeper 只读转置（App Translocation）下也不会裸 mkdir 把启动带崩。
+
+        两处口径上的收口（2026-11-12 全局自审）：
+          · 形态判定共用 :func:`tool_config.app_bundle_dir`（向上找 ``.app``），不再把
+            ``Contents/MacOS`` 的深度写死在本地——写死了就等于赌 PyInstaller 的包布局
+            永远不变，而本轮崩的那条路径恰恰就在 ``Contents/Frameworks`` 那一支；
+          · 最后一退路是系统临时目录，而不是「返回一个写不进去的目录」。以前两级都不
+            行时返回 primary，调用方一句 ``mkdir`` 就 OSError 崩在启动那一下——那是
+            本轮 Mac 故障的同一种收场，只是触发条件更苛刻（主目录被文件夹保护/占满）。
+        """
+        name = "b2bcollect_data"
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).resolve().parent
-            if (sys.platform == "darwin"
-                    and exe_dir.parent.parent.name.endswith(".app")):
-                primary = exe_dir.parent.parent.parent / "b2bcollect_data"
-            else:
-                primary = exe_dir / "b2bcollect_data"
+            app = _tc.app_bundle_dir()
+            primary = (app.parent / name) if app is not None else (exe_dir / name)
         else:
-            primary = Path(__file__).resolve().parent / "b2bcollect_data"
-        for d in (primary, Path.home() / ".b2bcollect" / "b2bcollect_data"):
+            primary = Path(__file__).resolve().parent / name
+        for d in (primary, Path.home() / _tc.USER_CONFIG_DIR_NAME / name,
+                  Path(tempfile.gettempdir()) / f"b2bcollect_{name}"):
             try:
                 d.mkdir(parents=True, exist_ok=True)
                 probe = d / ".write_test"

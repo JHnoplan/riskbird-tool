@@ -51,7 +51,7 @@ check("陕西MIC=Shaanxi", pf.MIC_EN["陕西"], "Shaanxi")
 check("西藏MIC=Tibet", pf.MIC_EN["西藏"], "Tibet")
 check("内蒙古MIC=InnerMongolia", pf.MIC_EN["内蒙古"], "InnerMongolia")
 check("马可波罗拼音值互不撞车", len(set(pf.MAKEPOLO_PINYIN.values())), len(pf.PROVINCES))
-check("参数直筛站名单", sorted(pf.PARAM_SITES), ["1688", "makepolo", "mic"])
+check("参数直筛站名单", sorted(pf.PARAM_SITES), ["1688", "gongchang", "makepolo", "mic"])
 check("8 平台=7 并行站+1688", {"mic", "b2b168", "11467", "aipage", "maimaib2b",
                               "globalimporter", "makepolo", "1688"} <=
       pf.PARAM_SITES | {"b2b168", "11467", "aipage", "maimaib2b", "globalimporter"}, True)
@@ -81,6 +81,32 @@ _M = [  # (省份, 文本, 期望)——文本全是各站实测字段形态
 ]
 for pv, text, want in _M:
     check(f"match_province({pv!r}, {text!r})", pf.match_province(pv, text), want)
+
+# 多省勾选下的歧义口径（2026-11-12 复核补）：「省份多选」第一版把命中判断写在歧义
+# 判断之前，「深圳江西商会」在只勾广东时也被当成本省企业入库——fail-closed 被短路。
+# 同时另一头也要钉住：勾了广东+江西后这条**必须**算 match，否则「多勾一个省反而一条
+# 都救不回来」（judge_record 旧版逐省循环的实际后果）。
+_AMB = "深圳江西商会"
+check("单省勾选：跨省歧义仍 unknown", pf.match_province("广东", _AMB), "unknown")
+check("多省勾选：全部命中都在已选集合内 = match",
+      pf.match_province("广东,江西", _AMB), "match")
+check("多省勾选（列表写法）同上", pf.match_province(["广东", "江西"], _AMB), "match")
+check("多省勾选但含外省信号：仍 unknown",
+      pf.match_province("广东,江苏", _AMB), "unknown")
+_rec = {"公司名称": "深圳市深海诺科技有限公司", "所在区域": "", "地址": _AMB}
+check("strict 站（1688）单省勾选丢弃歧义记录",
+      pf.judge_record("1688", "广东", _rec), ("unknown", False))
+check("strict 站多省勾选收下歧义记录",
+      pf.judge_record("1688", "广东,江西", _rec), ("match", True))
+check("lenient 站（mic）只砍确认外省",
+      pf.judge_record("mic", "广东", _rec), ("unknown", True))
+check("lenient 站确认外省照样砍",
+      pf.judge_record("mic", "广东", {"公司名称": "河北某某管道有限公司"}),
+      ("miss", False))
+# 标签与判定必须同一条闸门：判不出归属的记录不许被填上「有页面证据」的所在区域
+check("歧义记录单省勾选不出标签", pf.region_label("广东", _AMB), "")
+check("歧义记录多省勾选各出各的标签",
+      pf.region_label("广东,江西", _AMB), "广东·深圳/江西")
 
 print("\n=== C 参数直筛三站的 URL 拼接 ===")
 from mic_crawler import MicCrawler          # noqa: E402
@@ -306,24 +332,48 @@ _sandbox = tempfile.mkdtemp(prefix="prov_home_")
 gui.MainWindow._get_desktop_dir = lambda self: _sandbox
 _w = gui.MainWindow()
 check("有「选择省份」按钮", _w.btn_province.text(), "选择省份")
-check("默认全国不限", _w.selected_province, "")
+check("默认全国不限", _w.selected_provinces, [])
 check("默认文案回显", _w.lbl_province.text(), "🗺 采集范围：全国（不限省份）")
-dlg = gui.ProvincePickerDialog("", _w)
-check("弹窗按钮数=全国+34", len(dlg._radios), 35)
-_pv = {v for v in dlg._radios.values()}
-check("弹窗选项=全国+全部省份", _pv == set(pf.PROVINCES) | {""}, True)
-dlg2 = gui.ProvincePickerDialog("广东", _w)
-_gd = next(rb for rb, v in dlg2._radios.items() if v == "广东")
-check("回显打开时选中上次省份", _gd.isChecked(), True)
-_w.selected_province = "广东"
+# 弹窗已改多选（复选框 + 大区快捷）：判据从「35 个单选 radio」换成「34 个复选 + 集合对齐」
+dlg = gui.ProvincePickerDialog([], _w)
+check("弹窗省份数=34", len(dlg._checks), 34)
+_pv = set(dlg._checks)
+check("弹窗选项=全部省份（无「全国」项，空选即全国）", _pv == set(pf.PROVINCES), True)
+check("空选时摘要说全国", dlg._summary.text(), "🗺 全国（不限省份）")
+dlg2 = gui.ProvincePickerDialog(["广东"], _w)
+check("回显打开时勾上上次省份", dlg2._checks["广东"].isChecked(), True)
+check("回显只勾那一个", sum(cb.isChecked() for cb in dlg2._checks.values()), 1)
+dlg3 = gui.ProvincePickerDialog([], _w)
+dlg3._checks["广东"].setChecked(True)
+dlg3._checks["浙江"].setChecked(True)
+# 回显顺序固定按官方区划顺序（PROVINCES），与用户勾选的先后无关：
+# 否则同一组选择在两台机器上会显示成两种文案，快照比对与「省份没变」的判断都会失真
+check("多选摘要按区划顺序", dlg3._summary.text(), "🗺 已选 2 个省：浙江、广东")
+dlg3._on_ok()
+check("确定后返回选中列表（区划顺序）", dlg3.chosen_list, ["浙江", "广东"])
+# 大区快捷：整区替换而不是叠加（误叠加会让「选华北」变成 34 省全选）
+dlg4 = gui.ProvincePickerDialog(["广东"], _w)
+dlg4._select_region(gui.ProvincePickerDialog.REGIONS["东北"])
+dlg4._on_ok()
+check("大区快捷为替换语义", dlg4.chosen_list, ["辽宁", "吉林", "黑龙江"])
+_w.selected_provinces = ["广东"]
 _w._refresh_province_label()
-check("选后文案明显", _w.lbl_province.text(), "🗺 采集范围：广东（只采广东的企业）")
-check("快照带省份", _w._params_snapshot().get("province"), "广东")
+check("选后文案明显", _w.lbl_province.text(), "🗺 采集范围：广东（只采这些省份的企业）")
+_w.selected_provinces = ["广东", "浙江", "江苏", "上海"]
+_w._refresh_province_label()
+check("超 3 个省折叠显示", _w.lbl_province.text(), "🗺 采集范围：已选 4 个省（广东、浙江、江苏…）")
+check("快照带省份（列表）", _w._params_snapshot().get("province"), ["广东", "浙江", "江苏", "上海"])
 # 老快照（没 province 键）续采回填：按全国不限处理，不许崩
 _w._apply_params({"delay_between": 5.0, "relevance_guard": True})
-check("老快照回填=全国不限", _w.selected_province, "")
+check("老快照回填=全国不限", _w.selected_provinces, [])
+check("老快照回填后文案同步", _w.lbl_province.text(), "🗺 采集范围：全国（不限省份）")
+# 单省字符串是「省份多选」之前的历史格式，必须兼容而不是当场报错或整串当一个省
 _w._apply_params({"province": "浙江"})
-check("新快照回填省份", _w.selected_province, "浙江")
+check("历史单省字符串快照回填", _w.selected_provinces, ["浙江"])
+_w._apply_params({"province": "浙江,江苏"})
+check("历史逗号串快照回填", _w.selected_provinces, ["浙江", "江苏"])
+_w._apply_params({"province": ["浙江", "江苏"]})
+check("新列表快照回填", _w.selected_provinces, ["浙江", "江苏"])
 check("回填后文案同步", "浙江" in _w.lbl_province.text(), True)
 
 print(f"\n===== 通过 {PASS} / 失败 {FAIL} =====")

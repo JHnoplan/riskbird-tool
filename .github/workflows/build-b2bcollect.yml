@@ -9,7 +9,8 @@ name: Build B2bCollectTool EXE
 #   · 但「1688」与「企知道补采」两条通道经由 site_adapters 复用成熟的 Selenium 爬虫
 #     （ali1688_build / riskbird_build），因此本工具【确实依赖 selenium + chromedriver】，
 #     与 1688 工具一样需内置驱动——旧注释「不依赖 selenium」是错的。
-#   · site_adapters 跨目录引用的 4 个源文件与驱动，一并通过 --add-data 打进包；
+#   · site_adapters 跨目录引用的源文件**数量以 site_adapters.EXTERNAL_MODULES 为准**
+#     （由构建前硬门逐项对拍，不在这里抄一份数字），与驱动一并通过 --add-data 打进包；
 #     frozen 运行时由 site_adapters 从 sys._MEIPASS 解析这些外部模块树。
 #
 # 随包凭证（2026-11 外部机器全员丐版的直接根因）：
@@ -26,6 +27,10 @@ on:
       - 'b2bcollect_build/**'
       - '.github/workflows/build-b2bcollect.yml'
       - 'enf_clean/**'
+      # 与 Mac 版同一句：跨目录引用的采集器源码改了却不重打包，发出去的产物就是旧的。
+      # 判据由构建前硬门反查（见 check_packaging_manifest.py 的触发目录检查）。
+      - 'ali1688_build/**'
+      - 'riskbird_build/**'
   workflow_dispatch:  # 允许在 Actions 页面手动只打包这个工具
 
 jobs:
@@ -112,12 +117,30 @@ jobs:
       # 类型表达式解析，当场 ParserError「Missing type name after '['」——构建连
       # PyInstaller 都没启动就红了（实机踩过）。声明成 bash 之后这一步与 Mac 版
       # 同一份脚本，两个平台的差异只剩 --add-data 的分隔符和驱动文件名。
+      #
+      # 【本轮根修：去掉 --onefile，改出 onedir 目录】（2026-11-12 Windows 实机崩溃）
+      #   现场：打开工具正常，切换账号后点界面上的「重启」就报
+      #     FileNotFoundError: ...\Temp\_MEI000025982\base_library.zip
+      #   onefile 每次启动都把整个运行时解包到一个 %TEMP%\_MEI<pid> 目录，**退出时删掉**。
+      #   于是「重启自己」天生要和这个回收过程赛跑：旧实例还没删完、新实例已经在同一个
+      #   临时目录上开始解包（PID 复用时会撞名），解到一半的归档被对方删掉，PyInstaller
+      #   的 zipimport 就在那句「读 base_library.zip」上抛 ENOENT——栈里全是
+      #   importlib/_bootstrap 与 zipimport，用户看到的却是一句和账号、和风鸟都无关的
+      #   「找不到文件」，排查方向极容易被带去查网络或权限。
+      #   第二重代价更隐蔽：onefile 的 ``__file__`` 指向那个退出即删的目录，**所有**按
+      #   「模块所在目录」写的缓存、Cookie、字体字典都会每次归零（本项目里是风鸟/爱企查
+      #   的 Cookie 与 30 天列表缓存），症状不是报错，是「每天白烧一遍查询额度」。
+      #   onedir 把这两件事一起消掉：运行时就是安装目录里的真实文件，不解包、不回收、
+      #   没有赛跑，``sys.executable`` 与数据落点都稳定。这也与 Mac 侧本来就用的 onedir
+      #   对齐——两个平台一种交付形态，打包脚本与校验器也少一套分支。
+      #   代价是产物从「一个 exe」变成「一个目录」，所以必须配安装包（下一步 NSIS），
+      #   并且额外留一份目录 zip 作为「不想装东西」的兜底。
       shell: bash
       run: |
         cd b2bcollect_build
         # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
         [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\runtime_paths.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，
@@ -128,21 +151,82 @@ jobs:
       # （参数没被认出来就会走到建界面那条路，runner 上多半也没有可用图形会话），
       # 一卡就是 job 默认的 6 小时，日志里连一行自检结论都留不下。exe 里的自检
       # 本身是有界的（网络侧全部带超时与重试上限），这里再兜一层防「没走到那里」。
+      # onedir 之后 exe 住在 dist\B2bCollectTool\ 里，自检报告也落在它同级的
+      # b2bcollect_state 下；这里用递归查找而不是写死路径，将来布局再变（比如
+      # _internal 挪位置）也不会出现「产物是好的、门禁读错了文件」这种假失败。
       timeout-minutes: 10
       shell: pwsh
       run: |
-        $exe = "b2bcollect_build\dist\B2bCollectTool.exe"
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：$exe（onedir 布局变了？先修这一步再谈交付）"
+          exit 1
+        }
         $p = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -Wait -PassThru
-        $log = "b2bcollect_build\dist\b2bcollect_state\acl_doctor.txt"
-        if (Test-Path $log) { Get-Content $log }
+        $log = Get-ChildItem -Path "b2bcollect_build\dist" -Recurse -Filter "acl_doctor.txt" |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($log) { Get-Content $log.FullName } else { Write-Host "（没找到 acl_doctor.txt）" }
         Write-Host "acl-doctor exit code = $($p.ExitCode)"
         if ($p.ExitCode -ne 0) {
           Write-Host "::error::产物自检未通过（退出码 $($p.ExitCode)）：这个包发出去只会是精简版，禁止上传"
           exit $p.ExitCode
         }
 
-    - name: Upload EXE artifact
+    - name: Package Windows artifacts
+      # onedir 交付装配，三道事一并做（判据全在脚本里，不抄在 yml）：
+      #   1) 验布局：dist\B2bCollectTool\ 里 exe + _internal + 随包凭证 + 跨目录采集器
+      #      一项不缺，并且**dist 里不许再躺一个旧的单文件 exe**（那个会把本轮修好的
+      #      onefile 故障原样带回用户机器）；
+      #   2) 剔运行期目录：上一步 --acl-doctor 在 runner 上跑出了 b2bcollect_state 等
+      #      目录，那是「CI 那台机器」的状态，绝不能进任何交付物；
+      #   3) 打绿色版 zip：顶层固定是一个 B2bCollectTool/ 目录 + 一份使用说明，
+      #      给「不让装软件 / 放共享盘」的场景兜底。
+      # 这一步排在安装包之前：makensis 用 File /r 拷整棵 dist 树，先剔干净再拷，
+      # 安装器与 zip 才是同一份干净布局。
+      shell: bash
+      run: python .github/scripts/package_win_artifacts.py --root b2bcollect_build
+
+    - name: Build Windows installer (NSIS, per-user)
+      # 交付形态：目录形态的产物必须靠安装包落到用户机器上，否则「解压到哪都行」会
+      # 变成「用户把文件夹删了一半」。这里按业界主流做法做成**每用户安装**：
+      #   · 默认目录 $LOCALAPPDATA\Programs\B2bCollectTool —— 用户在配置文件里，
+      #     RequestExecutionLevel user 不弹 UAC（VS Code / Slack / Discord 同一路线），
+      #     也保证安装目录本身**可写**：Cookie、缓存、自检报告这些运行期数据按
+      #     riskbird_build/runtime_paths.py 与 tool_config.state_dir 的口径优先落在
+      #     程序同级，装在 Program Files 里就会全部退到用户目录，用户看不见也
+      #     说不清「为什么我的登录状态没保住」。
+      #   · 卸载信息写 HKCU（不是 HKLM），控制面板里能正常卸载、且不污染机器级注册表。
+      # makensis 不在位就直接失败：宁可没有安装包，也绝不静默退化成「只发一个 zip」
+      # 却告诉用户「这就是交付物」（那种降级只有用户会发现）。
+      # B2B_ROOT 用绝对路径传给 NSIS 的 !cd：NSIS 的相对路径基准是 makensis 的启动
+      # 目录而不是脚本目录，靠「反正我 cd 过了」迟早对不上（Git Bash 的 pwd -W 才给
+      # Windows 形式的绝对路径，纯 MSYS 形式 /d/... 传给 Windows 版 makensis 会读错）。
+      shell: bash
+      env:
+        APP_VERSION: ${{ github.run_number }}
+      run: |
+        cd b2bcollect_build
+        MAKENSIS=$(command -v makensis || command -v makensis.exe || true)
+        if [ -z "$MAKENSIS" ]; then
+          for c in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
+            [ -f "$c" ] && MAKENSIS="$c" && break
+          done
+        fi
+        [ -n "$MAKENSIS" ] || { echo "::error::这台 runner 上没有 makensis（NSIS），打不出安装包"; exit 1; }
+        WIN_ROOT=$(pwd -W 2>/dev/null || pwd)
+        case "$WIN_ROOT" in
+          [A-Za-z]:*) : ;;
+          *) echo "::error::拿不到 Windows 形式的绝对路径（当前 $WIN_ROOT），NSIS 会读错相对路径"; exit 1 ;;
+        esac
+        echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT"
+        "$MAKENSIS" /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="1.$APP_VERSION.0" installer/b2bcollect_setup.nsi
+        ls -l B2bCollectToolSetup.exe B2bCollectTool_Win_portable.zip
+
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: B2bCollectTool
-        path: b2bcollect_build/dist/B2bCollectTool.exe
+        path: |
+          b2bcollect_build/B2bCollectToolSetup.exe
+          b2bcollect_build/B2bCollectTool_Win_portable.zip
+        if-no-files-found: error

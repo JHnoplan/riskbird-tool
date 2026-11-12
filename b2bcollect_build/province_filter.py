@@ -22,8 +22,11 @@
 
 属地判定规则（match_province）：先把文本里的行政区划尾巴去掉（广东省→广东、
 深圳市→深圳），再拿「本省短名/简称 + 下辖全部地级市名」做子串命中：
-  · 只命中目标省 → match；只命中别的省 → miss；
-  · 同时命中两个省（如「深圳江西商会」）或谁都没命中 → unknown（按 ②口径处置）。
+  · 只命中一个省：是目标省 → match，不是 → miss；
+  · 同时命中两个省（如「深圳江西商会」）：**除非全部命中都落在已选省份集合内**，
+    否则一律 unknown（按 ②口径处置）——勾了「广东 + 江西」时这条记录没有任何外省
+    污染的证据，算 match；只勾「广东」时它仍可能是江西机构，宁判不出不误归；
+  · 谁都没命中 → unknown（按 ②口径处置）。
 
 判定文本（record_region_text）除区域/地址外**一定带上公司名**：中国大陆公司名开头就是
 登记地的行政区划（工商强制），是比页面标注更硬的属地信号。实测那一轮 300 条
@@ -150,30 +153,45 @@ def _parse_provinces(province):
     return [s]
 
 
-def match_province(province, text):
-    """返回 "match" / "miss" / "unknown"（口径见模块 docstring）。
-    支持多省：province 可以是单省字符串、逗号分隔多省、或列表——
-    命中任一目标省即 match，全部未命中且有明确外省信号即 miss。"""
-    targets = _parse_provinces(province)
-    if not targets:
-        return "unknown"
+def hit_provinces(text):
+    """这段文本里能识别出的**全部**省级归属（可能不止一个）。
+
+    单独成一个出口是为了「一次扫描、多处复用」：判定（match_province）与属地回填
+    （region_label）问的本来是同一件事，各自扫一遍就会出现「一处改了歧义口径、另一处
+    还按老口径填标签」这种自相矛盾的输出。空文本 / 无属地信号 → 空集合。
+    """
     raw, stripped = _norm_variants(text)
     if not stripped:
+        return set()
+    return {pv for pv, toks in PROVINCE_TOKENS.items()
+            if any((t in raw) or (t and t in stripped) for t in toks)}
+
+
+def match_province(province, text):
+    """返回 "match" / "miss" / "unknown"（口径见模块 docstring）。
+    支持多省：province 可以是单省字符串、逗号分隔多省、或列表。
+
+    判序（2026-11-12 复核「省份多选」改造时补回的纪律）：
+      · 只命中一个省 → 是目标省就 match，不是就 miss；
+      · **同时命中两个及以上省**（「深圳江西商会」「上海办事处 东莞工厂」这类商会/
+        多地经营形态）→ 除非所有信号都落在已选集合内，否则一律 unknown。
+        多选改造的第一版把「命中任一目标省即 match」写在歧义判断**前面**，等于把
+        这条 fail-closed 短路掉了：strict 站（1688 与全部数据层站）会把跨省歧义的
+        公司当成本省企业入库，而 docstring 的口径是「混进外省商家比少几条更伤」。
+        歧义永远优先于命中——这里一次拿到整组目标省来判，多省语义就不会被「逐省
+        分别判再取最优」那种循环拆散（逐省判时「广东+江西」选中的双省记录每单省都算
+        歧义，选两个省反而比选一个省更容易丢数据）。
+    """
+    targets = set(_parse_provinces(province))
+    if not targets:
         return "unknown"
-    hits = set()
-    for pv, toks in PROVINCE_TOKENS.items():
-        if any((t in raw) or (t and t in stripped) for t in toks):
-            hits.add(pv)
+    hits = hit_provinces(text)
     if not hits:
         return "unknown"
-    # 多省场景：命中任一目标省即 match
-    if hits & set(targets):
-        return "match"
-    # 全部命中结果都不在目标省集合内 → 明确 miss
-    if len(hits) == 1:
-        return "miss"
-    # 多省命中但都不是目标省 → 跨省歧义，判 unknown
-    return "unknown"
+    if len(hits) > 1:
+        # 跨省歧义：全部信号都落在已选集合里才算数，否则宁判不出、不误归
+        return "match" if hits <= targets else "unknown"
+    return "match" if hits & targets else "miss"
 
 
 def param_value(site_slug, province, kind):
@@ -213,24 +231,23 @@ def record_region_text(rec):
 def judge_record(site_slug, province, rec):
     """省份精准采集的入库判定。返回 (verdict, keep)：
     verdict ∈ match/miss/unknown，keep = 这条是否入库。
-    支持多省：province 可以是单省字符串、逗号分隔多省、或列表——
-    命中任一目标省即 match，按该站核验策略决定 keep。"""
-    targets = _parse_provinces(province)
-    if not targets:
+    支持多省：province 可以是单省字符串、逗号分隔多省、或列表；整组目标省一次
+    交给 match_province 判，keep 只按该站的核验策略（lenient/strict）决定。
+
+    这里原本是一段「逐省调用、取最优」的循环，两个问题都不是靠肉眼扫日志能发现的：
+      · 多省的语义被拆成 N 次单省判定，跨省歧义记录（「深圳江西商会」）选一个省判
+        unknown、选两个省**还是** unknown——用户多勾一个省，一条也救不回来；而按
+        口径「全部属地信号都在已选集合内 = 没有外省污染的证据」本该算 match；
+      · 歧义规则住在 match_province 里，循环却住在这一层，两处各自演进迟早读歪同
+        一条纪律（本轮修的正是这个）。
+    口径改由 match_province 一处负责后，本函数只回答「这种 verdict 在该站留不留」。
+    """
+    if not _parse_provinces(province):
         return "unknown", True
-    text = record_region_text(rec)
-    # 逐省判定，取最优结果（任一 match 即 match，全部 miss 即 miss）
-    best_verdict = "unknown"
-    for pv in targets:
-        v = match_province(pv, text)
-        if v == "match":
-            best_verdict = "match"
-            break
-        if v == "miss" and best_verdict != "match":
-            best_verdict = "miss"
+    verdict = match_province(province, record_region_text(rec))
     if uses_param_filter(site_slug) and param_verify_policy(site_slug) == "lenient":
-        return best_verdict, best_verdict != "miss"
-    return best_verdict, best_verdict == "match"
+        return verdict, verdict != "miss"
+    return verdict, verdict == "match"
 
 
 def region_label(province, text):
@@ -242,12 +259,16 @@ def region_label(province, text):
     targets = _parse_provinces(province)
     if not targets:
         return ""
-    raw, stripped = _norm_variants(text)
-    if not raw:
+    hits = hit_provinces(text)
+    # 与 match_province 共用同一道歧义闸门：判不出归属的文本同样不配拿到标签。
+    # 各扫各的话，「判定按歧义丢弃、标签却按命中单省填上」这种自相矛盾的输出
+    # 迟早会出现，而那时候表里的「所在区域」就是凭半个证据写上去的。
+    if not hits or (len(hits) > 1 and not hits <= set(targets)):
         return ""
+    raw, _ = _norm_variants(text)
     labels = []
     for pv in targets:
-        if match_province(pv, text) != "match":
+        if pv not in hits:
             continue
         city = ""
         for c in _CITY_TABLE.get(pv, []):

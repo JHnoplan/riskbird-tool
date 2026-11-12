@@ -3833,14 +3833,30 @@ def main():
     def global_excepthook(exctype, value, tb):
         import traceback
         err_msg = "".join(traceback.format_exception(exctype, value, tb))
-        # 写入日志文件方便排查
+        # 写入日志文件方便排查。落点必须是**绝对路径**：裸文件名等于跟着当前工作目录跑，
+        # 而打包态的 CWD 由「谁把进程拉起来」决定（双击是 exe 同级，从服务/计划任务拉起
+        # 是 System32，onefile 还可能是退出即删的 _MEIxxxx）——排障的人最后拿到的就是
+        # 「崩溃日志找不到」这条无从核对的口述。口径与 Cookie 同一处，发一个目录就够。
+        candidates = []
         try:
-            with open("crash_log.txt", "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*50}\n")
-                f.write(f"Crash at: {datetime.now().isoformat()}\n")
-                f.write(err_msg)
+            import runtime_paths
+            candidates.append(Path(str(runtime_paths.stable_data_dir())) / "crash_log.txt")
         except Exception:
             pass
+        try:
+            candidates.append(Path.home() / "riskbird_crash_log.txt")
+        except Exception:
+            pass
+        for path in candidates:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*50}\n")
+                    f.write(f"Crash at: {datetime.now().isoformat()}\n")
+                    f.write(err_msg)
+                break
+            except Exception:
+                continue
 
     sys.excepthook = global_excepthook
 

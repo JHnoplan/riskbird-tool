@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 import block_guard
+import runtime_paths
 
 try:
     import websocket
@@ -103,9 +104,10 @@ class AiQiChaCrawlerV2:
         else:
             self.signals = None
         
-        # Cookie 持久化
-        self._data_dir = Path(__file__).parent / "riskbird_data"
-        self._data_dir.mkdir(exist_ok=True)
+        # Cookie 的落点：绝不在应用包内部（口径见 runtime_paths.py，与风鸟同一份实现）。
+        # 旧写法 Path(__file__).parent / "riskbird_data" + 裸 mkdir 在 Mac 转置包上是
+        # OSError [Errno 30]（启动即崩），在 Windows onefile 上是退出即删（每次重新登录）。
+        self._data_dir = runtime_paths.stable_data_dir()
         self._cookie_file = self._data_dir / "aiqicha_cookies.json"
         
         self.delay_between = 0.5
@@ -701,18 +703,24 @@ class AiQiChaCrawlerV2:
         self._navigate(ws_url, self.BASE_URL)
         time.sleep(5)
     
-    def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = 5,
-                      ready=None, heal=None, heal_every: int = 30) -> bool:
+    def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = None,
+                      ready=None, heal=None, heal_every: int = None, revive=None) -> bool:
         """被拦截/被限流时原地等恢复，不推进名单、不写入空记录
 
+        interval/heal_every 允许由通道侧按实例属性设定（三平台并行时统一 15 秒只读
+        轮询、60 秒才试一次自愈；单平台跑仍用 5/30 的老节奏），不传就用类默认值。
         ready 传能力探针时，“验证页没了”不再算恢复，必须实测能拿到数据才放行；
-        heal 默认给上 _heal_block，验证页挂在另一个标签时不至于死等到超时。
+        heal 只做不打断人工的动作（换回已验证的标签），验证页还挂着时绝不刷新；
+        revive 才允许导航/重刷，且只在签名消失后拿不到数据时才发生。
         """
         ok = block_guard.wait_unblock(
             reason, self._log, self._emit_blocked,
             lambda: self._stop_requested, self._detect_block,
-            max_wait=max_wait, interval=interval,
-            ready=ready, heal=heal or self._heal_block, heal_every=heal_every,
+            max_wait=max_wait,
+            interval=int(interval or getattr(self, "block_probe_interval", 5) or 5),
+            ready=ready, heal=heal or self._heal_block,
+            heal_every=int(heal_every or getattr(self, "block_heal_every", 30) or 30),
+            revive=revive if revive is not None else self._revive_after_block,
         )
         if ok:
             self._emit_cleared(reason)
@@ -772,17 +780,20 @@ class AiQiChaCrawlerV2:
                 pass
 
     def _heal_block(self) -> bool:
-        """卡在验证页时的自愈，返回是否做了动作（调用方会再判一次拦截）。
+        """验证页**还挂在屏幕上**时的自愈：只许做不打断人工的动作。
 
-        过验证码最常见的两种“假死”：
-        ① 平台另开了一个标签做验证，用户在那个标签里验过了，但本会话的标签
-          还停在 wappass 验证页上——只看本标签就会一直判拦截，直到 30 分钟超时；
-        ② 本标签已经飘到验证页/空白页，而验证已写进全局 Cookie，导回首页就能直接用。
+        只做一件事：① 双标签并行时，共享浏览器里若有另一个没被拦的爱企查标签，
+        把会话切过去（用户常常是在另一个标签里过的验证，本标签一直判拦截会死等到超时）。
+
+        历史上这里还带 ②「地址不在爱企查就把标签导回首页」和 ③「页面没挂载就整页重刷」，
+        2026-11-11 用户实机反馈：百度验证页的地址本来就是 wappass.baidu.com（不在爱企查
+        域名里），于是每 30 秒把用户正拖到一半的滑块刷回首页、挑战作废重来，人工永远过
+        不完。这两条已挪到 _revive_after_block —— 那是「人点完了但页面是死页」的处置，
+        只在验证签名消失之后才允许发生。
         """
         ws = self._get_ws_url()
         if not ws:
             return False
-        # ① 双标签并行时，共享浏览器里若有另一个没被拦的爱企查标签，把会话切过去
         if self.pin_tab_id:
             for t in (self._get_tabs() or []):
                 if t.get("type") != "page" or t.get("id") == self.pin_tab_id:
@@ -796,17 +807,36 @@ class AiQiChaCrawlerV2:
                 self.pin_tab_id = t.get("id")
                 self._log(f"  改用已恢复的爱企查标签 {str(self.pin_tab_id)[:8]}")
                 return True
-        # ② 本标签不在爱企查域名上（停在验证页/空白页）：导回首页
+        return False
+
+    def _revive_after_block(self) -> bool:
+        """验证签名已消失、却仍拿不到数据时的自愈（会导航/重刷，故只能在人工过完后调用）。
+
+        两种“假死”：
+        ② 本标签飘到空白页/回跳页：导回首页（此时已经没有验证页可被打断）；
+        ③ 地址在爱企查里、验证页也没了，但页面其实是死页（组件没挂载/停在验证回跳页）：
+           这正是“手工搜能进详情、脚本却什么都抽不到”的样子，整页重刷才能拿到新 DOM。
+        """
+        # 严格只认自己那个独占标签：pin 丢失时 _get_ws_url() 会兜底到 tabs[0]，而共享
+        # Chrome 里 tabs[0] 通常是企知道/风鸟正在用的页面——把它导航回爱企查首页就是
+        # 串台（2026-11-11 三路并行后最贵的一类事故：一路过验证反倒打断另一路采集）。
+        # 标签没了的情况交给 search_company 前置的认领逻辑重建，这里一律不动页面。
+        ws = None
+        if self.pin_tab_id:
+            ws = next((t.get("webSocketDebuggerUrl") for t in (self._get_tabs() or [])
+                       if t.get("id") == self.pin_tab_id), None)
+        if not ws:
+            return False
         try:
             cur = str(self._execute_js(ws, "(function(){return location.href;})()") or "")
         except Exception:
             cur = ""
         if "aiqicha.baidu.com" not in cur:
+            if self._detect_block(ws):
+                return False        # 还在验证页上：不碰它，让人工过完
             self._navigate_to_homepage(ws)
             time.sleep(4)
             return True
-        # ③ 地址在爱企查里、验证页也没了，但页面其实是个死页（组件没挂载/停在验证回跳页）：
-        #    这正是“手工搜能进详情、脚本却什么都抽不到”的样子，整页重刷一次才能拿到新 DOM
         if not self._page_hydrated(ws):
             self._log("  页面已不可用（组件未挂载/停在验证回跳页），整页重刷…")
             self._soft_reset_tab(ws)

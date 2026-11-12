@@ -70,10 +70,11 @@ for kv in "${IDS[@]}"; do
   curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "/tmp/b2b_dl/$key.zip" \
     "$API/actions/artifacts/$AID/zip"
   mkdir -p "/tmp/b2b_dl/$key" && unzip -oq "/tmp/b2b_dl/$key.zip" -d "/tmp/b2b_dl/$key"
-  # Actions 制品本身是一个 zip，里面装的才是 workflow 用 ditto 打的真实产物包（Mac 侧
-  # 就是 B2bCollectTool_Mac_arm64.zip，.app 在这个内层 zip 里）。只解一层时 find 到的
-  # 永远只有那个内层 zip，.app 根本不存在 → 校验报「没找到 .app，无法校验」并按坏包退出：
-  # 看上去像产物出了问题，其实是校验器自己少解一层（本轮实测踩过，云打包明明 success）。
+  # 制品是「zip 里再套一层真实产物包」，两个平台都要解到内层才能验：
+  #   · Mac：外层 Actions zip 里是 ditto 打的 B2bCollectTool_Mac_arm64.zip，.app 在里面；
+  #   · Windows：外层 Actions zip 里是 B2bCollectToolSetup.exe（安装包）+
+  #     B2bCollectTool_Win_portable.zip（绿色版），**布局判据在绿色版那个 zip 里**，
+  #     所以解到内层、把 B2bCollectTool/ 归位成 dist/B2bCollectTool 再交给校验脚本。
   # 解不开必须当场停：静默跳过校验等于把「随包凭证」这道门拆了，而它正是外部机器全员
   # 精简版那次事故的守门人。
   if [ "$key" = "mac" ]; then
@@ -82,6 +83,13 @@ for kv in "${IDS[@]}"; do
     ditto -x -k "$INNER" "/tmp/b2b_dl/$key/unpacked" \
       || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; exit 6; }
     echo "[$key] 已解开内层：$(basename "$INNER") → $(find "/tmp/b2b_dl/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
+  else
+    INNER=$(find "/tmp/b2b_dl/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
+    [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有 B2bCollectTool_Win_portable.zip（onedir 交付的两个产物少了一个，先修 workflow 再谈交付）"; exit 6; }
+    mkdir -p "/tmp/b2b_dl/$key/root/dist"
+    unzip -oq "$INNER" -d "/tmp/b2b_dl/$key/root/dist" \
+      || { echo "[$key] ❌ 内层绿色版 zip 解不开：$INNER"; exit 6; }
+    echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "/tmp/b2b_dl/$key/root/dist" | tr '\n' ' ')"
   fi
   echo "[$key] artifact 内容：$(find /tmp/b2b_dl/$key -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
 done
@@ -95,28 +103,54 @@ done
 #      真的读得出两把非空密钥（文件在但是空的，症状和没注入一模一样）。
 #    Mac 产物是 arm64，本机是 Intel，跑不了 —— 所以这边只做结构校验，运行期校验
 #    由 CI 的 --acl-doctor 产物门禁负责（它跑在 arm64 runner 上，形态才对得上）。
+# ── 随包凭证与产物布局校验 ──
+#    为什么不能用「在 exe 字节里 grep config.json」：我们自己的源码里就写着这个
+#    字符串，它必然存在，判据永远绿——等于没有判据。必须读**归档结构**，并且
+#    两个平台读的是同一份判据（.github/scripts/package_win_artifacts.py）：
+#    · Windows onedir：直接按文件查 dist/B2bCollectTool/{exe, _internal/…}，
+#      判据本体就是 CI 装配交付物时跑的同一个函数——本机与 CI 各写一套迟早对不上；
+#      还要真读出两把非空 OSS 密钥（文件在但内容空，症状和没注入一模一样）；
+#    · Mac onedir：数据项在 Contents/Frameworks 还是 Contents/Resources 由 PyInstaller
+#      大版本决定（本机 6.x 实测两处都有），所以两处都认，命中哪处就用哪处判密钥。
+#    Mac 产物是 arm64，本机是 Intel，跑不了 —— 所以这边只做结构校验，运行期校验
+#    由 CI 的 --acl-doctor 产物门禁负责（它跑在 arm64 runner 上，形态才对得上）。
 check_win() {
-  [ -n "$1" ] || { echo "[win] ❌ 没找到 B2bCollectTool.exe，无法校验"; return 1; }
-  .venv/bin/python - "$1" <<'PYEOF'
-import sys
-from PyInstaller.archive import readers as R
-try:
-    arc = R.CArchiveReader(sys.argv[1])
-    # --add-data 的条目在 CArchive 的 TOC 里按**目标相对路径**登记（onedir 落成文件、
-    # onefile 解到 _MEI 临时目录），所以判据是「有一张名为 config.json 的表项」。
-    has_cfg = "config.json" in set(arc.toc)
-    mods = set(arc.open_embedded_archive("PYZ.pyz").toc)
-except Exception as e:
-    print(f"[win] ❌ 归档解析失败：{type(e).__name__}: {e}")
+  local root=$1 setup=$2
+  [ -n "$root" ] || { echo "[win] ❌ 没解开绿色版 zip，无法校验产物布局"; return 1; }
+  if [ -z "$setup" ] || [ ! -f "$setup" ]; then
+    echo "[win] ❌ 制品里没有 B2bCollectToolSetup.exe（安装包是主交付物，缺它等于没交付）"
+    return 1
+  fi
+  .venv/bin/python - "$root" <<'PYEOF'
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location(
+    "package_win_artifacts", ".github/scripts/package_win_artifacts.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)                    # 判据与 CI 共用一份，不在这抄第二份
+problems = []
+mod.check_layout(Path(sys.argv[1]), problems)
+internal = Path(sys.argv[1]) / "dist" / mod.APP_DIR_NAME / "_internal"
+cfg = internal / "config.json"
+if cfg.is_file():
+    try:
+        d = json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception as e:
+        problems.append(f"config.json 读不出来：{type(e).__name__}")
+        d = {}
+    keys = ("oss_access_key_id", "oss_access_key_secret")
+    missing = [k for k in keys if not str(d.get(k) or "").strip()]
+    if missing:
+        problems.append(f"随包凭证不全，缺 {'、'.join(missing)}（外部机器会一律精简版）")
+elif not problems:
+    problems.append("_internal/config.json 不在位")
+if problems:
+    print("[win] ❌ 产物布局 / 随包凭证不合格：")
+    for p in problems:
+        print("   · " + p)
     sys.exit(1)
-need = [m for m in ("tool_config", "access_guard", "oss_pool_client", "edition") if m not in mods]
-ok = has_cfg and not need
-print(f"[win] {'✅' if ok else '❌'} 随包 config.json={'在位' if has_cfg else '缺失'}"
-      f"  缺失模块={need or '无'}")
-if not ok:
-    print("   · config.json 缺失 → 改 workflow 的 --add-data；模块缺失 → 改 --hidden-import。"
-          " 这两项任一缺失，外部机器都会读不到权限服务凭证（全员精简版），本机却一切正常。")
-sys.exit(0 if ok else 1)
+print("[win] ✅ onedir 布局齐全（exe + _internal + 采集器 + 凭证），OSS 两把密钥齐")
+sys.exit(0)
 PYEOF
 }
 check_mac() {
@@ -126,9 +160,14 @@ check_mac() {
 import json, sys
 from pathlib import Path
 app = Path(sys.argv[1])
-cfg = app / "Contents" / "Resources" / "config.json"
+# PyInstaller 6.x 把 --add-data 落在 Contents/Frameworks，旧版与个别参数落在
+# Contents/Resources（本机 6.22 实测两处都有同一份 config.json）。写死一处就会
+# 在升级 PyInstaller 那天报「随包凭证缺失」——产物明明是好的，报的却是校验器的毛病。
+cfg = next((p for p in (app / "Contents" / "Frameworks" / "config.json",
+                        app / "Contents" / "Resources" / "config.json") if p.is_file()),
+           app / "Contents" / "Resources" / "config.json")
 ok = cfg.is_file()
-detail = "config.json 不在 Resources 下"
+detail = f"config.json 不在 Frameworks/Resources 下（找的是 {cfg}）"
 if ok:
     try:
         d = json.loads(cfg.read_text(encoding="utf-8"))
@@ -141,6 +180,14 @@ if ok:
         ok = len(have) == 2
         detail = (f"OSS 两把密钥齐（deepseek={'有' if str(d.get('deepseek_api_key') or '').strip() else '无'}）"
                   if ok else f"密钥不全，只读到 {have or '无'}")
+    # 本轮 Mac 实机崩在「包内只读还要 mkdir」，配套修好的口径文件必须真的进包：
+    # 少它就是开机即崩，与「少一个平台」同属静默交付缺陷，只能在这里拦住。
+    rp = cfg.parent / "riskbird_build" / "runtime_paths.py"
+    if not rp.is_file():
+        ok = False
+        detail += "；但 riskbird_build/runtime_paths.py 没进包（会开机即崩）"
+    else:
+        detail += "，runtime_paths.py 在包内"
 # 模块收没收（tool_config 这类）不在这里查：onedir 的模块藏在归档里，按文件名找
 # 是靠猜布局。这一层由 CI 里跑在 arm64 runner 上的 --acl-doctor 产物门禁负责，
 # 它跑的是真产物，判据比任何结构猜测都硬。
@@ -150,13 +197,20 @@ PYEOF
 }
 
 FAIL=0
-WIN_EXE=$(find /tmp/b2b_dl/win -maxdepth 3 -name "B2bCollectTool.exe" -type f | head -1)
+WIN_ROOT="/tmp/b2b_dl/win/root"
+WIN_SETUP=$(find /tmp/b2b_dl/win -maxdepth 2 -name "B2bCollectToolSetup.exe" -type f | head -1)
 MAC_APP=$(find /tmp/b2b_dl/mac -maxdepth 4 -name "B2bCollectTool.app" -type d | head -1)
-check_win "$WIN_EXE" || FAIL=1
+check_win "$WIN_ROOT" "$WIN_SETUP" || FAIL=1
 check_mac "$MAC_APP" || FAIL=1
-[ "$FAIL" = 0 ] || { echo "❌ 随包凭证校验未通过，本地 dist 保持原样（不覆盖成坏包）"; exit 5; }
+[ "$FAIL" = 0 ] || { echo "❌ 产物校验未通过，本地 dist 保持原样（不覆盖成坏包）"; exit 5; }
 
-find /tmp/b2b_dl/win -name "B2bCollectTool.exe" -exec cp -f {} b2bcollect_build/dist/B2bCollectTool.exe \;
+# 交付物落到本地 dist：安装包与绿色版是给用户的两份产物，使用说明随绿色版 zip 一起。
+mkdir -p b2bcollect_build/dist
+cp -f "$WIN_SETUP" b2bcollect_build/dist/B2bCollectToolSetup.exe
+cp -f "$(find /tmp/b2b_dl/win -maxdepth 2 -name B2bCollectTool_Win_portable.zip | head -1)" \
+  b2bcollect_build/dist/B2bCollectTool_Win_portable.zip
 find /tmp/b2b_dl/mac -name "B2bCollectTool_Mac_arm64.zip" -exec cp -f {} b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip \;
-ls -l b2bcollect_build/dist/B2bCollectTool.exe b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip
+ls -l b2bcollect_build/dist/B2bCollectToolSetup.exe \
+      b2bcollect_build/dist/B2bCollectTool_Win_portable.zip \
+      b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip
 echo DONE

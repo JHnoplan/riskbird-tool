@@ -12,9 +12,11 @@
   · 质量过滤：对 API 输出做去重、过滤纯服务词、长度校验，防止低质量结果
 """
 import os
+import sys
 import json
 import time
 import hashlib
+import tempfile
 import requests
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -32,6 +34,39 @@ CONFIG_DIR = Path(__file__).parent
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 CACHE_NAME = "deepseek_cache.json"
+# 用户目录里那一级的容器名：与 tool_config.USER_CONFIG_DIR_NAME、
+# riskbird_build/runtime_paths.USER_DIR_NAME 同一个家（远程排障只需问一个目录）。
+# 这里写 literals 而不是 import 那两个模块，因为下面这些函数恰恰只在「那两个模块
+# 没加载成功」时才会被走到——报信的路径不能依赖正在被报信的模块。
+_USER_DIR_NAME = ".b2bcollect"
+
+
+def fallback_dir() -> Path:
+    """tool_config 没能加载时的落点：**打包态绝不往包内写**。
+
+    本轮 Mac 崩溃（``OSError: [Errno 30] Read-only file system``）与 Windows 的
+    「Cookie 每次归零」是同一个根因的两面，而模块目录在打包态正好就是包内目录
+    （onedir 的 ``_internal``、onefile 的 ``%TEMP%\\_MEI``、转置 .app 的只读卷）。
+    旧写法把「退路」直接写成 ``CONFIG_DIR``，等于在最不该写的位置上写：
+      · 只读卷上：抛 OSError，缓存/密钥保存这件事变成一次崩溃；
+      · 临时解压目录上：写成功但下次开机没了，界面却提示「已保存」。
+    所以退路按**形态**选，不按「写探针会不会碰巧成功」选：开发态保持模块目录
+    （历史缓存不搬家），打包态退用户目录，用户目录也不行就退系统临时目录——
+    最后一级的目标只剩「不崩、不骗人」，它确实会在重启后丢，但那是无路可走时
+    唯一诚实的形态，且界面上的保存结果由返回值如实播报。
+    """
+    if not getattr(sys, "frozen", False):
+        return CONFIG_DIR
+    for cand in (Path.home() / _USER_DIR_NAME, Path(tempfile.gettempdir()) / _USER_DIR_NAME):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
 
 
 def cache_file() -> Path:
@@ -45,7 +80,7 @@ def cache_file() -> Path:
         import tool_config
         return tool_config.state_dir() / CACHE_NAME
     except Exception:
-        return CONFIG_DIR / CACHE_NAME
+        return fallback_dir() / CACHE_NAME
 
 
 # 兼容旧引用：模块属性仍是路径常量语义（开发态与旧值完全一致）
@@ -63,15 +98,22 @@ def _env_first(*names: str) -> str:
 
 
 def _module_dir_key() -> str:
-    """退路：直接读模块目录 config.json（只在解析链本身不可用时走）。"""
-    try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            key = cfg.get("deepseek_api_key")
+    """退路：直接读磁盘上的 config.json（只在解析链本身不可用时走）。
+
+    读的地方必须比写的地方**宽**：随包那份（只读、密钥的出厂默认值）与退路目录
+    里那份（用户自己在界面上存的）都要看到。旧写法只看模块目录，于是打包态一旦
+    走到退路，用户存过的密钥永远读不出来——界面上「已保存」，下次开机又变回未配置。
+    """
+    for cand in (fallback_dir() / "config.json", CONFIG_FILE):
+        try:
+            if not cand.is_file():
+                continue
+            cfg = json.loads(cand.read_text(encoding="utf-8"))
+            key = cfg.get("deepseek_api_key") if isinstance(cfg, dict) else None
             if key:
                 return str(key).strip()
-    except Exception:
-        pass
+        except Exception:
+            continue
     return ""
 
 
@@ -121,13 +163,20 @@ def save_api_key(key: str) -> bool:
         except Exception:
             pass
         cfg = {}
-        if CONFIG_FILE.exists():
+        target = fallback_dir() / "config.json"
+        for cand in (target, CONFIG_FILE):
             try:
-                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if cand.is_file():
+                    obj = json.loads(cand.read_text(encoding="utf-8"))
+                    if isinstance(obj, dict):
+                        cfg = obj
+                        if cand == target:
+                            break     # 已经在退路目录里了：在它上面改，别再合并随包那份
             except Exception:
-                cfg = {}
+                continue
         cfg["deepseek_api_key"] = key
-        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         return True
     except Exception:
         return False

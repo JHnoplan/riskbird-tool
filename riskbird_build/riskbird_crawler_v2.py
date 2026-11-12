@@ -32,6 +32,7 @@ except ImportError:
 
 import block_guard
 import chrome_driver
+import runtime_paths
 
 
 # ── Qt 信号类 ──
@@ -187,9 +188,12 @@ class RiskBirdCrawlerV2:
         else:
             self.signals = None
 
-        # Cookie 持久化
-        self._data_dir = Path(__file__).parent / "riskbird_data"
-        self._data_dir.mkdir(exist_ok=True)
+        # Cookie / 30 天列表缓存的落点：绝不在应用包内部（口径见 runtime_paths.py）。
+        # 旧写法是 Path(__file__).parent / "riskbird_data" 加裸 mkdir——Mac 上被
+        # Gatekeeper 转置的 .app 整棵树只读，那句 mkdir 直接 OSError [Errno 30] 把
+        # 整个工具带走（用户侧就是「双击没反应」）；Windows onefile 下它指向退出即删
+        # 的 _MEI 临时目录，Cookie 与缓存每次归零，等于每次重新登录、每天白烧额度。
+        self._data_dir = runtime_paths.stable_data_dir()
         self._cookie_file = self._data_dir / "cookies.json"
         self._cache_file = self._data_dir / "风鸟列表缓存.json"
 

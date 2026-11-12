@@ -40,6 +40,19 @@ except ImportError:  # 兼容从上级目录运行
     sys.path.insert(0, str(Path(__file__).parent))
     import customer_library_cleaner as _cleaner
 
+# 数据落点口径：全工具只许有一份实现，就是 riskbird_build/runtime_paths.py。
+# 本文件以前自己写了一版候选链，形状与本轮 Mac 崩溃同族，而且缺了最后一级退路——
+# 「包旁 + 用户目录都写不进」的机器上把不可写的目录原样 return，调用方一句 mkdir
+# 就 OSError 崩在启动那一下（见 runtime_paths.py 与离线回归 test_data_dir_offline.py
+# 第 8 节）。在这里补路径而不是再抄一份实现：独立运行本工具时 riskbird_build 不在
+# sys.path 上，b2bcollect 打包态与源码态都在。用 append 不 insert，理由与
+# site_adapters 一致——本目录同名模块永远优先，别把外部目录顶到前面来遮蔽清洗模块。
+try:
+    import runtime_paths as _paths
+except ImportError:
+    sys.path.append(str(Path(__file__).resolve().parent.parent / "riskbird_build"))
+    import runtime_paths as _paths
+
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
     HAS_PYQT = True
@@ -285,31 +298,19 @@ class Ali1688Crawler:
     # ── Chrome 生命周期 ────────────────────────────────────────
     @staticmethod
     def _stable_data_dir():
-        """种子库/数据目录必须跨运行持久，且要可写。
-        PyInstaller onefile 下 __file__ 指向每次启动都变、退出即删的 _MEIxxxx 临时目录，
-        用它当数据目录会让 seen_store.json 既写不进也活不到下一轮（跨运行去重彻底失效）。
-        故：打包运行时用「exe 同级目录」，开发时用模块目录；都不可写再回退用户主目录。
-        Mac .app 双击启动时 exe 在 Contents/MacOS 里（Gatekeeper 转置下还是只读的），
-        改放 .app 旁边的 b2bcollect_data，与本工具其它持久数据同处一个可见目录。"""
-        if getattr(sys, "frozen", False):
-            exe_dir = Path(sys.executable).resolve().parent
-            if (sys.platform == "darwin"
-                    and exe_dir.parent.parent.name.endswith(".app")):
-                primary = exe_dir.parent.parent.parent / "b2bcollect_data" / "ali1688_data"
-            else:
-                primary = exe_dir / "ali1688_data"
-        else:
-            primary = Path(__file__).resolve().parent / "ali1688_data"
-        for d in (primary, Path.home() / ".ali1688" / "ali1688_data"):
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-                probe = d / ".write_test"
-                probe.write_text("1", encoding="utf-8")
-                probe.unlink()
-                return d
-            except Exception:
-                continue
-        return primary
+        """种子库/数据目录的落点：口径全交给 runtime_paths，本函数只是一层旧名字的门面。
+
+        PyInstaller onefile 下 ``__file__`` 指向每次启动都变、退出即删的 ``_MEIxxxx``，
+        拿它当数据目录会让 ``seen_store.json`` 既写不进也活不到下一轮（跨运行去重彻底
+        失效）；Mac .app 被 Gatekeeper 转置后整卷只读，包内 mkdir 直接 OSError 30。这两
+        件事的解法都不是在本文件里再写一版候选链，而是问一处口径：包旁 / exe 同级 →
+        ``~/.b2bcollect/ali1688_data`` → 系统临时目录，逐级写探针实测，永不返回一个写不
+        进去的目录。容器名只认 ``.b2bcollect`` 一个（多一个 ``~/.ali1688`` 就等于远程排障
+        时要多问一句「你那个是哪年的」）。``dev_dir`` 是本目录：开发机上跑了几年的种子库
+        历史就在 ``ali1688_build/ali1688_data``，口径不许替它搬家。
+        """
+        return _paths.stable_data_dir("ali1688_data",
+                                      dev_dir=str(Path(__file__).resolve().parent))
 
     def _profile_path(self):
         if sys.platform == "win32":

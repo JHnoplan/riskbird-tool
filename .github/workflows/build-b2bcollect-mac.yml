@@ -16,6 +16,13 @@ on:
       - 'b2bcollect_build/**'
       - '.github/workflows/build-b2bcollect-mac.yml'
       - 'enf_clean/**'
+      # 跨目录引用的采集器源码也必须触发重打包（2026-11-12 实机的第二类「静默失效」）：
+      # site_adapters 运行时要从包里 import ali1688_build / riskbird_build 的 .py，
+      # 这两个目录改了却不重打包，发出去的产物就永远是旧的那一份——症状不是报错，
+      # 而是「代码明明修好了，用户那边还是坏的」，排查会一路查到用户机器上去。
+      # 由构建前硬门 check_packaging_manifest.py 反查这两个目录确实列在触发 paths 里。
+      - 'ali1688_build/**'
+      - 'riskbird_build/**'
   workflow_dispatch:
 
 jobs:
@@ -73,7 +80,7 @@ jobs:
         cd b2bcollect_build
         # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
         [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
-        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json:." --add-data "mk_phone_font.json:." --add-data "../enf_clean:enf_clean" --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../riskbird_build/riskbird_crawler_v2.py:riskbird_build" --add-data "../riskbird_build/aiqicha_crawler_v2.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json:." --add-data "mk_phone_font.json:." --add-data "../enf_clean:enf_clean" --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" --add-data "../riskbird_build/qizhidao_crawler.py:riskbird_build" --add-data "../riskbird_build/block_guard.py:riskbird_build" --add-data "../riskbird_build/chrome_driver.py:riskbird_build" --add-data "../riskbird_build/riskbird_crawler_v2.py:riskbird_build" --add-data "../riskbird_build/aiqicha_crawler_v2.py:riskbird_build" --add-data "../riskbird_build/runtime_paths.py:riskbird_build" --add-data "../mac_driver/chromedriver:." b2bcollect_gui.py
 
     - name: Artifact doctor gate (B2bCollectTool.app --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 .app 能不能连上权限服务」，放在打成
@@ -85,10 +92,22 @@ jobs:
       timeout-minutes: 10
       shell: bash
       run: |
+        # Actions 的 bash 步默认带 -e：自检不通会在拿到 rc 之前就把整步带走，下面那句
+        # ::error:: 注解永远打不出来——门禁还是拦住了，但日志里只有一句 exit code 1，
+        # 远程排障的人分不清是「产物坏了」还是「这一步自己坏了」。所以显式收住退出码。
+        set +e
         b2bcollect_build/dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool --acl-doctor
         rc=$?
-        log=b2bcollect_build/dist/b2bcollect_state/acl_doctor.txt
-        [ -f "$log" ] && cat "$log" || true
+        set -e
+        # 报告文件按「刚被写过」查找，不写死 dist/b2bcollect_state：落点由产物自己的
+        # state_dir 候选链决定，写死的路径一变就静默 cat 不到东西（Windows 那一步同理）。
+        log=$(find b2bcollect_build/dist -name acl_doctor.txt -mmin -10 2>/dev/null | head -1 || true)
+        if [ -n "$log" ]; then
+          echo "· 自检报告原文：$log"
+          cat "$log"
+        else
+          echo "· （没找到本次的 acl_doctor.txt，以上面的标准输出为准）"
+        fi
         if [ "$rc" -ne 0 ]; then
           echo "::error::产物自检未通过（退出码 $rc）：这个包发出去只会是精简版，禁止上传"
         fi

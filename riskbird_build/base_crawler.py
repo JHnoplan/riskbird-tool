@@ -9,6 +9,7 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 import block_guard
+import runtime_paths          # 本目录唯一的数据落点口径（见 BaseCrawler.__init__）
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -59,9 +60,14 @@ class BaseCrawler(ABC):
         self.delay_between = 0.5
         self.max_retries = 2
         
-        # 数据目录
-        self._data_dir = Path(__file__).parent / "riskbird_data"
-        self._data_dir.mkdir(exist_ok=True)
+        # 数据目录：落点只许问 runtime_paths 这一处（口径与风鸟/爱企查/企知道同一份）。
+        # 旧写法是 Path(__file__).parent / "riskbird_data" 加裸 mkdir——那句话就是
+        # 2026-11-12 Mac「打开工具就报错」的崩溃现场：被 Gatekeeper 转置的 .app 整卷
+        # 只读，包内 mkdir 抛 OSError [Errno 30]。本基类目前没有子类在用，但保留旧写法
+        # 等于在这棵树里留着一颗同族地雷：谁哪天拿它派生一个新采集器，症状会原样复现，
+        # 而排查的人会先去看那个新采集器，不会想到基类。（stable_data_dir 永不抛异常，
+        # 也绝不会把目录建在应用包里。）
+        self._data_dir = runtime_paths.stable_data_dir()
         self._cookie_file = self._data_dir / f"{self.PLATFORM_NAME}_cookies.json"
     
     def _log(self, msg: str):

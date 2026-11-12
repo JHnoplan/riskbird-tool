@@ -7,7 +7,8 @@
 剩下 2 个也推荐"电话"。
 
 实现：
-- 历史映射持久化到 mapping_history.json（{表头名: [(字段, 次数), ...]}）
+- 历史映射持久化到 mapping_history.json（{表头名: [(字段, 次数), ...]}），落在
+  **持久状态目录**里（口径见 tool_config.state_file，与审计日志同一件事同一份实现）
 - recommend(headers) 返回 {列下标: 字段名}，按历史次数降序推荐
 - update(headers, mapping) 累加次数，新字段初始为 1
 """
@@ -15,32 +16,80 @@ import json
 import os
 from typing import Dict, List, Optional, Tuple
 
+HISTORY_FILE_NAME = "mapping_history.json"
+
+
+def _default_cache_file() -> str:
+    """历史映射的落点：只问 tool_config.state_file（运行期数据的唯一口径）。
+
+    旧默认值是相对当前工作目录的裸文件名，而打包态的 CWD 由「谁把进程拉起来」决定：
+    访达双击 .app 时是 ``/``（Mac 只读转置副本下写不进去），重启链路里是 exe 同级
+    （Program Files 同样写不进去），历史上 Windows onefile 下还会落进退出即删的
+    _MEI 目录。三种结果都不是「这个用户的历史映射」，而是**永远学不到东西却一句错
+    也不报**——列映射推荐一直停在首次使用的空状态，用户只会觉得这功能没用。
+    """
+    try:
+        import tool_config as _tc
+        try:
+            return str(_tc.state_file(HISTORY_FILE_NAME))
+        except Exception:
+            return str(_tc.user_state_dir() / HISTORY_FILE_NAME)
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".b2bcollect",
+                            "b2bcollect_state", HISTORY_FILE_NAME)
+
 
 class MappingRecommender:
     """列映射智能推荐器（基于历史映射记录）。"""
     
-    def __init__(self, cache_file: str = "mapping_history.json"):
-        self.cache_file = cache_file
+    def __init__(self, cache_file: Optional[str] = None):
+        # 显式传参仍然优先（离线测试与特殊落点要用），默认值改为「问口径」
+        self.cache_file = str(cache_file) if cache_file else _default_cache_file()
         self.history = self._load_history()
     
     def _load_history(self) -> Dict[str, List[Tuple[str, int]]]:
-        """加载历史映射：{表头名: [(字段名, 次数), ...]}"""
-        if os.path.exists(self.cache_file):
-            try:
-                data = json.load(open(self.cache_file, encoding="utf-8"))
-                # 兼容旧格式（如果存在）
-                return {k: [(f, c) for f, c in v] for k, v in data.items()}
-            except (json.JSONDecodeError, ValueError):
+        """加载历史映射：{表头名: [(字段名, 次数), ...]}
+
+        读不出来一律退化成「没有历史」，绝不往外抛：这个对象是在「导入数据池」对话框
+        构造时创建的（``MappingRecommender()``），让它把界面带崩就是本轮 Mac 崩溃的
+        同一个形状——一份半截的、被别的版本写歪的缓存文件，代价不该是整个工具打不开。
+        """
+        if not os.path.exists(self.cache_file):
+            return {}
+        try:
+            with open(self.cache_file, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
                 return {}
-        return {}
+            out: Dict[str, List[Tuple[str, int]]] = {}
+            for header, items in data.items():
+                pairs = []
+                for item in (items or []):
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    try:
+                        field, count = str(item[0]), int(item[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if field:
+                        pairs.append((field, max(0, count)))
+                if pairs:
+                    out[str(header)] = pairs
+            return out
+        except (OSError, ValueError, TypeError) as e:
+            print(f"⚠ 读取映射历史失败，本次按没有历史处理: {e}")
+            return {}
     
     def _save_history(self):
-        """保存历史映射到磁盘"""
+        """保存历史映射到磁盘：写不进去只报一句，绝不带着导入动作一起崩。"""
         try:
-            json.dump(self.history, open(self.cache_file, "w", encoding="utf-8"),
-                     ensure_ascii=False, indent=2)
-        except OSError as e:
-            print(f"⚠ 保存映射历史失败: {e}")
+            parent = os.path.dirname(self.cache_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.history, f, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"⚠ 保存映射历史失败: {e}（落点 {self.cache_file}）")
     
     def recommend(self, headers: List[str]) -> Dict[int, str]:
         """根据历史推荐映射：{列下标: 字段名}

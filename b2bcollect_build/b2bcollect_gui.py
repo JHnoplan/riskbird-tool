@@ -36,15 +36,110 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QGridLayout, QRadioButton, QScrollArea, QStyle, QStyleOptionButton,
 )
 
-from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
-                              LIST_CHANNEL_SLUGS, STATS_LABELS, STATUS_ORDER, QZD_SLUG)
-from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
-import customer_library_cleaner as _cleaner
-import keyword_expander as _kwexp
-import province_filter as _pfilter
-# 交付档位（对内 full / 对外精简版）的唯一真源：界面上「哪些入口存在」全部由它投影，
-# 不在几十个按钮上各写一遍 if lite（那样必然漏入口，见 edition.py 模块头）。
-import edition
+# ── 启动失败的唯一收口 ──────────────────────────────────────────────────────
+# 这一组定义必须排在下面那些「本项目自己的模块」之前：导入它们中的任何一个都可能
+# 在打包态当场失败，而那时 main() 还没开始跑，没有 except 兜着，屏幕上只剩一段裸
+# traceback（2026-11-12 Windows 实机那段 base_library.zip 就是用户从黑窗口里逐字抄
+# 出来的）。收口写在前面，才够得到那一类故障。
+
+# 崩溃日志的文件名：界面话术、落盘、使用说明三处说的是同一件事，只许有一份写法
+# （使用说明里那句「桌面上的 B2B采集工具启动错误.log」由离线测试对着这个常量验）。
+FATAL_LOG_NAME = "B2B采集工具启动错误.log"
+
+
+def _fatal_log_dirs():
+    """崩溃日志的候选落点：桌面优先（用户自己就能找到并发出来），其次用户目录。
+
+    这里刻意写字面量 ``.b2bcollect`` 而不是问 tool_config：会走到这一步的包，很可能
+    正是 tool_config 自己没加载上——报信的路径不能依赖那个正在被报信的模块。
+    """
+    return [Path.home() / "Desktop", Path.home() / ".b2bcollect"]
+
+
+def _fatal_log_header() -> str:
+    """崩溃日志的抬头：先写「这段栈是在什么运行形态下产生的」。
+    只有栈没有形态，同一句 ``Read-only file system`` 可能是转置包、可能是没权限的
+    Program Files、也可能是被安全软件拦住的桌面目录——三种成因给的是三个不同的处置。
+    这里说的一律是**本机实测到的路径**，不写「大概是哪种」。永不抛异常：连日志
+    自己都把程序带崩，就等于本次事故再没有留下任何证据。
+    """
+    lines = [f"运行形态：platform={sys.platform} "
+             f"frozen={'是' if getattr(sys, 'frozen', False) else '否'}",
+             f"    可执行文件：{sys.executable}",
+             f"    随包数据目录：{getattr(sys, '_MEIPASS', '（源码态，无此目录）')}"]
+    try:
+        import tool_config as _tc
+        lines.append(f"    转置运行（App Translocation）：{_tc.app_translocated()}")
+        lines.append(f"    持久状态目录：{_tc.state_dir()}")
+    except Exception:
+        pass
+    try:
+        import runtime_paths as _rp
+        lines.append(f"    风鸟/爱企查数据目录：{_rp.stable_data_dir()}")
+    except Exception:
+        pass
+    return "\n".join(lines) + "\n\n"
+
+
+def _fatal_log(exc):
+    """启动即崩时把 traceback 落盘：Finder 双击打开没有终端，错误看不见，
+    日志就是在对方电脑上排查「图标转一下消失」的唯一线索。"""
+    import traceback
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    for d in _fatal_log_dirs():
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / FATAL_LOG_NAME).write_text(
+                _fatal_log_header() + text, encoding="utf-8")
+            break
+        except OSError:
+            continue
+
+
+def _report_fatal_startup(exc) -> None:
+    """把「工具起不来」这件事实说人话，并在用户找得到的地方留下一份日志。
+
+    两种形态共用这一份话术（同一事实只许有一份写法）：
+      ① main() 里建界面失败；
+      ② **导入本项目模块就失败**——它发生在 main() 之前，屏幕上连一个像素都还没有，
+         PyInstaller 只会甩一段裸 traceback，非技术用户既看不懂也发不出来。
+    本函数**永不抛异常**：报告这件事自己再把程序带崩，本次事故就什么证据都没留下。
+    """
+    _fatal_log(exc)
+    try:
+        paths = "\n".join(str(d / FATAL_LOG_NAME) for d in _fatal_log_dirs())
+        body = (f"{type(exc).__name__}: {exc}\n\n"
+                "详细堆栈见这份日志——先看第一个位置，找不到就看第二个：\n" + paths)
+        # 没有可用图形会话时（CI 的 offscreen、无头机器）绝不弹模态框：弹了就等于
+        # 等一次永远不会来的点击，症状从「起不来」变成「卡死」，比原故障更难查。
+        if "offscreen" in str(os.environ.get("QT_QPA_PLATFORM") or "").lower():
+            print(f"❌ 工具启动失败（无图形会话，日志见下）：\n{body}", flush=True)
+        else:
+            QMessageBox.critical(None, "工具启动失败", body)
+    except Exception:
+        pass
+
+
+# 本项目自己的模块。这些名字**不是可选依赖**：少任何一个，界面上的按钮、通道、档位
+# 投影全都无从建立，所以失败时不降级、直接收口退出——但收口之后桌面上会多一份带运行
+# 形态抬头的日志，而不是一段只能靠用户手抄的裸 traceback（打包态的 ``<frozen ...>``
+# 栈帧对用户没有任何信息量，对发包方却有全部信息量）。
+try:
+    from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
+                                  LIST_CHANNEL_SLUGS, STATS_LABELS, STATUS_ORDER, QZD_SLUG)
+    from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
+    import customer_library_cleaner as _cleaner
+    import keyword_expander as _kwexp
+    import province_filter as _pfilter
+    # 交付档位（对内 full / 对外精简版）的唯一真源：界面上「哪些入口存在」全部由它投影，
+    # 不在几十个按钮上各写一遍 if lite（那样必然漏入口，见 edition.py 模块头）。
+    import edition
+except Exception as _bootstrap_exc:               # noqa: BLE001 - 收口后按启动失败退出
+    _report_fatal_startup(_bootstrap_exc)
+    # SystemExit 而不是原样 raise：原样抛出去会让 PyInstaller 再弹一个自带 traceback 的
+    #  fatal error 框，用户面对两个框、其中一个是天书。堆栈已经完整落进上面那份日志，
+    # 退出码非零也照样能被 CI 抓到——证据一样不少，只少一个吓人的框。
+    raise SystemExit(1) from _bootstrap_exc
 
 try:
     import enhanced_cleaner as _enhanced
@@ -1983,6 +2078,10 @@ class MainWindow(QMainWindow):
         # 恰恰是「静默少功能」——不主动出声，用户就会把它当成权限问题一直查错方向。
         # 只在真缺时出声（正常机器上日志里一条也不会多），不骚扰没碰到这个问题的人。
         QTimer.singleShot(0, self._log_channel_health)
+        # 运行形态播报：Mac 的只读转置包（App Translocation）与「刚被重启链路拉起来」
+        # 都属于「界面已经开起来了，但用户该知道眼下是什么状态」，见两个方法本身。
+        QTimer.singleShot(0, self._announce_relaunch)
+        QTimer.singleShot(0, self._warn_read_only_runtime)
         # 窗口最小宽的校准留到首次显示：那时视口宽度才是真的（见 showEvent /
         # _apply_width_floor），构造阶段量出来的是默认尺寸，算出来的闸口是假的。
         self._width_floor_done = False
@@ -2236,8 +2335,25 @@ class MainWindow(QMainWindow):
             return {}
 
     @staticmethod
+    def _lost_channels_kinds(lost: tuple) -> set:
+        """逐路失败的种类（``missing`` / ``broken`` / ``unknown``）。
+
+        判据**不在界面**：这一路到底是「文件没进包」还是「本机加载它时报错」，只有
+        site_adapters 知道（它亲手 import 过那些模块），见 ``channel_failure_kind``。
+        界面以前自己按异常前缀分类，会把 Mac 实机那种「文件明明在包里、只是只读卷写
+        不进去」的 FileNotFoundError 报成「安装包缺文件」——把发包方指到打包清单上去
+        查一个根本不缺的文件。
+        """
+        if not HAS_ADAPTERS:
+            return {"unknown"}
+        try:
+            return set((_adapters.channel_failure_kind(s) or "unknown") for s in lost)
+        except Exception:
+            return {"unknown"}
+
+    @staticmethod
     def _lost_channels_reason(lost: tuple) -> str:
-        """「原因」那一行按**实测到的加载错误**说话，不押宝在某一种猜测上。
+        """「原因」那一行按**实测到的失败种类**说话，不押宝在某一种猜测上。
 
         同一条「② 只剩企知道」背后有三种完全不同的成因：采集器 .py 没进包（补
         --add-data）、随包依赖没进（多半补 --hidden-import）、文件都在但初始化抛异常。
@@ -2245,21 +2361,13 @@ class MainWindow(QMainWindow):
         ——界面话术的信任是一次性资源，错一次，下次真告警用户也不会当回事。
         逐路的错误原文在悬停说明里（_lost_channels_detail），这里只给一句结论。
         """
-        errs = MainWindow._lost_channels_errors()
-        kinds = set()
-        for s in lost:
-            e = str(errs.get(s) or "")
-            if not e:
-                kinds.add("unknown")
-            elif e.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError")):
-                kinds.add("missing")       # 要找的文件不在包里（模块本身或它的依赖）
-            else:
-                kinds.add("broken")        # 文件在，加载/初始化时抛了别的异常
+        kinds = MainWindow._lost_channels_kinds(lost)
         if len(kinds) == 1 and "missing" in kinds:
             return ("原因：安装包缺了它们运行所需的文件（采集器本身或它的依赖没进包，"
                     "不是账号权限/设置问题，重登录、换账号、重装都不会让它回来）")
         if len(kinds) == 1 and "broken" in kinds:
-            return ("原因：本机加载这些采集器时报错了（不是账号权限/设置问题，"
+            return ("原因：文件在包里，但本机加载这些采集器时报错了（多半是磁盘只读、"
+                    "目录不可写或缺运行组件，不是账号权限/设置问题；"
                     "具体错误在悬停说明与产物自检报告里）")
         return ("原因：安装包缺了、或本机加载不出这些采集器（不是账号权限/设置问题，"
                 "具体原因见产物自检 --doctor 报告）")
@@ -3124,6 +3232,8 @@ class MainWindow(QMainWindow):
         """
         if link == "#acl-restart":
             self._acl_prompt_restart()
+        elif link == "#app-relocate":
+            self._offer_app_relocation()
         # 其余未知动作静默忽略：横幅文案由别处拼装，将来加新链接不该在这里炸界面
 
     def _on_blocked(self, reason):
@@ -5344,7 +5454,12 @@ class MainWindow(QMainWindow):
         self.close()          # closeEvent 真退出时才把新进程拉起来
 
     def _relaunch_command(self):
-        """新实例怎么启动：冻结态直接起自身可执行文件，源码态起解释器 + 本脚本。"""
+        """新实例怎么启动：冻结态直接起自身可执行文件，源码态起解释器 + 本脚本。
+
+        打包态这里取的是 ``sys.executable``——onedir 产物里它就是磁盘上那个真实 exe，
+        不再指向任何临时解包目录。（这也是本轮把 Windows 从 onefile 改成 onedir 的
+        原因之一：onefile 下「重启自己」这件事天生要跟 %TEMP% 的回收时机赛跑。）
+        """
         try:
             if getattr(sys, "frozen", False):
                 return [sys.executable]
@@ -5353,28 +5468,205 @@ class MainWindow(QMainWindow):
             return None
 
     def _spawn_relaunch(self):
-        """closeEvent 收尾之后调用：等旧进程把 Chrome/端口/文件句柄释放干净再起新的。
+        """closeEvent 收尾之后调用：拉起新实例，并把「等我退出」这件事交给新实例去做。
 
-        延时是必需的，不是保守：共享 Chrome 只有一个调试端口，两个实例同时抢的结果
-        是新实例启动失败，用户看到的是「重启了一下工具打不开了」。
+        三条改动都对应实机故障，不是风格问题：
+          1. **工作目录不再是包内**（旧写法 ``Path(__file__).parent`` 在打包态就是随包
+             数据目录）：子进程占着那个目录，旧实例退出时自己的临时目录就删不干净，
+             Windows 上 ``base_library.zip`` 报 FileNotFoundError 正是这条链路（图二图三）；
+          2. **不再用 ``cmd /c start ... timeout /t 2`` 猜延时**：改由新实例观测旧 PID
+             真退出（见 :func:`_wait_for_previous_instance`），既不抢 Chrome 端口也不白等；
+          3. **不再走 shell=True**：命令行里有中文路径、空格、8.3 短名（实机日志里就是
+             ``C:\\Users\\ADMINI~1\\...``），过一层 shell 就多一层引号歧义。
         """
         cmd = getattr(self, "_relaunch_pending", None)
         if not cmd:
             return
         self._relaunch_pending = None
         import subprocess
-        cwd = str(Path(__file__).resolve().parent)
+        cmd = list(cmd) + [RELAUNCH_FLAG, str(os.getpid())]
+        note = getattr(self, "_relaunch_note", "")
+        if note:
+            # 重启原因跟着参数走，不落到任何文件里：新实例要说的那句话由「为什么重启」
+            # 决定，而这件事只有这一次启动需要知道，没必要在磁盘上留一份会过期的状态。
+            self._relaunch_note = ""
+            cmd.append(note)
+        kwargs = {"cwd": _relaunch_workdir(), "close_fds": True,
+                  "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                  "stderr": subprocess.DEVNULL}
         try:
             if sys.platform.startswith("win"):
-                args = " ".join(f'"{c}"' for c in cmd)
-                subprocess.Popen(f'start "" /min cmd /c "timeout /t 2 >nul & {args}"',
-                                 shell=True, cwd=cwd)
+                # DETACHED_PROCESS + 新进程组：新实例不跟着旧实例的控制台一起被带走
+                flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+                subprocess.Popen(cmd, creationflags=flags, **kwargs)
             else:
-                import shlex
-                text = "sleep 2; " + " ".join(shlex.quote(c) for c in cmd)
-                subprocess.Popen(["sh", "-c", text], cwd=cwd, start_new_session=True)
+                subprocess.Popen(cmd, start_new_session=True, **kwargs)
         except Exception as e:
-            self._on_log(f"⚠ 自动重启失败（请手动重新打开工具）：{type(e).__name__}")
+            self._on_log(f"⚠ 自动重启失败（请手动重新打开工具）：{type(e).__name__}: {e}")
+
+    def _announce_relaunch(self):
+        """被重启链路拉起来时道一声「已经生效了」：闭环必须合上。
+
+        用户在横幅上点了「重启工具现在生效」，新实例开起来后界面本该多出风鸟/爱企查
+        那几路——但界面不会自己说「这就是我刚才让你重启换来的结果」，于是那一次点击
+        在用户眼里永远悬着（万一没生效呢？）。只播一条日志，不弹横幅：横幅会被
+        后面的告警抢掉，而这条只是确认，不该占用唯一的告警位。
+        """
+        pid = _relaunch_source_pid(sys.argv[1:])
+        if not pid:
+            return
+        if _relaunch_note(sys.argv[1:]) == RELAUNCH_NOTE_MOVED:
+            # 搬家那一次闭环要说的是「隔离解除了没有」，而这件事必须由本进程自己实测，
+            # 不能照抄上一轮那句「权限入口一致了」——两句都指不上对方要确认的东西。
+            bundle, still = "", False
+            if HAS_TOOL_CONFIG:
+                try:
+                    bundle = str(_tool_config.app_bundle_dir() or "")
+                    still = bool(_tool_config.app_translocated())
+                except Exception:
+                    still = False
+            self._on_log(
+                f"↻ 已移进「应用程序」并从新位置打开（上一个实例 PID={pid} 已退出）："
+                f"{bundle or sys.executable}\n"
+                + ("   ⚠ macOS 仍在按只读临时副本运行它：这属于系统层面的异常，"
+                   "请把这份日志和桌面那份启动错误日志一起发给发包方"
+                   if still else "   本次起不再被 macOS 挂到只读临时副本上运行"))
+            return
+        self._on_log(f"↻ 工具已重启（上一个实例 PID={pid} 已退出），"
+                     "权限等级对应的入口现在与界面一致了")
+
+    def _warn_read_only_runtime(self):
+        """Mac 的只读转置包（App Translocation）：把运行形态这件事说给用户听。
+
+        为什么值得单独出声：被 Gatekeeper 隔离过的 .app 双击打开时，macOS 会把它挂到
+        ``/private/var/folders/.../AppTranslocation/<随机>/d/`` 上以**只读**方式运行，
+        每次启动都换一个地址。功能上本轮修完之后已经不受影响（所有落点都走包外），
+        但这件事仍然值得说：同一个 app 每次的包旁目录都不同，持久数据一律退到用户目录，
+        而且下次开机启动会更慢。用户按提示把 app 拖进「应用程序」就彻底回到正常形态。
+        只在**真处于转置态**时播一次（正常安装的人一条也不会多），也绝不弹模态。
+        """
+        translocated = False
+        if HAS_TOOL_CONFIG:
+            try:
+                translocated = bool(_tool_config.app_translocated())
+            except Exception:
+                translocated = False
+        if not translocated:
+            return
+        self._on_log("ℹ 本次是从 macOS 的只读临时副本启动的（下载后没移进「应用程序」文件夹）："
+                     "工具功能不受影响，登录状态与数据会落在「个人目录/.b2bcollect」里")
+        self._show_banner(
+            "本工具正被 macOS 隔离运行（只读临时副本，每次启动都换地址）："
+            "把 <B2bCollectTool.app> 拖进「应用程序」文件夹、并从那里打开，"
+            "启动更快、数据也落在更直观的位置。" + self._app_relocate_link(),
+            "#fff3cd", "#7a5a00")
+
+    @staticmethod
+    def _app_relocate_link() -> str:
+        """转置横幅尾部那条动作链接：能代做就说代做，只能指路就实话指路。
+
+        链接**永远给**（既然已经在播报只读副本了，就必须在同一屏给出出口，否则这条
+        提示只是让人烦躁），但话术按判定结果分两种：工具能一步搬好的时候不许写成
+        「请你自己拖」，搬不了的时候也绝不承诺「点一下就搞定」。
+        """
+        plan = MainWindow._app_migration_plan_safe()
+        if str(plan.get("status") or "") == "ready":
+            return '<a href="#app-relocate">帮我移进「应用程序」文件夹</a>'
+        return '<a href="#app-relocate">在访达里打开这两个位置</a>'
+
+    @staticmethod
+    def _app_migration_plan_safe() -> dict:
+        """搬家判定（只查不动磁盘）的永不抛异常包装。
+
+        判据本体在 tool_config（路径策略的唯一口径），这里只负责「判据自己出问题」
+        这一种情况：一条运行形态提醒绝不能把界面带崩——本轮 Mac 崩溃的形状就是
+        「提醒/日志链路里出了未捕获异常」。返回空 dict 时调用方按「不知道」说话。
+        """
+        if not HAS_TOOL_CONFIG:
+            return {}
+        try:
+            return dict(_tool_config.app_migration_plan() or {})
+        except Exception:
+            return {}
+
+    def _offer_app_relocation(self):
+        """横幅那条链接的落点：把「下载目录里的只读副本」变成「应用程序里的正常安装」。
+
+        一次点击能不能做完，取决于 tool_config 的判定；四种做不完的形态（目标同名、
+        多份副本、读不到包标识、压根没找到）都退回「在访达里打开两个位置」这句实话。
+        为什么值得代做：本轮 Mac 崩溃的直接触发条件就是这种运行形态，而处置办法历来
+        只有一个，说明书里写这句话多数人不会去做。
+        """
+        plan = self._app_migration_plan_safe()
+        status = str(plan.get("status") or "")
+        dest = plan.get("dest")
+        if status == "ready":
+            self._confirm_app_relocation(plan)
+            return
+        if status == "already_installed":
+            self._on_log("ℹ 「应用程序」文件夹里已经有同一份工具，请从那里打开："
+                         f"{dest}（这个由只读副本启动的窗口关掉就好）")
+            _tool_config.reveal_in_finder([dest])
+            return
+        detail = str(plan.get("detail") or status or "没能确认运行形态")
+        self._on_log(f"ℹ 这一步工具没法代做（{detail}）："
+                     "把 B2bCollectTool.app 拖进「应用程序」文件夹，再从那里打开即可")
+        self._reveal_migration_dirs(plan)
+
+    def _confirm_app_relocation(self, plan: dict):
+        """把要动哪两个目录逐字写在确认框里：代用户搬家不留「点了会发生什么」的悬念。"""
+        src, dest = plan.get("source"), plan.get("dest")
+        ret = QMessageBox.question(
+            self, "移进「应用程序」文件夹",
+            "这一步只做一件事——同卷改名（不复制、不占额外空间、瞬间完成）：\n"
+            f"· 从：{src}\n"
+            f"· 到：{dest}\n\n"
+            "移完本工具会自动退出，并从新位置重新打开；此后不再被 macOS 挂到只读临时副本上。\n"
+            "现在做吗？（选「否」则只在访达里打开这两个位置，你自己拖过去也一样）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ret == QMessageBox.Yes:
+            self._do_app_relocation(plan)
+            return
+        self._reveal_migration_dirs(plan)
+
+    def _do_app_relocation(self, plan: dict):
+        """执行搬家并闭环：成功就从新位置重开（走同一条落盘收尾链路），失败就交回访达。"""
+        src, dest, exe = plan.get("source"), plan.get("dest"), plan.get("dest_exe")
+        if not src or not dest:
+            return
+        ok, why = _tool_config.move_app_bundle(src, dest)
+        if not ok:
+            # 跨卷、需要管理员授权这类一律不在这里硬做：那会卡界面或留下半个副本
+            self._on_log(f"⚠ 没能自动移过去：{why}；已在访达里打开这两个位置，拖过去即可")
+            self._reveal_migration_dirs(plan)
+            return
+        if not exe or not Path(str(exe)).is_file():
+            # 搬是搬成了，但新位置的可执行文件对不上：绝不自动重启一个来路不明的路径
+            self._on_log(f"↻ 已移进「应用程序」文件夹：{dest}\n"
+                         "   请从那里（访达/启动台）打开，这个窗口关掉就行")
+            _tool_config.reveal_in_finder([dest])
+            return
+        self._on_log(f"↻ 已移进「应用程序」文件夹：{dest}\n"
+                     "   正在从新位置打开，本次起不再受只读临时副本限制")
+        # 新进程用搬家后的路径启动，其余机制与「重启工具现在生效」完全同一条链路：
+        # 先走 closeEvent 的落盘收尾，再由新实例确认旧 PID 真退出后才建窗口。
+        self._relaunch_pending = [str(exe)]
+        self._relaunch_note = RELAUNCH_NOTE_MOVED
+        self.close()
+
+    @staticmethod
+    def _reveal_migration_dirs(plan: dict):
+        """把「源在哪、该放到哪」两个目录开在访达里：代做不成时至少让人少找一步。"""
+        paths = []
+        for key in ("dest", "source"):
+            p = plan.get(key)
+            if p:
+                paths.append(Path(str(p)).parent)
+        try:
+            _tool_config.reveal_in_finder(paths)
+        except Exception:
+            pass
 
     def _open_acl_admin(self):
         """权限管理面板（只有等级 0 的账号能看到这个入口）。"""
@@ -5897,18 +6189,112 @@ def _app_stylesheet():
     """
 
 
-def _fatal_log(exc):
-    """启动即崩时把 traceback 落盘：Finder 双击打开没有终端，错误看不见，
-    日志就是在对方电脑上排查「图标转一下消失」的唯一线索。"""
-    import traceback
-    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    for d in (Path.home() / "Desktop", Path.home() / ".b2bcollect"):
+# （启动失败那一组常量与函数——FATAL_LOG_NAME / _fatal_log_dirs / _fatal_log_header /
+#  _fatal_log / _report_fatal_startup——统一住在文件开头「启动失败的唯一收口」那里：
+#  导入本项目模块失败时它们必须已经定义好，放在这里就来不及报信了。）
+
+
+# ── 重启链路（一键「重启工具现在生效」背后的全部机制）──────────────────────
+# 新实例靠这个开关认出「我是被上一个实例拉起来的」，参数写法刻意与 doctor 系列
+# 不同族：_doctor_request 只把含 doctor 或以 --acl 开头的写法当成「像自检却认不出」，
+# 这个开关必须走建界面那条路，绝不能被误判成自检参数（离线测试逐字钉住这条边界）。
+RELAUNCH_FLAG = "--relaunch-from"
+# 等新实例的前任退出最多等多久：超过这个时间还没走，就当它已经不会走了
+# （旧实例可能卡在某个不该卡的收尾里），让新实例正常起来比死等更重要。
+RELAUNCH_WAIT_SECONDS = 12.0
+# 重启**原因**的标记：搬家（移进应用程序文件夹）之后拉起的那一次，新实例要说的是
+# 「已经在新位置了」，而不是「权限等级对应的入口一致了」。两种话术共用同一条重启链路，
+# 差别只在这一句上；写法与 doctor 系列不同族（不含 doctor、不以 --acl 开头），
+# 由离线测试逐字钉住「不许被误判成自检参数」这条边界。
+RELAUNCH_NOTE_MOVED = "--relaunch-moved"
+
+
+def _relaunch_note(argv) -> str:
+    """这组参数里的重启原因；不是重启拉起的进程返回空串。纯函数，便于离线断言。"""
+    argv = [str(a) for a in (argv or [])]
+    return RELAUNCH_NOTE_MOVED if RELAUNCH_NOTE_MOVED in argv else ""
+
+
+def _relaunch_source_pid(argv) -> int:
+    """从参数里取出「前任实例的 PID」，不是重启拉起的进程返回 0。纯函数，便于离线断言。"""
+    argv = list(argv or [])
+    for i, a in enumerate(argv):
+        if a == RELAUNCH_FLAG and i + 1 < len(argv):
+            try:
+                return max(0, int(argv[i + 1]))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    """这个 PID 还在不在。不引第三方库（psutil 从来不在随包清单里，为这一件事加依赖不值）。"""
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
         try:
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "B2B采集工具启动错误.log").write_text(text, encoding="utf-8")
-            break
-        except OSError:
-            continue
+            import ctypes
+            # PROCESS_QUERY_LIMITED_INFORMATION：只查状态，不需要目标进程的任何权限
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        import errno
+        import os
+        os.kill(pid, 0)
+        return True
+    except OSError as e:
+        # EPERM＝进程在、只是没权限探它（绝不能当成「已经退出」，那是反向误判）
+        return e.errno == errno.EPERM
+    except Exception:
+        return False
+
+
+def _wait_for_previous_instance(pid: int, timeout: float = RELAUNCH_WAIT_SECONDS) -> bool:
+    """等前任实例真退出再继续；返回 True = 观测到它已退出。
+
+    为什么把「等」放在新实例这一侧、还要带上限（旧写法是父进程用 cmd 延时 2 秒再拉起）：
+      · 2 秒是猜的。共享 Chrome 只有一个调试端口，猜短了两个实例抢同一个端口，新实例
+        起不来（用户看到「重启一下工具就打不开了」），猜长了则每次白屏多等好几秒；
+      · 真实判据是「前任的进程句柄没了」，那就直接观测它，不再猜时长；
+      · 上限同样重要：前任万一卡在收尾里不退出，新实例不能陪它一起永不现身。
+    """
+    import time
+    deadline = time.time() + max(0.0, float(timeout))
+    while _pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.2)
+    return not _pid_alive(pid)
+
+
+def _relaunch_workdir() -> str:
+    """拉起新实例时给它的工作目录：**绝不用包内目录**。
+    旧写法取 ``Path(__file__).resolve().parent``，打包态那是随包数据目录（Windows
+    onefile 下正是 %TEMP%\\_MEIxxxx）——子进程把它当当前目录，旧实例退出时就删不掉、
+    也删不干净自己的临时目录，``base_library.zip`` 就是这么在半删的状态下报
+    FileNotFoundError 的（2026-11-12 Windows 实机）。现在：打包态用 exe 同级目录，
+    写不动再退用户目录，源码态保持模块目录。
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            import tool_config as _tc
+            ed = _tc.exe_dir()
+            if ed is not None and _tc.probe_writable(ed):
+                return str(ed)
+        except Exception:
+            pass
+        try:
+            home = Path.home() / ".b2bcollect"
+            home.mkdir(parents=True, exist_ok=True)
+            return str(home)
+        except Exception:
+            return str(Path.home())
+    return str(Path(__file__).resolve().parent)
 
 
 # access_guard.DOCTOR_FLAGS 的退路副本：只在权限模块本身就没加载进来时使用
@@ -5992,6 +6378,15 @@ def main():
         print(f"❌ 没认出这几个参数：{' '.join(wrong)}；"
               f"产物自检的正确写法是 {' 或 '.join(_doctor_flags())}")
         sys.exit(3)
+    # 重启链路的交接：新实例先等前任真退出，再建 QApplication 与共享 Chrome。
+    # 放在这里（而不是界面起来之后）的原因：抢同一个调试端口的风险只存在于「两个实例
+    # 都在启动」这段时间里，而这段时间正好是 QApplication + 建窗口；等完之后窗口才现身，
+    # 用户看到的就是「重启了一下，工具开了」，不是「重启了一下，工具没了」。
+    previous_pid = _relaunch_source_pid(sys.argv[1:])
+    if previous_pid and not _wait_for_previous_instance(previous_pid):
+        # 说清楚而不是悄悄多等：真到超时说明前任卡在收尾里，此时继续启动是对的
+        # （宁可两个实例并存几秒让用户能操作，也不要一个永远不出现的窗口）。
+        print(f"ℹ 上一个实例（PID={previous_pid}）在限定时间内没退出，本实例直接启动")
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())
@@ -6018,7 +6413,11 @@ def main():
     except Exception as e:
         _fatal_log(e)
         try:
-            QMessageBox.critical(None, "工具启动失败", f"{type(e).__name__}: {e}\n\n详细堆栈见桌面「B2B采集工具启动错误.log」。")
+            _fatal_paths = [str(d / FATAL_LOG_NAME) for d in _fatal_log_dirs()]
+            QMessageBox.critical(
+                None, "工具启动失败",
+                f"{type(e).__name__}: {e}\n\n详细堆栈见这份日志——先看第一个位置，"
+                "找不到就看第二个：\n" + "\n".join(_fatal_paths))
         except Exception:
             pass
         raise

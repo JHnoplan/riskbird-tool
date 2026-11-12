@@ -1972,6 +1972,7 @@ DOCTOR_EXIT_NETWORK = 5
 DOCTOR_EXIT_OTHER = 6
 DOCTOR_EXIT_CLOCK = 7
 DOCTOR_EXIT_TLS = 8
+DOCTOR_EXIT_PATH = 9
 
 # 一张表同时给出「类别 → 退出码 + 短标签」，退出码表和 CLI 帮助都由它派生：
 # 上一轮就吃过「帮助里列了 6 个码、实际有 8 个码」的亏——同一条口径写两处，
@@ -1992,6 +1993,17 @@ _DOCTOR_KINDS = {
 
 _DOCTOR_KIND_CODE = {k: v[0] for k, v in _DOCTOR_KINDS.items()}
 
+# 非服务类（发包级）故障：自检里还有一类门禁问的不是「权限服务连不连得上」，而是
+# 「这个包把自己的数据写在会丢的地方没有」。**故意不并进 _DOCTOR_KINDS**：那三张表
+# （_UNREACHABLE_TEXT / _REASON_MARKERS / SERVICE_NEXT_STEP）说的是服务为什么连不上，
+# 把发包缺陷混进去，界面就会把「包打错了」解释成「请检查网络」——本轮丐版事故的形状
+# 来源正是这种张冠李戴的归类。但退出码全表必须由两张表**一起**派生：分开列的话就会
+# 有人只加常量忘了进表，那种故障在 --doctor 帮助里就没名字（上一轮「帮助只列 6 个码、
+# 实际 8 个码」吃的就是这个亏）。
+_DOCTOR_NONSERVICE_KINDS = {
+    "path": (DOCTOR_EXIT_PATH, "落点违规"),
+}
+
 DOCTOR_LOG_NAME = "acl_doctor.txt"
 
 # 自检开关的两个写法必须是**同一份**：CI 工作流里写的是 --acl-doctor（历史命名，
@@ -2000,10 +2012,12 @@ DOCTOR_LOG_NAME = "acl_doctor.txt"
 # Start-Process -Wait 会一路干等到 job 超时。
 DOCTOR_FLAGS = ("--doctor", "--acl-doctor")
 
-# 退出码全表（含 0）：CLI 帮助、测试与排查手册都读它，避免「文档只列了 6 个码」
+# 退出码全表（含 0）：CLI 帮助、测试与排查手册都读它，避免「文档只列了 6 个码」。
+# 两张分类表一起派生（理由见 :data:`_DOCTOR_NONSERVICE_KINDS` 的注释）。
 _DOCTOR_EXIT_TABLE = ([(DOCTOR_EXIT_OK, "通过")]
-                      + sorted(_DOCTOR_KINDS.values(), key=lambda v: v[0]))
-DOCTOR_EXIT_HELP = ("产物自检：只读地验证凭证链、权限服务真连与采集通道完整性，"
+                      + sorted({**_DOCTOR_KINDS, **_DOCTOR_NONSERVICE_KINDS}.values(),
+                               key=lambda v: v[0]))
+DOCTOR_EXIT_HELP = ("产物自检：只读地验证凭证链、权限服务真连、采集通道完整性与落点纪律，"
                     "退出码按故障分类（"
                     + " / ".join(f"{code} {label}"
                                  for code, label in _DOCTOR_EXIT_TABLE) + "）")
@@ -2063,6 +2077,60 @@ def _channel_integrity(frozen: bool) -> Tuple[int, List[str]]:
     return (DOCTOR_EXIT_MODULE if frozen else DOCTOR_EXIT_OK), lines
 
 
+def _path_discipline(frozen: bool) -> Tuple[int, List[str]]:
+    """落点纪律：打包产物里任何一处落点（候选与实际选中的）都不许在应用包内部。
+
+    为什么这一条要进自检（2026-11-12 全局自审）：Mac 崩溃日志里那句
+    ``OSError: [Errno 30] Read-only file system`` 只是「数据写进包里」最响亮的一种
+    下场，同一条纪律还有三种不吭气的写法——整包可写时数据被塞进 ``.app``（覆盖升级
+    或拖废纸篓就把 Cookie、审计日志、自检报告一起带走）；Windows 写进退出即删的
+    ``_MEI`` 目录（＝每次重新登录、每天白烧一遍查询额度）；界面报「已保存」而文件
+    下次开机不见了。共同症状是「用户只觉得功能没了」，界面上却查不出任何痕迹。
+
+    判据直接取两份口径模块自己列出的候选链（``state_dir_candidates`` /
+    ``candidate_dirs`` / ``config_save_target``），不在这里另抄一份路径清单——抄一份
+    就会漏改一处，本轮缺的正是「同一纪律在三处各有实现」里的那一处。
+
+    口径：打包态违规就是发包失败（退出码 9）；源码态只报现状不判红（开发机的数据
+    本来就该待在仓库目录里，那是历史 Cookie 与调试产物的正常位置）。
+    """
+    lines: List[str] = []
+    try:
+        import tool_config as _tc
+        groups: List[Tuple[str, List]] = [
+            ("状态目录候选", list(_tc.state_dir_candidates())),
+            ("实际状态目录", [_tc.state_dir()]),
+        ]
+        save_target = _tc.config_save_target()
+        if save_target is not None:
+            groups.append(("配置保存落点", [save_target]))
+    except Exception as e:                      # 口径模块自己读不到：这条门禁弃权
+        lines.append(f"   · 落点纪律：判定失败（{type(e).__name__}: {e}）")
+        return DOCTOR_EXIT_OK, lines
+    try:
+        import runtime_paths as _rp
+        groups.append(("通道数据候选", list(_rp.candidate_dirs())))
+    except Exception:
+        pass                                    # 上面 0.6 那段已经如实报过读不到
+    bad = [(label, p) for label, paths in groups for p in paths
+           if _tc.inside_app_bundle(p)]
+    if not bad:
+        lines.append("   · 落点纪律：候选与实际落点全在应用包外"
+                     + ("（开发态按模块目录，不判红）" if not frozen else ""))
+        return DOCTOR_EXIT_OK, lines
+    lines.append(("❌ acl-doctor：产物把数据落在应用包内部" if frozen
+                  else "⚠️ acl-doctor：数据落在应用包内部（源码态不判红）"))
+    for label, p in bad:
+        lines.append(f"   · {label}：{p}")
+    lines.append("   · 症状：只读卷上启动即崩（Errno 30）；整包可写时不崩，但升级或卸载"
+                 "会把 Cookie、审计日志、自检报告一起带走；Windows 写进退出即删的临时目录"
+                 "＝登录态与缓存每次归零，界面却照样提示「已保存」。")
+    lines.append("   · 修法：按**形态**排除包内（tool_config.inside_app_bundle 与 "
+                 "runtime_paths.candidate_dirs），不许等写探针碰运气；离线判据见 "
+                 "b2bcollect_build/test_data_dir_offline.py 第 7 节。")
+    return (DOCTOR_EXIT_PATH if frozen else DOCTOR_EXIT_OK), lines
+
+
 def doctor_lines() -> Tuple[int, List[str]]:
     """执行一次自检，返回 ``(退出码, 报告行)``。
 
@@ -2101,6 +2169,32 @@ def doctor_lines() -> Tuple[int, List[str]]:
     #      而它恰恰是本轮真正坏掉的那一层——凭证全通、名单全通、包里却少两个平台。
     ch_code, ch_lines = _channel_integrity(frozen)
     for line in ch_lines:
+        say(line)
+
+    # 0.6) 运行形态与落点（2026-11-12 两份实机故障都该由这两行提前说清）：
+    #      · Mac 被 Gatekeeper 转置的包整棵树只读，日志里那句 Errno 30 背后就是它；
+    #      · 风鸟/爱企查的 Cookie 与缓存落在包外哪一处，决定用户明天还需不需要重新登录、
+    #        当天要不要白烧一遍查询额度——「在包内」和「在包外」在界面上完全看不出来。
+    #      排在通道完整性之后：那一步已经把 site_adapters（顺带 riskbird_build 路径）
+    #      拉进来了，这里才谈得上 import 到口径模块；拉不进来时如实说「读不到」。
+    try:
+        shape = ("macOS 只读转置包（App Translocation）"
+                 if tool_config.app_translocated() else "正常安装位置")
+        say(f"   · 运行形态：{shape}  可执行文件={getattr(sys, 'executable', '?')}")
+    except Exception as e:
+        say(f"   · 运行形态：判定失败（{type(e).__name__}: {e}）")
+    try:
+        import runtime_paths as _rp
+        say(f"   · 名单通道数据目录：{_rp.describe()}")
+    except Exception as e:
+        say(f"   · 名单通道数据目录：读不到（{type(e).__name__}: {e}）")
+
+    # 0.7) 落点纪律（2026-11-12 全局自审新增的门禁）：上面两行只说「现在落在哪」，
+    #      这一条说的是「候选里有没有包内那一级」。两者必须分开报：整包可写的机器上
+    #      实际落点看起来正常（候选 1 命中），而包内那一处仍在链上，哪天包旁写不进
+    #      （装进 /Applications、被只读挂载、被同步盘接管）就立刻掉进包里。
+    path_code, path_lines = _path_discipline(frozen)
+    for line in path_lines:
         say(line)
 
     # 1) 凭证：能不能拿到、从哪一级拿到（只报来源，绝不报值）
@@ -2208,9 +2302,12 @@ def doctor_lines() -> Tuple[int, List[str]]:
 
     # 权限链每一层都通了，功能模块却少了两路——同样是「发出去就不能用」，退出码
     # 必须跟着改。反过来若前面已经因为凭证/网络判红，那个码更该先看，通道缺失的
-    # 结论已经写在上面那几行里，不会被淹没。
+    # 结论已经写在上面那几行里，不会被淹没。（落点纪律同理：它是第三类「前面全通、
+    # 发出去照样出事」的缺陷，报告里已经逐条点名，这里只补退出码。）
     if code == DOCTOR_EXIT_OK and ch_code != DOCTOR_EXIT_OK:
         code = ch_code
+    if code == DOCTOR_EXIT_OK and path_code != DOCTOR_EXIT_OK:
+        code = path_code
 
     say("✅ acl-doctor：权限服务连通且名单可读" if code == DOCTOR_EXIT_OK
         else f"❌ acl-doctor：未通过（退出码 {code}）")

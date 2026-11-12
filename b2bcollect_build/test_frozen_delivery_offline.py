@@ -33,6 +33,25 @@
      逐条对上、且落对目录（缺一条或放错地方都在构建前红）；产物自检在打包态缺
      通道退 3，源码态只警告；界面只点名「该给却没给」的那几路（档位藏起来的
      功能不许被念出来）——本轮第三种红法：CI 全绿、产物却只剩企知道一路
+  O. Windows 交付形态：三处入口都不许再出现 --onefile；装配校验器对合成产物树判得
+     准（onedir 目录缺失/只有空壳 exe/混进旧单文件 exe/缺 runtime_paths 都要点名），
+     校验不过就**不产出 zip**，运行期目录绝不进交付物，zip 顶层必须是一个目录，
+     NSIS 脚本与使用说明必须 UTF-8 with BOM，CI 与制品校验器共用同一份判据；
+     说明书里的每一条事实都要有代码或脚本撑着（每用户安装、安装目录、三个数据目录、
+     崩溃日志名与界面同一个常量）
+  P. 运行期文件落点：审计日志与列映射历史的默认值不再相对当前工作目录（切到别处
+     也照样落在状态目录、且不落进随包目录），坏缓存/写不进去一律退化而不抛异常
+  Q. 重启链路：给新实例的 cwd 绝不是包内目录（Windows 那句 base_library.zip
+     FileNotFoundError 就是这么来的），重启参数不被误判成自检参数，不走 shell、
+     不猜时长，由新实例观测旧 PID 真退出
+  R. 一路通道失败的种类由「文件的主人」回答成因：模块已加载却在构造期抛
+     FileNotFoundError 绝不能报成「安装包缺文件」（Mac 只读卷的实况就是这一类）
+  S. Mac 只读副本：识别得出转置运行，并且能在界面上一次点完「移进应用程序文件夹」
+     ——判定与执行分开，四种不许动手的形态（目标同名/版本不同/多份副本/读不到包
+     标识）各有独立判据，执行只做同卷改名，其余一律交回访达
+  T. 落点纪律门禁：--acl-doctor 必须在**发包前**认出「数据写进应用包里」——候选链
+     和实际落点都查，打包态违规退 9（落点违规），源码态只报现状；这一类故意不进
+     服务故障分类表（那三张表说的是服务为什么连不上），但必须进退出码全表和帮助
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -42,6 +61,7 @@
 
 运行：QT_QPA_PLATFORM=offscreen .venv/bin/python b2bcollect_build/test_frozen_delivery_offline.py
 """
+import ast
 import contextlib
 import importlib.util
 import inspect
@@ -49,10 +69,13 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
+import zipfile
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
@@ -256,6 +279,27 @@ def _patch(obj, name, value):
         yield
     finally:
         setattr(obj, name, old)
+
+
+def _code_only(fn) -> str:
+    """函数正文，只留**会执行的那几行**（docstring 与注释整体剔掉）。
+
+    「不许再出现某种写法」这类判据必须压在这里：本轮修好的旧写法（``cmd /c start``、
+    ``timeout /t 2``、``shell=True``、``Path(__file__).parent``）恰恰都要写进 docstring
+    里说明「为什么不能用」——直接从 ``inspect.getsource`` 上判负，会得到两种坏法：判据
+    永远红，或者有人为了变绿把解释删掉（那是抹掉下次排查最需要的上下文）。注释行整体
+    剔掉同一个道理，与 ``_strip_comments``（shell 文本）配成一对。
+    """
+    src = textwrap.dedent(inspect.getsource(fn))
+    lines = src.splitlines()
+    start = 0
+    body = ast.parse(src).body[0]
+    if (body.body and isinstance(body.body[0], ast.Expr)
+            and isinstance(body.body[0].value, ast.Constant)
+            and isinstance(body.body[0].value.value, str)):
+        start = body.body[0].end_lineno          # docstring 之后才是正文
+    return "\n".join(ln for ln in lines[start:]
+                     if ln.strip() and not ln.lstrip().startswith("#"))
 
 
 AKV = {"oss_access_key_id": "AKID_BUNDLE", "oss_access_key_secret": "SK_BUNDLE"}
@@ -961,6 +1005,23 @@ def test_delivery_chain():
     _assert("没有内层产物 zip" in fetch and "解不开" in fetch
             and fetch.count("exit 6") >= 2,
             "内层 zip 不在位/解不开两处都非零退出（静默跳过校验等于拆掉随包凭证这道门）")
+
+    # 自检报告的落点由产物自己的 state_dir 候选链决定，两个 Mac 入口都不许把它写死：
+    # 写死之后的下一步一定是「口径或布局变了、门禁静默 cat 不到报告」——CI 里看着像
+    # 「产物是好的，只是这一步没打印原文」，而这种红法没人会去修（本来就拦不住上传）。
+    _assert("b2bcollect_state/acl_doctor.txt" not in mac
+            and "b2bcollect_state/acl_doctor.txt" not in local,
+            "两个 Mac 入口都不写死自检报告路径（Windows 那一步早就是查找，两边同规矩）")
+    for label, text2, pat in (("Mac workflow", mac,
+                               "find b2bcollect_build/dist -name acl_doctor.txt"),
+                              ("本机打包脚本", local, "find dist -name acl_doctor.txt")):
+        _assert(pat in text2 and "-mmin " in text2,
+                f"{label} 按「刚被写过」查找自检报告（递归找旧文件会把上一次的报告当本次结论）")
+    # Actions 的 bash 步默认 -e：不收住退出码，::error:: 那行永远打不出来，
+    # 日志里只剩一句 exit code 1，分不清是产物坏了还是这一步自己坏了。
+    _assert("set +e" in mac, "Mac workflow 显式收住自检退出码，失败注解才有机会打印")
+    _assert("set +e" in local and "set -e" in local,
+            "本机脚本同样收住退出码（两个入口的失败话术要一样齐全）")
 
     # 注入脚本与运行时的键名契约：不一致 = 注入了等于没注入
     import oss_pool_client as _oss
@@ -2014,6 +2075,583 @@ def test_packaging_manifest_gate():
         _ed.reset_for_tests()
 
 
+# ══════════════════════════════════════════════ O. 两条实机根因的判据
+_WIN_ASM_MOD = None
+
+
+def _win_assembler():
+    """把 Windows 交付物装配脚本当模块载进来：它就是判据本体，这里不抄第二份。
+
+    与 N 组的 `_manifest_gate()` 同一个道理——校验器与用例各写一套提取逻辑时，同一颗
+    坑要踩两次；而 CI 与本机的制品校验器**必须**共用同一份装配判据（否则 CI 绿了、
+    本机校验器却按另一套规矩说话，用户拿到的包由谁说了算就变成了运气）。
+    """
+    global _WIN_ASM_MOD
+    if _WIN_ASM_MOD is None:
+        path = _REPO / ".github" / "scripts" / "package_win_artifacts.py"
+        spec = importlib.util.spec_from_file_location("_win_artifact_asm", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WIN_ASM_MOD = mod
+    return _WIN_ASM_MOD
+
+
+def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
+    """搭一棵**合成**的 onedir 产物树：指定项可以缺席，用来验校验器自己判得对不对。"""
+    app = root / "dist" / _win_assembler().APP_DIR_NAME
+    internal = app / "_internal"
+    internal.mkdir(parents=True, exist_ok=True)
+    (app / _win_assembler().EXE_NAME).write_text("MZ", encoding="utf-8")
+    asm = _win_assembler()
+    for rel in asm.REQUIRED_INTERNAL:
+        if rel in drop:
+            continue
+        target = internal / rel
+        if rel.endswith("/") or rel == "enf_clean":
+            (target / "keep.txt").parent.mkdir(parents=True, exist_ok=True)
+            (target / "keep.txt").write_text("x", encoding="utf-8")
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("x", encoding="utf-8")
+    # installer/ 那两份也必须铺上：装配脚本在目录布局之外还校验它们的编码，缺席时
+    # 校验不过就**不产出 zip**，于是「合成树装配通过」会红成一条看着像产物坏了的结果
+    # ——那其实是夹具自己没铺全。这里写带 BOM 的合成桩而不是复制仓库里的真文件：
+    # 夹具的职责只是「搭一棵合格的树」，真文件合规与否由下面第 3 段单独判（同一件事
+    # 不留两处判据，否则真文件哪天改了名，这里会跟着红成一条莫名其妙的装配失败）。
+    for rel in (asm.NSI_PATH, asm.GUIDE_SRC):
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(asm.BOM + "合成桩\n".encode("utf-8"))
+    if stale_onefile:
+        (root / "dist" / asm.EXE_NAME).write_text("MZ", encoding="utf-8")
+    for name in runtime_dirs:
+        (app / name / "history.json").parent.mkdir(parents=True, exist_ok=True)
+        (app / name / "history.json").write_text("{}", encoding="utf-8")
+    return app
+
+
+@contextlib.contextmanager
+def _hush():
+    """收下被检对象自己往屏幕上的播报。
+
+    反例段落要验的是**判据**（problems 列表里有没有那一条），而不是把校验器已经说过
+    的话再刷一遍：它的 ❌ 混在用例结果里，读日志的人会以为用例失败了，而真正失败的
+    那一条反而被淹掉——这类「夹具的动静冒充结论」在 K 组已经红过一次。
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        yield buf
+
+
+def test_windows_onedir_delivery():
+    print("\n═══ O. Windows 交付形态：onefile 绝迹、装配判据共用一份 ═══")
+    asm = _win_assembler()
+    gate = _manifest_gate()
+
+    # 1) 三个入口都不许再出现 --onefile（注释里提它是写给维护者看的，不算）
+    wf = _REPO / ".github" / "workflows"
+    win = (wf / "build-b2bcollect.yml").read_text(encoding="utf-8")
+    mac = (wf / "build-b2bcollect-mac.yml").read_text(encoding="utf-8")
+    local = (_REPO / "debug" / "build_b2bcollect_mac_local.sh").read_text(encoding="utf-8")
+    for label, text in (("Windows workflow", win), ("Mac workflow", mac), ("本机脚本", local)):
+        _assert("--onefile" not in gate._strip_comments(text),
+                f"{label} 的构建命令里没有 --onefile（onefile 会原样复发 "
+                "base_library.zip 找不到 + Cookie 每次归零）")
+    _assert("--name B2bCollectTool" in gate._strip_comments(win),
+            "Windows 仍然产出同一个名字（改的是形态，不是品牌）")
+
+    # 2) 装配判据自己判得对不对：正例全绿 + 四个反例各自点名
+    root = Path(tempfile.mkdtemp(prefix="windist_"))
+    _fake_dist(root)
+    problems = []
+    with _hush():
+        exe, internal = asm.check_layout(root, problems)
+    _assert_eq(problems, [], f"合格的 onedir 布局一条也不报（实际={problems}）")
+    _assert(exe is not None and internal is not None, "正例返回 exe 与 _internal 两个路径")
+
+    bad = Path(tempfile.mkdtemp(prefix="windist_bad_"))
+    _fake_dist(bad, drop=("riskbird_build/runtime_paths.py",))
+    got = []
+    with _hush():
+        asm.check_layout(bad, got)
+    _assert(any("runtime_paths.py" in p for p in got),
+            f"_internal 少了 runtime_paths.py 必须点名（缺它开机即崩）：{got}")
+
+    stale = Path(tempfile.mkdtemp(prefix="windist_stale_"))
+    _fake_dist(stale, stale_onefile=True)
+    got = []
+    with _hush():
+        asm.check_layout(stale, got)
+    _assert(any("单文件" in p and "原样复发" in p for p in got),
+            f"制品里混着旧的单文件 exe 必须判红（用户双击它就回到本轮修好的故障）：{got}")
+
+    noapp = Path(tempfile.mkdtemp(prefix="windist_none_"))
+    got = []
+    with _hush():
+        asm.check_layout(noapp, got)
+    _assert(any("--onefile 又回来了" in p for p in got),
+            f"连 onedir 目录都没有时，直接把最可能的原因说成 onefile 复发：{got}")
+
+    nointernal = Path(tempfile.mkdtemp(prefix="windist_shell_"))
+    (nointernal / "dist" / asm.APP_DIR_NAME).mkdir(parents=True)
+    (nointernal / "dist" / asm.APP_DIR_NAME / asm.EXE_NAME).write_text("MZ", encoding="utf-8")
+    got = []
+    with _hush():
+        asm.check_layout(nointernal, got)
+    _assert(any("空壳" in p for p in got), f"只有 exe、没有 _internal 时判红：{got}")
+
+    # 3) UTF-8 BOM：仓库里那两份真实文件必须已经合规，缺 BOM 的反例必须红
+    real = []
+    with _hush():
+        asm.check_bom(_REPO / "b2bcollect_build" / asm.NSI_PATH, "NSIS", real)
+        asm.check_bom(_REPO / "b2bcollect_build" / asm.GUIDE_SRC, "说明", real)
+    _assert_eq(real, [], f"仓库里的安装脚本与使用说明都是 UTF-8 with BOM（实际={real}）")
+    nobom = Path(tempfile.mkdtemp(prefix="nobom_")) / "x.nsi"
+    nobom.write_text("中文", encoding="utf-8")
+    got = []
+    with _hush():
+        asm.check_bom(nobom, "反例", got)
+    _assert(any("BOM" in p for p in got),
+            "没有 BOM 时必须判红：makensis 会按系统代码页解释，中文全乱码而构建照样成功")
+
+    # 4) 装配次序：校验不过就到此为止；运行期目录绝不进 zip；zip 顶层是一个目录
+    dirty = Path(tempfile.mkdtemp(prefix="windist_dirty_"))
+    _fake_dist(dirty, runtime_dirs=asm.RUNTIME_DIRS)
+    _rc = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
+                            "package_win_artifacts.py"), "--root", str(dirty)],
+                         capture_output=True, text=True, cwd=str(_REPO))
+    _assert_eq(_rc.returncode, 0, f"合成产物树装配通过（stderr={_rc.stderr[-200:]}）")
+    _assert(not any((dirty / "dist" / asm.APP_DIR_NAME / n).exists()
+                    for n in asm.RUNTIME_DIRS),
+            "runner 上 --acl-doctor 跑出来的状态目录被剔掉了（带着别人机器的登录状态"
+            "和任务历史安装包不能发）")
+    zpath = dirty / asm.PORTABLE_NAME
+    _assert(zpath.is_file(), "校验通过才产出绿色版 zip")
+    with zipfile.ZipFile(zpath) as z:
+        names = z.namelist()
+    _assert(all(n.startswith(asm.APP_DIR_NAME + "/") or n == asm.GUIDE_DEST for n in names),
+            f"zip 顶层只有 {asm.APP_DIR_NAME}/ 与根上的使用说明（解压出来是一堆散文件的话，"
+            f"用户会把它摊到桌面上）（实际={names[:3]}）")
+    _assert(asm.GUIDE_DEST in names, "绿色版 zip 根上有使用说明（第一眼就看到）")
+    _assert(not any(f"/{n}/" in f"/{x}" for x in names for n in asm.RUNTIME_DIRS),
+            "运行期目录连一个条目都没进 zip")
+
+    broken = Path(tempfile.mkdtemp(prefix="windist_broken_"))
+    _fake_dist(broken, drop=("config.json",))
+    _rc2 = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
+                             "package_win_artifacts.py"), "--root", str(broken)],
+                          capture_output=True, text=True, cwd=str(_REPO))
+    _assert(_rc2.returncode != 0 and not (broken / asm.PORTABLE_NAME).exists(),
+            "随包凭证缺失时非零退出**且不产出 zip**（否则又是一个 CI 绿、用户拿坏包）")
+
+    # 5) CI 与本机的制品校验器共用这份判据，不抄第二份
+    fetch = (_REPO / "debug" / "fetch_b2bcollect_artifacts.sh").read_text(encoding="utf-8")
+    _assert("package_win_artifacts" in fetch and "check_layout" in fetch,
+            "制品校验器 import 装配脚本复用 check_layout（两套规矩迟早对不上）")
+    _assert("B2bCollectToolSetup" in fetch,
+            "制品校验器要求安装包存在（只有绿色版目录 zip 等于交付形态没落地）")
+    _assert("makensis" in win and "Package Windows artifacts" in win,
+            "Windows workflow 里既有装配步也有 NSIS 安装包步")
+    _assert(asm.SETUP_NAME in win and asm.PORTABLE_NAME in win,
+            "安装包与绿色版两份产物都进上传清单")
+
+    # 6) 交付文档与安装脚本、界面话术必须说同一件事：说明书写下的承诺没有代码撑着时，
+    #    漂移没有任何运行期症状，只有用户在第一次安装时被问住（本轮说明书改过三处，
+    #    每处都对应一个真实存在/不存在的目录，逐条对拍比读一遍可靠）。
+    nsi = (_REPO / "b2bcollect_build" / asm.NSI_PATH).read_text(encoding="utf-8-sig")
+    guide = (_REPO / "b2bcollect_build" / asm.GUIDE_SRC).read_text(encoding="utf-8-sig")
+    _assert("RequestExecutionLevel user" in nsi
+            and "RequestExecutionLevel admin" not in nsi,
+            "安装脚本是每用户安装：说明书那句「全程不会弹管理员权限窗口」全靠这一行撑着")
+    _assert("$LOCALAPPDATA\\Programs" in nsi and "管理员权限" in guide,
+            "默认安装目录与说明书第一节写的是同一个位置（装进 Program Files 的话 "
+            "Cookie 与缓存写不进去，那节讲的正是这个因果）")
+    for d in ("b2bcollect_data", "riskbird_data", "b2bcollect_state"):
+        _assert(d in guide, f"说明书第三节逐个写明 {d} 存的是什么（用户找日志不必猜）")
+        _assert(d in asm.RUNTIME_DIRS,
+                f"{d} 同时在装配剔除名单里（说明书承诺的目录与发包前剔的目录必须是同一批，"
+                "否则 CI 上跑出自检报告就会随包发出去）")
+        _assert(f'"$INSTDIR\\{d}"' in nsi,
+                f"卸载脚本的「连数据一起删」清单覆盖 {d}（用户选了全删却还剩一个空目录，"
+                "这种漏法没有症状，只有下次重装时才被发现）")
+    _assert("aiqicha_data" not in guide,
+            "说明书不列 aiqicha_data：爱企查与风鸟共用 riskbird_data，"
+            "文档不许列出程序根本不会创建的目录（RUNTIME_DIRS 里那一项是留着防身的）")
+    import b2bcollect_gui as _gui
+    _assert(_gui.FATAL_LOG_NAME in guide,
+            f"说明书里的崩溃日志名与界面落盘用的是同一个名字（{_gui.FATAL_LOG_NAME}）")
+    _assert("App Translocation" in guide and "应用程序" in guide,
+            "说明书 Mac 那节仍在讲只读副本这件事（界面横幅的出口要有文字版可对）")
+
+
+def test_state_file_never_relative_cwd():
+    print("\n═══ P. 运行期文件的落点：绝不相对当前工作目录 ═══")
+    import audit_logger as _al
+    import mapping_recommender as _mr
+
+    # 1) 源码层面：两个默认值都不许再是「裸文件名」（那等于相对 CWD）
+    for label, path, name in (("audit_logger", "audit_logger.py", "log_file"),
+                              ("mapping_recommender", "mapping_recommender.py", "cache_file")):
+        src = (_REPO / "b2bcollect_build" / path).read_text(encoding="utf-8")
+        _assert(not re.search(rf'{name}: str = "[^"/\\\\]+\.(json|log)"', src),
+                f"{label} 的 {name} 默认值不再是相对 CWD 的裸文件名")
+        _assert("state_file" in src, f"{label} 的默认落点问 tool_config.state_file（唯一口径）")
+
+    # 2) 行为层面：CWD 切到一个根本写不出文件的地方，落点仍在状态目录里
+    elsewhere = Path(tempfile.mkdtemp(prefix="cwd_elsewhere_"))
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(str(elsewhere))
+        with _workspace() as ws, _frozen(ws):
+            for label, got in (("审计日志", _al._default_log_file()),
+                               ("映射历史", _mr._default_cache_file())):
+                p = Path(got)
+                _assert(p.is_absolute(), f"{label} 的落点是绝对路径（实际={got}）")
+                _assert(str(ws["bundle"]) not in str(p),
+                        f"{label} 不落在随包数据目录里（打包态那可能是退出即删的 _MEI，"
+                        f"或 Mac 的只读转置卷）（实际={got}）")
+                _assert(p.parent == tc.state_dir(),
+                        f"{label} 与状态目录同源（口径只有一份）（实际={p.parent}）")
+            # 真的写一次：状态目录可写就落得下，且读得回来
+            _mr.MappingRecommender().update(["公司名称"], {0: "公司名"})
+            _assert(Path(_mr._default_cache_file()).is_file(), "映射历史真写得进去")
+            _al.AuditLogger().log("export", "u", {"n": 1})
+            _assert(Path(_al._default_log_file()).is_file(), "审计日志真写得进去")
+    finally:
+        os.chdir(old_cwd)
+
+    # 3) 坏缓存绝不能把对话框带崩：这一类形状就是本轮 Mac 崩溃的翻版
+    bad_root = Path(tempfile.mkdtemp(prefix="badhist_"))
+    for name, payload in (("半截", "{不是 JSON"), ("形状不对", "[1, 2, 3]"),
+                          ("条目是字符串", json.dumps({"表头": "字段"})),
+                          ("计数不是数字", json.dumps({"表头": [["字段", "abc"]]})),
+                          ("空值", json.dumps({"表头": [None, [], ["", 1]]}))):
+        f = bad_root / f"{name}.json"
+        f.write_text(payload, encoding="utf-8")
+        rec = _mr.MappingRecommender(cache_file=str(f))
+        _assert_eq(rec.recommend(["表头"]), {}, f"坏缓存「{name}」退化成没有历史，不抛异常")
+    _assert_eq(_mr.MappingRecommender(cache_file=str(bad_root / "不存在.json")).history, {},
+               "文件不存在时按空历史起步")
+    unwritable = bad_root / "blocker"
+    unwritable.write_text("x", encoding="utf-8")
+    raised = None
+    try:
+        _mr.MappingRecommender(cache_file=str(unwritable / "nope" / "h.json"))._save_history()
+        _al.AuditLogger(log_file=str(unwritable / "nope" / "a.log")).log("a", "u", {})
+    except Exception as e:
+        raised = e
+    _assert(raised is None,
+            "落点写不进去时只报一句、不把导入动作带崩"
+            + (f"（实际抛了 {type(raised).__name__}: {raised}）" if raised else ""))
+
+
+def test_relaunch_chain_off_the_bundle():
+    print("\n═══ Q. 重启链路：不拿包内目录当 cwd、旧进程真退出才起新实例 ═══")
+    import b2bcollect_gui as gui
+
+    # 1) 工作目录：打包态取 exe 同级（磁盘上那个真实文件），绝不取随包数据目录
+    with _workspace() as ws, _frozen(ws):
+        _assert(ws["exe_dir"].exists(),
+                "夹具的 exe 同级目录在位（onedir 的意义就在这：可执行文件是真实文件）")
+        workdir = Path(gui._relaunch_workdir())
+        _assert(str(ws["bundle"]) not in str(workdir.resolve()),
+                f"重启给新实例的 cwd 不是随包数据目录（实际={workdir}）——"
+                "子进程占着那个目录，旧实例就删不掉自己的临时目录，"
+                "base_library.zip 正是这么报 FileNotFound 的")
+        _assert(workdir.is_dir(), f"给出去的 cwd 真存在：{workdir}")
+
+    # 2) 参数写法：重启标记不许被当成自检参数（否则 CI/界面两条路互相劫持）
+    for argv in ([gui.RELAUNCH_FLAG, "4242"], [gui.RELAUNCH_FLAG, "4242",
+                                              gui.RELAUNCH_NOTE_MOVED]):
+        want_doctor, wrong = gui._doctor_request(list(argv))
+        _assert(not want_doctor and wrong == [],
+                f"{argv} 被判成「不是自检、也没有认不出的写法」（必须走建界面这条路）")
+    _assert_eq(gui._relaunch_source_pid([gui.RELAUNCH_FLAG, "4242"]), 4242,
+               "取到前任 PID")
+    _assert_eq(gui._relaunch_source_pid([gui.RELAUNCH_FLAG, "abc"]), 0,
+               "PID 写坏时退回 0（当普通启动，绝不 wait 一个不存在的进程）")
+    _assert_eq(gui._relaunch_source_pid([]), 0, "没有这个参数就不是重启拉起的")
+    _assert_eq(gui._relaunch_note([gui.RELAUNCH_FLAG, "1", gui.RELAUNCH_NOTE_MOVED]),
+               gui.RELAUNCH_NOTE_MOVED, "搬家那一次的重启原因读得出来")
+    _assert_eq(gui._relaunch_note([gui.RELAUNCH_FLAG, "1"]), "",
+               "权限变更那一次没有原因标记（话术各说各的，不互相冒充）")
+
+    # 3) 三条纪律只能在文本上钉住（跑一次就会真的拉起新进程/真的退出）
+    body = _code_only(gui.MainWindow._spawn_relaunch)
+    _assert("shell=True" not in body,
+            "自动重启不走 shell：命令行里有中文路径、空格、8.3 短名"
+            "（实机日志里就是 C:\\Users\\ADMINI~1\\...），过一层 shell 就多一层引号歧义")
+    _assert("_relaunch_workdir()" in body, "cwd 走唯一那个函数，不在这里各写一份")
+    _assert("RELAUNCH_FLAG" in body and "os.getpid()" in body,
+            "把「我是谁」交给新实例去观测（旧写法 timeout /t 2 是猜时长）")
+    _assert("_relaunch_note" in body or gui.RELAUNCH_NOTE_MOVED in body,
+            "重启原因跟着参数走，新实例才知道该说哪句话")
+    _assert("timeout" not in body.lower() and "cmd /c" not in body.lower(),
+            "不再用 cmd /c start + timeout 猜时长：真实判据是「前任进程没了」，"
+            "由新实例去观测（见 :func:`_wait_for_previous_instance`）")
+    cmd_src = _code_only(gui.MainWindow._relaunch_command)
+    _assert("return [sys.executable]" in cmd_src,
+            "打包态起的是自身可执行文件——onedir 下它是磁盘上的真实文件，"
+            "不再指向退出即删的临时解包目录")
+    _assert(0 <= cmd_src.index("frozen") < cmd_src.index("return [sys.executable]"),
+            "frozen 分支先返回，源码分支才用 __file__（两种形态各有各的启动路径）")
+
+
+def test_channel_failure_kind():
+    print("\n═══ R. 一路通道失败的种类：成因由文件的主人回答 ═══")
+    import site_adapters as _sa
+
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"riskbird": True, "aiqicha": False}), \
+         _patch(_sa, "ADAPTER_ERRORS",
+                {"riskbird": "FileNotFoundError: [Errno 30] Read-only file system",
+                 "aiqicha": "ModuleNotFoundError: No module named 'aiqicha_crawler_v2'"}):
+        _assert_eq(_sa.channel_failure_kind("riskbird"), "broken",
+                   "模块已经加载成功却在构造期抛 FileNotFoundError：文件明明在包里，"
+                   "说成「缺文件」就是把只读卷的环境问题报成发包缺陷")
+        _assert_eq(_sa.channel_failure_kind("aiqicha"), "missing",
+                   "模块压根没加载上、报的又是找不到模块：这是发包缺文件，两条证据同向")
+        _assert_eq(_sa.channel_failure_kind("qzd"), "", "没失败就不下结论")
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"aiqicha": False}), \
+         _patch(_sa, "ADAPTER_ERRORS", {"aiqicha": "FileNotFoundError: [Errno 2] "
+                                                   "No such file or directory"}):
+        _assert_eq(_sa.channel_failure_kind("aiqicha"), "missing",
+                   "同一句 FileNotFoundError，模块没加载上时它就是「包里有依赖但那个文件"
+                   "没进包」——判据必须看加载状态，只读异常文本会把两类故障说成同一句话")
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"aiqicha": False}), \
+         _patch(_sa, "ADAPTER_ERRORS", {"aiqicha": "ImportError: No module named 'cv2'"}):
+        _assert_eq(_sa.channel_failure_kind("aiqicha"), "missing",
+                   "缺依赖也是「东西没进包」这一类（发包方要查的是清单，不是用户权限）")
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"aiqicha": False}), \
+         _patch(_sa, "ADAPTER_ERRORS", {"aiqicha": "OSError: [Errno 13] Permission denied"}):
+        _assert_eq(_sa.channel_failure_kind("aiqicha"), "broken",
+                   "非 import 期的错误不算缺文件（本机加载不出）")
+    import b2bcollect_gui as gui
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"riskbird": True, "aiqicha": True}), \
+         _patch(_sa, "ADAPTER_ERRORS", {"riskbird": "FileNotFoundError: x",
+                                        "aiqicha": "FileNotFoundError: y"}):
+        _assert_eq(gui.MainWindow._lost_channels_kinds(("riskbird", "aiqicha")), {"broken"},
+                   "两路同一成因只得到一个种类（界面据此只说一句结论）")
+        _assert("磁盘只读" in gui.MainWindow._lost_channels_reason(("riskbird", "aiqicha")),
+                "全是 broken 时把「只读/不可写」这一类摆在话术里，不让人去查网络")
+    with _patch(_sa, "_LIST_CHANNEL_LOADED", {"riskbird": False, "aiqicha": True}), \
+         _patch(_sa, "ADAPTER_ERRORS", {"riskbird": "ModuleNotFoundError: x",
+                                        "aiqicha": "AttributeError: y"}):
+        _assert("缺了、或本机加载不出" in gui.MainWindow._lost_channels_reason(
+            ("riskbird", "aiqicha")),
+            "两种成因并存时退回覆盖得下的那句，不替某一路下结论")
+    # 判据本体出问题也不能把界面带崩
+    with _patch(_sa, "channel_failure_kind", lambda s: (_ for _ in ()).throw(RuntimeError("x"))):
+        _assert_eq(gui.MainWindow._lost_channels_kinds(("riskbird",)), {"unknown"},
+                   "判据自身抛异常时退化成 unknown，界面照常起得来")
+
+
+def test_app_translocation_relocation():
+    print("\n═══ S. Mac 只读副本：识别得出，也能一次点完搬家 ═══")
+    import plistlib
+
+    root = Path(tempfile.mkdtemp(prefix="relocate_"))
+    home = root / "home"
+    apps = home / "Applications"
+    apps.mkdir(parents=True)
+
+    def mkapp(p, bid="com.b2bcollect.tool", ver="1.0"):
+        (p / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+        (p / "Contents" / "Info.plist").write_bytes(plistlib.dumps(
+            {"CFBundleIdentifier": bid, "CFBundleShortVersionString": ver,
+             "CFBundleExecutable": "B2bCollectTool"}))
+        (p / "Contents" / "MacOS" / "B2bCollectTool").write_text("MZ", encoding="utf-8")
+        return p
+
+    running = mkapp(root / "AppTranslocation" / "UUID-XYZ" / "B2bCollectTool.app")
+    source = mkapp(home / "Downloads" / "B2bCollectTool.app")
+    K = dict(app=running, home=home, apps_dir=apps, platform="darwin")
+
+    plan = tc.app_migration_plan(**K)
+    _assert_eq(plan["status"], "ready", "只读副本 + 下载目录里有同一份 = 可以由工具代做")
+    _assert_eq(plan["source"], source, "源就是实测到的那一份，不靠猜文件名")
+    _assert_eq(Path(str(plan["dest_exe"])), apps / "B2bCollectTool.app" / "Contents" /
+               "MacOS" / "B2bCollectTool", "新位置的可执行路径由 Info.plist 算出")
+
+    # 四种「不许动手」的形态各有一条独立判据（每一种都是能损坏用户数据的方向）
+    stash = [0]
+
+    def _clear_dest():
+        """把「应用程序」里那份挪走：每颗反例都从目标位置是空的起步。"""
+        d = apps / "B2bCollectTool.app"
+        if d.exists():
+            stash[0] += 1
+            d.rename(root / f"stash{stash[0]}.app")
+
+    mkapp(apps / "B2bCollectTool.app", bid="com.someone.else")
+    _assert_eq(tc.app_migration_plan(**K)["status"], "name_taken",
+               "目标位置有同名但不同产品的包时绝不动手（同名不是证据）")
+    _clear_dest()
+    mkapp(apps / "B2bCollectTool.app", bid="com.b2bcollect.tool", ver="9.9")
+    _assert_eq(tc.app_migration_plan(**K)["status"], "name_taken",
+               "目标位置已有同产品但版本不同：不覆盖、不删除，交回给用户决定")
+    _clear_dest()
+    running_no_id = mkapp(root / "AppTranslocation" / "UUID-2" / "B2bCollectTool.app")
+    (running_no_id / "Contents" / "Info.plist").write_bytes(plistlib.dumps(
+        {"CFBundleExecutable": "B2bCollectTool"}))
+    got = tc.app_migration_plan(app=running_no_id, home=home, apps_dir=apps,
+                                platform="darwin")
+    _assert_eq(got["status"], "unknown_identity", "读不到包标识就承认无法证明，不猜")
+
+    mkapp(apps / "B2bCollectTool.app", bid="com.b2bcollect.tool")   # 同一份已在应用程序里
+    _assert_eq(tc.app_migration_plan(**K)["status"], "already_installed",
+               "已经装好了就说「从那里打开」，不再给一个会失败的搬家按钮")
+    _clear_dest()
+    source.rename(root / "moved-away.app")
+    _assert_eq(tc.app_migration_plan(**K)["status"], "no_source",
+               "在有限的几个用户目录里没找到同一份时实话实说（绝不做全盘搜索）")
+    root_app = mkapp(home / "B2bCollectTool.app", bid="com.b2bcollect.tool")
+    _assert_eq(tc.app_migration_plan(**K)["status"], "ready", "家目录根上也算候选（深度一层）")
+    mkapp(home / "Desktop" / "B2bCollectTool.app", bid="com.b2bcollect.tool")
+    got = tc.app_migration_plan(**K)
+    _assert_eq(got["status"], "ambiguous", "多份副本时不替用户猜搬哪一个")
+    _assert(got["detail"].count("B2bCollectTool.app") >= 2,
+            f"两份都逐字列在细节里，用户才知道要去处理谁（实际={got['detail']}）")
+    root_app.rename(home / "Desktop" / "extra.app")      # 只剩桌面那一份
+    _assert_eq(tc.app_migration_plan(**K)["status"], "ready", "去掉一份就不再含糊")
+    _assert_eq(tc.app_migration_plan(**{**K, "platform": "win32"})["status"], "not_mac",
+               "非 macOS 直接判「没这回事」（搬家这件事是 Mac 专属）")
+    _assert_eq(tc.app_migration_plan(app=home / "Desktop" / "B2bCollectTool.app", home=home,
+                                     apps_dir=apps, platform="darwin")["status"],
+               "not_translocated", "不是从只读副本启动的，就不给搬家入口")
+
+    # 执行层：同卷改名真能搬成；源没了、目标已存在都不许判成功
+    got = tc.app_migration_plan(app=running, home=home, apps_dir=apps, platform="darwin")
+    src_now, dest_now = got["source"], got["dest"]
+    ok, why = tc.move_app_bundle(src_now, dest_now)
+    _assert(ok and Path(str(got["dest_exe"])).is_file() and not src_now.exists(),
+            "同卷改名真搬得动，且源目录不残留半个副本"
+            + ("" if ok else f"（失败原因：{why}）"))
+    again = tc.move_app_bundle(src_now, dest_now)
+    _assert(not again[0], "源已经不在了再搬一次必须判失败，绝不能把「不存在」当成功")
+    other = mkapp(home / "Desktop" / "second.app")
+    ok2, why2 = tc.move_app_bundle(other, dest_now)
+    _assert(not ok2 and "不覆盖" in why2, f"目标已存在时拒绝动手并说清原因：{why2}")
+    _assert(other.is_dir(), "拒绝的时候源目录一定还在（不许留下半个搬家现场）")
+
+    # 界面侧：链接永远给，但话术跟着判据变；判据自身出问题也不能带崩界面
+    import b2bcollect_gui as gui
+    with _patch(tc, "app_migration_plan", lambda: {"status": "ready", "dest": apps}):
+        _assert("帮我移进" in gui.MainWindow._app_relocate_link(),
+                "能代做时链接就承诺代做，不写「请你自己拖」")
+    with _patch(tc, "app_migration_plan", lambda: {"status": "no_source"}):
+        _assert("在访达里打开" in gui.MainWindow._app_relocate_link(),
+                "做不了时链接只承诺指路，不假装一键搞定")
+    with _patch(tc, "app_migration_plan",
+                lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
+        _assert("在访达里打开" in gui.MainWindow._app_relocate_link(),
+                "判据抛异常时退回最保守的那句（一条提醒绝不能把界面带崩）")
+
+    class _Fake:
+        def __init__(self):
+            self.called = []
+
+        def _acl_prompt_restart(self):
+            self.called.append("restart")
+
+        def _offer_app_relocation(self):
+            self.called.append("relocate")
+
+    f = _Fake()
+    gui.MainWindow._on_banner_link(f, "#app-relocate")
+    gui.MainWindow._on_banner_link(f, "#acl-restart")
+    gui.MainWindow._on_banner_link(f, "#什么都不知道")
+    _assert_eq(f.called, ["relocate", "restart"],
+               "两个动作各自分派、未知动作静默忽略（横幅加新链接不该炸界面）")
+    # reveal_in_finder 只在 macOS 上真的去开访达：其它平台必须原样返回 False，
+    # 离线机器上谁都不该因为一条提醒拉起一个外部进程（判据先于动作，不靠 except 兜）
+    old_platform = sys.platform
+    try:
+        sys.platform = "win32"
+        _assert_eq(tc.reveal_in_finder([apps]), False,
+                   "非 macOS 不碰 /usr/bin/open")
+    finally:
+        sys.platform = old_platform
+    _assert("shell=True" not in inspect.getsource(tc.reveal_in_finder)
+            and "/usr/bin/open" in inspect.getsource(tc.reveal_in_finder),
+            "开访达走绝对路径 + 参数列表，不过 shell（中文路径与引号歧义不值得再冒一次险）")
+    _assert("app_relocate_link" in inspect.getsource(gui.MainWindow._warn_read_only_runtime),
+            "播报只读副本的那一屏同时给出出口（只提示不给办法等于让人烦躁）")
+
+
+def test_path_discipline_gate():
+    print("\n═══ T. 落点纪律门禁：发包前就得认出「数据写进应用包里」 ═══")
+    # 为什么这条门禁值得单独一类退出码：本轮 Mac 崩的那句 Errno 30 只是同一条纪律最
+    # 响亮的下场，另外三种写法（整包可写时把数据塞进 .app、Windows 写进退出即删的
+    # _MEI、界面报「已保存」而文件下次开机不见了）在界面上**一点痕迹都没有**。凭
+    # 证链与网络全绿的产物照样能带病发货，所以它必须让 --acl-doctor 的退出码也变红。
+    root = Path(tempfile.mkdtemp(prefix="pathgate_"))
+    app = root / "B2bCollectTool.app"
+    macos = app / "Contents" / "MacOS"
+    macos.mkdir(parents=True)
+    (macos / "B2bCollectTool").write_text("MZ", encoding="utf-8")
+    old = (sys.platform, sys.executable, getattr(sys, "frozen", None))
+    try:
+        sys.platform = "darwin"
+        sys.frozen = True
+        sys.executable = str(macos / "B2bCollectTool")
+
+        code0, lines0 = ag._path_discipline(frozen=True)
+        _assert_eq(code0, ag.DOCTOR_EXIT_OK, "候选与实际落点都在包外时判绿（不误伤好包）")
+        _assert(any("落点纪律" in l for l in lines0),
+                f"绿也要在报告里留一行，否则下次没人记得这道门在不在（实际={lines0}）")
+
+        # 旧写法「exe 同级 = Contents/MacOS 也进候选链」：判据必须认出来并点名。
+        # 这里**只**改候选链、不改 inside_app_bundle：后者既是排除规则又是这道门禁的
+        # 判据，整体打桩会把两边一起打掉（自废武功式的假绿），那正是 7a0 立条要避免的。
+        with _patch(tc, "state_dir_candidates", lambda subdir="": [macos / tc.STATE_DIR_NAME]):
+            code1, lines1 = ag._path_discipline(frozen=True)
+        _assert_eq(code1, ag.DOCTOR_EXIT_PATH, "候选链里出现包内那一级时直接判红（不许发货）")
+        _assert(any(str(macos) in l or str(macos.resolve()) in l for l in lines1),
+                f"红的那一段必须点名是哪一处（实际={lines1}）")
+        _assert(any("test_data_dir_offline" in l for l in lines1),
+                "报告要给下一步该做什么（离线判据在哪、按形态排除是什么意思）"
+                f"（实际={lines1}）")
+
+        # 包内判定必须对同一个目录的两种拼写都成立：macOS 上 /var 是 /private/var 的
+        # 软链，而 App Translocation 就发生在 /private/var/folders 这一棵上。只认其中
+        # 一种拼写（一边 resolve 一边不 resolve），这条纪律恰好会在最需要它的那台机器
+        # 上把包内判成包外——本轮给自检加这道门时就是这样实测出来的。
+        _assert(tc.inside_app_bundle(macos / tc.STATE_DIR_NAME)
+                and tc.inside_app_bundle(macos.resolve() / tc.STATE_DIR_NAME),
+                "包内判定对软链两种拼写都成立（比较前统一 resolve）")
+        _assert(not tc.inside_app_bundle(app.parent / tc.STATE_DIR_NAME),
+                "包旁那个目录不算包内（否则包旁这一级会被自己排除掉，退路全断）")
+
+        # 只看候选链不够：真正选中的落点在包内同样要红（探针运气挑出包内路径那种形态）
+        with _patch(tc, "state_dir", lambda subdir="": macos / tc.STATE_DIR_NAME):
+            code2, lines2 = ag._path_discipline(frozen=True)
+        _assert_eq(code2, ag.DOCTOR_EXIT_PATH, "实际落点跑进包里同样判红（不靠「候选看着干净」）")
+
+        # 源码态不判红：开发机的数据本来就该待在仓库目录里（与 N 节通道口径同一纪律）
+        with _patch(tc, "state_dir_candidates",
+                    lambda subdir="": [macos / tc.STATE_DIR_NAME]):
+            code3, _ = ag._path_discipline(frozen=False)
+        _assert_eq(code3, ag.DOCTOR_EXIT_OK, "源码态只报现状不判红（别把开发机拖成红灯）")
+
+        # 新类别的三件配套事：有码、进了全表、帮助里念得出名字
+        _assert(ag.DOCTOR_EXIT_PATH not in {v[0] for v in ag._DOCTOR_KINDS.values()},
+                "落点违规不许混进「服务故障分类表」（那三张表说的是服务为什么连不上）")
+        _assert(ag.DOCTOR_EXIT_PATH in {c for c, _ in ag._DOCTOR_EXIT_TABLE},
+                "退出码进了常量却没进全表 = --doctor 帮助里它没名字（上一轮就吃过这亏）")
+        _assert("9" in ag.DOCTOR_EXIT_HELP and "落点违规" in ag.DOCTOR_EXIT_HELP,
+                f"帮助文本要数得出这一类（实际={ag.DOCTOR_EXIT_HELP}）")
+        src = _code_only(ag.doctor_lines)
+        _assert("_path_discipline" in src and "path_code" in src,
+                "自检必须真的调用这道门禁并把它的码并进结论（只写函数不调用＝门开着）")
+    finally:
+        sys.platform, sys.executable = old[0], old[2]
+        if old[1] is None:
+            sys.__dict__.pop("frozen", None)
+        else:
+            sys.frozen = old[1]
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     print("═══ 打包态交付链 离线测试 ═══")
     test_config_chain()
@@ -2030,6 +2668,12 @@ def main():
     test_doctor_flag_parity()
     test_workflow_shell_syntax()
     test_packaging_manifest_gate()
+    test_windows_onedir_delivery()
+    test_state_file_never_relative_cwd()
+    test_relaunch_chain_off_the_bundle()
+    test_channel_failure_kind()
+    test_app_translocation_relocation()
+    test_path_discipline_gate()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 

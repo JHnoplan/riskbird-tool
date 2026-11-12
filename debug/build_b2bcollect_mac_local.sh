@@ -112,6 +112,7 @@ fi
   --add-data "../riskbird_build/chrome_driver.py:riskbird_build" \
   --add-data "../riskbird_build/riskbird_crawler_v2.py:riskbird_build" \
   --add-data "../riskbird_build/aiqicha_crawler_v2.py:riskbird_build" \
+  --add-data "../riskbird_build/runtime_paths.py:riskbird_build" \
   "${DRIVER_ARG[@]+"${DRIVER_ARG[@]}"}" \
   b2bcollect_gui.py
 
@@ -127,8 +128,17 @@ set +e
 "$APP" --acl-doctor
 RC=$?
 set -e
-LOG="dist/b2bcollect_state/acl_doctor.txt"
-[ -f "$LOG" ] && cat "$LOG" || true
+# 报告文件按「刚被写过」来find，而不是写死 dist/b2bcollect_state：自检报告的落点
+# 由 tool_config.state_dir 的候选链算出来（环境变量、包旁、exe 同级、用户目录…），
+# 口径或布局一变，写死的那条路径就静默 cat 不到任何东西——门禁还是对的，但远程排障
+# 时少了一份可以直接发给发包方的原文。Windows 那一步早就是查找而不是写死，两边同规矩。
+LOG=$(find dist -name acl_doctor.txt -mmin -10 2>/dev/null | head -1)
+if [ -n "${LOG:-}" ]; then
+  echo "· 自检报告原文：$LOG"
+  cat "$LOG"
+else
+  echo "· （没找到本次的 acl_doctor.txt，以上面的标准输出为准）"
+fi
 if [ "$RC" -ne 0 ]; then
   echo "❌ 产物自检未通过（退出码 $RC，报告见上）：这个包发出去只会是精简版，别外发"
   exit "$RC"

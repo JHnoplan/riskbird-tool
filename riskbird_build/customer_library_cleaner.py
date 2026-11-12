@@ -57,6 +57,11 @@ SOURCE_FIELDS = {
     "微信号": ("微信号", "微信"),
     "官网": ("官网", "网址", "企业网址"),
     "地址": ("地址", "注册地址", "通信地址"),
+    "主营": ("主营", "主营产品", "主营商品", "经营范围"),
+    "行业": ("行业", "所属行业"),
+    "国家": ("国家",),
+    "经营模式": ("经营模式",),
+    "所在区域": ("所在区域", "区域"),
     "状态": ("状态",),
     "数据来源": ("数据来源",),
     "备注": ("备注",),
@@ -280,7 +285,8 @@ def _join_all(values, sep=","):
 
 
 def _remark(fields: dict):
-    """备注：状态说明 + 官网 + 地址摘要（+ 外部数据自带的备注列），供外呼人员参考。"""
+    """备注：状态说明 + 官网 + 地址摘要 + 主营/行业/国家/经营模式（结构化字段显式写入，
+    不依赖备注透传，避免跨平台合并时信息丢失），供外呼人员参考。"""
     pieces = []
     status = fields.get("状态", "")
     if status and status not in ("存续", "在业", "开业", "正常"):
@@ -291,11 +297,20 @@ def _remark(fields: dict):
     addr = fields.get("地址", "")
     if addr:
         pieces.append(f"地址:{addr[:50]}")
+    # ── 结构化字段显式写入备注（主营/行业/国家/经营模式/区域）──
+    for field_key, prefix in [("主营", "主营"), ("行业", "行业"),
+                               ("国家", "国家"), ("经营模式", "经营模式")]:
+        val = fields.get(field_key, "")
+        if val and f"{prefix}:" not in (fields.get("备注", "") or ""):
+            pieces.append(f"{prefix}:{val}")
+    region = fields.get("所在区域", "")
+    if region and "区域:" not in (fields.get("备注", "") or ""):
+        pieces.append(f"区域:{region}")
     own = fields.get("备注", "")
     if own:
         pieces.append(own)
     remark = " | ".join(pieces)
-    return remark[:180]
+    return remark[:300]
 
 
 def fill_bare_area_code(landlines: list):
@@ -522,7 +537,7 @@ def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=pr
 
 # 对外清洗只关心这些规范字段（其余列一律归入「未识别」）
 EXTERNAL_FIELDS = ("公司名", "联系人", "岗位", "电话", "邮箱", "微信号",
-                   "官网", "地址", "状态", "数据来源", "备注")
+                   "官网", "主营", "行业", "国家", "地址", "状态", "数据来源", "备注")
 
 # 可以吃多列的字段：同一类联系方式分两列装（“手机号”+“固话”）时必须全部拿到。
 # 公司名/联系人/岗位不在名单里：拼在一起会变成“张三;李四”这种坏客户名称。
@@ -546,6 +561,11 @@ EXTERNAL_ALIASES = {
     "微信号": (("微信号", "微信", "wechat", "weixin", "wx号", "wxid"), ()),
     "官网": (("公司网站", "企业网站", "官方网站", "官网网址", "公司网址", "企业网址",
                 "网址", "网站", "website", "url", "web"), ("官网", "站点")),
+    "主营": (("主营", "经营范围", "业务范围", "产品与服务", "经营产品", "business scope",
+              "main products", "main business", "products"),
+             ("产品", "业务")),
+    "行业": (("行业", "industry", "sector"), ("领域", "category")),
+    "国家": (("国家", "国别", "country", "nation"), ()),
     "地址": (("公司地址", "企业地址", "单位地址", "通信地址", "注册地址", "办公地址",
                 "详细地址", "联系地址", "地址", "address", "addr"),
              ("地区", "所在地", "所在区域", "区域")),
@@ -559,8 +579,8 @@ EXTERNAL_ALIASES = {
 # 这些列对入库没用（序号/注册资本/统一社会信用代码等），即使包含“名称/号码”也不给认
 EXTERNAL_IGNORE = ("序号", "编号", "行号", "水号", "税号", "统一社会信用代码", "信用代码",
                    "组织机构代码", "工商注册号", "注册资本", "实缴资本", "成立日期", "成立时间",
-                   "核准日期", "营业期限", "参保人数", "人员规模", "所属行业", "行业",
-                   "企业类型", "类型", "币种", "经营范围", "登记机关", "邮编", "邮政编码",
+                   "核准日期", "营业期限", "参保人数", "人员规模",
+                   "企业类型", "类型", "币种", "登记机关", "邮编", "邮政编码",
                    "postal", "zip", "传真", "fax", "qq", "二维码", "标签", "分组", "创建时间",
                    "更新时间", "修改时间", "操作人", "评分", "风险", "诉讼", "商标", "专利",
                    "登录密码", "账号密码", "附件", "图片")
@@ -691,6 +711,76 @@ def _is_status(v: str) -> bool:
     return True
 
 
+# 行业分类值（国民经济行业分类门类 + 常见行业词）。2~4 字纯中文行业名（"制造业"
+# "批发业"）会命中 _EXT_PERSON_RE 被抢成联系人——与状态/省市名同一类"短枚举值
+# 列"陷阱：新枚举字段必须同时给内容分并在人名判定里排除。
+_INDUSTRY_WORDS = frozenset(
+    "制造业 批发业 零售业 建筑业 采矿业 金融业 房地产 农业 林业 牧业 渔业 "
+    "教育 医疗 医药 卫生 体育 餐饮 住宿 物流 运输 旅游 新能源 新材料 "
+    "光伏 风电 储能 半导体 电子 通信 互联网 电商 人工智能 大数据 云计算 "
+    "机械 化工 化纤 纺织 服装 冶金 电力 环保 航空 航天 船舶 汽车 五金 "
+    "塑胶 包装 印刷 食品 饮料 矿产 石油 天然气".split()
+)
+_INDUSTRY_TAIL_RE = re.compile(
+    r"(?:业|服务|科技|贸易|制造|工程|设计|咨询|传媒|能源|环保|物流|电商|互联网|"
+    r"信息技术|电子|通信|医药|医疗|教育|金融|地产|建筑|化工|纺织|服装|机械|汽车|"
+    r"光伏|半导体|软件|生物|农业|矿产|石油|天然气)$"
+)
+
+
+def _is_industry(v: str) -> bool:
+    """是否是行业分类值：制造业 / 批发和零售业 / 信息技术服务业 / 新能源。"""
+    if not v or len(v) > 20:
+        return False
+    if v in _INDUSTRY_WORDS:
+        return True
+    return bool(_INDUSTRY_TAIL_RE.search(v))
+
+
+# 国家/地区名（中英文）。"中国""美国""Germany" 会命中 _EXT_PERSON_RE 被抢成联系人。
+_COUNTRY_NAMES = frozenset(
+    "中国 美国 英国 德国 法国 意大利 西班牙 荷兰 比利时 瑞士 瑞典 挪威 丹麦 芬兰 "
+    "波兰 捷克 奥地利 匈牙利 罗马尼亚 希腊 葡萄牙 爱尔兰 俄罗斯 乌克兰 土耳其 "
+    "日本 韩国 朝鲜 蒙古 印度 越南 泰国 缅甸 柬埔寨 老挝 马来西亚 新加坡 印尼 "
+    "菲律宾 巴基斯坦 孟加拉 斯里兰卡 尼泊尔 伊朗 伊拉克 沙特 阿联酋 卡塔尔 科威特 "
+    "以色列 约旦 埃及 利比亚 突尼斯 摩洛哥 阿尔及利亚 尼日利亚 南非 肯尼亚 加纳 "
+    "加拿大 墨西哥 巴西 阿根廷 智利 哥伦比亚 秘鲁 澳大利亚 新西兰 古巴".split()
+    + [
+        "china", "prc", "usa", "us", "uk", "uae", "united states",
+        "united kingdom", "united arab emirates", "germany", "france", "italy",
+        "spain", "netherlands", "belgium", "switzerland", "sweden", "norway",
+        "denmark", "finland", "poland", "czech", "austria", "hungary",
+        "romania", "greece", "portugal", "ireland", "russia", "ukraine",
+        "turkey", "japan", "korea", "south korea", "india", "vietnam",
+        "thailand", "myanmar", "cambodia", "malaysia", "singapore",
+        "indonesia", "philippines", "pakistan", "bangladesh", "iran", "iraq",
+        "saudi arabia", "qatar", "kuwait", "israel", "egypt", "nigeria",
+        "south africa", "kenya", "ghana", "canada", "mexico", "brazil",
+        "argentina", "chile", "colombia", "peru", "australia", "new zealand",
+        "taiwan", "hong kong", "macau",
+    ]
+)
+
+
+def _is_country(v: str) -> bool:
+    """是否是国家/地区名：中国 / 美国 / Germany / United States。"""
+    if not v:
+        return False
+    low = v.strip().lower()
+    return low in _COUNTRY_NAMES or v.strip() in _COUNTRY_NAMES
+
+
+def _is_product_desc(v: str) -> bool:
+    """主营/经营范围类值：4 字以上的业务描述（排除联系方式/公司名/人名等干扰值）。"""
+    if not v or len(v) < 4:
+        return False
+    if _is_phone(v) or _is_email(v) or _is_url(v) or _is_company(v):
+        return False
+    if _is_person(v) or _is_address(v):
+        return False
+    return True
+
+
 def _is_person(v: str) -> bool:
     if not v or not _EXT_PERSON_RE.match(v):
         return False
@@ -699,6 +789,10 @@ def _is_person(v: str) -> bool:
     # 中国省市名不是人名（实测「省份」列填「海南」「广东」被 _EXT_PERSON_RE 的 2 字中文
     # 匹配当成联系人，客户名称整列变成省份名）
     if v.strip() in _CN_PROVINCE_CITY_NAMES:
+        return False
+    # 行业/国家枚举值（"制造业""中国""Germany"）不是人名，
+    # 否则行业/国家列被抢成联系人
+    if _is_industry(v) or _is_country(v):
         return False
     return True
 
@@ -753,6 +847,15 @@ def content_score(field: str, values: list) -> float:
         # 状态列的表头「状态」只是弱别名（39 分够不到 40 的录用线），全靠内容把它认领，
         # 否则这一列会被「存续」像人名这点抢去当联系人。
         return 100 * _ratio(values, _is_status)
+    if field == "主营":
+        # 主营是长文本业务描述（"光伏组件、储能系统研发销售"），弱表头（"产品"39 分）
+        # 要靠内容越过录用线；同时防止主营列被联系人内容分抢走
+        return 100 * _ratio(values, _is_product_desc)
+    if field == "行业":
+        # 行业枚举值（"制造业"）像人名，必须靠内容分把列认领回去
+        return 100 * _ratio(values, _is_industry)
+    if field == "国家":
+        return 100 * _ratio(values, _is_country)
     # 岗位/微信号/备注/数据来源靠内容猜不出来，只看表头
     return 0.0
 

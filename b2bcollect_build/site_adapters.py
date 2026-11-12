@@ -28,8 +28,8 @@ from typing import Dict
 # ali1688_build / riskbird_build 的源文件与 chromedriver。frozen 时：
 #   · 外部模块树根 _ROOT 指向 sys._MEIPASS（--add-data 已把 ali1688_build/、
 #     riskbird_build/ 各自的 .py 解到此处，跨目录 import 才能命中）；
-#   · 本工具可写数据基准 _HERE 指向 exe 同级目录（_MEIPASS 是临时目录、退出即清，
-#     b2bcollect_data 里的种子库/进度等持久数据绝不能写在那）。
+#   · 本目录基准 _HERE 指向 exe 同级目录——**它不再是数据落点**：_MEIPASS 是临时目录、
+#     退出即清，落点只问 :func:`_writable_data_dir`（口径在 cdp_base 那一份里）。
 if getattr(sys, "frozen", False):
     _APP_DIR = Path(sys.executable).resolve().parent
     _HERE = _APP_DIR
@@ -40,28 +40,19 @@ else:
 
 
 def _writable_data_dir():
-    """持久数据目录：先试 exe 同级，写不动就退用户主目录。
+    """本工具持久数据目录：实现只在 :meth:`cdp_base.CdpSiteCrawler._stable_data_dir` 一处。
 
-    macOS 被 Gatekeeper 隔离的 .app 会从只读随机路径（App Translocation）启动，
-    这时 exe 同级在包内且不可写，裸 mkdir 直接 PermissionError 把程序带走；
-    与 cdp_base._stable_data_dir 同一策略：Mac .app 优先放包旁边的可见目录，
-    先写探针文件验可写，不行再退 ~/.b2bcollect。
+    这里保留一个同名函数是因为**调用方按这个名字用它**（``local_scan._forbidden_dirs``
+    拿它来排除「扫到自己产物」的目录，本模块的 1688 通道也覆写父类时用它的结果），
+    删掉就是让那两个调用方各写一份落点。以前这里与 cdp_base 各有一份一模一样的候选
+    链，2026-11-12 全局自审时两份都要各自补齐「按形态排除包内」和「最后一级临时目录」
+    ——同一个形状存两份的结果就是每修一次都得记得修两处，而「记得」从来不是保障。
+    现在这个形状在本目录只有一份实现；跨目录那一侧（riskbird_build/runtime_paths.py）
+    因为独立运行的 1688/风鸟工具不能依赖本目录，仍是另一份，两边由离线回归钉住不再
+    分叉——test_data_dir_offline.py 第 1、2、3、8 节把五路采集器与状态目录逐字比对
+    同一组期望，谁改出自己的说法就会红在哪一路。
     """
-    if (getattr(sys, "frozen", False) and sys.platform == "darwin"
-            and _HERE.parent.parent.name.endswith(".app")):
-        primary = _HERE.parent.parent.parent / "b2bcollect_data"
-    else:
-        primary = _HERE / "b2bcollect_data"
-    for d in (primary, Path.home() / ".b2bcollect" / "b2bcollect_data"):
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            probe = d / ".write_test"
-            probe.write_text("1", encoding="utf-8")
-            probe.unlink()
-            return d
-        except Exception:
-            continue
-    return primary
+    return cdp_base.CdpSiteCrawler._stable_data_dir()
 
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
@@ -73,6 +64,8 @@ except ImportError:
 import customer_library_cleaner as _cleaner  # noqa: F401  先进 sys.modules 防遮蔽
 import shared_chrome as _sc                 # noqa: F401
 import province_filter as _pf               # 属地判定词表（1688/企知道通道的省份核验用）
+import tool_config as _tc                   # 落点口径本体（.app 形态判定只许问一处）
+import cdp_base                             # 数据落点只有一份实现，在本模块里也是它定的
 
 for _p in (str(_ROOT / "ali1688_build"), str(_ROOT / "riskbird_build")):
     if _p not in sys.path:
@@ -100,6 +93,9 @@ EXTERNAL_MODULES = (
     "riskbird_build/chrome_driver.py",
     "riskbird_build/riskbird_crawler_v2.py",
     "riskbird_build/aiqicha_crawler_v2.py",
+    # 三个采集器共用的「可写数据落点」口径：漏了它不是少一个平台，而是**开机即崩**
+    # （v2 采集器顶层 import 它），所以它与采集器本身同级进清单，由同一道构建前硬门看着。
+    "riskbird_build/runtime_paths.py",
 )
 
 # 名单补采通道里「产品上就该有」的那几路。这里只回答**代码在不在**，不回答
@@ -165,6 +161,45 @@ try:
     HAS_AQC = True
 except Exception as _e:
     print(f"[site_adapters] ⚠ 爱企查适配器不可用：{_adapter_fail('aiqicha', _e)}", flush=True)
+
+# 各路采集器**模块本身**是否 import 成功。它和 LIST_CHANNEL_AVAILABLE 不是一回事：
+# 这一张只回答「文件在不在包里」，那一张回答「这一路现在能不能用」。两张分开，
+# 才可能把「发包漏文件」与「本机环境起不来」这两种成因说清楚（判据见下面两个函数）。
+_LIST_CHANNEL_LOADED = {"qzd": HAS_QZD, "riskbird": HAS_RB, "aiqicha": HAS_AQC}
+
+# 「这一路要找的模块没进包」这一类异常的开头。它们**自身**就是证据（异常文本说的
+# 就是「某个 .py/.so 找不到」），不需要 import 快照来否决；见 channel_failure_kind。
+_IMPORT_ERROR_HEADS = ("ModuleNotFoundError", "ImportError")
+
+
+def channel_module_loaded(slug: str) -> bool:
+    """这一路的采集器模块 import 成功了没有（与它能不能被创建无关）。"""
+    return bool(_LIST_CHANNEL_LOADED.get(slug))
+
+
+def channel_failure_kind(slug: str) -> str:
+    """这一路失败的种类：``missing`` / ``broken`` / ``""``（没失败）。
+
+    为什么这个判定必须由本模块回答、而不是由界面猜异常类型：
+      · ``ModuleNotFoundError`` / ``ImportError`` 一律是 missing：异常文本说的就是
+        「某个模块不在包里」，采集器自己不在、还是它的依赖（selenium/cv2）不在，
+        对发包方都是同一件事——补 --add-data / --hidden-import；
+      · ``FileNotFoundError`` **有歧义**，所以只有它需要 import 快照来定夺：模块没
+        加载上时它指包里没有这个文件（missing）；模块明明已经 import 成功（文件必然
+        在包里）时它指的是运行期某个可写目录/字体拿不到——2026-11-12 Mac 实机就是
+        这一类，只读转置卷上写不出 Cookie 目录，按异常类型报成「安装包缺文件」会把
+        发包方指到打包清单上去查，而真正该改的是采集器的数据落点口径（broken）；
+      · 其余异常（OSError 只读、AttributeError 缺模板图……）都是「文件在、加载它的
+        时候环境炸了」＝ broken。
+    """
+    err = str(ADAPTER_ERRORS.get(slug) or "")
+    if not err:
+        return ""
+    if err.startswith(_IMPORT_ERROR_HEADS):
+        return "missing"
+    if err.startswith("FileNotFoundError") and not channel_module_loaded(slug):
+        return "missing"
+    return "broken"
 
 
 # ── 名单通道产出契约 ───────────────────────────────────────────
@@ -288,14 +323,27 @@ if HAS_1688:
         NEEDS_BROWSER = True          # 参与 start_browser 的共享 Chrome 保活
         HOME_DOMAIN = "1688.com"
 
+        @staticmethod
+        def _stable_data_dir():
+            """本通道持久数据的落点：只问 :func:`_writable_data_dir` 这一处。
+
+            父类 ``Ali1688Crawler.__init__`` 取的正是 ``self._stable_data_dir()``，
+            所以在这里覆写，而不是等父类建完目录再回 ``__init__`` 里改
+            ``self._data_dir``：后者会在 Windows 安装目录里凭空留下一个空的
+            ``ali1688_data``（父类的可写探针 mkdir 出来的），而说明书、卸载脚本、
+            发包前的运行期目录剔除清单对用户都只承诺「三个数据目录」。多出来那一个
+            不是笔误——它是「同一件事两份口径」在磁盘上的样子，用户照着文档找不到
+            东西时只会怀疑文档。种子库文件名另说：与原 1688 工具的库分开、互不污染。
+            """
+            return _writable_data_dir()
+
         def __init__(self, port=9255):
             super().__init__(debug_port=port)
             if _Signals1688 is not None:
                 self.signals = _Signals1688()
             self.pin_tab_id = ""      # Selenium 站不进 shared_chrome 的 CDP pin 表
-            # 种子库落在本工具数据目录（与原 1688 工具的库分开，互不污染）；
-            # 只读启动环境（App Translocation）下自动退到 ~/.b2bcollect
-            self._data_dir = _writable_data_dir()
+            # 种子库落在本工具数据目录里的独立文件名（落点见上面的 _stable_data_dir；
+            # 只读启动环境（App Translocation）下自动退到 ~/.b2bcollect）
             self._seen_store_path = self._data_dir / "seen_store_1688.json"
             # session 级量化账目（stats() 八键契约）
             self.stat_pages = 0
@@ -943,14 +991,10 @@ if HAS_RB:
             self._own_handle = None
             self._own_window_type = "tab"   # 与企知道同居一个窗口的一个标签（见 QizhidaoSite 注释）
             self._init_list_channel(delay=1.5)
-            # Cookie / 30 天列表缓存必须落在跨运行稳定的可写目录：基类写死在包内
-            # riskbird_data/，打包态那是 _MEIPASS 临时目录——每次启动丢登录、每天白烧额度。
-            try:
-                self._data_dir = _qzd_mod._stable_data_dir()
-                self._cookie_file = self._data_dir / "cookies.json"
-                self._cache_file = self._data_dir / "风鸟列表缓存.json"
-            except Exception:
-                pass
+            # Cookie / 30 天列表缓存的落点由采集器自己在构造时定（riskbird_build/
+            # runtime_paths.py：只读包内绝不落盘）。这里**不再**事后改一遍 _data_dir：
+            # 旧写法是在 super().__init__() 之后补救，而基类那句裸 mkdir 已经在前一步
+            # 抛过 OSError 了——补丁晚于事故，等于没有补丁（2026-11-12 Mac 崩溃实证）。
             self._load_card_cache()         # 命中缓存的公司不消耗当日模糊查询次数
 
         # ── 独占标签管理（共享 Chrome 纪律）───────────────────
@@ -1214,12 +1258,8 @@ if HAS_AQC:
             self._init_list_channel(delay=2.0)
             self.handoff = _BlockWaitSentinel()     # 见类注释③：让「等人工」有上限
             self.diag_dir = None
-            # Cookie 落跨运行稳定目录（基类写死包内 riskbird_data/，打包态会随临时目录消失）
-            try:
-                self._data_dir = _qzd_mod._stable_data_dir()
-                self._cookie_file = self._data_dir / "aiqicha_cookies.json"
-            except Exception:
-                pass
+            # Cookie 落点由基类构造时定（riskbird_build/runtime_paths.py），这里不再
+            # 事后改 _data_dir：与风鸟同一理由——基类那句裸 mkdir 早就在 super() 里跑过了。
 
         # ── 独占标签 ──────────────────────────────────────────
         def open_own_tab(self) -> bool:
@@ -1355,21 +1395,56 @@ LIST_CHANNEL_AVAILABLE = {"qzd": HAS_QZD, "riskbird": HAS_RB, "aiqicha": HAS_AQC
 from pending_companies import CHANNEL_LABELS as LIST_CHANNEL_LABELS  # noqa: E402
 
 
+def _list_channel_factory(slug):
+    """这一路的创建函数；**类本身没加载上来**时返回 None。
+
+    两类失败必须分开（同一条「② 只剩企知道」背后是两种完全不同的账）：
+      · 返回 None —— 顶层 import 就失败了，连类都没有，原因早在 import 那一步记进
+        ADAPTER_ERRORS，这里不该也不便再记一遍；
+      · 返回了函数、调用时抛异常 —— 文件都在，是本机环境让这一路起不来（只读卷、
+        被安全软件拦、缺字体），由 build_list_channels 逐路记账。
+    写成函数而不是 dict 字面量：三个类各自只在 HAS_* 为真时才存在，字典字面量会在
+    import 阶段就撞 NameError。
+    """
+    if slug == "qzd" and HAS_QZD:
+        return lambda port: QizhidaoSite(port=port)
+    if slug == "riskbird" and HAS_RB:
+        return lambda port: RiskbirdSite(port=port)
+    if slug == "aiqicha" and HAS_AQC:
+        return lambda port: AiqichaSite(port=port)
+    return None
+
+
 def build_list_channels(port=9255, slugs=None):
     """按需创建名单通道 {slug: 实例}：只建本机可用的平台。
 
     三平台共用同一份待采名单（PendingCompanyList 的 master），各自有独立游标，
     所以「100 家名单」= 每家平台都从第 1 家跑到第 100 家；采完在清洗层按公司名
     合并成一份文件，手机号/邮箱取并集（英文逗号分隔）。
+
+    **一路创建失败只降这一路，绝不带走整个工具**（2026-11-12 Mac 实机的形状：
+    风鸟构造期一个裸 mkdir 抛 OSError，异常穿过 parallel_session 与 MainWindow.__init__，
+    用户看到的是「双击没反应」而不是「风鸟这一路今天用不了」）。这里的口径：
+      · 记下原因（ADAPTER_ERRORS）并把该路标成不可用，让既有的「该有却没有」播报
+        自然接管——界面、tooltip、自检报告说的都是同一份事实，不另写一套话术；
+      · 已成功创建的通道照常返回，用户还能用剩下的路干活。
+    顶层的 import 失败之所以不这样处理，是因为那时连类都没有；这里失败的是**本机环境**
+    （只读卷、缺字体、被安全软件拦），本来就是逐路成立的判据。
     """
     out = {}
     for slug in (slugs or LIST_CHANNEL_SLUGS):
-        if slug == "qzd" and HAS_QZD:
-            out[slug] = QizhidaoSite(port=port)
-        elif slug == "riskbird" and HAS_RB:
-            out[slug] = RiskbirdSite(port=port)
-        elif slug == "aiqicha" and HAS_AQC:
-            out[slug] = AiqichaSite(port=port)
+        factory = _list_channel_factory(slug)
+        if factory is None:
+            continue
+        try:
+            out[slug] = factory(port)
+        except Exception as exc:
+            short = _adapter_fail(slug, exc)
+            LIST_CHANNEL_AVAILABLE[slug] = False
+            try:
+                print(f"⚠ {LIST_CHANNEL_LABELS.get(slug, slug)} 通道本次不可用：{short}")
+            except Exception:
+                pass      # --windowed 产物里 stdout 没人看，落进原因表就够了，绝不为打印再抛
     return out
 
 

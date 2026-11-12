@@ -169,7 +169,75 @@ def _split_add_data(token: str) -> tuple:
     return src.strip(), ""
 
 
-def check_caller(label: str, text: str, externals: tuple, modules: list) -> list:
+def trigger_paths(text: str) -> set:
+    """取 ``on.push.paths`` 里那几条 glob（只认 ``- 'xxx'`` 形式的列表项）。
+
+    不用 PyYAML：这一步跑在 pip 安装之前，多一个依赖就多一类「本机绿、CI 红」。
+    列表里允许有整行注释（我们真的写了注释），遇到第一个非列表项就收尾。
+    """
+    m = re.search(r"^[ \t]*paths:[ \t]*$", text, re.M)
+    if not m:
+        return set()
+    out = set()
+    for line in text[m.end():].splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        mm = re.match(r"-\s*['\"](.+?)['\"]\s*$", s)
+        if not mm:
+            break
+        out.add(mm.group(1))
+    return out
+
+
+def _is_source_add_data(src: str) -> bool:
+    """这条 --add-data 带的是**仓库里的源码**（改了就该重打包），还是现场下载的产物？
+
+    必须分开：chromedriver、drivers/ 这类二进制由 CI 步骤现下载，本地既不存在也
+    永远不会有人提交，把它们算进「该触发的目录」只会得到一条谁也修不了的假告警——
+    而一条修不了的告警会让整道门禁失去可信度。判据用「源码」这两个字本来的意思：
+    .py 文件，或者目录里确实有 .py。
+    """
+    if src.endswith(".py"):
+        return True
+    try:
+        target = (ROOT / src[3:]).resolve()
+    except Exception:
+        return False
+    return target.is_dir() and any(target.rglob("*.py"))
+
+
+def check_trigger_dirs(text: str, add_data: list) -> list:
+    """跨目录进包的那些目录，必须同时出现在 workflow 的触发 paths 里。
+
+    这是「少一个文件只少一个功能」的孪生缺陷——**产物过期**：改完
+    riskbird_build/riskbird_crawler_v2.py 却不触发重打包，CI 全绿、清单全对、
+    界面上报的却还是老逻辑，用户那边「明明修好了怎么还崩」。而且它的症状会被
+    当成「修复没生效＝修错了」，把人带去重新排查一条已经修完的链路。
+    判据取自 --add-data 自己：源码目录改了要重打包这件事，本来就是「它进了包」
+    的推论，所以不另立一张表（另立一张就会和清单漂移）。
+    """
+    problems = []
+    paths = trigger_paths(text)
+    if not paths:
+        return ["这个 workflow 读不到 on.push.paths（触发条件被改了？跨目录源码将无法带动重打包）"]
+    need = set()
+    for src, _dst in add_data:
+        if not src.startswith("../"):
+            continue                     # 本目录的改动天然在 b2bcollect_build/** 里
+        if not _is_source_add_data(src):
+            continue                     # CI 现场下载的二进制/驱动，没人提交它
+        top = src[3:].split("/")[0]
+        if top:
+            need.add(top + "/**")
+    for want in sorted(need - paths):
+        problems.append(f"on.push.paths 缺 {want}：这个目录的源码会进包，改了却不会触发重新打包"
+                        f"（产物永远带着旧代码，症状是「修好了但没生效」）")
+    return problems
+
+
+def check_caller(label: str, text: str, externals: tuple, modules: list,
+                 with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
     problems = []
     text = _strip_comments(text)
@@ -228,6 +296,10 @@ def check_caller(label: str, text: str, externals: tuple, modules: list) -> list
             continue
         if not (ROOT / src[3:]).exists():
             problems.append(f"--add-data 指向的源码不存在：{src}")
+
+    # 6) 只有 workflow 才有触发条件：跨目录源码进了包，就必须能带动重打包。
+    if with_triggers:
+        problems += check_trigger_dirs(text, add_data)
     return problems
 
 
@@ -254,7 +326,8 @@ def main(argv=None) -> int:
             bad += 1
             continue
         problems = check_caller(label, path.read_text(encoding="utf-8", errors="replace"),
-                                 externals, modules)
+                                 externals, modules,
+                                 with_triggers=path.name.endswith(".yml"))
         if problems:
             bad += 1
             print(f"❌ {label}（{path.relative_to(ROOT)}）打包清单不合格：")
@@ -263,7 +336,8 @@ def main(argv=None) -> int:
                 if path.name.endswith(".yml"):
                     print(f"::error::{label} 打包清单：{p}")
         else:
-            print(f"✅ {label}：跨目录模块、本地模块、运行期数据三项齐全")
+            extra = "，触发目录覆盖跨目录源码" if path.name.endswith(".yml") else ""
+            print(f"✅ {label}：跨目录模块、本地模块、运行期数据三项齐全{extra}")
 
     if bad:
         print(f"\n❌ 打包清单硬门：{bad} 处入口不合格。少一个文件不会报错、只会少一个"
