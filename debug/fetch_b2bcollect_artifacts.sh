@@ -14,8 +14,18 @@ cd /Users/jhnoplan/Desktop/PythonDemo
 TOK=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p')
 [ -n "$TOK" ] || { echo "NO_TOKEN：git credential helper 里没有 github.com 凭证"; exit 2; }
 API="https://api.github.com/repos/JHnoplan/riskbird-tool"
-SHA=$(git rev-parse HEAD)
-echo "· 目标 commit：${SHA:0:7}"
+# 目标 commit 默认就是 HEAD。只有在「推送不是走常规 git push」时才需要显式传 sha：
+# 本机到 github.com:443 的路由偶发不可达（api.github.com 一直通），此时提交通过
+# Git Data API 快进上去，云端那个 sha 与本地 HEAD 号不同、但 tree 完全一致。
+# 允许显式指定是为了不把这种情况变成「脚本本身 unusable」；查不到 run 仍然当场停，
+# 「绝不拿旧产物交差」这条不会因为多了一个入参就松掉。
+SHA=${1:-}
+[ -n "$SHA" ] || SHA=$(git rev-parse HEAD)
+case "$SHA" in
+  *[!0-9a-fA-F]*|'') echo "SHA 不合法（要 40 位十六进制，或留空表示用 HEAD）：$SHA"; exit 2 ;;
+esac
+[ ${#SHA} -eq 40 ] || { echo "SHA 长度 ${#SHA} 不是 40 位：$SHA"; exit 2; }
+echo "· 目标 commit：${SHA:0:7}$([ "$SHA" = "$(git rev-parse HEAD)" ] || echo '（显式指定，非本地 HEAD）')"
 
 # 按 (平台 key, workflow 文件名) 查本次 commit 最新那条 run 的 id
 find_run() {
