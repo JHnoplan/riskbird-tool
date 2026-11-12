@@ -26,6 +26,9 @@
   L. 自检开关口径：CI 的 --acl-doctor、源码 CLI 的 --doctor、产物界面的分派三者
      必须是同一份写法（拼错时不许退化成「安静地去建界面」，那会让 runner 挂到
      job 超时）；退出码全表由故障分类表派生，帮助文本不许再手写一份清单
+  M. workflow 步骤的脚本语言与这一步真正用的 shell 必须配套：Windows 上 run 步
+     默认是 pwsh，bash 的 `[ -f x ] || { …; exit 1; }` 会被解析成类型表达式，
+     ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -1682,6 +1685,98 @@ def test_doctor_flag_parity():
             f"{ag.DOCTOR_EXIT_HELP}")
 
 
+# ════════════════════════════════ M. workflow 步骤的脚本与 shell 必须配套
+_BASH_ONLY = ("[ -f ", "[ -n ", "] ||", "|| {", "rc=$?", "$((", "&& {")
+_PS_ONLY = ("Test-Path", "Start-Process", "Write-Host", "$env:", "$($", "-PassThru")
+
+
+def _step_region(text: str, step_name: str):
+    """取出某个 step 的正文：从它的 ``- name:`` 到下一个 ``- name:`` 之前。
+
+    不用 PyYAML：这套离线测试跑在任何一台开发机上，多一个依赖就多一类「本机绿、
+    别人红」。所以只用最笨的定位，并让调用方先确认这一步真的存在。
+    """
+    i = text.find(f"- name: {step_name}")
+    if i < 0:
+        return None
+    j = text.find("- name: ", i + 1)
+    return text[i:(j if j > 0 else len(text))]
+
+
+def _iter_steps(text: str):
+    """按 ``- name:`` 把 workflow 切成一个个 step 正文。
+
+    不用 PyYAML：这套离线测试要跑在任何一台开发机上，多一个依赖就多一类
+    「本机绿、别人红」。定位只需最笨的切法，判据是「这一步的正文里出现了什么」。
+    注释行整体剔掉：注释里引用另一种 shell 的写法是写给维护者看的，不是要执行的。
+    """
+    heads = [(m.start(), m.group(1).strip())
+             for m in re.finditer(r"^\s*-\s+name:\s*(.+)$", text, re.M)]
+    for i, (pos, name) in enumerate(heads):
+        end = heads[i + 1][0] if i + 1 < len(heads) else len(text)
+        body = "\n".join(ln for ln in text[pos:end].splitlines()
+                         if not ln.strip().startswith("#"))
+        yield name, body
+
+
+def _step_shell(region: str, default: str) -> str:
+    """这一步真正由哪个 shell 执行：显式声明优先，没声明就是 runner 的默认值。"""
+    m = re.search(r"^\s*shell:\s*(\w+)", region, re.M)
+    return (m.group(1).strip() if m else default)
+
+
+def test_workflow_shell_syntax():
+    print("\n═══ M. workflow：写的脚本必须和这一步真正用的 shell 对上 ═══")
+    # 本轮 CI 的第二种红法：Windows 上 run 步**默认**是 pwsh，而构建前那道
+    # 「config.json 不在位就不许出包」的硬门是 bash 写法，PowerShell 把 `[ -f ...`
+    # 当类型表达式解析，ParserError 之后 PyInstaller 根本没启动。这类错误不在任何
+    # 一行的逻辑里，只在「脚本语言」和「解释器」的接缝上，本机永远测不出来。
+    wf = _REPO / ".github" / "workflows"
+    win = (wf / "build-b2bcollect.yml").read_text(encoding="utf-8")
+    mac = (wf / "build-b2bcollect-mac.yml").read_text(encoding="utf-8")
+    _assert(len(list(_iter_steps(win))) >= 6 and len(list(_iter_steps(mac))) >= 6,
+            "两个 workflow 都切得出至少 6 个 step（切不出来=定位失效）")
+
+    # 1) 通用不变量：每一个 step 的脚本语法都得配上它的 shell。
+    #    只在真的扫到某种写法时才下结论——每条都报一句会把 60 行无关的 ✅ 灌进
+    #    输出里，而那些 ✅ 一条都没有回答「万一改坏了会怎样」。
+    seen_bash = seen_ps = 0
+    for text, runner, default in ((win, "Windows", "pwsh"), (mac, "macOS", "bash")):
+        for name, region in _iter_steps(text):
+            shell = _step_shell(region, default)
+            bashy = [b for b in _BASH_ONLY if b in region]
+            psky = [p for p in _PS_ONLY if p in region]
+            is_bash = shell in ("bash", "sh")
+            seen_bash += bool(bashy)
+            seen_ps += bool(psky)
+            if bashy:
+                _assert(is_bash,
+                        f"{runner}「{name}」里的 bash 写法 {bashy} 配的是 shell={shell}")
+            if psky:
+                _assert(not is_bash,
+                        f"{runner}「{name}」里的 PowerShell 写法 {psky} 配的是 shell={shell}")
+    _assert(seen_bash >= 3 and seen_ps >= 1,
+            f"扫描确实找到了待配对的写法（bash 步骤 {seen_bash} 个 / PowerShell 步骤 {seen_ps} 个）")
+
+    # 2) 关键步骤的存在性与各自的手法：这三样一旦被人顺手改回去，包就又变成
+    #    「没凭证也照样出」「自检拿不到退出码」
+    build = _step_region(win, "Build EXE with PyInstaller")
+    _assert(build is not None and _step_shell(build, "pwsh") == "bash",
+            "Windows 构建步骤显式 shell: bash（bash 硬门才生效，也不依赖默认值）")
+    gate = _step_region(win, "Artifact doctor gate (B2bCollectTool.exe --acl-doctor)")
+    _assert(gate is not None, "Windows 产物自检门禁步骤还在（发包前最后一道门）")
+    if gate:
+        _assert(_step_shell(gate, "bash") == "pwsh", "自检门禁显式声明 pwsh（不靠默认值）")
+        for need in ("Start-Process", "-Wait", "-PassThru", "$p.ExitCode"):
+            _assert(need in gate, f"自检门禁保留了 {need}（GUI 子系统程序靠它才拿得到退出码）")
+
+    # 3) 两个平台的构建前硬门必须是**同一句**：少一边，那一边就是「没凭证也照出包」
+    _assert("[ -f config.json ]" in win and "[ -f config.json ]" in mac,
+            "两个 workflow 都在构建前检查随包 config.json")
+    for text, path in ((win, "Windows"), (mac, "Mac")):
+        _assert("不许出包" in text, f"{path} 的构建前硬门说清了后果（不是只 exit 1）")
+
+
 def main():
     print("═══ 打包态交付链 离线测试 ═══")
     test_config_chain()
@@ -1696,6 +1791,7 @@ def main():
     test_time_basis()
     test_console_encoding()
     test_doctor_flag_parity()
+    test_workflow_shell_syntax()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 

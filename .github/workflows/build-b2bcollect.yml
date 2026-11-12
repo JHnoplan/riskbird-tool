@@ -92,6 +92,12 @@ jobs:
       # makepolo_crawler / maimaib2b_crawler / province_filter / mk_phone_ocr 一度就这么漏过）。
       # mk_phone_font.json 是马可波罗图片码的字形字典（运行时零标注成本的全部本钱），
       # 不 --add-data 进包则打包版手机号识别永远拿不到字典。
+      # 必须显式 shell: bash：Windows runner 上 run 步的**默认** shell 是 pwsh，
+      # 上面那句 `[ -f config.json ] || { ...; exit 1; }` 在 PowerShell 里会被当成
+      # 类型表达式解析，当场 ParserError「Missing type name after '['」——构建连
+      # PyInstaller 都没启动就红了（实机踩过）。声明成 bash 之后这一步与 Mac 版
+      # 同一份脚本，两个平台的差异只剩 --add-data 的分隔符和驱动文件名。
+      shell: bash
       run: |
         cd b2bcollect_build
         # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
