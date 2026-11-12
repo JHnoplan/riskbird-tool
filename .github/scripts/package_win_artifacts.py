@@ -56,6 +56,10 @@ PORTABLE_NAME = "B2bCollectTool_Win_portable.zip"
 GUIDE_DEST = "使用说明.txt"          # 用户看到的名字（源文件用 ASCII 名，见下）
 GUIDE_SRC = "installer/usage_guide.txt"
 NSI_PATH = "installer/b2bcollect_setup.nsi"
+# onedir 的运行时目录名。**只许有一处定义**：装配校验按它找文件、安装脚本按它清目录，
+# 写成两个字面量就等于「PyInstaller 改了布局名而我们的判据还盯着旧名字」——那正是
+# 第 13 条要防的「两处各抄一份」，只不过这次抄的是目录名。
+INTERNAL_DIR = "_internal"
 BOM = b"\xef\xbb\xbf"
 
 # 程序**自己会在安装目录里造**的那几个运行期目录。它们绝不能进交付物：
@@ -134,9 +138,9 @@ def check_layout(root: Path, problems: list) -> tuple:
     if not exe.is_file():
         _fail(problems, f"产物目录里没有 {EXE_NAME}：{exe}")
         return None, None
-    internal = app / "_internal"
+    internal = app / INTERNAL_DIR
     if not internal.is_dir():
-        _fail(problems, f"产物目录里没有 _internal：{internal}"
+        _fail(problems, f"产物目录里没有 {INTERNAL_DIR}：{internal}"
                         "（onedir 的运行时就在这一层，缺它等于产物只剩一个空壳 exe）")
         return exe, None
     # onefile 残留是最危险的形状：制品里同时躺着单文件 exe 与目录版，用户随手双击
@@ -257,7 +261,7 @@ def nsi_payload_checks() -> tuple:
     """
     out = [(EXE_NAME, "主程序本体（缺它 = 装完点不开）")]
     for rel, why in REQUIRED_INTERNAL.items():
-        path = NSI_SEP.join(["_internal"] + rel.rstrip("/").split("/"))
+        path = NSI_SEP.join([INTERNAL_DIR] + rel.rstrip("/").split("/"))
         if is_dir_entry(rel):
             path += NSI_SEP + "*.*"
         out.append((path, why))
@@ -299,10 +303,11 @@ def check_installer_payload(text: str, problems: list) -> None:
       2) makensis 的 ``File /r`` 是「匹配到几份就打几份」：dist 布局改了名、或装配那步
          少放一样，安装包照样编得出来、装得上、跑得起来，只少那一路功能。
     CI 上 ``check_layout`` 验的是 **dist 树**，从来没有一处验过「makensis 把这些文件放
-    进了用户机器」——补的就是这一格。判据只看结构，六种漂移都必须在编译前响：清单里有
+    进了用户机器」——补的就是这一格。判据只看结构，七种漂移都必须在编译前响：清单里有
     而脚本没验、脚本验了而清单里没有、同一项验两遍、校验排在快捷方式/注册表之后、
     失败分支没有 Abort 或忘了 Goto 跳过它（最后一种最坏：每次都装失败）、失败分支把
-    用户留在「然后呢？」那里（没有下一步动作的中止文案）。
+    用户留在「然后呢？」那里（没有下一步动作的中止文案）、运行时目录没先清或清错了对象
+    （升级后新旧混着的一棵树，只在装过旧版的机器上现形）。
     """
     lines = text.splitlines()
 
@@ -488,6 +493,49 @@ def check_installer_payload(text: str, problems: list) -> None:
         _fail(problems, f"第 {early[0] + 1} 行的快捷方式/注册表写入排在校验之前：装不全的包"
                         "会在控制面板里留下一个点开就跑不起来的条目，"
                         "比什么都不留更难收拾（用户只会以为是程序坏了）")
+    # 7) 升级时旧运行时必须先清掉。File /r 的语义是「同名覆盖、不同名保留」：上一版有、
+    #    这一版改名或删掉的那几个模块会原样留在运行时目录里，装出来是一棵**新旧混着**的树。
+    #    这一类比「少一个文件」更阴：本机怎么试都是好的（本机每次都是全新安装），只有升级过
+    #    的机器上才会出现，而报出来的错和「压根没装对」一样难读——本轮修的那个
+    #    base_library.zip 找不到，形状上正是「新旧两批文件互相咬不住」。
+    #    递归删除的对象**只允许**是运行时目录：安装目录里还躺着用户这几个月的登录状态与
+    #    采集数据（RUNTIME_DIRS 那三个），安装步骤没有资格删它们。卸载段那条「问一次、默认
+    #    保留」的纪律在这里同样成立，只不过这里连问都不该问。
+    runtime = NSI_SEP.join(["$INSTDIR", INTERNAL_DIR])
+    cleans = [(k, m.group("path")) for k in code
+              for m in [NSIS_RECURSIVE.search(lines[k])] if m]
+    cleans = [(k, expand(p)) for k, p in cleans]
+    mine = [(k, p) for k, p in cleans if p.lower() == runtime.lower()]
+    if not mine:
+        _fail(problems, f'安装段没有 RMDir /r "{runtime}"：File /r 只覆盖同名的那些，'
+                        "上一版有而这一版改名或删掉的模块会原样留在运行时目录里，"
+                        "升级得到的是新旧混着的一棵树（本机全新安装永远试不出来，"
+                        "只有装过旧版的机器上才现形）")
+    else:
+        if len(mine) > 1:
+            _fail(problems, f"运行时目录被清了 {len(mine)} 遍（第 {[k + 1 for k, _p in mine]} 行）："
+                            "同一件事做两遍说明有一段是从别处抄来的，改动时只会改到一处")
+        first_copy = min((k for k in code if NSIS_FILE_COPY.match(lines[k])), default=None)
+        if first_copy is not None and mine[0][0] > first_copy:
+            _fail(problems, f"第 {mine[0][0] + 1} 行的递归删除排在 File 之后：刚铺好的运行时又被删掉，"
+                            "后面那段逐条校验会红在「文件没落地」上，而真原因是这一行的次序——"
+                            "报错报在校验上，下个人就会去查 dist 树")
+    for k, p in cleans:
+        if p.lower() == runtime.lower():
+            continue
+        hit = [d for d in RUNTIME_DIRS
+               if p.lower().startswith(NSI_SEP.join(["$INSTDIR", d]).lower())]
+        if hit:
+            _fail(problems, f'第 {k + 1} 行在安装段里递归删除 {p}：{hit[0]} 里是用户的登录状态、'
+                            "缓存与采集进度，安装步骤没有资格删它（卸载段都要问一次，这里连问都没问）")
+        elif p.lower() in ("$instdir", "$instdir" + NSI_SEP):
+            _fail(problems, f'第 {k + 1} 行递归删除的是整个安装目录 {p}：那里面除了运行时还有'
+                            "用户的数据目录，一次升级就把几个月的劳动成果一起带走；"
+                            f"要清的只有运行时目录 {runtime}")
+        else:
+            _fail(problems, f'第 {k + 1} 行递归删除 {p}：安装段里唯一的递归删除对象是运行时目录 '
+                            f"{runtime}，删到别处去的行为没有人核对过")
+
     if cut is not None and cut > last and success is None:
         # 失败分支排在校验之后（本项目就是这么写的）：校验全过的那条路必须**跳出去**，
         # 否则文件一个都不缺也会走进 Abort——那种「修法」比不校验更坏，因为它让每次

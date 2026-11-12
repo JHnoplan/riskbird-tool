@@ -131,6 +131,20 @@ Section "主程序" SEC_APP
     ; 「少一个文件不报错、只少一个功能」正是本项目被咬过最多次的形状。
     ; 下面**校验**那一段则要逐条列——那里对拍的正是那张打包清单。
     SetOutPath "$INSTDIR"
+    ; ── 升级先把旧运行时清掉，再铺新的 ────────────────────────────────────────
+    ; File /r 的语义是「同名覆盖、不同名保留」：它只覆盖这一版里有的那些文件，上一版有、
+    ; 这一版改名或删掉的模块会**原样留着**。onedir 的 _internal 是一整批互相咬合的文件
+    ; （base_library.zip、Python 的 .dll/.pyd、各个包目录），混着两批的版本只在「装过旧版
+    ; 再装新版」的机器上出现——本机每次都是全新安装，怎么试都是好的，用户那边却会报出读
+    ; 不懂的错（本轮修的「base_library.zip 找不到」形状上正是新旧两批互相咬不住）。PyInstaller
+    ; 官方对升级的口径同样是「先删掉旧的 _internal 再放新的」。
+    ;
+    ; 递归删除在安装段里**只允许**指向运行时目录这一处：安装目录里还躺着用户的登录状态、
+    ; 缓存与采集进度（b2bcollect_data / b2bcollect_state / riskbird_data），安装步骤没有
+    ; 资格删它们——卸载段都要问一次、默认保留，这里连问都不必问。这一句由
+    ; .github/scripts/package_win_artifacts.py 的 check_installer_payload 在 makensis 之前
+    ; 判：少这一句、排到 File 之后、或删到别处去，都在装配那一步拦下而不是等用户发现。
+    RMDir /r "$INSTDIR\_internal"
     File /r "${BUILD_DIR}\${APP_DIRNAME}\*.*"
 
     ; 使用说明进安装目录（完成页有勾选框直接打开；产物 zip 里也带同一份，

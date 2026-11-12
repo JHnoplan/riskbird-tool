@@ -2468,16 +2468,40 @@ def test_workflow_shell_syntax():
     # 「说不清是谁编的」安装包交到用户手上。
     INST_STEP = "Build Windows installer (NSIS, per-user)"
     PIN_ANCHOR = '[ -n "${NSIS_PINNED:-}" ]'
+    # 5-e-0) 横幅的真字节以**云端跑过的那台编译器**为准，不是任何人脑子里的格式。
+    # 2026-11-13 凌晨那次云端红：判据只找 "Nullsoft Install System v…"，而 NSIS 3.10 的
+    # makensis 自报的是 "MakeNSIS v3.10 - Copyright 1999-2023 Contributors"——114MB 安装包
+    # 已经编出来了，却被「读不到横幅」这句整体拦下。更难看的是本机这一整段**全绿**：
+    # 仿真假编译器印的就是判据想要的那句假格式，两边抄的是同一个想象。所以现在把真日志
+    # 开头原样钉在这里（来源见下面的注释），仿真用它的字节，判据用正则去够它——两头都
+    # 得对上证据，谁再改格式就当场红。
+    # 证据：run 43271171596 / job 131367773604 编译日志第 924-926 行（行尾实测 \r\n）。
+    NSIS_V4_HEAD = ("MakeNSIS v3.10 - Copyright 1999-2023 Contributors\n"
+                    "See the file COPYING for license details.\n"
+                    "Credits can be found in the Users Manual.\n")
+    NSIS_V4_BANNER = "MakeNSIS v3.10"                 # 判据从上面那行里取出来的片段
+    NSIS_LEGACY_BANNER = "Nullsoft Install System v3.10"   # 老 NSIS / -V1 的自报写法
     inst_body = next((b for n, b in _iter_steps(win) if INST_STEP in n), "")
     cut = inst_body.find(PIN_ANCHOR)
     _assert(cut >= 0, f"安装步骤里找得到版本判据的锚点 {PIN_ANCHOR}（找不到=整段被删了）")
     gate_script = inst_body[cut:] if cut >= 0 else ""
-    for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1", 'grep -oE "Nullsoft Install System'):
+    for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1",
+                 "grep -haoE", "(MakeNSIS|Nullsoft Install System)", "|| true",
+                 'BANNER_VER=${BANNER##* v}', '[ "$BANNER_VER" != "$NSIS_PINNED" ]'):
         _assert(need in gate_script, f"版本判据保留了 {need}（缺一样就是判据少一个方向）")
+    # 「只认一种想象出来的格式」本身就是这轮的真缺陷，反向钉住：文本里不许再出现那种
+    # 只找 Nullsoft 一句、并且不带 MakeNSIS 的写法。
+    _assert('grep -oE "Nullsoft Install System' not in gate_script,
+            "横幅判据不许退回只猜一种写法（云端那台编译器自报的是 MakeNSIS，猜错=交付没安装包）")
+    # 正则必须真的够得到钉在这里的真字节：判据与证据之间的关系由这一条把住，
+    # 而不是由「看起来差不多」把住。
+    _assert(re.search(r"(MakeNSIS|Nullsoft Install System) v[0-9][0-9.]*", NSIS_V4_HEAD),
+            "横幅正则必须命中真 makensis 自报的那一行（命中不了=判据与证据再一次分家）")
 
     def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10",
                             pipefail: bool = True, crlf: bool = False,
-                            app_version: str = "999", script: str = ""):
+                            app_version: str = "999", script: str = "",
+                            binary: bool = False):
         """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
 
         假 makensis 干四件事：按真编译器的口径验 `/DVER4=` 是不是 X.X.X.X、印横幅
@@ -2487,13 +2511,18 @@ def test_workflow_shell_syntax():
         能本机复现的部分，所以把编译器的这条行为也一起搬进假编译器。
         crlf=True 按 Windows 编译器的实际输出给行尾：判据取到的那行会带一个尾随 \\r，
         「在本机换行下绿、到 Windows 换行下红」正是这一段最可能被漏掉的那半个坑。
+        binary=True 在横幅前面塞两个非 UTF-8 字节：真编译日志里就有（安装包里的中文
+        菜单名是 ANSI 写的），GNU grep 会把整份文件判成二进制并只回一句
+        "Binary file matches"，横幅照样取不到——少了 `-a` 就是这个下场，而它在
+        本机那种干净 ASCII 日志上永远试不出来。
         """
         root = Path(tempfile.mkdtemp(prefix="b2b_nsis_gate_"))
         try:
             stub = root / "makensis"
             eol = r"\r\n" if crlf else r"\n"
-            head = (f'printf "{banner}{eol}"\n' if banner
-                    else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
+            head = 'printf "\\200\\377\\n"\n' if binary else ""
+            head += (f'printf "{banner}{eol}"\n' if banner
+                     else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
             stub.write_text("#!/bin/sh\n"
                             # 与真实 makensis 同口径：VIProductVersion 必须是四段数字
                             'for a in "$@"; do case "$a" in /DVER4=*) '
@@ -2510,27 +2539,43 @@ def test_workflow_shell_syntax():
                        RUNNER_TEMP=str(root), APP_VERSION=app_version, WIN_ROOT=str(root))
             cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + \
                   ["-c", script or gate_script]
+            # errors="replace"：binary=True 时子进程的输出里就是非法 UTF-8 字节，
+            # 严格解码会让取证本身炸掉（观测手段不能污染被测对象，这条在这轮已经付过学费）
             proc = subprocess.run(cmd, cwd=str(root), env=env,
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, errors="replace")
             return proc.returncode, _redact(proc.stdout + proc.stderr)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    _ok_rc, _ok_out = _run_installer_gate("Nullsoft Install System v3.10", 0)
-    _assert_eq(_ok_rc, 0, f"正例：横幅与钉住版本一致时放行（输出尾部 {_ok_out[-90:]}）")
+    # 正例一律用**钉在上面的真字节**（NSIS_V4_HEAD），不再用手抄的一句话：这一段的
+    # 历史就是一次「假编译器印假格式、判据读假格式、双双绿着把真交付挡在门外」。
+    _ok_rc, _ok_out = _run_installer_gate(NSIS_V4_HEAD, 0)
+    _assert_eq(_ok_rc, 0, f"正例：真 makensis 的自报横幅与钉住版本一致时放行（输出尾部 {_ok_out[-90:]}）")
     _assert("✅ 安装包出自" in _ok_out,
             "放行时把这个安装包出自哪个编译器念进日志（可追溯性写在交付当场，不靠事后翻 CI）")
-    _crlf_rc, _crlf_out = _run_installer_gate("Nullsoft Install System v3.10", 0, crlf=True)
+    _assert(NSIS_V4_BANNER in _ok_out,
+            f"放行话术里念的是判据真取到的那一段（{NSIS_V4_BANNER}），不是重新拼一遍的字符串")
+    _crlf_rc, _crlf_out = _run_installer_gate(NSIS_V4_HEAD, 0, crlf=True)
     _assert_eq(_crlf_rc, 0, f"正例·Windows 行尾：横幅带 \\r 也放行（输出尾部 {_crlf_out[-90:]}）")
+    _bin_rc, _bin_out = _run_installer_gate(NSIS_V4_HEAD, 0, binary=True)
+    _assert_eq(_bin_rc, 0, f"正例·日志含非 UTF-8 字节：横幅照样取得到（尾部 {_bin_out[-90:]}）")
+    _old_rc, _old_out = _run_installer_gate(NSIS_LEGACY_BANNER + "\n", 0)
+    _assert_eq(_old_rc, 0, f"正例·老 NSIS 那句自报写法也认（尾部 {_old_out[-90:]}）")
     _bad = {
-        "版本不是钉住的那个": _run_installer_gate("Nullsoft Install System v3.08", 0),
+        "版本不是钉住的那个": _run_installer_gate(NSIS_V4_HEAD.replace("v3.10", "v3.08"), 0),
+        # 前缀撞车：旧写法是 case 通配 `*v3.10*`，一台自报 v3.100 的编译器会被判成
+        # 「就是钉住的 3.10」放行——现在按全等比，必须红。
+        "自报 v3.100 冒充 3.10": _run_installer_gate(NSIS_V4_HEAD.replace("v3.10", "v3.100"), 0),
         "连 -V4 都不印横幅": _run_installer_gate("", 0),
-        "编译器非零退出": _run_installer_gate("Nullsoft Install System v3.10", 1),
-        "关掉 pipefail 仍要认得编译器": _run_installer_gate("Nullsoft Install System v3.10", 3,
+        "编译器非零退出": _run_installer_gate(NSIS_V4_HEAD, 1),
+        "关掉 pipefail 仍要认得编译器": _run_installer_gate(NSIS_V4_HEAD, 3,
                                                           pipefail=False),
-        "上一步没传版本号": _run_installer_gate("Nullsoft Install System v3.10", 0, pinned=""),
+        "上一步没传版本号": _run_installer_gate(NSIS_V4_HEAD, 0, pinned=""),
     }
     _needles = {"版本不是钉住的那个": "不是钉住的 3.10",
+                "自报 v3.100 冒充 3.10": "不是钉住的 3.10",
+                # 取不到横幅时必须把日志开头原样贴出来：下一回编译器改措辞，靠这几行
+                # 就能当场对格式，而不是再猜一次、再红一次。
                 "连 -V4 都不印横幅": "读不到 makensis 自报版本",
                 "编译器非零退出": "编译安装包失败（退出码 1",
                 "关掉 pipefail 仍要认得编译器": "编译安装包失败（退出码 3",
@@ -2538,6 +2583,8 @@ def test_workflow_shell_syntax():
     for _tag, (_rc, _out) in _bad.items():
         _assert(_rc != 0 and _needles[_tag] in _out and "✅" not in _out,
                 f"反例·{_tag}：必须非零退出、说清后果、且不印成功话术（rc={_rc}，尾部 {_out[-120:]}）")
+    _assert("Processing config" in _bad["连 -V4 都不印横幅"][1],
+            "读不到横幅时，判据把它当场看到的日志开头原样念出来（猜格式的人需要证据，不需要形容词）")
 
     # 5-e-ii) 版本号那四个数字。2026-11-12 的 Windows 红法：PyInstaller、产物自检、窗口
     #   冒烟全部通过，最后一步 makensis 回一句「invalid VIProductVersion format,
@@ -2548,17 +2595,17 @@ def test_workflow_shell_syntax():
     legacy = gate_script.replace('/DVER4="$VER4"', '/DVER4="1.$APP_VERSION.0"')
     _assert(legacy != gate_script,
             "安装步骤里找得着那句 makensis 调用（找不着=这段判据在跟着代码一起漂）")
-    _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, script=legacy)
+    _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, script=legacy)
     _assert(_rc != 0 and "invalid VIProductVersion" in _out and "✅" not in _out,
             f"反向对照：本轮那种三段版本号必须被编译器拒掉（rc={_rc}，尾部 {_out[-120:]}）")
     for _tag, _av in (("常规 run_number", "999"), ("跨过 16 位边界", "65536"),
                       ("七位数", "1234567")):
-        _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, app_version=_av)
+        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, app_version=_av)
         _assert_eq(_rc, 0, f"{_tag}（APP_VERSION={_av}）也要拼得出合法版本号（尾部 {_out[-110:]}）")
     for _tag, _av, _said in (("非数字", "1.2.3-beta", "必须是纯数字"),
                              ("空值", "", "必须是纯数字"),
                              ("大到四段装不下", "5000000000", "装不下")):
-        _rc, _out = _run_installer_gate("Nullsoft Install System v3.10", 0, app_version=_av)
+        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, app_version=_av)
         _assert(_rc != 0 and _said in _out and "✅" not in _out,
                 f"反例·{_tag}的 APP_VERSION：不开建就停下来说清后果（rc={_rc}，尾部 {_out[-110:]}）")
 
@@ -3095,13 +3142,18 @@ def _uninstall_nsi(runtime_dirs, ask=_UN_ASK, dirs=None, inst=True, goto=None,
 def _install_nsi(asm, drop=(), dup=None, extra=None, abort=True, goto=None,
                  target="copy_missing", checks=True, entry_before=False,
                  file_after=False, nameless=False, cont=False, stray=False,
-                 nostep=False, sections=1):
+                 nostep=False, sections=1, clean=None, clean_after=False,
+                 clean_twice=False):
     """按**清单、次序、分支归属**拼一份安装段：默认那份合格，每个参数只坏一处。
 
     校验项直接从 `asm.nsi_payload_checks()` 取——它是 REQUIRED_INTERNAL 的投影。夹具
     自己抄一份文件名单的话，清单改了名这里会红成「装配失败」而不是「夹具过期」，
     那是把第 13 条要防的「两处各抄一份」在测试里再演一遍。
     """
+    # 运行时目录的名字也从装配脚本取（INTERNAL_DIR）：夹具这里再硬写一遍 `_internal`，
+    # 布局改名时会红成「夹具过期」而不是「判据与脚本一起跟着布局走」，同一个道理。
+    # clean 传的是**不带引号**的路径（""＝这一句没写），坏在哪一处由参数一眼看出。
+    clean = f"$INSTDIR\\{asm.INTERNAL_DIR}" if clean is None else clean
     items = [(p, w) for p, w in asm.nsi_payload_checks() if p not in drop]
     if extra:
         items.append((extra, "夹具自造的一项"))
@@ -3109,7 +3161,14 @@ def _install_nsi(asm, drop=(), dup=None, extra=None, abort=True, goto=None,
         items.append((dup, "同一项验第二遍"))
     entries = ['    CreateShortCut "$SMPROGRAMS\\x.lnk" "$INSTDIR\\x.exe"',
                '    WriteUninstaller "$INSTDIR\\uninstall.exe"']
+    clean_line = f'    RMDir /r {clean}' if clean else None
     copy_in = ['    File /r "dist\\*.*"']
+    if clean_line:
+        # 默认排在 File **之前**：先清旧运行时，再铺这一版的（排在后面等于把刚拷好的删掉）
+        copy_in = ([] if clean_after else [clean_line]) + copy_in \
+                  + ([clean_line] if clean_after else [])
+        if clean_twice:
+            copy_in = copy_in + [clean_line]
     probe = []
     if checks:
         for path, _why in items:
@@ -3289,15 +3348,22 @@ def test_windows_onedir_delivery():
     _rc = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
                             "package_win_artifacts.py"), "--root", str(dirty)],
                          capture_output=True, text=True, cwd=str(_REPO))
-    _assert_eq(_rc.returncode, 0, f"合成产物树装配通过（stderr={_rc.stderr[-200:]}）")
+    # 装配脚本把「为什么红」打到 stdout（❌ 那几行），stderr 反而是空的：只贴 stderr
+    # 的话，红一次就等于让人重新查一次——本轮第 7 条判据接上之后第一次红就是这样，
+    # 屏幕上只有一句「期望 0，实际 1」，真原因在没打印出来的那几行里。
+    _assert_eq(_rc.returncode, 0,
+               f"合成产物树装配通过（stderr={_rc.stderr[-200:]} stdout尾部={_rc.stdout[-400:]}）")
     _assert(not any((dirty / "dist" / asm.APP_DIR_NAME / n).exists()
                     for n in asm.RUNTIME_DIRS),
             "runner 上 --acl-doctor 跑出来的状态目录被剔掉了（带着别人机器的登录状态"
             "和任务历史安装包不能发）")
     zpath = dirty / asm.PORTABLE_NAME
-    _assert(zpath.is_file(), "校验通过才产出绿色版 zip")
-    with zipfile.ZipFile(zpath) as z:
-        names = z.namelist()
+    # 这里必须是「一条干净的判据」而不是一个 traceback：上一条判据一红，zip 就不存在，
+    # 拿 ZipFile 直接打开会让整节炸在栈里——真原因（装配失败）被埋在最后一行，读到的
+    # 人只会去查 zip，而 zip 从来不是问题。取不到 zip 就交一个空清单下去，后面几条各自
+    # 报自己的红，栈里那一条不再有「唯一线索却是错线索」的威力。
+    _assert(zpath.is_file(), f"校验通过才产出绿色版 zip（{zpath} 不存在）")
+    names = zipfile.ZipFile(zpath).namelist() if zpath.is_file() else []
     _assert(all(n.startswith(asm.APP_DIR_NAME + "/") or n == asm.GUIDE_DEST for n in names),
             f"zip 顶层只有 {asm.APP_DIR_NAME}/ 与根上的使用说明（解压出来是一堆散文件的话，"
             f"用户会把它摊到桌面上）（实际={names[:3]}）")
@@ -3602,6 +3668,30 @@ def test_windows_onedir_delivery():
             "失败分支排在校验之后：否则每次安装都会走进 Abort")
     _assert(nsi.index("copy_ok:") < nsi.index("CreateShortCut"),
             "快捷方式排在成功标号之后：装不全的包不许在控制面板里留条目")
+    # 升级那一条：先清旧运行时、再铺新的，而且**安装段**里只允许这一处递归删除。
+    # 刻意只在安装段里数：卸载段本来就有五处 RMDir /r（那是「连数据一起删」那条分支），
+    # 拿全文当安装段数会数出 6 条并红成「有人在动别的东西」——判据读的是执行顺序，
+    # 归属必须先切开，否则报的是一条指错方向的话。目录名取自 asm.INTERNAL_DIR 而不是
+    # 夹具里再硬写一遍：布局改名时这条断言与判据要一起跟着走，红的才真是布局变了。
+    _rt = f'$INSTDIR\\{asm.INTERNAL_DIR}'
+    _clean_k = f'RMDir /r "{_rt}"'
+    _ins_code = [_expand(nsi.splitlines()[k])
+                 for _t, _b, _s in asm._nsis_section_bodies(nsi.splitlines())
+                 if _t != "Uninstall" for k in _b
+                 if not asm.NSIS_COMMENT.match(nsi.splitlines()[k])]
+    _hits = [i for i, ln in enumerate(_ins_code) if _clean_k in ln]
+    _assert_eq(len(_hits), 1,
+               f"真安装脚本必须恰好一句 {_clean_k}：少一句=升级留下新旧混着的一棵树，"
+               f"多一句=同一件事抄了两遍（改动时只会改到一处）")
+    _i_clean = _hits[0] if _hits else len(_ins_code)
+    _i_file = min((i for i, ln in enumerate(_ins_code) if ln.lstrip().startswith("File /r")),
+                  default=len(_ins_code))
+    _assert(_i_clean < _i_file,
+            "清旧运行时必须排在 File 之前：排在后面就是把这一版刚铺好的运行时删掉，"
+            "下面那段逐条校验会红在「文件没落地」上而真原因是这一行的次序")
+    _assert_eq(len([ln for ln in _ins_code if "RMDir /r" in ln]), 1,
+               "安装段里唯一的递归删除就是运行时目录那一句：多一句就说明有人在动安装目录里的"
+               "别的东西（用户的数据也在那里面）")
 
     # 反例逐条只差一处（见 _install_nsi 的参数分工）：既要求报红，也要求红在**那一条**消息上
     _cases_p = [
@@ -3640,6 +3730,19 @@ def test_windows_onedir_delivery():
          dict(nostep=True), ["没给出下一步动作"]),
         ("安装段被拆成两段（校验条数就不再唯一）",
          dict(sections=2), ["关键文件校验只能有一个归属"]),
+        # ── 运行时目录那一处递归删除：它坏的是「升级」这条只有老用户才会走的路径 ──
+        ("升级不清旧运行时（新旧混着一棵树，本机全新安装永远试不出来）",
+         dict(clean=""), ['安装段没有 RMDir /r "$INSTDIR\\_internal"']),
+        ("清的是整个安装目录（把用户这几个月的数据一起带走）",
+         dict(clean="$INSTDIR"), ["递归删除的是整个安装目录"]),
+        ("清到了用户的数据目录（安装步骤没资格删它）",
+         dict(clean="$INSTDIR\\b2bcollect_data"), ["安装步骤没有资格删它"]),
+        ("清了一个清单外的目录（行为没人核对过）",
+         dict(clean="$INSTDIR\\somewhere_else"), ["唯一的递归删除对象是运行时目录"]),
+        ("清排在 File 之后（刚铺好的运行时又被删掉）",
+         dict(clean_after=True), ["排在 File 之后"]),
+        ("同一棵运行时目录清两遍（有一段是从别处抄来的）",
+         dict(clean_twice=True), ["被清了 2 遍"]),
     ]
     for _label, _kw, _needles in _cases_p:
         _p = []

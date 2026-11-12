@@ -408,17 +408,33 @@ jobs:
           echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
           exit 1
         fi
-        BANNER=$(grep -oE "Nullsoft Install System v[0-9][0-9.]*" "$LOG" || true)
-        BANNER=${BANNER%%$'\n'*}
+        # 横幅必须按**真编译器自报的写法**找，不能按想象中的写法找。
+        # 2026-11-13 凌晨云端那次红就是这个：这里原来只找 "Nullsoft Install System v…"，
+        # 而 NSIS 3.10 的 makensis 自报的是 "MakeNSIS v3.10 - Copyright 1999-2023 Contributors"
+        # （run 43271171596 / job 131367773604 编译日志第 924 行的原字节，行尾 \r\n）。
+        # 安装包 114MB 已经编出来了，却被这句「读不到横幅」整体拦下——判据猜错格式的代价
+        # 就是交付凭空没有安装包，而且它报的话听起来像是编译器坏了。两种写法都收：老 NSIS
+        # 与 -V1 走的是 Nullsoft 那句，哪天换编译器不至于再瞎一次。
+        # -a 不是可选项：-V4 的日志里混着非 UTF-8 字节（安装包里的中文菜单名是 ANSI 写的），
+        # GNU grep 一旦判定「二进制文件」就只回一句 Binary file matches，横幅照样取不到。
+        # `|| true` 必须留着：这一步是 bash（GitHub 默认给 -e -o pipefail），编译器一字
+        # 不印时 grep 退 1、整条管道就非 0，`set -e` 会在下面那句判据之前把进程带走——
+        # 报错的话术永远说不出口，红成「这一步自己炸了」，比猜错横幅格式更难查。
+        BANNER=$(grep -haoE "(MakeNSIS|Nullsoft Install System) v[0-9][0-9.]*" "$LOG" 2>/dev/null | head -1 || true)
         if [ -z "$BANNER" ]; then
           echo "::error::编译日志里读不到 makensis 自报版本那行横幅（连 -V4 都没印，这台编译器的行为和预期不一样），无法证明这个安装包出自校验过的那份 NSIS ${NSIS_PINNED}"
+          # 把日志开头原样贴出来：下一次编译器换措辞，靠这几行就能当场对格式，不用再去猜。
+          echo "::error::横幅判据看到的日志前 5 行（原样，不解释）：$(head -5 "$LOG" 2>/dev/null | tr '\r\n' '  ')"
           exit 1
         fi
-        case "$BANNER" in
-          *v"$NSIS_PINNED"*) echo "✅ 安装包出自 makensis ${BANNER##*System }（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）" ;;
-          *) echo "::error::安装包是自报 ${BANNER} 的 makensis 编出来的，不是钉住的 ${NSIS_PINNED}——两次构建产物不可比，这一份不发"
-             exit 1 ;;
-        esac
+        # 版本比对取**全等**而不是通配包含：`*v3.10*` 会放过一个自报 v3.100 的编译器，
+        # 那和「自报 v3.1」是两个方向的错，都不该出安装包。
+        BANNER_VER=${BANNER##* v}
+        if [ "$BANNER_VER" != "$NSIS_PINNED" ]; then
+          echo "::error::安装包是自报 ${BANNER} 的 makensis 编出来的，不是钉住的 ${NSIS_PINNED}——两次构建产物不可比，这一份不发"
+          exit 1
+        fi
+        echo "✅ 安装包出自 makensis ${BANNER}（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）"
         ls -l B2bCollectToolSetup.exe B2bCollectTool_Win_portable.zip
 
     - name: Upload artifacts
