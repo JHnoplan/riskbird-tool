@@ -14,18 +14,42 @@ cd /Users/jhnoplan/Desktop/PythonDemo
 TOK=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p')
 [ -n "$TOK" ] || { echo "NO_TOKEN：git credential helper 里没有 github.com 凭证"; exit 2; }
 API="https://api.github.com/repos/JHnoplan/riskbird-tool"
-# 目标 commit 默认就是 HEAD。只有在「推送不是走常规 git push」时才需要显式传 sha：
-# 本机到 github.com:443 的路由偶发不可达（api.github.com 一直通），此时提交通过
-# Git Data API 快进上去，云端那个 sha 与本地 HEAD 号不同、但 tree 完全一致。
-# 允许显式指定是为了不把这种情况变成「脚本本身 unusable」；查不到 run 仍然当场停，
-# 「绝不拿旧产物交差」这条不会因为多了一个入参就松掉。
+# 取制品的工作目录：每一次都有自己的落点（B2B_FETCH_WORK 可显式指定，指定时先清空它）。
+# 旧写法把所有人挤在同一个 /tmp/b2b_dl 上：两次取制品并发（或者上一次崩了留下半个目录）
+# 时，校验读到的可能是另一批的字节——「验证的字节和交付的字节不是同一份」在这一环最阴，
+# 因为它报出来的仍然是 ✅。
+WORK=${B2B_FETCH_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/b2b_dl.XXXXXX")}
+# 目标 commit 的取法（2026-11-12 改的，与 poll 那一份同口径）：
+#   ①显式参数优先；②缺省取**远端 main 当前那条**（走 api.github.com）；③API 不通才退回
+#   本地 HEAD 并明说。为什么不能一上来就用本地 HEAD：推送偶发要走 Git Data API 快进，
+#   那种时候远端那个 sha 与本地 HEAD 号不同（内容等价），按本地号去查 run 只会得到
+#   「本次 commit 没有 run」——而它看起来和「云端没打这个包」一模一样，人就去找旧制品，
+#   那一步才是真正的风险：拿旧包冒充新包，症状是完全成功。
+#   所以查到 run 之后还要再对一次 tree：远端那条提交的 tree 与本地 HEAD 的 tree 不一致时
+#   点名告警（不静默），因为「取回来的字节不含本地这份改动」必须是能被看见的事实。
 SHA=${1:-}
-[ -n "$SHA" ] || SHA=$(git rev-parse HEAD)
+SHA_SRC="显式参数"
+if [ -z "$SHA" ]; then
+  SHA=$(curl -sS -m 30 -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+        "$API/git/ref/heads/main" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    b = {}
+print((b.get("object") or {}).get("sha") or "")')
+  SHA_SRC="远端 main（API 现取）"
+fi
+if [ -z "$SHA" ]; then
+  SHA=$(git rev-parse HEAD)
+  SHA_SRC="本地 HEAD（API 没取到远端 ref）"
+fi
 case "$SHA" in
-  *[!0-9a-fA-F]*|'') echo "SHA 不合法（要 40 位十六进制，或留空表示用 HEAD）：$SHA"; exit 2 ;;
+  *[!0-9a-fA-F]*|'') echo "SHA 不合法（要 40 位十六进制，或留空表示用远端 main）：$SHA"; exit 2 ;;
 esac
 [ ${#SHA} -eq 40 ] || { echo "SHA 长度 ${#SHA} 不是 40 位：$SHA"; exit 2; }
-echo "· 目标 commit：${SHA:0:7}$([ "$SHA" = "$(git rev-parse HEAD)" ] || echo '（显式指定，非本地 HEAD）')"
+LOCAL_TREE=$(git rev-parse "HEAD^{tree}")
+echo "· 目标 commit：${SHA:0:7}（基准：${SHA_SRC}）"
 
 # 按 (平台 key, workflow 文件名) 查本次 commit 最新那条 run 的 id
 find_run() {
@@ -44,6 +68,27 @@ for pair in "win:build-b2bcollect.yml" "mac:build-b2bcollect-mac.yml"; do
   echo "[$key] run=$id $status $concl"
   IDS+=("$key:$id")
 done
+
+# 字节级等价证明（放在等结果**之前**：内容都不等价就别浪费这二十分钟轮询）。
+# 号不同、tree 相同 = 用 Git Data API 快进推送的正常结果，取回来的就是这个内容；
+# tree 不同 = 本地还有没推上去的改动（或远端多了别的），这一份制品不代表刚在本机跑绿的
+# 那份代码——必须停下来说清楚。旧写法是「按本地 HEAD 查 run，查不到才停」，既报错了
+# 原因（说的是「推送没触发」），又挡不住真正的风险：拿一个内容不同的旧包交付。
+REMOTE_TREE=$(curl -s -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+              "$API/git/commits/$SHA" | python3 -c 'import json,sys
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    b = {}
+print(((b.get("tree") or {}).get("sha")) or "")')
+[ -n "$REMOTE_TREE" ] || { echo "❌ 取不回 ${SHA:0:7} 的 tree，无法证明制品与本地内容等价（这一步不靠猜）"; exit 7; }
+if [ "$REMOTE_TREE" != "$LOCAL_TREE" ]; then
+  echo "❌ 制品那条提交(${SHA:0:7}，基准：${SHA_SRC}) 的 tree ${REMOTE_TREE:0:8} 与本地 HEAD 的 tree ${LOCAL_TREE:0:8} 不是同一颗"
+  echo "   先看清差异（git diff --name-only ${SHA:0:7} HEAD）；若确认只是不随包的文件（测试/工具脚本），"
+  echo "   就把远端那条 sha 显式传给本脚本再取；否则先把要交付的改动推上去。"
+  exit 7
+fi
+echo "· tree ${LOCAL_TREE:0:8} 远端与本地一致：取回来的制品与刚在本机验证的这份字节等价"
 
 for kv in "${IDS[@]}"; do
   key=${kv%%:*}; id=${kv##*:}
@@ -71,15 +116,19 @@ for kv in "${IDS[@]}"; do
   esac
 done
 
-mkdir -p /tmp/b2b_dl && rm -rf /tmp/b2b_dl/*
+mkdir -p "$WORK" || { echo "❌ 工作目录建不出来：${WORK}"; exit 2; }
+if [ -n "${B2B_FETCH_WORK:-}" ]; then
+  find "$WORK" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+echo "· 工作目录：$WORK"
 FAIL=0
 for kv in "${IDS[@]}"; do
   key=${kv%%:*}; id=${kv##*:}
   AID=$(curl -s -H "Authorization: Bearer $TOK" "$API/actions/runs/$id/artifacts" \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["artifacts"][0]["id"])')
-  curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "/tmp/b2b_dl/$key.zip" \
+  curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "$WORK/$key.zip" \
     "$API/actions/artifacts/$AID/zip"
-  mkdir -p "/tmp/b2b_dl/$key" && unzip -oq "/tmp/b2b_dl/$key.zip" -d "/tmp/b2b_dl/$key"
+  mkdir -p "$WORK/$key" && unzip -oq "$WORK/$key.zip" -d "$WORK/$key"
   # 制品是「zip 里再套一层真实产物包」，两个平台都要解到内层才能验：
   #   · Mac：外层 Actions zip 里是 ditto 打的 B2bCollectTool_Mac_arm64.zip，.app 在里面；
   #   · Windows：外层 Actions zip 里是 B2bCollectToolSetup.exe（安装包）+
@@ -88,20 +137,20 @@ for kv in "${IDS[@]}"; do
   # 解不开必须当场停：静默跳过校验等于把「随包凭证」这道门拆了，而它正是外部机器全员
   # 精简版那次事故的守门人。
   if [ "$key" = "mac" ]; then
-    INNER=$(find "/tmp/b2b_dl/$key" -maxdepth 2 -name "*.zip" -type f | head -1)
+    INNER=$(find "$WORK/$key" -maxdepth 2 -name "*.zip" -type f | head -1)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有内层产物 zip（workflow 的上传步骤变了？先修校验器再谈交付）"; exit 6; }
-    ditto -x -k "$INNER" "/tmp/b2b_dl/$key/unpacked" \
+    ditto -x -k "$INNER" "$WORK/$key/unpacked" \
       || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; exit 6; }
-    echo "[$key] 已解开内层：$(basename "$INNER") → $(find "/tmp/b2b_dl/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
+    echo "[$key] 已解开内层：$(basename "$INNER") → $(find "$WORK/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
   else
-    INNER=$(find "/tmp/b2b_dl/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
+    INNER=$(find "$WORK/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有 B2bCollectTool_Win_portable.zip（onedir 交付的两个产物少了一个，先修 workflow 再谈交付）"; exit 6; }
-    mkdir -p "/tmp/b2b_dl/$key/root/dist"
-    unzip -oq "$INNER" -d "/tmp/b2b_dl/$key/root/dist" \
+    mkdir -p "$WORK/$key/root/dist"
+    unzip -oq "$INNER" -d "$WORK/$key/root/dist" \
       || { echo "[$key] ❌ 内层绿色版 zip 解不开：$INNER"; exit 6; }
-    echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "/tmp/b2b_dl/$key/root/dist" | tr '\n' ' ')"
+    echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "$WORK/$key/root/dist" | tr '\n' ' ')"
   fi
-  echo "[$key] artifact 内容：$(find /tmp/b2b_dl/$key -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
+  echo "[$key] artifact 内容：$(find "$WORK/$key" -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
 done
 
 # ── 随包凭证校验：产物里必须真的带着可用的 config.json ──
@@ -207,9 +256,9 @@ PYEOF
 }
 
 FAIL=0
-WIN_ROOT="/tmp/b2b_dl/win/root"
-WIN_SETUP=$(find /tmp/b2b_dl/win -maxdepth 2 -name "B2bCollectToolSetup.exe" -type f | head -1)
-MAC_APP=$(find /tmp/b2b_dl/mac -maxdepth 4 -name "B2bCollectTool.app" -type d | head -1)
+WIN_ROOT="$WORK/win/root"
+WIN_SETUP=$(find "$WORK/win" -maxdepth 2 -name "B2bCollectToolSetup.exe" -type f | head -1)
+MAC_APP=$(find "$WORK/mac" -maxdepth 4 -name "B2bCollectTool.app" -type d | head -1)
 check_win "$WIN_ROOT" "$WIN_SETUP" || FAIL=1
 check_mac "$MAC_APP" || FAIL=1
 [ "$FAIL" = 0 ] || { echo "❌ 产物校验未通过，本地 dist 保持原样（不覆盖成坏包）"; exit 5; }
@@ -217,9 +266,9 @@ check_mac "$MAC_APP" || FAIL=1
 # 交付物落到本地 dist：安装包与绿色版是给用户的两份产物，使用说明随绿色版 zip 一起。
 mkdir -p b2bcollect_build/dist
 cp -f "$WIN_SETUP" b2bcollect_build/dist/B2bCollectToolSetup.exe
-cp -f "$(find /tmp/b2b_dl/win -maxdepth 2 -name B2bCollectTool_Win_portable.zip | head -1)" \
+cp -f "$(find "$WORK/win" -maxdepth 2 -name B2bCollectTool_Win_portable.zip | head -1)" \
   b2bcollect_build/dist/B2bCollectTool_Win_portable.zip
-find /tmp/b2b_dl/mac -name "B2bCollectTool_Mac_arm64.zip" -exec cp -f {} b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip \;
+find "$WORK/mac" -name "B2bCollectTool_Mac_arm64.zip" -exec cp -f {} b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip \;
 ls -l b2bcollect_build/dist/B2bCollectToolSetup.exe \
       b2bcollect_build/dist/B2bCollectTool_Win_portable.zip \
       b2bcollect_build/dist/B2bCollectTool_Mac_arm64.zip

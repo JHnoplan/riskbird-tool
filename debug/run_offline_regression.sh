@@ -133,9 +133,44 @@ TMO=$(command -v timeout || command -v gtimeout)
 # 每套件的完整输出都落盘：失败时「tail -N」只能看到最后几行，而断言失败的那一行
 # （`  FAIL xxx`）通常埋在中间——上次 gui_store 批跑红 2 条、单跑全绿，就是因为
 # 看不到具体哪两条，只能靠猜。留档 + 只打 FAIL 行，才能定位抖动。
-LOG_DIR="$(dirname "$0")/regression_logs"
+#
+# 落点可以是私有目录（B2B_REGRESSION_SANDBOX），这一条是本轮自己抓出来的事故：批跑入口
+# 一开头就 rm -rf 共享日志目录，而离线用例 5c-II 会**在批跑里面**再调一次本脚本注入
+# 夹具——内层那一次把外层已经写好的 31 份日志连同外层正开着的自己的日志一起删了。
+# 后果有两层：①排障证据凭空消失（报的是「FAIL」，可完整输出那一行 cat 都 cat 不出来）；
+# ②外层那些套件真实是绿的，却因为日志被删被判成红。并发/嵌套互删日志的症状和「代码坏了」
+# 完全一样，人就会去改代码——所以每次批跑都有自己的落点，并且用一把锁把「同时两批」堵住。
+BASE=${B2B_REGRESSION_SANDBOX:-}
+if [ -n "$BASE" ]; then
+  CLEAN_BASE=0          # 别人给的路径不做整目录删除：里面可能还有调用方自己的东西
+else
+  BASE="$(dirname "$0")/regression_logs"
+  CLEAN_BASE=1          # 本脚本自己的落点，整目录重建（旧版平铺的 *.log 也一并收掉）
+fi
+LOG_DIR="$BASE/logs"
+LOCK_DIR="$BASE/.lock"
+mkdir -p "$BASE" 2>/dev/null || { echo "❌ 落点建不出来：$BASE"; exit 2; }
+# 锁：**先抢锁再动目录**，顺序反了就没用了——旧写法是先 rm -rf 再判，嵌套调用只要忘了
+# 指定私有落点，就会在被告知「你被挡住了」之前把外层已经写好的日志全删干净。
+# 同一落点上同时跑两批 = 互相删对方的证据。取不到锁就当场停，并且说清下一步
+# （等它跑完 / 给自己指定私有落点），绝不静默等待——「等一下」在无人值守的批跑里
+# 就是「永远卡住」。内层夹具走私有落点，因此不会被外层的锁挡住。
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "❌ 这个落点上已经有一批回归在跑（锁：${LOCK_DIR}）"
+  echo "   两批并发会互相删对方的日志：本轮就是这么丢掉了 31 份证据，还把 2 个其实是绿的"
+  echo "   套件判成了红。等前一批跑完再重跑；若是离线用例要在批跑里注入夹具，"
+  echo "   就给它一个私有落点：B2B_REGRESSION_SANDBOX=\$(mktemp -d)"
+  exit 8
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+# 锁在手之后才清日志。注意清的是**日志**，不是落点本身：整目录 rm -rf 会把自己刚建的
+# 锁一起删掉，那一瞬间第二个批跑能乘虚拿到锁，两批又开始互删对方的证据——本轮要的正是
+# 堵住这一类。默认落点下顺手收掉旧版平铺在 BASE 根的 *.log（换了目录层级，别留遗物）。
+if [ "$CLEAN_BASE" -eq 1 ]; then
+  rm -f "$BASE"/*.log 2>/dev/null
+fi
 rm -rf "$LOG_DIR" 2>/dev/null
-mkdir -p "$LOG_DIR" 2>/dev/null
+mkdir -p "$LOG_DIR" 2>/dev/null || { echo "❌ 日志目录建不出来：${LOG_DIR}（判定看不到证据就没法诚实）"; exit 2; }
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
@@ -145,8 +180,20 @@ for f in $FILES; do
     $PY -u -X faulthandler "$f" >"$log" 2>&1
   fi
   code=$?
-  out=$(cat "$log")
-  last=$(printf '%s\n' "$out" | grep -E "PASS|FAIL|通过|失败" | tail -1)
+  out=$(cat "$log" 2>/dev/null)
+  last=$(printf '%s\n' "$out" | grep -E "PASS|FAIL|通过|失败|_OK" | tail -1)
+  # 证据必须先在场，判定才有意义。日志不见了（被并发的另一批删了）或压根没写一行
+  # （套件静默 exit 0，一句断言都没报）都属于「看不到」，看不到的东西不许算绿。
+  if [ ! -f "$log" ]; then
+    fail=$((fail+1)); failed="$failed $f"
+    printf 'FAIL  %-52s 退出码 %s，但套件日志不在（%s）：没有证据就无法判断它真的跑过\n' "$f" "$code" "$log"
+    continue
+  fi
+  if [ -z "$out" ]; then
+    fail=$((fail+1)); failed="$failed $f"
+    printf 'FAIL  %-52s 退出码 %s，可日志一个字都没写：一条断言都没报的「绿」没有任何含义\n' "$f" "$code"
+    continue
+  fi
   # 判定交叉核对：套件自己在汇总里数出来的失败条数，必须和它的退出码一致。
   # 这一条是本轮补的：批跑入口原先无论红多少都 `exit 0`，「全量跑绿」这件事从来没有
   # 机器可判的口径，只有人眼盯着屏幕那一刻算数——而同一套逻辑的坑在同一个套件里已经
@@ -167,6 +214,17 @@ for f in $FILES; do
     fail=$((fail+1)); failed="$failed $f"; hung="$hung $f"
     printf 'HANG  %-52s 超过 %ss 没跑完（已 SIGABRT，挂死栈见下）\n' "$f" "$PER_TEST_TIMEOUT"
     printf '%s\n' "$out" | tail -22 | sed 's/^/        /'
+  elif [ -z "$nfail" ] && printf '%s\n' "$out" | grep -qE "全部 [0-9]+ 项断言通过|ALL ASSERTS PASSED" \
+       && ! printf '%s\n' "$out" | grep -qE "^Traceback|^AssertionError"; then
+    # 「矛盾」这一类是本轮 gui_smoke_test 的实况：屏幕最后一行写着「全部 54 项断言
+    # 通过 ✅」，退出码却不是 0（崩在解释器收尾阶段，Qt/线程的析构与判定毫无关系）。
+    # 旧写法把这一行照原样打出来，人看见的是「✅ 却 FAIL」，只能靠猜和重跑——
+    # 重跑又是绿的，于是这条真红被当成抖动放过去了。现在直接说清：断言全过，
+    # 崩的是收尾，并提醒「判定要与退出码同源」（套件自己收尾 os._exit）。
+    fail=$((fail+1)); failed="$failed $f"
+    printf 'FAIL  %-52s 断言全过但退出码 %s：崩在收尾阶段，不是判定阶段（套件的退出码必须和断言结果同源）\n' "$f" "$code"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/        /'
+    printf '        （完整输出：%s）\n' "$log"
   else
     fail=$((fail+1)); failed="$failed $f"; printf 'FAIL  %-52s %s\n' "$f" "$last"
     # 只打红的那几条断言（含前后各一行上下文），完整日志见 LOG_DIR

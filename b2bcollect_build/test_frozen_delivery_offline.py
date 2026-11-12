@@ -28,10 +28,12 @@
      job 超时）；退出码全表由故障分类表派生，帮助文本不许再手写一份清单
   M. workflow 步骤的脚本语言与这一步真正用的 shell 必须配套：Windows 上 run 步
      默认是 pwsh，bash 的 `[ -f x ] || { …; exit 1; }` 会被解析成类型表达式，
-     ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法。同组还管三件
+     ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法。同组还管四件
      交付链上的「绿得没意义」：NSIS 版本以**真正编译那一次** makensis 自报的横幅为
      权威（拿假编译器真跑四种现实验活）、::error:: 注解必须是本步 shell 打出来的单行
-     文本、批跑入口的总判定必须进退出码（它曾红着 6 条却退 0）
+     文本、批跑入口的总判定必须进退出码（它曾红着 6 条却退 0）、批跑入口自己的证据
+     不许被嵌套调用删掉（同一落点上的两批互斥、夹具批跑关进私有沙箱，否则外层绿的
+     套件会被判成红，而「完整输出」连 cat 都 cat 不出来）
   N. 打包清单硬门与采集通道完整性：site_adapters 声明的跨目录模块必须在三处入口
      逐条对上、且落对目录（缺一条或放错地方都在构建前红）；产物自检在打包态缺
      通道退 3，源码态只警告；界面只点名「该给却没给」的那几路（档位藏起来的
@@ -1062,6 +1064,27 @@ def test_delivery_chain():
             and fetch.count("exit 6") >= 2,
             "内层 zip 不在位/解不开两处都非零退出（静默跳过校验等于拆掉随包凭证这道门）")
 
+    # 随包凭证校验读的字节必须就是这一批取回来的字节：旧写法把所有人挤在写死的
+    # /tmp/b2b_dl 上，两次取制品并发（或上一次崩了留半个目录）时校验可能读到另一批
+    # 解出来的东西——它照样报 ✅，但验的不是要交付的那一份。这一类和「dirty 工作区」
+    # 同属最坏的假绿：所有断言都是真的，量的却是别的字节。
+    def _workdir_problems(text: str) -> list:
+        code = "\n".join(ln for ln in text.splitlines()
+                         if not ln.strip().startswith("#"))
+        out = []
+        if "mktemp -d" not in code:
+            out.append("工作目录不是每次现建的（并发取制品会读到另一批解出来的字节）")
+        if "/tmp/b2b_dl/" in code:
+            out.append("还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）")
+        return out
+
+    _assert_eq(_workdir_problems(fetch), [], "取制品落在自己现建的工作目录里")
+    _assert_eq(_workdir_problems('mkdir -p /tmp/b2b_dl && rm -rf /tmp/b2b_dl/*\n'
+                                 'unzip -oq x -d /tmp/b2b_dl/win\n'),
+               ["工作目录不是每次现建的（并发取制品会读到另一批解出来的字节）",
+                "还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）"],
+               "反向对照：本轮那种固定共用落点必须被判红（判据抓不住=这条门是空的）")
+
     # 自检报告的落点由产物自己的 state_dir 候选链决定，两个 Mac 入口都不许把它写死：
     # 写死之后的下一步一定是「口径或布局变了、门禁静默 cat 不到报告」——CI 里看着像
     # 「产物是好的，只是这一步没打印原文」，而这种红法没人会去修（本来就拦不住上传）。
@@ -2056,26 +2079,77 @@ def test_workflow_shell_syntax():
     # 5c-II) 批跑入口的**退出码**才是「全量跑绿」唯一的机器口径。它此前无论红多少都
     # exit 0——本轮就是这样：屏幕顶上写着「1 失败」，脚本却退 0，被当成全绿提交。
     # 「跑绿」只有人盯屏幕那一次算数，等于没有口径。判据不能只写成「文里有 exit 1」，
-    # 注入三份夹具真跑一遍：会绿的、会红的、以及**自己数出 1 条失败却退 0** 的那种
-    # （判定与退出码不一致——屏幕上明明有 ❌，机器却说是绿的，这一类最坏）。
+    # 注入夹具真跑一遍：会绿的、会红的、自己数出 1 条失败却退 0 的、一句话都不说的、
+    # 以及断言全过却带着非零码出局的（gui_smoke_test 本轮的红法——判定与退出码不同源）。
+    #
+    # 内层这一批必须落在**自己的沙箱**里。本轮它落在默认落点上，而入口一开头就要
+    # rm -rf 那个目录：外层已经写好的 31 份日志连同外层自己那份正开着的句柄一起被删，
+    # 结果外层两个其实是绿的套件被判成红，报「完整输出」时连 cat 都 cat 不出来。
+    # 这是判据链自己造的红——而且造的是**假红**（会让人去改代码，代码却是好的）。
     runner = _REPO / "debug" / "run_offline_regression.sh"
     fixture = _REPO / "debug" / "zz_regression_probe.py"
-    for tag, src, want_rc in (
-            ("绿的套件", 'print("结果：3 通过 / 0 失败")\n', 0),
-            ("红的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\nraise SystemExit(1)\n', 1),
-            ("退出码说谎的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\n', 1)):
+    sandbox = Path(tempfile.mkdtemp(prefix="b2b_regression_sandbox_"))
+    shared = _REPO / "debug" / "regression_logs"
+
+    def _shared_state():
+        return sorted(p.relative_to(shared).as_posix() for p in shared.rglob("*")) \
+            if shared.is_dir() else []
+
+    def _run_probe(src: str, extra_env: dict | None = None):
         fixture.write_text(src, encoding="utf-8")
         try:
-            proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True,
-                                  cwd=str(_REPO),
-                                  env=dict(os.environ, B2B_REGRESSION_ONLY="debug/zz_regression_probe.py"))
-            _assert_eq(proc.returncode, want_rc,
-                       f"批跑入口对「{tag}」给的退出码（尾部：{proc.stdout.strip()[-110:]}）")
+            env = dict(os.environ)
+            env.update(extra_env or {})
+            env["B2B_REGRESSION_ONLY"] = "debug/zz_regression_probe.py"
+            env["B2B_REGRESSION_SANDBOX"] = str(sandbox)
+            return subprocess.run(["bash", str(runner)], capture_output=True, text=True,
+                                  cwd=str(_REPO), env=env)
         finally:
             fixture.unlink(missing_ok=True)
+
+    _before = _shared_state()
+    for tag, src, want_rc, want_said in (
+            ("绿的套件", 'print("结果：3 通过 / 0 失败")\n', 0, ""),
+            ("红的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\nraise SystemExit(1)\n', 1, ""),
+            ("退出码说谎的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\n', 1,
+             "判定与退出码不一致"),
+            ("一句话都不说的套件", 'import os\nos._exit(0)\n', 1, "一个字都没写"),
+            ("断言全过却崩在收尾的套件",
+             'print("全部 1 项断言通过 ✅")\nimport os\nos._exit(139)\n', 1, "崩在收尾阶段")):
+        proc = _run_probe(src)
+        _assert_eq(proc.returncode, want_rc,
+                   f"批跑入口对「{tag}」给的退出码（尾部：{proc.stdout.strip()[-110:]}）")
+        if want_said:
+            _assert(want_said in proc.stdout,
+                    f"「{tag}」要红得说清为什么（期望含「{want_said}」，实际：{proc.stdout.strip()[-160:]}）")
         _assert(not fixture.exists(), f"夹具跑完就删，不许留在磁盘上冒充套件（{tag}）")
+    _assert_eq(_shared_state(), _before,
+               "内层夹具批跑不许碰默认落点：外层那一批的证据（每套件一份日志）被删过一次，"
+               "删证据的判据本身必须被关在自己的沙箱里")
+    _assert((sandbox / "logs").is_dir(), "沙箱落点真的在用（没在用=上面那条等价校验是空的）")
+
+    # 反向对照：同一落点上的两批必须互斥。锁只在文档里写着、实际不生效，症状与
+    # 「从来没并发过」完全一样——所以先把锁真的摆上，再要求入口当场拒绝并给出下一步。
+    (sandbox / ".lock").mkdir(parents=True, exist_ok=True)
+    try:
+        proc = _run_probe('print("结果：1 通过 / 0 失败")\n')
+        _assert_eq(proc.returncode, 8, f"落点上已有锁时必须拒绝开跑（实际 rc={proc.returncode}）")
+        _assert("已经有一批回归在跑" in proc.stdout and "B2B_REGRESSION_SANDBOX" in proc.stdout,
+                f"被挡住时要说清等什么、以及怎么绕开（实际：{proc.stdout.strip()[-200:]}）")
+    finally:
+        shutil.rmtree(sandbox / ".lock", ignore_errors=True)
+    proc = _run_probe('print("结果：1 通过 / 0 失败")\n')
+    _assert_eq(proc.returncode, 0, f"锁收掉后同一落点立刻能再跑（rc={proc.returncode}）")
+    _assert(not (sandbox / ".lock").exists(),
+            "跑完必须自己释放锁：留下一把死锁会把之后每次批跑都挡在门外，"
+            "症状和「回归跑不动」一模一样")
+    shutil.rmtree(sandbox, ignore_errors=True)
+
+    sandbox2 = Path(tempfile.mkdtemp(prefix="b2b_reg_empty_"))
     proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True, cwd=str(_REPO),
-                          env=dict(os.environ, B2B_REGRESSION_ONLY=" "))
+                          env=dict(os.environ, B2B_REGRESSION_ONLY=" ",
+                                   B2B_REGRESSION_SANDBOX=str(sandbox2)))
+    shutil.rmtree(sandbox2, ignore_errors=True)
     _assert(proc.returncode != 0 and "没有任何套件被执行" in proc.stdout,
             f"清单展开成空也必须红：一项都没跑的症状和「真的全过」一模一样（rc={proc.returncode}）")
 
