@@ -70,6 +70,19 @@ for kv in "${IDS[@]}"; do
   curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "/tmp/b2b_dl/$key.zip" \
     "$API/actions/artifacts/$AID/zip"
   mkdir -p "/tmp/b2b_dl/$key" && unzip -oq "/tmp/b2b_dl/$key.zip" -d "/tmp/b2b_dl/$key"
+  # Actions 制品本身是一个 zip，里面装的才是 workflow 用 ditto 打的真实产物包（Mac 侧
+  # 就是 B2bCollectTool_Mac_arm64.zip，.app 在这个内层 zip 里）。只解一层时 find 到的
+  # 永远只有那个内层 zip，.app 根本不存在 → 校验报「没找到 .app，无法校验」并按坏包退出：
+  # 看上去像产物出了问题，其实是校验器自己少解一层（本轮实测踩过，云打包明明 success）。
+  # 解不开必须当场停：静默跳过校验等于把「随包凭证」这道门拆了，而它正是外部机器全员
+  # 精简版那次事故的守门人。
+  if [ "$key" = "mac" ]; then
+    INNER=$(find "/tmp/b2b_dl/$key" -maxdepth 2 -name "*.zip" -type f | head -1)
+    [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有内层产物 zip（workflow 的上传步骤变了？先修校验器再谈交付）"; exit 6; }
+    ditto -x -k "$INNER" "/tmp/b2b_dl/$key/unpacked" \
+      || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; exit 6; }
+    echo "[$key] 已解开内层：$(basename "$INNER") → $(find "/tmp/b2b_dl/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
+  fi
   echo "[$key] artifact 内容：$(find /tmp/b2b_dl/$key -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
 done
 

@@ -951,6 +951,17 @@ def test_delivery_chain():
     _assert("if [ ! -f config.json ]" in local and "exit 1" in local,
             "本机脚本在 config.json 不在位时中止（不许安静地出一个没凭证的包）")
 
+    # 校验器自己也得懂产物结构：Actions 制品是「zip 里再套一层 ditto 打的产物 zip」，
+    # 只解外层时 .app 永远找不到，脚本会报「没找到 .app，无法校验」并按坏包退出——
+    # 症状和产物真坏了完全一样（本轮两个云 run 都 success，却被自己的校验器拦下）。
+    # 判据钉在文本上：必须解内层 zip；解不出内层时必须非零退出，绝不许安静跳过校验。
+    fetch = (_REPO / "debug" / "fetch_b2bcollect_artifacts.sh").read_text(encoding="utf-8")
+    _assert("ditto -x -k" in fetch and "INNER" in fetch,
+            "制品校验器解到内层产物 zip 再找 .app（少解一层=把校验器自己的毛病报成产物坏了）")
+    _assert("没有内层产物 zip" in fetch and "解不开" in fetch
+            and fetch.count("exit 6") >= 2,
+            "内层 zip 不在位/解不开两处都非零退出（静默跳过校验等于拆掉随包凭证这道门）")
+
     # 注入脚本与运行时的键名契约：不一致 = 注入了等于没注入
     import oss_pool_client as _oss
     script = (_REPO / ".github" / "scripts" / "inject_build_config.py").read_text(
