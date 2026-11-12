@@ -29,6 +29,10 @@
   M. workflow 步骤的脚本语言与这一步真正用的 shell 必须配套：Windows 上 run 步
      默认是 pwsh，bash 的 `[ -f x ] || { …; exit 1; }` 会被解析成类型表达式，
      ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法
+  N. 打包清单硬门与采集通道完整性：site_adapters 声明的跨目录模块必须在三处入口
+     逐条对上、且落对目录（缺一条或放错地方都在构建前红）；产物自检在打包态缺
+     通道退 3，源码态只警告；界面只点名「该给却没给」的那几路（档位藏起来的
+     功能不许被念出来）——本轮第三种红法：CI 全绿、产物却只剩企知道一路
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -39,6 +43,7 @@
 运行：QT_QPA_PLATFORM=offscreen .venv/bin/python b2bcollect_build/test_frozen_delivery_offline.py
 """
 import contextlib
+import importlib.util
 import inspect
 import io
 import json
@@ -78,15 +83,27 @@ _TC_SRC = (_REPO / "b2bcollect_build" / "tool_config.py").read_text(encoding="ut
 _PASS = 0
 _FAIL = 0
 
+# 失败详情里不许带出密钥明文。这套用例的主角就是凭证解析链：只要某一级命中了开发机上
+# 的真实密钥（本机打过包就一定会有），diff 就会把 AK/SK 原样打进 CI 日志和本地终端——
+# 日志会被留存、会被别人看到，而「测试输出里有真密钥」这件事本身就是一个缺陷。
+# 判据取「连续 24 位以上的纯字母数字」：AK/SK 这类正好命中；路径、URL、中文里都有
+# / . 或非标点字符断串，不会被误伤成脱敏（把有用的定位信息抹掉也是一种坏法）。
+_SECRET_RE = re.compile(r"[A-Za-z0-9]{24,}")
+
+
+def _redact(text) -> str:
+    return _SECRET_RE.sub(
+        lambda m: m.group(0)[:4] + f"…（已脱敏，{len(m.group(0))} 位）", str(text))
+
 
 def _assert(cond, msg):
     global _PASS, _FAIL
     if cond:
         _PASS += 1
-        print(f"  ✅ {msg}")
+        print(f"  ✅ {_redact(msg)}")
     else:
         _FAIL += 1
-        print(f"  ❌ {msg}")
+        print(f"  ❌ {_redact(msg)}")
 
 
 def _assert_eq(actual, expected, msg):
@@ -99,14 +116,14 @@ def _assert_raises(exc_type, fn, msg):
         fn()
     except exc_type:
         _PASS += 1
-        print(f"  ✅ {msg}")
+        print(f"  ✅ {_redact(msg)}")
         return
     except Exception as e:
         _FAIL += 1
-        print(f"  ❌ {msg}（抛的是 {type(e).__name__}: {e}）")
+        print(f"  ❌ {_redact(msg)}（抛的是 {type(e).__name__}: {_redact(e)}）")
         return
     _FAIL += 1
-    print(f"  ❌ {msg}（没抛异常）")
+    print(f"  ❌ {_redact(msg)}（没抛异常）")
 
 
 def _fmt_idx(i):
@@ -162,6 +179,26 @@ def _workspace(with_exe_config=None, with_bundle_config=None, env_config=None):
     stack = contextlib.ExitStack()
     try:
         stack.enter_context(_patch(ag, "_state_dir", lambda: local_state))
+        # ── 源码态的三级文件候选也一并搬进临时目录 ──────────────────────────
+        # 不搬就会「跑过一次本地打包，回归就红四条」：打包脚本会现写
+        # b2bcollect_build/config.json（真密钥），PyInstaller 还会在源码态把
+        # state_dir 指回模块目录。测试读到的来源因此从「什么都没配」变成「随包内置
+        # 命中」，.m 兜底那几条断言当场变红——而红法最坏的地方是它**看起来像真缺陷**，
+        # 换一台没打过包的机器又全绿。测试的输入必须只由夹具决定（本套的职责就是把
+        # 打包态模拟出来，结果被开发机磁盘上的真实产物影响，等于没模拟）。
+        _orig_bundle = tc.bundle_dir
+        _orig_repo = tc._repo_root
+
+        def _bundle_isolated():
+            return (root / "src_module") if not tc.is_frozen() else _orig_bundle()
+
+        def _repo_isolated():
+            return (root / "src_none") if not tc.is_frozen() else _orig_repo()
+
+        stack.enter_context(_patch(tc, "bundle_dir", _bundle_isolated))
+        stack.enter_context(_patch(tc, "_repo_root", _repo_isolated))
+        stack.enter_context(_patch(tc, "user_config_file",
+                                  lambda: root / "home_isolated" / "config.json"))
         yield {"root": root, "exe_dir": exe_dir, "bundle": bundle,
                "env_file": env_file, "local_state": local_state}
     finally:
@@ -817,9 +854,31 @@ _HIDDEN_RE = r'--hidden-import\s+([\w.]+)'
 _COLLECT_RE = r'--collect-(?:all|submodules)\s+([\w.]+)'
 _ADD_DATA_RE = r'--add-data\s+"([^"]+)"'
 
+_GATE_MOD = None
+
+
+def _manifest_gate():
+    """把构建前的「打包清单硬门」脚本当模块载进来（它就是判据本体，不另抄一份）。
+
+    这份用例既校验三处入口的清单，也校验那个脚本自己判得对不对：脚本和用例各写一套
+    提取逻辑时，同一颗坑要踩两次（注释里的 --hidden-import 被当成参数就是这么回事）。
+    """
+    global _GATE_MOD
+    if _GATE_MOD is None:
+        path = _REPO / ".github" / "scripts" / "check_packaging_manifest.py"
+        spec = importlib.util.spec_from_file_location("_pkg_manifest_gate", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GATE_MOD = mod
+    return _GATE_MOD
+
 
 def _cli_values(text: str, pattern: str) -> set:
-    return set(re.findall(pattern, text))
+    # 注释必须先剔掉再匹配：workflow/脚本的注释里写着「--add-data/--hidden-import 与
+    # site_adapters 的清单」这种话，不剔就会凭空多出一个叫「与」的幽灵清单项，
+    # 于是「本机脚本与 CI 清单一致」这条永远红——而它红的时候没人怀疑是解析器的问题。
+    # 解析器与构建前的硬门共用同一份（见 _manifest_gate），两边不再各写一遍正则。
+    return set(re.findall(pattern, _manifest_gate()._strip_comments(text)))
 
 
 def test_delivery_chain():
@@ -884,14 +943,13 @@ def test_delivery_chain():
             and "$DRIVER" in local,
             "两边都带内置驱动：CI 写死 arm64 路径，本机按架构探测")
 
-    # spec 只存在于开发机：在位就顺手比对，不在位绝不算失败。
-    spec_file = _REPO / "b2bcollect_build" / "B2bCollectTool.spec"
-    if spec_file.is_file():
-        spec = spec_file.read_text(encoding="utf-8")
-        _assert("'config.json'" in spec, "本地 spec 也把 config.json 打进包")
-        _assert("B2B_BUILD_ALLOW_NO_CONFIG" in spec,
-                "本地 spec 缺配置时默认中止，不许安静地出一个没凭证的包")
-        _assert("'tool_config'" in spec, "本地 spec 收了 tool_config（与两个 workflow 同口径）")
+    # 这里**不再**比对 b2bcollect_build/B2bCollectTool.spec：它由 PyInstaller 在
+    # CLI 构建时自动生成（.gitignore 里 *.spec 就是为此），内容只是那串命令行参数的
+    # 回显，既不是入口也不是人工维护的清单。以前「在位就顺手比对」的写法会让回归结果
+    # 取决于「这台机器最近跑没跑过本地打包」——跑过就红三条，而且红的是一条根本不参与
+    # 出包的旁路文件。真正要钉的门在下面这句：本机脚本自己必须在 config.json 不在位时中止。
+    _assert("if [ ! -f config.json ]" in local and "exit 1" in local,
+            "本机脚本在 config.json 不在位时中止（不许安静地出一个没凭证的包）")
 
     # 注入脚本与运行时的键名契约：不一致 = 注入了等于没注入
     import oss_pool_client as _oss
@@ -1777,6 +1835,174 @@ def test_workflow_shell_syntax():
         _assert("不许出包" in text, f"{path} 的构建前硬门说清了后果（不是只 exit 1）")
 
 
+# ══════════════════════════════════════════════ N. 打包清单硬门 + 采集通道完整性
+class _NoSuchKeyClient:
+    """凭证通、网络通、但名单还没播种过的 OSS（自检里唯一那条提前返回的分支）。"""
+
+    bucket = "images6396289"
+    endpoint = "oss-cn-shenzhen.aliyuncs.com"
+
+    def download_json(self, key, *a, **kw):
+        raise OSSPoolError("404 NoSuchKey: 指定的名单文件不存在")
+
+
+def test_packaging_manifest_gate():
+    """2026-11-12 实测：等级 0 的账号在产物里只看到企知道 —— 根因是三处入口的
+    --add-data 漏收了 riskbird_crawler_v2.py / aiqicha_crawler_v2.py。
+
+    「少一个文件不会报错、只会少一个功能」是这一类缺陷的共同形状，而且它在界面上和
+    「档位没给这个功能」一模一样，第一轮排查必然被带去查权限。所以四个方向都要钉住：
+      1) 清单真源（site_adapters.EXTERNAL_MODULES）与三处入口逐条对拍，含目标目录；
+      2) 硬门脚本自己判得对不对（两个反例：删一条、放错目录，都必须红）；
+      3) 产物自检的通道完整性（打包态退 3、源码态只警告、那条提前返回不放过）；
+      4) 界面说话只点名「该给却没给」的那几路，档位藏起来的路绝不念出来。
+    """
+    print("\n═══ N. 打包清单硬门 + 采集通道完整性（少一路=静默少功能）═══")
+    gate = _manifest_gate()
+    externals, channels = gate.module_manifest()
+    _assert_eq(set(channels), {"qzd", "riskbird", "aiqicha"},
+               "名单通道应有路数 = 企知道 / 风鸟 / 爱企查 三路")
+    _assert(any("riskbird_crawler_v2.py" in r for r in externals)
+            and any("aiqicha_crawler_v2.py" in r for r in externals),
+            "两个 v2 采集器在清单真源里（正是这次漏掉的那两个文件）")
+
+    # 1) 三处入口逐条对拍（正例）
+    modules = gate.local_modules()
+    _assert(len(modules) >= 40, f"本地模块清单扫出来了（{len(modules)} 个）")
+    for label, path in gate.CALLERS.items():
+        _assert(path.is_file(), f"{label} 入口在位：{path}")
+        problems = gate.check_caller(label, path.read_text(encoding="utf-8", errors="replace"),
+                                     externals, modules)
+        _assert_eq(problems, [], f"{label} 过打包清单硬门（任何一条不合格都拦在开建之前）")
+
+    # 2) 硬门自己判得对不对：两个反例必须红，否则「门禁全绿、用户少功能」会原样复发
+    local = gate.CALLERS["本机 Mac 打包脚本"].read_text(encoding="utf-8")
+    cut = "\n".join(ln for ln in local.splitlines() if "riskbird_crawler_v2.py" not in ln)
+    _assert(cut != local, "反例①构造成功（删掉那条 --add-data；没删掉就是空跑）")
+    got = gate.check_caller("反例①", cut, externals, modules)
+    _assert(any("riskbird_crawler_v2.py" in p and "缺跨目录模块" in p for p in got),
+            f"漏一条 --add-data 必须被点名（实际={got}）")
+    moved = local.replace("riskbird_build/riskbird_crawler_v2.py:riskbird_build",
+                          "riskbird_build/riskbird_crawler_v2.py:.")
+    _assert(moved != local, "反例②构造成功（目标目录写成 .）")
+    got2 = gate.check_caller("反例②", moved, externals, modules)
+    _assert(any("riskbird_crawler_v2.py" in p and "目标目录不是 riskbird_build" in p for p in got2),
+            f"文件进了包但落错目录同样要红（运行时按 _MEIPASS/riskbird_build/ 找不到）：{got2}")
+    # 注释里的参数名不是参数：这颗坑在硬门和本用例里各踩过一次，解析器现在只有一份
+    _assert_eq(gate._flag_values(gate._strip_comments(
+                   "# --hidden-import 注释里的假项\n--hidden-import real_mod\n"),
+                   "--hidden-import"), ["real_mod"],
+               "整行注释被剔掉，只有真正会执行的参数进清单")
+    # CLI 退出码语义：CI 靠它拦构建，返回 1 就等于门禁形同虚设
+    proc = subprocess.run([sys.executable,
+                           str(_REPO / ".github" / "scripts" / "check_packaging_manifest.py")],
+                          capture_output=True, text=True, cwd=str(_REPO))
+    _assert_eq(proc.returncode, 0, f"硬门脚本实跑通过（stderr={proc.stderr[-200:]}）")
+
+    # 3) 产物自检的通道完整性
+    import site_adapters as _sa
+    import b2bcollect_gui as gui
+    two_lost = {"qzd": True, "riskbird": False, "aiqicha": False}
+    errs = {"riskbird": "FileNotFoundError: riskbird_crawler_v2.py 不存在",
+            "aiqicha": "ImportError: selenium 没装"}
+    with _patch(_sa, "LIST_CHANNEL_AVAILABLE", two_lost), _patch(_sa, "ADAPTER_ERRORS", dict(errs)):
+        _assert_eq(_sa.missing_list_channels(), ("riskbird", "aiqicha"),
+                   "缺路口径只看「加载上了没有」，与档位/等级无关")
+        code_f, lines_f = ag._channel_integrity(frozen=True)
+        _assert_eq(code_f, ag.DOCTOR_EXIT_MODULE, "打包态缺通道 → 自检退 3（不许发货）")
+        code_s, lines_s = ag._channel_integrity(frozen=False)
+        _assert_eq(code_s, ag.DOCTOR_EXIT_OK, "源码态只警告不判红（开发机没装 selenium 不该拖红 CI）")
+        # 中文名按 slug 取，不是按位置：位置映射在增删通道时全体错位，会把风鸟说成爱企查
+        _assert(any("产物里缺采集通道：风鸟 / 爱企查" in ln for ln in lines_f),
+                f"报告按 slug 点名缺哪几路（实际={lines_f[:2]}）")
+        _assert(any("不是权限问题" in ln for ln in lines_f),
+                "报告直接把人从「查权限」这条错路上拦回来")
+        _assert(any("check_packaging_manifest" in ln for ln in lines_f),
+                "报告给出可执行的修法（发包方照着跑就能定位缺哪条）")
+
+    # 唯一那条提前返回的成功分支（名单还没播种）不许放过通道判红
+    with _patch(_sa, "LIST_CHANNEL_AVAILABLE", two_lost), _patch(_sa, "ADAPTER_ERRORS", dict(errs)):
+        with _workspace() as _ws, _frozen(_ws):
+            with _patch(AccessGuard, "_load_bound_account", staticmethod(lambda: "")), \
+                 _patch(AccessGuard, "_client_probe", staticmethod(lambda: (_NoSuchKeyClient(), "ok", ""))):
+                code_e, lines_e = ag.doctor_lines()
+                _assert_eq(code_e, ag.DOCTOR_EXIT_MODULE,
+                           "「名单没播种 + 包少平台」两件事叠在一起时，提前返回也必须带通道退出码")
+                _assert(any("采集通道完整性不通" in ln for ln in lines_e),
+                        f"报告说清为什么权限项过了还判红（实际={lines_e[-3:]}）")
+    with _patch(_sa, "LIST_CHANNEL_AVAILABLE", {"qzd": True, "riskbird": True, "aiqicha": True}):
+        with _workspace() as _ws, _frozen(_ws):
+            with _patch(AccessGuard, "_load_bound_account", staticmethod(lambda: "")), \
+                 _patch(AccessGuard, "_client_probe", staticmethod(lambda: (_NoSuchKeyClient(), "ok", ""))):
+                code_ok, _ = ag.doctor_lines()
+                _assert_eq(code_ok, ag.DOCTOR_EXIT_OK, "通道齐全时，名单没播种仍然判通过（不误伤首次使用）")
+
+    # 4) 界面说话：只念「该给却没给」的那几路
+    _old_ed = os.environ.get(_ed.ENV_VAR)
+    _old_lv = os.environ.get(_ed.LEVEL_ENV_VAR)
+    try:
+        with _patch(_sa, "LIST_CHANNEL_AVAILABLE", two_lost), _patch(_sa, "ADAPTER_ERRORS", dict(errs)):
+            os.environ[_ed.ENV_VAR] = "pro"
+            os.environ[_ed.LEVEL_ENV_VAR] = "0"
+            _ed.reset_for_tests()
+            _assert_eq(gui._lost_list_channels(), ("riskbird", "aiqicha"),
+                       "pro + 等级 0 该有三路：缺的两路必须报出来")
+            os.environ[_ed.ENV_VAR] = "lite"
+            os.environ[_ed.LEVEL_ENV_VAR] = "2"
+            _ed.reset_for_tests()
+            _assert_eq(gui._lost_list_channels(), (),
+                       "丐版本来只给企知道：缺风鸟/爱企查不能在日志里点名内部平台（等于把藏起来的功能念出来）")
+            # 档位藏起来的那几路即使真的缺失也不许出现在给外部用户看的文案里
+            _lost_pro = gui.MainWindow._lost_channels_text(("riskbird", "aiqicha"), "风鸟 / 爱企查")
+            _assert("不是账号权限" in _lost_pro and "找发包方" in _lost_pro,
+                    "缺路文案三件事齐全：是什么、不是什么（权限）、怎么办（要新包）")
+            _lines = [x for x in _lost_pro.strip().splitlines() if x]
+            _assert(len(_lines) == 3 and _lines[-1].startswith("⚠ 处置"),
+                    f"「怎么办」必须排在最后一条：收起态只看得见最后两三行（实际={_lines}）")
+            # 「原因」那一行必须由实测到的加载错误决定：漏模块、漏依赖、初始化抛异常
+            # 三种情况界面症状完全一样，说死其中一种就等于让发包方照着错的那句去查。
+            _reason = gui.MainWindow._lost_channels_reason
+            with _patch(_sa, "ADAPTER_ERRORS", {
+                    "riskbird": "ModuleNotFoundError: No module named 'riskbird_crawler_v2'",
+                    "aiqicha": "ImportError: No module named 'cv2'"}):
+                _r = _reason(("riskbird", "aiqicha"))
+                _assert("缺了它们运行所需的文件" in _r and "采集器本身或它的依赖" in _r,
+                        f"全是「找不到文件」这一类时才说漏文件，且把依赖也算进去"
+                        f"（selenium/cv2 不是采集器文件）（实际={_r}）")
+            with _patch(_sa, "ADAPTER_ERRORS", {
+                    "riskbird": "AttributeError: 'NoneType' object has no attribute 'x'",
+                    "aiqicha": "AttributeError: 缺模板图"}):
+                _assert("本机加载这些采集器时报错了" in _reason(("riskbird", "aiqicha")),
+                        "文件都在、初始化抛异常时说「加载报错」，不说漏文件")
+            with _patch(_sa, "ADAPTER_ERRORS", {
+                    "riskbird": "ModuleNotFoundError: No module named 'riskbird_crawler_v2'",
+                    "aiqicha": "AttributeError: 缺模板图"}):
+                _r2 = _reason(("riskbird", "aiqicha"))
+                _assert("缺了、或本机加载不出" in _r2,
+                        f"证据不止一种时退回覆盖得下的那句，不替某一路下结论（实际={_r2}）")
+            with _patch(_sa, "ADAPTER_ERRORS", {}):
+                _r = _reason(("riskbird",))
+                _assert("缺了、或本机加载不出" in _r and "--doctor" in _r,
+                        f"没有任何加载错误记录时不编原因，只把人指向自检报告（实际={_r}）")
+            _detail = gui.MainWindow._lost_channels_detail(("riskbird", "aiqicha"))
+            _assert("风鸟" in _detail and "爱企查" in _detail and "selenium 没装" in _detail,
+                    f"逐路的错误原文进悬停说明（长句不进日志）（实际={_detail[:120]}）")
+            _assert("check_packaging_manifest" in gui.MainWindow._lost_channels_detail(("riskbird",)),
+                    "发包方自查命令挂在悬停说明里（长句不进日志，否则会把结论顶出可见区）")
+            _assert_eq(gui.MainWindow._lost_channels_detail(()), "",
+                       "一路不缺时连细节也不产（正常机器上不多一个字）")
+            _assert_eq(gui.MainWindow._lost_channels_text((), ""), "",
+                       "一路不缺时不产文案（正常机器上日志里一条也不会多）")
+    finally:
+        # 档位是进程级状态：不收回去，后面每一条用例都在 lite 里跑
+        for _k, _v in ((_ed.ENV_VAR, _old_ed), (_ed.LEVEL_ENV_VAR, _old_lv)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        _ed.reset_for_tests()
+
+
 def main():
     print("═══ 打包态交付链 离线测试 ═══")
     test_config_chain()
@@ -1792,6 +2018,7 @@ def main():
     test_console_encoding()
     test_doctor_flag_parity()
     test_workflow_shell_syntax()
+    test_packaging_manifest_gate()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 

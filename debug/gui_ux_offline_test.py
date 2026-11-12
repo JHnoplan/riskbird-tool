@@ -3,7 +3,8 @@
 ① 页数控件彻底删除、翻页一律不限（max_pages 固定 0）
 ② 「后台运行」默认勾选
 ③ 看板由 5 行压成 1 行、次要文字按深浅主题自适应（根治「已采 xxx 家下方空一块把日志挤出屏幕」）
-④ 界面整洁化：长说明进 tooltip、参数区 1 行、主按钮唯一、日志给死最小高度
+④ 界面整洁化：长说明进 tooltip、参数区 1 行、主按钮唯一、日志折叠抽屉默认收起
+   （2026-11-12 追加：主动作行钉在滚动容器之外 + 窗口最小宽按屏宽分档，见下面 ④ 段）
 """
 import inspect
 import io
@@ -14,7 +15,8 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
 
-from PyQt5.QtWidgets import QApplication, QGroupBox, QPushButton  # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QGroupBox, QLabel, QPushButton)  # noqa: E402
+from PyQt5.QtGui import QImage, QPainter                                        # noqa: E402
 
 import b2bcollect_gui as gui  # noqa: E402
 
@@ -31,7 +33,108 @@ def check(name, cond, detail=None):
     print(f"  ✓ {name}")
 
 
+def _scroll_of(wd):
+    """控件所在的可滚动容器；没有就返回 None（=它钉在常驻区，不用滚就能看到）。"""
+    p = wd.parent()
+    while p is not None and not isinstance(p, gui.QScrollArea):
+        p = p.parent()
+    return p
+
+
+def _floor_at(cap_w):
+    """把可用屏宽假装成 cap_w，量一次「窗口最小宽被抬到多少 / 退路是什么」。
+
+    offscreen 的假屏只有 800 宽，直接跑永远只落在「封顶 + 退回横向滚动」那一档，
+    「按内容抬起地板」这条真机上天天生效的主路在 CI 里等于没人测。这里造两种屏各量一次。
+    """
+    gui.MainWindow._width_floor_cap = lambda self, _c=cap_w: _c
+    win = gui.MainWindow()
+    win.show()
+    app.processEvents()
+    content = win._cfg_scroll.widget()
+    # 最宽的几个控件一起带回来：内容最小宽突然变大时，光看一个总数等于什么也没说
+    # （本轮就被「1466 > 1440」这条红拖了一整轮，因为它只报了总数、没报是谁顶起来的）。
+    widest = sorted(((wd.minimumSizeHint().width(), type(wd).__name__,
+                      (wd.title() if isinstance(wd, QGroupBox) else wd.text())[:28])
+                     for wd in content.findChildren((QLabel, QGroupBox))), reverse=True)[:3]
+    got = (win.minimumWidth(),
+           content.minimumSizeHint().width(),
+           win._cfg_scroll.horizontalScrollBarPolicy(),
+           win._gb_list.title() if getattr(win, "_gb_list", None) is not None else "",
+           widest)
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    gui.MainWindow._width_floor_cap = lambda self: 800      # 恢复：后面还用得上小屏那一档
+    return got
+
+
+def _floor_after_morph(cap_w):
+    """首次显示**之后**把配置内容撑宽（模拟启动回填上次任务、告警挂上分区标题），
+    量窗口最小宽跟不跟得上，再改回去量它降不降得下来。
+
+    这一组是「同一份代码两次跑出门禁结果不同」的正解：那些改变形状的动作全部发生在
+    showEvent 之后，只在那一刻算一次地板的用例永远量不到它们（红的时候像布局缺陷，
+    绿的时候又什么都没说）。现在把「变宽要跟上、变窄要松开」钉成可复现的显式动作。
+    """
+    gui.MainWindow._width_floor_cap = lambda self, _c=cap_w: _c
+    win = gui.MainWindow()
+    win.show()
+    app.processEvents()
+    orig = win._gb_list.title()
+    before = (win.minimumWidth(), win._cfg_scroll.widget().minimumSizeHint().width())
+    win._gb_list.setTitle("② 公司名单（" + "补" * 60 + "）")
+    for _ in range(4):
+        app.processEvents()
+    wider = (win.minimumWidth(), win._cfg_scroll.widget().minimumSizeHint().width())
+    win._gb_list.setTitle(orig)                        # 原样换回：别的机器的标题可能带告警后缀
+    for _ in range(4):
+        app.processEvents()
+    back = (win.minimumWidth(), win._cfg_scroll.widget().minimumSizeHint().width())
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    gui.MainWindow._width_floor_cap = lambda self: 800
+    return before, wider, back
+
+
+def _badge_pixels(win):
+    """把折叠条右半边（角标占位区）真渲染一遍取像素。
+
+    为什么非要取像素：状态改对了、paintEvent 却没画（忘记 update、坐标算出界、
+    提前 return），在纯状态断言下全都一片绿——而用户看到的就是一条没有角标的折叠条。
+    「画出来的东西」只能由画出来的结果验收。
+    """
+    btn = win.btn_log_toggle
+    img = QImage(btn.size(), QImage.Format_ARGB32)
+    img.fill(0)
+    p = QPainter(img)
+    btn.render(p)
+    p.end()
+    left = max(0, btn.width() - btn._worst_badge_width())
+    zone = img.copy(left, 0, max(1, btn.width() - left), btn.height())
+    return bytes(zone.bits().asstring(zone.bytesPerLine() * zone.height()))
+
+
+def _badge_painted(win):
+    """同一控件在「有告警 / 无告警」两态下渲染必须不同，否则角标等于没画。"""
+    btn = win.btn_log_toggle
+    keep = (btn._notice_error, btn._notice_warn)
+    try:
+        btn.set_notice(1, 0)
+        with_badge = _badge_pixels(win)
+        btn.set_notice(0, 0)
+        without = _badge_pixels(win)
+    finally:
+        btn.set_notice(*keep)
+    return with_badge != without and len(with_badge) > 0
+
+
 app = QApplication.instance() or QApplication([])
+# 窗口最小宽的天花板就是可用屏宽，而 offscreen 的假屏只有 800x600：这条用例今天在任何
+# 机器上量到的都是「小屏退路」那一档（横向滚动条 + 最小宽不抬）。把 cap 显式钉死，
+# 换真机、换 CI 机器跑的才是同一件事，不会哪天在同事的 5K 屏上莫名红一条。
+gui.MainWindow._width_floor_cap = lambda self: 800
 w = gui.MainWindow()
 w.show()
 
@@ -114,17 +217,165 @@ try:
 finally:
     gui._is_dark_theme = _real_dark
 
-# ── ④ 整洁化：布局行数 / 长文案归位 / 主按钮唯一 ────────────────
-check("④ 日志给死最小高度（小屏绝不再被顶出屏幕）", w.log.minimumHeight() >= 180)
 check("④ 主窗口默认尺寸按小屏收拢（宽<=1000 且高<=760）",
-      w.width() <= 1000 and w.height() <= 760)
-check("④ 最小尺寸允许进一步压缩", w.minimumWidth() <= 900 and w.minimumHeight() <= 640)
+      w.width() <= 1000 and w.height() <= 760,
+      f"{w.width()}x{w.height()}")
+check("④ 最小尺寸允许进一步压缩", w.minimumWidth() <= 900 and w.minimumHeight() <= 640,
+      f"{w.minimumWidth()}x{w.minimumHeight()}")
+# ── ④ 整洁化：布局行数 / 长文案归位 / 主按钮唯一 ────────────────
+# 日志区（2026-11-12 用户反馈「一屏显示不全……把日志区域缩小，正常用户不会经常看日志，
+# 太占用屏幕了」）：老契约「最小高写死 180 常驻」正是这次的账——偶发诊断区常驻半屏，
+# 主流程就被挤出屏幕。新契约钉四件事：新用户默认收起、收起态定高两行（挂机仍能扫最后
+# 一行 ⚠/⛔）、展开态拿回旧底线、展开/收起时富余高度在配置区与日志之间正确换手。
+check("④ 日志默认收起（偶发诊断区不再常驻半屏）", gui._LOG_DEFAULT_EXPANDED is False)
+w._apply_log_area(False)
+check("④ 收起态定高且至少两行（是折叠，不是彻底藏掉）",
+      w.log.minimumHeight() == w.log.maximumHeight()
+      >= 2 * w.log.fontMetrics().lineSpacing(),
+      f"{w.log.minimumHeight()}x{w.log.maximumHeight()}")
+check("④ 收起态不抢配置区的富余高度", w._root_lay.stretch(w._log_index) == 0)
+w._apply_log_area(True)
+check("④ 展开态拿回旧的小屏底线（150）且高度能跟着窗口长",
+      w.log.minimumHeight() >= 150 and w.log.maximumHeight() > w.log.minimumHeight())
+check("④ 展开态才把富余高度让给日志", w._root_lay.stretch(w._log_index) == 1)
+check("④ 折叠条文字跟着档位走（用户看得见还能收回去）",
+      w.btn_log_toggle.text() == gui.MainWindow.LOG_TOGGLE_EXPANDED
+      and "日志" in w.btn_log_toggle.text())
+w._apply_log_area(False)
+# 折叠的固有代价是「看不见就等于没有」：收起态里滚过去的告警必须留下计数，否则折叠
+# 自己就成了下一轮「静默少功能」的藏身处（本轮用户就是因为界面不吭声才去查权限）。
+# 计数还必须按严重度分档并封顶：挂机一晚 ⚠ 能刷上千行，跟 ⛔ 混成一个数字就等于壁纸。
+# 而计数一律**画成角标**、绝不拼进按钮文字：拼进文字按钮就跟着条数变宽，窗口一窄
+# 文字截成「▸ 展开日志（⚠ 3 条…」，布局门禁量到的形状还会随磁盘状态漂移。
+w._log_notice_error = w._log_notice_warn = 0
+_geo0 = (w.btn_log_toggle.minimumWidth(), w.btn_log_toggle.sizeHint().width(),
+         w._action_lay.totalMinimumSize().width())
+w._on_log("⚠ 风鸟 / 爱企查 在你当前账号等级下本该可用，本机却没加载出来")
+w._on_log("这一行是普通进度，不算提醒")
+w._on_log("正文里偶然出现 ⚠ 这种符号，不算一条提醒")
+w._on_log("  ⛔ 持续限流，本站本轮结束")
+check("④ 收起态告警计入角标，且按严重度分两档（⚠ 提醒 / ⛔❌🚫 失败）",
+      w._log_notice_warn == 1 and w._log_notice_error == 1
+      and w.btn_log_toggle.badge_label() == "1"
+      and "1 条失败" in w.btn_log_toggle.toolTip()
+      and "1 条提醒" in w.btn_log_toggle.toolTip(),
+      f"{w._log_notice_error}/{w._log_notice_warn}｜{w.btn_log_toggle.badge_label()}")
+check("④ 只有失败级才用失败色（红色是稀缺资源，天天红=天天不红）",
+      w.btn_log_toggle.badge_colors()[0] == gui._badge_tone_colors("error")[1],
+      w.btn_log_toggle.badge_colors())
+w._log_notice_error = 0
+w._refresh_log_toggle()
+check("④ 只剩提醒时角标换提醒档色相",
+      w.btn_log_toggle.badge_colors()[0] == gui._badge_tone_colors("pause")[1],
+      w.btn_log_toggle.badge_colors())
+check("④ 严重度词汇必须和色表档位同名（对不上不报错，只是静默落到默认灰=角标哑成没消息）",
+      w.btn_log_toggle.badge_colors()[0] != gui._badge_tone_colors("__unknown__")[1]
+      and w.btn_log_toggle.badge_tone() in ("", "error", "pause", "ok", "run"),
+      f"{w.btn_log_toggle.badge_tone()}｜{w.btn_log_toggle.badge_colors()}")
+check("④ 角标必须实心（低饱和底在 15px 胶囊上和窗口底色分不出来，去掉符号后它就是唯一轻重通道）",
+      w.btn_log_toggle.badge_colors()[0] != w.btn_log_toggle.badge_colors()[1]
+      and gui._badge_tone_colors("pause")[0] not in w.btn_log_toggle.badge_colors(),
+      w.btn_log_toggle.badge_colors())
+check("④ 两档底色互不相同（同一种颜色说不清「失败」和「提醒」）",
+      gui._badge_tone_colors("error")[1] != gui._badge_tone_colors("pause")[1])
+check("④ 角标上的字符只许是 ASCII（drawText 不走字体回退链，符号在缺字体的机器上=豆腐块）",
+      w.btn_log_toggle.badge_label().isascii()
+      and w.btn_log_toggle.badge_label().replace("+", "").isdigit(),
+      w.btn_log_toggle.badge_label())
+w._log_notice_error = 1
+w._refresh_log_toggle()
+check("④ 悬停折叠条能看出最近一条是什么（不必先展开再翻日志）",
+      "持续限流" in w.btn_log_toggle.toolTip(), w.btn_log_toggle.toolTip()[-40:])
+check("④ 角标计数不改几何（0 条与 1 条时按钮一样宽，文字永不被截）",
+      (w.btn_log_toggle.minimumWidth(), w.btn_log_toggle.sizeHint().width(),
+       w._action_lay.totalMinimumSize().width()) == _geo0,
+      f"{_geo0} → {(w.btn_log_toggle.minimumWidth(), w.btn_log_toggle.sizeHint().width(), w._action_lay.totalMinimumSize().width())}")
+# 封顶：角标是信号不是台账，刷一万行也只能看到 99+
+w._log_notice_error = 0
+w._log_notice_warn = 250
+w._refresh_log_toggle()
+check("④ 条数显示封顶 99+（刷屏期不变成没人看的壁纸，也不再逐行重画）",
+      w.btn_log_toggle.badge_display() == "99+"
+      and w.btn_log_toggle.badge_label() == "99+"
+      and "250" not in w.btn_log_toggle.toolTip(),
+      f"{w.btn_log_toggle.badge_label()}｜{w.btn_log_toggle.toolTip()[-50:]}")
+w._log_notice_error = 250
+w._refresh_log_toggle()
+check("④ 两档都爆表时角标报失败档色、悬停把两个 99+ 都报全（信息不因为只显示一个而丢）",
+      w.btn_log_toggle.badge_label() == "99+"
+      and w.btn_log_toggle.badge_colors()[0] == gui._badge_tone_colors("error")[1]
+      and "99+ 条失败" in w.btn_log_toggle.toolTip()
+      and "99+ 条提醒" in w.btn_log_toggle.toolTip(),
+      f"{w.btn_log_toggle.badge_label()}｜{w.btn_log_toggle.toolTip()[-60:]}")
+w._log_notice_error = 1
+w._log_notice_warn = 0
+w._refresh_log_toggle()
+check("④ 角标真的画出来了（像素级取证：占位区里两态渲染必须不同，不是只改了内部状态）",
+      _badge_painted(w), "占位区两态像素一致 → paintEvent 没生效")
+w._apply_log_area(True)
+check("④ 展开即视为已读：两档计数一起归零、文字换回收起口吻、角标撤掉",
+      w._log_notice_error == 0 and w._log_notice_warn == 0
+      and w.btn_log_toggle.badge_label() == ""
+      and w.btn_log_toggle.text() == gui.MainWindow.LOG_TOGGLE_EXPANDED)
+w._apply_log_area(False)
+check("④ 再折回去不凭空冒出条数（计数只由新告警驱动）",
+      w.btn_log_toggle.badge_label() == "", w.btn_log_toggle.badge_label())
+check("④ 折叠条两种文案共用同一个宽度地板（切换状态不改变几何）",
+      w.btn_log_toggle.minimumWidth() >= max(
+          w.btn_log_toggle.fontMetrics().horizontalAdvance(gui.MainWindow.LOG_TOGGLE_COLLAPSED),
+          w.btn_log_toggle.fontMetrics().horizontalAdvance(gui.MainWindow.LOG_TOGGLE_EXPANDED))
+      + w.btn_log_toggle._worst_badge_width(),
+      f"{w.btn_log_toggle.minimumWidth()}")
+# 主动作行移出滚动容器：这条是「开始采集要滑动才能看到」的正解（只挪日志不改结构，
+# 窗口一矮照样要滚到最底下才能开工）。
+check("④ 主动作行钉在滚动容器之外（不在容器里=永远不用滚就能开工）",
+      _scroll_of(w.btn_start) is None)
+check("④ 常驻行整行最小宽放得进窗口最小宽（滚出去的那一行没有裁切退路，只能压扁）",
+      w._action_lay.totalMinimumSize().width() <= w.minimumWidth() - 40,
+      f"{w._action_lay.totalMinimumSize().width()} vs {w.minimumWidth()}")
+check("④ 常驻行按钮按布局会让出的宽度钉住（不会被压成「导出 Exc…」）",
+      all(b.minimumWidth() >= b.minimumSizeHint().width()
+          for b in (w.btn_start, w.btn_pause, w.btn_stop, w.btn_clean,
+                    w.btn_export, w.btn_reset)),
+      [(b.text(), b.minimumWidth(), b.minimumSizeHint().width())
+       for b in (w.btn_pause, w.btn_stop)])
+check("④ 数据池四个入口搬进可滚动的配置区（次要工具不再陪跑常驻行）",
+      w.btn_pool_sync is not None and _scroll_of(w.btn_pool_sync) is not None)
+check("④ 待机时「就绪」只说一次（进度条内不写字，状态行是唯一口径：两处同样的词=看着像卡住）",
+      w.progress.format() == "" and w.lbl_stats.text() == "就绪",
+      f"{w.progress.format()!r}｜{w.lbl_stats.text()!r}")
+_small, _big = _floor_at(800), _floor_at(1440)
+check("④ 小屏放不下时退路是「封顶 + 横向滚动」，不是把窗口撑出屏幕",
+      _small[0] < _big[0] and _small[2] != gui.Qt.ScrollBarAlwaysOff,
+      f"屏 800 → 最小宽 {_small[0]}／屏 1440 → {_big[0]}")
+# 大屏这一档必须把两条合法出路都认下来：内容放得下就抬地板（不裁按钮），
+# 内容比屏还宽就封顶 + 横向滚动（不把窗口撑出屏幕）。旧断言只认第一条，于是
+# 「内容 1466 > 屏 1440」这种**正确行为**会被判红——门禁红在界面说真话上，
+# 比漏红更糟：下一次没人相信红了。
+check("④ 大屏下窗口按内容抬地板，或按退路封顶+横向滚动（两条出路都要自洽）",
+      _big[0] >= _big[1] or (_big[0] == 1440 and _big[2] != gui.Qt.ScrollBarAlwaysOff),
+      f"最小宽 {_big[0]}｜内容最小宽 {_big[1]}｜横向策略 {_big[2]}｜"
+      f"② 标题={_big[3]}｜最宽控件={_big[4]}")
+_b0, _b1, _b2 = _floor_after_morph(2000)
+check("④ 首次显示之后内容才变宽的（启动回填/告警挂标题），地板当场跟得上",
+      _b1[0] > _b0[0] and _b1[0] >= _b1[1], f"变更前 {_b0} → 变更后 {_b1}")
+check("④ 内容变窄回去时地板也松开（只抬不降会把窗口永久钉死在很宽）",
+      _b2[0] <= _b0[0] + gui.MainWindow._WIDTH_FLOOR_HYSTERESIS
+      and _b2[0] >= _b2[1], f"变更后 {_b1} → 换回 {_b2}")
+# 注意顺序：上面那几个 helper 会临时把 _width_floor_cap 顶成 1440/2000，而**已开着的
+# 窗口**在下一次重排时也会用那个假屏宽重新定地板（自动再校准的必然结果，不是缺陷）。
+# 所以「默认尺寸/最小尺寸」必须在动 cap 之前量（见本段开头那两条），在这儿量到的是
+# 别人借用的假屏宽，断言的就不是用户看到的形状了。
 
 groups = {g.title(): g for g in w.findChildren(QGroupBox)}
-check("④ 分区标题一律短句（长说明已迁 tooltip；允许带一句括注）",
-      all(len(t) <= 20 for t in groups), str(list(groups)))
-check("④ 五个分区都挂了悬停说明（信息量不减）",
-      all(g.toolTip() for g in groups.values()))
+# ② 的标题在「本机缺采集通道」时会追加一句 ⚠ 告警（安装包漏文件的现场提示）。告警是
+# 追加在同一条标题里的，短句判定必须切掉它——否则这条用例会因为界面**多说了真话**而红。
+check("④ 分区标题一律短句（长说明已迁 tooltip；允许带一句括注，告警后缀不计）",
+      all(len(t.split(gui.MainWindow.LOST_HINT_SEP)[0]) <= 20 for t in groups),
+      str(list(groups)))
+check("④ 每个分区都挂了悬停说明（信息量不减）",
+      all(g.toolTip() for g in groups.values()),
+      [t for t, g in groups.items() if not g.toolTip()])
 check("④ 站点说明提为模块常量且覆盖全部在采站（qzd 是额外名单通道，不在 SITE_ORDER 里）",
       set(gui.SITE_ORDER) <= set(gui.SITE_TIPS) and "qzd" in gui.SITE_TIPS)
 

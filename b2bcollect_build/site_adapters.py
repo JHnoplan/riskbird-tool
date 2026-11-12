@@ -22,6 +22,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Dict
 
 # 打包（PyInstaller）后 __file__ 落在临时解包目录，而本工具会跨目录引用
 # ali1688_build / riskbird_build 的源文件与 chromedriver。frozen 时：
@@ -82,6 +83,52 @@ HAS_QZD = False
 Ali1688Crawler = None
 QiZhiDaoCrawler = None
 
+# ── 跨目录外部模块清单（打包清单的唯一真源）─────────────────────────────
+# 为什么这张表必须写在这里，而不是只抄在 workflow 里：本文件是这些模块的**使用者**，
+# 运行时是它去 sys._MEIPASS/ali1688_build、riskbird_build 里找这些 .py；而 --add-data
+# 是另一处**手抄的副本**。两处只要漏一项，症状不是报错而是「界面上少一个平台」——
+# 2026-11-12 实测就是这个形状：风鸟与爱企查的源文件没进包，等级 0 的账号在产物里
+# 也只看到企知道一路，而权限矩阵、界面投影、CI 产物自检**全都是绿的**（那时自检只
+# 验凭证链，没人验「功能模块在不在包里」）。
+# 消费方（都用 ast 读这张表，不 import 本模块，免得把 selenium 拖进 CI 前置步）：
+#   · .github/scripts/check_packaging_manifest.py —— 构建前硬门，缺项就不许开建；
+#   · b2bcollect_build/test_frozen_delivery_offline.py —— 离线回归，防止改回来。
+EXTERNAL_MODULES = (
+    "ali1688_build/ali1688_crawler.py",
+    "riskbird_build/qizhidao_crawler.py",
+    "riskbird_build/block_guard.py",
+    "riskbird_build/chrome_driver.py",
+    "riskbird_build/riskbird_crawler_v2.py",
+    "riskbird_build/aiqicha_crawler_v2.py",
+)
+
+# 名单补采通道里「产品上就该有」的那几路。这里只回答**代码在不在**，不回答
+# 「该不该显示」——后者归 edition 能力矩阵（档位/等级），两件事一旦混在一个判据里，
+# 就会出现「模块没打进包」被当成「用户没权限」这种谁也查不出来的误诊。
+EXPECTED_LIST_CHANNELS = ("qzd", "riskbird", "aiqicha")
+
+# 各适配器加载失败的第一行原因。打包成 --windowed 之后 stdout 没人看得见，这些
+# 原因只有落到产物自检报告里才算存在过——否则「少一个平台」永远是一句无从核对的
+# 用户口述。键名与 EXPECTED_LIST_CHANNELS / 关键词站名同族（1688 用 "1688"）。
+ADAPTER_ERRORS: Dict[str, str] = {}
+
+
+def _adapter_fail(name: str, exc: BaseException) -> str:
+    """记下适配器加载失败原因并返回那句短文案（打印与登记共用一份，不分叉）。"""
+    short = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+    ADAPTER_ERRORS[name] = f"{type(exc).__name__}: {short}"
+    return short
+
+
+def missing_list_channels() -> tuple:
+    """产品上该有、本机/本包却没加载出来的名单通道。
+    空元组 = 三路齐全。与 ``edition.visible_list_channels`` 无关：那条管权限档位，
+    这条管「文件在不在」，两条各自成立才能把「被档位藏起来」和「发包漏了」分开。
+    """
+    return tuple(s for s in EXPECTED_LIST_CHANNELS
+                 if not LIST_CHANNEL_AVAILABLE.get(s))
+
+
 try:
     _spec = importlib.util.spec_from_file_location(
         "ali1688_crawler", str(_ROOT / "ali1688_build" / "ali1688_crawler.py"))
@@ -91,14 +138,14 @@ try:
     Ali1688Crawler = _m1688.Ali1688Crawler
     HAS_1688 = True
 except Exception as _e:
-    print(f"[site_adapters] ⚠ 1688 适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+    print(f"[site_adapters] ⚠ 1688 适配器不可用：{_adapter_fail('1688', _e)}", flush=True)
 
 try:
     import qizhidao_crawler as _qzd_mod      # 其依赖 block_guard/chrome_driver 走 append 路径
     QiZhiDaoCrawler = _qzd_mod.QiZhiDaoCrawler
     HAS_QZD = True
 except Exception as _e:
-    print(f"[site_adapters] ⚠ 企知道适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+    print(f"[site_adapters] ⚠ 企知道适配器不可用：{_adapter_fail('qzd', _e)}", flush=True)
 
 HAS_RB = False
 HAS_AQC = False
@@ -110,14 +157,14 @@ try:
     RiskBirdCrawlerV2 = _rb_mod.RiskBirdCrawlerV2
     HAS_RB = True
 except Exception as _e:
-    print(f"[site_adapters] ⚠ 风鸟适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+    print(f"[site_adapters] ⚠ 风鸟适配器不可用：{_adapter_fail('riskbird', _e)}", flush=True)
 
 try:
     import aiqicha_crawler_v2 as _aqc_mod
     AiQiChaCrawlerV2 = _aqc_mod.AiQiChaCrawlerV2
     HAS_AQC = True
 except Exception as _e:
-    print(f"[site_adapters] ⚠ 爱企查适配器不可用：{str(_e).splitlines()[0][:120]}", flush=True)
+    print(f"[site_adapters] ⚠ 爱企查适配器不可用：{_adapter_fail('aiqicha', _e)}", flush=True)
 
 
 # ── 名单通道产出契约 ───────────────────────────────────────────

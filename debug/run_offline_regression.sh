@@ -2,6 +2,9 @@
 # 离线回归批跑：逐个跑全部离线测试，报 PASS/FAIL/SKIP 与断言数，最后给总判定。
 # 清单必须与 b2bcollect_build/test_*_offline.py 保持同步：新写的套件当天就要登记进来，
 # 否则它只跑一次就再也无人回归，改动踩到契约也不会红。
+# 非断言型的门禁也进这张表（debug/check_gui_fit.py：布局几何体检，退出码就是判定）：
+# 「一屏放不下主按钮」这类问题只有量几何才发现得了，而量几何的工具不登记，就会退化成
+# 只有改布局那天才会想起来跑一次的私人脚本。
 # SKIP 单独计数：部分套件依赖实机取回的夹具（页面/码图），夹具不在仓库里时它必须
 # 如实报 SKIP 而不是 FAIL——把「缺夹具」混进 FAIL，长期红着的一项会淹掉真问题。
 cd /Users/jhnoplan/Desktop/PythonDemo || exit 1
@@ -32,6 +35,7 @@ debug/gi_pace_offline_test.py
 debug/keyword_junk_offline_test.py
 debug/local_scan_offline_test.py
 debug/qzd_channel_offline_test.py
+debug/check_gui_fit.py
 b2bcollect_build/test_block_triage_offline.py
 b2bcollect_build/test_data_dir_offline.py
 b2bcollect_build/test_external_clean_offline.py
@@ -79,7 +83,9 @@ for f in $FILES; do
   else
     fail=$((fail+1)); failed="$failed $f"; printf 'FAIL  %-52s %s\n' "$f" "$last"
     # 只打红的那几条断言（含前后各一行上下文），完整日志见 LOG_DIR
-    printf '%s\n' "$out" | grep -nE "^  (FAIL|❌|✗)" | head -20 | sed 's/^/        /'
+    # BAD 也要打：check_gui_fit 这类几何体检报的是「BAD 某控件被压扁」，按 FAIL 找
+    # 就等于失败了却看不到失败在哪——留档了却不去读，跟没留一样。
+    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)" | head -20 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   fi
 done

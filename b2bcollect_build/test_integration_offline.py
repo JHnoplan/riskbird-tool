@@ -614,7 +614,47 @@ def test_gui_defaults():
     for _lb in (w.lbl_kw, w.lbl_province, w.lbl_co):
         assert _lb.minimumHeight() >= _lb.fontMetrics().height(), (
             f"{_lb.objectName() or type(_lb).__name__} 说明行没锁「至少一行」，会压成看不见")
-    assert w.log.minimumHeight() >= 180, "输出日志的硬性最小高是小屏底线，不能被配置区挤掉"
+    # 输出日志（2026-11-12 用户反馈「一屏显示不全……把日志区域缩小，正常用户不会经常
+    # 看日志，太占用屏幕了」）：从「常驻 180 硬最小高」改成折叠抽屉。这里只钉**行为契约**，
+    # 不钉「当前是收起态」——初始那一档是从用户偏好恢复的（上次展开就一直展开），
+    # 拿某个人的历史选择当产品对错判，会在别人机器上假失败。
+    assert g._LOG_DEFAULT_EXPANDED is False, (
+        "新用户默认收起日志：偶发诊断区常驻半屏，就是把主流程挤出屏幕的那个原因")
+    _rlay = w._root_lay
+    w._apply_log_area(False)
+    assert w.log.minimumHeight() == w.log.maximumHeight(), (
+        "收起态必须定高：只压最小值不锁最大值，窗口一高它又自己涨回去占地方")
+    assert w.log.maximumHeight() >= 2 * w.log.fontMetrics().lineSpacing(), (
+        f"收起态至少留两行（挂机时扫一眼最后有没有 ⚠/⛔）：{w.log.maximumHeight()}")
+    assert _rlay.stretch(w._log_index) == 0, "收起态还在抢富余高度：配置区会被日志挤小"
+    w._apply_log_area(True)
+    assert w.log.minimumHeight() >= 150 and w.log.maximumHeight() > w.log.minimumHeight(), (
+        f"展开态要拿回原来的小屏底线并能跟着窗口长：{w.log.minimumHeight()}")
+    assert _rlay.stretch(w._log_index) == 1, "展开态没拿到富余高度，等于白展开"
+    assert w.btn_log_toggle.text().startswith("▾"), "展开/收起的按钮文字要跟着档位走"
+    w._apply_log_area(False)
+    # ── 主动作行必须钉在滚动容器之外（同一条用户反馈的另一半）──────────────
+    # 「开始采集」跟着配置一起滚 = 窗口高度决定今天能不能开工。断言分三层：
+    # 结构（不在 QScrollArea 里）→ 宽度（常驻行的最小宽要放得下写死的窗口最小宽，
+    # 否则移出滚动容器后 Qt 会把按钮压扁）→ 几何（拖到最小窗口仍在可见区内）。
+    def _in_scroll(_wd):
+        _p = _wd.parent()
+        while _p is not None and not isinstance(_p, QScrollArea):
+            _p = _p.parent()
+        return _p is not None
+    for _nm in ("btn_start", "btn_pause", "btn_stop", "btn_clean", "btn_export", "btn_reset"):
+        _b = getattr(w, _nm)
+        assert not _in_scroll(_b), f"{_nm} 被放进了滚动容器：要滚才能点到，主流程被打断"
+        _need = max(_b.minimumWidth(), _b.minimumSizeHint().width())
+        assert _need < w.minimumWidth() - 200, (
+            f"{_nm} 单按钮最小宽 {_need} 已经快顶满窗口最小宽 {w.minimumWidth()}，"
+            "常驻行放不下就会被压扁")
+    _row = w._action_lay.totalMinimumSize().width()
+    assert _row <= w.minimumWidth() - 40, (
+        f"常驻动作行整行最小宽 {_row} > 窗口最小宽 {w.minimumWidth()} - 40："
+        "窄窗口下这一行的按钮会被压扁（滚动区外没有裁切这个退路）")
+    assert w._action_lay.indexOf(w.btn_start) == 0, (
+        "「开始采集」要排在常驻行最左边：万一右侧掉出窗口，主按钮也得先保住")
     # 窗口拖到允许的最小值时，输入框与日志仍必须拿到各自的下限
     _geo0 = (w.width(), w.height())
     w.resize(w.minimumWidth(), w.minimumHeight())
@@ -623,6 +663,17 @@ def test_gui_defaults():
     assert w.kw_text.height() >= w.kw_text.minimumHeight(), (
         f"最小窗口下关键词框被压扁：{w.kw_text.height()}")
     assert w.log.height() >= w.log.minimumHeight(), f"最小窗口下日志被挤掉：{w.log.height()}"
+    # 最后一道是**看得见**：常驻行不在滚动容器里，所以它只会整行掉出窗口，没有「滚一下
+    # 就出现」这个退路。最小窗口下把主动作逐个映射到窗口坐标比对可见区——正是这次的账。
+    for _nm in ("btn_start", "btn_pause", "btn_stop", "btn_clean", "btn_export", "btn_reset"):
+        _b = getattr(w, _nm)
+        if not _b.isVisible():
+            continue          # 按档位投影不创建的控件不参与判定（本函数跑在默认档位）
+        _tl = _b.mapTo(w, _b.rect().topLeft())
+        _br = _b.mapTo(w, _b.rect().bottomRight())
+        assert _tl.x() >= 0 and _tl.y() >= 0 and _br.x() < w.width() and _br.y() < w.height(), (
+            f"最小窗口 {w.width()}x{w.height()} 下 {_nm} 掉出可见区"
+            f"（位置 {_tl.x()},{_tl.y()} 尺寸 {_b.width()}x{_b.height()}）")
     w.resize(*_geo0)
     app.processEvents()
     # 启动回填绝不许弹模态：1688 的 toggled 挂着「先去登录」提示，程序化恢复勾选态时

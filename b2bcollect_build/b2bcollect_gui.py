@@ -25,15 +25,15 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent
-from PyQt5.QtGui import QFont, QPalette
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent, QRect
+from PyQt5.QtGui import QFont, QPalette, QColor, QPainter, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QFileDialog, QSpinBox, QDoubleSpinBox,
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
-    QSizePolicy, QGridLayout, QRadioButton, QScrollArea,
+    QSizePolicy, QGridLayout, QRadioButton, QScrollArea, QStyle, QStyleOptionButton,
 )
 
 from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
@@ -66,6 +66,14 @@ try:
     HAS_ACL_GUARD = True
 except ImportError:
     HAS_ACL_GUARD = False
+
+# 平台适配器层：它同时是「名单通道模块到底加载上了没有」的唯一判据来源
+# （missing_list_channels 由使用者自己声明，界面不另数一遍平台名）。
+try:
+    import site_adapters as _adapters
+    HAS_ADAPTERS = True
+except Exception:
+    HAS_ADAPTERS = False
 
 # 统一配置/凭证解析链：它自己也是**产物自检要验的一项**（漏收它就等于产物读不到
 # 任何配置），所以这里按可选依赖的同一套写法收口，绝不在调用点各写一份 try/except。
@@ -135,21 +143,30 @@ def _tab_toggle_style():
             + checked)
 
 
+def _badge_tone_colors(tone):
+    """胶囊徽标的（底色, 前景色）：深浅主题各一套，低饱和底 + 同层级前景。
+
+    单独成一个函数而不是埋在样式串里：界面里既有「用样式表画的徽标 QLabel」，也有
+    「用 QPainter 画的角标按钮」，两种画法必须共用同一张色表——否则同一个「失败」在
+    两处出现两种红，用户就得先学会辨认哪一种是真红（同一事实只许有一份）。
+    """
+    dark = _is_dark_theme()
+    if tone == "error":
+        return ("#3a2224", "#ff6b6b") if dark else ("#fdecea", "#c62828")
+    if tone == "ok":
+        return ("#1f3324", "#7fc97f") if dark else ("#e8f5e9", "#2e7d32")
+    if tone == "run":
+        return ("#1d2f4a", "#8ab4f8") if dark else ("#e8f0fe", "#1a63c9")
+    if tone == "pause":
+        return ("#3a2f1e", "#ffcc80") if dark else ("#fff4e5", "#a85c00")
+    return ("#2f3134", _muted_color()) if dark else ("#f0f0f0", _muted_color())
+
+
 def _status_badge_style(tone):
     """胶囊状态徽标（ok 绿 / error 红 / run 蓝 / pause 橙 / neutral 灰）。
     写死浅底深字在深色主题下像贴了张便签，各态亮度差还会被放大成一个很跳两个很暗；
     这里按主题给成套的低饱和底色加同层级前景，三态只靠色相区分、不靠亮度抢视线。"""
-    dark = _is_dark_theme()
-    if tone == "error":
-        bg, fg = ("#3a2224", "#ff6b6b") if dark else ("#fdecea", "#c62828")
-    elif tone == "ok":
-        bg, fg = ("#1f3324", "#7fc97f") if dark else ("#e8f5e9", "#2e7d32")
-    elif tone == "run":
-        bg, fg = ("#1d2f4a", "#8ab4f8") if dark else ("#e8f0fe", "#1a63c9")
-    elif tone == "pause":
-        bg, fg = ("#3a2f1e", "#ffcc80") if dark else ("#fff4e5", "#a85c00")
-    else:
-        bg, fg = ("#2f3134", _muted_color()) if dark else ("#f0f0f0", _muted_color())
+    bg, fg = _badge_tone_colors(tone)
     return ("QLabel { padding: 4px 10px; border-radius: 4px; background: %s; color: %s; }" % (bg, fg))
 
 
@@ -405,14 +422,21 @@ class TaskRow(QFrame):
 
 
 class _ResizeWatcher(QObject):
-    """把某个控件的 resize 事件转成一次回调（QListWidget 没有现成的 resize 信号）。"""
+    """把某个控件的某类事件转成一次回调（QListWidget 没有现成的 resize 信号）。
 
-    def __init__(self, fn, parent=None):
+    事件类型做成参数而不是写死 Resize：窗口最小宽的再校准要盯的是 LayoutRequest
+    （内容**重排**才意味着所需宽度变了，单纯改变控件尺寸反而是结果不是原因）。
+    一个类两用比再造一个同构的 watcher 好——两个几乎一样的 eventFilter 迟早一个改了
+    另一个没改，而那正是「有些事件漏听」的生成方式。
+    """
+
+    def __init__(self, fn, parent=None, ev_types=(QEvent.Resize,)):
         super().__init__(parent)
         self._fn = fn
+        self._ev_types = tuple(ev_types)
 
     def eventFilter(self, obj, ev):
-        if ev.type() == QEvent.Resize:
+        if ev.type() in self._ev_types:
             self._fn()
         return False
 
@@ -549,6 +573,30 @@ SITE_TIPS = {
            "到点自动让路，未查的公司全部留在名单里下次接续。\n"
            "同窗共享 Chrome 只占自己一个标签，不碰别的平台的页面。",
 }
+
+
+def _lost_list_channels() -> tuple:
+    """**该显示却加载不出来**的名单补采通道（＝发包缺陷，与权限无关）。
+
+    为什么必须与「档位藏起来的通道」分开说：两者的界面结果一模一样（② 只剩企知道），
+    用户的第一反应却永远是「我账号没这个权限」，于是排查从界面一路查到权限矩阵，
+    而真正缺的是包里的两个 .py（2026-11-12 实测：等级 0 的管理员在产物里只看到企知道，
+    风鸟/爱企查的采集器根本没进包）。判据由模块的使用者自己给出，界面不数第二遍。
+
+    「该不该给」取 edition 的投影函数，界面这里绝不自己 ``has(CAP_…)``：档位判据
+    只有一份是这套改造的红线（否则将来加一档能力位，界面里那份就会说旧话）。
+    取交集的意思很直白：只报「档位要给、模块却没有」的那几路——对外档位本来就不
+    显示它们，此时点名平台名等于替用户透露一个他无权使用的功能（文字不许先交底）。
+    企知道自己没加载上来时两档都会报缺：那一路是所有档位都该有的一路，不存在泄露。
+    """
+    if not HAS_ADAPTERS:
+        return ()
+    try:
+        expected = tuple(getattr(_adapters, "EXPECTED_LIST_CHANNELS", ()))
+        given = set(edition.visible_list_channels(expected, QZD_SLUG))
+        return tuple(s for s in _adapters.missing_list_channels() if s in given)
+    except Exception:
+        return ()
 
 
 def build_stats_html(text, site_status=None):
@@ -1585,6 +1633,231 @@ class YzdGroupDialog(QDialog):
         event.accept()
 
 
+# ── 界面偏好（目前只有一项：日志区展开/收起）──────────────────────────────
+# 为什么落文件而不是 QSettings：本工具的长期状态本来就统一放在可写目录里
+# （种子库、名单台账、自检报告），再开一条注册表/plist 的路，只是多一处
+# 「只读包里写失败怎么办」要操心，而收益是零。
+# 读写都必须**静默降级**：偏好丢了大不了下次回到默认，绝不能为这件事弹错误框，
+# 更不能让它挡住窗口显示——一个勾选框的记忆不值得用户重启工具。
+_LOG_PREF_KEY = "log_expanded"
+_LOG_DEFAULT_EXPANDED = False   # 新机器第一屏就该一屏放得下，所以默认收起
+
+
+def _ui_prefs_path() -> Path:
+    return Path.home() / ".b2bcollect" / "ui_prefs.json"
+
+
+def _load_log_expanded_pref() -> bool:
+    """上次是展开还是收起；读不到一律按默认（收起）。"""
+    try:
+        raw = json.loads(_ui_prefs_path().read_text(encoding="utf-8"))
+        return bool(raw.get(_LOG_PREF_KEY, _LOG_DEFAULT_EXPANDED))
+    except Exception:
+        return _LOG_DEFAULT_EXPANDED
+
+
+def _save_log_expanded_pref(expanded: bool) -> None:
+    try:
+        p = _ui_prefs_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        try:
+            cur = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(cur, dict):
+                data = cur
+        except Exception:
+            data = {}
+        data[_LOG_PREF_KEY] = bool(expanded)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── 带角标的按钮（收起面板上的「有几条没看」）────────────────────
+class _NoticeBadgeButton(QPushButton):
+    """把未读告警计数**画**在右上角，而不是拼进按钮文字。
+
+    为什么必须是画的（2026-11-12 两条实测缺陷都记在这笔账上）：把「⚠ 3 条提醒」写进
+    文字后，按钮宽度就跟着告警条数长——冷启动按当时文字钉好的宽度地板被顶大，而折叠条
+    的策略是 QSizePolicy.Maximum（允许被削到 sizeHint 以下），窗口稍窄文字立刻截成
+    「▸ 展开日志（⚠ 3 条…」。同一份文字还让布局门禁量到的形状随磁盘上的历史任务漂移：
+    这台机器全绿、那台机器红一条，红得像布局缺陷却查不出复现条件。
+
+    IDE 问题面板、浏览器控制台、macOS Dock 的计数一律是画上去的角标：信号强度一点不减，
+    几何却完全恒定（计数从 0 到 99+ 宽高一个像素都不动）。轻重靠**底色 + 悬停原话**两条
+    通道：红色胶囊=有失败必须点进去看，琥珀色=只是提醒；悬停里逐档写着「N 条失败 / M 条
+    提醒」，色觉障碍或系统高对比度下靠文字照样读得出来（角标上不放符号，理由见 badge_label）。
+    """
+
+    CAP = 99                  # 显示封顶：角标是「有事发生」的信号，不是台账
+    HEIGHT = 15               # 胶囊高度（比按钮文字小一号，抢文字但不抢焦点）
+    H_PAD = 4                 # 胶囊内左右留白
+    EDGE = 5                  # 胶囊距按钮右缘
+    TEXT_MARGIN = 14          # 文字与胶囊之间必留的间隙（flat 按钮无内边框可借）
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._notice_error = 0
+        self._notice_warn = 0
+        self._pin_texts = ()
+        # 文字靠左：居中的文字会把留白劈成两半，右边就只剩半个占位区，最坏形态的角标
+        # （99+）会压到最后一个字上（离线出图当场看到的就是这个）。靠左之后，
+        # pin_texts 钉下的那份占位完整地留在右侧。
+        # Qt5 的 QPushButton 没有 setAlignment，靠左只有样式表这一条路；这里**只**给
+        # 一条 text-align，不碰 border/background，flat 观感由原样式继续负责。
+        self.setStyleSheet("text-align: left;")
+
+    def badge_font(self):
+        """画角标用的字体：比按钮文字小一号加粗。唯一出口，占位与绘制都从它量宽度
+        （两处各量一次迟早对不上，那时就是「角标压住文字」这种看上去像随机的缺陷）。"""
+        f = self.font()
+        if f.pointSize() > 7:
+            f.setPointSize(max(7, f.pointSize() - 2))
+        f.setBold(True)
+        return f
+
+    def badge_pill_width(self, label=None) -> int:
+        label = self.badge_label() if label is None else label
+        if not label:
+            return 0
+        return self.badge_font_metrics().horizontalAdvance(label) + 2 * self.H_PAD
+
+    def badge_font_metrics(self):
+        return QFontMetrics(self.badge_font())
+
+    def content_left_inset(self) -> int:
+        """按钮文字左边真正吃掉的内边距（问样式，不猜常数）。
+
+        钉宽度时必须把它算进去：靠左对齐之后文字是从 inset 起排的，漏算就等于把角标
+        往文字上压。样式各平台不同（macOS/Windows/Fusion 都不一样），写死一个数就等着
+        在某个系统上重叠。
+        """
+        try:
+            opt = QStyleOptionButton()
+            opt.initFrom(self)
+            return max(0, int(self.style().subElementRect(
+                QStyle.SE_PushButtonContentRect, opt, self).left()))
+        except Exception:
+            return 0
+
+    def _worst_badge_width(self) -> int:
+        """角标占位：按**最坏形态**（99+）实测，绝不按当前计数算。
+
+        这一步是「几何恒定」的全部实现：占位如果跟着计数走，角标一出现按钮就变宽，
+        本类存在的理由就白写了。宽度用画它的那支字体量（见 badge_font），换系统字号
+        也照样量得准。
+        """
+        return (self.badge_pill_width(f"{self.CAP}+")
+                + self.EDGE + self.TEXT_MARGIN)
+
+    def badge_display(self) -> str:
+        """角标上的计数文本（封顶后写 99+，不写 250+：写具体大数就等于继续刷壁纸）。"""
+        n = self._notice_error or self._notice_warn
+        if n <= 0:
+            return ""
+        return f"{self.CAP}+" if n > self.CAP else str(n)
+
+    def badge_tone(self) -> str:
+        """角标当前的严重度，返回值**直接用色表的档位名**。
+
+        这一条是被打出来的教训：上一版这里返回 "warn"，而色表里那一格叫 "pause"，
+        取色时静默落到默认灰——「有提醒」和「没消息」在角标上变成同一个颜色。两套词汇
+        对不上不会报错，只会把信号哑掉，所以这里不给角标另起名字。
+
+        失败优先：⛔ 一出现就得点进去看，提醒只在没有失败时才占角标；提醒沿用色表
+        pause 那一格（界面上「要看一眼但不严重」的琥珀色只许有一支）。
+        """
+        if self._notice_error:
+            return "error"
+        if self._notice_warn:
+            return "pause"
+        return ""
+
+    def badge_label(self) -> str:
+        """角标上真正画出来的那几个字符。
+
+        **只许是 ASCII 数字**（外加封顶那个 '+'）：这里不放 ⛔/⚠ 这类符号，因为
+        角标是 QPainter 直接 drawText 画上去的，走的不是按钮文字那条字体回退链——
+        同一枚 U+26D4 在 macOS 可能出彩色 emoji、在 Windows 可能出单色描边、在
+        缺字体的机器上就是一个豆腐块，而打包出去的 exe 恰恰最可能落在最后一种机器上。
+        一个「看上去像 bug」的方框会把整套告警机制的信用一起带走，而轻重本来就由
+        **胶囊底色 + 悬停里的原话**双通道传达，符号在这里只是重复表达一次风险。
+        """
+        return self.badge_display()
+
+    def badge_colors(self) -> tuple:
+        """角标的（底色, 前景色）：单独成方法只为可测——画出来的东西若只能靠肉眼验收，
+        离线门禁就永远管不到它（而「画错颜色」和「没画」在截图外是同一种故障）。
+
+        这里刻意**反着取**那张色表：表里「低饱和底 + 同层级前景」是给大面积状态标签
+        配的，原样搬到 15px 高的胶囊上，底色和窗口底色根本分不出来（离线出图当场就是
+        「只有一个红字、没有角标」——去掉符号之后实心底更是唯一的轻重通道，不能哑）。
+        小面积信号一律实心：拿表里那支前景色当底，文字按主题取对比的一侧（浅色主题白
+        字压深底，深色主题深字压亮底）。色表仍是一份，只是取的是另一个通道。
+        """
+        fill = _badge_tone_colors(self.badge_tone() or "muted")[1]
+        return (fill, "#ffffff" if not _is_dark_theme() else "#202124")
+
+    def set_notice(self, error: int, warn: int) -> None:
+        """更新两档计数；画面真的变了才重绘（挂机刷屏期每行都 update 是白活）。"""
+        pair = (max(0, int(error)), max(0, int(warn)))
+        if pair == (self._notice_error, self._notice_warn):
+            return
+        self._notice_error, self._notice_warn = pair
+        self.update()
+
+    def pin_texts(self, *texts) -> None:
+        """把宽度钉成「这几个候选文案里最宽的一个 + 角标占位」。
+
+        必须在文案切换之前调用一次：之后无论展开/收起、有无角标，布局都拿得到同一个
+        下限，不会再出现「状态一变文字就被截」的那条路。
+        """
+        self._pin_texts = tuple(t for t in texts if t)
+        fm = self.fontMetrics()
+        w = max([fm.horizontalAdvance(t) for t in self._pin_texts] or [0])
+        self.setMinimumWidth(max(1, w + self._worst_badge_width() + self.content_left_inset(),
+                                 self.minimumSizeHint().width()))
+
+    def changeEvent(self, ev):
+        """字号/字体变了就重新钉一次宽度：钉的是像素数，字体一换那个数就不作数了
+        （用户在系统里改字号、深色模式切换都可能带来一次 FontChange）。"""
+        super().changeEvent(ev)
+        if ev.type() == QEvent.FontChange and self._pin_texts:
+            self.pin_texts(*self._pin_texts)
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        label = self.badge_label()
+        if not label or not self.isEnabled():
+            return
+        # 文案截断时（窄到连最宽候选都放不下）不再画角标：压着文字画一个胶囊，
+        # 比少一个角标更糟——「看不清」和「看不懂」同时发生。
+        r = self.rect()
+        if r.width() < self.minimumWidth():
+            return
+        bg, fg = self.badge_colors()
+        w = self.badge_pill_width()
+        box = QRect(r.right() - self.EDGE - w, (r.height() - self.HEIGHT) // 2,
+                    w, self.HEIGHT)
+        # 兜底：文字右缘 + 间隙越过角标左缘就不画（窗口被压到地板以下时的事）。
+        # 少一个角标只是少个信号，压着字画则是把两个信息一起毁掉，还顺带看着像 bug。
+        fm = self.fontMetrics()
+        if box.left() < self.content_left_inset() + fm.horizontalAdvance(self.text()):
+            return
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setFont(self.badge_font())
+            h = self.HEIGHT
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(bg))
+            p.drawRoundedRect(box, h // 2, h // 2)
+            p.setPen(QColor(fg))
+            p.drawText(box, Qt.AlignCenter, label)
+        finally:
+            p.end()
+
+
 # ── 主窗口 ─────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1706,27 +1979,77 @@ class MainWindow(QMainWindow):
         # 打开工具就接上次的任务：关键词、平台勾选、参数、采到哪儿一并回填（静默）。
         # 延到事件循环开始再做：读回上次数据要一两秒，卡在构造里窗口会先白屏。
         QTimer.singleShot(0, self._restore_last_task)
+        # 通道缺失开机播报：② 的标题与 tooltip 要鼠标移过去才看得到，而这次的缺陷形状
+        # 恰恰是「静默少功能」——不主动出声，用户就会把它当成权限问题一直查错方向。
+        # 只在真缺时出声（正常机器上日志里一条也不会多），不骚扰没碰到这个问题的人。
+        QTimer.singleShot(0, self._log_channel_health)
         # 窗口最小宽的校准留到首次显示：那时视口宽度才是真的（见 showEvent /
         # _apply_width_floor），构造阶段量出来的是默认尺寸，算出来的闸口是假的。
         self._width_floor_done = False
+        # 三个校准状态：base=构造时那个显式下限（允许降回去的位置，首次校准时记下），
+        # pending=这一轮重排已经排过队（合并噪声），running=正在自己改下限（别再被自己的
+        # 重排回调追尾）。
+        self._width_floor_base = None
+        self._floor_pending = False
+        self._width_floor_running = False
 
     def showEvent(self, ev):
-        """首次显示校准一次窗口最小宽，之后交给 Qt 自己维持，不再干预用户拖窗口。"""
+        """首次显示校准窗口最小宽，并从此盯住内容重排（见 _watch_cfg_layout）。"""
         super().showEvent(ev)
         if not self._width_floor_done:
             self._width_floor_done = True
+            self._calibrate_width_floor()
             try:
-                self._apply_width_floor()
+                self._watch_cfg_layout()
             except Exception:
-                pass          # 校准失败最多回到「窄窗裁切」的老行为，绝不能挡住窗口显示
+                pass      # 没挂上监视只是回到「只在首次显示校准一次」，不能挡住窗口显示
+
+    def _calibrate_width_floor(self):
+        try:
+            self._apply_width_floor()
+        except Exception:
+            pass          # 校准失败最多回到「窄窗裁切」的老行为，绝不能挡住窗口显示
+
+    def _watch_cfg_layout(self):
+        """内容一重排就再校准窗口最小宽，而不是只在首次显示校准那一次。
+
+        为什么必需（2026-11-12 布局门禁「同一份代码两次跑出不同结果」的根因）：界面
+        形状不是构造完就定死的——启动回填上次任务、通道缺失告警挂上 ② 标题、等级心跳
+        把 pro 入口补齐，这些都发生在首次显示**之后**。地板只按显示那一刻的内容算，之后
+        内容变宽，Qt 的行为照旧是裁掉行尾按钮：正是这条路径让 CI 与开发机看到的形状
+        不一致，而且没人能复现。列「哪些动作会改形状」迟早漏一条，盯 LayoutRequest
+        才是把不变量交给 Qt 自己维护——形状一变，地板一定跟着变。
+        """
+        targets = [self._cfg_scroll.widget(), self.centralWidget()]
+        for wd in targets:
+            if wd is not None:
+                wd.installEventFilter(_ResizeWatcher(
+                    self._schedule_width_floor, self, ev_types=(QEvent.LayoutRequest,)))
+
+    def _schedule_width_floor(self):
+        """把这次重排合并进下一轮事件循环：拖窗口时 LayoutRequest 每帧都有，逐条重算
+        既没必要（Qt 还没排完）也危险（自己改下限又会引发新一轮重排）。"""
+        if self._width_floor_running or self._floor_pending:
+            return
+        self._floor_pending = True
+        QTimer.singleShot(0, self._run_width_floor)
+
+    def _run_width_floor(self):
+        self._floor_pending = False
+        self._calibrate_width_floor()
+
+    # 余量与噪声门限：SLACK 是字体四舍五入的余量，HYSTERESIS 是「差这么点就别动」——
+    # 后者防的是两个取值互相追尾（抬一下又落一下），那会让界面在没人操作时自己抖。
+    _WIDTH_FLOOR_SLACK = 2
+    _WIDTH_FLOOR_HYSTERESIS = 4
 
     def _apply_width_floor(self):
-        """把窗口最小宽抬到「本次真正建出来的配置内容」所需宽度，杜绝窄窗裁切。
+        """把窗口最小宽定到「本次真正建出来的配置内容」所需宽度，杜绝窄窗裁切。
 
         配置区横向滚动是关掉的（不想让「开始采集」这种主按钮要左右拖才看到），而 Qt 在
         widgetResizable + 横向关闭下的行为是「内容按其最小宽排开，视口外的部分直接裁掉」，
-        不是自动换行。窗口最小宽过去写死 880，实测 pro + 等级 0 的配置内容最小宽 1079：
-        窗口落在 880~1079 这段时，行尾的「搜索采购商」「权限管理」被裁掉——按钮确实建出来了、
+        不是自动换行。窗口最小宽过去写死 880，实测 pro + 等级 0 的配置内容最小宽 981：
+        窗口落在 880~981 这段时，行尾的「搜索采购商」「权限管理」被裁掉——按钮确实建出来了、
         也确实 isVisible，却看不见也点不到（等级 0 的管理员会直接被自己的面板锁在外面）。
 
         余量全部**实测**，不拼常数：窗口宽减视口宽就是边距加边框加当前那条竖向滚动条，
@@ -1734,6 +2057,9 @@ class MainWindow(QMainWindow):
         反过来漏算就会正好裁掉行尾几像素——「按钮在界面上但差 11px 点不到」是最难复现的
         一类投诉）。档位/等级投影出的控件少，内容最小宽就小（lite 实测 867），丐版用户的
         小窗口依旧合法——判定只看内容量，不写 if lite。
+
+        本方法是**双向**的：内容变窄时地板跟着降回去。只抬不降的做法会让一次偶发的宽内容
+        （比如上次任务里那串很长的关键词回显）永久把窗口钉死在很宽，用户想缩小都缩不了。
         """
         sa = getattr(self, "_cfg_scroll", None)
         if sa is None or sa.widget() is None:
@@ -1741,21 +2067,42 @@ class MainWindow(QMainWindow):
         content = max(sa.widget().minimumSizeHint().width(), sa.widget().sizeHint().width())
         if content <= 0:
             return
+        if self._width_floor_base is None:
+            # 抬之前就记下构造时那个显式下限：它既是「绝不低于」的地板，也是本方法
+            # 唯一允许把 minimumWidth 往下放到的位置（不然就会把布局自己的下限也削掉）。
+            self._width_floor_base = self.minimumWidth()
         bar = sa.verticalScrollBar()
         reserve = 0 if (sa.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
                           or bar.isVisible()) else bar.sizeHint().width()
         chrome = max(0, self.width() - sa.viewport().width()) + reserve
-        need = content + chrome + 2                     # 2px：四舍五入与字体度量的余量
+        need = content + chrome + self._WIDTH_FLOOR_SLACK
+        # 常驻区（滚动容器之外的那几行：主动作行、进度条、状态行、日志折叠条）也要算进来。
+        # 主动作行移出滚动容器之后，这一步就从「可选优化」变成了「必需」：滚动容器里的
+        # 内容挤不下时 Qt 裁掉、常驻行挤不下时 Qt 压扁，而 vertical 布局的最小宽取的是
+        # 各行最小宽的最大值，正好就是「整窗口至少要这么宽」这句话。
+        try:
+            need = max(need, self._root_lay.totalMinimumSize().width()
+                       + self._WIDTH_FLOOR_SLACK)
+        except Exception:
+            pass
         # 上限是可用屏宽：小屏笔电上「窗口最小宽 1128、屏幕只有 1024」会让窗口伸出屏幕，
         # 右侧照样看不见——只是换了个更难查的原因。真装不下时把横向滚动还回去：
         # 宁可要一条看得见的横向滚动条，也不要一个看不见又点不到的按钮。
         cap = int(self._width_floor_cap() or 0)
-        if cap and need > cap:
-            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            need = cap
-        self.setMinimumWidth(max(self.minimumWidth(), need))
-        if self.width() < self.minimumWidth():
-            self.resize(self.minimumWidth(), self.height())   # 已经太窄就当场撑开，不留裁切
+        fits = not cap or need <= cap
+        want_policy = Qt.ScrollBarAlwaysOff if fits else Qt.ScrollBarAsNeeded
+        if sa.horizontalScrollBarPolicy() != want_policy:
+            sa.setHorizontalScrollBarPolicy(want_policy)
+        target = need if fits else max(self._width_floor_base, cap)
+        if abs(target - self.minimumWidth()) < self._WIDTH_FLOOR_HYSTERESIS:
+            return                                  # 差在噪声范围内就别动界面
+        self._width_floor_running = True
+        try:
+            self.setMinimumWidth(target)
+            if self.width() < target:
+                self.resize(target, self.height())  # 已经太窄就当场撑开，不留裁切
+        finally:
+            self._width_floor_running = False
 
     def _width_floor_cap(self) -> int:
         """最小宽的天花板：可用屏宽。单独成方法只为可测（离线用例顶掉它验退路）。"""
@@ -1800,9 +2147,173 @@ class MainWindow(QMainWindow):
             pass
         return desktop
 
+    # ── 名单补采通道在文字里的口径（标题/tooltip/开机日志共用同一份判据）──────
+    # 平台数量是 3，但这里不写死「三平台」这三个字：将来加一路通道时，写死的说法会
+    # 当场变成假话，而按数量投影只会跟着变。超出表范围退回阿拉伯数字，宁可土一点也不撒谎。
+    _PLATFORM_COUNT_WORDS = {1: "", 2: "两平台", 3: "三平台", 4: "四平台", 5: "五平台"}
+    # 缺路告警在标题里的分隔前缀：单独成常量，是为了让「分区标题必须短句」那条回归
+    # 断言可以把告警后缀切出去单独看——短句是常态，告警是例外，例外必须能被识别出来，
+    # 而不是把长度上限整体放宽（放宽就等于没有约束）。
+    LOST_HINT_SEP = "｜⚠ 本机缺："
+
+    def _list_built_slugs(self) -> tuple:
+        """界面上**真的有一路可用**的名单通道：勾选框建出来了、也没被等级收掉。
+        用 isHidden 而不是 isVisible：后者在父窗口还没 show 时一律返回 False，
+        建界面那一刻问它等于什么都问不到。"""
+        return tuple(s for s, c in getattr(self, "chk_list", {}).items() if not c.isHidden())
+
+    def _province_tip(self) -> str:
+        """「选择省份」的说明。通道清单只从 self._list_* 读，绝不在这另数一遍——
+        ① 这里数一遍、② 那里数一遍，就会出现「按钮藏好了、tooltip 还在报内部平台名」。"""
+        return ("可选多个省份，只采这些省份的企业数据。默认不选=全国都采。\n"
+                "・支持按地区筛选的网站（中国制造网 / 马可波罗 / 1688）：把省份交给网站筛，"
+                "采回来的每一条仍然用地址/公司名本地核一遍（网站筛不作为保证）；\n"
+                "・其余网站页面上没地区筛选：按页面上写的地区与公司名把关，"
+                "不是所选省份的不入库；\n"
+                "・页面上与公司名都看不出省份的：不拍脑袋入库，转名单补采通道"
+                f"（{self._list_vis_names}"
+                + ("，勾了哪路走哪路" if self._list_multi else "")
+                + "）按工商登记地址反查一次（在目标省就连联系方式一起补上，外省则丢弃）。\n"
+                "支持全选/清空/大区快捷选择，选好点「确定」即可。")
+
+    def _apply_list_channel_hint(self):
+        """② 的标题、② 与「选择省份」的 tooltip 一次性按当前状态重拼（唯一出口）。
+
+        两份事实分开说，是这个方法存在的全部理由：
+          · 「界面上有几路」——档位投影 + 模块是否加载，共同决定用户能勾到几路；
+          · 「本该有几路却没有」——只在档位确实该给时才算发包缺陷（见 _lost_list_channels）。
+        以前这两句话写在 _build_ui 的字面量里，于是等级 0 的管理员拿到漏文件的包时，
+        界面只显示企知道、也不解释为什么，所有人第一反应都是「我权限不够」。
+        """
+        built = self._list_built_slugs()
+        lost = _lost_list_channels()
+        self._list_lost = lost
+        self._list_vis_slugs = built
+        self._list_vis_names = " / ".join(SITE_NAMES.get(s, s) for s in built)
+        self._list_multi = len(built) > 1
+        if len(built) > 1:
+            lead = self._PLATFORM_COUNT_WORDS.get(len(built)) or f"{len(built)}平台"
+        elif built:
+            lead = SITE_NAMES.get(built[0], "企知道")
+        else:
+            lead = "暂无可用平台"
+        lost_names = " / ".join(SITE_NAMES.get(s, s) for s in lost)
+        gb = getattr(self, "_gb_list", None)
+        if gb is not None:
+            gb.setTitle("② 公司名单（" + lead + "逐家补采"
+                        + ((self.LOST_HINT_SEP + lost_names) if lost else "") + "）")
+            gb.setToolTip(
+                "可选：上传一份公司名文件（xlsx/csv/txt，有一列是公司名即可），"
+                + ("勾选的平台逐家" if self._list_multi else f"由{lead}逐家")
+                + "模拟人工查询补采。\n"
+                "只选名单、不填关键词也能点「开始采集」——就是「按公司名精准找联系方式」的用法。\n"
+                + ("勾了几个平台，同一份名单就每个平台都从第 1 家查到最后 1 家"
+                   "（不是几个平台分摊这份名单）；\n" if self._list_multi else "")
+                + "采完自动按公司名合并到同一个文件：多个手机号/邮箱等取并集、用英文逗号分隔。\n"
+                "开始采集后任务文件夹里会生成「待采集公司名单.xlsx」"
+                "（与原数据/清洗入库数据同层级）；\n"
+                "关键词采集清洗掉的无联系方式废数据会自动回流进这份名单、被补采（变废为宝）。\n"
+                "采过/查不到的公司名会自动剔除，不重复采集。"
+                + self._lost_channels_text(lost, lost_names)
+                + self._lost_channels_detail(lost))
+        btn = getattr(self, "btn_province", None)
+        if btn is not None:
+            btn.setToolTip(self._province_tip())
+
+    # 缺路说明拆成「三行短句 + 一行细节」：短句进日志，细节只进 tooltip。
+    # 排序按「事实 → 原因 → 处置」，处置刻意排在**最后一条**（2026-11-12 自审发现）：
+    # 收起态只看得见最后两三行，把结论写在最前面等于把结论藏起来——同一段话在展开态
+    # 和收起态会给出两个不同的重点，那比不写还糟。发包方专属的那条命令很长，摊进日志
+    # 会把三行短句全顶出可见区，所以它只挂在悬停说明上（该看到的人自然会悬上去看）。
+    @staticmethod
+    def _lost_channels_errors() -> dict:
+        """逐路采集器的加载错误（唯一取法，原因行与细节行共用一份证据）。"""
+        if not HAS_ADAPTERS:
+            return {}
+        try:
+            return dict(getattr(_adapters, "ADAPTER_ERRORS", {}) or {})
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _lost_channels_reason(lost: tuple) -> str:
+        """「原因」那一行按**实测到的加载错误**说话，不押宝在某一种猜测上。
+
+        同一条「② 只剩企知道」背后有三种完全不同的成因：采集器 .py 没进包（补
+        --add-data）、随包依赖没进（多半补 --hidden-import）、文件都在但初始化抛异常。
+        说死其中一种，发包方就会照着错的那句去查；证据不止一种时退回覆盖得下的那句
+        ——界面话术的信任是一次性资源，错一次，下次真告警用户也不会当回事。
+        逐路的错误原文在悬停说明里（_lost_channels_detail），这里只给一句结论。
+        """
+        errs = MainWindow._lost_channels_errors()
+        kinds = set()
+        for s in lost:
+            e = str(errs.get(s) or "")
+            if not e:
+                kinds.add("unknown")
+            elif e.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError")):
+                kinds.add("missing")       # 要找的文件不在包里（模块本身或它的依赖）
+            else:
+                kinds.add("broken")        # 文件在，加载/初始化时抛了别的异常
+        if len(kinds) == 1 and "missing" in kinds:
+            return ("原因：安装包缺了它们运行所需的文件（采集器本身或它的依赖没进包，"
+                    "不是账号权限/设置问题，重登录、换账号、重装都不会让它回来）")
+        if len(kinds) == 1 and "broken" in kinds:
+            return ("原因：本机加载这些采集器时报错了（不是账号权限/设置问题，"
+                    "具体错误在悬停说明与产物自检报告里）")
+        return ("原因：安装包缺了、或本机加载不出这些采集器（不是账号权限/设置问题，"
+                "具体原因见产物自检 --doctor 报告）")
+
+    @staticmethod
+    def _lost_channels_text(lost: tuple, lost_names: str) -> str:
+        """缺路说明（tooltip 与开机日志共用一份话术，免得两处说得不一样）。"""
+        if not lost:
+            return ""
+        return ("\n\n⚠ " + lost_names + " 在你当前账号等级下本该可用，本机却没加载出来"
+                "\n⚠ " + MainWindow._lost_channels_reason(lost) +
+                "\n⚠ 处置：找发包方要重新打的包（产物自检 --doctor 现在会因缺通道直接失败退出）")
+
+    @staticmethod
+    def _lost_channels_detail(lost: tuple) -> str:
+        """发包方专属细节（只进 tooltip，不进日志，理由见 _lost_channels_text）。
+
+        这里才放逐路的加载错误原文：它是给打包的人定位用的，不是给使用者读的，
+        且长度不可控（异常第一行可能带一长串路径），摊进日志正好会顶掉那三行短句。
+        """
+        if not lost:
+            return ""
+        errs = MainWindow._lost_channels_errors()
+        lines = [f"　{SITE_NAMES.get(s, s)}：{str(errs.get(s) or '（无加载错误记录）')[:120]}"
+                 for s in lost]
+        return ("\n各路加载错误：" + "\n".join(lines)
+                + "\n发包方自查：在仓库里执行 python .github/scripts/check_packaging_manifest.py"
+                "，它会点名三处打包入口各自缺哪一条 --add-data。")
+
+    def _log_channel_health(self):
+        """把「该有却没有的补采平台」念一遍（文字与 tooltip 同源，不另写一份）。
+
+        三行短句各占一条日志：收起态看得见最后两三行，而最后一条就是「该怎么办」，
+        所以用户不展开也知道这不是权限问题、该找谁。完整细节在 ② 的悬停说明里。
+        同一份事实只播一次：开机播一次，等级在运行中变更（_acl_sync_level）再播一次——
+        按上次播报的集合去重，免得心跳每 60 秒把同一条警告重复刷屏。
+        """
+        lost = tuple(getattr(self, "_list_lost", ()) or ())
+        if lost == getattr(self, "_list_lost_reported", None):
+            return
+        self._list_lost_reported = lost
+        if not lost:
+            return
+        names = " / ".join(SITE_NAMES.get(s, s) for s in lost)
+        for _ln in self._lost_channels_text(lost, names).strip().splitlines():
+            if _ln:
+                self._on_log(_ln)
+
     def _build_ui(self):
         root = QWidget()
         lay = QVBoxLayout(root)
+        # 常驻布局留一份引用：日志折叠要按槽位改 stretch（见 _apply_log_area），
+        # 每次都去 centralWidget().layout() 绕一圈不如直接攥着源头。
+        self._root_lay = lay
         # 统一节奏：分区之间留固定空隙、内边距收紧，避免控件贴边挤成一堆。
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(10)
@@ -1829,12 +2340,15 @@ class MainWindow(QMainWindow):
         # 不显示的通道**不可能被勾上**，而「未勾选＝本轮不跑」是编排层既有语义，
         # 所以这里完全不碰通道注册表与台账：功能一行没删，放开档位即恢复显示。
         _vis_slugs = edition.visible_list_channels(LIST_CHANNEL_SLUGS, QZD_SLUG)
-        _multi_ch = len(_vis_slugs) > 1
-        _vis_names = " / ".join(SITE_NAMES.get(s, s) for s in _vis_slugs)
-        # 存成属性：校验提示（_on_start）在布局之外，也得报同一份平台名。
-        # 那里的文案如果各写一遍平台清单，就会出现在丐版里点名隐藏平台的风险。
+        # 存成属性：校验提示（_on_start）与「选择省份」的 tooltip 都在 ② 定稿之前/之外，
+        # 也得报同一份平台名。那里的文案如果各写一遍平台清单，就会出现在丐版里点名
+        # 隐藏平台的风险。
+        # 定稿在 _apply_list_channel_hint：勾选框建完后按**界面上真正存在的**那几路重算，
+        # 等级运行中变更时再调一次，文案就不会停在旧集合上（多路判据、缺路判据同源）。
         self._list_vis_slugs = _vis_slugs
-        self._list_vis_names = _vis_names
+        self._list_vis_names = " / ".join(SITE_NAMES.get(s, s) for s in _vis_slugs)
+        self._list_multi = len(_vis_slugs) > 1
+        self._list_lost = ()
         top = QHBoxLayout()
         top.setSpacing(10)
 
@@ -1876,17 +2390,9 @@ class MainWindow(QMainWindow):
         # 第三行列出的是「看不出省份时数据去哪」，通道名必须跟 ② 显示的集合一致：
         # 这里自己写死「企知道 / 风鸟 / 爱企查」，丐版就成了按钮藏好、tooltip 还在
         # 报名字的泄露点。「勾了哪路走哪路」只在真有多路时才有意义。
-        self.btn_province.setToolTip(
-            "可选多个省份，只采这些省份的企业数据。默认不选=全国都采。\n"
-            "・支持按地区筛选的网站（中国制造网 / 马可波罗 / 1688）：把省份交给网站筛，"
-            "采回来的每一条仍然用地址/公司名本地核一遍（网站筛不作为保证）；\n"
-            "・其余网站页面上没地区筛选：按页面上写的地区与公司名把关，不是所选省份的不入库；\n"
-            "・页面上与公司名都看不出省份的：不拍脑袋入库，转名单补采通道"
-            f"（{_vis_names}"
-            + ("，勾了哪路走哪路" if _multi_ch else "")
-            + "）按工商登记地址反查一次"
-            "（在目标省就连联系方式一起补上，外省则丢弃）。\n"
-            "支持全选/清空/大区快捷选择，选好点「确定」即可。")
+        # 文案走 _province_tip()：等级在运行中被改动时，这段要和 ② 一起重投影（见
+        # _apply_list_channel_hint），否则就是「界面已经变了、tooltip 还在报旧集合」。
+        self.btn_province.setToolTip(self._province_tip())
         self.btn_province.setMinimumHeight(30)
         self.btn_province.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.lbl_province = QLabel("🗺 采集范围：全国（不限省份）")
@@ -1919,22 +2425,13 @@ class MainWindow(QMainWindow):
         v.addWidget(self.lbl_kw)
         top.addWidget(gb_kw, 3)
 
-        # 标题口径跟着可见通道走（_vis_slugs 在上面算一次，此处只读）：只剩企知道时
-        # 还写「三平台」，就是先用文字把隐藏的功能告诉用户，再去藏按钮——顺序错了。
-        gb_co = QGroupBox("② 公司名单（"
-                         + ("三平台" if _multi_ch else SITE_NAMES.get(QZD_SLUG, "企知道"))
-                         + "逐家补采）")
-        gb_co.setToolTip(
-            "可选：上传一份公司名文件（xlsx/csv/txt，有一列是公司名即可），"
-            + ("勾选的平台逐家" if _multi_ch else "由企知道逐家")
-            + "模拟人工查询补采。\n"
-            "只选名单、不填关键词也能点「开始采集」——就是「按公司名精准找联系方式」的用法。\n"
-            + ("勾了几个平台，同一份名单就每个平台都从第 1 家查到最后 1 家（不是几个平台分摊这份名单）；\n"
-               if _multi_ch else "")
-            + "采完自动按公司名合并到同一个文件：多个手机号/邮箱等取并集、用英文逗号分隔。\n"
-            "开始采集后任务文件夹里会生成「待采集公司名单.xlsx」（与原数据/清洗入库数据同层级）；\n"
-            "关键词采集清洗掉的无联系方式废数据会自动回流进这份名单、被补采（变废为宝）。\n"
-            "采过/查不到的公司名会自动剔除，不重复采集。")
+        # 标题口径跟着可见通道走（判据在 _apply_list_channel_hint 里，两处共用一份）：
+        # 只剩企知道时还写「三平台」，就是先用文字把隐藏的功能告诉用户，再去藏按钮——顺序错了。
+        # 但「只剩企知道」有两种截然不同的原因，必须在标题上分开说：档位本来就不给
+        # （对外版，正常）与档位给了、模块却没进包（发包缺陷，异常）。后者不写出来，
+        # 用户就只会去查权限——2026-11-12 那次等级 0 只看到企知道，就是这么被搁置的。
+        gb_co = QGroupBox("② 公司名单")
+        self._gb_list = gb_co
         vc = QVBoxLayout(gb_co)
         hc = QHBoxLayout()
         self.btn_co_file = QPushButton("选择公司名单文件")
@@ -1985,6 +2482,9 @@ class MainWindow(QMainWindow):
         for _slug, _chk in self.chk_list.items():
             if _slug != QZD_SLUG:
                 self._acl_reg(edition.CAP_LIST_ALL_CHANNELS, _chk)
+        # 标题与两段 tooltip 在这里一次性定稿：此刻勾选框已建完，「界面上到底有几路」
+        # 才是实测值而不是档位推算值（缺模块的那几路压根没建控件）。
+        self._apply_list_channel_hint()
         # AlignTop：本区自然高度比 ① 矮（尤其对外档只剩一路勾选框）。不加对齐时
         # QHBoxLayout 会把 ② 一路拉到与 ① 同高，多出来的高度全被那句 wordWrap 说明
         # 文字吃掉——文字占 155 像素高却只写了一行，中间一片空白，看上去像界面坏了。
@@ -2152,43 +2652,72 @@ class MainWindow(QMainWindow):
         hb.addStretch(1)
         for b in (self.btn_clean, self.btn_export, self.btn_reset):
             hb.addWidget(b)
-        # ── 数据池按钮（导入历史 + 扫描本地 + 同步 + 搜索）──
+        self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
+        # 动作行**不进滚动容器**（2026-11-12 按用户反馈改：「开始采集那些要滑动才能
+        # 看到，体验很不好」）。主操作跟着配置一起滚，等于让窗口高度去决定「今天能不能
+        # 开工」；密集面板的通行做法正相反——主操作钉在常驻区，只有配置本身允许滚
+        # （IDE 的运行条、CI 的提交按钮都在滚动区之外）。这里仍按原顺序把控件建在
+        # cfg 之后，只是**添加**改到滚动容器落位之后（见下面 lay.addLayout(hb)）。
+        self._action_lay = hb
+        # 常驻行的按钮统一钉住「布局真正会让出的宽度」。这一步在「移出滚动容器」之后
+        # 是必需的：滚动容器里窗口太窄时 Qt 的行为是**裁掉**视口外的内容（文字始终完整），
+        # 而直接挂在窗口上的布局是**压扁**控件（「导出 Exc…」这种截断就是这么来的）。
+        # 基线取 minimumSizeHint 而不是只按字体算：Qt 给按钮的默认下限（80）比两个字的
+        # 文字宽度大得多，只钉文字宽度等于没钉——实测「暂停」会被削到 57 像素。
+        # 最坏形态因此从「主按钮被压扁」变成「右侧次要按钮掉出窗口」，而「开始采集」排在
+        # 最左边，永远看得见点得到，与 _apply_width_floor 的降级口径正好配套。
+        for _i in range(hb.count()):
+            _it = hb.itemAt(_i)
+            _wd = _it.widget() if _it is not None else None
+            if isinstance(_wd, QPushButton):
+                _wd.setMinimumWidth(max(_wd.minimumWidth(), _wd.minimumSizeHint().width(),
+                                        _wd.fontMetrics().horizontalAdvance(_wd.text()) + 24))
+
+        # ── 数据池入口（导入历史 + 扫描本地 + 同步 + 搜索）：整组在配置区内，不占常驻行 ──
         # 对外档位整组**不创建**：这四个入口一旦画出来就说不清了——灰着的按钮同样告诉
         # 用户「本来有这件事」，而 Tab 键还能逐个走过去。数据链路本身不关（采集完成后
         # 由 _silent_pool_sync 后台同步），关掉的只是「让人知道有这功能」的那一层。
+        # 位置（2026-11-12 按用户反馈「开始采集那些要滑动才能看到」重排）：这四个是
+        # 「管已有数据」的后台动作，和「跑本轮」的主动作不是一件事，以前却挤在同一条常驻行里，
+        # 把整行的最小宽顶到 1127——比窗口还宽。常驻区一旦放不下，布局只能压扁按钮或把
+        # 主按钮挤出屏幕，正是用户看到的「要滑动才能点开始采集」。所以常驻行只留跑批要用的
+        # 六个按钮（最小宽 600 上下），数据池搬进可滚动的配置区，和同样要滚的「云展动力
+        # 客户库」排在一起：主流程永远一屏可见，次要工具挪到它该在的那一层。
         self.btn_pool_import = None
         self.btn_pool_scan = None
         self.btn_pool_sync = None
         self.btn_pool_search = None
         if edition.pool_ui_visible():
-            hb.addSpacing(14)
+            pool_group = QGroupBox("团队数据池")
+            pool_group.setToolTip(
+                "团队共享的历史数据池：把以前采过的表格导进来、把本机散落的相关表格扫出来入池、\n"
+                "把本次采集结果同步上去，也可以直接按行业搜别人池子里的下游采购商。")
+            pl = QHBoxLayout(pool_group)
+            pl.setSpacing(8)
             self.btn_pool_import = QPushButton("导入历史数据")
             self.btn_pool_import.setToolTip("选择本地 Excel/CSV 文件，自动转换后批量上传到团队数据池。\n适合把以前采集的大量数据一次性导入，不用就浪费了。")
-            self.btn_pool_import.setMinimumHeight(36)
             self.btn_pool_sync = QPushButton("同步数据池")
             self.btn_pool_sync.setToolTip("把本次采集数据上传到团队共享数据池，供所有人搜索使用。")
-            self.btn_pool_sync.setMinimumHeight(36)
             self.btn_pool_search = QPushButton("搜索采购商")
             self.btn_pool_search.setToolTip("从团队数据池智能搜索下游采购商，支持 DeepSeek 语义匹配。")
-            self.btn_pool_search.setMinimumHeight(36)
             self.btn_pool_scan = QPushButton("扫描本地表格")
             self.btn_pool_scan.setToolTip(
                 "全盘扫描本机 Excel/CSV，逐个判断能不能入池，出清单给你勾选后再上传。\n"
                 "已传过的内容、同系列旧快照、说明文档类表格会自动分开标注。")
-            self.btn_pool_scan.setMinimumHeight(36)
+            for _b in (self.btn_pool_import, self.btn_pool_scan,
+                       self.btn_pool_sync, self.btn_pool_search):
+                _b.setMinimumHeight(32)
+                _b.setMinimumWidth(max(88, _b.fontMetrics().horizontalAdvance(_b.text()) + 20))
+                pl.addWidget(_b)
             if not HAS_POOL:
                 self.btn_pool_import.setEnabled(False)
                 self.btn_pool_sync.setEnabled(False)
                 self.btn_pool_search.setEnabled(False)
                 self.btn_pool_scan.setEnabled(False)
-            hb.addWidget(self.btn_pool_import)
-            hb.addWidget(self.btn_pool_scan)
-            hb.addWidget(self.btn_pool_sync)
-            hb.addWidget(self.btn_pool_search)
+            pl.addStretch()
+            cfg.addWidget(pool_group)
             self._acl_reg(edition.CAP_POOL_UI, self.btn_pool_import, self.btn_pool_scan,
                           self.btn_pool_sync, self.btn_pool_search)
-        self.btn_pause.setEnabled(False); self.btn_stop.setEnabled(False)
-        cfg.addLayout(hb)
 
         self.auto_import_check = QCheckBox("采集完自动导入云展客户库")
         self.auto_import_check.setToolTip(
@@ -2248,7 +2777,8 @@ class MainWindow(QMainWindow):
         cfg.addWidget(yzd_group)
 
         # 配置区→滚动容器：窗口不够高时滚配置，绝不把输入框压扁（详见上面 cfg 的注释）。
-        # 富余高度按 3:2 分给「配置区 : 日志」——大屏上配置一屏看全，小屏上两者各留底线。
+        # 富余高度全给配置区（日志收起时 stretch=0，见 _apply_log_area）：大屏上配置
+        # 一屏多看一行是一行，小屏上日志的收起态也只有两行，两边都不互相抢地方。
         cfg_scroll = QScrollArea()
         cfg_scroll.setWidgetResizable(True)
         cfg_scroll.setFrameShape(QFrame.NoFrame)
@@ -2258,6 +2788,9 @@ class MainWindow(QMainWindow):
         cfg_scroll.setMinimumHeight(180)       # 配置可视区底线：再矮就只能挪窗口了
         cfg_scroll.setWidget(cfg_body)
         lay.addWidget(cfg_scroll, 3)
+        # 主动作行钉在滚动容器之外（见上面 self._action_lay 的注释）：窗口再矮，
+        # 「开始采集」也永远在屏幕上，要滚的只有配置本身。
+        lay.addLayout(self._action_lay)
         # 配置区滚动容器留一份引用：首次显示时按它的真实视口宽度校准窗口最小宽
         # （见 _apply_width_floor）。这里不直接算，是因为构造阶段视口宽度还不是最终值。
         self._cfg_scroll = cfg_scroll
@@ -2282,7 +2815,9 @@ class MainWindow(QMainWindow):
         self.progress.setMinimumHeight(26)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setFormat("就绪")
+        # 待机时条内不写字：「就绪」由下面那行状态口径唯一给出。旧版条内、条下各写一个
+        # 「就绪」，同一屏两个同样的词，看着就像界面卡住没刷新（离线出图当场看到）。
+        self.progress.setFormat("")
         prog_row.addWidget(self.progress, 1)
         self.timer_lbl = QLabel("⏱ 00:00:00")
         f = self.timer_lbl.font(); f.setBold(True); f.setPointSize(11)
@@ -2310,16 +2845,149 @@ class MainWindow(QMainWindow):
         self.lbl_save_info.setVisible(False)
         lay.addWidget(self.lbl_save_info)
 
+        # ── 输出日志：默认收成一条「最近动态」，要看细节时一键展开 ─────────────
+        # 为什么默认收起（2026-11-12 用户反馈「一屏显示不全……把日志区域缩小，
+        # 正常用户不会经常看日志，太占用屏幕了」）：日志是**偶发**的诊断区，采集是
+        # **天天点**的主流程，让偶发用途常驻占掉半屏，等于让所有人为它付高度。
+        # 业界同类面板的统一做法就是折叠抽屉：IDE 的输出面板、CI 的构建日志都默认
+        # 收起，因为「现在跑到哪了、采了多少家」本来就有常驻的状态行与进度条在讲，
+        # 收起日志一条信息都不丢——那两样在这里也确实在滚动区之外常驻着。
+        # 收起态仍留两行（不是彻底藏掉）：挂机时扫一眼最后一行有没有 ⚠/⛔ 是刚需。
+        self.btn_log_toggle = _NoticeBadgeButton()
+        self.btn_log_toggle.setFlat(True)
+        self.btn_log_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_log_toggle.setMinimumHeight(22)
+        self.btn_log_toggle.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        # 宽度先钉死再画：两种文案谁宽谁窄一次性量定，之后角标出现/消失、展开/收起
+        # 都不再改变几何（Maximum 策略允许被削到 sizeHint 以下，不钉住就会截文字）。
+        self.btn_log_toggle.pin_texts(self.LOG_TOGGLE_COLLAPSED, self.LOG_TOGGLE_EXPANDED)
+        self.btn_log_toggle.setToolTip(
+            "展开/收起输出日志。采集进度、各路家数、保存结果都在上面那行常驻显示，"
+            "日志里是逐条明细，需要排查时再展开。")
+        self.btn_log_toggle.clicked.connect(self._toggle_log_area)
+        lay.addWidget(self.btn_log_toggle)
+
         self.log = QTextEdit(); self.log.setReadOnly(True)
         self.log.setFont(QFont("Menlo", 10) if sys.platform != "win32" else QFont("Consolas", 9))
-        # 日志是小屏电脑的底线：上面所有控件都压缩过，这里给硬性最小高度，
-        # 绝不再出现「日志被顶出屏幕、得把窗口拉大才能看到输出」。
-        self.log.setMinimumHeight(180)
         # 性能（同事反馈挂机后电脑卡）：过夜采集日志能刷上万行，QTextEdit 无上限
         # 累积会让文档越来越大、每次 append 重排越来越慢、内存持续上涨。
         # 设最大块数：只保留最近 N 行，超出自动从头丢弃，渲染/内存恒定。
         self.log.document().setMaximumBlockCount(3000)
-        lay.addWidget(self.log, 2)
+        lay.addWidget(self.log, 0)
+        # 日志在常驻布局里的槽位下标：折叠时要把它的 stretch 归零，靠下标改最稳
+        # （按 widget 找要遍历布局，按名字找更是把布局结构焊死在字符串里）。
+        self._log_index = lay.indexOf(self.log)
+        # 折叠态在这里一次性定稿（含从偏好恢复「上次是展开还是收起」）：
+        # 高度、stretch、按钮文字三件事必须同一处生效，分开写迟早会有一处改了另一处没改。
+        self._apply_log_area(_load_log_expanded_pref())
+
+    # ── 输出日志折叠抽屉 ─────────────────────────────────────────────
+    LOG_COLLAPSED_HEIGHT = 60       # 收起态约两行：够扫一眼最后一行有没有 ⚠/⛔
+    LOG_EXPANDED_MIN_HEIGHT = 150   # 展开态硬底线：沿用「日志不许被压成一条缝」的旧口径
+    _WIDGET_SIZE_MAX = 16777215     # Qt 的 QWIDGETSIZE_MAX，写常量免得依赖导入顺序
+
+    def _apply_log_area(self, expanded: bool):
+        """把日志区按收起/展开定稿：高度上下限、布局 stretch、按钮文字一次改齐。
+
+        三件事必须同时改，只改高度不改 stretch 的话，大屏上日志会一边被顶到最大
+        一边说「我只要两行」——那是同一条口径写两处的必然结果。
+        """
+        self._log_expanded = bool(expanded)
+        if self._log_expanded:
+            self.log.setMinimumHeight(self.LOG_EXPANDED_MIN_HEIGHT)
+            self.log.setMaximumHeight(self._WIDGET_SIZE_MAX)
+        else:
+            self.log.setMinimumHeight(self.LOG_COLLAPSED_HEIGHT)
+            self.log.setMaximumHeight(self.LOG_COLLAPSED_HEIGHT)
+        # 收起时把富余高度整份让给配置区（日志 stretch 归零）：小屏上配置少滚一点，
+        # 大屏上关键词框自然长高，两种窗口都各得其所。
+        try:
+            self._root_lay.setStretch(self._log_index, 1 if self._log_expanded else 0)
+        except Exception:
+            pass
+        if self._log_expanded:
+            # 展开就是「我已经看过了」：两档计数一起归零，收起态才需要角标
+            self._log_notice_error = self._log_notice_warn = 0
+        # 按钮文字的唯一出口（折叠态与条数在这里一起算，不在上面再拼一遍）
+        self._refresh_log_toggle()
+
+    # 折叠条文案的唯一出处：两个状态各一句，**恒定不带计数**（计数走角标绘制）。
+    # 写成常量而不是就地拼串，是因为 pin_texts 要在画之前用同一句量宽度——文案若在
+    # 两处各写一遍，钉住的宽度迟早和真实文字对不上，那就是又回到「状态一变文字被截」。
+    LOG_TOGGLE_COLLAPSED = "▸ 展开日志"
+    LOG_TOGGLE_EXPANDED = "▾ 收起日志"
+
+    # 收起态里滚过去的告警行要计入角标。按严重度分两档计数，而不是揉成一个数字：
+    # 挂机一晚，请求失败、限流提示这类 ⚠ 能刷上千行，和 ⛔「本轮结束/权限被中止」混在
+    # 同一个计数里，真正的失败就被常规噪音冲成壁纸——那是过度告警的经典死法（角标一旦
+    # 常年很大就没人看）。分开计数才能做到「数字很大也不慌，⛔ 一出现就得点」。
+    _LOG_NOTICE_ERROR_MARKS = ("⛔", "❌", "🚫")
+    _LOG_NOTICE_WARN_MARKS = ("⚠",)
+    # 显示封顶：与角标类同一个数（真源在 _NoticeBadgeButton.CAP，这里只引用不再写一遍）。
+    _LOG_NOTICE_CAP = _NoticeBadgeButton.CAP
+
+    def _notice_display(self, n: int) -> str:
+        # 封顶显示的是「上限+」而不是「原始数+」：写 250+ 就把封顶这件事抵消了——
+        # 用户看到的还是一个吓人的具体数字，壁纸效应照旧。
+        return f"{self._LOG_NOTICE_CAP}+" if n > self._LOG_NOTICE_CAP else str(n)
+
+    def _refresh_log_toggle(self):
+        """折叠条：文字恒定，未读告警按严重度画成角标，细节全在悬停说明里。
+
+        折叠抽屉的固有代价是「看不见就等于没有」——业界（IDE 问题面板、浏览器控制台）
+        的统一解法就是给收起的面板挂计数，并且**按错误/警告分档、错误用红色**：收起的是
+        内容，不收起的是「有事发生」，而「有事」还得能一眼分出轻重。
+        """
+        if getattr(self, "btn_log_toggle", None) is None:
+            return
+        err = getattr(self, "_log_notice_error", 0)
+        warn = getattr(self, "_log_notice_warn", 0)
+        if self._log_expanded:
+            self.btn_log_toggle.setText(self.LOG_TOGGLE_EXPANDED)
+            self.btn_log_toggle.set_notice(0, 0)
+            return
+        self.btn_log_toggle.setText(self.LOG_TOGGLE_COLLAPSED)
+        self.btn_log_toggle.set_notice(err, warn)
+        base = ("展开/收起输出日志。采集进度、各路家数、保存结果都在上面那行常驻显示，"
+                "日志里是逐条明细，需要排查时再展开。")
+        tiers = []
+        if err:
+            tiers.append(f"{self._notice_display(err)} 条失败（⛔）")
+        if warn:
+            tiers.append(f"{self._notice_display(warn)} 条提醒（⚠）")
+        if tiers:
+            # 两档都在悬停里报全：角标只能显示一个，另一档的信息绝不能因此丢掉
+            base += ("\n收起期间累计：" + "、".join(tiers)
+                     + "——角标只报最重的那一档，两个数都在这里")
+        last = getattr(self, "_log_notice_last", "")
+        self.btn_log_toggle.setToolTip(base + (f"\n最近一条：{last}" if last else ""))
+
+    def _count_log_notice(self, msg):
+        """收起态里滚过去的告警行计入角标（展开态不需要提醒，用户正在看）。"""
+        if getattr(self, "btn_log_toggle", None) is None or self._log_expanded:
+            return
+        # 只看行首（去掉缩进）：正文里偶然出现的符号（清洗统计引用的原文、多行明细的
+        # 中间行）不该算成一条提醒；行首才是爬虫约定打标记的位置。
+        head = str(msg).lstrip()
+        if head.startswith(self._LOG_NOTICE_ERROR_MARKS):
+            key = "_log_notice_error"
+        elif head.startswith(self._LOG_NOTICE_WARN_MARKS):
+            key = "_log_notice_warn"
+        else:
+            return
+        n = getattr(self, key, 0) + 1
+        setattr(self, key, n)
+        self._log_notice_last = head.strip()[:200]
+        # 封顶之后角标不再变化，也就不必再动界面（与上面日志只留 3000 行同一份挂机性能
+        # 账）。取舍写明白：悬停里的「最近一条」会停在第 100 条——刷屏期没人悬停，
+        # 而每刷一行都改一次界面才是真问题。
+        if n <= self._LOG_NOTICE_CAP + 1:
+            self._refresh_log_toggle()
+
+    def _toggle_log_area(self):
+        """点一下换一档，并把这一档记下来：下次开工具就是用户上次要的样子。"""
+        self._apply_log_area(not self._log_expanded)
+        _save_log_expanded_pref(self._log_expanded)
 
     def _connect_signals(self):
         s = self.session.signals
@@ -2363,6 +3031,8 @@ class MainWindow(QMainWindow):
     def _on_log(self, msg):
         self.log.append(msg)
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        # 日志被折起来时，告警行不能跟着一起折没（见 _count_log_notice）
+        self._count_log_notice(msg)
 
     # ── 进度条 / 计时 / 看板 ──────────────────────────────
     @staticmethod
@@ -2989,7 +3659,7 @@ class MainWindow(QMainWindow):
         self._crawl_elapsed = 0.0
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setFormat("就绪")
+        self.progress.setFormat("")     # 与构造时同一口径：待机文字只由状态行说一次
         self.timer_lbl.setText("⏱ 00:00:00")
         self.lbl_stats.setText("就绪")
         self.lbl_board.setText("")
@@ -4113,10 +4783,12 @@ class MainWindow(QMainWindow):
         folder = str(last.get("folder") or "")
         if not folder or not os.path.isdir(folder):
             return
-        if self._restore_task(last, silent=True):
-            self._on_log(f"↻ 已自动显示上次任务的关键词与进度："
-                         f"{last.get('name') or folder}（{len(self.keywords)} 个关键词）。"
-                         "点「开始采集」即接着采；想换一批词从头采就点「开始新任务」。")
+        # 恢复成功后不再补一条「已自动显示上次任务…」日志：_restore_task 内部已经打过
+        # 一条带全部分项数字的 ↻，横幅也已经把「点开始采集即接着采」说给用户了。同一件事
+        # 在启动那一屏留三条（两条日志 + 一条横幅）时，第二条起就只是噪音；而任务名本身
+        # 常带「N 个关键词」，再拼一次就成了「13 个关键词（13 个关键词）」这种读起来像 bug
+        # 的句子（离线出图当场看到）。
+        self._restore_task(last, silent=True)
 
     def _restore_task(self, task, silent=False):
         """按任务恢复现场：关键词/站点/参数 + 逐词游标 + 已采数据装回内存。
@@ -4192,12 +4864,14 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._on_log(f"⚠ 读回上次数据失败（不影响接着采，只是本轮不会累加显示旧数据）："
                              f"{str(e).splitlines()[0][:120]}")
-        shown = "、".join(kws[:5]) + ("…" if len(kws) > 5 else "")
-        self.lbl_kw.setText(f"已接上次任务：{len(kws)} 个关键词（已跑完 {done_n} 个）：" + shown)
+        # 关键词名单本身就在上面那个输入框里，这里再抄一遍就是把同一个事实摆成三份
+        # （输入框 + 状态行 + 横幅），而横幅与状态行都是换行显示，白吃掉两行竖向空间——
+        # 用户要的是「一屏看全」，界面就不该用重复内容把它撑爆。
+        self.lbl_kw.setText(f"已接上次任务：{len(kws)} 个关键词（已跑完 {done_n} 个）")
         self._on_log(f"↻ 恢复任务：{task.get('name') or self._first_start}｜{len(kws)} 个关键词"
                      f"｜已跑完 {done_n} 个｜已采 {seeded} 条装回内存｜{resumed} 个通道已接上游标")
         self._show_banner(
-            f"已接上次的任务：{shown}　共 {len(kws)} 个关键词、已采 {seeded} 条。"
+            f"已接上次的任务（{len(kws)} 个关键词、已采 {seeded} 条）："
             "点「开始采集」就从上次停下的地方接着采，已采过的商家不会重复采。",
             "#e8f5e9", "#1b5e20")
         return True
@@ -4556,14 +5230,33 @@ class MainWindow(QMainWindow):
             self._on_log(f"⚠ 收尾停止失败（请手动点「停止」）：{type(e).__name__}")
         self._acl_stopped = True
         self._refresh_acl_status()
-        # 模态只弹一次：这是唯一「必须让用户当场知道」的权限事件（活已经停了，不弹窗
-        # 就是莫名其妙）。但弹窗打开期间心跳仍在跑（模态是嵌套事件循环，定时器照发），
-        # 万一这期间又来一条事件，第二第三个同样的框叠上去只会让人分不清哪次是哪个号——
-        # 后续事件走界面日志那行（上面已 ⛔ 记过），不再重复拦窗口。
+        # 这条链路是**后台事件**（心跳 / guard.refreshed 信号）叫醒的，用户什么都没点，
+        # 所以这里绝不能用 QMessageBox.warning 这种模态写法（2026-11-12 实测两处事故）：
+        #   1) 模态 = 嵌套事件循环，主线程被接管，心跳、进度、停止收尾全在框后排队——
+        #      「先把活收尾」和「拦住用户」的顺序反了，采集数据可能停在半路；
+        #   2) offscreen / 无人值守（CI 界面自检、远程排障）下 exec() 永久等一次根本不会
+        #      来的点击，进程直接挂死：比崩溃更难查，因为日志看起来像「跑到一半没声音」。
+        # 与拦截提醒同一套做法：常驻一个非模态框，说清楚「发生了什么 + 数据在不在 +
+        # 下一步做什么」，用户点不点它，工具都已经按自己的节奏收好尾。
         if self._acl_revoked_box_shown:
             return
         self._acl_revoked_box_shown = True
-        QMessageBox.warning(self, "本机使用权限已中止", reason)
+        box = getattr(self, "_acl_revoked_box", None)
+        if box is None:
+            box = QMessageBox(self)
+            box.setModal(False)
+            box.setIcon(QMessageBox.Critical)
+            box.setWindowTitle("本机使用权限已中止")
+            box.setStandardButtons(QMessageBox.Ok)
+            box.button(QMessageBox.Ok).setText("知道了")
+            self._acl_revoked_box = box
+        box.setText(reason + "\n\n"
+                    "本轮已采到的数据与进度都按停止流程落盘，不会丢。\n"
+                    "如果确实是你要换到这台电脑上用：点主界面「绑定账号」重新绑定即可把使用权限"
+                    "转到本机（转到本机后另一台会停用）。")
+        box.show()
+        box.raise_()
+        box.activateWindow()
 
     def _acl_sync_level(self):
         """等级变了就当场收口：多出来的入口立刻隐掉，缺的入口提示重启补齐。
@@ -4590,6 +5283,12 @@ class MainWindow(QMainWindow):
         new_title = self._base_title + edition.title_suffix()
         if new_title != self.windowTitle():
             self.setWindowTitle(new_title)
+        # ② 的标题/tooltip 与「选择省份」的 tooltip 跟着重投影：它们报的都是「现在
+        # 界面上有几路补采平台」，等级一变这个集合就变了，留着旧文案等于说假话
+        # （降级时泄露内部平台名，升级时又承诺界面上还没有的东西）。
+        # 顺带补一次缺路播报：按集合去重，正常机器上一条也不会多。
+        self._apply_list_channel_hint()
+        self._log_channel_health()
         # 收不掉的那一类：控件当初压根没创建（构建时等级不够），显示不出来
         need_restart = bool(lost) or any(not self._acl_gated.get(c) for c in gained)
         if not need_restart:

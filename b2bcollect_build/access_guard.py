@@ -2003,9 +2003,64 @@ DOCTOR_FLAGS = ("--doctor", "--acl-doctor")
 # 退出码全表（含 0）：CLI 帮助、测试与排查手册都读它，避免「文档只列了 6 个码」
 _DOCTOR_EXIT_TABLE = ([(DOCTOR_EXIT_OK, "通过")]
                       + sorted(_DOCTOR_KINDS.values(), key=lambda v: v[0]))
-DOCTOR_EXIT_HELP = ("产物自检：只读地验证凭证链与权限服务真连，退出码按故障分类（"
+DOCTOR_EXIT_HELP = ("产物自检：只读地验证凭证链、权限服务真连与采集通道完整性，"
+                    "退出码按故障分类（"
                     + " / ".join(f"{code} {label}"
                                  for code, label in _DOCTOR_EXIT_TABLE) + "）")
+
+
+def _channel_integrity(frozen: bool) -> Tuple[int, List[str]]:
+    """采集通道完整性：包里少了风鸟/爱企查的采集器，界面上就永远只有企知道一路。
+
+    这一条与权限无关，却和「外部机器一律精简版」是同一类发包缺陷，而且是它的
+    **更难查的兄弟**：2026-11-12 实测，等级 0 的管理员账号在产物里只看到企知道，
+    而当时的产物自检全绿——因为它只验凭证链与名单可读，没人验「功能模块在不在包里」。
+    少一路的症状在界面上和「档位没给这个功能」长得一模一样，用户只会来问权限。
+
+    判据取自 ``site_adapters`` 那张表：模块的**使用者**自己声明运行时要去哪几个路径
+    找这些 .py，自检与打包硬门都读它，不在这里另抄一份清单（抄一份就会漏改一处）。
+
+    口径：打包态缺一路就是发包失败（退出码 3 = 缺模块，与「access_guard 没进包」同类）；
+    源码态只警告不判红——开发机可能故意没装 selenium，那既不是发包缺陷，也不该把
+    本地回归和 CI 前置步一起拖成红灯。
+    """
+    lines: List[str] = []
+    try:
+        import site_adapters as _sa
+    except Exception as e:
+        why = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+        lines.append(f"⚠️ acl-doctor：采集通道模块（site_adapters）加载失败 —— {why}")
+        if frozen:
+            return DOCTOR_EXIT_MODULE, lines
+        return DOCTOR_EXIT_OK, lines
+    try:
+        missing = tuple(_sa.missing_list_channels())
+        errors = dict(getattr(_sa, "ADAPTER_ERRORS", {}) or {})
+        expected = tuple(getattr(_sa, "EXPECTED_LIST_CHANNELS", ()))
+    except Exception as e:
+        lines.append(f"⚠️ acl-doctor：采集通道完整性判据取不到（{type(e).__name__}: {e}）")
+        return DOCTOR_EXIT_OK, lines
+    # 按 slug 取中文名（不是按位置）：位置映射在 EXPECTED_LIST_CHANNELS 增删一次就会
+    # 全体错位，而这张表只是给人看的报告文案，绝不该把「风鸟」说成「爱企查」。
+    # 新加的通道没登记名字时退回 slug 本身，宁可生僻也不张冠李戴。
+    names = {"qzd": "企知道", "riskbird": "风鸟", "aiqicha": "爱企查"}
+    if not missing:
+        lines.append(f"   · 采集通道：{len(expected)} 路齐全（"
+                     + " / ".join(names.get(s, s) for s in expected) + "）")
+        return DOCTOR_EXIT_OK, lines
+    lost = " / ".join(names.get(s, s) for s in missing)
+    head = ("❌ acl-doctor：产物里缺采集通道" if frozen
+            else "⚠️ acl-doctor：本机缺采集通道（源码态不判红）")
+    lines.append(f"{head}：{lost}")
+    for s in missing:
+        why = errors.get(s)
+        lines.append(f"   · {s}：{why or '加载结果不可用（原因未登记）'}")
+    lines.append("   · 症状：② 公司名单只剩企知道，等级 0/1 也看不到风鸟与爱企查——"
+                 "这不是权限问题，是那几个 .py 没进包。")
+    lines.append("   · 修法：在打包工作流与 debug/build_b2bcollect_mac_local.sh 的 "
+                 "--add-data 里补齐 site_adapters.EXTERNAL_MODULES 列出的文件"
+                 "（跑 .github/scripts/check_packaging_manifest.py 会点名缺哪一条）。")
+    return (DOCTOR_EXIT_MODULE if frozen else DOCTOR_EXIT_OK), lines
 
 
 def doctor_lines() -> Tuple[int, List[str]]:
@@ -2041,6 +2096,13 @@ def doctor_lines() -> Tuple[int, List[str]]:
     except Exception:
         pass
 
+    # 0.5) 采集通道完整性：放在**任何网络步骤之前**，因为报告里每一处提前返回都
+    #      会跳过后面的段落。这一项不联网、只问模块自己「那几路加载上了没有」，
+    #      而它恰恰是本轮真正坏掉的那一层——凭证全通、名单全通、包里却少两个平台。
+    ch_code, ch_lines = _channel_integrity(frozen)
+    for line in ch_lines:
+        say(line)
+
     # 1) 凭证：能不能拿到、从哪一级拿到（只报来源，绝不报值）
     try:
         from oss_pool_client import credential_origin
@@ -2073,6 +2135,12 @@ def doctor_lines() -> Tuple[int, List[str]]:
         say(f"   · 用户侧口径：{AccessGuard._unreachable_text(k)}")
         if "不存在" in str(e):
             say("   · 名单文件还没播种过：首次使用会自动建，本次判为通过。")
+            # 这是全流程里唯一一个「返回码还没定就提前退出」的成功分支：通道完整性
+            # 判红时必须照样退 3，否则「名单还没建 + 包少两个平台」这两件事叠在一起，
+            # CI 门禁会拿着 0 直接发一个功能不全的包出去。
+            if ch_code != DOCTOR_EXIT_OK:
+                say(f"❌ acl-doctor：权限链本项通过，但采集通道完整性不通（退出码 {ch_code}）")
+                return ch_code, out
             return DOCTOR_EXIT_OK, out
         return code, out
     accounts = _parse_accounts(doc)
@@ -2137,6 +2205,12 @@ def doctor_lines() -> Tuple[int, List[str]]:
             say(f"⚠️ acl-doctor：{p}")
     except Exception:
         pass
+
+    # 权限链每一层都通了，功能模块却少了两路——同样是「发出去就不能用」，退出码
+    # 必须跟着改。反过来若前面已经因为凭证/网络判红，那个码更该先看，通道缺失的
+    # 结论已经写在上面那几行里，不会被淹没。
+    if code == DOCTOR_EXIT_OK and ch_code != DOCTOR_EXIT_OK:
+        code = ch_code
 
     say("✅ acl-doctor：权限服务连通且名单可读" if code == DOCTOR_EXIT_OK
         else f"❌ acl-doctor：未通过（退出码 {code}）")

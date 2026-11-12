@@ -45,6 +45,21 @@ jobs:
       with:
         python-version: '3.11'
 
+    - name: Packaging manifest gate
+      # 构建前硬门：把「产物该有的模块与数据」逐项对拍一遍再开建。
+      # 判据在 b2bcollect_build/site_adapters.py 的 EXTERNAL_MODULES（模块的使用者
+      # 自己声明运行时要去 _MEIPASS 找哪些 .py），这里把它与下面 PyInstaller 命令行
+      # 里的 --add-data/--hidden-import 对拍，另加两条：本地模块新增了却没登记
+      # --hidden-import、清单指向的源码已经不存在。
+      # 为什么值得单独一步（2026-11-12 实测）：riskbird_crawler_v2.py 与
+      # aiqicha_crawler_v2.py 没进包时，构建成功、产物自检也通过（那时自检只验凭证），
+      # 用户拿到的包却在「② 公司名单」里只剩企知道一路——**少一个文件不报错、只少
+      # 一个平台**，而症状和「档位没给这个功能」长得一模一样，第一轮排查必然被带去
+      # 查权限。这类缺陷只能在构建前拦，事后靠用户截图发现要往返几个小时。
+      # 纯标准库（ast + 正则），不装任何依赖，所以放在 Install dependencies 之前。
+      shell: bash
+      run: python .github/scripts/check_packaging_manifest.py
+
     - name: Write bundled config.json from Secrets
       # 随包凭证注入：值只从 Secrets 经 env 传进进程，绝不 echo、绝不进产物清单之外
       # 的地方（跑完这一步后 config.json 就在 runner 的临时工作区里，随 job 结束销毁）。
@@ -102,7 +117,7 @@ jobs:
         cd b2bcollect_build
         # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
         [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
-        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        python -m PyInstaller --noconfirm --clean --onefile --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，

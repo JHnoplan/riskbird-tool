@@ -768,7 +768,9 @@ check("隐藏点的数量与能力位对得上：每个入口都真在被禁时�
       # 扩词两处：④ 的勾选框建不建 + 日志里那句「怎么关掉换词」的说法
       and _gsrc.count("edition.auto_expand_visible()") == 2
       # 名单通道：② 的控件集合 + 日志看板的状态行 + 开始采集时的运行时重投影
-      and _gsrc.count("edition.visible_list_channels(") == 3
+      # + 缺路判据（「该给却没给」的那几路必须也走同一份投影，否则丐版会在日志里
+      #   点名内部平台，等于把藏起来的功能念出来）
+      and _gsrc.count("edition.visible_list_channels(") == 4
       # 权限管理入口两处：徽章/按钮建不建 + 打开面板前的复核
       and _gsrc.count("edition.acl_admin_visible()") == 2,
       (_gsrc.count("edition.pool_ui_visible()"),
@@ -998,16 +1000,50 @@ try:
     check("只有用户点链接这一条路能走到重启询问（后台收口函数里没有弹窗与询问调用）",
           not any("QMessageBox" in ln or "_acl_prompt_restart" in ln for ln in _sync_code),
           [ln for ln in _sync_code if "QMessageBox" in ln or "_acl_prompt_restart" in ln])
-    # 顶号模态：第一次必弹（活已经停了，不弹就是莫名其妙），第二次不许叠上来
-    _warns = []
-    gui.QMessageBox.warning = staticmethod(
-        lambda *a, **k: (_warns.append(a[2] if len(a) > 2 else ""), None)[1])
-    w_pro._acl_revoked_box_shown = False
-    w_pro._acl_stopped = False
-    w_pro._on_acl_revoked("当前云展账号已在新设备使用，本机已停止。")
-    w_pro._on_acl_revoked("当前云展账号已在新设备使用，本机已停止。")
-    check("顶号第一次弹窗、第二次只记日志（弹窗期间心跳照跑，叠框只会分不清哪次是哪个号）",
-          len(_warns) == 1, _warns)
+    # 顶号提示：第一次必须当场说清楚（活都停了，不吭声就是莫名其妙），第二次不许叠框；
+    # 并且必须是**非模态**——叫醒这条链路的是心跳/后台刷新，不是用户的点击：模态等于
+    # 让一个没人点过的对话框用嵌套事件循环接管主线程（停止收尾、进度、心跳全在框后排队），
+    # offscreen/无人值守下 exec 还会永久等一次永远不会来的点击（2026-11-12 实测：整批
+    # 回归就是这么被拖到 SIGABRT 的）。所以「说清楚」与「不接管」只能同时靠非模态做到。
+    _boxes = []
+    _real_box_cls = gui.QMessageBox
+
+    class _RecordingBox(_real_box_cls):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            _boxes.append(self)
+
+        def show(self):                 # 无头环境只记账，不真弹窗（也别往屏幕上抢焦点）
+            return None
+
+    gui.QMessageBox = _RecordingBox
+    # 上面第 B 节把 w_pro._on_log 换成了「只进列表」（那段要靠收下来的日志查文案），
+    # 所以这里不能去读 log 控件，必须自己接一份：顶号这条链路的日志与提示是**两条**
+    # 独立出口，只验其中一条，另一条被静默换掉也查不出来。
+    _revoke_logs = []
+    _real_on_log = w_pro._on_log
+    w_pro._on_log = lambda m: (_revoke_logs.append(m), _real_on_log(m))[1]
+    try:
+        w_pro._acl_revoked_box = None
+        w_pro._acl_revoked_box_shown = False
+        w_pro._acl_stopped = False
+        w_pro._on_acl_revoked("当前云展账号已在新设备使用，本机已停止。")
+        w_pro._on_acl_revoked("当前云展账号已在新设备使用，本机已停止。")
+        check("顶号只提示一次（第二次只记日志，叠框只会分不清哪次是哪个号）",
+              len(_boxes) == 1, len(_boxes))
+        check("顶号提示是非模态框（后台事件绝不用嵌套事件循环接管主线程）",
+              bool(_boxes) and _boxes[0].isModal() is False,
+              _boxes[0].isModal() if _boxes else None)
+        check("非模态提示里带上下一步（怎么把使用权限拿回本机）",
+              bool(_boxes) and "绑定账号" in _boxes[0].text(),
+              _boxes[0].text() if _boxes else "")
+        check("顶号事件同时落到日志（提示被人关掉也还有据可查）",
+              any(t.startswith("⛔") for t in _revoke_logs), _revoke_logs[:2])
+    finally:
+        gui.QMessageBox = _real_box_cls
+        w_pro._on_log = _real_on_log
+        w_pro._acl_revoked_box = None
+        w_pro._acl_revoked_box_shown = False
 finally:
     gui.QMessageBox.question = _real_q
     gui.QMessageBox.warning = _real_w
