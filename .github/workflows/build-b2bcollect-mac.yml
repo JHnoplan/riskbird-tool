@@ -71,6 +71,10 @@ jobs:
       # 发包门禁：**用产物自己**验证「这个 .app 能不能连上权限服务」，放在打成
       # zip 之前——不通就不许有制品可下。直接调 .app 里的可执行文件：它走的才是
       # 打包态真实凭证链（随包 config.json）与真实 frozen 判定，源码跑通不代表它通。
+      # 必须带超时：这一步的失败形态里最坏的一种不是非零退出，而是**一声不响地
+      # 卡住**（参数没认出来就会去建界面、网络半通时也会等），一卡就是 job 默认
+      # 的 6 小时，日志里什么结论都留不下。自检自己是有界的，这里再兜一层。
+      timeout-minutes: 10
       shell: bash
       run: |
         b2bcollect_build/dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool --acl-doctor

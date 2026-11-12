@@ -20,6 +20,12 @@
      加密连接被中途拦下单独一类；出网失败一律在唯一通道里转成可分类的错误
   J. 时间基准：进程内新鲜度与有界等待走单调时钟，落盘时间戳落在将来按不可信处理
      ——改系统时间不许让「被删的账号还能用」，也不许把 3 秒等待变成几小时卡死
+  K. 控制台编码：CI 脚本与 CLI/自检入口在**第一次打印之前**就把 stdout 切到
+     UTF-8 ——Windows 英文系统用 cp1252 编码控制台，中文和 ✅ 都编不出来，本轮
+     CI 就是「config.json 已写好、进程却死在打印成功话术」这种红法
+  L. 自检开关口径：CI 的 --acl-doctor、源码 CLI 的 --doctor、产物界面的分派三者
+     必须是同一份写法（拼错时不许退化成「安静地去建界面」，那会让 runner 挂到
+     job 超时）；退出码全表由故障分类表派生，帮助文本不许再手写一份清单
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -64,6 +70,7 @@ from oss_pool_client import (OSSPoolError, OSSCredentialError,    # noqa: E402
 # edition），运行时看不出漏了第二处，只有在文本上钉住才不会日后悄悄多出一份。
 _OSS_SRC = (_REPO / "b2bcollect_build" / "oss_pool_client.py").read_text(encoding="utf-8")
 _AG_SRC = (_REPO / "b2bcollect_build" / "access_guard.py").read_text(encoding="utf-8")
+_TC_SRC = (_REPO / "b2bcollect_build" / "tool_config.py").read_text(encoding="utf-8")
 
 _PASS = 0
 _FAIL = 0
@@ -97,6 +104,16 @@ def _assert_raises(exc_type, fn, msg):
         return
     _FAIL += 1
     print(f"  ❌ {msg}（没抛异常）")
+
+
+def _fmt_idx(i):
+    """把「有没有找到某一行」说成人话。
+
+    配合 ``next(gen, None)`` 用：裸 ``next(gen)`` 找不到就抛 StopIteration，那是
+    测试框架自己的异常，一整棵用例树会被它带走，屏幕上连一条 ❌ 都看不到——
+    本轮 K 组被自己的夹具打死就是这一类，查找/夹具的异常永远不该冒充用例结论。
+    """
+    return f"第 {i + 1} 行" if i is not None else "没找到"
 
 
 def _write(path: Path, payload: dict):
@@ -764,14 +781,20 @@ def test_doctor():
         finally:
             sys.modules["tool_config"] = saved_tc
 
-    # 4) GUI 必须在 QApplication 之前分派 --acl-doctor（否则 CI 在无图形会话里跑不动）
+    # 4) GUI 必须在 QApplication 之前分派自检（否则 CI 在无图形会话里跑不动）。
+    #    这里只问**先后**，不问写法：写法已经收进 DOCTOR_FLAGS 一处，由 L 组逐字
+    #    对拍；在文本里搜 "--acl-doctor" 字面量等于把「写法」和「顺序」两件事焊在
+    #    一起，改一处命名就会把这条完全无关的顺序断言炸成整棵树崩溃。
     import b2bcollect_gui as gui
     src = inspect.getsource(gui.main)
     body = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
-    idx = next(i for i, ln in enumerate(body) if "--acl-doctor" in ln)
-    app_idx = next(i for i, ln in enumerate(body) if "QApplication(sys.argv)" in ln)
-    _assert(idx < app_idx,
-            "main() 里 --acl-doctor 的分派排在 QApplication 之前（纯 python 可跑）")
+    idx = next((i for i, ln in enumerate(body) if "_doctor_request(" in ln), None)
+    app_idx = next((i for i, ln in enumerate(body)
+                    if "QApplication(sys.argv)" in ln), None)
+    _assert(idx is not None and app_idx is not None,
+            f"分派与建界面两段代码都在（{_fmt_idx(idx)}, {_fmt_idx(app_idx)}）")
+    _assert(idx is not None and app_idx is not None and idx < app_idx,
+            "main() 里自检的分派排在 QApplication 之前（纯 python 可跑）")
     _assert("_acl_doctor_entry" in src, "GUI 入口走的是统一收口，不各写一份")
 
 
@@ -1446,6 +1469,219 @@ def test_time_basis():
                 f"这一处墙上时钟必须是**要落盘**的时间戳或其判定：{ln}")
 
 
+# ══════════════════════════════════════════════ K. 控制台编码
+def _cp1252_stdout():
+    """造一个「英文 Windows 控制台」：缓冲区是内存，编码是 cp1252。
+
+    为什么要在 macOS 上模拟它：Windows 的 Python 用**系统代码页**给 stdout 编码，
+    非中文系统就是 cp1252 —— 中文和 ✅ 都编不出来，直接抛 UnicodeEncodeError。
+    这个坑只在 CI 的那台机器上成立，本机跑一百遍也测不出来（本轮 CI 就是这么红的：
+    config.json 已经写好了，进程却死在打印成功话术那一行）。所以这里把控制台
+    本身做成夹具。
+    """
+    buf = io.BytesIO()
+    return io.TextIOWrapper(buf, encoding="cp1252", errors="strict"), buf
+
+
+def _print_on_cp1252(text: str, fix=None):
+    """在「英文 Windows 控制台」上真打印一次，把异常和落盘字节**带回给调用方**。
+
+    夹具的作用域只许包住被测语句本身：断言函数自己也要 print 结论，一旦它跑在
+    cp1252 流上，结论还没打出来就先抛 UnicodeEncodeError——测试框架被自己的夹具
+    打死，整棵用例树崩掉，反而看不到到底是哪一条红（本套第一版就是这么炸的）。
+    所以这里在交出结论之前先把 sys.stdout 换回真的那个。
+    """
+    stream, buf = _cp1252_stdout()
+    saved = sys.stdout
+    err = None
+    try:
+        sys.stdout = stream
+        if fix is not None:
+            fix()
+        print(text)
+    except BaseException as e:
+        err = e
+    finally:
+        try:
+            stream.flush()
+        except Exception:
+            pass
+        raw = buf.getvalue()
+        sys.stdout = saved          # 先恢复，再谈结论
+    return err, raw
+
+
+def _force_with_stdout(value):
+    """把 sys.stdout 换成 value 后调用 force_utf8_stdout，恢复之后才交出结果。"""
+    saved = sys.stdout
+    try:
+        sys.stdout = value
+        got = tc.force_utf8_stdout()
+    except BaseException as e:
+        got = e
+    finally:
+        sys.stdout = saved
+    return got
+
+
+def _prints_before(src: str, needle: str) -> bool:
+    """``needle`` 是否排在这段代码**第一次真正打印**之前。
+
+    顺序就是这里的全部语义：编码修在第一次打印之后，那一行就已经抛完了，后面
+    再改也换不回结论。注释行先剔掉——文档字符串里出现「print」不算打印。
+    """
+    body = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    i = body.find(needle)
+    if i < 0:
+        return False
+    outlets = [body.find(p) for p in ("print(", "say(") if body.find(p) >= 0]
+    return not outlets or i < min(outlets)
+
+
+def test_console_encoding():
+    print("\n═══ K. 控制台编码：中文与 ✅ 在英文 Windows 上必须说得出来 ═══")
+    import b2bcollect_gui as gui
+
+    # 1) 先把「环境确实会坏」钉住：否则后面所有断言都是在测一个不会失败的场景
+    err, _ = _print_on_cp1252("✅ 已生成随包配置")
+    _assert(isinstance(err, UnicodeEncodeError),
+            f"cp1252 控制台上打印带 ✅ 的成功话术当场抛错（实际 {type(err).__name__}）")
+    err, _ = _print_on_cp1252("写入失败")
+    _assert(isinstance(err, UnicodeEncodeError),
+            f"纯中文一样抛错（所以只改 emoji 是假修法，下一句中文字又撞墙）："
+            f"实际 {type(err).__name__}")
+
+    # 2) 修法本身：换编码之后同一条打印能出来，且落的是 UTF-8 字节
+    fixed = []
+    err, raw = _print_on_cp1252("✅ 已生成随包配置 b2bcollect_build/config.json",
+                               fix=lambda: fixed.append(tc.force_utf8_stdout()))
+    _assert(err is None, f"换成 UTF-8 后同一条打印不再抛错（实际 {type(err).__name__}）")
+    _assert_eq(fixed, [True], "能改的流改成功了（返回值如实说）")
+    _assert("随包配置" in raw.decode("utf-8") and "✅" in raw.decode("utf-8"),
+            f"中文与符号都落到了字节上（{raw[:40]!r}）")
+
+    # 3) 改不动的流不许把调用方带崩：--windowed 产物里 stdout 是 None / 不落字的
+    #    NullWriter，没有 reconfigure；自检报告的价值远高于「顺便修好编码」
+    got = _force_with_stdout(io.StringIO())        # 有 write、没有 reconfigure
+    _assert(got is True, f"无 reconfigure 的流安静跳过（不算失败）（实际 {got!r}）")
+    got = _force_with_stdout(None)                 # 打包 --windowed 的真实形态
+    _assert(got is True, f"stdout 是 None 也不抛（CI 的产物门禁就长这样）（实际 {got!r}）")
+
+    # 4) 四个会打印的入口都必须**在第一次打印之前**修好编码。它们是各自独立的进程
+    #    入口（CI 脚本 / 源码 CLI / 产物自检 / 打包后的 --acl-doctor），谁都不能假设
+    #    另外几个跑过；判据统一成「排在第一次打印之前」，而不是「代码里提过一句」。
+    inject = (_REPO / ".github" / "scripts" / "inject_build_config.py").read_text(encoding="utf-8")
+    entries = (
+        ("CI 注入脚本", inject, 'reconfigure(encoding="utf-8"'),
+        ("源码 CLI 入口", inspect.getsource(ag._cli_guarded), "_force_utf8_stdout()"),
+        ("自检主流程", inspect.getsource(ag.run_doctor), "_force_utf8_stdout()"),
+        ("产物自检入口", inspect.getsource(gui._acl_doctor_entry),
+         "_tool_config.force_utf8_stdout()"),
+    )
+    for name, src, needle in entries:
+        _assert(_prints_before(src, needle), f"{name} 第一次打印之前就修好了编码")
+    # 「本地取密钥」那一支确实要 import tool_config（开发机上它就在旁边），所以
+    # 判据只许管它之前的顶层部分；找不到这个分界就得直说，不能让下面那条断言
+    # 因为 split 退化成整份文件而报一个看不出根因的错。
+    _assert("def _from_local" in inject, "CI 脚本仍保留 --from-local 分支（本机打包同一条链）")
+    head = inject.split("def _from_local")[0]
+    head_code = "\n".join(ln for ln in head.splitlines() if not ln.strip().startswith("#"))
+    _assert(not re.search(r"^\s*(import|from)\s+tool_config", head_code, re.M),
+            "CI 脚本顶层的编码修法不依赖产物模块（模块全坏时它还得能说话）")
+    _assert("HAS_TOOL_CONFIG" in inspect.getsource(gui._acl_doctor_entry),
+            "tool_config 自己没加载进来时也不能抛（那正是门禁要报的故障）")
+
+    # 5) 只许有一处实现：编码口径写三份，迟早一份改了另两份没改
+    _assert_eq(len(re.findall(r"def force_utf8_stdout", _TC_SRC)), 1,
+               "force_utf8_stdout 只有 tool_config 一个定义")
+    _assert_eq(len(re.findall(r'reconfigure\(encoding="utf-8"', _TC_SRC)), 1,
+               "tool_config 里真正改编码的语句只有一处")
+
+
+# ══════════════════════════════════════════ L. 自检开关的口径一致
+def test_doctor_flag_parity():
+    print("\n═══ L. 自检开关：CI 写法、CLI 写法、界面写法必须是同一件事 ═══")
+    import b2bcollect_gui as gui
+
+    # 1) 两种写法在三个地方都得认：CI 的 yml 写 --acl-doctor，管理员手敲源码 CLI
+    #    看帮助是 --doctor，产物 exe 收哪个由界面分派决定。历史上这三处各写一份，
+    #    拼错的一方不会报错，而是**安静地走另一条路**（见下面第 3 条）。
+    _assert_eq(set(ag.DOCTOR_FLAGS), {"--doctor", "--acl-doctor"},
+               "access_guard 声明的自检开关就这两种写法")
+    _assert_eq(set(gui._DOCTOR_FLAGS_FALLBACK), set(ag.DOCTOR_FLAGS),
+               "界面那份退路副本与 access_guard 逐字一致（漏收权限模块时仍要认得）")
+
+    # 三个发包出口都要用同一个写法：两个 CI workflow + 本机 Mac 打包脚本。
+    # 少查一个出口，就等于允许那个出口用一个产物认不出来的开关。
+    wf_dir = _REPO / ".github" / "workflows"
+    exits = [(wf_dir / "build-b2bcollect.yml", True),
+             (wf_dir / "build-b2bcollect-mac.yml", True),
+             (_REPO / "debug" / "build_b2bcollect_mac_local.sh", False)]
+    for p, in_ci in exits:
+        name = p.relative_to(_REPO).as_posix()
+        if not p.exists():
+            _assert(False, f"{name} 必须还在（发包门禁的定义处）")
+            continue
+        text = p.read_text(encoding="utf-8")
+        used = set(re.findall(r"(--acl-doctor|--doctor)", text))
+        _assert(used and used <= set(ag.DOCTOR_FLAGS),
+                f"{name} 里调自检用的写法都在口径内（实际 {sorted(used)}）")
+        _assert("acl_doctor.txt" in text or "--acl-doctor" not in text,
+                f"{name} 自检失败时会把报告原文打出来（不只剩一个退出码）")
+        if in_ci:
+            # CI 里必须有超时：这一步最坏的失败不是非零退出，而是一声不响地卡住
+            _assert("timeout-minutes" in text,
+                    f"{name} 的自检门禁带超时（卡住比非零退出更难查）")
+
+    # 2) 界面分派本身：两种写法都进自检；带 doctor 字样却拼错的**不许**掉去建界面
+    for argv, want in ((["--acl-doctor"], (True, [])),
+                       (["--doctor"], (True, [])),
+                       (["--windowed", "--doctor"], (True, [])),
+                       ([], (False, [])),
+                       (["--doctors"], (False, ["--doctors"])),
+                       (["--acl-doctor-x"], (False, ["--acl-doctor-x"]))):
+        _assert_eq(gui._doctor_request(argv), want, f"界面分派 {argv}")
+
+    # 3) 反向确认这条分支真的会「挂住 CI」：拼错时主流程走到的是建界面那一行，
+    #    所以这里必须靠兜底把它拦下来——判据直接读源码里的先后顺序。
+    src = inspect.getsource(gui.main)
+    _assert(src.index("if wrong:") < src.index("QApplication(sys.argv)"),
+            "认不出的自检写法在 QApplication 之前就被拦下（否则 runner 挂到超时）")
+
+    # 4) 权限模块没加载时退回本地常量：那正是门禁要报的故障，开关必须先认得出来
+    with _patch(gui, "HAS_ACL_GUARD", False):
+        _assert_eq(set(gui._doctor_flags()), set(gui._DOCTOR_FLAGS_FALLBACK),
+                   "access_guard 缺席时仍认得两种写法（用退路副本）")
+    with _patch(ag, "DOCTOR_FLAGS", ("--only-one-way",)):
+        _assert_eq(gui._doctor_flags(), ("--only-one-way",),
+                   "口径只认 access_guard 那一份，界面不另立一套")
+
+    # 5) 源码 CLI 侧：两种写法都要真的走到自检，且「只读」约束对两种写法同样成立
+    for flag in ag.DOCTOR_FLAGS:
+        seen = []
+        with _patch(ag, "run_doctor", lambda *a, **k: (seen.append(1), 0)[1]):
+            ag._cli([flag])
+        _assert_eq(seen, [1], f"python -m access_guard {flag} 真的跑了自检")
+        _assert_raises(SystemExit,
+                       lambda: ag._cli([flag, "--add", "13417047813"]),
+                       f"{flag} 与写操作混用时当场拒绝（自检读到的会是刚写下去的东西）")
+
+    # 6) 退出码全表由分类表派生：加了新故障类别却忘了补标签，这里立刻红
+    codes = [c for c, _ in ag._DOCTOR_EXIT_TABLE]
+    _assert_eq(len(codes), len(set(codes)), "退出码不重复")
+    declared = {v for k, v in vars(ag).items() if k.startswith("DOCTOR_EXIT_")
+                and isinstance(v, int)}
+    _assert_eq(declared, set(codes),
+               "每一个 DOCTOR_EXIT_* 常量都进了全表（漏一个=那种故障在帮助里没名字）")
+    _assert_eq(set(ag._DOCTOR_KINDS), set(ag._DOCTOR_KIND_CODE),
+               "分类表与退出码表同源（派生出来的，不是又抄一份）")
+    for kind, (code, label) in ag._DOCTOR_KINDS.items():
+        _assert(label and code != ag.DOCTOR_EXIT_OK, f"{kind} 有码也有短标签")
+    _assert("8" in ag.DOCTOR_EXIT_HELP and "加密被拦" in ag.DOCTOR_EXIT_HELP,
+            f"帮助文本里能数出全部类别（本轮就吃过「帮助只列 6 个码」的亏）："
+            f"{ag.DOCTOR_EXIT_HELP}")
+
+
 def main():
     print("═══ 打包态交付链 离线测试 ═══")
     test_config_chain()
@@ -1458,6 +1694,8 @@ def main():
     test_state_dir()
     test_clock_skew()
     test_time_basis()
+    test_console_encoding()
+    test_doctor_flag_parity()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 

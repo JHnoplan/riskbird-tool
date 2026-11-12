@@ -103,6 +103,11 @@ jobs:
       # 不通就不许有制品可下。必须走 --windowed 的 exe，所以用 Start-Process -Wait
       # 拿退出码（GUI 子系统程序在 shell 里不会被自然等待，这是 Windows 上的老坑）；
       # 报告同时落在包外状态目录 acl_doctor.txt，失败时把原文打出来供远程排障。
+      # 必须带超时：这一步最坏的失败形态不是非零退出，而是**一声不响地卡住**
+      # （参数没被认出来就会走到建界面那条路，runner 上多半也没有可用图形会话），
+      # 一卡就是 job 默认的 6 小时，日志里连一行自检结论都留不下。exe 里的自检
+      # 本身是有界的（网络侧全部带超时与重试上限），这里再兜一层防「没走到那里」。
+      timeout-minutes: 10
       shell: pwsh
       run: |
         $exe = "b2bcollect_build\dist\B2bCollectTool.exe"

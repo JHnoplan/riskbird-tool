@@ -1973,21 +1973,39 @@ DOCTOR_EXIT_OTHER = 6
 DOCTOR_EXIT_CLOCK = 7
 DOCTOR_EXIT_TLS = 8
 
-_DOCTOR_KIND_CODE = {
-    "credential": DOCTOR_EXIT_CREDENTIAL,
-    "module": DOCTOR_EXIT_MODULE,
-    "denied": DOCTOR_EXIT_DENIED,
-    "network": DOCTOR_EXIT_NETWORK,
-    "other": DOCTOR_EXIT_OTHER,
+# 一张表同时给出「类别 → 退出码 + 短标签」，退出码表和 CLI 帮助都由它派生：
+# 上一轮就吃过「帮助里列了 6 个码、实际有 8 个码」的亏——同一条口径写两处，
+# 加一类故障时必然漏一处。现在加一类只需要在这一张表里加一行。
+_DOCTOR_KINDS = {
+    "credential": (DOCTOR_EXIT_CREDENTIAL, "缺凭证"),
+    "module": (DOCTOR_EXIT_MODULE, "缺模块"),
+    "denied": (DOCTOR_EXIT_DENIED, "被拒"),
+    "network": (DOCTOR_EXIT_NETWORK, "网络"),
+    "other": (DOCTOR_EXIT_OTHER, "其它"),
     # 时钟偏差单独一个码：CI 的 runner 时间是同步好的，红在这里基本只可能是
     # 「产物里的自愈逻辑没生效」，与「密钥不对」是两个完全不同的排查方向
-    "clock": DOCTOR_EXIT_CLOCK,
+    "clock": (DOCTOR_EXIT_CLOCK, "时钟"),
     # 加密连接被拦也单独一个码：CI 上出现它 = 构建环境的证书链/代理与 OSS 不通，
     # 该修的是构建机网络策略，而不是发包用的密钥
-    "tls": DOCTOR_EXIT_TLS,
+    "tls": (DOCTOR_EXIT_TLS, "加密被拦"),
 }
 
+_DOCTOR_KIND_CODE = {k: v[0] for k, v in _DOCTOR_KINDS.items()}
+
 DOCTOR_LOG_NAME = "acl_doctor.txt"
+
+# 自检开关的两个写法必须是**同一份**：CI 工作流里写的是 --acl-doctor（历史命名，
+# 报告话术也叫 acl-doctor），管理员手敲源码 CLI 时惯用 --doctor。谁认不出谁的
+# 写法都会出事——打包态更狠：exe 认不出 --doctor 就当普通启动去建界面，CI 的
+# Start-Process -Wait 会一路干等到 job 超时。
+DOCTOR_FLAGS = ("--doctor", "--acl-doctor")
+
+# 退出码全表（含 0）：CLI 帮助、测试与排查手册都读它，避免「文档只列了 6 个码」
+_DOCTOR_EXIT_TABLE = ([(DOCTOR_EXIT_OK, "通过")]
+                      + sorted(_DOCTOR_KINDS.values(), key=lambda v: v[0]))
+DOCTOR_EXIT_HELP = ("产物自检：只读地验证凭证链与权限服务真连，退出码按故障分类（"
+                    + " / ".join(f"{code} {label}"
+                                 for code, label in _DOCTOR_EXIT_TABLE) + "）")
 
 
 def doctor_lines() -> Tuple[int, List[str]]:
@@ -2125,6 +2143,25 @@ def doctor_lines() -> Tuple[int, List[str]]:
     return code, out
 
 
+def _force_utf8_stdout() -> None:
+    """命令行入口的第一件事：把控制台输出切到 UTF-8（口径见 tool_config）。
+
+    这一步必须排在**任何打印之前**。Windows 英文系统上 Python 打印中文会抛
+    UnicodeEncodeError，而这一层恰恰是**发包门禁与远程排障**用的：报错的是打印，
+    被误判的却是权限服务——「工具说自己连不上」和「工具没法把自己说的话写到屏幕上」
+    在日志里长得一模一样。本轮 CI 就是这样：config.json 已经写好了，进程却死在
+    打印 ✅ 的那一句上。
+
+    安静失败：tool_config 没被收进打包清单时（这才是门禁要抓的故障），绝不能让
+    「修编码」这件事把它自己的诊断也一起弄丢，所以这里不抛、也不打印。
+    """
+    try:
+        import tool_config
+        tool_config.force_utf8_stdout()
+    except Exception:
+        pass
+
+
 def run_doctor(write_log: bool = True) -> int:
     """打印自检报告并返回退出码。
 
@@ -2132,6 +2169,7 @@ def run_doctor(write_log: bool = True) -> int:
     （``sys.stdout`` 是 None，``print`` 会静默什么也不做），所以报告除了打屏还
     必须落一份到包外的状态目录，CI 与远程排障才有东西可看。
     """
+    _force_utf8_stdout()
     code, lines = doctor_lines()
     text = "\n".join(lines)
     printed = False
@@ -2201,9 +2239,9 @@ def _cli(argv: Optional[List[str]] = None):
     ap.add_argument("--whoami", action="store_true", help="看本机设备身份与认领状态")
     ap.add_argument("--claim", nargs="?", default=None, const="",
                     help="把本机登记为该账号的当前设备（不带号码=用已绑定账号）")
-    ap.add_argument("--doctor", action="store_true",
-                    help="产物自检：只读地验证凭证链与权限服务真连，退出码分类"
-                         "（0 通过 / 2 缺凭证 / 3 缺模块 / 4 被拒 / 5 网络 / 6 其它）")
+    ap.add_argument(*DOCTOR_FLAGS, dest="doctor", action="store_true",
+                    help=DOCTOR_EXIT_HELP + "（--acl-doctor 是同义写法，与打包工作流、"
+                                            "界面产物入口保持一致）")
     args = ap.parse_args(argv)
 
     # 参数组合校验：--force 只在移除时有意义，别让它默默被忽略（管理员以为生效了）
@@ -2223,8 +2261,8 @@ def _cli(argv: Optional[List[str]] = None):
         # 调用里先改了名单，自检读到的就是刚写下去的东西），所以必须单独跑。
         if (args.add or args.set_level or args.remove or args.kick
                 or args.claim is not None):
-            ap.error("--doctor 只读，不能与 --add/--set-level/--remove/--kick/"
-                     "--claim 同时使用")
+            ap.error("、".join(DOCTOR_FLAGS) + " 只读，不能与 "
+                     "--add/--set-level/--remove/--kick/--claim 同时使用")
         code = run_doctor()
         if code != DOCTOR_EXIT_OK:
             sys.exit(code)
@@ -2320,6 +2358,7 @@ def _cli_guarded(argv: Optional[List[str]] = None) -> int:
     网络抖动、OSS 报错）都必须**明确没有生效**：打一句错误并退 1，让脚本和人都
     能据此停手，而不是看到半屏异常后猜「到底写进去没有」。
     """
+    _force_utf8_stdout()
     try:
         from oss_pool_client import OSSPoolError as _oss_err
     except Exception:                    # 没装 oss2/依赖时也不该让 CLI 先崩

@@ -388,3 +388,34 @@ def describe() -> str:
     parts += [f"{label}={'有' if path.is_file() else '无'}({path.name})"
               for label, path in config_candidates()]
     return " ".join(parts)
+
+
+# ── 控制台输出编码 ───────────────────────────────────────────────────────────
+
+def force_utf8_stdout() -> bool:
+    """把 stdout/stderr 切成 UTF-8（编不出来的字符替换掉），绝不抛异常。
+
+    为什么必须有这一步：Windows 的 Python 用**系统代码页**给控制台编码，英文系统
+    就是 cp1252。这条链路上所有给用户看的字都是中文，还带着 ✅ ❌ ⚠ 这类符号，
+    在 cp1252 上直接抛 UnicodeEncodeError —— 于是发生本轮 CI 那种最费解的失败：
+    `inject_build_config.py` 已经把 config.json 写好了，却在打印成功话术那一刻
+    非零退出，构建被自己写的门禁拦在门外（功能成功、进程失败，日志里只看得到
+    "codec can't encode character '\u2705'"）。
+
+    换编码是唯一的根治：把 emoji 改成文字只能治这一处，下一句中文字又会撞同一堵
+    墙（cp1252 同样编不出「应」）。而 CI、远程排障、用户手跑 CLI 三条路都要打印，
+    逐处包 try/except 迟早漏一处。
+
+    只在**能改**的时候改：``--windowed`` 产物里 PyInstaller 给的是不落字的
+    NullWriter，没有 reconfigure，这时安静跳过就是正确行为。
+    """
+    ok = True
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            ok = False      # 改不动就算了：自检报告的价值远高于「顺便修好编码」
+    return ok

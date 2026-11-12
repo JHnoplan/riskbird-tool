@@ -67,6 +67,14 @@ try:
 except ImportError:
     HAS_ACL_GUARD = False
 
+# 统一配置/凭证解析链：它自己也是**产物自检要验的一项**（漏收它就等于产物读不到
+# 任何配置），所以这里按可选依赖的同一套写法收口，绝不在调用点各写一份 try/except。
+try:
+    import tool_config as _tool_config
+    HAS_TOOL_CONFIG = True
+except ImportError:
+    HAS_TOOL_CONFIG = False
+
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
 # done=✅绿粗「已完成」/ stopped=■橙粗「已停止」/ running=●蓝「进行中」
 # 字形选高覆盖度的 ✅/●/■（避开 ⏳ 这类小字号下会糊成方块的 emoji）
@@ -5204,15 +5212,60 @@ def _fatal_log(exc):
             continue
 
 
+# access_guard.DOCTOR_FLAGS 的退路副本：只在权限模块本身就没加载进来时使用
+# （那正是自检要报的故障）。离线测试逐字对拍两个集合，防止写偏。
+_DOCTOR_FLAGS_FALLBACK = ("--doctor", "--acl-doctor")
+
+
+def _doctor_flags() -> tuple:
+    """产物自检开关的可选写法。
+
+    为什么界面上也要认 --doctor：CI 工作流写的是 --acl-doctor，管理员手敲源码 CLI
+    看到的是 --doctor，两个写法只要有一个 exe 认不出来，打包态的后果不是报错而是
+    **安静地去建界面**——CI 的 Start-Process -Wait 一路干等到 job 超时，日志里连
+    一行自检输出都没有，比失败更难查。
+    优先取 access_guard 那份（唯一口径）；它没加载进来时退回本地常量——那正是门禁
+    要报的故障，此时开关还得认得出来，否则故障包连自检都启动不了。
+    """
+    if HAS_ACL_GUARD:
+        try:
+            return tuple(_access_guard.DOCTOR_FLAGS)
+        except AttributeError:
+            pass
+    return _DOCTOR_FLAGS_FALLBACK
+
+
+def _doctor_request(argv) -> tuple:
+    """这组参数是不是「要跑产物自检」。返回 ``(要自检, 像自检却认不出的写法)``。
+
+    拆成纯函数的原因：分派发生在 QApplication 之前，是产物自检唯一真正的入口，
+    而它的失败形态是「挂到 CI 超时」而不是「抛异常」——没法用异常测出来。做成
+    不建界面就能调的函数，离线测试才能把两种拼写和错拼都跑一遍。
+    """
+    flags = _doctor_flags()
+    if any(a in flags for a in argv):
+        return True, []
+    return False, [a for a in argv
+                   if "doctor" in a.lower() or a.startswith("--acl")]
+
+
 def _acl_doctor_entry() -> int:
     """产物自检入口的收口：把「模块没打进包」也当成一种自检失败，而不是崩栈。
 
     这一步在打包态最可能遇到的失败恰恰是「依赖缺失」（本轮修的正是发包漏配凭证
     与它同族的漏收模块）。让它返回分类退出码，CI 才有稳定可判的口径。
     """
+    # 第一件事是修控制台编码：Windows 英文系统上 Python 用 cp1252 编码 stdout，
+    # 打中文直接抛 UnicodeEncodeError。那时屏幕上留下的最后一行会是 codecs 的
+    # 栈，而不是这一层要说的结论——排查的人会去查权限服务，而坏掉的只是打印。
+    if HAS_TOOL_CONFIG:
+        _tool_config.force_utf8_stdout()
     if not HAS_ACL_GUARD:
         print("❌ acl-doctor：权限模块（access_guard）没能加载，"
               "说明打包清单漏收依赖——这本身就是发包缺陷")
+        if not HAS_TOOL_CONFIG:
+            print("   · tool_config 同样没加载到：配置与凭证解析链整条缺失，"
+                  "请在打包工作流里补 --hidden-import tool_config")
         return 3
     try:
         return int(_access_guard.run_doctor())
@@ -5226,8 +5279,20 @@ def main():
     # ① CI runner 上常常根本没有可用的图形会话，建 QApplication 会先炸在显示上，
     #    而它要验证的只是「这个包能不能连上权限服务」，与界面无关；
     # ② 自检必须在**产物自己**里跑——开发机跑通的永远是源码，不是发货的那个包。
-    if "--acl-doctor" in sys.argv[1:]:
+    run_doctor_requested, wrong = _doctor_request(sys.argv[1:])
+    if run_doctor_requested:
         sys.exit(_acl_doctor_entry())
+    # 兜底：写法里带 doctor 却没被认出来时，绝不退化成「安静启动界面」。
+    # 打包态最坏的失败不是报错而是卡住——CI 用 Start-Process -Wait 取退出码，一旦
+    # 走到建界面这条路（runner 上多半根本没有可用的图形会话），这一步要么崩在显示
+    # 上，要么一路挂到 job 超时，日志里连一行自检结论都留不下。当场说清正确写法并
+    # 返回非零，坏掉的就只是这一步，而且原因直接写在最后一行上。
+    if wrong:
+        if HAS_TOOL_CONFIG:
+            _tool_config.force_utf8_stdout()
+        print(f"❌ 没认出这几个参数：{' '.join(wrong)}；"
+              f"产物自检的正确写法是 {' 或 '.join(_doctor_flags())}")
+        sys.exit(3)
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())
