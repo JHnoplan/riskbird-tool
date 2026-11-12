@@ -110,6 +110,15 @@ echo "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .) �
      "+ 手写 ${_hand_count} 项 = 合计 $(printf '%s\n' $FILES | grep -c .) 项，" \
      "另有 $(printf '%s\n' "$EXCLUSIONS" | grep -c .) 项按登记排除（都带理由）"
 
+# 单跑几套（排查时不必等全批）：给了 B2B_REGRESSION_ONLY 就以它为准，其余判据
+# （清单完整性、计数自洽、总判定进退出码）一条都不少。为什么要开这个口子：批跑入口
+# 的退出码是「全量跑绿」唯一的机器口径，而它必须能被用例注入一份**故意会红**的夹具来
+# 验活——不能验的判据和没有判据只差一句注释。
+if [ -n "${B2B_REGRESSION_ONLY:-}" ]; then
+  FILES=$(printf '%s\n' $B2B_REGRESSION_ONLY)
+  echo "   ℹ 本轮只跑指定的 $(printf '%s\n' $B2B_REGRESSION_ONLY | grep -c .) 项（B2B_REGRESSION_ONLY）"
+fi
+
 # --list：只把解析完的批跑清单打出来（给回归入口自己的离线断言用：判据写在脚本里，
 # 核对写在用例里，两边共用同一份展开结果，不重复实现一遍发现逻辑）。
 if [ "${1:-}" = "--list" ]; then
@@ -117,7 +126,7 @@ if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
 
-pass=0; fail=0; skip=0; failed=""; hung=""
+pass=0; fail=0; skip=0; failed=""; hung=""; total=0
 # 有 timeout/gtimeout 就上真实看门狗（SIGABRT + faulthandler 能把挂死点栈打出来），
 # 没有也别裸跑：宁可用例慢，也不要一个模态弹窗把整批回归拖死。
 TMO=$(command -v timeout || command -v gtimeout)
@@ -128,6 +137,7 @@ LOG_DIR="$(dirname "$0")/regression_logs"
 rm -rf "$LOG_DIR" 2>/dev/null
 mkdir -p "$LOG_DIR" 2>/dev/null
 for f in $FILES; do
+  total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
   if [ -n "$TMO" ]; then
     "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1
@@ -137,7 +147,18 @@ for f in $FILES; do
   code=$?
   out=$(cat "$log")
   last=$(printf '%s\n' "$out" | grep -E "PASS|FAIL|通过|失败" | tail -1)
-  if [ $code -eq 0 ] && printf '%s\n' "$out" | grep -q "SKIP-FIXTURE"; then
+  # 判定交叉核对：套件自己在汇总里数出来的失败条数，必须和它的退出码一致。
+  # 这一条是本轮补的：批跑入口原先无论红多少都 `exit 0`，「全量跑绿」这件事从来没有
+  # 机器可判的口径，只有人眼盯着屏幕那一刻算数——而同一套逻辑的坑在同一个套件里已经
+  # 抓过一次（poll 脚本静默空跑）。这里只认能明确解析出「N 失败 / 失败 N」的那种汇总，
+  # 认不出来的仍按退出码判（宁可少判也不误判：误判的红会让人去改判据，而不是改代码）。
+  nfail=$(printf '%s\n' "$out" | grep -oE "[0-9]+ 失败|失败[：: ]*[0-9]+" | tail -1 | grep -oE "[0-9]+" | tail -1)
+  if [ $code -eq 0 ] && [ -n "$nfail" ] && [ "$nfail" -gt 0 ]; then
+    fail=$((fail+1)); failed="$failed $f"
+    printf 'FAIL  %-52s 退出码 0，可套件自己数出了 %s 条失败（判定与退出码不一致，这种绿不算绿）\n' "$f" "$nfail"
+    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)" | head -20 | sed 's/^/        /'
+    printf '        （完整输出：%s）\n' "$log"
+  elif [ $code -eq 0 ] && printf '%s\n' "$out" | grep -q "SKIP-FIXTURE"; then
     skip=$((skip+1))
     printf 'SKIP  %-52s %s\n' "$f" "$(printf '%s\n' "$out" | grep 'SKIP-FIXTURE' | head -1)"
   elif [ $code -eq 0 ]; then
@@ -156,7 +177,19 @@ for f in $FILES; do
   fi
 done
 echo "----------------------------------------------------------------"
-echo "套件：$pass 通过 / $fail 失败 / $skip 跳过（缺实机夹具）"
+echo "套件：$pass 通过 / $fail 失败 / $skip 跳过（缺实机夹具），本轮共展开 $total 项"
+# 一项都没跑就等于「全绿」：清单解析空了、目录改名了，症状都和「真的全过」一模一样。
+if [ "$total" -eq 0 ]; then
+  echo "❌ 批跑清单是空的：没有任何套件被执行，这份「全绿」没有任何含义（查 FILES/自动发现两段）"
+  exit 1
+fi
+if [ $((pass + fail + skip)) -ne "$total" ]; then
+  echo "❌ 计数不自洽（$pass + $fail + $skip ≠ ${total}）：有一项没被归类，判定不可信"
+  exit 1
+fi
 [ $fail -eq 0 ] && echo "ALL SUITES PASS" || echo "FAILED:$failed"
 [ -n "$hung" ] && echo "HANG:$hung"
+# 总判定必须进退出码：这一句之前，「跑绿」只有人眼盯屏幕那一次算数，CI 与任何脚本
+# 拿到的都是 0——红着 6 条也一样绿。SKIP 不算失败（缺的是实机夹具，不是代码）。
+[ $fail -eq 0 ] || exit 1
 exit 0

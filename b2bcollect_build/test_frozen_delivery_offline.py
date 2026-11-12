@@ -28,7 +28,10 @@
      job 超时）；退出码全表由故障分类表派生，帮助文本不许再手写一份清单
   M. workflow 步骤的脚本语言与这一步真正用的 shell 必须配套：Windows 上 run 步
      默认是 pwsh，bash 的 `[ -f x ] || { …; exit 1; }` 会被解析成类型表达式，
-     ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法
+     ParserError 之后 PyInstaller 根本没启动——本轮 CI 的第二种红法。同组还管三件
+     交付链上的「绿得没意义」：NSIS 版本以**真正编译那一次** makensis 自报的横幅为
+     权威（拿假编译器真跑四种现实验活）、::error:: 注解必须是本步 shell 打出来的单行
+     文本、批跑入口的总判定必须进退出码（它曾红着 6 条却退 0）
   N. 打包清单硬门与采集通道完整性：site_adapters 声明的跨目录模块必须在三处入口
      逐条对上、且落对目录（缺一条或放错地方都在构建前红）；产物自检在打包态缺
      通道退 3，源码态只警告；界面只点名「该给却没给」的那几路（档位藏起来的
@@ -2011,6 +2014,29 @@ def test_workflow_shell_syntax():
     finally:
         g.HYGIENE_SCRIPTS = _saved_scripts
 
+    # 5b-ii) 第 7 条的最后一头：文件**在提交里，但工作区改过没提交**。老判据看它在 HEAD 里
+    # 就放行，于是本机跑绿的是工作区、CI 检出并打包的是提交，两份内容不是同一份——验证结论
+    # 对交付没有担保（这条链上最坏的假绿：所有断言都是真的，量的却是不会被交付的那份字节）。
+    _scr = _REPO / g.HYGIENE_SCRIPTS[0]
+    _orig = _scr.read_bytes()
+    try:
+        _scr.write_bytes(_orig + "\n# 探针：改过没提交\n".encode("utf-8"))
+        g.reset_git_cache()                 # 三张 git 清单是进程内缓存的，不重置就是空跑
+        _assert_eq(g.tracked_state(_scr), "dirty",
+                   f"改过没提交要能被认出来（{_scr.name} 此刻就不在提交里）")
+        _gotd = g.check_script_hygiene()
+        _assert(any(_scr.name in p and "两份内容不是同一份" in p for p in _gotd),
+                f"卫生判据也要报这一头（它读的是工作区那份，交付的却是提交那份）：{_gotd}")
+        _gotd2 = g.check_tracked([(f"../{_scr.parent.name}/{_scr.name}", ".")])
+        _assert(any(_scr.name in p and "git commit" in p for p in _gotd2),
+                f"进包输入同款判据（第 7 条本身）也要报，措辞给出下一步：{_gotd2}")
+    finally:
+        _scr.write_bytes(_orig)
+        g.reset_git_cache()
+    _assert_eq(g.tracked_state(_scr), "ok",
+               "按原字节写回后立刻回到 ok（判据看内容，不看时间戳——touch 不会造出假红）")
+    _assert_eq(g.check_script_hygiene(), [], "自己造的红不许留给别人（还原干净后不再报）")
+
     # 5c) 批跑清单的完整性：交付目录里靠命名约定**自动发现**，这条判据核对「磁盘上有、
     # 清单里没有」。riskbird_build 那 13 个套件就是这么整目录消失了两年的——写完当天
     # 跑绿，此后随包代码怎么改都不红（本轮手工补跑才发现一条真实上传缺陷）。
@@ -2027,6 +2053,32 @@ def test_workflow_shell_syntax():
         _assert(not any(junk in x for x in listed),
                 f"一次性源码补丁脚本不许进批跑（跑一次就往套件里再插一段）：{junk}")
 
+    # 5c-II) 批跑入口的**退出码**才是「全量跑绿」唯一的机器口径。它此前无论红多少都
+    # exit 0——本轮就是这样：屏幕顶上写着「1 失败」，脚本却退 0，被当成全绿提交。
+    # 「跑绿」只有人盯屏幕那一次算数，等于没有口径。判据不能只写成「文里有 exit 1」，
+    # 注入三份夹具真跑一遍：会绿的、会红的、以及**自己数出 1 条失败却退 0** 的那种
+    # （判定与退出码不一致——屏幕上明明有 ❌，机器却说是绿的，这一类最坏）。
+    runner = _REPO / "debug" / "run_offline_regression.sh"
+    fixture = _REPO / "debug" / "zz_regression_probe.py"
+    for tag, src, want_rc in (
+            ("绿的套件", 'print("结果：3 通过 / 0 失败")\n', 0),
+            ("红的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\nraise SystemExit(1)\n', 1),
+            ("退出码说谎的套件", 'print("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\n', 1)):
+        fixture.write_text(src, encoding="utf-8")
+        try:
+            proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True,
+                                  cwd=str(_REPO),
+                                  env=dict(os.environ, B2B_REGRESSION_ONLY="debug/zz_regression_probe.py"))
+            _assert_eq(proc.returncode, want_rc,
+                       f"批跑入口对「{tag}」给的退出码（尾部：{proc.stdout.strip()[-110:]}）")
+        finally:
+            fixture.unlink(missing_ok=True)
+        _assert(not fixture.exists(), f"夹具跑完就删，不许留在磁盘上冒充套件（{tag}）")
+    proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True, cwd=str(_REPO),
+                          env=dict(os.environ, B2B_REGRESSION_ONLY=" "))
+    _assert(proc.returncode != 0 and "没有任何套件被执行" in proc.stdout,
+            f"清单展开成空也必须红：一项都没跑的症状和「真的全过」一模一样（rc={proc.returncode}）")
+
     # 5) 安装包编译器不许「赌这台机器恰好装了什么」：本轮 Windows 就是红在 CI 全绿、
     #    产物与自检都过、最后一步找不到 makensis ——镜像里 NSIS 没了，而本机永远复现不了。
     #    判据只看这一步自己的手法：钉版本、钉 sha256、校验不过就停、解压后还要问一次
@@ -2040,8 +2092,38 @@ def test_workflow_shell_syntax():
         _assert(m is not None, "NSIS_SHA256 钉的是 64 位十六进制（占位串或空值都算没钉）")
         _assert(re.search(r'NSIS_VERSION:\s*"(\d+\.\d+)"', prov) is not None,
                 "NSIS_VERSION 钉了具体版本（不钉就会出现「今天能打包、明天打的不是同一个安装包」）")
-        for need in ("sha256", "exit 1", "::error::", "-V"):
-            _assert(need in prov, f"NSIS 准备步骤保留了 {need}（下载/校验/版本确认任一缺失都是拿坏编译器出包）")
+        for need in ("sha256", "exit 1", "::error::"):
+            _assert(need in prov, f"NSIS 准备步骤保留了 {need}（下载/校验/失败即停任一缺失都是拿坏编译器出包）")
+        # 5-d) 版本探测不许赌一种写法：2026-11-12 云端 Windows 就是红在这一步——sha256
+        # 早就过了、包也打好了，只有「问一句版本号」拿 `makensis -V` 回了一句 Usage，判据
+        # 把它读成「版本不是钉住的那个」。Git Bash 会把以 / 开头的参数当路径改写，而某些
+        # 写法又以 - 开头才被认得，一种写法必然在某一侧失灵。判据做成函数，再用旧做法反向对照。
+        def _probe_problems(text: str) -> list:
+            out = []
+            if "VERSION" not in text:
+                out.append("压根没问编译器版本（打出来的安装包说不清是谁编的）")
+            if text.count("VERSION") < 2:
+                out.append("只赌一种写法（/ 与 - 各有一侧失灵：路径改写与选项解析）")
+            if "MSYS_NO_PATHCONV" not in text and "//VERSION" not in text:
+                out.append("没防 Git Bash 把 / 开头的参数改写成路径")
+            if not re.search(r"for\s+\w+\s+in[^\n]*VERSION", text):
+                out.append("几种写法没有逐个试一遍、取第一个真报出版本号的结果")
+            if "Usage" in text and "试过的写法" not in text:
+                out.append("失败时没把试过的写法与实际输出印出来（只说版本不对＝让下个人从头猜）")
+            return out
+        _pc = g._strip_comments(prov)      # 注释里正写着那种错写法，拿原文判就是自己判自己
+        _assert_eq(_probe_problems(_pc), [],
+                   "NSIS 版本探测合格：多种写法、防路径改写、逐个试、失败留证")
+        _bad_probe = ('VOUT=$("$MK" -V 2>&1 || true)\n'
+                      'case "$VOUT" in *v3.10*) : ;; *) echo bad; exit 1 ;; esac\n')
+        _assert_eq(_probe_problems(_bad_probe),
+                   ["压根没问编译器版本（打出来的安装包说不清是谁编的）",
+                    "只赌一种写法（/ 与 - 各有一侧失灵：路径改写与选项解析）",
+                    "没防 Git Bash 把 / 开头的参数改写成路径",
+                    "几种写法没有逐个试一遍、取第一个真报出版本号的结果"],
+                   "反向对照：本轮云端那种单写法必须被判红（判据空转等于没有判据）")
+        _assert("试过的写法与返回" in _pc,
+                "失败分支会印出试过的每种写法与返回（探测失败与编译器坏了长得不一样，得能分开）")
         # 本轮那次 CI 红的不是 NSIS，是**校验哈希的那一行自己**：Git Bash 里
         # $RUNNER_TEMP 是带反斜杠的 Windows 路径，而 GNU coreutils 遇到「文件名里含反斜杠」
         # 会给整行输出加一个 `\` 前缀，`| awk '{print $1}'` 于是取出 `\fcdce…`——
@@ -2060,6 +2142,111 @@ def test_workflow_shell_syntax():
             "安装包步骤不再在 runner 上找 NSIS（找不找得到是镜像的事，不该决定用户有没有安装包）")
     _assert("MAKENSIS=$MK\" >> \"$GITHUB_ENV" in prov and "${MAKENSIS:-}" in inst,
             "编译器路径由准备步骤写进 GITHUB_ENV、安装步骤只认这一个来源")
+
+    # 5-e) 「编译器自报的版本就是钉住的那个」这句判据必须**真跑一遍**才算数。这一段的成败
+    # 全在 shell 自己的语义上：管道里取的是 makensis 的退出码还是 tee 的、`set -e` 会不会
+    # 在判据之前就把进程带走、grep 在那条带反斜杠的日志路径上取不取得到横幅、case 的通配
+    # 能不能匹配 v3.10——这些都不是「文本里有这句话」能担保的。本轮云端两次红都是「每一行
+    # 看着都对」的语义坑，其中一次还是**负责解释失败的那句 echo 自己先炸**（引号写漏）。
+    # 所以拿一个假 makensis 把判据整段跑五种现实：版本对、版本不对、不印横幅、编译器非零、
+    # 上一步没把版本号传下来。后四种都必须非零退出且不印成功话术——松一头，就是把一份
+    # 「说不清是谁编的」安装包交到用户手上。
+    INST_STEP = "Build Windows installer (NSIS, per-user)"
+    PIN_ANCHOR = '[ -n "${NSIS_PINNED:-}" ]'
+    inst_body = next((b for n, b in _iter_steps(win) if INST_STEP in n), "")
+    cut = inst_body.find(PIN_ANCHOR)
+    _assert(cut >= 0, f"安装步骤里找得到版本判据的锚点 {PIN_ANCHOR}（找不到=整段被删了）")
+    gate_script = inst_body[cut:] if cut >= 0 else ""
+    for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1", 'grep -oE "Nullsoft Install System'):
+        _assert(need in gate_script, f"版本判据保留了 {need}（缺一样就是判据少一个方向）")
+
+    def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10", pipefail: bool = True):
+        """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
+
+        假 makensis 只干三件事：印横幅（或不印）、把两个交付文件名落出来、按指定码退出。
+        判据读的是它自己的那套 shell 语义，与被编的东西无关——这正是能本机复现的部分。
+        """
+        root = Path(tempfile.mkdtemp(prefix="b2b_nsis_gate_"))
+        try:
+            stub = root / "makensis"
+            stub.write_text("#!/bin/sh\n"
+                            + (f'echo "{banner}"\n' if banner
+                               else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
+                            + ": > B2bCollectToolSetup.exe\n"
+                              ": > B2bCollectTool_Win_portable.zip\n"
+                              f"exit {stub_rc}\n", encoding="utf-8")
+            stub.chmod(0o755)
+            env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
+                       RUNNER_TEMP=str(root), APP_VERSION="999", WIN_ROOT=str(root))
+            cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + ["-c", gate_script]
+            proc = subprocess.run(cmd, cwd=str(root), env=env,
+                                  capture_output=True, text=True)
+            return proc.returncode, _redact(proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    _ok_rc, _ok_out = _run_installer_gate("Nullsoft Install System v3.10", 0)
+    _assert_eq(_ok_rc, 0, f"正例：横幅与钉住版本一致时放行（输出尾部 {_ok_out[-90:]}）")
+    _assert("✅ 安装包出自" in _ok_out,
+            "放行时把这个安装包出自哪个编译器念进日志（可追溯性写在交付当场，不靠事后翻 CI）")
+    _bad = {
+        "版本不是钉住的那个": _run_installer_gate("Nullsoft Install System v3.08", 0),
+        "连 -V4 都不印横幅": _run_installer_gate("", 0),
+        "编译器非零退出": _run_installer_gate("Nullsoft Install System v3.10", 1),
+        "关掉 pipefail 仍要认得编译器": _run_installer_gate("Nullsoft Install System v3.10", 3,
+                                                          pipefail=False),
+        "上一步没传版本号": _run_installer_gate("Nullsoft Install System v3.10", 0, pinned=""),
+    }
+    _needles = {"版本不是钉住的那个": "不是钉住的 3.10",
+                "连 -V4 都不印横幅": "读不到 makensis 自报版本",
+                "编译器非零退出": "编译安装包失败（退出码 1",
+                "关掉 pipefail 仍要认得编译器": "编译安装包失败（退出码 3",
+                "上一步没传版本号": "NSIS_PINNED 是空的"}
+    for _tag, (_rc, _out) in _bad.items():
+        _assert(_rc != 0 and _needles[_tag] in _out and "✅" not in _out,
+                f"反例·{_tag}：必须非零退出、说清后果、且不印成功话术（rc={_rc}，尾部 {_out[-120:]}）")
+
+    # 5-f) 注解必须是「本步 shell 打出来的单行文本」。跨行或引号没闭合，GitHub 不认这条
+    # ::error::，于是失败原因静默消失，屏幕上只剩一个说不清的退出码——本轮写上面那段时就
+    # 真漏了一个引号（bash -n 抓到了语法，但语法过了不等于注解还在）。判据对两个 workflow
+    # 的每个 step 都跑，不只对本次改的这一段；打印语句按这一步真正用的 shell 认（bash 用
+    # echo/printf，pwsh 用 Write-Host/Write-Output），拿一种 shell 的关键字去判另一种，
+    # 就会把写得对的那一步判成红的——而消红的人下一步就会去改判据。
+    _ANNOT_PRINTERS = {"bash": ('echo "', 'printf "'),
+                       "pwsh": ('Write-Host "', 'Write-Output "', 'echo "')}
+
+    def _annotation_problems(script: str, shell: str = "bash") -> list:
+        printers = _ANNOT_PRINTERS.get(shell, _ANNOT_PRINTERS["bash"])
+        out = []
+        for i, ln in enumerate(script.splitlines(), 1):
+            k = ln.find("::error::")
+            while k >= 0:
+                if not any(p in ln[:k] for p in printers):
+                    out.append(f"第 {i} 行 ::error:: 前面没有本步 shell 认得的打印语句"
+                               f"（不是打出来的注解 Actions 不认，失败原因会静默消失）")
+                elif '"' not in ln[k + len("::error::"):]:
+                    out.append(f"第 {i} 行 ::error:: 后面没有闭合的引号（跨行的注解会被直接丢掉，报错静默消失）")
+                k = ln.find("::error::", k + 1)
+        return out
+
+    _assert_eq(_annotation_problems(gate_script), [], f"{INST_STEP} 的失败注解都是单行 echo 出来的")
+    for _label, _body in _iter_steps(win):
+        _assert_eq(_annotation_problems(_body, _step_shell(_body, "pwsh")),
+                   [], f"Windows step「{_label}」注解单行且引号闭合")
+    for _label, _body in _iter_steps(mac):
+        _assert_eq(_annotation_problems(_body, _step_shell(_body, "bash")),
+                   [], f"Mac step「{_label}」注解单行且引号闭合")
+    _assert_eq(_annotation_problems('echo "::error::甲' + "\n" + '乙"'),
+               ['第 1 行 ::error:: 后面没有闭合的引号（跨行的注解会被直接丢掉，报错静默消失）'],
+               "反向对照：本轮真实写漏的那个引号必须被这条抓住（否则判据只是现在恰好没样本）")
+    _assert_eq(_annotation_problems('::error::没走 echo'),
+               ['第 1 行 ::error:: 前面没有本步 shell 认得的打印语句'
+                '（不是打出来的注解 Actions 不认，失败原因会静默消失）'],
+               "反向对照：裸写注解不经过打印语句同样要红")
+    _assert_eq(_annotation_problems('Write-Host "::error::产物没生成到位"', "pwsh"), [],
+               "反向对照：pwsh 那两步用 Write-Host 是合法的，不该被 bash 的关键字误判")
+    _assert_eq(len(_annotation_problems('echo "::error::甲"')), 0,
+               "反向对照：bash 写法喂给 bash 判据也是空的（判据不是一律判红）")
 
 
 # ══════════════════════════════════════════════ N. 打包清单硬门 + 采集通道完整性
@@ -3041,8 +3228,19 @@ def _smoke_problems(region: str, readonly_expected: bool) -> list:
     if readonly_expected:
         if "chmod -R a-w" not in region:
             out.append("没把副本改成只读：这一步验的就不是 Gatekeeper 转置那个现场")
-        if "touch" not in region:
-            out.append("没验「只读真的生效了」：chmod 失灵时这一步绿得毫无意义")
+        # 探针必须是**真写入**。macOS 上文件属主改时间戳不需要写权限，touch 在 r-- 的文件
+        # 上照样成功——2026-11-12 本机与云端同时红在「这份副本没被改成只读」，而那份副本
+        # 其实早就只读了：一个永远成功的检查拿来当判据，比没有判据更坏（它把真做成的仿真
+        # 说成失效，整条门禁就此卡在「验不过自己」上，产品反而是好的）。
+        # 判据按**同一行**要求 printf + >> + 探针变量：只要求「文中有 >> 也有 READONLY_PROBE」
+        # 的话，把探针语句换成 touch 却留着那行赋值就蒙混过去了（反向对照当场抓到过一次）。
+        if not re.search(r"printf[^\n]*>>[^\n]*READONLY_PROBE", region):
+            out.append("只读仿真自己没被一次真写入验过（touch 改时间戳对属主永远成功，"
+                       "判据必须往探针文件里追加字节才算数）")
+        # ACL 与扩展属性会盖在模式位之上（PyInstaller 产物每个文件都带 com.apple.provenance），
+        # 只 chmod 就可能「看着只读、实际还能写」——那是第二种假象，方向与上面正好相反。
+        if "chmod -R -N" not in region or "xattr" not in region:
+            out.append("改只读之前没清掉 ACL 与扩展属性（它们会盖过模式位，仿真可以看着成立而实际可写）")
         if "wc -l" not in region:
             out.append("没比对副本前后的文件数：写进包内在没转置的机器上不报错，只会在"
                        "升级/卸载时把用户数据一起带走")
@@ -3307,6 +3505,34 @@ def test_window_smoke_gate():
     n = _smoke_region(mac, True).replace(' -name "*.log"', '-name "*.txt"')
     _assert(any("崩溃日志" in p for p in _smoke_problems(n, True)),
             "不查崩溃日志必须判红（异常被吞掉、界面勉强开出来那种半坏看不出来）")
+    # 「只读仿真成立了吗」这句判据自己也要被验：本轮它就是坏在探针永远成功上（本机与云端
+    # 同时红在这里）。拿一份按老写法（touch 当探针、没清 ACL）的段落喂进同一条判据，必须
+    # 各判红一次；合格段落喂进去必须是空的——否则上面那几条压根是空转。
+    _ro_ok = ('chmod -R -N "$SAPP" 2>/dev/null || true\n'
+              'xattr -cr "$SAPP" 2>/dev/null || true\n'
+              'chmod -R a-w "$SAPP"\n'
+              'READONLY_PROBE="$SAPP/Contents/Info.plist"\n'
+              "if (printf 'x' >> \"$READONLY_PROBE\") 2>/dev/null; then exit 1; fi\n"
+              'before=$(find "$SAPP" | wc -l)\n'
+              'env "$BIN" --ui-smoke\n'
+              'rc=$?\n'
+              'stray=$(find "$STAGE/home" -name "*.log")\n')
+    _assert_eq(_smoke_problems(_ro_ok, True), [],
+               "反例起点：合格写法在这条判据上必须是空的（不然下面几条抓不到任何东西）")
+
+    def _ro_drop(text, *needles):
+        return "".join(ln + "\n" for ln in text.splitlines()
+                       if not any(n in ln for n in needles))
+
+    _touch_probe = _ro_drop(_ro_ok, ">>") + 'touch "$READONLY_PROBE" 2>/dev/null\n'
+    _assert(any("真写入" in p for p in _smoke_problems(_touch_probe, True)),
+            "拿 touch 当只读探针必须判红（属主改时间戳不需要写权限，那种探针永远成功）")
+    _assert(any("ACL" in p for p in _smoke_problems(
+        _ro_drop(_ro_ok, "chmod -R -N", "xattr -cr"), True)),
+        "少清 ACL 与扩展属性那两句同样要红（模式位之外还有 ACL，仿真可以看着成立而实际可写）")
+    _assert(any("没把副本改成只读" in p for p in _smoke_problems(
+        _ro_drop(_ro_ok, 'chmod -R a-w'), True)),
+        "只读那一句被摘掉要红（同一条判据的第三种断法）")
     gone = "\n".join(ln for ln in mac.splitlines() if SMOKE_STEP_NAME not in ln)
     _assert(not _smoke_region(gone, True),
             "整步删掉时切出来的是空段（判据靠 step 名字定位，改名也要能被看见）")

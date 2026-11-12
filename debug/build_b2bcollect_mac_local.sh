@@ -154,18 +154,28 @@ fi
 #       1) 退出码 0                  —— 窗口真建出来了（Mac 那份崩溃日志停在建通道那一步）；
 #       2) 临时 HOME 里没有崩溃日志   —— 挡住「异常被上层吞掉、界面勉强开出来」的半坏；
 #       3) 副本树文件数没多           —— 挡住「没被转置的机器上写进应用包」那种不报错的写法。
-#     最后那句 touch 是给仿真自己立的判据：chmod 没生效时这一步会绿得毫无意义。
+#     最后那句是给仿真自己立的判据，判据必须是**真写入**：2026-11-12 本机与云端同时红在
+#     「这份副本没被改成只读」，而它其实已经只读——macOS 上文件属主改时间戳（touch 走的
+#     utimensat 只要拥有者一致就允许）不需要写权限，拿 touch 当探针等于用一个永远成功的
+#     检查去证明一件事成立。改成往里追加一个字节：能写就是仿真没做成，此时这份副本已经
+#     被污染，但下一步就是退出，不影响任何交付物。
 echo "· 只读包窗口冒烟（App Translocation 现场）"
 STAGE=$(mktemp -d)
 # 退出前先把写权限还回来再删：只读树里 rm 连自己父目录的子项都删不掉（解链要目录的写权限）
 trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
 cp -R dist/B2bCollectTool.app "$STAGE/"
-chmod -R a-w "$STAGE/B2bCollectTool.app"
 SAPP="$STAGE/B2bCollectTool.app"
 SBIN="$SAPP/Contents/MacOS/B2bCollectTool"
+# ACL 与扩展属性会盖在模式位之上（PyInstaller 产物的每个文件都带 com.apple.provenance，
+# cp 还可能带上继承的 ACL），只 chmod 就可能「看着只读、实际可写」。这里先把两者清掉，
+# 再收模式位；清不动不算失败（本来就没有），真写探针会替我们把结论收口。
+chmod -R -N "$SAPP" 2>/dev/null || true
+xattr -cr "$SAPP" 2>/dev/null || true
+chmod -R a-w "$SAPP"
 [ -x "$SBIN" ] || { echo "❌ 只读副本里没有可执行文件：$SBIN"; exit 1; }
-if touch "$SAPP/Contents/Info.plist" 2>/dev/null; then
-  echo "❌ 这份副本没被改成只读（Info.plist 仍可写）：仿真失效，这一步绿了也不代表产物没问题"
+READONLY_PROBE="$SAPP/Contents/Info.plist"
+if (printf 'x' >> "$READONLY_PROBE") 2>/dev/null; then
+  echo "❌ 这份副本真的还能写（${READONLY_PROBE}）：仿真没做成，这一步绿了也不代表产物没问题"
   exit 1
 fi
 BEFORE=$(find "$SAPP" | wc -l)

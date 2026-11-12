@@ -37,7 +37,9 @@
      `riskbird_build/runtime_paths.py` 本机一切正常，CI 却报「--add-data 指向的源码
      不存在」。根因不是清单写错，是**这个文件从来没被提交过**。5 与 7 缺一不可：
      5 管「本机有没有」，7 管「检出出来有没有」。症状与第 1 条一字不差——本机绿、
-     CI 红、用户拿到少一块功能的包；
+     CI 红、用户拿到少一块功能的包。同一头还差最后一格：文件**在提交里、工作区却改过
+     没提交**——这时 5 与 7 都绿，可本机验证的是工作区那份字节，CI 检出并打包的是提交
+     那份，「回归全绿」对交付没有担保（判据量的是不会被交付的内容，比缺一块文件更难查）；
   8 跨目录模块的**传递**本地依赖是否也登记了（或明确由本目录同名模块供给）：
      `ali1688_crawler` 顶层 import 的 `customer_library_cleaner` 就是这一类——它不在
      清单里、磁盘上也在、git 里也在，第 5、7 两条全都绿，包里却压根没有它。
@@ -342,7 +344,7 @@ def _git_raw(*args) -> tuple:
     return r.returncode, r.stdout
 
 
-_INDEX, _HEAD = {}, {}
+_INDEX, _HEAD, _DIRTY = {}, {}, {}
 
 
 def _tracked_sets() -> tuple:
@@ -376,14 +378,30 @@ def _rel_posix(path: Path):
         return None if text.startswith("/") else text
 
 
+def _dirty_paths() -> set:
+    """工作区（含索引）与 HEAD 内容不一致的**已跟踪**文件，进程内取一次。
+
+    为什么第 7 条要区分「在 HEAD 里，但被改过」：CI 检出的是**提交**，本机回归跑的是
+    **工作区**。只改不提交时，老判据看它在 HEAD 里就放行，于是「本机 713 条断言全绿」
+    对交付的那点担保当场断掉——打出来的包用的是旧内容，缺陷要等用户点开才被发现。
+    这一条把「验证过的内容」与「交付的内容」钉成同一份，等价于大厂 CI 里的
+    clean-checkout 前提。仓库还没有提交、或 git 压根不可用时退回空集——宁可不判，
+    也不在没把握的地方误报（第一条误报就会让人开始跳过这一步）。
+    """
+    if "files" not in _DIRTY:
+        head_ok = _git("rev-parse", "--verify", "HEAD")[0] == 0
+        _DIRTY["files"] = _path_set(["diff", "--name-only", "HEAD"]) if head_ok else set()
+    return _DIRTY["files"]
+
+
 def tracked_state(path: Path) -> str:
-    """`ok` 在提交里 / `staged` 只 add 没提交 / `missing` 压根没被跟踪。"""
+    """`ok` 在提交里 / `staged` 只 add 没提交 / `missing` 压根没被跟踪 / `dirty` 在提交里但改过没提交。"""
     rel = _rel_posix(path)
     if rel is None:
         return "ok"                       # 仓库外的路径不归这条判据管
     index, head = _tracked_sets()
     if rel in head:
-        return "ok"
+        return "dirty" if rel in _dirty_paths() else "ok"
     return "staged" if rel in index else "missing"
 
 
@@ -392,7 +410,21 @@ def is_tracked(path: Path) -> bool:
     return tracked_state(path) != "missing"
 
 
+def reset_git_cache() -> None:
+    """清掉三张 git 清单的进程内缓存。
+
+    没有它，离线回归里「先造一个改过的文件、再问判据认不认得」必然空跑：缓存是在
+    第一次调用时抓的，探针落地时那张表早就定稿了。判据自己也要能被当场改动验证。
+    """
+    _INDEX.clear()
+    _HEAD.clear()
+    _DIRTY.clear()
+
+
 def _state_hint(rel: str, state: str) -> str:
+    if state == "dirty":
+        return (f"{rel} 在提交里，但工作区改过没提交——本机跑绿的是工作区，CI 检出并打包的是"
+                f"提交，两份内容不是同一份（验证结论对交付没有担保）：先 git commit {rel}")
     if state == "staged":
         return (f"{rel} 已 git add 但还没提交——CI 检出的是**提交**，本机绿、构建机上没这个"
                 f"文件：先 git commit {rel}")
@@ -679,9 +711,12 @@ def check_script_hygiene() -> list:
         if not path.is_file():
             problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
             continue
-        if in_work_tree() and tracked_state(path) != "ok":
-            # 与第 7 条同一个坑：本机全绿、别人检出后这份脚本压根不存在
-            problems.append(f"{rel} 没在提交里（换台机器/CI 上它就凭空消失）")
+        state = tracked_state(path) if in_work_tree() else "ok"
+        if state != "ok":
+            # 与第 7 条同一个坑，而且更阴：这里读的是**工作区**那份文本，CI 上跑的却是
+            # 提交里那份。改过没提交时，「文案卫生」验的是不会被交付的内容，判据看着绿，
+            # 真正上云的那份脚本可能正带着同一个 bug。所以脏也要红，措辞按状态分开。
+            problems.append(_state_hint(rel, state))
         for msg in check_shell_hygiene(path.read_text(encoding="utf-8", errors="replace")):
             problems.append(f"{rel} {msg}")
     return problems

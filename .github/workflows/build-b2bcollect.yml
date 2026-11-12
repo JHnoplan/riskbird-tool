@@ -296,14 +296,37 @@ jobs:
         [ -f "$MK" ] || { echo "::error::解压后没找到 ${MK}（NSIS 目录布局变了？别改这一步，改钉住的版本并重新校验）"; exit 1; }
         # 不用 `| head -1`：这个 job 开着 pipefail，head 提前收线会让上游吃一个 SIGPIPE，
         # 于是「版本打印成功」也能变成「这一步失败」——这种红法谁也想不到是管道干的。
-        VOUT=$("$MK" -V 2>&1 || true)
-        VOUT=${VOUT%%$'\n'*}
-        case "$VOUT" in
-          *v"$NSIS_VERSION"*) : ;;
-          *) echo "::error::makensis 报的版本不是钉住的 ${NSIS_VERSION}：$VOUT"; exit 1 ;;
-        esac
-        echo "· 安装包编译器：${MK}（${VOUT}，sha256 已校验）"
+        # 写法也不许赌一种：makensis 的选项前缀 / 与 - 都算，可 Git Bash 会把以 / 开头的
+        # 参数当**路径**转换（/VERSION → C:/Program Files/Git/VERSION），于是编译器收到的
+        # 是个不存在的文件名，回一句 Usage。2026-11-12 云端就是这么红的：sha256 校验早就
+        # 过了，红在「版本探测」这一步——探测失败与编译器坏了看起来一模一样。
+        # 所以：①几种写法逐个试（统一 MSYS_NO_PATHCONV=1，别LET bash 改写参数）；②探到
+        # 版本号就按钉住的值硬对，探不到**不在这里判死**——真正说了算的是下一步编译时
+        # makensis 自己印的那行横幅，它用的就是交付这个安装包的那台编译器，不会有「探测
+        # 与构建两套结果」的缝隙。
+        VOUT=""
+        VATTEMPTS=""
+        for opt in -VERSION //VERSION /VERSION; do
+          out=$(MSYS_NO_PATHCONV=1 "$MK" "$opt" 2>&1 || true)
+          first=${out%%$'\n'*}
+          VATTEMPTS="${VATTEMPTS}${opt} => ${first}"$'\n'
+          case "$first" in
+            *v[0-9]*) VOUT="$first"; break ;;
+          esac
+        done
+        if [ -n "$VOUT" ]; then
+          case "$VOUT" in
+            *v"$NSIS_VERSION"*) echo "· 安装包编译器：${MK}（${VOUT}，sha256 已校验）" ;;
+            *) echo "::error::makensis 自报的版本不是钉住的 ${NSIS_VERSION}（实际 ${VOUT}）"
+               echo "试过的写法与返回："; printf '%s' "$VATTEMPTS"
+               exit 1 ;;
+          esac
+        else
+          echo "· 版本开关这几种写法都没理人，改由安装包那一步用编译器自己的横幅定版（不是放行，是换一处更硬的判据）"
+          printf '%s' "$VATTEMPTS"
+        fi
         echo "MAKENSIS=$MK" >> "$GITHUB_ENV"
+        echo "NSIS_PINNED=$NSIS_VERSION" >> "$GITHUB_ENV"
 
     - name: Build Windows installer (NSIS, per-user)
       # 交付形态：目录形态的产物必须靠安装包落到用户机器上，否则「解压到哪都行」会
@@ -336,8 +359,42 @@ jobs:
           [A-Za-z]:*) : ;;
           *) echo "::error::拿不到 Windows 形式的绝对路径（当前 ${WIN_ROOT}），NSIS 会读错相对路径"; exit 1 ;;
         esac
-        echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT"
-        "$MAKENSIS" /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="1.$APP_VERSION.0" installer/b2bcollect_setup.nsi
+        # 权威版本判据就在这一步，不在上一步：上一步是「另外问一句版本号」，这一步是
+        # 真正把交付的这个安装包编出来的那一次调用，makensis 自己印的横幅用的就是这台
+        # 编译器、这一份字节——不会有「探测一套结果、构建另一套结果」的缝隙。
+        # 版本对不上就不出包：宁可没有安装包，也绝不静默降级成「只发一个 zip 却告诉
+        # 用户这就是交付物」（那种降级只有用户会发现）。
+        [ -n "${NSIS_PINNED:-}" ] || { echo "::error::上一步没把钉住的 NSIS 版本号传下来（GITHUB_ENV 里的 NSIS_PINNED 是空的）：包能编出来，但说不清它和校验过的那份编译器是不是同一个，这种交付物不发"; exit 1; }
+        # 禁掉 Git Bash 的「参数看着像路径就改写」：/DB2B_ROOT=... 这种 NSIS 定义被改写成
+        # C:/Program Files/Git/DB2B_ROOT=... 之后编译器只会回一句 Usage；而日志文件名里
+        # 带反斜杠时 GNU 工具还会给整行输出加转义前缀（上一节 sha256 就是栽在这上面）。
+        export MSYS_NO_PATHCONV=1
+        TMP_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+        LOG="$TMP_DIR/nsis_build.log"
+        echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT  钉住版本：$NSIS_PINNED"
+        # -V4：要它把「我是谁」那行横幅和每一步细节都落到日志里。红了好查，绿了也能对版。
+        # 管道接 tee 是为了既让日志上屏（Actions 里能直接读）又留一份文件供判据取用；
+        # 但 pipefail 会把「tee 成功」和「编译器失败」搅在一起，所以显式取 PIPESTATUS[0]，
+        # 并在这个区间里关掉 -e——否则编译器一非零，下面那行判据压根执行不到。
+        set +e
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="1.$APP_VERSION.0" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG"
+        NSIS_RC=${PIPESTATUS[0]}
+        set -e
+        if [ "$NSIS_RC" -ne 0 ]; then
+          echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
+          exit 1
+        fi
+        BANNER=$(grep -oE "Nullsoft Install System v[0-9][0-9.]*" "$LOG" || true)
+        BANNER=${BANNER%%$'\n'*}
+        if [ -z "$BANNER" ]; then
+          echo "::error::编译日志里读不到 makensis 自报版本那行横幅（连 -V4 都没印，这台编译器的行为和预期不一样），无法证明这个安装包出自校验过的那份 NSIS ${NSIS_PINNED}"
+          exit 1
+        fi
+        case "$BANNER" in
+          *v"$NSIS_PINNED"*) echo "✅ 安装包出自 makensis ${BANNER##*System }（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）" ;;
+          *) echo "::error::安装包是自报 ${BANNER} 的 makensis 编出来的，不是钉住的 ${NSIS_PINNED}——两次构建产物不可比，这一份不发"
+             exit 1 ;;
+        esac
         ls -l B2bCollectToolSetup.exe B2bCollectTool_Win_portable.zip
 
     - name: Upload artifacts

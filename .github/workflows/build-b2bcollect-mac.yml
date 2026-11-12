@@ -130,8 +130,12 @@ jobs:
       #   3) 副本树里的文件数一个都没多      —— 挡住「没被转置的机器上写进应用包」：那种
       #      形态写入成功、不报错，代价是升级覆盖或拖进废纸篓时用户几个月的 Cookie 与缓存
       #      跟着一起消失，正是本轮纪律要根治的东西。
-      # 最后那句 touch 是给**仿真本身**立的判据：chmod 万一不生效（挂载方式或权限模型变了），
-      # 这一步会绿得毫无意义——仿真失效比没有仿真更坏。
+      # 最后一句是给**仿真本身**立的判据，而且判据必须是「真写入」：2026-11-12 云端与本机
+      # 同时红在「这份副本没被改成只读」，可它其实已经只读——macOS 上属主改时间戳（touch 走
+      # 的 utimensat）不需要写权限，用一个永远成功的检查去证明仿真成立，等于这一步从来没有
+      # 判据。改成往里追加一个字节：写得进去就是仿真没做成（仿真失效比没有仿真更坏）。
+      # ACL 与扩展属性会盖在模式位之上，所以 chmod 前先把两者清掉，别让「看着只读、实际可写」
+      # 变成第二种假象。
       # HOME 与 QT_QPA_PLATFORM 都指进临时/offscreen：门禁不碰 runner 的真实配置，也不赌
       # 「这台机器恰好有可用的窗口会话」——那种红了分不清是包坏了还是机器没桌面。
       timeout-minutes: 10
@@ -146,10 +150,13 @@ jobs:
         BIN="$APP/Contents/MacOS/B2bCollectTool"
         [ -d "b2bcollect_build/dist/B2bCollectTool.app" ] || { echo "::error::没找到 dist/B2bCollectTool.app（产物布局变了？先修构建那一步）"; exit 1; }
         cp -R b2bcollect_build/dist/B2bCollectTool.app "$STAGE/"
+        chmod -R -N "$APP" 2>/dev/null || true
+        xattr -cr "$APP" 2>/dev/null || true
         chmod -R a-w "$APP"
         [ -x "$BIN" ] || { echo "::error::只读副本里没有可执行文件：$BIN"; exit 1; }
-        if touch "$APP/Contents/Info.plist" 2>/dev/null; then
-          echo "::error::这份副本没被改成只读（Info.plist 仍可写）：仿真失效，这一步绿了也不代表产物没问题"
+        READONLY_PROBE="$APP/Contents/Info.plist"
+        if (printf 'x' >> "$READONLY_PROBE") 2>/dev/null; then
+          echo "::error::这份副本真的还能写（${READONLY_PROBE}）：仿真没做成，这一步绿了也不代表产物没问题"
           exit 1
         fi
         before=$(find "$APP" | wc -l)
