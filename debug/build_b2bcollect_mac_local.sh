@@ -140,7 +140,7 @@ else
   echo "· （没找到本次的 acl_doctor.txt，以上面的标准输出为准）"
 fi
 if [ "$RC" -ne 0 ]; then
-  echo "❌ 产物自检未通过（退出码 $RC，报告见上）：这个包发出去只会是精简版，别外发"
+  echo "❌ 产物自检未通过（退出码 ${RC}，报告见上）：这个包发出去只会是精简版，别外发"
   exit "$RC"
 fi
 echo "✅ 打包完成并通过产物自检：$(pwd)/dist/B2bCollectTool.app"

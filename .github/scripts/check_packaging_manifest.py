@@ -41,6 +41,9 @@
   8 跨目录模块的**传递**本地依赖是否也登记了（或明确由本目录同名模块供给）：
      `ali1688_crawler` 顶层 import 的 `customer_library_cleaner` 就是这一类——它不在
      清单里、磁盘上也在、git 里也在，第 5、7 两条全都绿，包里却压根没有它。
+  9 打包入口里的 shell 文案有没有 `$变量` 紧跟中文标点这种写法——2026-11-12 干跑
+     NSIS 步骤时当场炸出来：bash 把全角括号的字节读进变量名，`set -u` 下失败的是那句
+     「解释失败原因」的 echo，不带 `set -u` 时更坏，值被静默印成空。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -553,6 +556,35 @@ def check_closure(externals: tuple, shadowed: dict) -> list:
     return problems
 
 
+VAR_BEFORE_CJK = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)[^\x00-\x7F]")
+
+
+def check_shell_hygiene(text: str) -> list:
+    """第 9 条：shell 里 `$VAR` 后面紧跟中文（或任何非 ASCII）必须写成 `${VAR}`。
+
+    这不是风格问题，是 2026-11-12 拿假 makensis 干跑新加的 NSIS 步骤时当场撞出来的：
+    `echo "· 安装包编译器：$MK（$VOUT，sha256 已校验）"` 在 bash 里把变量名一路读到
+    全角括号／全角逗号那几个字节里去，于是
+      · 带 `set -u` 的步骤直接 `MK\uff1a: unbound variable` 退出——**失败的是那句解释
+        失败原因的 echo**，日志里只剩一句谁也看不懂的 unbound variable；
+      · 不带 `set -u` 的步骤更坏：静默把值印成空，「退出码 ）」「编译器：（）」，
+        远程排障时最该看见的那个数字凭空消失。
+    中文标点在这条链路上到处都是（本仓库所有 ::error:: 文案都是中文），所以判据必须
+    机械化，而不是靠人记住「加花括号」。三个打包入口一起判：workflow 与本机脚本同规矩。
+    """
+    problems = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue                       # 注释里的 `$VAR（` 不会被执行
+        for m in VAR_BEFORE_CJK.finditer(line):
+            name, punct = m.group(1), m.group(0)[-1]
+            problems.append(
+                f"第 {lineno} 行的 ${name} 后面紧跟「{punct}」：shell 会把这些非 ASCII "
+                f"字节一起读进变量名（带 set -u 时 unbound variable 当场炸，不带时把值"
+                f"印成空），必须写成 ${{{name}}}「{punct}」")
+    return problems
+
+
 def check_caller(label: str, text: str, externals: tuple, modules: list,
                  with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
@@ -625,6 +657,10 @@ def check_caller(label: str, text: str, externals: tuple, modules: list,
         problems += check_tracked(add_data, text)
     else:
         print(f"   ℹ {label}：当前不是 git 工作区，跳过「必须被 git 跟踪」这条")
+
+    # 9) shell 文案里的变量写法：中文标点紧跟变量名时，坏的是**报错那一行本身**
+    #    （见函数文档：一处 unbound variable 直接把失败原因替换成另一句失败）。
+    problems += check_shell_hygiene(text)
     return problems
 
 

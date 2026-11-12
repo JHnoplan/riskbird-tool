@@ -109,7 +109,7 @@ jobs:
           echo "· （没找到本次的 acl_doctor.txt，以上面的标准输出为准）"
         fi
         if [ "$rc" -ne 0 ]; then
-          echo "::error::产物自检未通过（退出码 $rc）：这个包发出去只会是精简版，禁止上传"
+          echo "::error::产物自检未通过（退出码 ${rc}）：这个包发出去只会是精简版，禁止上传"
         fi
         exit "$rc"
 

@@ -159,7 +159,7 @@ jobs:
       run: |
         $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
         if (-not (Test-Path $exe)) {
-          Write-Host "::error::产物没生成到位：$exe（onedir 布局变了？先修这一步再谈交付）"
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修这一步再谈交付）"
           exit 1
         }
         $p = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -Wait -PassThru
@@ -186,6 +186,68 @@ jobs:
       shell: bash
       run: python .github/scripts/package_win_artifacts.py --root b2bcollect_build
 
+    - name: Provision NSIS (钉版本 + 校验 sha256)
+      # 第五刀（2026-11-12 Windows 实机）：原来这一步是「在 runner 上找 makensis，
+      # 找不到就报错」，红在**所有**产物步骤之后——exe 打好了、--acl-doctor 过了、
+      # 绿色 zip 也生成了，只差最后这一步，用户手里还是没有安装包。根因不是脚本写错，
+      # 是「工具链依赖这台机器恰好装了什么」：镜像一更新 NSIS 就没了，本机永远复现不了。
+      # 业界对这件事的标准答案是 hermetic 构建：自己下载、钉死版本、校验 sha256、解压即用。
+      # 镜像里就算有 makensis 也不借用——两次构建用同一个编译器，产物才可比。
+      # 下载/校验/解压每一步失败都在这里响，不留给 NSIS 一句谁也看不懂的「文件不存在」。
+      shell: bash
+      env:
+        NSIS_VERSION: "3.10"
+        NSIS_SHA256: "fcdce3229717a2a148e7cda0ab5bdb667f39d8fb33ede1da8dabc336bd5ad110"
+      run: |
+        set -u
+        MAJOR=${NSIS_VERSION%%.*}
+        DEST="$GITHUB_WORKSPACE/.tools/nsis-$NSIS_VERSION"
+        MK="$DEST/Bin/makensis.exe"
+        ZIP="$RUNNER_TEMP/nsis-$NSIS_VERSION.zip"
+        # 两条官方写法（downloads.sourceforge.net 与 /files 页面那条），都走 HTTPS、
+        # 都会被重定向到镜像；一个不通换另一个再试，最后仍用 sha256 收口——
+        # 镜像可以换，字节不能换。
+        URLS="https://downloads.sourceforge.net/project/nsis/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip
+        https://sourceforge.net/projects/nsis/files/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip/download"
+        sha256() {
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+          else certutil -hashfile "$(cygpath -w "$1")" SHA256 | sed -n 2p | tr -d ' '; fi
+        }
+        if [ ! -f "$MK" ]; then
+          got=""
+          for round in 1 2 3; do
+            for u in $URLS; do
+              rm -f "$ZIP"
+              curl -sSLf --connect-timeout 20 --max-time 180 -o "$ZIP" "$u" \
+                || { echo "· 下载失败（镜像抖动，换下一条）：$u"; continue; }
+              got=$(sha256 "$ZIP")
+              [ "$got" = "$NSIS_SHA256" ] && break 2
+              echo "· 第 $round 轮校验不过（下坏了或没下全）：$got"
+            done
+          done
+          [ "$got" = "$NSIS_SHA256" ] || {
+            echo "::error::nsis-$NSIS_VERSION.zip 的 sha256 与钉住的值不一致（或三轮都没下全）：期望 $NSIS_SHA256 实际 ${got:-无}。宁可不打安装包，也不拿一个来路不明的编译器打用户手上的东西"
+            exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/.tools"
+          # Git Bash 自带 unzip，走不到下面这条；但兜底分支必须是**能跑的**：PowerShell
+          # 不认 /d/... 这种 MSYS 路径，直接把 $ZIP 传给它只会得到一句「路径不存在」，
+          # 而这一步的失败原因看起来会像「NSIS 包坏了」。（同一句里两处都要 cygpath -w，
+          # 别只给 DestinationPath 加——本轮就是这么漏的。）
+          if command -v unzip >/dev/null 2>&1; then unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/.tools"
+          else powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$ZIP")' -DestinationPath '$(cygpath -w "$GITHUB_WORKSPACE/.tools")' -Force" >/dev/null; fi
+        fi
+        [ -f "$MK" ] || { echo "::error::解压后没找到 ${MK}（NSIS 目录布局变了？别改这一步，改钉住的版本并重新校验）"; exit 1; }
+        # 不用 `| head -1`：这个 job 开着 pipefail，head 提前收线会让上游吃一个 SIGPIPE，
+        # 于是「版本打印成功」也能变成「这一步失败」——这种红法谁也想不到是管道干的。
+        VOUT=$("$MK" -V 2>&1 || true)
+        VOUT=${VOUT%%$'\n'*}
+        case "$VOUT" in
+          *v"$NSIS_VERSION"*) : ;;
+          *) echo "::error::makensis 报的版本不是钉住的 ${NSIS_VERSION}：$VOUT"; exit 1 ;;
+        esac
+        echo "· 安装包编译器：${MK}（${VOUT}，sha256 已校验）"
+        echo "MAKENSIS=$MK" >> "$GITHUB_ENV"
+
     - name: Build Windows installer (NSIS, per-user)
       # 交付形态：目录形态的产物必须靠安装包落到用户机器上，否则「解压到哪都行」会
       # 变成「用户把文件夹删了一半」。这里按业界主流做法做成**每用户安装**：
@@ -206,17 +268,16 @@ jobs:
         APP_VERSION: ${{ github.run_number }}
       run: |
         cd b2bcollect_build
-        MAKENSIS=$(command -v makensis || command -v makensis.exe || true)
-        if [ -z "$MAKENSIS" ]; then
-          for c in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
-            [ -f "$c" ] && MAKENSIS="$c" && break
-          done
-        fi
-        [ -n "$MAKENSIS" ] || { echo "::error::这台 runner 上没有 makensis（NSIS），打不出安装包"; exit 1; }
+        # makensis 由上一步现下载、校验、解压，并把路径写进 GITHUB_ENV。这里不再
+        # 「在机器上找」：找得到找不到都不是产品的事，是镜像的事，而镜像会变（本轮就是
+        # 这么红的）。上一步没成功就不该走到这里，走到了也照样停，绝不静默降级成
+        # 「只发一个 zip 却告诉用户这就是交付物」。
+        [ -n "${MAKENSIS:-}" ] || { echo "::error::上一步没把 makensis 的在包路径传下来（GITHUB_ENV 里的 MAKENSIS 是空的），不许出安装包"; exit 1; }
+        [ -f "$MAKENSIS" ] || { echo "::error::makensis 路径不存在：$MAKENSIS"; exit 1; }
         WIN_ROOT=$(pwd -W 2>/dev/null || pwd)
         case "$WIN_ROOT" in
           [A-Za-z]:*) : ;;
-          *) echo "::error::拿不到 Windows 形式的绝对路径（当前 $WIN_ROOT），NSIS 会读错相对路径"; exit 1 ;;
+          *) echo "::error::拿不到 Windows 形式的绝对路径（当前 ${WIN_ROOT}），NSIS 会读错相对路径"; exit 1 ;;
         esac
         echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT"
         "$MAKENSIS" /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="1.$APP_VERSION.0" installer/b2bcollect_setup.nsi

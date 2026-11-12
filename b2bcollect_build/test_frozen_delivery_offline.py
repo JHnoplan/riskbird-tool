@@ -1906,6 +1906,54 @@ def test_workflow_shell_syntax():
     for text, path in ((win, "Windows"), (mac, "Mac")):
         _assert("不许出包" in text, f"{path} 的构建前硬门说清了后果（不是只 exit 1）")
 
+    # 4) M 组的第三种接缝错：不是「语法配不上解释器」，而是**报错那一行自己配不上变量名**。
+    #    `$MK（…）` 这种写法在 bash 里会把全角括号/全角逗号的字节一起读进变量名：开
+    #    `set -u` 的步骤直接 unbound variable 炸掉（炸的是那句解释失败原因的 echo），
+    #    没开的更坏——值被静默印成空，「退出码 ）」。本轮是给 NSIS 步骤干跑时当场撞上的，
+    #    而同类写法在 Mac 那两个入口里已经躺了两处。判据用构建前硬门那一份，不另抄规则。
+    g = _manifest_gate()
+    local_sh = (_REPO / "debug" / "build_b2bcollect_mac_local.sh").read_text(encoding="utf-8")
+    for label, text in (("本机 Mac 打包脚本", local_sh),
+                        ("Windows workflow", win), ("Mac workflow", mac)):
+        got = g.check_shell_hygiene(g._strip_comments(text))
+        _assert(not got, f"{label} 里没有 $VAR 紧跟非 ASCII 的写法（{got[:1]}）")
+    for script in sorted((_REPO / ".github" / "scripts").glob("*.sh")):
+        got = g.check_shell_hygiene(script.read_text(encoding="utf-8", errors="replace"))
+        _assert(not got, f"{script.name} 的报错文案不会自己把变量名读坏（{got[:1]}）")
+    # 反向对照：判据必须真的抓得住，而不是「现在恰好没样本」。
+    _assert(len(g.check_shell_hygiene('echo "退出码 $RC，见上"')) == 1,
+            "反向对照：$RC 紧跟全角逗号必须判红")
+    _assert(g.check_shell_hygiene('echo "退出码 ${RC}，见上"') == [],
+            "反向对照：写成 ${RC} 就放行（判据抓的是写法，不是中文）")
+    _assert(g.check_shell_hygiene('# 注释里的 $RC，不会被执行') == [],
+            "反向对照：注释行不算（否则每条中文注释都要加花括号，门禁立刻沦为噪音）")
+    # 本轮那三处实际坏掉的行，钉成「现在这个样子」：顺手改回去时用例不会跟着改。
+    _assert("${RC}，报告见上" in local_sh,
+            "本机脚本失败分支把退出码印得出来（${RC} 而不是 $RC）")
+    _assert("退出码 ${rc}）" in mac, "Mac workflow 自检门禁的失败文案同理")
+
+    # 5) 安装包编译器不许「赌这台机器恰好装了什么」：本轮 Windows 就是红在 CI 全绿、
+    #    产物与自检都过、最后一步找不到 makensis ——镜像里 NSIS 没了，而本机永远复现不了。
+    #    判据只看这一步自己的手法：钉版本、钉 sha256、校验不过就停、解压后还要问一次
+    #    版本；并且不许再留「去 Program Files 里找」的旧写法（那条路等于把交付形态
+    #    交给别人的镜像决定）。
+    prov = _step_region(win, "Provision NSIS")
+    _assert(prov is not None, "Windows workflow 里 NSIS 的准备步骤还在（安装包不能靠镜像）")
+    if prov:
+        _assert(_step_shell(prov, "pwsh") == "bash", "NSIS 准备步骤显式 bash")
+        m = re.search(r'NSIS_SHA256:\s*"([0-9a-f]{64})"', prov)
+        _assert(m is not None, "NSIS_SHA256 钉的是 64 位十六进制（占位串或空值都算没钉）")
+        _assert(re.search(r'NSIS_VERSION:\s*"(\d+\.\d+)"', prov) is not None,
+                "NSIS_VERSION 钉了具体版本（不钉就会出现「今天能打包、明天打的不是同一个安装包」）")
+        for need in ("sha256", "exit 1", "::error::", "-V"):
+            _assert(need in prov, f"NSIS 准备步骤保留了 {need}（下载/校验/版本确认任一缺失都是拿坏编译器出包）")
+    inst = _step_region(win, "Build Windows installer (NSIS, per-user)")
+    _assert(inst is not None and "Program Files (x86)/NSIS" not in inst
+            and "这台 runner 上没有 makensis" not in win,
+            "安装包步骤不再在 runner 上找 NSIS（找不找得到是镜像的事，不该决定用户有没有安装包）")
+    _assert("MAKENSIS=$MK\" >> \"$GITHUB_ENV" in prov and "${MAKENSIS:-}" in inst,
+            "编译器路径由准备步骤写进 GITHUB_ENV、安装步骤只认这一个来源")
+
 
 # ══════════════════════════════════════════════ N. 打包清单硬门 + 采集通道完整性
 class _NoSuchKeyClient:
