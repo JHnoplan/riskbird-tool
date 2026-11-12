@@ -2628,6 +2628,8 @@ def test_packaging_manifest_gate():
       2c) 第 8 条——清单顺着 import 走必须闭合，故意让位给本目录的那几笔要登记理由；
       2d) 第 10 条——三个交付目录里的同名拷贝要么字节一致、要么登记分叉理由（生效的那
           份由 import 顺序决定，「一致但都是旧的」还要按行为钉住）；
+      2e) 第 13 条——Windows 装配清单与构建命令的 --add-data **双向**对拍（单向清单等于
+          没有清单：构建命令放进包的东西，装配校验可能压根不知道它存在）；
       3) 产物自检的通道完整性（打包态退 3、源码态只警告、那条提前返回不放过）；
       4) 界面说话只点名「该给却没给」的那几路，档位藏起来的路绝不念出来。
     """
@@ -2841,6 +2843,71 @@ def test_packaging_manifest_gate():
     finally:
         shutil.rmtree(fake, ignore_errors=True)
 
+    # 2e) 第 13 条「Windows 装配清单 ↔ 构建命令的 --add-data 双向对拍」。第 1 条判的是
+    #     「运行时要什么 → 构建命令抄了没有」，方向单向；它管不到另一半：构建命令明明把
+    #     文件放进了包，装配校验（package_win_artifacts.REQUIRED_INTERNAL）却不知道它存在。
+    #     本轮实测漏登记的是 block_guard.py / chrome_driver.py / drivers：驱动目录哪天
+    #     下载失败被剔掉，check_layout 一声不响、安装包照样出，症状与「用户机器没网」一样。
+    #     反方向同样致命：清单登记了一项却没有任何 --add-data 产它，装配那一步会永远红在
+    #     「_internal 缺 x」，而真原因是构建命令少抄了一行——报错报在校验上会把人带去查
+    #     PyInstaller，而不是查 workflow 那一行。
+    asm = _win_assembler()
+    win_text = gate.CALLERS[gate.WIN_WORKFLOW_LABEL].read_text(encoding="utf-8")
+    _assert_eq(gate.check_win_payload_manifest(win_text, asm), [],
+               "真仓库现况：装配清单与构建命令互相钉死（每一项都有「缺了会怎样」的理由）")
+    for key in ("riskbird_build/block_guard.py", "riskbird_build/chrome_driver.py", "drivers"):
+        _assert(key in asm.REQUIRED_INTERNAL,
+                f"{key} 必须在装配清单里（本轮实测漏掉的正是这三项）")
+    _assert(asm.is_dir_entry("drivers") and asm.is_dir_entry("enf_clean")
+            and not asm.is_dir_entry("riskbird_build/block_guard.py"),
+            "目录/文件按「最后一段有没有扩展名分隔点」判，夹具与判据共用这一个口径")
+    _assert_eq(gate.add_data_internal_key("../ali1688_build/drivers", "drivers"), "drivers",
+               "目录型 --add-data 的落点就是目标目录本身（dst 是它在包里的名字）")
+    _assert_eq(gate.add_data_internal_key("../riskbird_build/block_guard.py", "riskbird_build"),
+               "riskbird_build/block_guard.py",
+               "文件型 --add-data 的落点要带上文件名（同一目标目录下有多个文件）")
+    _assert_eq(gate.add_data_internal_key("mk_phone_font.json", "."), "mk_phone_font.json",
+               'dst="." 就是 _internal 根')
+
+    # 反例：四种漂移都要红，而且要点名是哪个方向（报「清单不合格」却不指方向＝下个人从头比对）
+    _k0 = "riskbird_build/block_guard.py"
+    with _patch(asm, "REQUIRED_INTERNAL", {k: v for k, v in asm.REQUIRED_INTERNAL.items()
+                                           if k != _k0}):
+        got13 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(any(_k0 in p and "REQUIRED_INTERNAL 却没有它" in p for p in got13),
+                f"构建命令放了进包、清单没登记 → 必须点名这一项（这是本轮的真漏）：{got13}")
+    with _patch(asm, "REQUIRED_INTERNAL", dict(asm.REQUIRED_INTERNAL,
+                                               **{"no_such_dir": "缺它 = 夹具自造项"})):
+        got14 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(any("no_such_dir" in p and "少抄了一条" in p for p in got14),
+                f"清单登记了、构建命令却不产它 → 必须说清真原因在 workflow：{got14}")
+    _vague = dict(asm.REQUIRED_INTERNAL)
+    _vague["config.json"] = "随包凭证"          # 有理由，但没说缺了会怎样
+    with _patch(asm, "REQUIRED_INTERNAL", _vague):
+        got15 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(any("config.json" in p and "没写清后果" in p for p in got15),
+                f"理由不含后果时必须红（凑数的条目会把真漏项淹在里面）：{got15}")
+    with _patch(asm, "REQUIRED_INTERNAL", _vague), \
+            _patch(asm, "BY_BUILDER", {"base_library.zip": "  "}):
+        got16 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(any("base_library.zip" in p and "没写它由谁产出" in p for p in got16),
+                f"放行名单里空白理由＝放行任何名字，必须红：{got16}")
+    with _patch(asm, "BY_BUILDER", dict(asm.BY_BUILDER, **{"phantom.zip": "自产"})):
+        got17 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(any("phantom.zip" in p and "这条登记在空转" in p for p in got17),
+                f"放行名单多出一项、校验清单里却没有 → 登记在空转，必须红：{got17}")
+    with _patch(asm, "REQUIRED_INTERNAL", {}), _patch(asm, "BY_BUILDER", {}):
+        got18 = gate.check_win_payload_manifest(win_text, asm)
+        _assert(all("REQUIRED_INTERNAL 却没有它" in p for p in got18) and len(got18) >= 10,
+                f"清单被清空时每一条 --add-data 都要点名（清空≠放行）：{len(got18)} 条")
+    for _broken_wf in ("build:\n    echo 没有打包命令\n", "Name X\n", ""):
+        _b = gate.check_win_payload_manifest(_broken_wf, asm)
+        _assert_eq(_b, [p for p in _b if "切不出任何 --add-data" in p],
+                   f"构建命令被改坏到读不出清单时必须红在「无从对拍」上（返回空列表=这条门"
+                   f"在这份 workflow 上绿灯）（输入={_broken_wf!r}）")
+        _assert(len(_b) == 1, f"这一格必须是**一条**红，而不是零条：输入={_broken_wf!r} "
+                              f"实际={_b}")
+
     # CLI 退出码语义：CI 靠它拦构建，返回 1 就等于门禁形同虚设
     proc = subprocess.run([sys.executable,
                            str(_REPO / ".github" / "scripts" / "check_packaging_manifest.py")],
@@ -3025,17 +3092,76 @@ def _uninstall_nsi(runtime_dirs, ask=_UN_ASK, dirs=None, inst=True, goto=None,
             + "\n".join("    " + ln for ln in lines) + "\nSectionEnd\n")
 
 
+def _install_nsi(asm, drop=(), dup=None, extra=None, abort=True, goto=None,
+                 target="copy_missing", checks=True, entry_before=False,
+                 file_after=False, nameless=False, cont=False, stray=False,
+                 nostep=False, sections=1):
+    """按**清单、次序、分支归属**拼一份安装段：默认那份合格，每个参数只坏一处。
+
+    校验项直接从 `asm.nsi_payload_checks()` 取——它是 REQUIRED_INTERNAL 的投影。夹具
+    自己抄一份文件名单的话，清单改了名这里会红成「装配失败」而不是「夹具过期」，
+    那是把第 13 条要防的「两处各抄一份」在测试里再演一遍。
+    """
+    items = [(p, w) for p, w in asm.nsi_payload_checks() if p not in drop]
+    if extra:
+        items.append((extra, "夹具自造的一项"))
+    if dup is not None:
+        items.append((dup, "同一项验第二遍"))
+    entries = ['    CreateShortCut "$SMPROGRAMS\\x.lnk" "$INSTDIR\\x.exe"',
+               '    WriteUninstaller "$INSTDIR\\uninstall.exe"']
+    copy_in = ['    File /r "dist\\*.*"']
+    probe = []
+    if checks:
+        for path, _why in items:
+            named = asm._payload_item(path) if not nameless else "装不全"
+            probe.append(f'    StrCpy $7 "{named}"')
+            probe.append(f'    IfFileExists "$INSTDIR\\{path}" 0 {target}')
+    else:
+        probe = ['    DetailPrint "拷完就直接登记"']
+    if entry_before:                 # 控制面板先登记，校验才有机会补上
+        probe, entries = entries + probe, []
+    if file_after:                   # 拷完却不验这一批（校验排在 File 之前 = 验的是旧内容）
+        probe, copy_in = probe + copy_in, []
+    lines = list(copy_in) + probe + list(entries)
+    if stray:      # 真脚本里本来就有一段「工具正在运行」的 Abort：失败分支没 Abort 时，
+        # 安装段并非「一个 Abort 都没有」，判据必须按**归属到哪个标号**判而不是数 Abort
+        lines = ['abort_locked:', '    Abort "工具正在运行，请先退出"', "    Goto skip_it"] \
+            + lines + ["skip_it:"]
+    if goto is not None:
+        lines += ["    " + g for g in goto]
+    else:
+        lines.append("    Goto copy_ok")
+    # 失败分支的标号名**不跟着 target 变**：target="copy_gone" 要的正是「跳进一个不存在的标号」
+    lines.append("copy_missing:")
+    if cont:
+        lines.append('    MessageBox MB_OK|MB_ICONSTOP "程序文件没落地" \\')
+        lines.append('        "请重新运行这个安装包"')
+    else:
+        lines.append('    MessageBox MB_OK|MB_ICONSTOP "程序文件没落地"')
+        if not nostep:      # 中止安装的那一刻用户手里只剩这个弹窗，光说失败=让他猜下一步
+            lines.insert(-1, '    StrCpy $6 "$6请关掉正在运行的工具后重新运行这个安装包"')
+    if abort:
+        lines.append('    Abort "安装未完成：关键文件没有落到安装目录"')
+    lines.append("copy_ok:")
+    lines.append('    DetailPrint "安装完成"')
+    out = ('Section "Install"\n' + "\n".join(lines) + "\nSectionEnd\n")
+    if sections > 1:      # 「安装段」只能有一个归属：分段之后校验条数就数不出来了
+        out += 'Section "Helpers"\n    DetailPrint "又一段"\nSectionEnd\n'
+    return out
+
+
 def _stub_nsi_text() -> str:
-    """合成产物树里那份 .nsi：既然叫「合格的树」，卸载分支也得跟着合格。
+    """合成产物树里那份 .nsi：既然叫「合格的树」，卸载分支与安装校验都得跟着合格。
 
     不在这里复制仓库里的真脚本——真文件合规与否由 O 组单独判；这里的职责只是给装配
     脚本一个「除了被测那一项以外全都合格」的输入，好让失败一定指向被测的那一项。
     """
-    return ('Unicode true\nName "B2B"\n'
-            + _uninstall_nsi(_win_assembler().RUNTIME_DIRS))
+    asm = _win_assembler()
+    return ('Unicode true\nName "B2B"\n' + _install_nsi(asm)
+            + _uninstall_nsi(asm.RUNTIME_DIRS))
 
 
-def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
+def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=(), nsi=None):
     """搭一棵**合成**的 onedir 产物树：指定项可以缺席，用来验校验器自己判得对不对。"""
     app = root / "dist" / _win_assembler().APP_DIR_NAME
     internal = app / "_internal"
@@ -3046,7 +3172,9 @@ def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
         if rel in drop:
             continue
         target = internal / rel
-        if rel.endswith("/") or rel == "enf_clean":
+        if asm.is_dir_entry(rel):
+            # 目录型条目（drivers / enf_clean）必须**里面有文件**才算落地：装配判据
+            # 认「空目录 = 一个驱动都没下载成功」，夹具铺一个空目录就是在伪造正例
             (target / "keep.txt").parent.mkdir(parents=True, exist_ok=True)
             (target / "keep.txt").write_text("x", encoding="utf-8")
         else:
@@ -3060,8 +3188,9 @@ def _fake_dist(root: Path, drop=(), stale_onefile=False, runtime_dirs=()):
     for rel in (asm.NSI_PATH, asm.GUIDE_SRC):
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(asm.BOM + ("合成桩\n" if rel == asm.GUIDE_SRC
-                                      else _stub_nsi_text()).encode("utf-8"))
+        target.write_bytes(asm.BOM + (
+            "合成桩\n" if rel == asm.GUIDE_SRC
+            else (_stub_nsi_text() if nsi is None else nsi)).encode("utf-8"))
     if stale_onefile:
         (root / "dist" / asm.EXE_NAME).write_text("MZ", encoding="utf-8")
     for name in runtime_dirs:
@@ -3084,7 +3213,7 @@ def _hush():
 
 
 def test_windows_onedir_delivery():
-    print("\n═══ O. Windows 交付形态：onefile 绝迹、装配判据共用一份 ═══")
+    print("\n═══ O. Windows 交付形态：onefile 绝迹、装配判据共用一份、装进用户机器也逐条验 ═══")
     asm = _win_assembler()
     gate = _manifest_gate()
 
@@ -3443,6 +3572,124 @@ def test_windows_onedir_delivery():
     _assert_eq(_rc2.returncode, 0,
                f"同一棵树只把 .nsi 换成合格那份就必须通过（不通过=这条门一直响）"
                f"（out尾部={_rc2.stdout[-200:]!r}）")
+
+    # 10) 安装段必须**逐条验关键文件真的落进了安装目录**。CI 上一直只验 dist 树
+    #     （check_layout），从来没有一处验「makensis 把这些文件放进了用户机器」；而安装
+    #     脚本用的是 `SetOverwrite try`——目标被占用就跳过、**不算失败**，于是新 exe 配
+    #     旧运行时这种拼起来的版本照样走到「完成」页。这一类和前九类同源：装了一半不报
+    #     错，只有用户点开才发现少一路功能，而那时没人会怀疑安装向导自己报的「成功」。
+    #     判据实现在 .github/scripts/package_win_artifacts.py（CI 在 makensis 之前跑），
+    #     这里钉住它的清单来源、次序判定与接线，不留第二份规矩。
+    _pl = []
+    with _hush():
+        asm.check_installer_payload(nsi, _pl)
+    _assert_eq(_pl, [], "真安装脚本的拷贝后校验合格：装配清单里每一项都逐条验过、"
+                        "失败分支落到 Abort、快捷方式与注册表排在校验之后")
+    _payload = asm.nsi_payload_checks()
+    _assert_eq(len(_payload), len(asm.REQUIRED_INTERNAL) + 2,
+               "校验清单 = 装配清单 + 根上的 exe 与使用说明（夹具的条数就是从这份投影来的，"
+               "自己抄一份文件名的话清单改名时这里会红成「装配失败」而不是「夹具过期」）")
+    _expand = asm._nsi_expander(nsi)
+    _expanded = "\n".join(_expand(ln) for ln in nsi.splitlines())
+    for _p, _why in _payload:
+        # 宏要**展开后**再对：真脚本写的是 "$INSTDIR\${APP_EXE}"，按字面比会报一条指错
+        # 方向的假红（清单与脚本其实是对得上的），而判据本身走的就是展开后的字节。
+        _assert(f'IfFileExists "$INSTDIR\\{_p}" 0 copy_missing' in _expanded,
+                f"清单里的 {_p} 必须逐条出现在安装段的校验里（{_why}）")
+    _assert_eq(_expanded.count(" 0 copy_missing"), len(_payload),
+               "校验条数与清单条数一条不差（多一条=清单外硬编码，少一条=静默少验一项）")
+    _assert(nsi.index("copy_missing:") > nsi.index("0 copy_missing"),
+            "失败分支排在校验之后：否则每次安装都会走进 Abort")
+    _assert(nsi.index("copy_ok:") < nsi.index("CreateShortCut"),
+            "快捷方式排在成功标号之后：装不全的包不许在控制面板里留条目")
+
+    # 反例逐条只差一处（见 _install_nsi 的参数分工）：既要求报红，也要求红在**那一条**消息上
+    _cases_p = [
+        ("少验一项（清单里有、脚本没验）",
+         dict(drop=("_internal\\config.json",)), ["没有校验 $INSTDIR\\_internal\\config.json"]),
+        ("同一项验两遍（说明有一段是从别处抄来的）",
+         dict(dup="_internal\\config.json"), ["被校验了 2 次"]),
+        ("验了清单里没有的路径（两处各抄一份迟早对不上）",
+         dict(extra="_internal\\somewhere_else.py"), ["校验了装配清单里没有的路径"]),
+        ("失败分支只弹窗不 Abort（整个安装段一个 Abort 都没有）",
+         dict(abort=False), ["没有任何带 Abort 的失败分支"]),
+        # 这一条和上一条只差「段里另有一句 Abort」：真脚本里那句「工具正在运行」就在那儿，
+        # 所以数 Abort 的判据会以为「有中止分支就够了」，而校验跳进去的那条路其实一路走进
+        # copy_ok。判据必须按**归属**判，报的也必须是「这条路掉进了成功标号」而不是「没有
+        # Abort」——后者会把人带去补一句 Abort，补完照样走进成功分支。
+        ("失败分支只弹窗不 Abort（同段里另有「工具正在运行」那句 Abort）",
+         dict(abort=False, stray=True),
+         ["这条路最后掉进了成功标号 copy_ok", "任何一条校验把失败分支接到 Abort"]),
+        ("校验全过却忘了 Goto 跳过失败分支（每次安装都中止）",
+         dict(goto=[]), ["没有 Goto 跳到成功分支"]),
+        ("Goto 跳错标号，直接跳进失败分支（同上，更隐蔽）",
+         dict(goto=["Goto copy_missing"]), ["没有 Goto 跳到成功分支"]),
+        ("假分支跳进一个不存在的标号（makensis 报 unknown label）",
+         dict(target="copy_gone"), ["安装段里没有这个标号"]),
+        ("整块拷贝后校验都没写",
+         dict(checks=False), ["一条「拷完验一遍」的 IfFileExists 都没有"]),
+        ("File 排在校验之后（验的是上一次装的旧内容）",
+         dict(file_after=True), ["排在拷贝后校验之后"]),
+        ("快捷方式/卸载器排在校验之前",
+         dict(entry_before=True), ["排在校验之前"]),
+        ("校验前那句 StrCpy 不点文件名（弹窗只会说「装不全」）",
+         dict(nameless=True), ["不是一句点名"]),
+        ("长文案用反斜杠续行（makensis 当额外参数，只留第一句）",
+         dict(cont=True), ["用反斜杠续行"]),
+        ("失败分支只说「没落地」，不说下一步该做什么",
+         dict(nostep=True), ["没给出下一步动作"]),
+        ("安装段被拆成两段（校验条数就不再唯一）",
+         dict(sections=2), ["关键文件校验只能有一个归属"]),
+    ]
+    for _label, _kw, _needles in _cases_p:
+        _p = []
+        with _hush():
+            asm.check_installer_payload(_install_nsi(asm, **_kw), _p)
+        _assert(_p, f"反向对照：{_label} 必须报红（报不出来=这条门在这一类改动上是空的）")
+        for _n in _needles:
+            _assert(any(_n in x for x in _p),
+                    f"反向对照：{_label} 要红在正确的地方——消息里得出现「{_n}」（实际={_p}）")
+    _p = []
+    with _hush():
+        asm.check_installer_payload('Section "Uninstall"\n    RMDir /r "$INSTDIR"\n'
+                                    "SectionEnd\n", _p)
+    _assert(any("没有安装段" in x for x in _p),
+            f"反向对照：整个安装段没了必须红，不能当成「没有校验项」放过：{_p}")
+    # 注释里写的旧形状不该被判成违规（和 9) 同一件事：判据读的是要执行的字节）
+    _p = []
+    with _hush():
+        asm.check_installer_payload(_install_nsi(asm).replace(
+            "    File /r", ';     旧写法是 ${IfNot} ${FileExists}，本文件没引 LogicLib.nsh\n'
+                           "    File /r", 1), _p)
+    _assert_eq(_p, [], "反向对照：注释里的旧写法不算违规（真脚本里就留着这样一行解释）")
+
+    # 接线：判据不能只是「一个函数存在」。行为验证——把合成树里那份 .nsi 换成「少验
+    # 一项」，装配脚本必须非零退出**且不产出 zip**（正是 CI 全绿、用户拿坏包那一形状）。
+    _less = Path(tempfile.mkdtemp(prefix="windist_payload_"))
+    _fake_dist(_less, nsi=('Unicode true\nName "B2B"\n'
+                           + _install_nsi(asm, drop=("_internal\\config.json",))
+                           + _uninstall_nsi(asm.RUNTIME_DIRS)))
+    _rc = subprocess.run([sys.executable, str(_REPO / ".github" / "scripts" /
+                             "package_win_artifacts.py"), "--root", str(_less)],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", cwd=str(_REPO))
+    _assert(_rc.returncode != 0 and "没有校验 $INSTDIR\\_internal\\config.json"
+            in (_rc.stdout + _rc.stderr),
+            f"反向对照：少验一项在安装包编译之前就被装配那一步拦下，消息点出是哪一项"
+            f"（rc={_rc.returncode} out尾部={_rc.stdout[-200:]!r}）")
+    _assert(not (_less / asm.PORTABLE_NAME).exists(),
+            "拦下来时不产出绿色版 zip：校验没过还继续装配，等于把坏包发出去")
+    # dist 树少一个驱动文件（目录在、里面空）也必须判红：空目录与缺目录在用户机器上
+    # 是同一个症状（浏览器通道点了没反应），而产物自检照样绿。
+    _empty = Path(tempfile.mkdtemp(prefix="windist_drivers_"))
+    _fake_dist(_empty)
+    shutil.rmtree(_empty / "dist" / asm.APP_DIR_NAME / "_internal" / "drivers")
+    (_empty / "dist" / asm.APP_DIR_NAME / "_internal" / "drivers").mkdir()
+    got = []
+    with _hush():
+        asm.check_layout(_empty, got)
+    _assert(any("drivers" in p and "目录型条目空着也算缺" in p for p in got),
+            f"反向对照：drivers/ 空目录＝一个 chromedriver 都没下载成功，必须点名：{got}")
 
 
 def test_state_file_never_relative_cwd():

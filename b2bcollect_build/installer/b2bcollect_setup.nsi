@@ -116,6 +116,10 @@ Section "主程序" SEC_APP
         FileClose $9
         Goto copy_files
     ask_close:
+        ; 静默安装（/S）里这句问句没人能回答：MessageBox 照样会弹、进程就一直等到被超时
+        ; 杀掉，日志里只剩一句「安装没结束」。所以静默时直接按「取消」处理——这个分支还
+        ; 排在任何 File 之前，中止得干干净净，一个文件都没动过。
+        IfSilent abort_locked
         MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP_NAME} 正在运行，安装目录里的程序文件被占用。$\n$\n请先关掉正在运行的工具窗口（必要时在任务管理器里结束 ${APP_EXE}），然后点「重试」。$\n点「取消」本次安装立即中止——不会留下装了一半的版本。" IDRETRY check_lock IDCANCEL abort_locked
     abort_locked:
         Abort "已取消：工具正在运行，本次没有替换任何文件。"
@@ -123,14 +127,97 @@ Section "主程序" SEC_APP
     copy_files:
     ; 整批复制 onedir 产物：程序本体 + _internal 运行时 + 随包凭证 config.json +
     ; 跨目录采集器源码（riskbird_build / ali1688_build）+ 内置 chromedriver。
-    ; 这里刻意不逐条列文件：列一条就少一处与打包清单对拍的机会，
+    ; **复制**这一步刻意不逐条列文件：列一条就少一处与打包清单对拍的机会，
     ; 「少一个文件不报错、只少一个功能」正是本项目被咬过最多次的形状。
+    ; 下面**校验**那一段则要逐条列——那里对拍的正是那张打包清单。
     SetOutPath "$INSTDIR"
     File /r "${BUILD_DIR}\${APP_DIRNAME}\*.*"
 
     ; 使用说明进安装目录（完成页有勾选框直接打开；产物 zip 里也带同一份，
     ; 由 .github/scripts/package_win_artifacts.py 放进去，两处只有一份源文件）。
     File /oname=使用说明.txt "installer\usage_guide.txt"
+
+    ; ── 拷完回头验一遍：装进机器的那份，必须真是打包时那份关键文件 ──────────
+    ; 为什么这一段不能省（两种失败都不报错，而且都只有用户那边看得见）：
+    ;   1) SetOverwrite try 的语义是「目标文件被占用就**跳过**，不算失败」。跳过之后
+    ;      装出来的是新 exe 配旧运行时（或反过来）这种拼起来的版本，安装却照样报成功。
+    ;      上面那段占用探测只探得到 exe 这一个文件——_internal 里的某个 .py、.dll 被
+    ;      安全软件或索引服务按住时，探测是绿的，文件却是旧的；
+    ;   2) makensis 的 File /r 是「匹配到几份就打几份」：dist 布局改了名、或者装配那
+    ;      一步少剔/少放一样东西，安装包照样编得出来、装得上、跑得起来，只少那一路功能。
+    ;      CI 上验的是 **dist 树**（package_win_artifacts.check_layout），没有任何一处
+    ;      验过「makensis 真的把这些文件放进了用户机器」——这一段补的就是这一格。
+    ; 关键文件清单只有一个真源：.github/scripts/package_win_artifacts.py 的
+    ; REQUIRED_INTERNAL。下面每一对（StrCpy + IfFileExists）都要与它逐个对上，由
+    ; check_installer_payload 在 makensis 之前判：清单加了一条、这里忘了一行，
+    ; 或者反过来这里多验了一个清单里没有的路径，构建当场拦下并点名是哪一条。
+    ;
+    ; 手法刻意用 NSIS 自带的 IfFileExists，而不是 ${IfNot} ${FileExists}：
+    ;   1) 不引入 LogicLib.nsh——多一个 !include 就多一类「这台机器的 NSIS 里没有这个
+    ;      库版本」的失败，而本文件通篇已经是 IfFileExists/StrCmp/Goto 这一套；
+    ;   2) 判据要按「这一行的假分支跳到哪个标号」把每条校验钉回打包清单，平铺的
+    ;      「真→下一行 / 假→copy_missing」形状判得最直接，LogicLib 的块结构还得先做
+    ;      一遍括号配对。配对错了不会有人报错，只会让这条门数错校验条数。
+    ; 每一条前面那句 StrCpy $7 是给失败文案用的：报的是**哪一个**文件没落地，
+    ; 而不是「装不全」——后者让用户只能重装一次试试看。
+    StrCpy $7 "${APP_EXE}（主程序本体）"
+    IfFileExists "$INSTDIR\${APP_EXE}" 0 copy_missing
+    StrCpy $7 "_internal\base_library.zip"
+    IfFileExists "$INSTDIR\_internal\base_library.zip" 0 copy_missing
+    StrCpy $7 "_internal\config.json"
+    IfFileExists "$INSTDIR\_internal\config.json" 0 copy_missing
+    StrCpy $7 "_internal\mk_phone_font.json"
+    IfFileExists "$INSTDIR\_internal\mk_phone_font.json" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\runtime_paths.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\runtime_paths.py" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\riskbird_crawler_v2.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\riskbird_crawler_v2.py" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\aiqicha_crawler_v2.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\aiqicha_crawler_v2.py" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\qizhidao_crawler.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\qizhidao_crawler.py" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\block_guard.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\block_guard.py" 0 copy_missing
+    StrCpy $7 "_internal\riskbird_build\chrome_driver.py"
+    IfFileExists "$INSTDIR\_internal\riskbird_build\chrome_driver.py" 0 copy_missing
+    StrCpy $7 "_internal\ali1688_build\ali1688_crawler.py"
+    IfFileExists "$INSTDIR\_internal\ali1688_build\ali1688_crawler.py" 0 copy_missing
+    ; 目录型条目只能验「目录里有文件」：*.* 匹配到任意一个文件才算落地。
+    ; 空目录在这里算失败是对的——drivers/ 空着等于一个 chromedriver 都没打进去。
+    StrCpy $7 "_internal\drivers（内置 chromedriver 多版本目录）"
+    IfFileExists "$INSTDIR\_internal\drivers\*.*" 0 copy_missing
+    StrCpy $7 "_internal\enf_clean（清洗子包目录）"
+    IfFileExists "$INSTDIR\_internal\enf_clean\*.*" 0 copy_missing
+    StrCpy $7 "使用说明.txt"
+    IfFileExists "$INSTDIR\使用说明.txt" 0 copy_missing
+    Goto copy_ok
+
+copy_missing:
+    ; 这里必须在写快捷方式与注册表**之前**中止：装了一半却在控制面板里留下一个能点开
+    ; 却跑不起来的条目，比什么都不留更难收拾（用户会以为是程序坏了，而不会想到是没装全）。
+    ; 文案逐句 StrCpy 拼接，不用行尾续行 `\`：makensis 把续行后的引号串当成**额外的
+    ; 参数**而不是同一段文本，MessageBox 拿到的还是第一句，后面几句变成无人认领的参数
+    ; ——本机没有 makensis，这种差异只在产物里现形，所以整份脚本一律只用单行写法
+    ; （这条纪律由 check_installer_payload 判：非注释行不许以 \ 结尾）。
+    StrCpy $6 "${APP_NAME} 没能把程序文件装到位：$7$\n$\n"
+    StrCpy $6 "$6安装目录里的程序文件被占用时，SetOverwrite try 会跳过它继续往下装，所以这里主动停下。$\n"
+    StrCpy $6 "$6继续装下去会得到一个新旧文件混在一起的版本，启动时报的错反而更难读。$\n"
+    StrCpy $6 "$6本次没有创建快捷方式与卸载入口；你的登录状态和采集数据都没有被动过。$\n$\n"
+    StrCpy $6 "$6请按下面的顺序处理，然后重新运行这个安装包（会覆盖补齐）：$\n"
+    StrCpy $6 "$6   · 关掉正在运行的工具窗口（必要时在任务管理器里结束 ${APP_EXE}）；$\n"
+    StrCpy $6 "$6   · 如果装了安全软件，允许本次安装写入安装目录；$\n"
+    StrCpy $6 "$6安装位置：$INSTDIR"
+    ; 静默安装（运维推送时的 /S）里 MessageBox **照样会弹并且等人点**：没有人看得见那
+    ; 个窗口，安装进程就一直挂在那里直到被超时杀掉，日志里只留一句「安装没结束」。
+    ; 所以静默分支只写日志并中止，图形安装才弹窗——这是 NSIS 文档给的标准手法。
+    ; IfSilent 的第一个参数是「条件成立时跳去的标号」（与上面 IfFileExists 同一套写法）。
+    IfSilent copy_abort
+    MessageBox MB_OK|MB_ICONSTOP "$6"
+copy_abort:
+    DetailPrint "安装未完成：$7 没有落到安装目录，没有创建快捷方式与卸载入口。"
+    Abort "安装未完成：$7 没有落到安装目录，本次没有创建快捷方式与卸载入口。"
+
+copy_ok:
 
     ; 快捷方式：开始菜单一份、桌面一份。每用户安装下 $SMPROGRAMS/$DESKTOP 就是
     ; 当前用户的目录，不需要管理员权限，也不会给别人多出一个图标。
@@ -173,7 +260,11 @@ Section "Uninstall"
         FileClose $9
         Goto uninstall_go
     uninstall_locked:
+        ; 静默卸载同样没人能点这个「确定」：先判 IfSilent，静默时直接中止（结论与图形
+        ; 分支一样——正在运行时不删文件，否则留下一半目录，下次安装还会撞上占用）。
+        IfSilent uninstall_abort
         MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 正在运行。请先关掉工具窗口，再重新执行卸载。"
+    uninstall_abort:
         Abort
     uninstall_go:
         Delete "$INSTDIR\uninstall.exe"
@@ -186,6 +277,11 @@ Section "Uninstall"
         ; MB_DEFBUTTON2 不是装饰：NSIS 的 MessageBox 不写这一位时，默认选中的是**第一个
         ; 按钮**（也就是「是，连数据一起删」），一路回车下去就把数据删了——跟这句
         ; 「默认保留」正好相反。把焦点放到「否」上，才让「不选就等于同意」这件事成立。
+        ;
+        ; IfSilent keep_data 是同一件事的另一半：运维推送 /S 卸载时没人回答这句问句，
+        ; 必须由脚本替用户选**保守**那一支（保留数据）。少了这一行，静默卸载要么挂在
+        ; 那个看不见的弹窗上，要么（更坏）按默认走进「连数据一起删」。
+        IfSilent keep_data
         MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "是否同时删除登录状态、缓存与采集进度数据？$\n$\n· 选「否」（推荐）：保留 $INSTDIR 下的 b2bcollect_data / b2bcollect_state / riskbird_data，以后重装会自动接着用，登录状态不用重新过一遍；$\n· 选「是」：连同这些目录一起清除，无法恢复。" IDNO keep_data
         ; ↓ 只有这一条分支（用户明确选了「是」）才允许递归删除。
         RMDir /r "$INSTDIR\b2bcollect_data"

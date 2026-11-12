@@ -63,6 +63,11 @@
      runner 在**写 stdin 那一刻**抛 UnicodeEncodeError（'charmap'，即控制台代码页 cp1252），
      构建前硬门自己炸在打包之前。同一族的另一半是往控制台写中文：本机复现不出来，症状却
      与「脚本内容有问题」一模一样。凡是「按环境决定编码」的地方，换一台镜像就换一种结果。
+ 13 Windows **装配清单**（package_win_artifacts.REQUIRED_INTERNAL）与 Windows 构建命令里的
+     --add-data 双向对拍：第 1 条的方向是「运行时需要什么 → 构建命令抄了没有」，管不到
+     反向那一半——构建命令明明把文件放进了包，装配校验却不知道它存在，于是它哪天没下载
+     成功、被装配步骤剔掉、布局改了名，check_layout 一声不响、安装包照样出。本轮实测漏
+     登记的是 block_guard.py / chrome_driver.py / drivers（内置 chromedriver 多版本目录）。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -1047,6 +1052,104 @@ def check_text_io_encoding(paths: tuple = None) -> list:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# 第 13 条：Windows 装配清单必须与 Windows 构建命令里的 --add-data **互相**对拍。
+#
+# 前面第 1 条判的是「site_adapters 运行时要 import 的东西，三处入口都抄了没有」，
+# 方向是**运行时 → 构建命令**。它管不到另一半：构建命令里明明把文件放进了包，
+# 装配校验器（package_win_artifacts.REQUIRED_INTERNAL）却不知道它存在——于是这个文件
+# 哪天没下载成功、被 prune 掉、dist 布局改了名，check_layout 一声不响，安装包照样出。
+# 本轮实测到的正是这一格：workflow 的 --add-data 里有 riskbird_build/block_guard.py、
+# riskbird_build/chrome_driver.py 与 drivers（三个大版本的 chromedriver），装配清单三条
+# 都没登记。chrome_driver 缺席的症状与「用户机器没网所以驱动下不来」一模一样。
+#
+# 反方向同样要判：清单里登记了一项却没有任何 --add-data 会产出它（也不在 BY_BUILDER
+# 里），check_layout 就会永远红在「_internal 缺 x」——真原因却是「构建命令少抄了一条」，
+# 报在装配那一步会把人带偏去查 PyInstaller。两头都要对上，才对得起「清单只有一个真源」。
+# ---------------------------------------------------------------------------
+
+WIN_WORKFLOW_LABEL = "Windows workflow"
+WIN_ASSEMBLER = ROOT / ".github" / "scripts" / "package_win_artifacts.py"
+
+
+def win_assembler():
+    """把 Windows 装配脚本当模块载进来：REQUIRED_INTERNAL / BY_BUILDER / is_dir_entry
+    都只认它那一份。这里不抄第二份清单，也不自己判目录型条目——抄的那一刻就是漂移的开始。
+    """
+    import importlib.util
+    if not WIN_ASSEMBLER.is_file():
+        raise SystemExit(f"❌ 读不到装配脚本 {WIN_ASSEMBLER.relative_to(ROOT)}："
+                         "第 13 条没有清单可对，这一步必须红而不是安静跳过")
+    spec = importlib.util.spec_from_file_location("_win_asm", WIN_ASSEMBLER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def add_data_internal_key(src: str, dst: str) -> str:
+    """``--add-data "src;dst"`` 在 onedir 里落到 ``_internal`` 的相对路径（不含前缀）。
+
+    PyInstaller 的口径：src 是**文件**时落在 ``dst/<文件名>``，src 是**目录**时整棵树的
+    内容落在 ``dst/`` 下（dst 就是它在包里的名字）；``dst="."`` 就是 _internal 根。
+    目录/文件按「最后一段有没有扩展名分隔点」判——与装配清单 is_dir_entry 同一口径，
+    不在这里读磁盘：CI 上 drivers/ 是这一步之后才下载的。
+    """
+    base = src.replace("\\", "/").rstrip("/").split("/")[-1]
+    d = dst.replace("\\", "/").strip().rstrip("/")
+    if "." not in base:                                  # 目录型
+        return base if d in ("", ".") else d
+    return base if d in ("", ".") else f"{d}/{base}"
+
+
+def check_win_payload_manifest(win_text: str, asm) -> list:
+    """Windows workflow 的 --add-data ↔ 装配清单 REQUIRED_INTERNAL 双向对拍。"""
+    problems = []
+    required = getattr(asm, "REQUIRED_INTERNAL", None)
+    by_builder = getattr(asm, "BY_BUILDER", None)
+    is_dir = getattr(asm, "is_dir_entry", None)
+    if required is None or by_builder is None or is_dir is None:
+        return [f"{WIN_ASSEMBLER.name} 里读不到 REQUIRED_INTERNAL / BY_BUILDER / "
+                "is_dir_entry：第 13 条的对照面没了"]
+
+    pairs = [_split_add_data(t) for t in _flag_values(_strip_comments(win_text), "--add-data")]
+    if not pairs:
+        return [f"{WIN_WORKFLOW_LABEL} 里切不出任何 --add-data："
+                "构建命令被改了？第 13 条无从对拍，这一步不能算过"]
+    produced = {}
+    for src, dst in pairs:
+        produced.setdefault(add_data_internal_key(src, dst), []).append(f"{src} → {dst}")
+
+    for key in sorted(produced):
+        if key not in required:
+            problems.append(
+                f"构建命令把 {key} 放进了包（--add-data {'；'.join(produced[key])}），"
+                f"装配清单 REQUIRED_INTERNAL 却没有它：这个文件哪天没下载成功、被装配步骤"
+                f"剔掉、或布局改了名，check_layout 一声不响，安装包照样出——"
+                f"「少一个文件只少一个功能」正是本项目反复出现的那一类")
+        elif not str(required[key]).strip():
+            problems.append(f"REQUIRED_INTERNAL['{key}'] 没写理由：每一项都要说清"
+                            "「缺了会怎样」，否则这张表迟早混进凑数的条目，真漏项也就淹在里面")
+        elif "缺" not in str(required[key]):
+            problems.append(f"REQUIRED_INTERNAL['{key}'] 的理由没写清后果（要出现「缺」"
+                            f"字并说明症状）：现在的值是「{required[key]}」")
+
+    for key in sorted(set(required) - set(produced)):
+        if key in by_builder:
+            if not str(by_builder[key]).strip():
+                problems.append(f"BY_BUILDER['{key}'] 没写它由谁产出：这张表是第 13 条的"
+                                "放行名单，空白理由等于放行任何名字")
+            continue
+        problems.append(
+            f"装配清单登记了 {key}，但 {WIN_WORKFLOW_LABEL} 里没有任何 --add-data 会把它"
+            f"放进包（也不在 BY_BUILDER 登记的「构建系统自产」名单里）："
+            f"装配那一步会永远红在「_internal 缺 {key}」，而真原因是构建命令少抄了一条——"
+            f"报在校验上会把人带去查 PyInstaller，而不是查这一行")
+    for key in sorted(set(by_builder) - set(required)):
+        problems.append(f"BY_BUILDER 登记了 {key}，REQUIRED_INTERNAL 里却没有它："
+                        "两个名单的差集必须是 REQUIRED_INTERNAL 的子集，否则这条登记在空转")
+    return problems
+
+
 def check_caller(label: str, text: str, externals: tuple, modules: list,
                  with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
@@ -1202,6 +1305,29 @@ def main(argv=None) -> int:
         print(f"✅ 交付链 Python 脚本编码：{len(io_scripts())} 份脚本"
               f"（{IO_SCRIPTS_DIR}/*.py）的 input/text/encoding 与控制台写入都写定了 UTF-8")
 
+    # Windows 装配清单与构建命令互相钉死（第 13 条）：第 1 条只管「运行时要什么 →
+    # 构建命令抄了没有」，管不到反方向——构建命令放了进包的文件，装配校验却不知道。
+    try:
+        _asm = win_assembler()
+        _wf = CALLERS[WIN_WORKFLOW_LABEL]
+        if not _wf.is_file():
+            win_problems = [f"读不到 {_wf.relative_to(ROOT)}：第 13 条的构建命令没了对照面，"
+                            f"这一步必须红而不是安静跳过"]
+        else:
+            win_problems = check_win_payload_manifest(
+                _wf.read_text(encoding="utf-8", errors="replace"), _asm)
+    except SystemExit as exc:          # 装配脚本不在位：这条判据不能安静跳过
+        win_problems = [str(exc)]
+    if win_problems:
+        bad += 1
+        print("❌ Windows 装配清单与构建命令的 --add-data 对不上（单向清单等于没有清单）：")
+        for p in win_problems:
+            print(f"   · {p}")
+            print(f"::error::Windows 装配清单对拍：{p}")
+    else:
+        print(f"✅ Windows 装配清单对拍：REQUIRED_INTERNAL 与构建命令的 --add-data "
+              f"双向一致（装配校验判的就是构建命令真正放进包的那些文件）")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -1227,7 +1353,7 @@ def main(argv=None) -> int:
         return 1
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
           "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
-          "交付链脚本的编码都写死在脚本里")
+          "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死")
     return 0
 
 
