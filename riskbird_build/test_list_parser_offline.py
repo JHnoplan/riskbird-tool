@@ -7,7 +7,26 @@ from lxml import html as lhtml
 
 from riskbird_crawler_v2 import RiskBirdCrawlerV2
 
-DOC = lhtml.parse("debug_rb_list_full.html").getroot()
+# ════ 实机夹具：按**文件位置**找，缺了就如实跳过 ═════════════════════════════
+# 这两份 HTML 是实机抓回的风鸟列表页（没入库，单份 0.5 MB 上下），断言的卡片数、
+# 公司名、字段全对着它们。过去写成裸相对路径，等于「只有站在 riskbird_build 里才跑得
+# 起来」：从仓库根批跑就是 OSError: failed to load "debug_rb_list_full.html"，
+# 红法和产品缺陷长得一模一样。缺夹具也不是红——按回归入口的约定报 SKIP-FIXTURE 退 0。
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_HERE = Path(__file__).resolve().parent
+
+
+def _fixture(name):
+    path = _HERE / name
+    if not path.is_file():
+        print(f"⏭ SKIP-FIXTURE 缺实机夹具：{name}（实机取回后放进 {_HERE}/，断言自动恢复）")
+        sys.exit(0)
+    return str(path)
+
+
+DOC = lhtml.parse(_fixture("debug_rb_list_full.html")).getroot()
 
 
 class El:
@@ -70,7 +89,7 @@ assert c._name_match("某某科技有限公司", "某某科技有限公司(深�
 assert c._name_match("某某科技有限公司（深圳）", "某某科技有限公司(深圳)")
 
 # 新誉列表页（实机保存）：目标卡片必须命中母公司，不能拉到分公司
-DOC = lhtml.parse("debug_rb_xinyu_list.html").getroot()
+DOC = lhtml.parse(_fixture("debug_rb_xinyu_list.html")).getroot()
 xinyu = c._parse_list_cards()
 print("\n新誉页卡片数:", len(xinyu), [x["公司名"] for x in xinyu][:4])
 assert xinyu, "新誉列表页未解析到卡片"

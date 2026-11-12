@@ -1,7 +1,7 @@
-"""离线验证自动保存改造：每次保存两份文件（原数据合并 + 清洗后入库），不分平台。
+"""离线验证自动保存改造：每次保存三份固定文件（原数据合并 + 清洗后入库 + 国内只留手机号），不分平台。
 
 覆盖：
-1. 会话目录里只有两个固定文件名，不再出现 企知道.xlsx / 爱企查.xlsx；
+1. 会话目录里只有那三个固定文件名，不再出现 企知道.xlsx / 爱企查.xlsx；
 2. 写盘失败（文件被 Excel 占用等）时旧文件内容完好、不留 .tmp，采集继续进行；
 3. 采集线程一边写 results、GUI 一边取快照写 Excel，不炸也不串数据；
 4. 上一轮还没写完时只保留最后一次请求，写完自动补一轮（停止/完成那次必然落盘）；
@@ -25,6 +25,11 @@ if TMP.exists():
     import shutil
     shutil.rmtree(str(TMP), ignore_errors=True)
 TMP.mkdir(parents=True, exist_ok=True)
+
+# 会话目录里那三份固定文件：判据只认 GUI 常量的集合，不写死条数。写死「两份」的
+# 那版判据哑火过一次——「国内只留手机号」第三份文件上线时，这个套件不在批跑清单
+# 里，没人被它提醒，直到手工跑才发现红的是判据本身而不是产品。
+FIXED_FILES = sorted([G.RAW_FILE_NAME, G.CLEAN_FILE_NAME, G.MOBILE_FILE_NAME])
 
 
 def make_record(i, platform):
@@ -60,7 +65,7 @@ def drain(timeout=90):
     raise AssertionError("自动保存超时未结束")
 
 
-# ── 1. 两份固定文件，不再分平台 ────────────────────────
+# ── 1. 三份固定文件，不再分平台 ────────────────────────
 w.qizhidao_crawler.results = [make_record(i, "企知道") for i in range(1, 21)]
 w.aiqicha_crawler.results = [make_record(i, "爱企查") for i in range(1, 16)]
 w.aiqicha_crawler.results.append({"公司名": "查无此公司", "状态": "未找到", "数据来源": "爱企查"})
@@ -69,7 +74,7 @@ w._auto_save("测试保存")
 drain()
 
 files = sorted(p.name for p in TMP.iterdir())
-assert files == [G.RAW_FILE_NAME, G.CLEAN_FILE_NAME], f"目录里应只有两份固定文件：{files}"
+assert files == FIXED_FILES, f"目录里应只有那三份固定文件：{files}"
 assert not list(TMP.glob("*.tmp")), "不应留下临时文件"
 from openpyxl import load_workbook
 wb = load_workbook(TMP / G.RAW_FILE_NAME)
@@ -80,14 +85,14 @@ wb = load_workbook(TMP / G.CLEAN_FILE_NAME)
 clean_rows = wb.active.max_row
 wb.close()
 assert clean_rows > 0, "清洗文件应有数据"
-print(f"① 两份固定文件 ✓ 原数据 {raw_rows} 条 / 清洗文件含 {clean_rows} 行（未找到不进库）")
+print(f"① 三份固定文件 ✓ 原数据 {raw_rows} 条 / 清洗文件含 {clean_rows} 行（未找到不进库）")
 
 # ── 2. 同名覆盖：第二次保存替换内容而不是堆文件 ─────────
 w.qizhidao_crawler.results.append(make_record(99, "企知道"))
 w._auto_save("第二次")
 drain()
 files = sorted(p.name for p in TMP.iterdir())
-assert files == [G.RAW_FILE_NAME, G.CLEAN_FILE_NAME], f"覆盖式保存不该堆文件：{files}"
+assert files == FIXED_FILES, f"覆盖式保存不该堆文件：{files}"
 wb = load_workbook(TMP / G.RAW_FILE_NAME)
 assert wb.active.max_row - 1 == 37, f"应覆盖为 37 条：{wb.active.max_row - 1}"
 wb.close()
@@ -187,7 +192,7 @@ wb = load_workbook(TMP / G.RAW_FILE_NAME)
 assert wb.active.max_row - 1 == 79, f"最后一次请求的数据必须落盘：{wb.active.max_row - 1}"
 wb.close()
 files = sorted(p.name for p in TMP.iterdir())
-assert files == [G.RAW_FILE_NAME, G.CLEAN_FILE_NAME], files
+assert files == FIXED_FILES, files
 print("⑤ 保存请求不排队只保留最后一次，最终数据一致 ✓")
 
 print("AUTOSAVE_OFFLINE_OK")

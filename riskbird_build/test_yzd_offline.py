@@ -587,7 +587,11 @@ assert task["yzd_group"] == "光伏组" and task["yzd_saved"] == 6, task
 assert task["yzd_import_at"], task
 
 # 历史任务走“回读 xlsx”这条路：当前会话没有内存数据时读文件
-# （会话目录里只有一份包含“未找到”公司的 3 行原数据，清洗后应只剩 2 行）
+# 会话目录里那份原数据 3 行：① 深圳（手机 + 邮箱）② 广州（只有固话）
+# ③ 空行公司（状态未找到、三个联系方式全空）。两道口径各挡一行，且**必须分开**
+# 说清是谁挡的——「清洗丢了行」与「只留手机号的口径挡了行」在界面上症状一模一样：
+#   build_clean_rows          → 2 行（③ 状态未找到＝无效行，清洗出口就挡掉）
+#   filter_cn_mobile_rows     → 1 行（② 只有固话，按「国内只留手机号」不进口径）
 w.qizhidao_crawler.results = []
 old_task = next(t for t in T.load_tasks() if t["id"] == "2026-10-05_10-00-00")
 old_task["raw_file"] = raw_path
@@ -600,7 +604,13 @@ while time.time() < deadline and not FakeBox.shown:
     app.processEvents()
     time.sleep(0.02)
 app.processEvents()
-assert uploads and sum(uploads) == 2, f"历史任务应回读原数据文件后上传：{uploads}"
+assert uploads and sum(uploads) == 1, f"历史任务应回读原数据文件后上传 1 条（见上面两道口径）：{uploads}"
+_imp_log = w.log_text.toPlainText()
+assert "原始 3 行 → 入库 2 条" in _imp_log and "剔除无效 1 行" in _imp_log, \
+    f"清洗出口丢掉的那行要留痕并说清是哪一条（③ 空行公司：状态未找到＝无效行），" \
+    f"否则用户只看到「少一条」，无从判断哪一步：{_imp_log[-400:]}"
+assert "国内只留手机号：2 条 → 1 条" in _imp_log, \
+    f"被「只留手机号」口径挡掉的那行（② 只有固话）必须在日志里点名是哪道口径：{_imp_log[-400:]}"
 assert "名单B" in FakeBox.shown[-1][2], FakeBox.shown[-1][2]
 
 # 后端业务失败（code=1）不能当成功，且要走完解锁

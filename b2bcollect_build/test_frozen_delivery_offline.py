@@ -52,6 +52,9 @@
   T. 落点纪律门禁：--acl-doctor 必须在**发包前**认出「数据写进应用包里」——候选链
      和实际落点都查，打包态违规退 9（落点违规），源码态只报现状；这一类故意不进
      服务故障分类表（那三张表说的是服务为什么连不上），但必须进退出码全表和帮助
+  U. 窗口冒烟门禁：--ui-smoke 让**产物自己**把界面真建一遍，三处打包入口都跑它，
+     Mac 那两处还跑在只读副本上（App Translocation 现场）；正例退 0、反例退非零并
+     留下崩溃日志——doctor 不碰 Qt，「CI 全绿、用户双击没界面」这一类只能由这条拦
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -73,6 +76,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import textwrap
 import time
 import zipfile
@@ -239,35 +243,21 @@ def _frozen(ws, state_dir=None):
 
     三个开关缺一不可：``sys.frozen`` 是本仓库所有 frozen 判定的唯一依据，
     ``sys._MEIPASS`` 决定「随包」这一级指向哪，``sys.executable`` 决定「程序同级」
-    与「包旁」指向哪。少拨一个，测的就不是打包态了。
+    与「包旁」指向哪。少拨一个，测的就不是打包态了；拨了不收回，测的就是邻居的
+    环境——所以三项都交给 ``_sys`` 按名字存取，这一层不再自己记 old。
     """
-    old = (getattr(sys, "frozen", None), getattr(sys, "_MEIPASS", None),
-           sys.executable)
     saved_env = os.environ.get("B2B_STATE_DIR")
-    sys.frozen = True
-    sys._MEIPASS = str(ws["bundle"])
-    sys.executable = str(ws["exe_dir"] / "B2bCollectTool.exe")
-    if state_dir is not None:
-        os.environ["B2B_STATE_DIR"] = str(state_dir)
-    try:
-        yield ws
-    finally:
-        (f, m, e) = old
-        if f is None:
-            if hasattr(sys, "frozen"):
-                del sys.frozen
-        else:
-            sys.frozen = f
-        if m is None:
-            if hasattr(sys, "_MEIPASS"):
-                del sys._MEIPASS
-        else:
-            sys._MEIPASS = m
-        sys.executable = e
-        if saved_env is None:
-            os.environ.pop("B2B_STATE_DIR", None)
-        else:
-            os.environ["B2B_STATE_DIR"] = saved_env
+    with _sys(frozen=True, _MEIPASS=str(ws["bundle"]),
+              executable=str(ws["exe_dir"] / "B2bCollectTool.exe")):
+        if state_dir is not None:
+            os.environ["B2B_STATE_DIR"] = str(state_dir)
+        try:
+            yield ws
+        finally:
+            if saved_env is None:
+                os.environ.pop("B2B_STATE_DIR", None)
+            else:
+                os.environ["B2B_STATE_DIR"] = saved_env
 
 
 @contextlib.contextmanager
@@ -279,6 +269,69 @@ def _patch(obj, name, value):
         yield
     finally:
         setattr(obj, name, old)
+
+
+_ABSENT = object()
+
+
+@contextlib.contextmanager
+def _sys(**values):
+    """按**名字**拨 sys 上的运行形态开关，退出时按名字还原。
+
+    为什么不让各节自己写 ``old = (sys.platform, sys.executable, ...)`` 这种位置元组：
+    T 节原来就是这么写的，取值顺序是 (platform, executable, frozen)，还原却按
+    (platform, frozen, executable) 赋回去——于是 ``sys.frozen`` 变成一个真值字符串、
+    ``sys.executable`` 变成 ``None``。它当场没红，红的是后面一整节（U 节在进程内真建
+    窗口，撞上 ``Path(None)``），报的还是「NoneType」这种和产品毫不相干的栈。这类缺陷
+    最坏的地方不在红，而在**红的位置离真因隔了一整节**：排查的人会先去查产品代码。
+    按名字存取让两边不可能错开；传 ``None`` 表示「这项要恢复成没拨过的样子」，直接
+    从 sys.__dict__ 删掉——``tool_config.is_frozen()`` 读的就是「有没有这个属性」。
+    """
+    old = {k: getattr(sys, k, _ABSENT) for k in values}
+    for k, v in values.items():
+        if v is None:
+            sys.__dict__.pop(k, None)
+        else:
+            setattr(sys, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is _ABSENT:
+                sys.__dict__.pop(k, None)
+            else:
+                setattr(sys, k, v)
+
+
+# 开跑前的运行形态快照：必须在**任何小节拨开关之前**记下来（写在模块顶部就是这个意思），
+# 它同时是「源码态」的标准答案和「谁没收拾」的判据来源。
+_SYS_SNAPSHOT = {"platform": sys.platform, "executable": sys.executable,
+                 "frozen": getattr(sys, "frozen", None),
+                 "_MEIPASS": getattr(sys, "_MEIPASS", None)}
+
+
+@contextlib.contextmanager
+def _source_form():
+    """把运行形态开关压回「本机源码直跑」这一档，退出时按现场恢复。
+
+    为什么 U 节要自己接管：本套十几节都会拨 frozen/_MEIPASS/executable，而 U 节是在
+    **同一个进程内**真建 Qt 窗口。邻居留一个半拨的状态（frozen 成了真值字符串、
+    executable 成了 None）时，U 节红的是 ``Path(None)`` 那种 TypeError——看着像新加的
+    门禁自己有 bug，其实是上一节没收拾。用例的输入只能由夹具决定，不能由「谁先跑」
+    决定，这条与 P/Q 节自己接管 ``Path.home``、cwd 是同一条纪律。
+    """
+    with _sys(**_SYS_SNAPSHOT):
+        yield
+
+
+def _switches_left() -> list:
+    """跑完全部小节后，与开跑前快照不一致的那几项（空 = 每一节都把自己拨走的收回了）。"""
+    out = []
+    for key, want in _SYS_SNAPSHOT.items():
+        now = getattr(sys, key, None)
+        if now != want:
+            out.append(f"sys.{key}={now!r}（开跑前是 {want!r}）")
+    return out
 
 
 def _code_only(fn) -> str:
@@ -1932,6 +1985,48 @@ def test_workflow_shell_syntax():
             "本机脚本失败分支把退出码印得出来（${RC} 而不是 $RC）")
     _assert("退出码 ${rc}）" in mac, "Mac workflow 自检门禁的失败文案同理")
 
+    # 5b) 同一份判据盖住交付链上另外几份手写 shell 脚本（派发云打包、取制品、轮询 CI、
+    # 批跑回归）。它们坏的时候恰好都是「排障现场最该看见那个数字」的时刻。登记表里的
+    # 脚本不在位或没提交也要红——一条静默不跑的判据比没有判据更危险（会让人以为验过）。
+    _assert_eq(g.check_script_hygiene(), [], "交付链 shell 脚本：文案卫生 + 在位 + 已提交")
+    for rel in g.HYGIENE_SCRIPTS:
+        _assert((_REPO / rel).is_file(), f"登记的脚本在位：{rel}")
+    _assert("debug/run_offline_regression.sh" in g.HYGIENE_SCRIPTS,
+            "回归入口自己也在判据范围内（它坏掉的那一行正是批跑要报红的那一行）")
+    # 反向对照：登记表读空了这条判据就永远绿，所以先证明它抓得住真问题
+    _saved_scripts = g.HYGIENE_SCRIPTS
+    try:
+        g.HYGIENE_SCRIPTS = ("debug/这个脚本不存在.sh",)
+        _gone = g.check_script_hygiene()
+        _assert(any("这个脚本不存在.sh" in p and "不在位" in p for p in _gone),
+                f"登记了却读不到必须红（判据不许静默空转）：{_gone}")
+        g.HYGIENE_SCRIPTS = ("debug/b2bcollect_bad_hygiene_probe.sh",)
+        probe = _REPO / "debug" / "b2bcollect_bad_hygiene_probe.sh"
+        probe.write_text('echo "清单不完整：$missing（见上）"\n', encoding="utf-8")
+        try:
+            _assert(any("紧跟" in p for p in g.check_script_hygiene()),
+                    "登记过的脚本里出现坏写法同样要红")
+        finally:
+            probe.unlink(missing_ok=True)
+    finally:
+        g.HYGIENE_SCRIPTS = _saved_scripts
+
+    # 5c) 批跑清单的完整性：交付目录里靠命名约定**自动发现**，这条判据核对「磁盘上有、
+    # 清单里没有」。riskbird_build 那 13 个套件就是这么整目录消失了两年的——写完当天
+    # 跑绿，此后随包代码怎么改都不红（本轮手工补跑才发现一条真实上传缺陷）。
+    proc = subprocess.run(["bash", str(_REPO / "debug" / "run_offline_regression.sh"), "--list"],
+                          capture_output=True, text=True, cwd=str(_REPO))
+    _assert_eq(proc.returncode, 0, f"回归入口能解析清单（stderr={proc.stderr[-200:]}）")
+    listed = {ln.strip() for ln in proc.stdout.splitlines() if ln.strip().endswith(".py")}
+    on_disk = {p.relative_to(_REPO).as_posix() for d in g.SHARED_SOURCE_DIRS
+               for p in (_REPO / d).glob("test_*_offline.py")}
+    _assert_eq(sorted(on_disk - listed), [],
+               f"三个交付目录里每个 test_*_offline.py 都在批跑清单里（清单共 {len(listed)} 项）")
+    _assert(len(on_disk) >= 20, f"自动发现真的跑起来了（发现 {len(on_disk)} 个，少于 20 就是约定没匹配上）")
+    for junk in ("append_offline_14.py", "append_offline_15.py", "fix_offline_14_5.py"):
+        _assert(not any(junk in x for x in listed),
+                f"一次性源码补丁脚本不许进批跑（跑一次就往套件里再插一段）：{junk}")
+
     # 5) 安装包编译器不许「赌这台机器恰好装了什么」：本轮 Windows 就是红在 CI 全绿、
     #    产物与自检都过、最后一步找不到 makensis ——镜像里 NSIS 没了，而本机永远复现不了。
     #    判据只看这一步自己的手法：钉版本、钉 sha256、校验不过就停、解压后还要问一次
@@ -1947,6 +2042,18 @@ def test_workflow_shell_syntax():
                 "NSIS_VERSION 钉了具体版本（不钉就会出现「今天能打包、明天打的不是同一个安装包」）")
         for need in ("sha256", "exit 1", "::error::", "-V"):
             _assert(need in prov, f"NSIS 准备步骤保留了 {need}（下载/校验/版本确认任一缺失都是拿坏编译器出包）")
+        # 本轮那次 CI 红的不是 NSIS，是**校验哈希的那一行自己**：Git Bash 里
+        # $RUNNER_TEMP 是带反斜杠的 Windows 路径，而 GNU coreutils 遇到「文件名里含反斜杠」
+        # 会给整行输出加一个 `\` 前缀，`| awk '{print $1}'` 于是取出 `\fcdce…`——
+        # 哈希本身一字不差，比对却永远不过。判据不许依赖字段位置，也不许把文件名喂进输出。
+        # 只看**会被执行的行**：注释里正是写着那种错写法（写给维护者看的），拿原文判
+        # 就是「解释了 bug 的行自己被当成 bug」。
+        prov_code = g._strip_comments(prov)
+        _assert("sha256sum < " in prov_code and 'sha256sum "$1"' not in prov_code,
+                "哈希只从内容算（文件名参与输出时 GNU 会整行加转义前缀，Windows 路径必踩）")
+        _assert('grep -oE "[0-9a-fA-F]{64}"' in prov_code
+                and "| awk '{print $1}'" not in prov_code and "sed -n 2p" not in prov_code,
+                "哈希值按 64 位十六进制取，不按行号/字段位置切（切歪了就是「值对、比对失败」）")
     inst = _step_region(win, "Build Windows installer (NSIS, per-user)")
     _assert(inst is not None and "Program Files (x86)/NSIS" not in inst
             and "这台 runner 上没有 makensis" not in win,
@@ -1976,6 +2083,8 @@ def test_packaging_manifest_gate():
       2) 硬门脚本自己判得对不对（反例：删一条、放错目录，都必须红）；
       2b) 第 7 条——要进包的源码必须已在**提交**里（本机绿、CI 检出后没文件就是它）；
       2c) 第 8 条——清单顺着 import 走必须闭合，故意让位给本目录的那几笔要登记理由；
+      2d) 第 10 条——三个交付目录里的同名拷贝要么字节一致、要么登记分叉理由（生效的那
+          份由 import 顺序决定，「一致但都是旧的」还要按行为钉住）；
       3) 产物自检的通道完整性（打包态退 3、源码态只警告、那条提前返回不放过）；
       4) 界面说话只点名「该给却没给」的那几路，档位藏起来的路绝不念出来。
     """
@@ -2117,6 +2226,77 @@ def test_packaging_manifest_gate():
                               gate.shadowed_modules())
     _assert(any("两份同名实现" in p for p in got6),
             f"让位登记与进包清单同时出现＝两份实现一起进包，必须红：{got6}")
+
+    # 2d) 第 10 条「跨目录同名拷贝必须在案」。这条盯的不是「少文件」，是「多份文件里挑了
+    # 一份旧的」：三个交付目录里有同名 .py，产物实际吃到哪一份由 sys.path 顺序决定
+    # （riskbird_gui 把 ../b2bcollect_build 插到最前，b2bcollect 那份永远赢）。本轮实测的
+    # 代价：两处上传侧修复只落在 riskbird 那份 yzd_client.py 里，进包生效的是 b2bcollect
+    # 那份旧的——界面不报错、日志不报错、CI 全绿，客户库里却多了没有联系方式的行，超长
+    # 手机号被从中间切成打不通的半截号。症状和「压根没写过这个修复」一模一样。
+    _assert_eq(gate.check_shared_source(), [],
+               "真实仓库现况：同名源码要么字节一致，要么在 DIVERGENT_VENDORED 登记了理由")
+    copies = [gate.ROOT / d / "yzd_client.py" for d in gate.SHARED_SOURCE_DIRS]
+    _assert(all(p.is_file() for p in copies), "yzd_client 三份拷贝都在位")
+    _assert_eq(len({gate._file_digest(p) for p in copies}), 1,
+               "yzd_client 三份字节一致（本轮同步的就是那两处上传侧修复）")
+    # 一致 ≠ 对：三份一起停在旧实现，这条判据同样是绿的。所以还要按行为钉住生效的那一份
+    import yzd_client as _yzd
+    _numbers = ",".join(f"1380000000{i}" for i in range(9))     # 9 条 = 107 字符 > 上限 100
+    _clamped = _yzd.clamp_fields({"手机号": _numbers})["手机号"]
+    _assert(len(_clamped) <= _yzd.FIELD_LIMITS["手机号"], "超长号码列收进字段上限")
+    _assert(all(_yzd.PHONE_RE.search(p) for p in _clamped.split(",")),
+            f"收拢后每一条都是完整号码（旧实现 text[:100] 会把最后一条切成半截打不通）"
+            f"（实际={_clamped!r}）")
+    _assert(not _yzd.has_contact({"企业名称": "只有一家公司名", "手机号": "", "固话": "",
+                                 "邮箱": "", "微信号": ""}),
+            "三个联系方式全空的行判为「不可入库」（旧实现没有这道过滤）")
+
+    # 反向对照：把判据放回到一个假仓库里跑四种现场，缺一种就说明它有一头是空转
+    fake = Path(tempfile.mkdtemp(prefix="shared_gate_"))
+    try:
+        dirs = {}
+        for _i, name in enumerate(gate.SHARED_SOURCE_DIRS):
+            dirs[name] = fake / name
+            dirs[name].mkdir(parents=True)
+            # same.py 三份一致；fork.py 三份不同；test_only.py 只有一份且是测试文件
+            # （分叉内容按下标生成，绝不能用 hash()：它是每进程加盐的，两台机器上可能
+            #   撞成相同值，那下面几条「必须红」就全成了空跑）
+            (dirs[name] / "same.py").write_text("A = 1\n", encoding="utf-8")
+            (dirs[name] / "fork.py").write_text(f"B = {_i}\n", encoding="utf-8")
+            # 测试文件三份故意不同：前缀判据一旦失效，这条就会把回归套件判成缺陷
+            (dirs[name] / "test_only.py").write_text(f"# {_i}\n", encoding="utf-8")
+        # 夹具检查：fork.py 必须真的分叉，否则下面几条「必须红」全是空跑
+        _assert_eq(len({(d / "fork.py").read_bytes() for d in dirs.values()}),
+                   len(gate.SHARED_SOURCE_DIRS), "反例起点：fork.py 三份内容互不相同")
+        with _patch(gate, "ROOT", fake), _patch(gate, "DIVERGENT_VENDORED",
+                                                {"fork.py": "两份按产品各留一份（假登记）"}):
+            _assert_eq(gate.check_shared_source(), [],
+                       "一致的不动、分叉的登记过 → 放行（test_ 前缀不参与）")
+        with _patch(gate, "ROOT", fake), _patch(gate, "DIVERGENT_VENDORED", {}):
+            got9 = gate.check_shared_source()
+            _assert(any("fork.py" in p and "sys.path" in p for p in got9),
+                    f"分叉又没登记必须红，还要说清「哪份生效由 import 顺序决定」：{got9}")
+            _assert_eq([p for p in got9 if "same.py" in p or "test_only.py" in p], [],
+                       "一致的文件与测试文件不被牵连（误报会把整条门禁消耗成噪音）")
+        with _patch(gate, "ROOT", fake), _patch(gate, "DIVERGENT_VENDORED", {"fork.py": "  "}):
+            got10 = gate.check_shared_source()
+            _assert(any("fork.py" in p and "没写理由" in p for p in got10),
+                    f"登记了却不写理由同样要红：{got10}")
+        for d in dirs.values():                     # 后来同步了，登记却留着
+            (d / "fork.py").write_text("B = 1\n", encoding="utf-8")
+        with _patch(gate, "ROOT", fake), _patch(gate, "DIVERGENT_VENDORED",
+                                                {"fork.py": "曾经分叉的理由"}):
+            got11 = gate.check_shared_source()
+            _assert(any("fork.py" in p and "该删了" in p for p in got11),
+                    f"早已一致还挂着「允许不同」的登记要红（否则下次真分叉时这张表不值得信）"
+                    f"：{got11}")
+        with _patch(gate, "ROOT", fake), _patch(gate, "SHARED_SOURCE_DIRS",
+                                                ("b2bcollect_build", "no_such_build")):
+            got12 = gate.check_shared_source()
+            _assert(any("no_such_build" in p for p in got12),
+                    f"交付目录整个不见了也要红，不能当成「没有同名文件」悄悄放过：{got12}")
+    finally:
+        shutil.rmtree(fake, ignore_errors=True)
 
     # CLI 退出码语义：CI 靠它拦构建，返回 1 就等于门禁形同虚设
     proc = subprocess.run([sys.executable,
@@ -2765,91 +2945,426 @@ def test_path_discipline_gate():
     macos = app / "Contents" / "MacOS"
     macos.mkdir(parents=True)
     (macos / "B2bCollectTool").write_text("MZ", encoding="utf-8")
-    old = (sys.platform, sys.executable, getattr(sys, "frozen", None))
     try:
-        sys.platform = "darwin"
-        sys.frozen = True
-        sys.executable = str(macos / "B2bCollectTool")
+        with _sys(platform="darwin", frozen=True,
+                  executable=str(macos / "B2bCollectTool")):
 
-        code0, lines0 = ag._path_discipline(frozen=True)
-        _assert_eq(code0, ag.DOCTOR_EXIT_OK, "候选与实际落点都在包外时判绿（不误伤好包）")
-        _assert(any("落点纪律" in l for l in lines0),
-                f"绿也要在报告里留一行，否则下次没人记得这道门在不在（实际={lines0}）")
+            code0, lines0 = ag._path_discipline(frozen=True)
+            _assert_eq(code0, ag.DOCTOR_EXIT_OK, "候选与实际落点都在包外时判绿（不误伤好包）")
+            _assert(any("落点纪律" in l for l in lines0),
+                    f"绿也要在报告里留一行，否则下次没人记得这道门在不在（实际={lines0}）")
 
-        # 旧写法「exe 同级 = Contents/MacOS 也进候选链」：判据必须认出来并点名。
-        # 这里**只**改候选链、不改 inside_app_bundle：后者既是排除规则又是这道门禁的
-        # 判据，整体打桩会把两边一起打掉（自废武功式的假绿），那正是 7a0 立条要避免的。
-        with _patch(tc, "state_dir_candidates", lambda subdir="": [macos / tc.STATE_DIR_NAME]):
-            code1, lines1 = ag._path_discipline(frozen=True)
-        _assert_eq(code1, ag.DOCTOR_EXIT_PATH, "候选链里出现包内那一级时直接判红（不许发货）")
-        _assert(any(str(macos) in l or str(macos.resolve()) in l for l in lines1),
-                f"红的那一段必须点名是哪一处（实际={lines1}）")
-        _assert(any("test_data_dir_offline" in l for l in lines1),
-                "报告要给下一步该做什么（离线判据在哪、按形态排除是什么意思）"
-                f"（实际={lines1}）")
+            # 旧写法「exe 同级 = Contents/MacOS 也进候选链」：判据必须认出来并点名。
+            # 这里**只**改候选链、不改 inside_app_bundle：后者既是排除规则又是这道门禁的
+            # 判据，整体打桩会把两边一起打掉（自废武功式的假绿），那正是 7a0 立条要避免的。
+            with _patch(tc, "state_dir_candidates", lambda subdir="": [macos / tc.STATE_DIR_NAME]):
+                code1, lines1 = ag._path_discipline(frozen=True)
+            _assert_eq(code1, ag.DOCTOR_EXIT_PATH, "候选链里出现包内那一级时直接判红（不许发货）")
+            _assert(any(str(macos) in l or str(macos.resolve()) in l for l in lines1),
+                    f"红的那一段必须点名是哪一处（实际={lines1}）")
+            _assert(any("test_data_dir_offline" in l for l in lines1),
+                    "报告要给下一步该做什么（离线判据在哪、按形态排除是什么意思）"
+                    f"（实际={lines1}）")
 
-        # 包内判定必须对同一个目录的两种拼写都成立：macOS 上 /var 是 /private/var 的
-        # 软链，而 App Translocation 就发生在 /private/var/folders 这一棵上。只认其中
-        # 一种拼写（一边 resolve 一边不 resolve），这条纪律恰好会在最需要它的那台机器
-        # 上把包内判成包外——本轮给自检加这道门时就是这样实测出来的。
-        _assert(tc.inside_app_bundle(macos / tc.STATE_DIR_NAME)
-                and tc.inside_app_bundle(macos.resolve() / tc.STATE_DIR_NAME),
-                "包内判定对软链两种拼写都成立（比较前统一 resolve）")
-        _assert(not tc.inside_app_bundle(app.parent / tc.STATE_DIR_NAME),
-                "包旁那个目录不算包内（否则包旁这一级会被自己排除掉，退路全断）")
+            # 包内判定必须对同一个目录的两种拼写都成立：macOS 上 /var 是 /private/var 的
+            # 软链，而 App Translocation 就发生在 /private/var/folders 这一棵上。只认其中
+            # 一种拼写（一边 resolve 一边不 resolve），这条纪律恰好会在最需要它的那台机器
+            # 上把包内判成包外——本轮给自检加这道门时就是这样实测出来的。
+            _assert(tc.inside_app_bundle(macos / tc.STATE_DIR_NAME)
+                    and tc.inside_app_bundle(macos.resolve() / tc.STATE_DIR_NAME),
+                    "包内判定对软链两种拼写都成立（比较前统一 resolve）")
+            _assert(not tc.inside_app_bundle(app.parent / tc.STATE_DIR_NAME),
+                    "包旁那个目录不算包内（否则包旁这一级会被自己排除掉，退路全断）")
 
-        # 只看候选链不够：真正选中的落点在包内同样要红（探针运气挑出包内路径那种形态）
-        with _patch(tc, "state_dir", lambda subdir="": macos / tc.STATE_DIR_NAME):
-            code2, lines2 = ag._path_discipline(frozen=True)
-        _assert_eq(code2, ag.DOCTOR_EXIT_PATH, "实际落点跑进包里同样判红（不靠「候选看着干净」）")
+            # 只看候选链不够：真正选中的落点在包内同样要红（探针运气挑出包内路径那种形态）
+            with _patch(tc, "state_dir", lambda subdir="": macos / tc.STATE_DIR_NAME):
+                code2, lines2 = ag._path_discipline(frozen=True)
+            _assert_eq(code2, ag.DOCTOR_EXIT_PATH, "实际落点跑进包里同样判红（不靠「候选看着干净」）")
 
-        # 源码态不判红：开发机的数据本来就该待在仓库目录里（与 N 节通道口径同一纪律）
-        with _patch(tc, "state_dir_candidates",
-                    lambda subdir="": [macos / tc.STATE_DIR_NAME]):
-            code3, _ = ag._path_discipline(frozen=False)
-        _assert_eq(code3, ag.DOCTOR_EXIT_OK, "源码态只报现状不判红（别把开发机拖成红灯）")
+            # 源码态不判红：开发机的数据本来就该待在仓库目录里（与 N 节通道口径同一纪律）
+            with _patch(tc, "state_dir_candidates",
+                        lambda subdir="": [macos / tc.STATE_DIR_NAME]):
+                code3, _ = ag._path_discipline(frozen=False)
+            _assert_eq(code3, ag.DOCTOR_EXIT_OK, "源码态只报现状不判红（别把开发机拖成红灯）")
 
-        # 新类别的三件配套事：有码、进了全表、帮助里念得出名字
-        _assert(ag.DOCTOR_EXIT_PATH not in {v[0] for v in ag._DOCTOR_KINDS.values()},
-                "落点违规不许混进「服务故障分类表」（那三张表说的是服务为什么连不上）")
-        _assert(ag.DOCTOR_EXIT_PATH in {c for c, _ in ag._DOCTOR_EXIT_TABLE},
-                "退出码进了常量却没进全表 = --doctor 帮助里它没名字（上一轮就吃过这亏）")
-        _assert("9" in ag.DOCTOR_EXIT_HELP and "落点违规" in ag.DOCTOR_EXIT_HELP,
-                f"帮助文本要数得出这一类（实际={ag.DOCTOR_EXIT_HELP}）")
-        src = _code_only(ag.doctor_lines)
-        _assert("_path_discipline" in src and "path_code" in src,
-                "自检必须真的调用这道门禁并把它的码并进结论（只写函数不调用＝门开着）")
+            # 新类别的三件配套事：有码、进了全表、帮助里念得出名字
+            _assert(ag.DOCTOR_EXIT_PATH not in {v[0] for v in ag._DOCTOR_KINDS.values()},
+                    "落点违规不许混进「服务故障分类表」（那三张表说的是服务为什么连不上）")
+            _assert(ag.DOCTOR_EXIT_PATH in {c for c, _ in ag._DOCTOR_EXIT_TABLE},
+                    "退出码进了常量却没进全表 = --doctor 帮助里它没名字（上一轮就吃过这亏）")
+            _assert("9" in ag.DOCTOR_EXIT_HELP and "落点违规" in ag.DOCTOR_EXIT_HELP,
+                    f"帮助文本要数得出这一类（实际={ag.DOCTOR_EXIT_HELP}）")
+            src = _code_only(ag.doctor_lines)
+            _assert("_path_discipline" in src and "path_code" in src,
+                    "自检必须真的调用这道门禁并把它的码并进结论（只写函数不调用＝门开着）")
     finally:
-        sys.platform, sys.executable = old[0], old[2]
-        if old[1] is None:
-            sys.__dict__.pop("frozen", None)
-        else:
-            sys.frozen = old[1]
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ── U. 窗口冒烟门禁 ────────────────────────────────────────────────────────
+# 这一条管的是「CI 全绿、用户双击却没界面」那类盲区：--acl-doctor 验凭证、验通道、
+# 验落点，唯独不碰 Qt，而本轮两份实机故障恰好都落在 Qt 那一段（Mac 崩在建名单通道，
+# Windows 崩在建窗口之前的 import）。所以判据分三层，缺一层就有一个方向被放过：
+#   界面侧：开关认得出、分派早于任何副作用、不与自检同族；
+#   行为侧：正例真把窗口建出来退 0，反例（只读卷上的 OSError）退非零并留下崩溃日志；
+#   入口侧：三处打包入口都跑了它，Mac 那两处还跑在**只读副本**上，且仿真自己也被验活。
+SMOKE_STEP_NAME = "Window smoke gate"
+SMOKE_MARK = "--ui-smoke"
+
+
+def _smoke_region(text: str, is_workflow: bool) -> str:
+    """三处入口里「窗口冒烟」那一段**会被执行**的行。
+
+    workflow 按 step 切（注释整体剔掉，_iter_steps 已经做了），本机脚本没有 step
+    概念，按整篇剔注释。两处都只留可执行行：这些入口的注释里正写着「--acl-doctor
+    不建窗口」这种话，拿原文判就是「解释了盲区的行自己被当成盲区」。
+    """
+    if not is_workflow:
+        return "\n".join(ln for ln in text.splitlines()
+                         if not ln.strip().startswith("#"))
+    for name, body in _iter_steps(text):
+        if SMOKE_STEP_NAME in name:
+            return body
+    return ""
+
+
+def _smoke_problems(region: str, readonly_expected: bool) -> list:
+    """一段冒烟脚本够不够格当发包门禁。返回问题清单，空 = 合格。"""
+    out = []
+    if SMOKE_MARK not in region:
+        out.append(f"没把 {SMOKE_MARK} 传进产物（跑 --acl-doctor 不算：它刻意不建窗口）")
+    elif not any(k in region for k in ("ExitCode", "rc=$?", "RC=$?")):
+        out.append("冒烟结果没进退出码（只看它跑没跑，红了也不知道为什么红）")
+    if "*.log" not in region:
+        out.append("没查「临时用户目录里有没有崩溃日志」：异常被吞掉、界面勉强开出来"
+                   "那种半坏状态，退出码 0 是绿的")
+    if readonly_expected:
+        if "chmod -R a-w" not in region:
+            out.append("没把副本改成只读：这一步验的就不是 Gatekeeper 转置那个现场")
+        if "touch" not in region:
+            out.append("没验「只读真的生效了」：chmod 失灵时这一步绿得毫无意义")
+        if "wc -l" not in region:
+            out.append("没比对副本前后的文件数：写进包内在没转置的机器上不报错，只会在"
+                       "升级/卸载时把用户数据一起带走")
+    return out
+
+
+# ── V. 运行形态开关的存取纪律 ──────────────────────────────────────────────
+# 本轮 3 条红（663 绿里有 3 条是隔了一整节才红的）根因就在这里：T 节把
+# ``old = (sys.platform, sys.executable, getattr(sys, "frozen", None))`` 存成位置元组，
+# 还原却按 ``sys.executable = old[2]`` / ``sys.frozen = old[1]`` 写——顺序错开一位。
+# 当场不红，红的是下一节（U 节在进程内真建窗口，撞上 Path(None)），报的还是
+# 「NoneType」这种和产品毫不相干的栈。这类缺陷最坏的地方不是红，是**红的位置离真因
+# 隔了一整节**：排查的人会先去查产品代码。所以除了本套自己的 ``_sys``/``_run``，
+# 这条写法要在全部离线套件上被机械地拦住。
+_SWITCH_INDEX_RESTORE = re.compile(
+    r"sys\.(?:frozen|_MEIPASS|executable|platform)\s*=\s*[A-Za-z_]\w*\[\d\]")
+_SWITCH_TUPLE_SAVE = re.compile(
+    r"(?:^|[\s(])(?:old|saved|before|_old|_saved)\s*=\s*\(\s*sys\.(?:frozen|_MEIPASS|executable|platform)\b")
+
+
+_STR_TOKENS = {tokenize.COMMENT, tokenize.STRING}
+for _name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):   # Python 3.12+ 拆开 f-string
+    _tok = getattr(tokenize, _name, None)
+    if _tok is not None:
+        _STR_TOKENS.add(_tok)
+
+
+def _switch_code_text(text: str):
+    """把注释与字符串**就地**掩成空格，返回只剩代码骨架的文本；行号与列位一字不移。
+
+    为什么是掩字符而不是跳过整行：本节自己的反例样本就写在代码行上
+    （``_bad_restore = "…sys.frozen = old[1]…"``），跳过整行会把同一行上真会执行的代码
+    一起放过；而 docstring/注释里那两句是**解释**这种写法为什么不行，不是要拦的行为。
+    一条误报的代价比漏报还大：下一来的人会为了消红去改判据。
+    读不懂（语法错、编码怪异）返回 None，调用方必须判红——「读不懂」不等于「没问题」。
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except Exception:
+        return None
+    lines = text.splitlines(keepends=True)
+    for tok in tokens:
+        if tok.type not in _STR_TOKENS:
+            continue
+        sl, sc, el, ec = tok.start[0], tok.start[1], tok.end[0], tok.end[1]
+        for i in range(sl, el + 1):
+            ln = lines[i - 1]
+            body = ln.rstrip("\r\n")
+            a = max(0, min(sc if i == sl else 0, len(body)))
+            b = max(a, min(ec if i == el else len(body), len(body)))
+            lines[i - 1] = body[:a] + " " * (b - a) + ln[len(body):]
+    return "".join(lines)
+
+
+def _switch_discipline_hits(text: str, where: str = "<文本>"):
+    """在这份源码上跑一次纪律，返回「位置:行号: 原文」清单；None 表示这份文本读不懂。"""
+    skeleton = _switch_code_text(text)
+    if skeleton is None:
+        return None
+    src = text.splitlines()
+    out = []
+    for lineno, line in enumerate(skeleton.splitlines(), 1):
+        if _SWITCH_INDEX_RESTORE.search(line) or _SWITCH_TUPLE_SAVE.search(line):
+            out.append(f"{where}:{lineno}: {src[lineno - 1].strip()[:80]}")
+    return out
+
+
+def _switch_scan_files():
+    """纪律扫描范围：三个交付目录的 test_*.py + 交付链上全部 debug/*.py。"""
+    g = _manifest_gate()
+    dirs = [d for d in g.SHARED_SOURCE_DIRS if (_REPO / d).is_dir()]
+    _assert_eq(len(dirs), len(g.SHARED_SOURCE_DIRS),
+               f"交付目录都在位，范围没缩水（登记 {list(g.SHARED_SOURCE_DIRS)}，实到 {dirs}）")
+    return sorted({p for d in dirs for p in (_REPO / d).glob("test_*.py")} |
+                  set((_REPO / "debug").glob("*.py"))), dirs
+
+
+def _switch_scan_hits(files):
+    """对一批文件跑纪律，返回违规清单；读不出来/读不懂的文件也算违规（不是跳过）。"""
+    hits = []
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            hits.append(f"{f.relative_to(_REPO)}: 读不出来（{exc}）")
+            continue
+        got = _switch_discipline_hits(text, str(f.relative_to(_REPO)))
+        if got is None:
+            hits.append(f"{f.relative_to(_REPO)}: 语法读不懂，这条判据在它上面没跑")
+            continue
+        hits.extend(got)
+    return hits
+
+
+def test_switch_discipline_gate():
+    print("\n═══ V. 开关存取纪律：不许用位置元组存运行形态开关（还原错一位没人看得出来）═══")
+    # 扫描范围按「三个交付目录 + 交付链脚本」来，不写 `*/test_*.py`：仓库里躺着本地备份
+    # 目录（b2bcollect_build_backup_20261106 那种），它们既不进包也不参与交付，把里面
+    # 特意保留的旧写法算成产品缺陷，这条判据就永久红——而永久红的判据等于没有判据。
+    # 目录清单取自构建前硬门，两边共用一张表（各抄一份迟早会漂）。
+    files, dirs = _switch_scan_files()
+    _assert(len(files) >= 40, f"扫描范围不是空的（实扫 {len(files)} 个文件，少于 40 就是通配写错了）")
+    _assert(__file__ in [str(f) for f in files], "本套自己也在扫描范围内（判据不许只量别人）")
+    _assert(not any("backup" in p.as_posix() for p in files),
+            "本地备份目录不在范围内（不进包的东西不该决定交付判据）")
+    _assert_eq(_switch_scan_hits(files), [], "全部离线套件里没有人用位置元组存/还运行形态开关"
+                       "（改回按名字存取：with _sys(...) / with _switches(...)）")
+    # 反向对照：把本轮真出过事的那两句喂给判据，必须各抓一次（抓不住就是空转）
+    _bad_restore = "        sys.frozen = old[1]\n"
+    _bad_save = "    old = (sys.platform, sys.executable, getattr(sys, 'frozen', None))\n"
+    _assert(_SWITCH_INDEX_RESTORE.search(_bad_restore), "反例①：按位置还原必须被抓住")
+    _assert(_SWITCH_TUPLE_SAVE.search(_bad_save), "反例②：位置元组取值必须被抓住")
+    _sample = ("# 注释里写 old = (sys.platform, sys.executable)\n"
+               "def f():\n"
+               '    """文档里写 old = (sys.platform, sys.executable) 这种位置元组\n'
+               "    是本轮翻车的那句，这里只是在解释它为什么不行\"\"\"\n"
+               "    sys.frozen = old[1]\n")
+    # 掩码版判据的三条要害：行号不漂、同一行上的真代码一个字符不少、字符串里的反例不算
+    _sample = _sample + '    print("上面那行才是真违规，这一句里的 sys.frozen = old[1] 只是话")'
+    _masked = _switch_code_text(_sample)
+    _assert(_masked is not None, "反例③起点：样例读得懂（读不懂时后面几条全是空跑）")
+    _assert_eq(len(_masked.splitlines()), len(_sample.splitlines()),
+               "反例③：掩码不合并行也不拆行（行号一漂，报出来的位置就不是人能跳过去的位置）")
+    _assert_eq(_masked.splitlines()[0], " " * len(_sample.splitlines()[0]),
+               "注释整行掩成等长空格：判据抓的是代码骨架，报出来的位置却还是原文的位置")
+    _assert(not _masked.splitlines()[2].strip() and not _masked.splitlines()[3].strip(),
+            "跨两行的 docstring 也掩干净，那两句示例说明都不算违规")
+    _assert_eq(_switch_discipline_hits(_sample, "样例"), ["样例:5: sys.frozen = old[1]"],
+               f"反例④：真违规那行照抓，同一份文本里注释/docstring/字符串上的同一句不抓"
+               f"（实际={_switch_discipline_hits(_sample, '样例')}）")
+    _assert("print(" in _masked.splitlines()[5] and "old[1]" not in _masked.splitlines()[5],
+            "字符串只掩字面量本身，同一行上的真代码一个字符都没少（跳过整行的老写法做不到）")
+    _fs = '    print(f"翻车那句是 sys.frozen = old[1]，值是 {old[1]}")'
+    _assert_eq(_switch_discipline_hits(_fs, "f串"), [],
+               "反例⑤：f-string 里的反例文字不算代码（3.12+ 把它拆成 FSTRING_* token，一样要掩）")
+    _assert_eq(_switch_discipline_hits(_bad_restore, "坏"), ["坏:1: sys.frozen = old[1]"],
+               "同样一份判据放在可执行行上照样抓得住（掩码不是把判据调松）")
+    _assert_eq(_switch_discipline_hits(Path(__file__).read_text(encoding="utf-8"), "本套"), [],
+               "本套不把自己这一节的反例样本判成违规（上一版「跳过整行」就是这么红的）")
+    # 反向对照⑥：上面几条测的是「判据认不认得这种写法」，这一条测的是「真放进交付目录的
+    # 文件会不会被扫到」。少了它，通配写错、目录名漂掉、helper 换成读常量表这些事故都会
+    # 表现成「全绿」——而这条判据当初就是为了拦那个让 U 节隔节翻车的 T 节写法。
+    probe = _REPO / "b2bcollect_build" / "zz_discipline_probe.py"
+    _assert(not probe.exists(), "反例⑥起点干净（探针文件不在位，上次没留残留）")
+    probe.write_text(os.linesep.join(("def g():", "    old = (sys.platform, sys.frozen)",
+                                      "    sys.frozen = old[1]")), encoding="utf-8")
+    try:
+        got6 = _switch_scan_hits([probe])
+        _assert_eq([h.split(":")[1] for h in got6], ["2", "3"],
+                   f"反例⑥：交付目录里新放一个位置元组的文件，扫描当场报出存与还两行"
+                   f"（实际={got6}）")
+    finally:
+        probe.unlink(missing_ok=True)
+    _assert(not any(p.name == probe.name for p in (_REPO / "b2bcollect_build").glob("*.py")),
+            "探针删掉后磁盘上立刻没有它（留一个「故意违规」的文件在交付目录里，下一次扫描就永久红）")
+    _good = ("    with _sys(platform='win32', frozen=True):\n"
+             "        sys.executable = str(exe)\n")
+    _assert_eq(_switch_discipline_hits(_good, "正例"), [],
+               "正例：就地拨、由 with 还——不误伤（否则这条纪律第一天就把所有套件拖红）")
+
+
+def test_window_smoke_gate():
+    print("\n═══ U. 窗口冒烟门禁：产物自己把界面建出来，Mac 跑在只读副本上 ═══")
+    import b2bcollect_gui as _gui
+
+    # 1) 界面侧：写法、分派位置、与自检那条边界
+    _assert_eq(_gui.UI_SMOKE_FLAG, SMOKE_MARK, "冒烟开关的写法（CI 抄的是同一个字符串）")
+    _assert_eq(_gui._doctor_request([SMOKE_MARK]), (False, []),
+               f"{SMOKE_MARK} 既不被当成自检开关，也不进「像自检却认不出」那份清单"
+               "（判错的方向很坏：CI 传冒烟参数却退出 3，红的是门禁不是包）")
+    msrc = _code_only(_gui.main)
+    _assert("UI_SMOKE_FLAG in sys.argv" in msrc and "_ui_smoke_entry()" in msrc,
+            "main() 里真的分派到冒烟入口（只有函数没有分派＝门开着没人走）")
+    _assert(0 < msrc.index("_acl_doctor_entry()") < msrc.index("_ui_smoke_entry()")
+            < msrc.index("previous_pid"),
+            "分派排在自检之后、重启交接与建界面之前——早于任何 Qt/Chrome 副作用")
+    ssrc = _code_only(_gui._ui_smoke_entry)
+    for need in ("MainWindow()", ".show()", "prefetch_authoritative", "install(app)",
+                 "_fatal_log(", "QTimer"):
+        _assert(need in ssrc, f"冒烟入口保留了 {need}（少一样，验的就不是用户那一次双击）")
+    _assert(_gui.UI_SMOKE_EXIT_FAILED != _gui.UI_SMOKE_EXIT_TIMEOUT
+            and _gui.UI_SMOKE_DEADLINE_MS > 0,
+            "「没建出来」与「建到一半卡住」是两种成因，退出码必须分开；看门狗必须有时长")
+
+    # 2) 行为侧：正例退 0、反例退非零并留下崩溃日志。崩溃日志的落点按 Path.home() 算，
+    #    所以整段把家目录指进临时目录——顺手也保证门禁不往真实桌面写东西。运行形态开关
+    #    也由这一段自己接管（_source_form）：建窗口这件事在两种形态下走的落点不同，
+    #    不压回源码态的话，测出来的可能是上一节留下的那副假打包态。
+    root = Path(tempfile.mkdtemp(prefix="uicheck_"))
+    old_home, old_prefetch = Path.home, _gui._access_guard.prefetch_authoritative
+    import site_adapters as _sa
+    import runtime_paths as _rp       # 落点口径本体：它有进程内择路缓存，切环境必须清
+    old_build = _sa.build_list_channels
+    seen = []
+    saved_env = {k: os.environ.get(k) for k in
+                 ("B2B_STATE_DIR", _rp.DATA_DIR_ENV_VAR)}
+    try:
+        Path.home = lambda *a, **k: root
+        _gui._access_guard.prefetch_authoritative = lambda *a, **k: seen.append("prefetch")
+        # 状态目录与采集数据目录整体指进临时目录：建一次界面会读写 seen_store 那几份
+        # 文件，不隔离的话这道门禁每跑一次就动一次开发机的真实数据——而「门禁改了用户的
+        # 数据」会让下一次回归的结果不再由夹具决定（与 _workspace 隔离本地状态同理）。
+        os.environ["B2B_STATE_DIR"] = str(root / "state")
+        os.environ[_rp.DATA_DIR_ENV_VAR] = str(root / "data")
+        _rp.reset_cache()
+        with _source_form():
+            _assert(not tc.is_frozen(), "行为侧跑在源码态（开关由这一段自己拨，不靠邻居收回）")
+            rc = _gui._ui_smoke_entry()
+            _assert_eq(rc, _gui.UI_SMOKE_EXIT_OK, f"正例：窗口建得出来就退 0（实际={rc}）")
+            _assert_eq(seen, ["prefetch"], "冒烟走的是与真实启动同一条路径（含权威身份判定）")
+            _assert(not list(root.rglob("*.log")),
+                    f"正例不该留下崩溃日志（实际={list(root.rglob('*.log'))}）")
+
+            def _boom(*a, **k):
+                raise OSError(30, "Read-only file system")
+
+            _sa.build_list_channels = _boom           # Mac 那份日志的第一个真实形态
+            rc2 = _gui._ui_smoke_entry()
+            _assert_eq(rc2, _gui.UI_SMOKE_EXIT_FAILED,
+                       f"建名单通道撞上只读卷时必须退非零（实际={rc2}）")
+            logs = sorted(root.rglob("*.log"))
+            _assert(logs, "失败要留下一份崩溃日志：Finder 双击没有终端，日志是唯一取证入口")
+            if logs:
+                txt = logs[0].read_text(encoding="utf-8")
+                _assert("Read-only file system" in txt and "运行形态" in txt,
+                        "日志里既要有那句栈，也要有「打包态/转置」这段运行形态抬头")
+                _assert(_gui.FATAL_LOG_NAME in str(logs[0]),
+                        f"日志名与界面话术、说明书用的是同一个常量（{_gui.FATAL_LOG_NAME}）")
+    finally:
+        Path.home = old_home
+        _gui._access_guard.prefetch_authoritative = old_prefetch
+        _sa.build_list_channels = old_build
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _rp.reset_cache()                             # 缓存里还指着临时目录就得清掉
+        shutil.rmtree(root, ignore_errors=True)
+
+    # 3) 入口侧：三处打包入口都把这道门跑起来，Mac 那两处跑在只读副本上
+    wf = _REPO / ".github" / "workflows"
+    win = (wf / "build-b2bcollect.yml").read_text(encoding="utf-8")
+    mac = (wf / "build-b2bcollect-mac.yml").read_text(encoding="utf-8")
+    local_sh = (_REPO / "debug" / "build_b2bcollect_mac_local.sh").read_text(encoding="utf-8")
+    entries = (("Windows workflow", _smoke_region(win, True), False),
+               ("Mac workflow", _smoke_region(mac, True), True),
+               ("本机 Mac 打包脚本", _smoke_region(local_sh, False), True))
+    for label, region, ro in entries:
+        _assert(bool(region), f"{label} 找得出冒烟那一段（找不到=这一步压根不存在）")
+        _assert_eq(_smoke_problems(region, ro), [], f"{label} 的冒烟门禁判据齐全")
+        _assert("--acl-doctor" in (win if label.startswith("Windows") else
+                                   (mac if label.startswith("Mac") else local_sh)),
+                f"{label} 里自检门禁仍在（冒烟补的是 Qt 那段盲区，不替凭证与落点让位）")
+    # 反向对照：三种「顺手改回去」的形态必须各自点名，否则判据只是摆设
+    n = _smoke_region(mac, True).replace(SMOKE_MARK, "--acl-doctor")
+    _assert(any("没把 --ui-smoke 传进产物" in p for p in _smoke_problems(n, True)),
+            "把冒烟退回成「再跑一遍自检」必须判红——那正是本轮的盲区本身")
+    n = _smoke_region(mac, True).replace("chmod -R a-w", "echo ok")
+    _assert(any("只读" in p for p in _smoke_problems(n, True)),
+            "只读副本被摘掉必须判红（Mac 那两份崩溃日志全靠这个形态才复现得出来）")
+    n = _smoke_region(mac, True).replace(' -name "*.log"', '-name "*.txt"')
+    _assert(any("崩溃日志" in p for p in _smoke_problems(n, True)),
+            "不查崩溃日志必须判红（异常被吞掉、界面勉强开出来那种半坏看不出来）")
+    gone = "\n".join(ln for ln in mac.splitlines() if SMOKE_STEP_NAME not in ln)
+    _assert(not _smoke_region(gone, True),
+            "整步删掉时切出来的是空段（判据靠 step 名字定位，改名也要能被看见）")
+
+
+def _switches_state() -> dict:
+    """运行形态开关的当前值（None = 这一项没拨过）。"""
+    return {k: getattr(sys, k, None) for k in _SYS_SNAPSHOT}
+
+
+def _run(section):
+    """跑一节，跑完立刻核对运行形态开关：谁拨走没收回就点谁的名。
+
+    为什么不等到最后统一核对：本轮 T 节还原开关时按位置元组赋错了值（executable 变成
+    None、frozen 变成一个真值字符串），红的是**隔了一整节**的 U 节，报的还是「NoneType」
+    这种和产品毫不相干的栈——排查的人会先去查产品代码。按节点名把这件事的成本从「翻一
+    整套用例」压回「看那一个函数」。最后一道总量核对仍然保留在 main() 末尾：它管的是
+    「每节都恢复到了上一节留下的错值」这种逐节看不出、但结果与开跑前不一致的形态。
+    """
+    before = _switches_state()
+    section()
+    after = _switches_state()
+    diff = [f"sys.{k}: {before[k]!r} → {after[k]!r}"
+            for k in before if before[k] != after[k]]
+    _assert_eq(diff, [], f"{section.__name__} 跑完后的运行形态开关要和进来时一致"
+                         "（拨走不收回＝下一节测的是邻居的环境）")
+
+
+SECTIONS = (
+    test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
+    test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
+    test_clock_skew, test_time_basis, test_console_encoding, test_doctor_flag_parity,
+    test_workflow_shell_syntax, test_packaging_manifest_gate,
+    test_windows_onedir_delivery, test_state_file_never_relative_cwd,
+    test_relaunch_chain_off_the_bundle, test_channel_failure_kind,
+    test_app_translocation_relocation, test_path_discipline_gate,
+    test_switch_discipline_gate,
+    test_window_smoke_gate,
+)
 
 
 def main():
     print("═══ 打包态交付链 离线测试 ═══")
-    test_config_chain()
-    test_oss_credentials()
-    test_failure_taxonomy()
-    test_gui_wording()
-    test_deepseek_and_cache()
-    test_doctor()
-    test_delivery_chain()
-    test_state_dir()
-    test_clock_skew()
-    test_time_basis()
-    test_console_encoding()
-    test_doctor_flag_parity()
-    test_workflow_shell_syntax()
-    test_packaging_manifest_gate()
-    test_windows_onedir_delivery()
-    test_state_file_never_relative_cwd()
-    test_relaunch_chain_off_the_bundle()
-    test_channel_failure_kind()
-    test_app_translocation_relocation()
-    test_path_discipline_gate()
+    for section in SECTIONS:
+        _run(section)
+    # 收尾硬判据：每一节拨走的运行形态开关都必须自己收回去。不查这一条的话，「邻居
+    # 没收拾」这种缺陷要等下一节撞出一个与产品毫不相干的栈才会被发现——本轮 T 节把
+    # sys.executable 还原成 None，红的是隔了一整节的 U 节（Path(None) 的 TypeError），
+    # 排查的人第一反应是「新加的门禁有 bug」。当场点名比隔节报错便宜得多。
+    _assert_eq(_switches_left(), [],
+               "跑完全部小节，运行形态开关要和开跑前一模一样（拨走不收回＝下一节的输入不再由夹具决定）")
+    # 每一节都真的被跑到：新增一节却忘了登记进 SECTIONS，它就永远不会执行，而且从输出上
+    # 看不出来——这正是 riskbird 那 13 个套件的形状（不是坏了，是压根没在跑）。
+    _defined = {n for n, v in globals().items() if n.startswith("test_") and callable(v)}
+    _missing = sorted(_defined - {s.__name__ for s in SECTIONS})
+    _assert_eq(_missing, [], f"文件里每个 test_ 小节都在 SECTIONS 里（漏登记＝这一节从没跑过）")
+    _assert_eq(len({s.__name__ for s in SECTIONS}), len(SECTIONS),
+               "SECTIONS 里没有重名小节（重名会让一节被跑两遍、另一遍掩盖真红）")
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 

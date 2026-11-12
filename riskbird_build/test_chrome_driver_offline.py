@@ -76,6 +76,15 @@ def make_tree(tmp: Path):
     return cache
 
 
+# 拨开关之前先按名字记下现场，末尾按名字还回去（原来不存在的项就直接删掉，恢复成
+# 「没拨过」）。为什么不用 ``sys.frozen = False`` / ``sys._MEIPASS = ""`` 收尾：把
+# ``_MEIPASS`` 留成空串等于给后面任何读它的人一个 ``Path("")`` == 当前工作目录，而那
+# 正是本仓库专门钉住的「运行期文件相对 CWD」那一类缺陷；``frozen`` 留成 False 也只是
+# 碰巧没人读。位置元组同理不可靠：错开一位就变成「executable=None」。
+_SWITCHES = ("frozen", "_MEIPASS", "executable")
+_ABSENT = object()
+_SWITCH_BEFORE = {k: getattr(sys, k, _ABSENT) for k in _SWITCHES}
+
 try:
     tmp = Path(tempfile.mkdtemp())
     cache = make_tree(tmp)
@@ -121,7 +130,13 @@ try:
     assert fake_chrome.calls[0] == cands[0] and len(fake_chrome.calls) == 2, fake_chrome.calls
     assert drv.used == fake_chrome.calls[1], drv
     assert FakeService.stopped == [cands[0]], f"失败的驱动进程要收掉：{FakeService.stopped}"
-    assert any("本地驱动不可用" in m for m in logs), logs
+    # 归因文案要能指到下一步动作：只说「本地驱动不可用」等于让人去重装驱动，而真实原因
+    # 是「这份驱动只支持 Chrome 142 以外的版本」。所以判据是「版本不符 + 两个版本号 +
+    # 底层异常」三件齐全，而不是某句固定话术（话术改一个字就红一条，红了又没人看得懂）。
+    _skip = [m for m in logs if "换下一个" in m]
+    assert _skip, logs
+    assert any("版本不符" in m and "SessionNotCreatedException" in m and "142" in m
+               for m in _skip), f"版本不匹配要说清是哪两个版本不符：{_skip}"
     assert "<selenium-manager>" not in fake_chrome.calls, f"还有本地驱动可试就不该联网：{fake_chrome.calls}"
     print("③ 本地驱动版本不匹配就换下一个，失败进程也收干净 ✓")
 
@@ -161,8 +176,11 @@ try:
 
     # ── 7. 随包代码不再自己建会话（否则每次都要问 SM） ─────────
     import re
+    # 源码红线必须按**文件位置**取，不能按 CWD：从仓库根跑批时这里读的是
+    # "./qizhidao_crawler.py"，不存在 → FileNotFoundError，红法看起来像「源码丢了」。
+    _here = Path(__file__).resolve().parent
     for fname in ("qizhidao_crawler.py", "riskbird_crawler_v2.py"):
-        src = Path(fname).read_text(encoding="utf-8")
+        src = (_here / fname).read_text(encoding="utf-8")
         bare = [ln.strip() for ln in src.split("\n") if re.search(r"webdriver\.Chrome\(", ln)]
         assert not bare, f"{fname} 还在自己建会话：{bare}"
         assert "import chrome_driver" in src and "chrome_driver.create(" in src, fname
@@ -171,7 +189,10 @@ finally:
     for k in [k for k in sys.modules if k.startswith("selenium")]:
         sys.modules.pop(k, None)
     sys.modules.update(_real_selenium)
-    sys.frozen = False
-    sys._MEIPASS = ""
+    for _k, _v in _SWITCH_BEFORE.items():         # 按名字还回去，不留自造的假现场
+        if _v is _ABSENT:
+            sys.__dict__.pop(_k, None)
+        else:
+            setattr(sys, _k, _v)
 
 print("CHROME_DRIVER_OFFLINE_OK")

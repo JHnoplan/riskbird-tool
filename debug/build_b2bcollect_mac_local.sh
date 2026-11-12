@@ -5,16 +5,19 @@
 #   云端 workflow 是主打包路径，但「本机现在就要一个能跑的包」这件事一直没人管：
 #   以前靠手敲 pyinstaller，参数散在 yml 里，敲漏一项就少一层，而少的那一项
 #   （随包 config.json）在症状上表现为「别人电脑上全是精简版」，本机却一切正常。
-#   本脚本与 .github/workflows/build-b2bcollect-mac.yml **同口径**：同样四道门，
-#   同样一份 hidden-import/datas 清单，跑完必须产物自己通过 --acl-doctor。
+#   本脚本与 .github/workflows/build-b2bcollect-mac.yml **同口径**：同样五道门，
+#   同样一份 hidden-import/datas 清单，跑完必须产物自己通过 --acl-doctor 与 --ui-smoke。
 #
-# 四道门（任何一道不过就没有包，不会有半成品）：
+# 五道门（任何一道不过就没有包，不会有半成品）：
 #   0) 打包清单硬门：三处入口的 --add-data/--hidden-import 与 site_adapters 的清单
 #      逐项对拍，缺一项就中止（少一个文件不会报错、只会少一个平台）；
 #   1) 随包凭证：用运行时同一条解析链现写 b2bcollect_build/config.json；
 #   2) 构建前硬门：config.json 不在位就中止（防止把「没带凭证」的包发出去）；
 #   3) 构建后自检：拿 **产物自己** 跑 --acl-doctor 真连权限服务并验采集通道完整性，
-#      不通就报错退出。
+#      不通就报错退出；
+#   4) 只读包窗口冒烟：把 .app 拷一份改成只读再跑 --ui-smoke，复现 Gatekeeper 转置
+#      （App Translocation）那一类「双击没界面」的现场——doctor 刻意不碰 Qt，这一段
+#      不补上就永远是「CI 全绿、用户开不了」。
 #
 # 用法：bash debug/build_b2bcollect_mac_local.sh
 #   可选环境变量：PY=python 解释器（默认 .venv/bin/python）
@@ -143,4 +146,54 @@ if [ "$RC" -ne 0 ]; then
   echo "❌ 产物自检未通过（退出码 ${RC}，报告见上）：这个包发出去只会是精简版，别外发"
   exit "$RC"
 fi
+
+# ── 5) 只读包窗口冒烟：把 Gatekeeper 转置（App Translocation）的现场在本机复现一遍 ──
+#     与云端 Mac workflow 里那一步同一条判据、同一段脚本口径，为什么本机还要再来一次：
+#     外部机器「双击没界面」时，第一手排查不该等到云端跑一轮（十几分钟 + 只能看日志），
+#     在这里 30 秒就能复现。三条判据各挡一种「绿得没意义」：
+#       1) 退出码 0                  —— 窗口真建出来了（Mac 那份崩溃日志停在建通道那一步）；
+#       2) 临时 HOME 里没有崩溃日志   —— 挡住「异常被上层吞掉、界面勉强开出来」的半坏；
+#       3) 副本树文件数没多           —— 挡住「没被转置的机器上写进应用包」那种不报错的写法。
+#     最后那句 touch 是给仿真自己立的判据：chmod 没生效时这一步会绿得毫无意义。
+echo "· 只读包窗口冒烟（App Translocation 现场）"
+STAGE=$(mktemp -d)
+# 退出前先把写权限还回来再删：只读树里 rm 连自己父目录的子项都删不掉（解链要目录的写权限）
+trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+cp -R dist/B2bCollectTool.app "$STAGE/"
+chmod -R a-w "$STAGE/B2bCollectTool.app"
+SAPP="$STAGE/B2bCollectTool.app"
+SBIN="$SAPP/Contents/MacOS/B2bCollectTool"
+[ -x "$SBIN" ] || { echo "❌ 只读副本里没有可执行文件：$SBIN"; exit 1; }
+if touch "$SAPP/Contents/Info.plist" 2>/dev/null; then
+  echo "❌ 这份副本没被改成只读（Info.plist 仍可写）：仿真失效，这一步绿了也不代表产物没问题"
+  exit 1
+fi
+BEFORE=$(find "$SAPP" | wc -l)
+mkdir -p "$STAGE/home"
+set +e
+HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$SBIN" --ui-smoke
+RC=$?
+set -e
+STRAY=$(find "$STAGE/home" -name "*.log" 2>/dev/null || true)
+AFTER=$(find "$SAPP" | wc -l)
+if [ -n "${STRAY:-}" ]; then
+  while read -r f; do
+    [ -n "$f" ] || continue
+    echo "—— 崩溃日志 $f ——"
+    cat "$f"
+  done <<<"$STRAY"
+fi
+if [ "$RC" -ne 0 ]; then
+  echo "❌ 只读包上窗口没建出来（退出码 ${RC}）：用户双击打开就是这个样子，别外发"
+  exit "$RC"
+fi
+if [ -n "${STRAY:-}" ]; then
+  echo "❌ 窗口建成了却留下崩溃日志：启动路径上有异常被吞掉了，两者不能同时成立"
+  exit 1
+fi
+if [ "$BEFORE" != "$AFTER" ]; then
+  echo "❌ 只读副本里多出了文件（${BEFORE} → ${AFTER}）：启动路径上有代码往应用包里写东西"
+  exit 1
+fi
+echo "✅ 只读包窗口冒烟通过：界面建得出、崩溃日志一份都没有、包内一字节没多"
 echo "✅ 打包完成并通过产物自检：$(pwd)/dist/B2bCollectTool.app"

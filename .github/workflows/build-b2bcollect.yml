@@ -172,6 +172,54 @@ jobs:
           exit $p.ExitCode
         }
 
+    - name: Window smoke gate (B2bCollectTool.exe --ui-smoke)
+      # 与 Mac 那一步同一条判据、同一个入口：让**产物自己**把界面真建一遍，退出码 0 才
+      # 许装配交付。（2026-11-12 那份 Windows 崩溃栈停在 ``File "b2bcollect_gui.py",
+      # line 39, in <module>``——正好是「建窗口之前的 import」那一段，而 --acl-doctor
+      # 刻意不碰 Qt：它验凭证、验通道、验落点，唯独不建窗口。于是「双击开不出界面」这一
+      # 整类故障在当天的门禁里是全绿的，只有用户能发现。这一步把那段盲区补成发包判据。）
+      # 这里不再模拟只读卷：Windows 本轮的根因是 onefile 的 _MEI 回收赛跑，改 onedir 之后
+      # 那个目录压根不存在了；「安装目录写不进去」（装在 Program Files、放共享盘、U 盘）
+      # 由 tool_config 与 riskbird_build/runtime_paths 的候选链兜住，那条口径由离线回归
+      # 与 --acl-doctor 的落点纪律（退出码 9）两头钉住，不靠这一仿真的运气。
+      # QT_QPA_PLATFORM 显式给 offscreen：runner 上有没有交互式桌面不是产品的事，赌它输了
+      # 就分不清「包坏了」还是「这台机器没会话」；随包的平台插件收没收到也由这一步的答案
+      # 说话——缺 qoffscreen.dll 会红在这里，而不是红在用户的双击上。
+      # USERPROFILE 指进临时目录有两个作用：门禁不碰 runner 的真实配置，并且「界面开成了
+      # 却留下一份崩溃日志」这种异常被吞掉的半坏状态也能被查出来（只看退出码会放过它）。
+      # 排在装配之前是刻意的：这一步会在安装目录里跑出 b2bcollect_state 等运行期目录，正好
+      # 由下一步（package_win_artifacts.py）统一剔掉——交付物里绝不带 CI 那台机器的状态。
+      timeout-minutes: 10
+      shell: pwsh
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修构建那一步再谈交付）"
+          exit 1
+        }
+        $stage = Join-Path $env:RUNNER_TEMP "ui-smoke-home"
+        if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        $env:QT_QPA_PLATFORM = "offscreen"
+        $env:USERPROFILE = $stage
+        $env:HOME = $stage
+        $p = Start-Process -FilePath $exe -ArgumentList "--ui-smoke" -Wait -PassThru
+        Write-Host "ui-smoke exit code = $($p.ExitCode)"
+        $stray = @(Get-ChildItem -Path $stage -Recurse -Filter "*.log" -ErrorAction SilentlyContinue)
+        foreach ($f in $stray) {
+          Write-Host "—— 崩溃日志 $($f.FullName) ——"
+          Get-Content $f.FullName
+        }
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::窗口没建出来（退出码 $($p.ExitCode)）：用户双击打开就是这个样子，禁止装配交付"
+          exit $p.ExitCode
+        }
+        if ($stray.Count -gt 0) {
+          Write-Host "::error::窗口建成了却留下崩溃日志：启动路径上有异常被吞掉了，两者不能同时成立"
+          exit 1
+        }
+        Write-Host "✅ 窗口冒烟通过：界面建得出、崩溃日志一份都没有"
+
     - name: Package Windows artifacts
       # onedir 交付装配，三道事一并做（判据全在脚本里，不抄在 yml）：
       #   1) 验布局：dist\B2bCollectTool\ 里 exe + _internal + 随包凭证 + 跨目录采集器
@@ -210,8 +258,17 @@ jobs:
         URLS="https://downloads.sourceforge.net/project/nsis/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip
         https://sourceforge.net/projects/nsis/files/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip/download"
         sha256() {
-          if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
-          else certutil -hashfile "$(cygpath -w "$1")" SHA256 | sed -n 2p | tr -d ' '; fi
+          # 只从**内容**算哈希，别让文件名参与输出。这不是洁癖：Git Bash 里 $RUNNER_TEMP
+          # 是 `D:\a\...\_temp` 这种带反斜杠的 Windows 路径，而 GNU coreutils 的规定是
+          # 「文件名里含反斜杠或换行时，整行输出前面加一个 \\ 作为转义标记」，于是
+          # `sha256sum … | awk '{print $1}'` 拿到的是 `\fcdce…`——哈希本身完全正确，却和
+          # 钉住的值「对不上」，2026-11-12 那次 CI 就是这么红的。用 < 喂标准输入，输出里
+          # 压根没有文件名可转义；再只取 64 位十六进制兜一层，两条分支同规矩。
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum < "$1" | grep -oE "[0-9a-fA-F]{64}" | head -1 || true
+          else
+            certutil -hashfile "$(cygpath -w "$1")" SHA256 | grep -oE "[0-9a-fA-F]{64}" | head -1 || true
+          fi
         }
         if [ ! -f "$MK" ]; then
           got=""

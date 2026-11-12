@@ -16,6 +16,7 @@
 运行：python test_data_dir_offline.py
 """
 import os
+import contextlib
 import importlib
 import shutil
 import stat
@@ -42,6 +43,11 @@ FAKE_HOME = TMP / "home"
 FAKE_HOME.mkdir()
 _real_home = Path.home
 Path.home = classmethod(lambda cls: FAKE_HOME)   # 兜底位置也指到临时目录，不污染真用户目录
+
+# 开跑前的运行形态快照：必须在任何用例拨开关之前记下（写在模块顶部就是这个意思），
+# 它是脚本末尾那道「谁拨走没收回」判据的比对基准——本机以源码态跑，`frozen` 本来就不
+# 存在，所以快照里那一项是 None，恢复时必须**删掉**而不是置 False。
+_SNAPSHOT = {k: getattr(sys, k, None) for k in ("frozen", "_MEIPASS", "platform", "executable")}
 
 PASS = []
 
@@ -121,35 +127,54 @@ def make_app(read_only=False):
 make_app.n = 0
 
 
+_ABSENT = object()
+
+
+@contextlib.contextmanager
+def _switches(**values):
+    """按**名字**拨 sys 上的运行形态开关，退出时按名字还原（传 None = 恢复成没拨过的样子）。
+
+    为什么不用 ``old = (sys.frozen, sys.platform, sys.executable)`` 这种位置元组：存取
+    两边一旦错开一位，``sys.frozen`` 就成了真值字符串、``sys.executable`` 就成了 None，
+    而红的是**隔了好几段**的下一条用例，报的还是「NoneType」这种和落点毫无关系的栈。
+    本仓库另一套离线测试（test_frozen_delivery_offline 的 T 节）就是这么把 U 节带红的，
+    判据形状完全一样，所以这边也走同一条纪律：按名字存取，末尾再核对一次快照。
+    """
+    old = {k: getattr(sys, k, _ABSENT) for k in values}
+    for k, v in values.items():
+        if v is None:
+            sys.__dict__.pop(k, None)
+        else:
+            setattr(sys, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is _ABSENT:
+                sys.__dict__.pop(k, None)
+            else:
+                setattr(sys, k, v)
+
+
 def run_resolver(fn, frozen, platform, exe=None, here=None):
     """在指定假环境下调用被测解析函数，返回 (结果路径, 异常)"""
-    old = (getattr(sys, "frozen", None), sys.platform, getattr(sys, "executable", None))
     old_here = site_adapters._HERE
+    switches = {"platform": platform, "frozen": True if frozen else None}
+    if exe is not None:                       # 没给就不动这一项（动了就回不到本机真实值）
+        switches["executable"] = str(exe)
     try:
         # 换环境之前必须清掉进程内择路缓存：四节用例问的是同一个目录名，缓存不清的话
         # 第 2 节测的其实是第 1 节的环境（结果一路都是 FAKE_HOME，「包旁优先」就假绿了）。
         # 这也是 runtime_paths.reset_cache 存在的唯一理由，测试必须用它，不许另造。
         runtime_paths.reset_cache()
-        if frozen:
-            sys.frozen = True
-        else:
-            sys.frozen = False
-            sys.__dict__.pop("frozen", None)
-            if hasattr(sys, "frozen"):
-                sys.frozen = False
-        sys.platform = platform
-        if exe is not None:
-            sys.executable = str(exe)
-        if here is not None:
-            site_adapters._HERE = here
-        return fn(), None
+        with _switches(**switches):
+            if here is not None:
+                site_adapters._HERE = here
+            return fn(), None
     except Exception as exc:                      # noqa: BLE001
         return None, exc
     finally:
-        sys.frozen, sys.platform, sys.executable = old[0], old[1], old[2]
         site_adapters._HERE = old_here
-        if old[0] is None:
-            sys.__dict__.pop("frozen", None)
 
 
 # ── 1. 核心场景：只读 .app（App Translocation）→ 不抛异常、结果在包外且真可写 ──
@@ -438,8 +463,8 @@ before_bytes = in_bundle_cfg.read_bytes()
 exc7c = None
 ok7c, where7c = (None, None)
 try:
-    sys.frozen, sys.platform, sys.executable = True, "darwin", str(exe7)
-    ok7c, where7c = tool_config.save_config({"deepseek_api_key": "用户自己填的"})
+    with _switches(frozen=True, platform="darwin", executable=str(exe7)):
+        ok7c, where7c = tool_config.save_config({"deepseek_api_key": "用户自己填的"})
 except Exception as e:                          # noqa: BLE001
     exc7c = e
 check("保存配置：不抛异常", exc7c is None, repr(exc7c))
@@ -468,8 +493,8 @@ try:
           _same(fb, FAKE_HOME / tool_config.USER_CONFIG_DIR_NAME), str(fb))
     saved_ok = None
     try:
-        sys.frozen, sys.platform, sys.executable = True, "darwin", str(exe7d)
-        saved_ok = deepseek_expander.save_api_key("sk-退路写入的密钥")
+        with _switches(frozen=True, platform="darwin", executable=str(exe7d)):
+            saved_ok = deepseek_expander.save_api_key("sk-退路写入的密钥")
     except Exception as e:                      # noqa: BLE001
         saved_ok = f"抛出 {type(e).__name__}: {e}"
     check("deepseek 退路：保存密钥成功（旧写法在这一步会把包带崩或骗用户「已保存」）",
@@ -480,8 +505,8 @@ try:
           not (app_dir7d / "Contents" / "MacOS" / "config.json").exists(), "")
     read_back = None
     try:
-        sys.frozen, sys.platform, sys.executable = True, "darwin", str(exe7d)
-        read_back = deepseek_expander._module_dir_key()
+        with _switches(frozen=True, platform="darwin", executable=str(exe7d)):
+            read_back = deepseek_expander._module_dir_key()
     except Exception as e:                      # noqa: BLE001
         read_back = f"抛出 {type(e).__name__}: {e}"
     check("deepseek 退路：写过的密钥下次还能读出来（写的地方比读的地方窄就是「已保存」变空）",

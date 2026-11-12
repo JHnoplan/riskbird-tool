@@ -3,7 +3,9 @@
 
 覆盖（都不启动浏览器，JS 与标签页都用假模型顶掉）：
 1. 限流不空转：验证页消失 ≠ 恢复，必须能力探针实测能拿到数据才放行；
-2. 验证页挂在别的标签：_heal_block 能把会话切到已恢复的标签/把飘走的标签导回首页；
+2. 两条自愈的分工：验证页**还挂着**时 _heal_block 只许把会话切到已恢复的另一个标签
+   （绝不导航/重刷，否则打断人工滑块）；签名消失后 _revive_after_block 才允许把飘走
+   的标签导回首页或整页重刷；
 3. 联想被抑制时改走搜索结果页仍能进详情并正常出数据（不再原地卡住）；
 4. 只有搜索结果页连续几次都确认没有，才允许写「未找到」；
 5. 拿不到结果又判不准时记「拦截未解除」：名单不推进、不写空记录；
@@ -193,12 +195,30 @@ assert c2._heal_block() is True, "有已恢复的标签就该切过去"
 assert c2.pin_tab_id == "T2", c2.pin_tab_id
 assert any("改用已恢复的爱企查标签" in m for m in c2.logs), c2.logs
 
-# 单平台（没有别的标签）时：本标签飘在验证页上，导回首页也算自愈
+# 单平台（没有别的标签）时：本标签飘在验证页上，_heal_block **一样不许动它**。
+# 这条判据来自 2026-11-11 用户实机反馈：百度验证页的地址本来就是 wappass.baidu.com
+# （不在爱企查域名里），旧实现把「地址不在爱企查」当成「标签飘走了」，于是每 30 秒把
+# 用户正拖到一半的滑块刷回首页、挑战作废重来，人工永远过不完。「导回首页」因此挪进
+# _revive_after_block——那是「人点完了但页面是死页」的处置，只在验证签名消失后才发生。
 b3 = Browser(Page("https://wappass.baidu.com/static/captcha/tuxing_v2.html",
                   title="百度安全验证", length=120))
-c3 = make_crawler(b3)
-assert c3._heal_block() is True and b3.page.url == HOME, f"应把飘走的标签导回首页：{b3.page.url}"
-print("② 自愈：验证页在别的标签/本标签飘走都能把自己捞回来 ✓")
+c3 = make_crawler(b3, pin="T1")
+assert c3._heal_block() is False, "只剩自己一个标签、且验证页还挂着 → 自愈不许有任何动作"
+assert b3.navs == [] and b3.page.url.startswith("https://wappass.baidu.com"), \
+    f"验证页上不许导航/重刷（会把用户拖到一半的滑块作废）：{b3.navs}"
+# 签名已消失、标签却飘在百度域名的回跳页上：这时才允许导回首页
+b4 = Browser(Page("https://www.baidu.com/", title="", length=30))
+c4 = make_crawler(b4, pin="T1")
+assert c4._revive_after_block() is True and b4.page.url == HOME, \
+    f"人工过完之后的死飘页要导回首页：url={b4.page.url} navs={b4.navs}"
+# 两条自愈的分工边界就在「签名在不在」：还在验证页时连 revive 也不许碰它
+c5 = make_crawler(b3, pin="T1")
+assert c5._revive_after_block() is False and b3.navs == [], \
+    f"验证签名没消失就导回首页＝重演 2026-11-11 事故：{b3.navs}"
+# pin 丢了（标签已被用户关掉）时不许退到 tabs[0]：共享浏览器里那通常是别的路在用的页面
+c6 = make_crawler(b4)
+assert c6._revive_after_block() is False, "没有独占标签就完全不动页面，串台比死页更贵"
+print("② 自愈分工：验证中还挂着→谁都不许动；签名消失后才导回首页/重刷 ✓")
 
 # ── 3. 联想被抑制 → 搜索结果页兜底照样采到 ───────────
 b = Browser(Page(HOME, suggest=[], input=NAME))     # 注入后联想恒为空

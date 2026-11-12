@@ -6359,6 +6359,89 @@ def _acl_doctor_entry() -> int:
         return 6
 
 
+# ── 窗口冒烟（产物级判据：双击到底开不开得出界面）─────────────────────────
+# 为什么单独立一个开关，而不是并进 --acl-doctor：doctor 的口径是「凭证链、权限服务
+# 真连、通道完整性、落点纪律」，它刻意不碰 Qt——两件事的失败原因完全不同，混在一张
+# 退出码表里就分不清「包没配好」和「界面起不来」；而且 runner 上常常根本没有图形
+# 会话，让 doctor 去建窗口只会多一类假红。
+#
+# 但本轮两份实机故障的共同盲区恰恰就是这条（2026-11-12）：Mac 只读转置包崩在
+# ``site_adapters.build_list_channels``（建窗口的下半程），Windows 重启崩在模块
+# import（建窗口的上半程）——两段都不在 doctor 的射程里，于是 CI 全绿、用户双击却没
+# 界面，缺陷只能在用户身上发现。这一条把「窗口真能建出来」变成发包前的硬判据；Mac
+# 那两个入口还把它放在**只读副本**上跑，把 App Translocation 的现场在 CI 里复现出
+# 来，而不是等用户替我们复现。
+UI_SMOKE_FLAG = "--ui-smoke"
+# 冒烟自己也不许变成「没人知道它卡住了」：建窗口期间万一冒出一个嵌套模态框（无人可
+# 点、offscreen 下永远等不到点击），到点直接按失败退出。没有这一层，最坏的失败形态
+# 又是 CI 干等到 job 超时、日志里一行结论都留不下——与 doctor 那一步同规矩。
+UI_SMOKE_DEADLINE_MS = 90_000
+UI_SMOKE_EXIT_OK = 0
+UI_SMOKE_EXIT_FAILED = 10      # 窗口没建出来（异常）
+UI_SMOKE_EXIT_TIMEOUT = 11     # 窗口建到一半卡住，被看门狗收掉
+
+
+def _ui_smoke_entry() -> int:
+    """产物窗口冒烟：走与真实启动完全相同的那段路，走到「窗口建好」就收，不进事件循环。
+
+    路径必须与 main() 一致（QApplication → 守卫 install → 权威身份判定 → MainWindow →
+    show），否则这条门禁验的就不是用户那一次双击：漏掉 ``prefetch_authoritative()`` 就
+    测不到「按等级投影入口」那一段，Mac 那一崩恰好发生在等级判定之后建通道的时候。
+    例外只有两处，都是为了「门禁不会自己变成新故障」：
+      · QT_QPA_PLATFORM 缺省时补 offscreen——runner 上没有窗口会话，撞真显示会以一种
+        和界面缺陷长得一模一样的方式失败；调用方显式给了平台就尊重它；
+      · 失败只落日志、绝不弹模态框——CI 里一次弹窗等于一次永远不会来的点击。
+    """
+    if HAS_TOOL_CONFIG:
+        _tool_config.force_utf8_stdout()
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    print(f"· ui-smoke：Qt 平台={os.environ.get('QT_QPA_PLATFORM')} "
+          f"frozen={'是' if getattr(sys, 'frozen', False) else '否'}")
+    app = None
+    stalled = []
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setStyleSheet(_app_stylesheet())
+        if HAS_ACL_GUARD:
+            _access_guard.install(app)
+            _access_guard.prefetch_authoritative()
+
+        def _abort():
+            stalled.append(True)
+            print(f"❌ ui-smoke：建窗口超过 {UI_SMOKE_DEADLINE_MS // 1000} 秒没返回，"
+                  "按失败退出（最可能是途中弹出了一个没人能点的模态框）")
+            app.exit(UI_SMOKE_EXIT_TIMEOUT)
+
+        watchdog = QTimer()
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(_abort)
+        watchdog.start(UI_SMOKE_DEADLINE_MS)
+        try:
+            window = MainWindow()
+            window.show()
+        finally:
+            watchdog.stop()
+        if stalled:
+            return UI_SMOKE_EXIT_TIMEOUT
+        print("✅ ui-smoke：窗口构建完成（名单通道、权限入口、状态区全部建出）")
+        return UI_SMOKE_EXIT_OK
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 与真实启动同一个收口：堆栈带运行形态抬头落到用户找得到的地方。这里不能走
+        # _report_fatal_startup 的弹窗分支——门禁的调用方是 CI，它只读退出码和日志。
+        _fatal_log(e)
+        print(f"❌ ui-smoke：窗口没建出来 {type(e).__name__}: {e}\n"
+              f"   堆栈落在：{'、'.join(str(d / FATAL_LOG_NAME) for d in _fatal_log_dirs())}")
+        return UI_SMOKE_EXIT_FAILED
+    finally:
+        if HAS_ACL_GUARD and app is not None:
+            try:
+                _access_guard.shutdown(app)
+            except Exception:
+                pass
+
+
 def main():
     # 产物自检（发包门禁）：必须在 QApplication 之前分派。两个原因：
     # ① CI runner 上常常根本没有可用的图形会话，建 QApplication 会先炸在显示上，
@@ -6367,6 +6450,12 @@ def main():
     run_doctor_requested, wrong = _doctor_request(sys.argv[1:])
     if run_doctor_requested:
         sys.exit(_acl_doctor_entry())
+    # 窗口冒烟（发包门禁的另一半）：与 doctor 分派在**同一层**、同样在 QApplication
+    # 之前认出来。它的写法刻意不与 doctor 同族（不含 doctor、不以 --acl 开头），所以
+    # 不会被上面那句判成「像自检却认不出」——判错的方向很坏：CI 传 --ui-smoke 却被当
+    # 成拼错的自检参数退出 3，门禁看着红了，包的其实没问题。
+    if UI_SMOKE_FLAG in sys.argv[1:]:
+        sys.exit(_ui_smoke_entry())
     # 兜底：写法里带 doctor 却没被认出来时，绝不退化成「安静启动界面」。
     # 打包态最坏的失败不是报错而是卡住——CI 用 Start-Process -Wait 取退出码，一旦
     # 走到建界面这条路（runner 上多半根本没有可用的图形会话），这一步要么崩在显示

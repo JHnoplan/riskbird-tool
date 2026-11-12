@@ -113,6 +113,74 @@ jobs:
         fi
         exit "$rc"
 
+    - name: Window smoke gate on a read-only bundle copy
+      # 窗口冒烟门禁（2026-11-12 Mac 实机崩溃的永久判据）：把 dist 里那份 .app 拷到临时
+      # 目录、整树 chmod 成只读，再让**产物自己**把界面真建一遍。必须先拷出来才改权限：
+      # dist 里那一份接下来还要打成 zip 交付，权限动不得。
+      # 为什么离线回归替不了这一步：用户那份崩溃日志的最后一行是
+      #   OSError: [Errno 30] Read-only file system: .../AppTranslocation/.../riskbird_data
+      # 它是「打包态 + 只读卷」叠在一起才出现的形态，源码态永远复现不了；而 --acl-doctor
+      # 验的是凭证、通道与落点纪律，刻意不碰 Qt——于是「双击开不出界面」这一整类故障在
+      # 当时的门禁里是全绿的，只能在用户身上发现。Mac 那一崩在 build_list_channels（建窗口
+      # 的下半程），Windows 那一崩在模块 import（建窗口的上半程），两段都在 doctor 射程外。
+      # 三条判据一起才算过，各挡一种「绿得没意义」：
+      #   1) 退出码 0                      —— 窗口真建出来了；
+      #   2) 临时 HOME 下没有崩溃日志       —— 挡住「异常被上层吞掉、界面勉强开出来」的半坏；
+      #      （只查退出码会放过它，只查日志又会放过「压根没建窗口」）
+      #   3) 副本树里的文件数一个都没多      —— 挡住「没被转置的机器上写进应用包」：那种
+      #      形态写入成功、不报错，代价是升级覆盖或拖进废纸篓时用户几个月的 Cookie 与缓存
+      #      跟着一起消失，正是本轮纪律要根治的东西。
+      # 最后那句 touch 是给**仿真本身**立的判据：chmod 万一不生效（挂载方式或权限模型变了），
+      # 这一步会绿得毫无意义——仿真失效比没有仿真更坏。
+      # HOME 与 QT_QPA_PLATFORM 都指进临时/offscreen：门禁不碰 runner 的真实配置，也不赌
+      # 「这台机器恰好有可用的窗口会话」——那种红了分不清是包坏了还是机器没桌面。
+      timeout-minutes: 10
+      shell: bash
+      run: |
+        STAGE=$(mktemp -d)
+        # 退出前必须先把写权限还回去再删：只读的那棵树里 rm 连自己父目录的子项都删不掉
+        # （解除链接要的是**目录**的写权限），trap 少这一句就会在 job 收尾时留一地删不
+        # 掉的临时文件，runner 的清理还会顺带红一条与自己无关的错误。
+        trap 'chmod -R u+w "$STAGE" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+        APP="$STAGE/B2bCollectTool.app"
+        BIN="$APP/Contents/MacOS/B2bCollectTool"
+        [ -d "b2bcollect_build/dist/B2bCollectTool.app" ] || { echo "::error::没找到 dist/B2bCollectTool.app（产物布局变了？先修构建那一步）"; exit 1; }
+        cp -R b2bcollect_build/dist/B2bCollectTool.app "$STAGE/"
+        chmod -R a-w "$APP"
+        [ -x "$BIN" ] || { echo "::error::只读副本里没有可执行文件：$BIN"; exit 1; }
+        if touch "$APP/Contents/Info.plist" 2>/dev/null; then
+          echo "::error::这份副本没被改成只读（Info.plist 仍可写）：仿真失效，这一步绿了也不代表产物没问题"
+          exit 1
+        fi
+        before=$(find "$APP" | wc -l)
+        mkdir -p "$STAGE/home"
+        set +e
+        env HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$BIN" --ui-smoke
+        rc=$?
+        set -e
+        stray=$(find "$STAGE/home" -name "*.log" 2>/dev/null || true)
+        after=$(find "$APP" | wc -l)
+        if [ -n "$stray" ]; then
+          echo "$stray" | while read -r f; do
+            [ -n "$f" ] || continue
+            echo "—— 崩溃日志 $f ——"
+            cat "$f"
+          done
+        fi
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::只读包上窗口没建出来（退出码 ${rc}）：用户双击打开就是这个样子，禁止上传"
+          exit "$rc"
+        fi
+        if [ -n "$stray" ]; then
+          echo "::error::窗口建成了却留下崩溃日志：启动路径上有异常被吞掉了，两者不能同时成立"
+          exit 1
+        fi
+        if [ "$before" != "$after" ]; then
+          echo "::error::只读副本里多出了文件（${before} → ${after}）：启动路径上有代码往应用包里写东西（转置时它会当场崩，没转置时它会把用户数据塞进包里）"
+          exit 1
+        fi
+        echo "✅ 只读包窗口冒烟通过：界面建得出、崩溃日志一份都没有、包内一字节没多"
+
     - name: Zip app bundle (ditto preserves perms/attrs)
       run: ditto -c -k --keepParent b2bcollect_build/dist/B2bCollectTool.app B2bCollectTool_Mac_arm64.zip
 

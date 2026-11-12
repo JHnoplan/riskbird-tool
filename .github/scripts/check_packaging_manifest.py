@@ -43,7 +43,13 @@
      清单里、磁盘上也在、git 里也在，第 5、7 两条全都绿，包里却压根没有它。
   9 打包入口里的 shell 文案有没有 `$变量` 紧跟中文标点这种写法——2026-11-12 干跑
      NSIS 步骤时当场炸出来：bash 把全角括号的字节读进变量名，`set -u` 下失败的是那句
-     「解释失败原因」的 echo，不带 `set -u` 时更坏，值被静默印成空。
+     「解释失败原因」的 echo，不带 `set -u` 时更坏，值被静默印成空。判据同时覆盖交付链
+     上另外几份手写脚本（HYGIENE_SCRIPTS：派发云打包、取制品、批跑回归），因为它们出错
+     的代价是「CI/本机排障时看不见真数字」，和打包入口同一类。
+ 10 跨目录**同名模块**的几份拷贝是否字节一致（不一致就必须在 DIVERGENT_VENDORED
+     里登记理由）：`import yzd_client` 拿到的是哪一份由 sys.path 顺序决定，内容分叉
+     等于「按加载顺序挑一份实现」。本轮实测到的正是没登记的代价——两处上传侧修复
+     只落在 riskbird 那份 yzd_client 里，产物生效的却是 b2bcollect 那份旧实现。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -53,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import re
 import subprocess
 import sys
@@ -556,6 +563,72 @@ def check_closure(externals: tuple, shadowed: dict) -> list:
     return problems
 
 
+# 交付链里这三个目录会各自出现**同名**的本地模块（vendor 副本）。运行时拿到哪一份
+# 由 sys.path 顺序决定：b2bcollect_build 永远优先，其次才是被 --add-data 带进包的
+# riskbird_build/ali1688_build 子目录。所以「同名但内容不同」等价于「同一件事有两套
+# 行为，用哪套取决于加载顺序」——这是本轮实测到的第 10 类缺陷：
+#   yzd_client.py 的两处上传侧修复（超长号码列按**整条**递减保留、无任何联系方式的行
+#   不入库）只落在 riskbird_build 那一份里，b2bcollect_build 与 ali1688_build 两份仍是
+#   旧实现。产物用的是 b2bcollect 那一份：界面不报错、日志不报错、CI 全绿，客户库里却
+#   多了没有联系方式的行，超长的手机号被从中间切成打不通的半截号。
+# 判据不是「不许分叉」，而是「分叉必须在案」：下面这张表里每一项都写清为什么允许不同
+# （新模块又分叉却没登记 → 直接红）。登记的意义和 NOT_PACKAGED 那张表一样——把「忘了
+# 同步」与「有意各留一份」这两种症状完全一样的形态分开。
+SHARED_SOURCE_DIRS = ("b2bcollect_build", "riskbird_build", "ali1688_build")
+DIVERGENT_VENDORED = {
+    "customer_library_cleaner.py":
+        "两套清洗口径按各自产品演进：b2bcollect 那份有岗位族标注/公司名尾巴剥离/"
+        "Excel 非法字符，riskbird 那份有多列号码合并/补区号/入库出口脏行。合并是一次"
+        "独立重构，不在交付日动；此项登记是为了让分叉**可见**，不是为了放行",
+    "task_registry.py":
+        "两份的任务目录名与原数据文件名按产品不同（B2B三站…/企业数据_原始 对 "
+        "企业数据自动采集工具/企业数据_全部平台），b2bcollect 那份另有续采快照与"
+        "进度台账。差异刻意，但同样必须被看见",
+}
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def check_shared_source() -> list:
+    """第 10 条：三个目录里同名的 .py 要么字节一致，要么在 DIVERGENT_VENDORED 里登记理由。"""
+    problems = []
+    copies = {}
+    for name in SHARED_SOURCE_DIRS:
+        d = ROOT / name
+        if not d.is_dir():
+            problems.append(f"交付目录 {name}/ 不在了（这条判据没法核对同名模块）")
+            continue
+        for p in sorted(d.glob("*.py")):
+            if p.name.startswith(TEST_PREFIX):
+                continue            # 测试文件不参与交付：各自的夹具与断言本来就该不同
+            copies.setdefault(p.name, []).append(p)
+    for name, paths in sorted(copies.items()):
+        if len(paths) < 2:
+            continue
+        digests = {p: _file_digest(p) for p in paths}
+        if len(set(digests.values())) == 1:
+            if name in DIVERGENT_VENDORED:
+                problems.append(
+                    f"{name}：三份拷贝已经字节一致，DIVERGENT_VENDORED 里那条登记该删了"
+                    f"（登记着「允许不同」却早就同步了，下次真分叉时这张表就不值得信了）")
+            continue
+        if name in DIVERGENT_VENDORED:
+            reason = str(DIVERGENT_VENDORED[name] or "").strip()
+            if not reason:
+                problems.append(
+                    f"{name}：登记为「允许不同」却没写理由——「忘了同步」与「有意分叉」"
+                    f"症状完全一样，只有理由能把它们分开")
+            continue
+        where = "、".join(str(p.relative_to(ROOT)) for p in paths)
+        problems.append(
+            f"{name}：{len(paths)} 份拷贝内容不一致（{where}）。运行时吃到哪一份由 "
+            f"sys.path 顺序决定，等于「同一件事两套行为」；要么把改动同步到每一份，"
+            f"要么在 DIVERGENT_VENDORED 里写清为什么允许各留一份")
+    return problems
+
+
 VAR_BEFORE_CJK = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)[^\x00-\x7F]")
 
 
@@ -582,6 +655,35 @@ def check_shell_hygiene(text: str) -> list:
                 f"第 {lineno} 行的 ${name} 后面紧跟「{punct}」：shell 会把这些非 ASCII "
                 f"字节一起读进变量名（带 set -u 时 unbound variable 当场炸，不带时把值"
                 f"印成空），必须写成 ${{{name}}}「{punct}」")
+    return problems
+
+
+# 交付链上手写的 shell 脚本（不在 CALLERS 里：它们没有打包清单要核对，只有文案要核对）。
+# 为什么也要判：这几份脚本出错时的代价是「排障时看不见真数字」——派发云打包的脚本报不出
+# run id、取制品的脚本把退出码印成空、批跑回归的脚本在「清单不完整」那句里把目录名印成空，
+# 三种都恰好发生在最需要读那行字的时候。登记在表里的脚本如果不在位，同样判红：
+# 一条静默不跑的判据比没有判据更危险（会让人以为这一项被验过）。
+HYGIENE_SCRIPTS = (
+    "debug/dispatch_b2bcollect_builds.sh",
+    "debug/fetch_b2bcollect_artifacts.sh",
+    "debug/poll_b2bci.sh",
+    "debug/run_offline_regression.sh",
+)
+
+
+def check_script_hygiene() -> list:
+    """第 9 条在「非打包入口」那几份脚本上的同样一份判据。"""
+    problems = []
+    for rel in HYGIENE_SCRIPTS:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        if in_work_tree() and tracked_state(path) != "ok":
+            # 与第 7 条同一个坑：本机全绿、别人检出后这份脚本压根不存在
+            problems.append(f"{rel} 没在提交里（换台机器/CI 上它就凭空消失）")
+        for msg in check_shell_hygiene(path.read_text(encoding="utf-8", errors="replace")):
+            problems.append(f"{rel} {msg}")
     return problems
 
 
@@ -690,6 +792,29 @@ def main(argv=None) -> int:
             print(f"   · {p}")
             print(f"::error::跨目录依赖链：{p}")
 
+    # 再验同名拷贝：清单齐、链路闭合，也可能「生效的那一份是旧的」（第 10 条）。
+    dup = check_shared_source()
+    if dup:
+        bad += 1
+        print("❌ 交付目录里同名模块分叉且未在案（哪一份生效由 import 顺序决定）：")
+        for p in dup:
+            print(f"   · {p}")
+            print(f"::error::同名模块拷贝：{p}")
+    else:
+        print(f"✅ 同名模块拷贝：{'/'.join(SHARED_SOURCE_DIRS)} 里同名的源码"
+              f"要么字节一致，要么在 DIVERGENT_VENDORED 登记了理由")
+
+    # 交付链上那几份手写脚本的文案卫生（同第 9 条，判据共用一个函数）
+    hygiene = check_script_hygiene()
+    if hygiene:
+        bad += 1
+        print("❌ 交付链 shell 脚本不合格（`$VAR` 紧跟中文会把报错那行本身弄坏）：")
+        for p in hygiene:
+            print(f"   · {p}")
+            print(f"::error::shell 文案：{p}")
+    else:
+        print(f"✅ 交付链 shell 脚本：{len(HYGIENE_SCRIPTS)} 份文案卫生合格")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -714,7 +839,7 @@ def main(argv=None) -> int:
               f"功能，所以这一步不放行就不许开建。")
         return 1
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
-          "依赖链闭合、进包源码都已在提交里")
+          "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案")
     return 0
 
 
