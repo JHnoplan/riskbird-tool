@@ -19,11 +19,28 @@
 口径（谁是真源）：
   · 跨目录模块清单 = b2bcollect_build/site_adapters.py 里的 EXTERNAL_MODULES
     ——由**使用者**声明自己运行时需要什么，而不是由打包脚本各自记一遍；
+  · 故意不跟着进包的传递依赖 = 同文件的 SHADOWED_EXTERNAL_MODULES（每项都要写理由）；
   · 本目录模块清单 = b2bcollect_build/*.py 扫出来的实际文件（新增模块忘了登记
     --hidden-import 正是历史上反复出现的漏项，workflow 注释里那句「维护约定」
     从今天起由这个脚本执行，不再靠人逐行比对）；
   · 三方消费本脚本：两个 workflow 的构建前步骤、离线回归测试
     b2bcollect_build/test_frozen_delivery_offline.py。
+
+检查项（每一条都对应一次真实故障，不是随手加的规矩）：
+  1 跨目录模块齐不齐、有没有落对目录；
+  2 本目录新模块登记 --hidden-import 了没有；
+  3 反向检查：登记了源码里已经不存在的名字；
+  4 运行期数据文件在不在清单里；
+  5 跨目录 .py 在**磁盘**上是否存在；
+  6 改了这些目录能不能触发重打包（on.push.paths）；
+  7 要进包的源码是否真的被 **git 跟踪**——2026-11-12 的第二刀：
+     `riskbird_build/runtime_paths.py` 本机一切正常，CI 却报「--add-data 指向的源码
+     不存在」。根因不是清单写错，是**这个文件从来没被提交过**。5 与 7 缺一不可：
+     5 管「本机有没有」，7 管「检出出来有没有」。症状与第 1 条一字不差——本机绿、
+     CI 红、用户拿到少一块功能的包；
+  8 跨目录模块的**传递**本地依赖是否也登记了（或明确由本目录同名模块供给）：
+     `ali1688_crawler` 顶层 import 的 `customer_library_cleaner` 就是这一类——它不在
+     清单里、磁盘上也在、git 里也在，第 5、7 两条全都绿，包里却压根没有它。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -34,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -82,9 +100,23 @@ REQUIRED_DATA = {
     "enf_clean": "清洗子包源码目录（缺它 = enhanced_cleaner 整条链路降级）",
 }
 
+# 进包但不该被 git 跟踪的输入：构建时现生成、或 CI 现场下载。与 NOT_PACKAGED 同理，
+# 每一项都要写清理由——「忘了提交」和「有意不提交」在 CI 上的症状完全一样，只有理由
+# 能把它们分开。这张表不是为了放行，而是为了让第 7 条只在**真漏提交**时响：一条谁也
+# 修不掉的告警会把整道门禁消耗成背景噪音，那比没有门禁更糟。
+GENERATED_AT_BUILD = {
+    "config.json": "Actions Secrets 现写（见 inject_build_config.py），密钥绝不入仓库",
+    "chromedriver": "CI 现场下载的二进制驱动，不提交",
+    "drivers": "CI 现场下载的驱动目录，不提交",
+}
+
+# 目录型 --add-data 里会混进来的本地垃圾：既不要求入库，也不该跟着进包。
+JUNK_DIR_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache"}
+JUNK_SUFFIXES = (".pyc", ".pyo", ".DS_Store")
+
 
 def _literal(node):
-    """取 ast 字面量：只认字符串与元组/列表，不接受任何求值。"""
+    """取 ast 字面量：只认字符串与元组/列表/字典，不接受任何求值。"""
     try:
         return ast.literal_eval(node)
     except Exception:
@@ -93,7 +125,7 @@ def _literal(node):
 
 def module_manifest() -> tuple:
     """从 site_adapters.py 的源码里读出两张表（不 import，免得把 selenium 拖进来）。"""
-    tree = ast.parse(ADAPTERS.read_text(encoding="utf-8"), filename=str(ADAPTERS))
+    tree = _adapter_tree()
     found = {}
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -110,6 +142,30 @@ def module_manifest() -> tuple:
         raise SystemExit(f"❌ {ADAPTERS.name} 里读不到 {missing_keys}："
                          "打包清单的判据本身没了，这一步必须红")
     return found["EXTERNAL_MODULES"], found["EXPECTED_LIST_CHANNELS"]
+
+
+def _adapter_tree():
+    return ast.parse(ADAPTERS.read_text(encoding="utf-8"), filename=str(ADAPTERS))
+
+
+def shadowed_modules() -> dict:
+    """读 SHADOWED_EXTERNAL_MODULES（外部模块里**故意不跟着进包**的那几个传递依赖）。
+
+    单独一个函数、单独一次 ast：`module_manifest()` 的返回值形状已经被三个消费方按
+    位置解包了，为了加一张表去改公共形状，等于把风险从「漏一个文件」换成「漏一个调用
+    点」——那正是本轮要根治的那类缺陷。表读不到时按空表处理：漏登记的依赖会由
+    `check_closure` 照常报红，不会因为读不到表就整条判据静默失效。
+    """
+    out = {}
+    for node in _adapter_tree().body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id == "SHADOWED_EXTERNAL_MODULES":
+                    val = _literal(node.value)
+                    if isinstance(val, dict):
+                        out = {str(k): str(v) for k, v in val.items()}
+    return out
 
 
 def local_modules() -> list:
@@ -236,6 +292,224 @@ def check_trigger_dirs(text: str, add_data: list) -> list:
     return problems
 
 
+def _git(*args) -> tuple:
+    """跑 git，返回 (退出码, stdout)。git 不可用时返回 (-1, "")，调用方自己决定算不算错。"""
+    try:
+        r = subprocess.run(["git", *args], cwd=str(ROOT),
+                           capture_output=True, text=True)
+    except OSError:
+        return -1, ""
+    return r.returncode, r.stdout.strip()
+
+
+def in_work_tree() -> bool:
+    rc, out = _git("rev-parse", "--is-inside-work-tree")
+    return rc == 0 and out == "true"
+
+
+def _path_set(cmd: list) -> set:
+    """跑一条 git 列文件的命令，把输出收成路径集合（失败返回空集）。"""
+    rc, out = _git(*cmd)
+    return set(out.splitlines()) if rc == 0 else set()
+
+
+_INDEX, _HEAD = {}, {}
+
+
+def _tracked_sets() -> tuple:
+    """索引里 / HEAD 提交里的文件清单，各取一次（进程内缓存，别一个文件 spawn 一次 git）。
+
+    仓库还没有任何提交时把「提交里」等同于「索引里」：这时没有任何东西能被检出，
+    照 HEAD 判会让每一个输入都报红，第一条告警就把整道门禁变成噪音。
+    """
+    if not _INDEX:
+        index = _path_set(["ls-files"])
+        head = (_path_set(["ls-tree", "-r", "--name-only", "HEAD"])
+                if _git("rev-parse", "--verify", "HEAD")[0] == 0 else index)
+        _INDEX.update(files=index)
+        _HEAD.update(files=head)
+    return _INDEX["files"], _HEAD["files"]
+
+
+def tracked_state(path: Path) -> str:
+    """`ok` 在提交里 / `staged` 只 add 没提交 / `missing` 压根没被跟踪。"""
+    try:
+        rel = str(path.relative_to(ROOT))
+    except ValueError:
+        return "ok"                       # 仓库外的路径不归这条判据管
+    index, head = _tracked_sets()
+    if rel in head:
+        return "ok"
+    return "staged" if rel in index else "missing"
+
+
+def is_tracked(path: Path) -> bool:
+    """兼容旧调用点：在索引里就算被跟踪。判红用 `tracked_state`，它更贴近 CI 的现实。"""
+    return tracked_state(path) != "missing"
+
+
+def _state_hint(rel: str, state: str) -> str:
+    if state == "staged":
+        return (f"{rel} 已 git add 但还没提交——CI 检出的是**提交**，本机绿、构建机上没这个"
+                f"文件：先 git commit {rel}")
+    return (f"{rel} 从未被 git 跟踪（本机绿、CI 检出后没这个文件）："
+            f"git add {rel} && git commit")
+
+
+def _package_input(src: str) -> Path:
+    """把 --add-data 的源换算成仓库内路径：`../x/y` → 仓库根，裸名 → 本目录。"""
+    if src.startswith("../"):
+        return ROOT / src[3:]
+    return ROOT / "b2bcollect_build" / src
+
+
+def _junk(p: Path) -> bool:
+    """目录型 --add-data 里的本地垃圾：缓存、字节码、Finder 元数据。"""
+    return (any(part in JUNK_DIR_NAMES for part in p.parts)
+            or p.name in JUNK_DIR_NAMES
+            or p.name.startswith(".")
+            or p.suffix in JUNK_SUFFIXES)
+
+
+# 入口文本里出现的「构建期脚本/文件」引用：这些不进 --add-data，但没有它们构建照样断。
+# 用一张模式表而不是全仓库扫描，是为了只判**真的被命令用到**的那几类路径；判据仍然取自
+# 入口文本自己，不另立清单（另立一份就会和入口漂移）。
+REF_PATTERNS = (r"\.github/scripts/[\w.\-]+\.(?:py|sh)",
+                r"b2bcollect_build/installer/[\w.\-]+",
+                r"debug/build_b2bcollect_mac_local\.sh")
+
+
+def referenced_inputs(text: str) -> list:
+    """从入口文本里扫出仓库内的构建期文件（只回报磁盘上真存在的那些）。"""
+    out = []
+    for pat in REF_PATTERNS:
+        for m in re.finditer(pat, text):
+            p = ROOT / m.group(0)
+            if p.is_file() and p not in out:
+                out.append(p)
+    return out
+
+
+def check_tracked(add_data: list, text: str = "") -> list:
+    """第 7 条：凡是要进包的源码与构建期脚本，必须真的被 git 跟踪。
+
+    为什么磁盘存在不够（2026-11-12 的第二刀）：CI 的检出来自 git，工作区里没提交的文件
+    在 runner 上压根不存在。`riskbird_build/runtime_paths.py` 本机写好了、清单也登记了、
+    自检也绿了，`git add` 从来没执行过——于是两个平台的构建在打包前硬门那一步直接报
+    「--add-data 指向的源码不存在」。这条判据抓的是**开发流程漏提交**，与清单对不对齐
+    无关，任何一处写清单都躲不过它。
+    """
+    problems = []
+    for src, _dst in add_data:
+        base = _package_input(src)
+        name = base.name
+        if name in GENERATED_AT_BUILD:
+            continue                       # 构建时现生成/CI 现下载：仓库里本来就不该有
+        if not base.exists():
+            continue                        # 缺失由第 5 条与 workflow 的前置检查负责报
+        files = ([f for f in sorted(base.rglob("*")) if f.is_file() and not _junk(f)]
+                 if base.is_dir() else [base])
+        for f in files:
+            state = tracked_state(f)
+            if state == "ok":
+                continue
+            rel = f.relative_to(ROOT)
+            problems.append(f"{_state_hint(str(rel), state)}"
+                            f"（它随 --add-data {src} 进包）")
+    # 本目录模块：--hidden-import 只保证「登记了」，磁盘上有没有、提交没提交是另一件事。
+    # 漏提交一个新的 b2bcollect_build/*.py 时，PyInstaller 会报一句谁也看不懂的
+    # "Hidden import 'xxx' not found"，比少一个 --add-data 更难查，所以一起判。
+    for name in local_modules():
+        p = BUILD_DIR / f"{name}.py"
+        state = tracked_state(p)
+        if p.exists() and state != "ok":
+            problems.append(_state_hint(f"{p.relative_to(ROOT)}", state)
+                            + f"（它是本地模块 {name}，靠 --hidden-import 进包）")
+    # 入口引用的构建期脚本：没有它们，连这道门禁本身都跑不起来。
+    for p in referenced_inputs(text):
+        state = tracked_state(p)
+        if state != "ok":
+            problems.append(_state_hint(str(p.relative_to(ROOT)), state)
+                            + "（入口命令直接引用它）")
+    return problems
+
+
+def local_imports(path: Path) -> set:
+    """一个 .py 里 import 到的**同目录**模块文件名（ast 扫，不执行、不装依赖）。"""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"),
+                         filename=str(path))
+    except (SyntaxError, ValueError, OSError):
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                names.add(a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.add(node.module.split(".")[0])
+    out = set()
+    for n in names:
+        cand = path.parent / f"{n}.py"
+        if cand.exists():
+            out.add(n)
+    return out
+
+
+def check_closure(externals: tuple, shadowed: dict) -> list:
+    """第 8 条：跨目录模块的传递本地依赖也必须登记，或者明确说明由谁供给。
+
+    为什么第 1 条不够：第 1 条只比对「使用者声明的那张表」，而这张表是人手抄的。
+    `ali1688_build/ali1688_crawler.py` 顶层 `import customer_library_cleaner`——同目录
+    确实有同名文件，PyInstaller 的分析器看不见（它是运行时按路径 exec 的），清单也没写，
+    于是第 1、5、7 三条全绿，包里却压根没有它。这一类缺陷的成因是「依赖链」而不是
+    「清单项」，所以判据必须顺着 import 走一遍，而不是等人再抄一遍。
+    """
+    problems = []
+    known = set(externals)
+    seen, queue = set(), list(externals)
+    importers = {}                      # 模块名 → 谁 import 它（报错要点名来源）
+    while queue:
+        rel = queue.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        src = ROOT / rel
+        if not src.exists():
+            continue                    # 不存在由第 5 条报，这里不重复刷屏
+        for n in sorted(local_imports(src)):
+            importers.setdefault(n, rel)
+            dep = f"{src.parent.relative_to(ROOT)}/{n}.py"
+            if dep in known:
+                if dep not in seen:
+                    queue.append(dep)
+                continue
+            if n in shadowed:
+                if not (BUILD_DIR / f"{n}.py").exists():
+                    problems.append(
+                        f"SHADOWED_EXTERNAL_MODULES 登记了 {n}，但 {BUILD_DIR.name}/ 没有同名"
+                        f"文件可供给它（{importers[n]} 运行时 import 不到）")
+                continue
+            if (BUILD_DIR / f"{n}.py").exists():
+                problems.append(
+                    f"{rel} 的传递依赖 {dep} 没登记：本目录恰好有同名模块会顶替它，"
+                    f"必须在 site_adapters.SHADOWED_EXTERNAL_MODULES 写清「谁供给、为什么"
+                    f"不跟着抄」（两份同名实现同时进包时，谁赢取决于 import 顺序）")
+                continue
+            problems.append(
+                f"{rel} 的传递依赖 {dep} 没进 EXTERNAL_MODULES：清单只登记了顶层那一个，"
+                f"打包后 {importers[n]} 运行时 import 不到它，症状同样是「少一个功能」")
+            known.add(dep)
+            queue.append(dep)
+    for n, why in sorted(shadowed.items()):
+        if any(x.endswith(f"/{n}.py") for x in known):
+            problems.append(
+                f"SHADOWED_EXTERNAL_MODULES 里的 {n} 同时也在 EXTERNAL_MODULES："
+                f"两份同名实现一起进包，谁生效取决于 import 顺序（理由：{why}）")
+    return problems
+
+
 def check_caller(label: str, text: str, externals: tuple, modules: list,
                  with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
@@ -300,6 +574,14 @@ def check_caller(label: str, text: str, externals: tuple, modules: list,
     # 6) 只有 workflow 才有触发条件：跨目录源码进了包，就必须能带动重打包。
     if with_triggers:
         problems += check_trigger_dirs(text, add_data)
+
+    # 7) 磁盘上有、仓库里没有：本机全绿、CI 检出后一堆文件不存在（见函数文档）。
+    #    非 git 工作区（源码包直构）跳过，但要明确说一声——静默跳过等于这条判据
+    #    在那些环境下凭空消失，下个人无从判断它是「过了」还是「没跑」。
+    if in_work_tree():
+        problems += check_tracked(add_data, text)
+    else:
+        print(f"   ℹ {label}：当前不是 git 工作区，跳过「必须被 git 跟踪」这条")
     return problems
 
 
@@ -319,7 +601,16 @@ def main(argv=None) -> int:
     print(f"本目录应进包模块：{len(modules)} 个"
           f"（另排除 {len(NOT_PACKAGED)} 个入口/一次性/已下线模块）")
 
+    # 先验清单本身：链没收齐的话，三处入口抄得再一致也是错的（第 8 条）。
     bad = 0
+    closure = check_closure(externals, shadowed_modules())
+    if closure:
+        bad += 1
+        print("❌ 跨目录模块的依赖链不闭合（清单少登记，三处入口一致也没用）：")
+        for p in closure:
+            print(f"   · {p}")
+            print(f"::error::跨目录依赖链：{p}")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -337,13 +628,14 @@ def main(argv=None) -> int:
                     print(f"::error::{label} 打包清单：{p}")
         else:
             extra = "，触发目录覆盖跨目录源码" if path.name.endswith(".yml") else ""
-            print(f"✅ {label}：跨目录模块、本地模块、运行期数据三项齐全{extra}")
+            print(f"✅ {label}：跨目录模块、本地模块、运行期数据、git 跟踪四项齐全{extra}")
 
     if bad:
-        print(f"\n❌ 打包清单硬门：{bad} 处入口不合格。少一个文件不会报错、只会少一个"
+        print(f"\n❌ 打包清单硬门：{bad} 处不合格。少一个文件不会报错、只会少一个"
               f"功能，所以这一步不放行就不许开建。")
         return 1
-    print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致")
+    print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
+          "依赖链闭合、进包源码都已在提交里")
     return 0
 
 

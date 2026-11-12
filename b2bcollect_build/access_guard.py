@@ -2051,6 +2051,8 @@ def _channel_integrity(frozen: bool) -> Tuple[int, List[str]]:
         missing = tuple(_sa.missing_list_channels())
         errors = dict(getattr(_sa, "ADAPTER_ERRORS", {}) or {})
         expected = tuple(getattr(_sa, "EXPECTED_LIST_CHANNELS", ()))
+        kw_missing = tuple(_sa.missing_keyword_channels())
+        kw_expected = tuple(getattr(_sa, "EXPECTED_KEYWORD_CHANNELS", ()))
     except Exception as e:
         lines.append(f"⚠️ acl-doctor：采集通道完整性判据取不到（{type(e).__name__}: {e}）")
         return DOCTOR_EXIT_OK, lines
@@ -2058,22 +2060,31 @@ def _channel_integrity(frozen: bool) -> Tuple[int, List[str]]:
     # 全体错位，而这张表只是给人看的报告文案，绝不该把「风鸟」说成「爱企查」。
     # 新加的通道没登记名字时退回 slug 本身，宁可生僻也不张冠李戴。
     names = {"qzd": "企知道", "riskbird": "风鸟", "aiqicha": "爱企查"}
-    if not missing:
+    kw_names = dict(getattr(_sa, "KEYWORD_CHANNEL_NAMES", {}) or {})
+    if not missing and not kw_missing:
         lines.append(f"   · 采集通道：{len(expected)} 路齐全（"
                      + " / ".join(names.get(s, s) for s in expected) + "）")
+        # 关键词那几路也一并打印：外部目录装载的模块，「在不在包里」只有自检说得出话。
+        lines.append(f"   · 关键词通道（外部目录）：{len(kw_expected)} 路齐全（"
+                     + " / ".join(kw_names.get(s, s) for s in kw_expected) + "）")
         return DOCTOR_EXIT_OK, lines
     lost = " / ".join(names.get(s, s) for s in missing)
+    lost_kw = " / ".join(kw_names.get(s, s) for s in kw_missing)
     head = ("❌ acl-doctor：产物里缺采集通道" if frozen
             else "⚠️ acl-doctor：本机缺采集通道（源码态不判红）")
-    lines.append(f"{head}：{lost}")
-    for s in missing:
+    if lost:
+        lines.append(f"{head}：{lost}")
+    if lost_kw:
+        lines.append(f"{head}（关键词）：{lost_kw}")
+    for s in tuple(missing) + tuple(kw_missing):
         why = errors.get(s)
         lines.append(f"   · {s}：{why or '加载结果不可用（原因未登记）'}")
-    lines.append("   · 症状：② 公司名单只剩企知道，等级 0/1 也看不到风鸟与爱企查——"
-                 "这不是权限问题，是那几个 .py 没进包。")
+    lines.append("   · 症状：界面上少一路来源（名单只剩企知道、关键词只剩内置站），"
+                 "等级 0/1 也一样——这不是权限问题，是那几处的 .py 没进包或没装载起来。")
     lines.append("   · 修法：在打包工作流与 debug/build_b2bcollect_mac_local.sh 的 "
                  "--add-data 里补齐 site_adapters.EXTERNAL_MODULES 列出的文件"
-                 "（跑 .github/scripts/check_packaging_manifest.py 会点名缺哪一条）。")
+                 "（跑 .github/scripts/check_packaging_manifest.py 会点名缺哪一条；"
+                 "它现在还顺 import 走一遍传递依赖，并校验每个进包源码都已提交）。")
     return (DOCTOR_EXIT_MODULE if frozen else DOCTOR_EXIT_OK), lines
 
 

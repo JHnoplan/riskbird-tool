@@ -1923,9 +1923,11 @@ def test_packaging_manifest_gate():
     --add-data 漏收了 riskbird_crawler_v2.py / aiqicha_crawler_v2.py。
 
     「少一个文件不会报错、只会少一个功能」是这一类缺陷的共同形状，而且它在界面上和
-    「档位没给这个功能」一模一样，第一轮排查必然被带去查权限。所以四个方向都要钉住：
+    「档位没给这个功能」一模一样，第一轮排查必然被带去查权限。所以六个方向都要钉住：
       1) 清单真源（site_adapters.EXTERNAL_MODULES）与三处入口逐条对拍，含目标目录；
-      2) 硬门脚本自己判得对不对（两个反例：删一条、放错目录，都必须红）；
+      2) 硬门脚本自己判得对不对（反例：删一条、放错目录，都必须红）；
+      2b) 第 7 条——要进包的源码必须已在**提交**里（本机绿、CI 检出后没文件就是它）；
+      2c) 第 8 条——清单顺着 import 走必须闭合，故意让位给本目录的那几笔要登记理由；
       3) 产物自检的通道完整性（打包态退 3、源码态只警告、那条提前返回不放过）；
       4) 界面说话只点名「该给却没给」的那几路，档位藏起来的路绝不念出来。
     """
@@ -1965,6 +1967,76 @@ def test_packaging_manifest_gate():
                    "# --hidden-import 注释里的假项\n--hidden-import real_mod\n"),
                    "--hidden-import"), ["real_mod"],
                "整行注释被剔掉，只有真正会执行的参数进清单")
+
+    # 2b) 第 7 条「进包源码必须已在提交里」。这是 2026-11-12 的第二刀：清单写得对、
+    # 磁盘上文件也在、本机打包全绿，唯独没 git add —— CI 检出后文件压根不存在，两个
+    # 平台的构建一起红在「--add-data 指向的源码不存在」。判据必须能区分三种状态：
+    # 在提交里 / 只 add 没提交 / 压根没跟踪，后两种都要红，而且要点名下一步命令。
+    probe = gate.ROOT / "_gate_untracked_probe.py"
+    _assert(not probe.exists(), "反例③起点干净（探针文件不存在）")
+    probe.write_text("# 硬门自审用探针，跑完即删\n", encoding="utf-8")
+    try:
+        _assert_eq(gate.tracked_state(probe), "missing", "新文件＝压根没被跟踪")
+        _assert_eq(gate.tracked_state(gate.ADAPTERS), "ok", "已提交的源码＝在提交里")
+        got3 = gate.check_tracked([("../_gate_untracked_probe.py", ".")])
+        _assert(any("_gate_untracked_probe.py" in p and "从未被 git 跟踪" in p
+                    for p in got3), f"未跟踪的进包源码必须红并给出 git add（实际={got3}）")
+        # 分隔符两种写法都要能换算到仓库内路径：Windows 用 ; 、类 Unix 用 :
+        _assert_eq(gate._split_add_data("../x.py;pkg")[1], "pkg", "Windows 分号拆得开")
+        _assert_eq(gate._split_add_data("../x.py:pkg")[1], "pkg", "类 Unix 冒号拆得开")
+        _assert_eq(gate._package_input("../riskbird_build/x.py").name, "x.py",
+                   "跨目录 --add-data 换算到仓库内路径（第 7 条判的就是它）")
+        # 有意不提交的那类（Secrets 现写 / CI 现下载）必须在表里写理由，不能靠沉默放行
+        got3c = gate.check_tracked([("config.json", ".")])
+        _assert_eq(got3c, [], "GENERATED_AT_BUILD 登记过的输入不误伤（否则门禁变噪音）")
+    finally:
+        probe.unlink(missing_ok=True)
+    # 同一形状的另外两个入口：本目录新模块（靠 --hidden-import 进包）与入口命令引用的
+    # 构建期脚本。少提交它们的下场分别是一句谁也看不懂的 "Hidden import not found" 和
+    # 「门禁脚本自己没检出」，比少一条 --add-data 更难查，所以一并判。
+    mod_probe = gate.BUILD_DIR / "zz_gate_probe_module.py"
+    _assert(not mod_probe.exists(), "反例④起点干净（本地模块探针不存在）")
+    mod_probe.write_text("# 硬门自审探针，跑完即删\n", encoding="utf-8")
+    try:
+        _assert("zz_gate_probe_module" in gate.local_modules(),
+                "新增的本地模块会进 local_modules（说明 --hidden-import 那条判据也看得见它）")
+        got7 = gate.check_tracked([], gate.CALLERS["Mac workflow"].read_text(encoding="utf-8"))
+        _assert(any("zz_gate_probe_module.py" in p and "--hidden-import" in p for p in got7),
+                f"本地模块没提交同样要红（实际={[p for p in got7 if 'zz_gate' in p]}）")
+    finally:
+        mod_probe.unlink(missing_ok=True)
+    got8 = gate.check_tracked([], gate.CALLERS["Mac workflow"].read_text(encoding="utf-8"))
+    _assert_eq([p for p in got8 if "zz_gate" in p], [], "探针删掉后立刻不再报（不是残留误报）")
+    _assert(any(".github/scripts/" in str(p) for p in
+                gate.referenced_inputs(gate.CALLERS["Mac workflow"].read_text(encoding="utf-8"))),
+           "入口引用的构建期脚本被扫进第 7 条的范围（缺一个连门禁自己都跑不起来）")
+    # 真清单实跑：三处入口的进包输入此刻都必须已在提交里（这条红＝现在推上去 CI 必红）
+    _assert_eq(gate.check_tracked(
+        [gate._split_add_data(t) for t in gate._flag_values(
+            gate._strip_comments(gate.CALLERS["Mac workflow"].read_text(encoding="utf-8")),
+            "--add-data")]), [], "Mac workflow 的进包输入全部已在提交里")
+
+    # 2c) 第 8 条「跨目录依赖链必须闭合」：清单是人手抄的，顺着 import 走一遍才敢收口。
+    _assert_eq(gate.check_closure(externals, gate.shadowed_modules()), [],
+               "EXTERNAL_MODULES 顺着 import 走是闭合的（含 SHADOWED 显式让位那几笔）")
+    _assert("customer_library_cleaner" in gate.shadowed_modules(),
+            "1688 清洗模块由本目录供给这件事是登记过的，不是碰巧 import 顺序对上")
+    _assert((gate.BUILD_DIR / "customer_library_cleaner.py").exists(),
+            "SHADOWED 说由本目录供给，本目录就得真有这个文件")
+    no_shadow = {k: v for k, v in gate.shadowed_modules().items()
+                 if k != "customer_library_cleaner"}
+    got4 = gate.check_closure(externals, no_shadow)
+    _assert(any("customer_library_cleaner" in p for p in got4),
+            f"撤掉那笔让位登记，链就必须报红（否则第 8 条是空转）：{got4}")
+    no_block = tuple(x for x in externals if not x.endswith("block_guard.py"))
+    got5 = gate.check_closure(no_block, gate.shadowed_modules())
+    _assert(any("block_guard.py" in p and "没进 EXTERNAL_MODULES" in p for p in got5),
+            f"漏登记一个传递依赖同样要红（真漏，不是让位）：{got5}")
+    got6 = gate.check_closure(externals + ("ali1688_build/customer_library_cleaner.py",),
+                              gate.shadowed_modules())
+    _assert(any("两份同名实现" in p for p in got6),
+            f"让位登记与进包清单同时出现＝两份实现一起进包，必须红：{got6}")
+
     # CLI 退出码语义：CI 靠它拦构建，返回 1 就等于门禁形同虚设
     proc = subprocess.run([sys.executable,
                            str(_REPO / ".github" / "scripts" / "check_packaging_manifest.py")],
@@ -2008,6 +2080,29 @@ def test_packaging_manifest_gate():
                  _patch(AccessGuard, "_client_probe", staticmethod(lambda: (_NoSuchKeyClient(), "ok", ""))):
                 code_ok, _ = ag.doctor_lines()
                 _assert_eq(code_ok, ag.DOCTOR_EXIT_OK, "通道齐全时，名单没播种仍然判通过（不误伤首次使用）")
+
+    # 3b) 关键词通道里那个**从外部目录装载**的 1688 也在同一道自检里。它与名单三路
+    # 是同一个装载形状（运行时按路径 import 外部 .py），此前却只被名单判据覆盖：
+    # 它依赖的 customer_library_cleaner 靠「本目录同名模块先进 sys.modules」这条隐式链，
+    # 链一断就是「界面上少一个来源、自检全绿」——正是本轮要根治的形状，所以判据必须
+    # 覆盖到它，报告也必须把这一路打印出来。
+    _assert_eq(_sa.missing_keyword_channels(), (), "源码实跑：关键词外部通道装载成功")
+    with _patch(_sa, "HAS_1688", False), _patch(_sa, "ADAPTER_ERRORS",
+                                                {"1688": "ModuleNotFoundError: customer_library_cleaner"}):
+        _assert_eq(_sa.missing_keyword_channels(), ("1688",),
+                   "1688 没装载起来时判据认得它（读当前值，不是定义时的快照）")
+        code_kw, lines_kw = ag._channel_integrity(frozen=True)
+        _assert_eq(code_kw, ag.DOCTOR_EXIT_MODULE,
+                   "打包态缺关键词外部通道同样退 3（与缺名单路同级，不许发货）")
+        _assert(any("1688 阿里巴巴" in ln for ln in lines_kw),
+                f"报告按登记名点名缺了哪一路（实际={lines_kw[:3]}）")
+        _assert(any("不是权限问题" in ln for ln in lines_kw),
+                "缺 1688 同样要把人从「查权限」这条错路上拦回来")
+    with _patch(_sa, "HAS_1688", True):
+        _c, _l = ag._channel_integrity(frozen=True)
+        _assert_eq(_c, ag.DOCTOR_EXIT_OK, "1688 在位时不判红（不误伤正常包）")
+        _assert(any("关键词通道（外部目录）：1 路齐全" in ln for ln in _l),
+                f"齐全时也要打印出来——不打印就没人知道这一路被验过（实际={_l}）")
 
     # 4) 界面说话：只念「该给却没给」的那几路
     _old_ed = os.environ.get(_ed.ENV_VAR)
