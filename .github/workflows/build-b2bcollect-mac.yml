@@ -92,16 +92,22 @@ jobs:
       timeout-minutes: 10
       shell: bash
       run: |
-        # Actions 的 bash 步默认带 -e：自检不通会在拿到 rc 之前就把整步带走，下面那句
-        # ::error:: 注解永远打不出来——门禁还是拦住了，但日志里只有一句 exit code 1，
-        # 远程排障的人分不清是「产物坏了」还是「这一步自己坏了」。所以显式收住退出码。
-        set +e
-        b2bcollect_build/dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool --acl-doctor
-        rc=$?
-        set -e
-        # 报告文件按「刚被写过」查找，不写死 dist/b2bcollect_state：落点由产物自己的
-        # state_dir 候选链决定，写死的路径一变就静默 cat 不到东西（Windows 那一步同理）。
-        log=$(find b2bcollect_build/dist -name acl_doctor.txt -mmin -10 2>/dev/null | head -1 || true)
+        # 这一步全程在 -e 下（Actions 的 bash 步默认值）。以前这里是 `set +e … set -e`，
+        # 那种写法把中间整段的保护都关了：后来人在两行之间插一条命令，它失败了也不会有人知道。
+        # `cmd || rc=$?` 只接管**这一条**的退出码，别的照旧拦，所以统一改成这个形状。
+        BIN=b2bcollect_build/dist/B2bCollectTool.app/Contents/MacOS/B2bCollectTool
+        rc=0
+        "$BIN" --acl-doctor || rc=$?
+        # 报告落点问**产物自己**（--state-dir），与本机打包脚本同一个口径：在 shell 里猜
+        # dist 目录是第二份真源——候选链或布局一变，这一步就静默 cat 不到本次报告，
+        # 日志里看着像「产物是好的，只是这步没打印原文」，而这种红法没人会去修。
+        state_out=$("$BIN" --state-dir 2>&1 | tail -1 || true)
+        log=""
+        if [ -n "${state_out}" ] && [ -d "${state_out}" ]; then
+          log=$(find "${state_out}" -name acl_doctor.txt -mmin -10 2>/dev/null | head -1 || true)
+        else
+          echo "::warning::--state-dir 没答出一个能用的目录（答的是「${state_out}」）：本次只按上面的标准输出判"
+        fi
         if [ -n "$log" ]; then
           echo "· 自检报告原文：$log"
           cat "$log"
@@ -159,14 +165,16 @@ jobs:
           echo "::error::这份副本真的还能写（${READONLY_PROBE}）：仿真没做成，这一步绿了也不代表产物没问题"
           exit 1
         fi
-        before=$(find "$APP" | wc -l)
+        # 这两处 find 不能裸着赋值：Actions 的 bash 步默认就是 `set -e`，`find` 在路径读不到
+        # 时返回 1，裸赋值会把非零直接交给 set -e —— 这一步会**静默结束**，后面的判据一道也不
+        # 跑，日志里只有一句 shell 的报错（2026-11-13 本机打包脚本就是这么让最后一道门消失的，
+        # 判据见硬门第 15 条）。基准数不到就必须说清为什么停，而不是安静退出。
+        before=$(find "$APP" | wc -l) || { echo "::error::数不到只读副本的文件数（${APP}）：判据没有基准，禁止上传"; exit 1; }
         mkdir -p "$STAGE/home"
-        set +e
-        env HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$BIN" --ui-smoke
-        rc=$?
-        set -e
+        rc=0
+        env HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$BIN" --ui-smoke || rc=$?
         stray=$(find "$STAGE/home" -name "*.log" 2>/dev/null || true)
-        after=$(find "$APP" | wc -l)
+        after=$(find "$APP" | wc -l) || { echo "::error::跑完之后数不到副本文件数（${APP}）：比对没有基准，禁止上传"; exit 1; }
         if [ -n "$stray" ]; then
           echo "$stray" | while read -r f; do
             [ -n "$f" ] || continue

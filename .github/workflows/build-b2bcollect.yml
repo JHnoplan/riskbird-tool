@@ -403,15 +403,32 @@ jobs:
         LOG="$TMP_DIR/nsis_build.log"
         echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT  钉住版本：$NSIS_PINNED"
         # -V4：要它把「我是谁」那行横幅和每一步细节都落到日志里。红了好查，绿了也能对版。
-        # 管道接 tee 是为了既让日志上屏（Actions 里能直接读）又留一份文件供判据取用；
-        # 但 pipefail 会把「tee 成功」和「编译器失败」搅在一起，所以显式取 PIPESTATUS[0]，
-        # 并在这个区间里关掉 -e——否则编译器一非零，下面那行判据压根执行不到。
-        set +e
-        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG"
-        NSIS_RC=${PIPESTATUS[0]}
-        set -e
+        # 管道接 tee 是为了既让日志上屏（Actions 里能直接读）又留一份文件供判据取用。
+        # 取码要 PIPESTATUS[0]，理由不是「$? 会漏掉编译器的失败」——本机 bash 3.2.57 实测
+        # pipefail 取的是**最右非零**，编译器退 7、tee 成功时 `$?` 同样给 7（Z 节跑真 bash
+        # 自证）。真正的理由是**归因**：tee 自己坏（日志落盘路径不合法，Git Bash 的 cygpath
+        # 转换就可能坏）时 `$?` 拿到的是 tee 的 1，这句 ::error:: 会指着编译器说「编译失败
+        # （退出码 1）」，而编译器其实成功——红了一条谎话。PIPESTATUS[0] 只问首段，谁坏说谁。
+        # 写法用 `cmd || rc=${PIPESTATUS[0]}`（实测 bash 3.2 与 5.x 都成立：|| 分支里
+        # PIPESTATUS 还是刚那条管道的），不再用 `set +e … set -e` 那种把**整段**保护关掉
+        # 的区间——区间里后来人插一条命令，它失败了没人知道，症状与本轮第 15 条一模一样。
+        # 但这个写法自己有个前提：管道整体得能反映首段的失败，也就是 pipefail 必须开着——
+        # 没开时 tee 成功就压根不进 || 分支，编译器退 3 会被当成成功（它代替不了 pipefail，
+        # Z 节跑真 bash 自证）。所以本步**自己声明** pipefail，不赌 runner 的默认 shell
+        # 选项：默认值是别人的实现细节，它哪天变了，坏法是「带着编译错误的安装包发出去」，
+        # 不是红一条日志。（离线仿真「关掉 pipefail 仍要认得编译器」那一味钉的就是这个。）
+        set -o pipefail
+        NSIS_RC=0
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
         if [ "$NSIS_RC" -ne 0 ]; then
           echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
+          exit 1
+        fi
+        # 上面取了首段，就得给「只有 tee 坏」这一路单独一句话：编译器成功、日志却没写成时，
+        # 下一节读横幅只会报「读不到横幅」，把一次落盘故障说成编译器行为异常（正是本轮要根治
+        # 的形状——错误的话听起来像别的东西坏了）。留这份文件是判据的输入，输入不在就在这里停。
+        if [ ! -s "$LOG" ]; then
+          echo "::error::makensis 本身是成功的（首段退出码 0），但编译日志 ${LOG} 没写成或为空：坏的是 tee/落盘这一步（Git Bash 把路径转成 ${RUNNER_TEMP} 时不合法就会这样），不是编译器。后面读横幅全靠这份文件，不放行是为了不让你去查一个没坏的编译器。"
           exit 1
         fi
         # 横幅必须按**真编译器自报的写法**找，不能按想象中的写法找。

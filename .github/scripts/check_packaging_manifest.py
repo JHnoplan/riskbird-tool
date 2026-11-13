@@ -76,6 +76,24 @@
      正是那句假话。格式无穷，猜是猜不完的；能落地的纪律是「猜过一次就要留下证据，改的人
      先看见证据」。自家 `printf`/`echo` 搬进 grep 的那些不算：那是同仓自己印的文案，改了
      打印那一行当场就红，不需要出处（把它也算进来只会逼人写假出处）。
+ 15 set -e（含 Actions bash 步的默认值）生效的那一段里，「正常情形也会返回非零」的命令
+     （pgrep 没匹配、grep 没命中、ls/cat/find 没这个文件、command -v 查不到）不许裸着当
+     赋值来源 `VAR=$(…)`：裸赋值把非零原样交给 set -e，脚本从那一行起**静默结束**，后面的
+     门一道也不会跑。2026-11-13 本机实发——Mac 打包脚本第 6 道门（真双击验窗）就是这么安静地
+     没执行，日志停第 5 步 ✅ 之后一行不剩；而它此前一直「绿」，只因机器上恰好留着一枚旧实例
+     让 pgrep 返回 0。修法要么 `|| true`，要么 `|| { echo 为什么停; exit 1; }`；同一天脚本
+     还加了 ERR 陷阱，让这一类退出至少留下一行行号（判据与夹具见离线套件 Z 节）。同一族的
+     另一半是「装了 ERR 陷阱却没开 -E（errtrace）」：实测函数与命令替换里的非零根本不走陷阱，
+     脚本看上去像处理过了，出事时照样一行不剩——所以看见 `trap … ERR` 就同时要到 -E。
+     第三半是 `set +e … set -e` 那种**整段关保护**的写法：区间里后来人插一条命令，它失败了
+     没人知道，而区间看着像「已经开回来了」。接管一条命令的退出码从来不需要关整段
+     （`cmd || rc=$?`；管道要首段用 `… | tee "$LOG" || rc=${PIPESTATUS[0]}`，实测成立）。
+ 16 入库路径两两在**大小写·Unicode 变体不敏感**的文件系统（macOS/Windows 默认）里不许撞
+     成同一个文件。2026-11-13 本机实发，而且先红在测试自己身上：离线夹具写成
+     `zz_errexit_trap_noe.sh` / `zz_errexit_trap_noE.sh`，本意两份，mac 上是一份——后写的
+     静默盖掉先写的，判据读出的是隔壁那份内容，红了一条不相干的话；Linux CI 大小写敏感，
+     同一份用例在云端全绿。同一形状落到交付上更贵：`Foo.py` 与 `foo.py` 同时入库，Windows
+     检出的那棵树里只有一个，装进包的就是「最后被写入的那一份」，而 CI 永远不会为此变红。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -90,6 +108,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 for _s in (sys.stdout, sys.stderr):
@@ -1127,6 +1146,285 @@ def check_external_output_provenance(workflows: tuple = None, sources: tuple = N
 
 
 # ---------------------------------------------------------------------------
+# 第 15 条：set -e 生效的 shell 里，「正常情况下也会返回非零」的命令不许裸着当赋值来源。
+#
+# 为什么单独立一条（2026-11-13 本机实发）：debug/build_b2bcollect_mac_local.sh 的第 6 道门
+# （真双击验窗）安静地没跑——日志停在第 5 步的 ✅ 之后，一行报错都没有。那一行是
+#     BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
+# 「机器上没有旧实例」是**最常见**的情形（干净机器就该一个都没有），pgrep 在这种情形返回 1，
+# pipefail 让整条管道非零，裸赋值把这个非零原样交给 set -e，脚本当场结束且零解释。
+# 它此前一直看起来是绿的，只因为那台机器上恰好留着一枚我自己起的旧实例——判据依赖运气。
+#
+# 三条口径要说清，否则这条门要么漏要么假红：
+#   · 只有**裸赋值** `VAR=$(...)` 会把替换的退出码交给 set -e；`local/export/readonly`
+#     前缀会把它吞掉（实测 rc=0 继续跑），所以那些写法不报（它们的问题是另一类：静默放过）；
+#   · 命令替换出现在别的命令的参数里（`echo "$(cat f)"`）退出码被外层命令覆盖，也不报；
+#   · 有 `|| true`／`|| { echo ...; exit 1; }`／在 if、while、&&、|| 列表里的，都是**作者
+#     已经表过态**的写法，一律放过——本条要拦的是「没表过态」那一种。
+# 判的是「这一段 shell 在 -e 下会怎么走」，与第 11 条（能不能被解析）正交：第 11 条绿、
+# 这一条红的脚本，症状正是「跑了一半，后面的门安静地不存在」。
+#
+# 同一族的另一半（15b，本轮补判据时实测出来）：脚本装了 `trap … ERR` 却没有 `set -E`
+# （errtrace）。陷阱在函数与命令替换里根本不生效（/bin/bash 实测：`set -euo pipefail`
+# + 陷阱 + `f(){ false; }; f` 一声不响，`set -Eeuo pipefail` 同一份才打印），症状和
+# 「没装陷阱」完全一样，但脚本看上去却像处理过了——所以只要看见 ERR 陷阱就同时要到 -E，
+# 而不是只改本轮那一句 `set`。
+# ---------------------------------------------------------------------------
+
+# 正常情形（没匹配、没找到、文件不存在）就返回非零的外部命令。
+NONZERO_PRONE = ("pgrep", "pidof", "grep", "egrep", "fgrep", "rg", "ls", "which",
+                 "diff", "cmp", "cat", "find", "test")
+# `command -v x` 与 `type x` 是「查得到=0／查不到=1」的代表，写法上不是单个命令名。
+NONZERO_PRONE_PREFIX = ("command -v", "builtin command -v")
+# 会吞掉替换退出码的赋值前缀（实测：local/export 后面的 `=$(false)` 不触发 set -e）。
+MASKING_PREFIX = re.compile(r"^\s*(?:local|export|readonly|declare|typeset)\s")
+# 裸赋值：VAR=$( ... )，整行就是这一句（行尾还有 `|| ...` 的说明作者表过态）。
+BARE_ASSIGN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=\$\((.*)\)\s*$")
+# set 的开关行。短选项那一串字母里**大小写不等价**（-e=errexit，-E=errtrace），长选项
+# 写法是 `-o errexit` / `-o errtrace`。这一条判据第一版写的是 `-[a-z]*e[a-z]*`，于是
+# `set -Eeuo pipefail` 整行认不出来——第 15 条对出事的那份脚本直接空转（加了 -E 之后
+# 大小写混排是必然写法），所以这里逐个字母判，而不是拿一串正则整行判。
+SET_LINE = re.compile(r"^\s*set\s+(\S.*)$")
+SET_OPT = re.compile(r"([+-])([A-Za-z]+)(?:[ \t]+([A-Za-z]+))?")
+# 装了 ERR 陷阱（`trap '…' ERR`）；`trap - ERR` 是把陷阱摘掉，不算装。
+ERR_TRAP = re.compile(r"^\s*trap\s+(?!-\s)(.*?)\s+([A-Za-z0-9 ]+)\s*$")
+# errtrace：让函数与命令替换里也继承 ERR 陷阱。实测（/bin/bash 3.2 与 5.x 同）：
+#   set -euo pipefail + trap … ERR + f(){ false; }; f  → 陷阱**不响**，脚本静默退出；
+#   set -Eeuo pipefail 同一份                         → 陷阱响，留下一行人话。
+# 也就是说只写 `set -euo` 的陷阱只覆盖脚本主体那一层，恰恰盖不住最容易静默结束的位置。
+
+
+def _set_state(line: str):
+    """这一行 `set` 把 errexit／errtrace 打开（True）、关掉（False）还是没提（None）。
+
+    口径：一行一句（`if …; then set +e` 这种把 set 藏在中间的不在本条覆盖内，报出来
+    也只会是漏报而不是假红——与第 11 条一样，判的是脚本自己写下来的那一行）。
+    """
+    m = SET_LINE.match(line)
+    if not m:
+        return None, None
+    er = et = None
+    for sign, opts, arg in SET_OPT.findall(m.group(1)):
+        on = sign == "-"
+        if opts == "o":
+            if arg == "errexit":
+                er = on
+            elif arg == "errtrace":
+                et = on
+        else:
+            if "e" in opts:
+                er = on
+            if "E" in opts:
+                et = on
+    return er, et
+
+
+def _is_err_trap(line: str) -> bool:
+    """这一行是不是「装 ERR 陷阱」（信号列表里含 ERR），注释行与 `trap - ERR` 都不算。"""
+    if line.strip().startswith("#"):
+        return False
+    m = ERR_TRAP.match(line)
+    return bool(m) and "ERR" in m.group(2).split()
+
+
+def _errtrap_problems(label: str, base: int, segments: list) -> list:
+    """第 15 条的另一半：装了 ERR 陷阱，脚本却让它压根没有触发的机会。
+
+    上面那半管的是「一句非零把脚本静默带走」，这一半管的是「已经决定要留一行话了，
+    结果那句话在出事的时候不会说」——两种症状都是「日志到此为止、没有解释」，但修法
+    不同：前者是给那一句接管非零，后者是在 set 里补一个 E。判据必须在装陷阱的那一刻
+    就把 -E 一起要到，否则下一来看见的是一副「已经处理过了」的样子，比什么都没有更危险。
+    """
+    out = []
+    traps = [(lineno, line) for lineno, line, _a in segments if _is_err_trap(line)]
+    if not traps:
+        return out
+    lineno, line = traps[0]
+    if not any(active for _n, _l, active in segments):
+        out.append(
+            f"{label} 第 {base + lineno} 行装了 ERR 陷阱，但整份脚本没有任何一段在 -e 下跑："
+            f"errexit 没开就不会产生 ERR 事件，这句 trap 永远不响（出错时既没有非零退出也没有"
+            f"一行解释）。要么补 `set -euo pipefail`，要么把这行删掉别留一副处理过的样子："
+            f"{line.strip()[:120]}")
+        return out
+    # errtrace 看整份脚本有没有被打开过（行序、中途关掉再开不在本条口径内）：
+    # 装陷阱的人要的就是「函数里的非零也留得下一句话」，这份脚本整体没这个能力就该响。
+    if not any(_set_state(ln)[1] for _n, ln, _a in segments
+               if not ln.strip().startswith("#")):
+        out.append(
+            f"{label} 第 {base + lineno} 行装了 ERR 陷阱，但 set 里没有 -E（errtrace）："
+            f"实测陷阱在函数与命令替换里不生效，只盖脚本主体那一层——而「静默结束」最常发生在"
+            f"函数里的那一次调用。补成 `set -Eeuo pipefail`：{line.strip()[:120]}")
+    return out
+
+
+def _setplus_problems(label: str, base: int, segments: list) -> list:
+    """第 15 条的第三半：`set +e` 把**一整段**的保护关掉。
+
+    上面两半管的是「一句非零把脚本带走」与「陷阱响了却没开 -E」，这一半管的是反向的那
+    种侥幸：`set +e … set -e` 之间每一条命令都失去了拦路资格，后来人在中间插一句（换
+    个落点、加一次查找）它失败了也不会有人知道，而这一段自己看着是「已经开回来」的。
+    接管某一条命令的退出码从来不需要关整段：`cmd || rc=$?`（管道要首段就
+    `cmd | tee log || rc=${PIPESTATUS[0]}`，实测 bash 3.2 与 5.x 都成立）。
+    """
+    out = []
+    for lineno, line, _active in segments:
+        if line.strip().startswith("#"):
+            continue
+        if _set_state(line)[0] is not False:
+            continue
+        out.append(
+            f"{label} 第 {base + lineno} 行用 `set +e` 关掉了整段的 errexit：这一句到"
+            f"`set -e` 之间的每一条命令都失去了拦路资格，后来人插进来的那一句失败不会"
+            f"有人知道。只接管这一条的退出码请写 `cmd || rc=$?`（管道里要首段就 "
+            f"`… | tee \"$LOG\" || rc=${{PIPESTATUS[0]}}`）：{line.strip()[:120]}")
+    return out
+
+
+def _errexit_segments(text: str, default: bool) -> list:
+    """把脚本切成 [(起行号, 该行原文, -e 是否生效)]。
+
+    Actions 的 bash 步默认就带 `-e`（`shell: bash` 时还是 `-o pipefail`），本地脚本要看
+    有没有 `set -e`，中间还可能被 `set +e` 关掉——判据必须跟着脚本自己的口径走，
+    否则会在「作者明确关掉 -e 的那一段」报一堆无意义的红。
+    """
+    active = default
+    out = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        er, _et = _set_state(line)
+        if er is not None and not line.strip().startswith("#"):
+            active = er
+        out.append((lineno, line, active))
+    return out
+
+
+def _nonzero_prone_head(seg: str) -> str:
+    """这一段命令的首个命令是不是「正常情形也返回非零」的那批。"""
+    s = seg.strip()
+    for prefix in NONZERO_PRONE_PREFIX:
+        if s.startswith(prefix):
+            return prefix
+    head = re.split(r"[\s|;&)]", s, maxsplit=1)[0]
+    return head if head in NONZERO_PRONE else ""
+
+
+def check_shell_errexit_hazards(sources: tuple = None, workflows: tuple = None,
+                                texts: tuple = ()) -> list:
+    """第 15 条：-e 下的裸赋值 + 正常也会非零的命令 = 脚本会静默结束（带行号点名）。
+
+    sources/workflows/texts 与第 11、14 条同口径：登记表可整体替换，texts 是内存里的
+    [(标签, 脚本)]——离线测试要能拿「同一句 pgrep 赋值，裸着写 / 加 || true」这一对喂进来，
+    要求裸着的那份必须报红、加了的那份必须干净。判据验不出「坏了会响」就等于没有判据。
+    """
+    sources = SHELL_SOURCES if sources is None else sources
+    workflows = WORKFLOWS if workflows is None else workflows
+    corpus = []
+    for rel in sources:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                    # 不在位由第 11 条点名，这里不重复报
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # 本地脚本：只有显式 `set -e` 之后才算（脚本里没写过就一路不设，本条不适用）。
+        corpus.append((rel, 0, _errexit_segments(text, default=False)))
+    for rel in workflows:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for name, start, shell, script in run_blocks_in_workflow(text):
+            if shell != "bash":
+                continue
+            # Actions 的默认值：bash 步就是 -e（显式写了 set +e 的话由上面那段切换处理）。
+            # start 是 `run:` 那一行，脚本体从 start+1 开始 → 块内第 n 行 = 文件第 start+n 行。
+            corpus.append((f"{rel}「{name}」", start,
+                           _errexit_segments(script, default=True)))
+    for label, script in texts:
+        corpus.append((label, 0, _errexit_segments(script, default=True)))
+    problems = []
+    for label, base, segments in corpus:
+        problems.extend(_errtrap_problems(label, base, segments))
+        problems.extend(_setplus_problems(label, base, segments))
+        for lineno, line, active in segments:
+            if not active:
+                continue
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            m = BARE_ASSIGN.match(line)
+            if not m or MASKING_PREFIX.match(line):
+                continue
+            inner = m.group(2)
+            if "||" in inner or "&&" in inner:
+                continue            # 作者已经接管了非零那条路
+            bad = ""
+            for seg in inner.split("|"):
+                seg = re.sub(r"^\s*(?:if|while|until|then|else|do|!)\s+", " ", seg)
+                found = _nonzero_prone_head(seg)
+                if found:
+                    bad = found
+                    break
+            if not bad:
+                continue
+            problems.append(
+                f"{label} 第 {base + lineno} 行：`{m.group(1)}=$(… {bad} …)`——{bad} 在正常情形下"
+                f"就返回非零（没匹配／没这个文件／机器上没这个进程），裸赋值把这个非零交给"
+                f" set -e，脚本从这里起**静默结束**，后面的门一道也不会跑。"
+                f"要么 `|| true`（取不到就算了），要么 `|| {{ echo \"为什么停\"; exit 1; }}`"
+                f"（取不到就不能往下走）：{s[:120]}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# 第 16 条：同一份仓库里不许有两个「在大小写不敏感文件系统上其实是同一个文件」的路径。
+#
+# 为什么单独立一条（2026-11-13 本机实发，红在**离线套件自己身上**）：Z 节加反向对照时写
+# 了两个夹具 `zz_errexit_trap_noe.sh` 与 `zz_errexit_trap_noE.sh`，本意是两份；在 macOS
+# （APFS 默认大小写不敏感）与 Windows 上它们是同一个 inode，后写的把先写的静默盖掉，于是
+# 「没开 -e」那条判据读到的是「没开 -E」那份内容，红了一条完全不相干的话。Linux CI 大小写
+# 敏感，同一份用例在云端是两份文件、全绿——**症状只在开发机上出现，且长得像判据写错了**。
+#
+# 同一形状在交付链上有两份得管的账：
+#   · 入库路径：`Foo.py` 与 `foo.py` 同时提交，Linux/macOS 都能检出，Windows/macOS  checkout
+#     时后者会覆盖前者（git 还会一路报 modified），装进包的就是被盖掉那一份；
+#   · 同名不同目录在 PyInstaller 里也是坑（--add-data 目标同名），但那已有第 1、13 条管；
+# 这里只补没人管的那一维：**归一化之后同名**。
+#
+# 口径：比较键用 Unicode 的「大小写＋变体无关匹配」（casefold 两次 + NFD），因为 macOS 的
+# HFS+/APFS 既不分大小写也不分组合形式（`é` 与 `e\u0301` 是同一个文件名）；只比**同一仓库
+# 相对路径**，跨平台一律以 git 的 `/` 写法为准（与 _rel_posix 同口径）。git 不可用时不判。
+# ---------------------------------------------------------------------------
+
+
+def fs_insensitive_key(name: str) -> str:
+    """大小写不敏感 + 变体不敏感文件系统（macOS/Windows 默认）眼里的同一个名字。
+
+    UTS#36 的 canonical caseless matching：casefold → NFD → 再 casefold（一次 casefold 后
+    出现的组合段可能又需要折叠，所以标准做法是折叠两次）。
+    """
+    return unicodedata.normalize("NFD", name.casefold()).casefold()
+
+
+def check_case_colliding_paths(paths=None) -> list:
+    """第 16 条：把「在 mac/Windows 上其实是同一个文件」的入库路径对点名出来。"""
+    if paths is None:
+        if not in_work_tree():
+            return []
+        paths = sorted(_tracked_sets()[0])
+    groups = {}
+    for p in paths:
+        groups.setdefault(fs_insensitive_key(p), set()).add(p)
+    problems = []
+    for _key, names in sorted(groups.items()):
+        if len(names) < 2:
+            continue
+        problems.append(
+            f"仓库里这几条路径在 macOS/Windows 的默认文件系统（大小写·变体不敏感）里是"
+            f"**同一个文件**：{sorted(names)}——Linux CI 检出是两份、开发机检出只剩一份，"
+            f"而那份还是哪一次写入的最后一个；改名的时候请把两个用途分开写全（不要只动大小写）")
+    return problems
+
+
+# ---------------------------------------------------------------------------
 # 第 12 条：交付链上的 Python 脚本，跟子进程与控制台之间的编码必须由脚本自己写定。
 #
 # 为什么单独立一条（2026-11-12 云端第二个红，由第 11 条自己带回来）：
@@ -1529,6 +1827,36 @@ def main(argv=None) -> int:
     else:
         print("✅ 外部工具输出格式假设：每一处按文本取值的地方都在近旁写明了那批字节的来源")
 
+    # -e 下的静默退出（第 15 条）：第 11 条保证「这段 shell 能被解析」，保证不了
+    # 「解析出来的一段跑到一半被 set -e 安静带走」。本轮红的正是后者，而且红在**最后一道门**。
+    hazards = check_shell_errexit_hazards()
+    if hazards:
+        bad += 1
+        print("❌ 交付链 shell 里有会让脚本「跑一半就没声音」的写法（裸赋值把非零交给 set -e、"
+              "装了 ERR 陷阱却没开 -E／-e、或整段 set +e 把保护关掉；后面的门不会跑，"
+              "日志里也不会有第二句话）：")
+        for p in hazards:
+            print(f"   · {p}")
+            print(f"::error::errexit 静默退出：{p}")
+    else:
+        print("✅ errexit 静默退出：-e 生效的 shell 段里没有「正常也会非零」的裸赋值，"
+              "装了的 ERR 陷阱也都带着 -E 生效，整段关保护的那种侥幸一处也没有"
+              f"（{len(SHELL_SOURCES)} 份脚本 + {len(WORKFLOWS)} 份 workflow 的 bash 步）")
+
+    # 大小写·变体不敏感文件系统上的同名路径（第 16 条）：这一条管的是「同一份仓库在不同
+    # 平台上不是同一棵树」。云端 Linux 检得出两份、开发机 mac 只有一份，且留哪一份取决于
+    # 写入顺序——这类差异不会让 CI 变红，只会让「我这边是好的」变成一句真话加一个坏包。
+    collide = check_case_colliding_paths()
+    if collide:
+        bad += 1
+        print("❌ 仓库里有只在大小写/Unicode 变体上不同的入库路径（mac 与 Windows 检出时"
+              "是同一个文件）：")
+        for p in collide:
+            print(f"   · {p}")
+            print(f"::error::同名路径撞车：{p}")
+    else:
+        print("✅ 同名路径撞车：入库路径两两在大小写不敏感文件系统下也不会撞到同一个文件")
+
     # 交付链 Python 脚本与子进程/控制台之间的编码（第 12 条）：本机是 UTF-8，Windows
     # runner 的控制台代码页是 cp1252——凡是把编码交给环境决定的写法，都在这里拦一次，
     # 而不是等它在云端炸开一条看不到根因的 UnicodeError。
@@ -1591,6 +1919,8 @@ def main(argv=None) -> int:
         return 1
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
           "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
+          "shell 里没有被 set -e 静默带走的裸赋值、装了的 ERR 陷阱也都带着 -E、"
+          "入库路径在大小写不敏感文件系统上也不撞车、"
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死")
     return 0
 

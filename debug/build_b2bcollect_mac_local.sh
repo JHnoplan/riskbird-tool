@@ -29,7 +29,21 @@
 # 用法：bash debug/build_b2bcollect_mac_local.sh
 #   可选环境变量：PY=python 解释器（默认 .venv/bin/python）
 #                 B2B_LOCAL_KEEP_OLD=1 保留旧 dist/B2bCollectTool.app（默认覆盖）
-set -euo pipefail
+set -Eeuo pipefail
+# ── ERR 陷阱：把「脚本静默结束」变成「带行号的一句话」（2026-11-13 本机实发）──────
+# 上一次跑这个脚本，第 5 步印完 ✅ 之后整个脚本一声不响地结束了：第 6 道门（真双击验窗）
+# 压根没执行，日志里连一行报错都没有。根因是 set -e 撞上一句**正常情况下也会返回非零**的命令：
+#   BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
+# 机器上没有旧实例时（干净机器 = 最常见的那种）pgrep 返回 1，pipefail 让整条管道非零，
+# 裸赋值又把这个非零状态原样交给 set -e，于是当场退出、零解释。
+# 更难看的是它此前一直「绿」：只因那台机器上恰好留着一枚我自己起的旧实例，pgrep 才返回 0
+# ——判据依赖机器上有没有碰巧的残留进程，就是拿运气当判据。
+# `|| true` 修的是那一句；这一条陷阱修的是**这一整类**：以后再有任何一句命令把脚本带走，
+# 至少留下一行「第几行、退出码多少」，而不是让交付链最后一道门安静地不存在。
+# 注：`exit 1` 不触发 ERR（实测），所以各处主动止损的报错照旧只打自己那句；
+#     需要「先跑完再看退出码」的地方一律写成 `cmd || RC=$?`——它在 || 列表里，
+#     set -e 与 ERR 陷阱都不插手，不再需要 set +e 那种整段关掉保护的做法。
+trap 'rc=$?; printf "❌ 第 %s 行的命令非零退出（rc=%s）：set -e 会在这里结束脚本，后面的门不会再跑\n" "$LINENO" "$rc" >&2' ERR
 
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
@@ -48,6 +62,31 @@ if [ -z "${PY:-}" ] || [ ! -x "$PY" ]; then
   exit 1
 fi
 echo "· 解释器：$PY"
+
+# 有边界地跑一个子进程：$1=秒上限，其余是命令；超时按 124 收（与 GNU timeout 同口径）。
+# 为什么连「取个路径」这种秒回的事也要包一层：本机已实证过两次，被堵死的 exec 评估队列
+# 能让任何一次新 exec 永远排不上队，那时整条交付链跟着挂住、日志里一行结论都留不下
+# （2026-11-13 凌晨那两个 0 字节的取日志文件就是这么来的）。
+# 放在文件顶部而不是第 6 步原地：第 4 步取「自检报告落点」也要用它——同一个「有边界地
+# 跑外部程序」的规矩只写一份，两处各抄一遍迟早会抄出两种超时语义。
+_run_bounded() {
+  local _limit=$1 _pid="" _i=0
+  shift
+  "$@" & _pid=$!
+  while [ $_i -lt $((_limit * 2)) ]; do
+    _i=$((_i + 1))
+    sleep 0.5
+    if ! kill -0 "$_pid" 2>/dev/null; then
+      wait "$_pid" && return 0
+      return $?
+    fi
+  done
+  kill -TERM "$_pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$_pid" 2>/dev/null || true
+  wait "$_pid" 2>/dev/null || true
+  return 124
+}
 
 # ── 0) 打包清单硬门：该有的模块与数据在清单里一项不缺，才许开建 ──
 #     判据来自 site_adapters.EXTERNAL_MODULES（模块的使用者自己声明需要什么），
@@ -134,15 +173,36 @@ if [ ! -x "$APP" ]; then
   exit 1
 fi
 echo "· 产物自检：$APP --acl-doctor"
-set +e
-"$APP" --acl-doctor
-RC=$?
-set -e
-# 报告文件按「刚被写过」来find，而不是写死 dist/b2bcollect_state：自检报告的落点
-# 由 tool_config.state_dir 的候选链算出来（环境变量、包旁、exe 同级、用户目录…），
+# 落点先问产物自己（--state-dir 只印一行绝对路径），后面第 4、5、6 步都用它：
+# 2026-11-13 受保护目录那条改动之后，本机这份 .app 建在 ~/Desktop 下，候选链按语义把
+# 受保护目录整条排除，自检报告因此不再落在 dist/ 里——原来那句 `find dist` 找不到任何东西，
+# 门禁仍然对，但「把报告原文发给发包方」这条排障用途静默失效（脚本只会说一句没找到）。
+STATE_OUT="dist/.state_dir.out"
+_rc=0
+_run_bounded 20 "$APP" --state-dir > "$STATE_OUT" 2>&1 || _rc=$?
+if [ "$_rc" = 124 ]; then
+  echo "❌ 产物取台账落点 20 秒没返回（--state-dir）：连一个路径都给不出，这份包别外发"
+  exit 1
+fi
+if [ "$_rc" -ne 0 ]; then
+  echo "❌ 产物不认 --state-dir（退出码 ${_rc}）：$(cat "$STATE_OUT" 2>/dev/null || true)"
+  exit 1
+fi
+# 格式依据：这个开关只 print 一行绝对路径（_state_dir_entry 里唯一那次 print），取末行
+# 既容得下它前面可能多出来的告警行，也不会因为话术改动而拿错字段。
+STATE_DIR=$(tail -1 "$STATE_OUT")
+rm -f "$STATE_OUT"
+if [ -z "$STATE_DIR" ]; then
+  echo "❌ --state-dir 给了空路径：台账与自检报告的落点问不出来，第 4、6 两步就没有判据"
+  exit 1
+fi
+echo "· 状态目录（产物自己报的）：$STATE_DIR"
+RC=0
+"$APP" --acl-doctor || RC=$?
+# 报告文件按「刚被写过」来 find，落点用上面问来的那一份，绝不写死 dist/b2bcollect_state：
 # 口径或布局一变，写死的那条路径就静默 cat 不到任何东西——门禁还是对的，但远程排障
 # 时少了一份可以直接发给发包方的原文。Windows 那一步早就是查找而不是写死，两边同规矩。
-LOG=$(find dist -name acl_doctor.txt -mmin -10 2>/dev/null | head -1)
+LOG=$(find "$STATE_DIR" -name acl_doctor.txt -mmin -10 2>/dev/null | head -1 || true)
 if [ -n "${LOG:-}" ]; then
   echo "· 自检报告原文：$LOG"
   cat "$LOG"
@@ -185,14 +245,14 @@ if (printf 'x' >> "$READONLY_PROBE") 2>/dev/null; then
   echo "❌ 这份副本真的还能写（${READONLY_PROBE}）：仿真没做成，这一步绿了也不代表产物没问题"
   exit 1
 fi
-BEFORE=$(find "$SAPP" | wc -l)
+# 数文件数是判据 3)「包内一字节没多」的基准：基准取不到就停下并说清为什么，别把
+# 「find 失败」留给 set -e 当成一次没有解释的退出（同一类事故见文件开头的 ERR 陷阱）。
+BEFORE=$(find "$SAPP" | wc -l) || { echo "❌ 数不到只读副本的文件数（${SAPP}）：判据没有基准，不放行"; exit 1; }
 mkdir -p "$STAGE/home"
-set +e
-HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$SBIN" --ui-smoke
-RC=$?
-set -e
+RC=0
+HOME="$STAGE/home" QT_QPA_PLATFORM=offscreen "$SBIN" --ui-smoke || RC=$?
 STRAY=$(find "$STAGE/home" -name "*.log" 2>/dev/null || true)
-AFTER=$(find "$SAPP" | wc -l)
+AFTER=$(find "$SAPP" | wc -l) || { echo "❌ 跑完之后数不到副本文件数（${SAPP}）：比对没有基准，不放行"; exit 1; }
 if [ -n "${STRAY:-}" ]; then
   while read -r f; do
     [ -n "$f" ] || continue
@@ -236,57 +296,18 @@ echo "✅ 只读包窗口冒烟通过：界面建得出、崩溃日志一份都�
 #   ⑤ 收尾把这个实例连同它带出来的子进程一起收干净，绝不留孤儿：今天这批孤儿就是把
 #      机器堵死的那批孤儿。
 APP_LIVE="dist/B2bCollectTool.app"
-APP_BIN="$APP_LIVE/Contents/MacOS/B2bCollectTool"
 LEDGER_NAME="launch_history.log"      # 与 b2bcollect_gui.LAUNCH_LOG_NAME 同一份名字
 LEDGER_STAGE="shown"                  # 与 b2bcollect_gui.LAUNCH_STAGE_SHOWN 同一个阶段
-BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
+# 「没有旧实例」是**最常见**的情形（干净机器上就该一个都没有），而 pgrep 在这种情况下返回 1：
+# 裸赋值 + pipefail + set -e 会让整条脚本在这里静默结束，最后一道门根本不跑
+# （2026-11-13 本机实发，症状是「第 5 步 ✅ 之后什么也没有」）。这里必须 `|| true`。
+BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ' || true)
 # 时间戳落在 dist/（工作区内，沙箱允许写；不在 .app 里面，免得自己污染自己写的探针）。
 STAMP_FILE="dist/.open_gate.stamp"
 : > "$STAMP_FILE"
 
-# 有边界地跑一个子进程：$1=秒上限，其余是命令；超时按 124 收（与 GNU timeout 同口径）。
-# 为什么连「取个路径」这种秒回的事也要包一层：本机已实证过两次，被堵死的 exec 评估队列
-# 能让任何一次新 exec 永远排不上队，那时整条交付链跟着挂住、日志里一行结论都留不下——
-# 与 doctor、ui-smoke 各自立看门狗是同一条理由。
-_run_bounded() {
-  local _limit=$1 _pid="" _rc=0 _i=0
-  shift
-  "$@" & _pid=$!
-  while [ $_i -lt $((_limit * 2)) ]; do
-    _i=$((_i + 1))
-    sleep 0.5
-    if ! kill -0 "$_pid" 2>/dev/null; then
-      wait "$_pid"
-      return $?
-    fi
-  done
-  kill -TERM "$_pid" 2>/dev/null || true
-  sleep 1
-  kill -KILL "$_pid" 2>/dev/null || true
-  wait "$_pid" 2>/dev/null || true
-  return 124
-}
-
-# 台账落点：由产物自己回答（纪律②）。输出落在 dist/ 下，跟着本步一起删掉。
-STATE_OUT="dist/.state_dir.out"
-_rc=0
-_run_bounded 20 "$APP_BIN" --state-dir > "$STATE_OUT" 2>&1 || _rc=$?
-if [ "$_rc" = 124 ]; then
-  echo "❌ 产物取台账落点 20 秒没返回（--state-dir）：连一个路径都给不出，这份包别外发"
-  exit 1
-fi
-if [ "$_rc" -ne 0 ]; then
-  echo "❌ 产物不认 --state-dir（退出码 ${_rc}）：$(cat "$STATE_OUT" 2>/dev/null)"
-  exit 1
-fi
-# 格式依据：这个开关只 print 一行绝对路径（_state_dir_entry 里唯一那次 print），取末行
-# 既容得下它前面可能多出来的告警行，也不会因为话术改动而拿错字段。
-STATE_DIR=$(tail -1 "$STATE_OUT")
-rm -f "$STATE_OUT"
-if [ -z "$STATE_DIR" ]; then
-  echo "❌ --state-dir 给了空路径：台账落点问不出来，这一步就没有判据"
-  exit 1
-fi
+# 台账落点：第 4 步已经向产物问过一次的 STATE_DIR（纪律②：全脚本只问一次，
+# 问两次就会有「两步各自拿到不同落点」这种查不出来的分裂）。
 LEDGER="$STATE_DIR/$LEDGER_NAME"
 echo "· 启动台账：$LEDGER"
 
@@ -401,7 +422,7 @@ if [ -z "$LIVE_PID" ]; then
   _harvest_live
   exit 1
 fi
-GREW=$(find "$APP_LIVE" -newer "$STAMP_FILE" 2>/dev/null | head -3)
+GREW=$(find "$APP_LIVE" -newer "$STAMP_FILE" 2>/dev/null | head -3 || true)
 if [ -n "${GREW:-}" ]; then
   echo "❌ 真跑起来的那一会儿往应用包里写了东西（用户机器上这就是 App Translocation"
   echo "   只读卷里的 OSError 30）：$(printf '%s\n' "$GREW")"

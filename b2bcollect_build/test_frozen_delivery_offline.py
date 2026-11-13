@@ -77,6 +77,17 @@
      「代码自己声明的状态文件」做前后快照对拍，改动进退出码；本节还抽出脚本里内嵌的那
      两段 Python 在假仓库上真跑一遍，验这道守卫确实点得出被改写/被删除的文件，且在
      什么都没改时报告为空（只查它在不在＝用一条假绿换掉另一条假绿）
+  Z. set -e 静默带走交付链：硬门第 15 条拦的是「`VAR=$(pgrep …)` 这种正常情形也返回非零
+     的裸赋值」——本机打包脚本第 6 道门（真双击验窗）就是这么安静地没跑，日志停第 5 步 ✅
+     之后一行不剩，而它此前一直「绿」只因机器上恰好留着一枚旧实例。本节两头都验：现状干净、
+     门抓得住原句（含 local/参数内替换/注释/set +e 四种不许误报的口径），并且**真起 bash**
+     证明旧写法确实会吃掉后面的步骤、`|| true` 确实管用（推断也要有证据）。同一节还管它的
+     另一半：装了 ERR 陷阱却没有 `set -E`（实测函数里的非零不触发陷阱）与「set 行大小写混排
+     时判据整行认不出来」（第一版就在这里对出事那份脚本静默空转）
+  AA. 大小写·Unicode 变体不敏感的文件系统：硬门第 16 条要保证同一份仓库在 mac/Windows 上
+     检出的还是同一棵树。本节自己就是这条的由来——两个夹具写成 `…_noe.sh` / `…_noE.sh`，
+     mac 上其实是同一个文件，判据读出隔壁那份内容，红了一条不相干的话，而 Linux CI 全绿。
+     除了拿合成路径判仓库那一半，收尾还硬判本套件自己的夹具名不许撞车
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -1037,7 +1048,8 @@ def test_delivery_chain():
     _assert(local_sh.is_file(), "本机打包入口受版本控制（换台机器 clone 也打得出同一个包）")
     local = local_sh.read_text(encoding="utf-8")
     for needle, why in (
-        ("set -euo pipefail", "任一步失败就整体失败，不会安静地留个半成品"),
+        ("set -Eeuo pipefail", "任一步失败就整体失败，不会安静地留个半成品；-E 是必需的："
+                              "不带它，函数与命令替换里的非零根本不走 ERR 陷阱（Z 节实测）"),
         ("inject_build_config.py --from-local",
          "随包凭证与 CI 同一个脚本、同一份键名契约（不靠人肉复制密钥）"),
         ('--add-data "config.json:."', "本机包也把 config.json 打进包"),
@@ -1104,21 +1116,37 @@ def test_delivery_chain():
                 "还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）"],
                "反向对照：本轮那种固定共用落点必须被判红（判据抓不住=这条门是空的）")
 
-    # 自检报告的落点由产物自己的 state_dir 候选链决定，两个 Mac 入口都不许把它写死：
-    # 写死之后的下一步一定是「口径或布局变了、门禁静默 cat 不到报告」——CI 里看着像
-    # 「产物是好的，只是这一步没打印原文」，而这种红法没人会去修（本来就拦不住上传）。
+    # 自检报告的落点由**产物自己回答**（--state-dir），两个 Mac 入口都不许在 shell 里猜目录：
+    # 猜出来的那份是第二真源——候选链或布局一变（本轮受保护目录改动后落点就搬去了 ~/.b2bcollect），
+    # 门禁就静默 cat 不到本次报告，CI 里看着像「产物是好的，只是这一步没打印原文」，
+    # 而这种红法没人会去修（本来就拦不住上传）。查找根必须是变量，不是写死的目录。
     _assert("b2bcollect_state/acl_doctor.txt" not in mac
             and "b2bcollect_state/acl_doctor.txt" not in local,
             "两个 Mac 入口都不写死自检报告路径（Windows 那一步早就是查找，两边同规矩）")
-    for label, text2, pat in (("Mac workflow", mac,
-                               "find b2bcollect_build/dist -name acl_doctor.txt"),
-                              ("本机打包脚本", local, "find dist -name acl_doctor.txt")):
-        _assert(pat in text2 and "-mmin " in text2,
-                f"{label} 按「刚被写过」查找自检报告（递归找旧文件会把上一次的报告当本次结论）")
-    # Actions 的 bash 步默认 -e：不收住退出码，::error:: 那行永远打不出来，
-    # 日志里只剩一句 exit code 1，分不清是产物坏了还是这一步自己坏了。
-    _assert("set +e" in mac, "Mac workflow 显式收住自检退出码，失败注解才有机会打印")
-    _assert("set +e" in local and "set -e" in local,
+    _REPORT_FIND = re.compile(r'find\s+"\$\{?(\w+)\}?"\s+-name\s+acl_doctor\.txt\s+-mmin\s')
+    _g = _manifest_gate()
+    for label, text2 in (("Mac workflow", mac), ("本机打包脚本", local)):
+        _plain = _g._strip_comments(text2)
+        _m = _REPORT_FIND.search(_plain)
+        _assert(_m, f"{label} 查自检报告的根必须是产物答出来的那个变量（写死目录=第二份真源，"
+                    f"布局一变就静默找不到本次报告）")
+        _assert("--state-dir" in _plain,
+                f"{label} 落点是问产物要的（--state-dir），不是 shell 自己算的")
+        _assert("set +e" not in _plain,
+                f"{label} 不许用 set +e 关掉整段保护（第 15 条第三半：接管一条命令的退出码"
+                f"用 `cmd || rc=$?` 就够，区间里后来人插的那一句失败不会有人知道）")
+    # 反向对照：上面那条正则抓不住旧写法就是空判据（旧写法正是「按 dist 递归找」）
+    _assert_eq(_REPORT_FIND.search('log=$(find b2bcollect_build/dist -name acl_doctor.txt '
+                                   '-mmin -10 2>/dev/null | head -1 || true)'), None,
+               "反向对照：查找根写成 dist 目录必须落到判据外面（这条判据要的就是「不许写死根」）")
+    _assert(_REPORT_FIND.search('LOG=$(find "$STATE_DIR" -name acl_doctor.txt -mmin -10)'),
+            "反向对照：同一处换成产物答出来的变量就得匹配上（不然上面那条红永远修不掉）")
+    # Actions 的 bash 步默认 -e：不收住自检退出码，::error:: 那行永远打不出来，日志里只剩
+    # 一句 exit code 1，分不清是产物坏了还是这一步自己坏了。
+    _assert(re.search(r'--acl-doctor"?\s+\|\|\s+(rc|RC)=\$', _g._strip_comments(mac)),
+            "Mac workflow 用 `|| rc=$?` 收住自检退出码，失败注解才有机会打印")
+    _assert(re.search(r'--acl-doctor"?\s+\|\|\s+(rc|RC)=\$', _g._strip_comments(local))
+            or re.search(r'--acl-doctor.*\|\|\s*RC=\$', _g._strip_comments(local)),
             "本机脚本同样收住退出码（两个入口的失败话术要一样齐全）")
 
     # 注入脚本与运行时的键名契约：不一致 = 注入了等于没注入
@@ -2581,10 +2609,15 @@ def test_workflow_shell_syntax():
     cut = inst_body.find(PIN_ANCHOR)
     _assert(cut >= 0, f"安装步骤里找得到版本判据的锚点 {PIN_ANCHOR}（找不到=整段被删了）")
     gate_script = inst_body[cut:] if cut >= 0 else ""
-    for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1",
-                 "grep -haoE", "(MakeNSIS|Nullsoft Install System)", "|| true",
+    for need in ('-V4', "PIPESTATUS[0]", "MSYS_NO_PATHCONV=1", "set -o pipefail",
+                 'grep -haoE', "(MakeNSIS|Nullsoft Install System)", "|| true",
+                 '[ ! -s "$LOG" ]',
                  'BANNER_VER=${BANNER##* v}', '[ "$BANNER_VER" != "$NSIS_PINNED" ]'):
         _assert(need in gate_script, f"版本判据保留了 {need}（缺一样就是判据少一个方向）")
+    # 取首段退出码的那个写法**依赖 pipefail**：没开它时 tee 成功就不进 || 分支，编译器的
+    # 非零压根不会被问一次。这一步自己声明，而不是赌 runner 默认（默认值是外部实现细节）。
+    _assert(gate_script.index("set -o pipefail") < gate_script.index("NSIS_RC=${PIPESTATUS[0]}"),
+            "pipefail 必须声明在取码那一句之前（写在后面等于这一句自己没保护）")
     # 「只认一种想象出来的格式」本身就是这轮的真缺陷，反向钉住：文本里不许再出现那种
     # 只找 Nullsoft 一句、并且不带 MakeNSIS 的写法。
     _assert('grep -oE "Nullsoft Install System' not in gate_script,
@@ -2597,7 +2630,7 @@ def test_workflow_shell_syntax():
     def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10",
                             pipefail: bool = True, crlf: bool = False,
                             app_version: str = "999", script: str = "",
-                            binary: bool = False):
+                            binary: bool = False, bad_temp: bool = False):
         """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
 
         假 makensis 干四件事：按真编译器的口径验 `/DVER4=` 是不是 X.X.X.X、印横幅
@@ -2611,6 +2644,11 @@ def test_workflow_shell_syntax():
         菜单名是 ANSI 写的），GNU grep 会把整份文件判成二进制并只回一句
         "Binary file matches"，横幅照样取不到——少了 `-a` 就是这个下场，而它在
         本机那种干净 ASCII 日志上永远试不出来。
+        bad_temp=True 把 RUNNER_TEMP 指到本次仿真目录里一个**不存在**的子目录：仿真
+        「编译器成功、只有 tee 写不下去」那一路（Windows 上 cygpath/MSYS 把路径转坏就是
+        这个形状）。取码只看 $? 时这一路会红成「makensis 编译失败」，而编译器明明没坏。
+        路径挂在本次的临时目录下（不是系统 /tmp 里一个固定名）：并发批跑时别人碰不到它，
+        「这次到底写没写成」只由本次夹具决定。
         """
         root = Path(tempfile.mkdtemp(prefix="b2b_nsis_gate_"))
         try:
@@ -2632,7 +2670,8 @@ def test_workflow_shell_syntax():
                               f"exit {stub_rc}\n", encoding="utf-8")
             stub.chmod(0o755)
             env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
-                       RUNNER_TEMP=str(root), APP_VERSION=app_version, WIN_ROOT=str(root))
+                       RUNNER_TEMP=(str(root / "nope") if bad_temp else str(root)),
+                       APP_VERSION=app_version, WIN_ROOT=str(root))
             cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + \
                   ["-c", script or gate_script]
             # errors="replace"：binary=True 时子进程的输出里就是非法 UTF-8 字节，
@@ -2681,6 +2720,37 @@ def test_workflow_shell_syntax():
                 f"反例·{_tag}：必须非零退出、说清后果、且不印成功话术（rc={_rc}，尾部 {_out[-120:]}）")
     _assert("Processing config" in _bad["连 -V4 都不印横幅"][1],
             "读不到横幅时，判据把它当场看到的日志开头原样念出来（猜格式的人需要证据，不需要形容词）")
+
+    # 反向对照：救「编译器退 3 + 没 pipefail」那一场的必须是**本步自己那句声明**，不是
+    # runner 的默认值。摘掉它、同一份仿真就必须退化成「编译器失败却被当成成功放行」——
+    # 只写文本判据（上面那条 need）证明不了这行代码真的在起作用。
+    _nopipe = gate_script.replace("set -o pipefail\n", "", 1)
+    _assert(_nopipe != gate_script,
+            "反向对照用的脚本真摘掉了本步的 pipefail 声明（没摘成功=拿同一段代码自己跟自己比）")
+    _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 3, pipefail=False, script=_nopipe)
+    _assert(_rc == 0 and "✅" in _out,
+            f"反向对照：摘掉声明后编译器退 3 被当成成功放行（rc={_rc}，尾部 {_out[-120:]}）"
+            f"——这一路的保护只能由本步自己给")
+
+    # 5-e-i′) 「只有 tee 坏」这一路必须说清坏的是谁。取了首段退出码以后，编译器成功、
+    #   日志没写成的那一次就不再被第一道门拦下，而会一路走到读横幅那句「读不到 makensis
+    #   自报版本」——把一次落盘故障说成编译器行为异常，正好是本轮反复踩的那种形状：错误
+    #   的话听起来像另一个东西坏了。所以这一路要自己的一句话，而且不许提「编译失败」。
+    _tee_only = _run_installer_gate(NSIS_V4_HEAD, 0, bad_temp=True)
+    _assert(_tee_only[0] != 0 and "坏的是 tee/落盘" in _tee_only[1]
+            and "编译安装包失败" not in _tee_only[1] and "✅" not in _tee_only[1],
+            f"反例·编译器成功但日志写不成：非零退出、点名落盘这一步、不冤枉编译器"
+            f"（rc={_tee_only[0]}，尾部 {_tee_only[1][-160:]}）")
+    # 反向对照：同一份仿真脚本只把取码换回 `$?`，这一路就会红成「makensis 编译失败（退出码 1）」
+    # ——那个 1 是 tee 的。这条对照钉住的正是「PIPESTATUS[0] 是为了归因，不是为了抓到非零」
+    # （pipefail 取最右非零，两种写法都抓得到；只有首段口径才不撒谎，Z 节跑真 bash 作证）。
+    _blame = gate_script.replace("NSIS_RC=${PIPESTATUS[0]}", "NSIS_RC=$?")
+    _assert(_blame != gate_script,
+            "反向对照用的脚本真把取码换回了 $?（没换成功就是拿同一段代码自己跟自己比）")
+    _blame_out = _run_installer_gate(NSIS_V4_HEAD, 0, script=_blame, bad_temp=True)
+    _assert(_blame_out[0] != 0 and "编译安装包失败（退出码 1" in _blame_out[1],
+            f"反向对照：只改取码写法这一路就把 tee 的 1 报成编译器的失败"
+            f"（rc={_blame_out[0]}，尾部 {_blame_out[1][-160:]}）——放行 PIPESTATUS[0] 的理由在这")
 
     # 5-e-ii) 版本号那四个数字。2026-11-12 的 Windows 红法：PyInstaller、产物自检、窗口
     #   冒烟全部通过，最后一步 makensis 回一句「invalid VIProductVersion format,
@@ -4616,33 +4686,60 @@ LEDGER_LOCAL_SH = Path("debug") / "build_b2bcollect_mac_local.sh"
 LEDGER_HEAD_MARK = "最后一步：真按用户那一次双击验一遍"
 
 
+def _ledger_code(text: str) -> str:
+    """整份本机脚本去掉整行注释之后的代码。
+
+    落点与有界函数这类是**脚本级**的规矩（一次打包只该问产物一次落点），判据就得跟着
+    脚本级走：只盯第 6 步那一段的话，把 `_run_bounded` 或 `--state-dir` 挪到第 4 步复用
+    （本轮就是这么改的：报告与台账读同一个落点）会被判成「没有」。
+    注释照旧整行剔掉，理由与 _ledger_region 一样。
+    """
+    return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+
+
 def _ledger_region(text: str) -> str:
     """本机脚本里「真双击」那一步**会被执行**的行（注释整行剔掉）。
 
     判据只看代码骨架：那一段的注释里正写着「数窗口不作判据」这类解释，拿原文去判
     就会把「说明了为什么不能这么写的行」当成违规行——下一来的人为了变绿会删注释，
     那是抹掉下次排查最需要的上下文（与 _code_only 配成一对）。
+
+    但**找那一步的起点必须用原文**：段头「── 6) 最后一步：…」本身就是一行注释，
+    先在去掉注释的文本里找起点，等于先把你要找的那一行删掉再按它切块——切出来永远是
+    空的，于是下面整串判据全变成「没有这一步」的红（本轮实测就是这么红了一屏）。
     """
     out, started = [], False
     for ln in text.splitlines():
-        if LEDGER_HEAD_MARK in ln:
-            started = True
+        if not started:
+            started = LEDGER_HEAD_MARK in ln
             continue
-        if started and not ln.strip().startswith("#"):
-            out.append(ln)
+        if ln.strip().startswith("#"):
+            continue
+        out.append(ln)
     return "\n".join(out)
 
 
-def _ledger_problems(region: str) -> list:
-    """「真双击」那一步够不够格当交付判据。返回问题清单，空 = 合格。"""
+def _ledger_problems(region: str, whole: str = None) -> list:
+    """「真双击」那一步够不够格当交付判据。返回问题清单，空 = 合格。
+
+    region=那一步的代码，whole=整份脚本的代码（省略时按 region 判，反向对照就地把
+    两段一起改即可）。脚本级的三条（问落点、有界函数、只问一次）看 whole，步骤级的
+    那几条看 region——分工写明白，否则下次一搬动就得到三条莫名其妙的红。
+    """
     out = []
+    whole = region if whole is None else whole
     if not region.strip():
         return [f"本机脚本里没有「{LEDGER_HEAD_MARK}」那一步（用户那一次双击压根没验）"]
-    if "--state-dir" not in region:
+    if "--state-dir" not in whole:
         out.append("台账落点没问产物（--state-dir）：在 shell 里重算候选链就是第二份真源，"
                    "改了 tool_config 忘了改这里，门禁会去读一个不存在的路径再判一场莫名其妙的红")
-    if "state_dir_candidates" in region or '/.b2bcollect/' in region:
+    if "state_dir_candidates" in whole or '/.b2bcollect/' in whole:
         out.append("shell 自己算了一遍状态目录（落点必须由产物回答；两处各算迟早漂）")
+    # 只问一次：问两次就会有「报告读 A 落点、台账读 B 落点」这种查不出来的分裂
+    # （产物两次都答得出来，答的却可能不是同一个目录——受保护目录、环境变量任一变动就是）。
+    if len(re.findall(r"_run_bounded\s+\d+\s+\S+\s+--state-dir", whole)) != 1:
+        out.append("问产物落点这一步要**全脚本只问一次**（各步各问一次，两次拿到的落点可能"
+                   "不是同一个目录，报告与台账就分别读进两个地方）")
     # 台账是产物写的文件，取值必须按字段：按行号或整行匹配的话，改一处话术门禁就安静地
     # 读错字段（第 14 条硬门管的是外部工具输出，这一条管的是自家产物留下的机器可读文件）。
     if not re.search(r"awk -F'\|'.*\$3 == .*print \$2", region):
@@ -4655,11 +4752,11 @@ def _ledger_problems(region: str) -> list:
     if "-ge 1" in region:
         out.append("数窗口又被拿来当判据（锁屏/远程会话下 System Events 对所有进程都报空，"
                    "那种场合它一个字也证不了；数得出就印出来给人看，数不出不判红）")
-    if "_run_bounded() {" not in region:
+    if "_run_bounded() {" not in whole:
         out.append("边界函数没定义（每个调用点自己等一遍，等法还各写各的）")
     # 判的是「这一次调用被包在边界里」，不是「文中有 _run_bounded 这个词」：只看词的话，
     # 把调用改回裸 exec、只留下函数定义，这条门就空转了。
-    if not re.search(r"_run_bounded\s+\d+\s+.*--state-dir", region):
+    if not re.search(r"_run_bounded\s+\d+\s+.*--state-dir", whole):
         out.append("问产物落点这一步没有边界（exec 评估队列被堵死时整条交付链跟着挂住，"
                    "日志里一行结论都留不下——与 doctor、ui-smoke 各立看门狗同一条理由）")
     if 'find "$APP_LIVE" -newer' not in region:
@@ -4886,9 +4983,10 @@ def test_launch_ledger_gate():
         shutil.rmtree(root, ignore_errors=True)
 
     # 4) 入口侧：本机脚本那一步的判据齐全，且每种「顺手改回去」都各自点名
+    whole_sh = _ledger_code(local_sh)
     region = _ledger_region(local_sh)
     _assert(bool(region), "本机脚本里认得出真双击那一段")
-    _assert_eq(_ledger_problems(region), [], "本机脚本的真双击判据齐全")
+    _assert_eq(_ledger_problems(region, whole_sh), [], "本机脚本的真双击判据齐全")
     _assert("count of windows" in region,
             "数窗口仍留在脚本里作附加信息（全删掉就没人告诉运维「这台机器现在能不能看见界面」）")
 
@@ -4899,27 +4997,36 @@ def test_launch_ledger_gate():
     # 老写法整段回灌：按窗口数放行 + 唤旧实例也算通过，必须各判红一次
     _old_way = ('  _w=$(/usr/bin/osascript -e "..." 2>/dev/null || true)\n'
                 '  if [ "$_w" -ge 1 ]; then LIVE_PID=$_p; break; fi\n')
-    _assert(any("数窗口" in p for p in _ledger_problems(region + "\n" + _old_way)),
+    _assert(any("数窗口" in p for p in _ledger_problems(region + "\n" + _old_way, whole_sh)),
             "把窗口数改回判据必须判红——那正是本机实测数不出的一种绿法")
     _assert(any("拍一份 shown 快照" in p for p in
-                _ledger_problems(_drop(region, "BEFORE_SHOWN="))),
+                _ledger_problems(_drop(region, "BEFORE_SHOWN="), whole_sh)),
             "快照那行被摘掉必须判红（旧实例的记录会让这一步绿在上一份字节上）")
-    _assert(any("还活着" in p for p in _ledger_problems(_drop(region, "kill -0"))),
+    _assert(any("还活着" in p for p in _ledger_problems(_drop(region, "kill -0"), whole_sh)),
             "不验 pid 存活必须判红（记过 shown 之后崩掉的过程不能算通过）")
     _assert(any("按 | 分字段" in p for p in
                 _ledger_problems(region.replace("""awk -F'|' -v s="$LEDGER_STAGE" '$3 == s { print $2 }'""",
-                                                 """grep shown"""))),
+                                                 """grep shown"""), whole_sh)),
             "取值改回整行 grep 必须判红（改一处话术门禁就安静地读错字段）")
-    _assert(any("问产物" in p for p in _ledger_problems(_drop(region, "--state-dir"))),
+    _assert(any("落点没问产物" in p for p in
+                _ledger_problems(_drop(region, "--state-dir"), _drop(whole_sh, "--state-dir"))),
             "落点不问产物必须判红")
     _assert(any("自己算了一遍状态目录" in p for p in
-                _ledger_problems(region + '\nLEDGER="$HOME/.b2bcollect/b2bcollect_state/launch_history.log"\n')),
+                _ledger_problems(region, whole_sh
+                                 + '\nLEDGER="$HOME/.b2bcollect/b2bcollect_state/launch_history.log"\n')),
             "shell 里重抄候选链必须判红（第二份真源）")
-    _assert(any("没有边界" in p for p in _ledger_problems(_drop(region, "_run_bounded 20"))),
+    _ASK = '_run_bounded 20 "$APP" --state-dir'
+    _assert(any("没有边界" in p for p in
+                _ledger_problems(region, _drop(whole_sh, _ASK))),
             "取落点不带边界必须判红")
-    _assert(any("边界函数没定义" in p for p in _ledger_problems(_drop(region, "_run_bounded() {"))),
+    _assert(any("只问一次" in p for p in
+                _ledger_problems(region, whole_sh + f"\n{_ASK} > /dev/null 2>&1 || _rc=$?\n")),
+            "同一份脚本问两次落点必须判红（报告读 A、台账读 B 这种分裂查不出来）")
+    _assert(any("边界函数没定义" in p for p in
+                _ledger_problems(region, _drop(whole_sh, "_run_bounded() {"))),
             "只留下调用、把边界函数删掉同样要判红（判的是这一次调用真被包住，不是文中有这个词）")
-    _assert(any("应用包" in p for p in _ledger_problems(_drop(region, 'find "$APP_LIVE" -newer'))),
+    _assert(any("应用包" in p for p in _ledger_problems(_drop(region, 'find "$APP_LIVE" -newer'),
+                                                     whole_sh)),
             "包内写入那项检查被摘掉必须判红（Mac 只读卷的根因就靠它）")
     _assert(_ledger_problems("") and LEDGER_HEAD_MARK in _ledger_problems("")[0],
             "整段被删掉时要点名「这一步压根不存在」（空串不能被当成合格）")
@@ -5247,6 +5354,420 @@ def test_batch_state_watch_gate():
                "状态文件一字未动时报告是空的（不空就说明守卫在自说自话）")
 
 
+def test_errexit_silent_death_gate():
+    print("\n═══ Z. set -e 不许把最后一道门安静带走：第 15 条硬门要有牙 ═══")
+    # 由来（2026-11-13 本机实发）：Mac 打包脚本的日志停在第 5 步的 ✅ 之后，一行报错都没有
+    # ——第 6 道门（真双击验窗）压根没执行，而它正是「用户能不能打开」那最后一问。坏掉的
+    # 那一行是：
+    #     BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\n' ' ')
+    # 「机器上没有旧实例」才是干净机器的正常情形，pgrep 在这种情形返回 1；pipefail 让整条
+    # 管道非零，裸赋值又把这个非零原样交给 set -e，脚本当场结束、零解释。它此前一直「绿」，
+    # 只因为那台机器上恰好留着一枚我自己起的旧实例——**判据依赖运气**比没有判据更危险：
+    # 它连「去查一下」的动机都不给。本节两头都要验：现状干净（正例）、门抓得住原句（反例）。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    build_sh = (_REPO / "debug" / "build_b2bcollect_mac_local.sh").read_text(encoding="utf-8")
+    mac_wf = (_REPO / ".github" / "workflows" / "build-b2bcollect-mac.yml").read_text(
+        encoding="utf-8")
+
+    # 1) 接线：结果必须并进「不合格」计数，只打印不拦路的那条不算门
+    _assert(callable(getattr(gate, "check_shell_errexit_hazards", None)),
+            "硬门模块里有第 15 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("hazards = check_shell_errexit_hazards()")
+    _assert(_at > 0, "硬门 main() 里真的调了它（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 600],
+            "报出来的问题要并进不合格计数并影响退出码")
+    _assert("debug/build_b2bcollect_mac_local.sh" in gate.SHELL_SOURCES,
+            "出事那份脚本在这条门的登记表里（不在表里的判据等于没判）")
+
+    # 2) 现状：整条交付链干净，且本轮改过的三处保持改后的写法
+    _assert_eq(gate.check_shell_errexit_hazards(), [],
+               "第 15 条：交付链 shell 里没有会被 set -e 静默带走的裸赋值")
+    _assert("BEFORE_PIDS=$(pgrep -x B2bCollectTool 2>/dev/null | tr '\\n' ' ' || true)" in build_sh,
+            "事故原句保持修好的样子（|| true 被删掉就是让这道门重新裸奔）")
+    _assert("set -Eeuo pipefail" in build_sh and "trap 'rc=$?;" in build_sh,
+            "本机打包脚本带 ERR 陷阱：以后再有一句非零把脚本带走，至少留下一行人话")
+    for _v in ("before=", "after="):
+        _line = next((ln for ln in mac_wf.splitlines() if ln.strip().startswith(_v)), "")
+        _assert("|| {" in _line,
+                f"Mac workflow 只读冒烟里的 {_v.strip()} 取值必须自己接管非零（裸赋值=这一步会静默消失）")
+
+    # 3) 反向对照：门必须抓得住「原句这一类」，而且只抓这一类
+    def _haz(script: str) -> list:
+        return gate.check_shell_errexit_hazards(sources=(), workflows=(),
+                                                texts=(("夹具", script),))
+
+    _RAW = "BEFORE_PIDS=$(pgrep -x Foo 2>/dev/null | tr '\\n' ' ')\necho hi\n"
+    _got = _haz(_RAW)
+    _assert_eq(len(_got), 1, "反向对照：裸赋值 + pgrep 必须判红（判不住=这条门是空的）")
+    _assert("pgrep" in _got[0] and "第 1 行" in _got[0],
+            f"报的要能被直接照做：命令名与行号（实际={_got[0][:90]}）")
+    _assert_eq(_haz(_RAW.replace("' ')", "' ') || true)")), [],
+               "反向对照：同一句加 || true 就放行（修法是明确的，不是让人删判据）")
+    _assert_eq(_haz('before=$(find "$APP" | wc -l) || { echo "数不到"; exit 1; }\n'), [],
+               "反向对照：自己止损的写法放行（这种写法已经把「为什么停」说出来了）")
+    _assert_eq(_haz('local x=$(pgrep -x Foo)\n'), [],
+               "反向对照：local/export 会吞掉替换的退出码（实测不触发 set -e），按口径不报")
+    _assert_eq(_haz('echo "看到的 pid：$(pgrep -x Foo)"\n'), [],
+               "反向对照：替换出现在别的命令参数里时退出码被外层覆盖，不该报（报了就是噪音）")
+    _assert_eq(_haz('# BEFORE_PIDS=$(pgrep -x Foo)\n'), [],
+               "反向对照：注释行不算（否则每句解释都要改写成转义，门禁立刻沦为噪音）")
+    _got = _haz('set +e\nX=$(pgrep -x Foo)\n')
+    _assert_eq(len(_got), 1,
+               "反向对照：set +e 之后那段不适用 15a（口径跟着脚本自己走），但整段关保护"
+               "这件事由 15c 自己判红——两头都不能放过")
+    _assert("整段的 errexit" in _got[0],
+            f"15c 报的要指明是哪一行关的保护（实际={_got[0][:90]}）")
+    for _cmd in ("grep -c ok f", "ls /nope", "diff a b", "command -v nope"):
+        _assert_eq(len(_haz(f"V=$({_cmd})\n")), 1,
+                   f"覆盖面不止 pgrep：`{_cmd}` 正常情形也返回非零，裸赋值同样要报")
+
+    # 3b) set 行的字母大小写必须都认得：第一版判据写的是 `-[a-z]*e[a-z]*`，本轮把脚本改成
+    #     `set -Eeuo pipefail` 之后那一行**整行匹配不上**，第 15 条就在出事那份脚本上静默
+    #     空转了——正例照旧 []、夹具照旧红，没有任何一条现象会提醒门已经断。这不是假想：
+    #     本节加 15b 时真就这么红了一次。所以把「同一句裸赋值 × 三种开启 errexit 的写法」
+    #     钉成判据，认不出哪一种就等于那条门在那种写法下没有跑。
+    for _s in ("set -euo pipefail", "set -Eeuo pipefail", "set -o errexit -o pipefail",
+               "set -e -u -o pipefail"):
+        _assert_eq(len(_haz(f"{_s}\n{_RAW}")), 1,
+                   f"反向对照：`{_s}` 都算开了 errexit，裸赋值那一句必须报"
+                   f"（认不出来=这条门在那种写法下从没跑过）")
+    _got = _haz("set +o errexit\n" + _RAW)
+    _assert_eq(len(_got), 1,
+               "反向对照：长写法关掉 errexit 时 15a 不报那句裸赋值（口径跟着 set 走），"
+               "但关保护这件事由 15c 报——两种写法都不能漏")
+    _assert("整段的 errexit" in _got[0],
+            f"报的要说是哪一行关的保护（实际={_got[0][:80]}）")
+
+    # 3e) 15c：`set +e … set -e` 那种整段关保护的区间一律判红，接管单条命令的两种写法
+    #     必须放行——不然这条门会在真正需要收退出码的地方变成噪音，而噪音的下场是被关掉。
+    for _txt, _want, _why in (
+        ("set -Eeuo pipefail\nset +e\nfoo\nset -e\n", 1, "整段关保护要判红"),
+        ("set -Eeuo pipefail\nfoo || rc=$?\n", 0, "只接管这一条就放行"),
+        ('set -Eeuo pipefail\nmake | tee "$LOG" || rc=${PIPESTATUS[0]}\n', 0,
+         "管道里取首段退出码的写法同样放行（Windows 那一步用的就是这个）"),
+        ("set -Eeuo pipefail\n# 这里不要用 set +e\n", 0, "注释里提到不算（否则解释都得删掉）"),
+    ):
+        _got = _haz(_txt)
+        _assert_eq(len(_got), _want, f"反向对照：15c 对{_why}（实际={_got[:1]}）")
+
+    # 3c) 15b：装了 ERR 陷阱，脚本却让它没有触发的机会（症状与「日志到此为止」一模一样，
+    #     但脚本看上去像处理过了，比什么都没有更危险）。两种坏样子各判一次红，两种好写法
+    #     各放行一次；`trap - ERR`（摘掉）、注释里的、非 ERR 信号的都不算装了陷阱。
+    for _txt, _want, _why in (
+        ("set -euo pipefail\ntrap 'echo boom' ERR\n", 1, "装了陷阱却没有 -E（函数里的非零不响）"),
+        ("set -Eeuo pipefail\ntrap 'echo boom' ERR\n", 0, "补了 -E 就放行（修法明确）"),
+        ("set -euo pipefail\nset -o errtrace\ntrap 'echo boom' ERR\n", 0, "长写法同样算数"),
+        ("set -euo pipefail\ntrap - ERR\n", 0, "trap - ERR 是摘掉陷阱，不是装"),
+        ("set -euo pipefail\n# trap 'echo boom' ERR\n", 0, "注释里的 trap 不算"),
+        ("set -euo pipefail\ntrap 'echo bye' EXIT\n", 0, "非 ERR 信号不在本条口径内"),
+    ):
+        _got = _haz(_txt)
+        _assert_eq(len(_got), _want, f"反向对照：{_why}（实际={_got[:1]}）")
+    _assert(any("-E" in p for p in _haz("set -euo pipefail\ntrap 'echo boom' ERR\n")),
+            "报的话要能直接照做：点名补 -E")
+
+    # 3d) 「整份脚本没开 -e 却装了陷阱」只有本地脚本口径（默认不带 -e）才判得出来，
+    #     texts 走的是 Actions 默认 -e 的口径，所以这一条必须落到真文件上跑一遍登记表。
+    #     夹具名不许只差大小写（noe/noE 那种）：macOS 与 Windows 的默认文件系统大小写不
+    #     敏感，两个名字是**同一个文件**，后写的把先写的盖掉——本轮实测于是把「没开 -e」
+    #     那条判成「缺 -E」，红得莫名其妙，而 Linux CI 上永远不会出现这个症状。
+    _shfx = {
+        "debug/zz_errtrap_noerrexit.sh": "trap 'echo boom' ERR\npgrep -x Foo\n",
+        "debug/zz_errtrap_noerrtrace.sh": "set -euo pipefail\ntrap 'echo boom' ERR\n",
+        "debug/zz_errtrap_ok.sh": "set -Eeuo pipefail\ntrap 'echo boom' ERR\n",
+    }
+    for _rel, _src in _shfx.items():
+        (_REPO / _rel).write_text(_src, encoding="utf-8")
+    try:
+        _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_noerrexit.sh",),
+                                                workflows=())
+        _assert(any("没有任何一段在 -e 下跑" in p for p in _got),
+                f"反向对照：没开 -e 的脚本装了 ERR 陷阱要判红（实际={_got}）")
+        _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_noerrtrace.sh",),
+                                                workflows=())
+        _assert(any("-E" in p for p in _got),
+                f"反向对照：登记表里读到的脚本，缺 -E 同样判红（实际={_got}）")
+        _assert_eq(gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_ok.sh",),
+                                                    workflows=()), [],
+                   "反向对照：同一份补上 -E 就干净（否则这条门只会一直响）")
+    finally:
+        for _rel in _shfx:
+            (_REPO / _rel).unlink(missing_ok=True)
+
+    # 4) 行为侧：上面那些都是「我认为 bash 会怎么走」。判据依赖的这一条推断本身也要有证据
+    #    ——真起 bash 跑一遍：旧写法必须 rc≠0 且**第二句 echo 不出现**（这才是「门安静消失」
+    #    的现实），修好的写法必须 rc=0 且两句都在。
+    bash = shutil.which("bash")
+    if not bash:
+        print("   ⏭ 这台机器上没有 bash，行为侧跳过（静态那几条照跑）；"
+              "第 11 条会因缺 bash 判红，所以交付链上不会出现「静默跳过的验窗」")
+    else:
+        _tmp = Path(tempfile.mkdtemp(prefix="errexit_fixture_"))
+        try:
+            _old = _tmp / "old.sh"
+            _old.write_text("set -Eeuo pipefail\n"
+                            "echo STEP1\n"
+                            "X=$(pgrep -x DefinitelyNoSuchProcZZZ 2>/dev/null | tr '\\n' ' ')\n"
+                            "echo STEP2\n", encoding="utf-8")
+            _new = _tmp / "new.sh"
+            # 整段写死而不是对 old.sh 做一次 str.replace：上一版这里用 replace 补 `|| true`，
+            # 补出来的是一份**语法就有错**的脚本（rc=2，STEP2 一样不出现），行为侧照旧「红得
+            # 很有道理」。正反两份夹具必须只差那一处写法，差在别处就是在验另一件事。
+            _new.write_text("set -Eeuo pipefail\n"
+                            "echo STEP1\n"
+                            "X=$(pgrep -x DefinitelyNoSuchProcZZZ 2>/dev/null | tr '\\n' ' ' || true)\n"
+                            "echo STEP2\n", encoding="utf-8")
+            # 夹具自己先过一遍解析器：语法错的「反例」也会让第二句不出现，那种 rc≠0 说明不了
+            # set -e 的任何事——本条要证的是「合法脚本会被非零赋值带走」，前提就得是它合法。
+            for _p in (_old, _new):
+                _chk = subprocess.run([bash, "-n", str(_p)], capture_output=True, timeout=20)
+                _assert_eq(_chk.returncode, 0,
+                           f"夹具 {_p.name} 自己得是一份能解析的脚本"
+                           f"（{(_chk.stderr.decode('utf-8', errors='replace').strip()[:60])}）")
+            _res = {}
+            for _tag, _p in (("old", _old), ("new", _new)):
+                try:
+                    _cp = subprocess.run([bash, str(_p)], capture_output=True, timeout=20)
+                    _res[_tag] = (_cp.returncode,
+                                  _cp.stdout.decode("utf-8", errors="replace"))
+                except subprocess.TimeoutExpired:
+                    _assert(False, f"夹具 {_tag}.sh 20 秒没返回：这条行为判据拿不到结论")
+            _assert(_res["old"][0] != 0 and "STEP2" not in _res["old"][1],
+                    f"旧写法真的会把后面的步骤吃掉（rc={_res['old'][0]}，"
+                    f"输出={_res['old'][1].strip()!r}）——这条门要拦的就是这个")
+            _assert(_res["new"][0] == 0 and "STEP1" in _res["new"][1] and "STEP2" in _res["new"][1],
+                    f"修法真的管用：rc={_res['new'][0]}，输出={_res['new'][1].strip()!r}")
+            # 15b 的同一套：判据要 -E 不是洁癖，这里拿真 bash 作证——函数里的那一次非零，
+            # 只有开了 errtrace 才会走到陷阱。两份夹具只差 set 行的一个字母。
+            _trap_body = ("{setline}\n"
+                          "trap 'echo TRAP-FIRED' ERR\n"
+                          "f() {{ pgrep -x DefinitelyNoSuchProcZZZ > /dev/null; }}\n"
+                          "f\n"
+                          "echo STEP2\n")
+            _tres = {}
+            for _tag, _setline in (("noE", "set -euo pipefail"), ("E", "set -Eeuo pipefail")):
+                _p = _tmp / f"trap_{_tag}.sh"
+                _p.write_text(_trap_body.format(setline=_setline), encoding="utf-8")
+                _chk = subprocess.run([bash, "-n", str(_p)], capture_output=True, timeout=20)
+                _assert_eq(_chk.returncode, 0, f"夹具 trap_{_tag}.sh 自己得能被解析")
+                try:
+                    _cp = subprocess.run([bash, str(_p)], capture_output=True, timeout=20)
+                    _tres[_tag] = (_cp.returncode,
+                                   _cp.stdout.decode("utf-8", errors="replace"))
+                except subprocess.TimeoutExpired:
+                    _assert(False, f"夹具 trap_{_tag}.sh 20 秒没返回：这条行为判据拿不到结论")
+            _assert(_tres["noE"][0] != 0 and "TRAP-FIRED" not in _tres["noE"][1],
+                    f"行为证据：没有 -E 时函数里的非零**不会**走到 ERR 陷阱"
+                    f"（rc={_tres['noE'][0]}，输出={_tres['noE'][1].strip()!r}）"
+                    f"——脚本看上去像处理过了，出事时却一行话都不留")
+            _assert(_tres["E"][0] != 0 and "TRAP-FIRED" in _tres["E"][1],
+                    f"行为证据：只差一个字母，同一处非零就留下一行人话"
+                    f"（rc={_tres['E'][0]}，输出={_tres['E'][1].strip()!r}）")
+            # 15c 的放行口径也要有**真 bash 的**证据，不能靠我对 pipefail 的印象。
+            # 2026-11-12 本机实测（bash 3.2.57）把两件我原先说反的事钉下来：
+            #   · pipefail 取的是**最右非零**，不是「最后一个命令的状态」：编译器退 7、
+            #     tee 成功时，`|| rc=$?` 拿到的同样是 7（我先前断言它会「把 7 说成 0」是错的）。
+            #   · `${PIPESTATUS[0]}` 真正的价值是**归因**：tee 自己坏（日志路径不合法，
+            #     Windows 上 cygpath/MSYS 转换就可能坏）时，`$?` 会把 tee 的 1 说成
+            #     「makensis 编译失败（退出码 1）」——编译器明明成功，红了一条假话；
+            #     PIPESTATUS[0] 拿到的是首段的 0，不冤枉编译器。
+            #   · 反过来 PIPESTATUS 也**代替不了** pipefail：没开 pipefail 时整条管道只看
+            #     tee，tee 成功就压根不进 `||` 分支，两种写法都留不下非零。
+            # 这四条一起构成本步写法该往哪个方向修的根据，所以逐条跑真 bash。
+            _pipes = {
+                # 首段坏（编译器退 7）、tee 正常：PIPESTATUS 拿得到 7 且脚本继续跑
+                "first": ('set -Eeuo pipefail\nrc=0\n(echo LINE; exit 7) | tee "$OUT" '
+                          '|| rc=${PIPESTATUS[0]}\necho "rc=$rc"\necho STEP2\n'),
+                # 同一条管道换成 $?：pipefail 取最右非零，同样是 7（不许再按「$? 只看最后一个
+                # 命令」的错误口径写判据或写注释）
+                "whole": ('set -Eeuo pipefail\nrc=0\n(echo LINE; exit 7) | tee "$OUT" '
+                          '|| rc=$?\necho "rc=$rc"\necho STEP2\n'),
+                # 只有 tee 坏、编译器成功：$? 会把成功说成失败（假红 + 一句谎话）
+                "blame_ok": ('set -Eeuo pipefail\nrc=0\n(echo LINE; exit 0) | tee "$BAD" '
+                             '|| rc=$?\necho "rc=$rc"\necho STEP2\n'),
+                # 同一处用 PIPESTATUS[0]：首段是 0，不替 tee 背锅，也不拦住后面的检查
+                "blame_real": ('set -Eeuo pipefail\nrc=0\n(echo LINE; exit 0) | tee "$BAD" '
+                               '|| rc=${PIPESTATUS[0]}\necho "rc=$rc"\necho STEP2\n'),
+                # 没开 pipefail 时，PIPESTATUS 也救不回来（tee 成功 → 不进 || 分支）
+                "nopipefail": ('set -Eeu\nrc=0\n(echo LINE; exit 7) | tee "$OUT" '
+                               '|| rc=${PIPESTATUS[0]}\necho "rc=$rc"\necho STEP2\n'),
+            }
+            _pres = {}
+            for _tag, _body in _pipes.items():
+                _p = _tmp / f"pipe_{_tag}.sh"
+                _p.write_text(_body, encoding="utf-8")
+                _chk = subprocess.run([bash, "-n", str(_p)], capture_output=True, timeout=20)
+                _assert_eq(_chk.returncode, 0, f"夹具 pipe_{_tag}.sh 自己得能被解析")
+                try:
+                    _cp = subprocess.run([bash, str(_p)], capture_output=True, timeout=20,
+                                         env={**os.environ,
+                                              "OUT": str(_tmp / f"out_{_tag}.txt"),
+                                              # 不存在的目录里的文件名：tee 必失败（退出码 1）
+                                              "BAD": str(_tmp / "nope" / "x.log")})
+                    _pres[_tag] = (_cp.returncode,
+                                   _cp.stdout.decode("utf-8", errors="replace"))
+                except subprocess.TimeoutExpired:
+                    _assert(False, f"夹具 pipe_{_tag}.sh 20 秒没返回：这条行为判据拿不到结论")
+
+            def _rc_of(_tag):
+                """夹具自己打印的那句 rc=（脚本本身退出码恒 0，判据只能读这句）"""
+                _m = re.search(r"^rc=(\d+)$", _pres[_tag][1], re.M)
+                _assert(_m, f"夹具 pipe_{_tag}.sh 没打印 rc=（输出={_pres[_tag][1].strip()!r}）："
+                            f"这条行为判据拿不到结论")
+                return int(_m.group(1))
+
+            _assert(_pres["first"][0] == 0 and _rc_of("first") == 7
+                    and "STEP2" in _pres["first"][1],
+                    f"行为证据：`|| rc=${{PIPESTATUS[0]}}` 拿到首段的 7 且脚本继续跑"
+                    f"（rc={_pres['first'][0]}，输出={_pres['first'][1].strip()!r}）")
+            _assert(_rc_of("whole") == 7,
+                    f"行为证据：pipefail 取的是**最右非零**，同一条管道用 `|| rc=$?` 也是 7"
+                    f"（实测输出={_pres['whole'][1].strip()!r}）——判据与注释都不许再写成"
+                    f"「$? 只看最后一个命令，所以会把编译器的失败说成成功」")
+            _assert(_rc_of("blame_ok") != 0,
+                    f"行为证据：编译器明明成功（退 0），只有 tee 坏时 `$?` 也把整条管道判成失败"
+                    f"（实测输出={_pres['blame_ok'][1].strip()!r}）——那句 ::error:: 会说"
+                    f"「makensis 编译失败」，红了一条谎话")
+            _assert(_rc_of("blame_real") == 0,
+                    f"行为证据：同一处用 PIPESTATUS[0] 拿到的是首段的 0"
+                    f"（实测输出={_pres['blame_real'][1].strip()!r}）——这才是放行它而不是"
+                    f"放行 $? 的理由：**归因要归到编译器那一段**")
+            _assert(_rc_of("nopipefail") == 0 and "STEP2" in _pres["nopipefail"][1],
+                    f"行为证据：PIPESTATUS 代替不了 pipefail——没开它时 tee 成功就不进 || 分支，"
+                    f"编译器的 7 谁都没看见（实测输出={_pres['nopipefail'][1].strip()!r}）")
+        finally:
+            shutil.rmtree(_tmp, ignore_errors=True)
+
+    # 5) workflow 的默认值口径：Actions 的 bash 步本身就带 -e，所以同一句裸赋值在 workflow
+    #    里也必须报；pwsh 步没有这套语义，拿它去报就是一条永远修不掉的假红（同第 11 条）。
+    def _wf(body: str, shell: str = "bash") -> str:
+        _s = f"\n{' ' * 6}shell: {shell}" if shell else ""
+        _b = "\n".join(" " * 8 + ln for ln in body.rstrip("\n").splitlines())
+        return (f"jobs:\n  b:\n    runs-on: macos-latest\n    steps:\n"
+                f"    - name: 被测的那一步{_s}\n      run: |\n{_b}\n")
+
+    _fx = {"debug/zz_errexit_bash.yml": _wf("pids=$(pgrep -x Foo | tr '\\n' ' ')\n"),
+           "debug/zz_errexit_pwsh.yml": _wf("$p = Get-Process", shell="pwsh")}
+    for _rel, _src in _fx.items():
+        (_REPO / _rel).write_text(_src, encoding="utf-8")
+    try:
+        _got = gate.check_shell_errexit_hazards(sources=(),
+                                                workflows=("debug/zz_errexit_bash.yml",))
+        _assert_eq(len(_got), 1,
+                   "反向对照：workflow 的 bash 步默认就是 -e，同一句裸赋值在这里也要报")
+        # 行号按**文件里**的那一行算：块内偏移不换算，人照着判据去翻就翻到隔壁行上去
+        # （这份夹具里 `run:` 上面还有一行 shell:，写死一个数字第一次就指错）。
+        _want_line = _fx["debug/zz_errexit_bash.yml"].splitlines().index(
+            "        pids=$(pgrep -x Foo | tr '\\n' ' ')") + 1
+        _assert(f"第 {_want_line} 行" in _got[0],
+                f"报的要是文件里那一行的行号（实际={_got[0][:100]}，期望含「第 {_want_line} 行」）")
+        _assert_eq(gate.check_shell_errexit_hazards(
+            sources=(), workflows=("debug/zz_errexit_pwsh.yml",)), [],
+            "pwsh 步不套 bash 的语义（假红会让这条门被人整个关掉）")
+    finally:
+        for _rel in _fx:
+            (_REPO / _rel).unlink(missing_ok=True)
+
+
+_FIXTURE_PATH = re.compile(r"[\"'](debug/zz_[A-Za-z0-9_.-]+\.[A-Za-z]{1,5})[\"']")
+
+
+def _fixture_name_collisions(names=None) -> list:
+    """把一批夹具路径按「大小写不敏感文件系统上的同一个文件」分组，报出撞车的组。
+
+    比较键**直接用硬门第 16 条那一个函数**（不在这儿再抄一份口径）：判据说一套、夹具按
+    另一套，下次撞车就又是一条「本机红、云端绿」的谜案——本节的存在理由就是这一类。
+    口径边界：只看源码里写死的夹具名；动态拼出来的（f"debug/zz_{tag}.sh"）不在这里，
+    那种地方要靠命名本身把用途写全。
+    """
+    if names is None:
+        names = _FIXTURE_PATH.findall(Path(__file__).read_text(encoding="utf-8"))
+    key = _manifest_gate().fs_insensitive_key
+    groups = {}
+    for _n in sorted(set(names)):
+        groups.setdefault(key(_n), set()).add(_n)
+    return [", ".join(sorted(_v)) for _v in groups.values() if len(_v) > 1]
+
+
+def test_case_insensitive_filesystem_gate():
+    print("\n═══ AA. 同一份仓库在 mac/Windows 上得检出同一棵树：第 16 条硬门 ═══")
+    # 由来（2026-11-13 本机实发）：Z 节加反向对照时写了 `zz_errexit_trap_noe.sh` 与
+    # `zz_errexit_trap_noE.sh` 两个夹具，本意两份、mac 上是一份（APFS 默认大小写不敏感），
+    # 后写的静默盖掉先写的，于是「没开 -e」那条判据读到的是「没开 -E」那份内容，红了一句
+    # 与现场无关的话。Linux CI 大小写敏感，同一份用例在云端永远全绿——这类缺陷的形状就是
+    # 「只在开发机出现，而且长得像判据自己写错了」。仓库层面的同一形状更贵：`Foo.py` 与
+    # `foo.py` 同时入库时，Windows/macOS 检出的那棵树里只有一个文件，装进包的就是最后
+    # 落盘的那一份，而 CI 不会为这件事变红一次。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # 1) 接线：函数在、main() 真调、结果进不合格计数
+    _assert(callable(getattr(gate, "check_case_colliding_paths", None)),
+            "硬门模块里有第 16 条这个函数（能单独喂合成清单，才谈得上反向对照）")
+    _at = gate_src.find("collide = check_case_colliding_paths()")
+    _assert(_at > 0, "硬门 main() 里真的调了它（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 700],
+            "报出来的撞车要并进不合格计数并影响退出码")
+
+    # 2) 现状：仓库干净，本套件的夹具名也不撞车
+    _assert_eq(gate.check_case_colliding_paths(), [],
+               "第 16 条：入库路径里没有两份只在大小写/Unicode 变体上不同的路径")
+    _assert_eq(_fixture_name_collisions(), [],
+               "本套件写死的夹具名两两不撞车（撞了就是在读隔壁那一节的内容）")
+
+    # 3) 反向对照：这一类要判得住，而相邻的几种「看着像」不能误报
+    for _paths, _want, _why in (
+        (("a/Foo.py", "a/foo.py"), 1, "只差大小写"),
+        (("a/Foo.py", "a/FOO.py"), 1, "全大写同样算撞车"),
+        (("caf\u00e9.py", "cafe\u0301.py"), 1, "同一个字的预组合与分解两种写法（mac 的文件名规则）"),
+        (("a/Foo.py", "b/Foo.py"), 0, "不同目录不是同一个文件"),
+        (("a/foo.py", "a/foo.txt"), 0, "扩展名不同不是同一个文件"),
+        (("a/Foo.py",), 0, "孤零零一份不该响（只有成对才算撞车）"),
+    ):
+        _got = gate.check_case_colliding_paths(paths=list(_paths))
+        _assert_eq(len(_got), _want, f"反向对照：{_why}（实际={_got}）")
+    _assert(any("同一个文件" in p for p in
+                gate.check_case_colliding_paths(paths=["a/Foo.py", "a/foo.py"])),
+            "报的话要说清「在 mac/Windows 上是同一个文件」，不然下一个人会以为在说重名提交")
+
+    # 4) 行为侧：这台机器的文件系统到底敏不敏感，不靠猜——真写一份再按另一个名字读。
+    #    判据本身不许依赖这个结论（合成清单永远按同一把键判），这里要的是「下一来看见
+    #    自己机器属于哪一类」，以及第 16 条的键和 OS 规则对得上。
+    _tmp = Path(tempfile.mkdtemp(prefix="casefs_"))
+    try:
+        (_tmp / "probe.sh").write_text("LOWER", encoding="utf-8")
+        _insensitive = False
+        try:
+            _insensitive = (_tmp / "PROBE.SH").read_text(encoding="utf-8") == "LOWER"
+        except OSError:
+            _insensitive = False
+        if _insensitive:
+            (_tmp / "PROBE.SH").write_text("UPPER", encoding="utf-8")
+            _assert((_tmp / "probe.sh").read_text(encoding="utf-8") == "UPPER",
+                    "本机大小写不敏感：按大写名写入改的就是那份小写文件（夹具撞车的现实形状）")
+            _assert_eq(len(list(_tmp.iterdir())), 1, "本机确实只有一个 inode（两个名字一份内容）")
+        else:
+            print("   · 本机文件系统大小写敏感（Linux CI 就是这样）——云端全绿而开发机红的那一类"
+                  "在这里测不出来，所以第 16 条只能按名字判、不能靠写文件试")
+        # 键函数与 OS 规则的一致性：这一条在两种机器上都成立（判的是字符串口径，不是本机 FS）
+        _assert(gate.fs_insensitive_key("probe.sh") == gate.fs_insensitive_key("PROBE.SH"),
+                "第 16 条的比较键必须把只差大小写的两个名字当成同一个")
+        # 两个名字必须**真的**是两种字节（写成转义就是为了防有人把它重打成一个字符：
+        # 那样下面两条会双双「通过」，而这一类里最难的 NFD 那一半已经没人判了）。
+        _nfc, _nfd = "caf\u00e9.py", "cafe\u0301.py"
+        _assert(_nfc != _nfd and len(_nfc) != len(_nfd),
+                f"夹具本身得真的是两种写法（否则这条判据在自证一件不存在的事：{_nfc!r} vs {_nfd!r}）")
+        _assert(gate.fs_insensitive_key(_nfc) == gate.fs_insensitive_key(_nfd),
+                "比较键必须把预组合与分解两种写法当成同一个（mac 的文件名规则就是这样）")
+        _assert(gate.fs_insensitive_key("a/Foo.py") != gate.fs_insensitive_key("b/Foo.py"),
+                "不同目录不能被归一成同一个名字（否则第 16 条会报一堆修不掉的假红）")
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -5260,6 +5781,8 @@ SECTIONS = (
     test_launch_ledger_gate,
     test_protected_dir_never_blocks_startup,
     test_batch_state_watch_gate,
+    test_errexit_silent_death_gate,
+    test_case_insensitive_filesystem_gate,
 )
 
 
@@ -5273,6 +5796,13 @@ def main():
     # 排查的人第一反应是「新加的门禁有 bug」。当场点名比隔节报错便宜得多。
     _assert_eq(_switches_left(), [],
                "跑完全部小节，运行形态开关要和开跑前一模一样（拨走不收回＝下一节的输入不再由夹具决定）")
+    # 夹具名的撞车检查放在收尾而不是某一节里：它是**跨节**的性质——AA 节跑到的时候，后面
+    # 新加那一节的夹具名已经在文件里了，但那一节还没跑，按节判就会漏掉「下一节和这一节同名」。
+    # 同一族的另一半是残留：哪一节的 finally 没清干净，下一节读到的是上一节的字节。
+    _assert_eq(_fixture_name_collisions(), [],
+               "全文件的夹具名在大小写不敏感文件系统上也不撞车（撞车＝两节读同一份字节）")
+    _left = sorted(p.name for p in (_REPO / "debug").glob("zz_*"))
+    _assert_eq(_left, [], "跑完全部小节，debug/ 下不该留下任何 zz_* 夹具（残留＝下一节的输入）")
     # 每一节都真的被跑到：新增一节却忘了登记进 SECTIONS，它就永远不会执行，而且从输出上
     # 看不出来——这正是 riskbird 那 13 个套件的形状（不是坏了，是压根没在跑）。
     _defined = {n for n, v in globals().items() if n.startswith("test_") and callable(v)}
