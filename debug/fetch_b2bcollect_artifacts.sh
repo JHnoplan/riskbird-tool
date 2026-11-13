@@ -19,6 +19,15 @@ API="https://api.github.com/repos/JHnoplan/riskbird-tool"
 # 时，校验读到的可能是另一批的字节——「验证的字节和交付的字节不是同一份」在这一环最阴，
 # 因为它报出来的仍然是 ✅。
 WORK=${B2B_FETCH_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/b2b_dl.XXXXXX")}
+# 自己生的垃圾自己收：2026-11-13 本机就是在这里翻车的——盘只剩 2.0Gi，取制品下到
+# 一半 unzip 报 "write error (disk full?) Continue? (y/n)"，它在**等一个不会来的回答**
+# （这条路是后台 nohup，没人敲键盘），被杀掉之后 TMPDIR 里留下两个各 883MB 的半截
+# 工作目录，把下一次取制品也一起堵死。崩一次留一份，等于这个脚本每失败一次就更可能
+# 再失败一次。所以：自动建的工作目录一律在退出时收掉（显式指定 B2B_FETCH_WORK 时保留，
+# 那是调用方要留着查的落点）。
+if [ -z "${B2B_FETCH_WORK:-}" ]; then
+  trap 'rm -rf "$WORK" 2>/dev/null || true' EXIT
+fi
 # 目标 commit 的取法（2026-11-12 改的，与 poll 那一份同口径）：
 #   ①显式参数优先；②缺省取**远端 main 当前那条**（走 api.github.com）；③API 不通才退回
 #   本地 HEAD 并明说。为什么不能一上来就用本地 HEAD：推送偶发要走 Git Data API 快进，
@@ -116,6 +125,60 @@ for kv in "${IDS[@]}"; do
   esac
 done
 
+# ── 开下载之前的两件事：先把往次崩留下的半截工作目录收掉，再问「这次装得下吗」──
+# 顺序很重要：不先收垃圾，可用空间里有一大块正被上一次失败的残留占着，那道空间判据
+# 就会指着一份根本不属于本次交付的字节说话。
+# 事故现场（2026-11-13 本机）：盘只剩 2.0Gi，取制品下到一半 unzip 报
+# "write error (disk full?) Continue? (y/n)"——它不是退出，是**回头问人**，而这条路是
+# 后台 nohup 跑的，没人敲键盘，整个取制品就挂在那里，看起来像「还在下载」；强杀之后
+# TMPDIR 里留下两个各 883MB 的 b2b_dl.* ，下一次取制品更放不下。失败会自己攒成
+# 下一次的失败，这种复利必须在脚本里断掉，不能靠人记得去打扫。
+reclaimed=0
+for d in $(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'b2b_dl.*' 2>/dev/null); do
+  [ "$d" = "$WORK" ] && continue
+  # 只收自己这一族，且 1 小时内没再被动过（可能是隔壁那次正在写），且没有进程还指着它
+  [ -n "$(find "$d" -maxdepth 0 -mmin -60 2>/dev/null)" ] && continue
+  pgrep -f -- "$d" >/dev/null 2>&1 && continue
+  rm -rf -- "$d" && reclaimed=$((reclaimed + 1))
+done
+if [ "$reclaimed" -gt 0 ]; then
+  echo "· 收掉往次崩留下的半截工作目录 $reclaimed 个（只限同前缀 b2b_dl.*，1 小时内动过的不碰）"
+fi
+
+NEED=0
+UNKNOWN=0
+for kv in "${IDS[@]}"; do
+  key=${kv%%:*}; id=${kv##*:}
+  SZ=$(curl -sS -m 40 -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+       "$API/actions/runs/$id/artifacts" | python3 -c 'import sys,json
+try:
+    a = json.load(sys.stdin).get("artifacts") or []
+except Exception:
+    a = None
+print(sum(int(x.get("size_in_bytes") or 0) for x in a) if a else -1)')
+  case "$SZ" in
+    ""|"-1") UNKNOWN=$((UNKNOWN + 1)); echo "· [$key] API 没答出制品大小（这一路按保守下限判，不当「不需要空间」）" ;;
+    *) NEED=$((NEED + SZ)); echo "· [$key] 制品 $((SZ / 1048576)) MB" ;;
+  esac
+done
+# 解压后要占的比制品数字大得多（.app 与 onedir 里全是压不动的可执行文件），按 3 倍
+# 外加 500MB 余量要空间。问不到数字时不许退化成「不判」：给一个下限，宁可停下来说话。
+NEED_KB=$(( (NEED * 3 + 524288000) / 1024 ))
+if [ "$UNKNOWN" -gt 0 ] && [ "$NEED_KB" -lt 2097152 ]; then
+  NEED_KB=2097152
+fi
+AVAIL_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -z "$AVAIL_KB" ]; then
+  echo "❌ 问不出 ${WORK} 所在卷的可用空间（df 没给数）：空间不够时 unzip 不会报错退出，而是回头问「Continue? (y/n)」——后台跑就挂死。判不了就不下载。"
+  exit 7
+fi
+echo "· 磁盘：可用 $((AVAIL_KB / 1024)) MB，本次至少要 $((NEED_KB / 1024)) MB（制品×3 + 500MB 余量${UNKNOWN:+，含 $UNKNOWN 路 API 没答出大小}）"
+if [ "$AVAIL_KB" -lt "$NEED_KB" ]; then
+  echo "❌ 磁盘不够：${WORK} 所在卷只剩 $((AVAIL_KB / 1024)) MB，取这一批制品至少要有 $((NEED_KB / 1024)) MB。不在这里停下来的话，坏法不是「报一条错」，而是下到一半 unzip 回头问人、整条交付链挂住，或在半截字节上做完校验还报 ✅。"
+  echo "   · 可以先收的（都是可再生的）：TMPDIR 里往次的 b2b_dl.*（本脚本上面已按规则收过一轮）、b2bcollect_build/build/（PyInstaller 中间产物）、本机 dist 里不需要的旧包。"
+  exit 7
+fi
+
 mkdir -p "$WORK" || { echo "❌ 工作目录建不出来：${WORK}"; exit 2; }
 if [ -n "${B2B_FETCH_WORK:-}" ]; then
   find "$WORK" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -128,7 +191,16 @@ for kv in "${IDS[@]}"; do
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["artifacts"][0]["id"])')
   curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "$WORK/$key.zip" \
     "$API/actions/artifacts/$AID/zip"
-  mkdir -p "$WORK/$key" && unzip -oq "$WORK/$key.zip" -d "$WORK/$key"
+  mkdir -p "$WORK/$key"
+  # `< /dev/null` 不是可选的：磁盘满或路径坏时 Info-ZIP 的第一反应是**问一句**
+  # （Continue? (y/n)），后台跑时这句话永远没人答。接上空设备，问句立刻拿到 EOF、
+  # unzip 非零退出，下面这句才说得出人话。外层解包的退出码过去没被接住——那等于
+  # 拿着半份字节去做「随包凭证」校验，而它照样能报 ✅。
+  if ! unzip -oq "$WORK/$key.zip" -d "$WORK/$key" < /dev/null; then
+    NOW_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
+    echo "[$key] ❌ 外层制品 zip 解不开（此刻可用 $(( ${NOW_KB:-0} / 1024 )) MB）：先看空间，再怀疑网络截断"
+    exit 6
+  fi
   # 制品是「zip 里再套一层真实产物包」，两个平台都要解到内层才能验：
   #   · Mac：外层 Actions zip 里是 ditto 打的 B2bCollectTool_Mac_arm64.zip，.app 在里面；
   #   · Windows：外层 Actions zip 里是 B2bCollectToolSetup.exe（安装包）+
@@ -146,8 +218,11 @@ for kv in "${IDS[@]}"; do
     INNER=$(find "$WORK/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有 B2bCollectTool_Win_portable.zip（onedir 交付的两个产物少了一个，先修 workflow 再谈交付）"; exit 6; }
     mkdir -p "$WORK/$key/root/dist"
-    unzip -oq "$INNER" -d "$WORK/$key/root/dist" \
-      || { echo "[$key] ❌ 内层绿色版 zip 解不开：$INNER"; exit 6; }
+    if ! unzip -oq "$INNER" -d "$WORK/$key/root/dist" < /dev/null; then
+      NOW_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
+      echo "[$key] ❌ 内层绿色版 zip 解不开：${INNER}（此刻可用 $(( ${NOW_KB:-0} / 1024 )) MB）：写不下去时 unzip 是回头问人而不是报错，这里已经把问题关掉再接退出码"
+      exit 6
+    fi
     echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "$WORK/$key/root/dist" | tr '\n' ' ')"
   fi
   echo "[$key] artifact 内容：$(find "$WORK/$key" -maxdepth 2 -type f | head -3 | tr '\n' ' ')"

@@ -1107,14 +1107,63 @@ def test_delivery_chain():
             out.append("工作目录不是每次现建的（并发取制品会读到另一批解出来的字节）")
         if "/tmp/b2b_dl/" in code:
             out.append("还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）")
+        # 下面三条都是 2026-11-13 本机那次「盘只剩 2.0Gi」的直接教训：症状不是报错，
+        # 是**挂住**（unzip 回头问人）+ **越失败越占盘**（半截工作目录没人收）。
+        if not re.search(r"\btrap\b[^\n]*\bEXIT\b", code):
+            out.append("自动建的临时工作目录没有退出清理（崩一次留一份几百 MB 的半截目录，"
+                       "下一次取制品更放不下——失败会攒成下一次的失败）")
+        if "df -kP" not in code:
+            out.append("开下载前没问目标卷的可用空间（写满时 unzip 不报错退出而是问人，"
+                       "后台那条路没人答；`-k` 不是可选的：`-k` 给的是 1K 块，按字节解析会在某些卷上算错）")
+        # 只盯**被执行的动作**：引号里的是给人看的话（"unzip 不会报错退出…"），拿它去判
+        # 就会把解释当成违规行——下一来的人为了变绿会删注释与话术，那是抹掉下次排查最
+        # 需要的上下文（与 _code_only 同一套做法）。
+        # 反过来也不许去猜「unzip 前面得是行首/if !/分号」才算调用：`! unzip …`、
+        # `then unzip …` 这些一样在执行，猜位置就会把真违规漏成 0 条（本轮反向对照
+        # 抓到的正是这个）。剔掉注释与引号之后还活着的 unzip，只能在执行。
+        _act = re.sub(r"'[^']*'|\"[^\"]*\"", " ", code)
+        _unguarded = [ln.strip() for ln in _act.splitlines()
+                      if re.search(r"\bunzip\b", ln)
+                      and ("< /dev/null" not in ln or ("if !" not in ln and "||" not in ln))]
+        if _unguarded:
+            out.append(f"有 unzip 没同时做到「stdin 接空设备 + 接住退出码」（{len(_unguarded)} 处，"
+                       f"例如：{_unguarded[0][:56]}）：问句拿不到答案就挂住，非零没被接住就拿半份字节去校验还报 ✅")
         return out
 
     _assert_eq(_workdir_problems(fetch), [], "取制品落在自己现建的工作目录里")
     _assert_eq(_workdir_problems('mkdir -p /tmp/b2b_dl && rm -rf /tmp/b2b_dl/*\n'
                                  'unzip -oq x -d /tmp/b2b_dl/win\n'),
                ["工作目录不是每次现建的（并发取制品会读到另一批解出来的字节）",
-                "还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）"],
+                "还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）",
+                "自动建的临时工作目录没有退出清理（崩一次留一份几百 MB 的半截目录，"
+                "下一次取制品更放不下——失败会攒成下一次的失败）",
+                "开下载前没问目标卷的可用空间（写满时 unzip 不报错退出而是问人，"
+                "后台那条路没人答；`-k` 不是可选的：`-k` 给的是 1K 块，按字节解析会在某些卷上算错）",
+                "有 unzip 没同时做到「stdin 接空设备 + 接住退出码」（1 处，"
+                "例如：unzip -oq x -d /tmp/b2b_dl/win）：问句拿不到答案就挂住，非零没被接住就拿半份字节去校验还报 ✅"],
                "反向对照：本轮那种固定共用落点必须被判红（判据抓不住=这条门是空的）")
+    # 三条新门各自要能被单独摘掉再抓回来：只对照「全坏的那种」等于三条里任一单独失效
+    # 都测不出来（与第 15 条拆三半同一个道理）。
+    _ok_work = ('WORK=$(mktemp -d "${TMPDIR:-/tmp}/b2b_dl.XXXXXX")\n'
+                'trap \'rm -rf "$WORK"\' EXIT\n'
+                'AVAIL_KB=$(df -kP "$WORK" | awk \'NR==2 {print $4}\')\n'
+                'if ! unzip -oq a.zip -d "$WORK/win" < /dev/null; then exit 6; fi\n')
+    _assert_eq(_workdir_problems(_ok_work), [], "正例：现建目录 + 退出清理 + 空间预检 + 解包接码")
+    for _needle, _why in (
+        (" EXIT\n", "退出清理那一句被摘掉要能单独被抓回"),
+        ("df -kP", "空间预检被摘掉要能单独被抓回"),
+        (" < /dev/null", "解包不接 stdin 就会被 unzip 的问句挂住（后台跑没人答）"),
+        ("if !", "解包不接退出码就会拿半份字节去做校验"),
+    ):
+        _mutated = _ok_work.replace(_needle, "", 1)
+        _assert(_mutated != _ok_work, f"反向对照夹具真的动到了 {_needle}（没动成功=自己跟自己比）")
+        _assert_eq(len(_workdir_problems(_mutated)), 1,
+                   f"反向对照：摘掉「{_needle}」必须恰好报一条——{_why}")
+    # 反向对照的另一半：只在**话说里**提到 unzip（解释「为什么这里要接 /dev/null」的
+    # echo）不能被抓成违规行。抓了，下一来的人就会去删那句解释——而删掉的正是下次
+    # 排查最需要的一行。
+    _assert_eq(_workdir_problems(_ok_work + 'echo "写不下去时 unzip 是回头问人，不是报错"\n'), [],
+               "反向对照：注释与话术里提到 unzip 不算一处违规（判的是被执行的动作，不是文中有这个词）")
 
     # 自检报告的落点由**产物自己回答**（--state-dir），两个 Mac 入口都不许在 shell 里猜目录：
     # 猜出来的那份是第二真源——候选链或布局一变（本轮受保护目录改动后落点就搬去了 ~/.b2bcollect），
