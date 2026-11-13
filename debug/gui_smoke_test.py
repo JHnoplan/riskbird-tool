@@ -10,12 +10,26 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 无头跑 Qt，绝不打扰用户桌面
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "b2bcollect_build"))
+
+# 状态落点必须单独钉一次（2026-11-13 批跑的状态文件对拍抓出来的第四处）
+# 下面那句 `_get_desktop_dir = lambda self: _desk` 的注释写着「任务索引/账号文件全落
+# 沙箱」，可它管的是**桌面**那一级：现行任务索引问的是 tool_config.state_file（开发态
+# 就是模块目录）。于是本套件每次跑都往开发机真实的 _采集任务索引.json 里登记一条假任务。
+# 这一类缺陷的坏在于：犯错的套件自己全绿，红的是隔壁；而且它是走 GUI 自己的登记路径写的，
+# 按「谁调了 save_tasks」去静态清点也会漏掉——所以批跑入口现在盯的是环境本身（前后快照
+# 对拍），这里再钉一次落点并当场自证。
+_STATE_SANDBOX = tempfile.mkdtemp(prefix="b2b_gui_state_")
+os.environ["B2B_STATE_DIR"] = _STATE_SANDBOX
 
 from PyQt5.QtWidgets import QApplication, QDialog, QCheckBox, QMessageBox
 from openpyxl import load_workbook
 
 import b2bcollect_gui as gui
+
+assert str(gui._tasks.index_path()).startswith(_STATE_SANDBOX), (
+    f"隔离没生效：任务索引指向 {gui._tasks.index_path()}（不是 {_STATE_SANDBOX}）"
+    f"——落点口径又搬了，本套件的假任务会写进开发机的真实索引")
 
 ok = 0
 
@@ -314,6 +328,20 @@ check("清空种子库仍不动已采的结果表文件", raw_p.exists() and cle
 # 恢复逻辑改指回用户真实任务夹，把真实原始表覆盖成 3 行假记录）
 check("全程 session_dir 只在临时目录里（没被改指回用户真实任务夹）",
       w.session_dir is None or str(w.session_dir).startswith(str(tmp)))
+
+# 第二条收尾自检（同一形状：判据看证据，不看注释）：把落点开关**撤掉**去读开发机真实的
+# 任务索引，本套件那条假任务必须不在里面。开头那句 assert 只证明开关拨到位了；这一句证明
+# 这一路确实没往真实状态文件写过东西——将来落点再搬一次，红的是这里，而不是隔壁套件。
+_saved_state_env = os.environ.pop("B2B_STATE_DIR", None)
+try:
+    _real_ids = sorted(str(t.get("id")) for t in gui._tasks.load_tasks())
+    _real_at = str(gui._tasks.index_path())
+finally:
+    if _saved_state_env is not None:
+        os.environ["B2B_STATE_DIR"] = _saved_state_env
+check("撤掉开关后读真实任务索引：里面没有本套件的假任务",
+      "20261028_160000" not in _real_ids,
+      f"{_real_at} 现有 id：{_real_ids}")
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n全部 {ok} 项断言通过 ✅")
