@@ -179,11 +179,52 @@ def _tool_names(zp: Path) -> tuple:
     return tuple(label for label, _, _, _ in _tool_specs(zp))
 
 
+def _ancestors(names) -> set:
+    """这些路径的全部父目录（zip 里以 / 分隔，落地后也是同一层结构）。"""
+    out: set = set()
+    for n in names:
+        parts = n.split("/")
+        for i in range(1, len(parts)):
+            out.add("/".join(parts[:i]))
+    return out
+
+
+def _missing_paths(want: set, got: set) -> list:
+    """条目里哪些路径**真的**没到用户手上。
+
+    AppleDouble 侧车（同层里那个 `._名字`）是唯一一种「本来就不该按字面落地」的条目：
+    ditto 把它读回去变成基文件的扩展属性与 ACL，解完根本不留 `._X` 这个文件——这不是少
+    交付，这正是用户想要的（Finder 里看到的包和打包时一模一样）；unzip 不认识它，于是老实
+    落一个 `._X`。同一批字节在两个工具下给出两种落地清单，恰好是本轮反复踩的那条线：拿别人
+    工具的实现差异当交付缺陷。所以这里只问「它描述的那个基文件到没到」，基文件也没到才报红。
+    """
+    miss = []
+    for n in sorted(want - got):
+        d, _, b = n.rpartition("/")
+        base = (d + "/" if d else "") + b[2:]
+        if b.startswith("._") and base in got:
+            continue
+        miss.append(n)
+    return miss
+
+
 def _expected_files(zp: Path) -> tuple:
-    """条目清单：(要落地的相对路径集合, 目录条目数)——目录条目不算文件。"""
+    """条目清单：(包里的所有路径, 重名条目数)。
+
+    **目录条目也算一条路径**，而且不靠尾斜杠分类：Apple 的 ditto 写目录条目时**不带**
+    尾斜杠（2026-11-13 云端 Mac run 正是这里假红——`解出来少了 168 个文件`，例如
+    `B2bCollectTool.app/Contents/Frameworks/PIL/.dylibs`；那 168 条全是目录，交付物一个
+    字节都没少），而 CPython 的装配脚本写目录条目时带。只认尾斜杠就等于把「这份包是哪个
+    工具打的」当成「用户手里的包少了东西」——判据红在自己的分类口径上，比不红更糟：它拦下
+    的是一个好包，还占了「门抓到真问题」的信用。
+    落地那一侧同样按**路径在不在**收（文件、目录、符号链接都算），两侧口径一致才对得起
+    「对拍」两个字；某个关键路径是不是真的可执行/非空，由 require 那一路单独判（那里用
+    is_file 与字节数），不在这里混进同一条判据。
+    """
     with zipfile.ZipFile(zp) as zf:
-        files = [i.filename for i in zf.infolist() if not i.filename.endswith("/")]
-    return set(files), len(files) - len(set(files))
+        names = [n for n in (i.filename.rstrip("/") for i in zf.infolist()) if n]
+    uniq = set(names)
+    return uniq, len(names) - len(uniq)
 
 
 def extract_with_os_tools(zp: Path, require: tuple = (), platform: str = "",
@@ -223,19 +264,24 @@ def extract_with_os_tools(zp: Path, require: tuple = (), platform: str = "",
             except OSError as exc:
                 problems.append(f"{zp.name}：{label} 根本没能启动：{exc}")
                 continue
-            got = {os.path.relpath(os.path.join(r, f), dst).replace(os.sep, "/")
-                   for r, _, fs in os.walk(dst) for f in fs}
+            got = {os.path.relpath(os.path.join(r, x), dst).replace(os.sep, "/")
+                   for r, ds, fs in os.walk(dst) for x in ds + fs}
             if r.returncode != 0:
                 problems.append(f"{zp.name}：{label} 解包退出码 {r.returncode}，它的最后一句："
                                 f"{(r.stdout or '').strip().splitlines()[-1][:120] if r.stdout else '(没有输出)'}")
-            miss = sorted(want - got)
-            extra = sorted(got - want)
+            miss = _missing_paths(want, got)
+            # 「落地比条目多」本身不是缺陷：包里有 a/b/c.txt 而没有 a/b/ 这一条时，任何工具
+            # 都得把 a 与 a/b 现建出来；ditto 的包里 __MACOSX 这一层也是这么冒出来的。上一版
+            # 我在这里把计数差异直接当成「用户手里多了东西」——那是我刚在上面那条注释里批评过的
+            # 同一个错（拿计数差异推断包坏，没先问每一个名字的身份），离线夹具 ⑤ 立刻把它抓了出来。
+            # 所以只有**既不是条目、也不是任何条目的父目录**的名字才算工具凭空造出来的东西。
+            extra = sorted(got - want - _ancestors(want))
             if miss:
-                problems.append(f"{zp.name}：{label} 解出来少了 {len(miss)} 个文件（例如 {miss[0]!r}）："
+                problems.append(f"{zp.name}：{label} 解出来少了 {len(miss)} 个路径（例如 {miss[0]!r}）："
                                 f"名字对不对是解包工具的事，少落地就是用户手里的包坏了")
             if extra:
-                problems.append(f"{zp.name}：{label} 解出了条目清单里没有的 {len(extra)} 个名字"
-                                f"（例如 {extra[0]!r}）：多半是名字被工具改写后落的地")
+                problems.append(f"{zp.name}：{label} 解出了条目清单里根本没有、也不是任何条目父目录的 "
+                                f"{len(extra)} 个名字（例如 {extra[0]!r}）：多半是名字被工具改写后落的地")
             for rel in require:
                 p = dst / rel
                 if not p.is_file():

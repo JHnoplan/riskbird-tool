@@ -109,6 +109,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -1550,6 +1551,109 @@ def test_delivery_chain():
                     f"反向对照：不给 bsdtar 建目录必须被拒绝（实际={_wr2}）")
     finally:
         _gate._tool_specs = _specs_real
+
+    # ⑤ 目录条目：交付包里的目录**不一定带尾斜杠**。Apple 的 ditto 就是这么写的
+    #    （Mac workflow 打交付包用的正是它）：2026-11-13 云端那个 run 报
+    #    「ditto/unzip 各少 168 个文件」，第一条例子是 …/Frameworks/PIL/.dylibs——
+    #    168 条全是目录，交付物一个字节都没少。门把「按尾斜杠分类」当成了「按身份分类」，
+    #    红的是自己的口径。这一段用**真 ditto** 造一份带空目录、隐藏目录、符号链接的包：
+    #    CPython 的 zipfile 造不出这个形状（它写目录条目就带斜杠），拿它当夹具就等于把
+    #    云端那条假红的原因留在用例之外——那正是本轮第 5 次犯、也最贵的一类错：
+    #    夹具的形状不是生产者的形状。
+    if ditto:
+        _dt_app = _ztmp / "ditto_tree" / "B2bCollectTool.app"
+        (_dt_app / "Contents" / "Frameworks" / "PIL" / ".dylibs").mkdir(parents=True)
+        (_dt_app / "Contents" / "MacOS").mkdir(parents=True)
+        (_dt_app / "Contents" / "MacOS" / "B2bCollectTool").write_bytes(b"\xcf\xfa\xed\xfe")
+        (_dt_app / "Contents" / "Resources").mkdir(parents=True)
+        (_dt_app / "Contents" / "Resources" / "config.json").write_text('{"ak":""}',
+                                                                        encoding="utf-8")
+        # 符号链接也铺上：一个指向文件、一个指向目录。.app 里真有这种结构，而工具对它们的
+        # 落地形态各不相同（unzip 可能把它解成一个装着目标路径的普通文件）。对拍只问「这条
+        # 路径在不在」，不猜工具把链接解成了什么——猜就又回到「拿计数差异推断包坏」那个坑。
+        os.symlink("config.json", _dt_app / "Contents" / "Resources" / "link_to_file")
+        os.symlink("PIL", _dt_app / "Contents" / "Frameworks" / "link_to_dir")
+        _dz = _ztmp / "ditto_made.zip"
+        subprocess.run([ditto, "-c", "-k", "--keepParent",
+                        str(_dt_app), str(_dz)], check=True, timeout=300,
+                       stdin=subprocess.DEVNULL, capture_output=True)
+        with zipfile.ZipFile(_dz) as _zf:
+            _entries = [i.filename for i in _zf.infolist()]
+        _assert_eq(len(_gate._expected_files(_dz)[0]), len(_entries),
+                   f"目录条目也要算一条路径（少算一条就少判一次交付，多算就在每个包上假红）："
+                   f"条目 {len(_entries)} 个")
+
+        def _landed(dst: Path) -> set:
+            return {Path(r, x).relative_to(dst).as_posix()
+                    for r, ds, fs in os.walk(dst) for x in ds + fs}
+
+        # 夹具自证：这条正例真的经过了「AppleDouble 侧车被吸收」那一格。本地 ditto 打的包里
+        # 有 `._X` 侧车，而 ditto 解完后那些名字一个都不落地（它把元数据读回基文件）；unzip
+        # 不认识侧车，原样落下来。少了这一格自证，上面的 ✅ 只说明「两边都全量落地」，云端
+        # 那种分歧压根没跑到——那正是本轮第 5 次犯的错：正例没覆盖到出问题的那一格。
+        _side = [n for n in _entries if n.rsplit("/", 1)[-1].startswith("._")]
+        _dst_d = _ztmp / "dz_ditto"
+        subprocess.run([ditto, "-x", "-k", str(_dz), str(_dst_d)], check=True,
+                       timeout=300, stdin=subprocess.DEVNULL, capture_output=True)
+        _ld = _landed(_dst_d)
+        _assert(_side and not (set(_side) & _ld),
+                f"夹具自证：ditto 造的包里有 {len(_side)} 个 AppleDouble 侧车条目，而 ditto 自己解完"
+                f"一个都不留（读回成元数据）——正例走的必须是这一格（实际落地含侧车="
+                f"{sorted(x for x in _ld if x.rsplit('/', 1)[-1].startswith('._'))}）")
+
+        # 云端那份交付包的另一个形状：目录条目**不带**尾斜杠（真实制品里核实过——568 条带斜杠，
+        # 隐藏目录 Contents/Frameworks/PIL/.dylibs 那一条不带）。本地 ditto 造不出这一格，就用
+        # dir-mode 条目把它摆出来给两个真工具解：形状是真的，只是不假装是 ditto 写的。
+        _sz = _ztmp / "shape_dirs.zip"
+
+        def _mkinfo(nm: str, mode: int) -> zipfile.ZipInfo:
+            _zi = zipfile.ZipInfo(nm)
+            _zi.create_system = 3
+            _zi.external_attr = mode << 16
+            return _zi
+
+        with zipfile.ZipFile(_sz, "w") as _z:
+            _z.writestr(_mkinfo("app/Contents/", stat.S_IFDIR | 0o755), "")
+            _z.writestr(_mkinfo("app/Contents/Frameworks/PIL/.dylibs",
+                                stat.S_IFDIR | 0o755), "")
+            _z.writestr(_mkinfo("app/Contents/MacOS/B2bCollectTool",
+                                stat.S_IFREG | 0o644), b"MZ\x90\x00")
+        _assert(any(n.endswith(".dylibs") and not n.endswith("/")
+                    for n in zipfile.ZipFile(_sz).namelist()),
+                "形状夹具必须真的带上「目录条目不带尾斜杠」这一格（云端那条假红就是这么来的）")
+        _sp2 = _gate.extract_with_os_tools(_sz, platform="darwin")
+        _assert_eq(_sp2, [],
+                   f"不带尾斜杠的目录条目在 ditto 与 unzip 上都算落地成功——按身份分类，"
+                   f"不按尾斜杠分类（实际={_sp2}）")
+        _dp = _gate.extract_with_os_tools(_dz, platform="darwin")
+        _assert_eq(_dp, [],
+                   f"正例：真 ditto 的包（带空目录、隐藏目录、两种符号链接与 __MACOSX）在 ditto "
+                   f"与 unzip 上都必须对拍得上，实际={_dp}")
+        _fake_dz = _ztmp / "fake_drop"
+        _fake_dz.mkdir(parents=True)
+        (_fake_dz / "unzip").write_text(
+            f"#!{sys.executable}\n"
+            "import sys, os, zipfile\n"
+            "a = sys.argv\n"
+            "d = a[a.index('-d') + 1]\n"
+            "z = [x for x in a if x.endswith('.zip')][0]\n"
+            "zf = zipfile.ZipFile(z)\n"
+            "zf.extractall(d)\n"
+            # 工具**凭空造**一个名字也要被抓到：把某个文件改名落地（多出来的名字既不是条目、
+            # 也不是任何条目的父目录）。这是「extra」那一路唯一的真语义；把「解包工具自己得建
+            # 父目录」当成违规，就是云端那一条假红的第二次。
+            "os.rename(os.path.join(d, 'B2bCollectTool.app/Contents/MacOS/B2bCollectTool'),\n"
+            "           os.path.join(d, 'B2bCollectTool.app/Contents/MacOS/B2bCollectTool_RENAMED'))\n",
+            encoding="utf-8")
+        (_fake_dz / "unzip").chmod(0o755)
+        with _path_first(_fake_dz):
+            _dr = _gate.extract_with_os_tools(_dz, platform="darwin")
+        _assert(any("unzip" in x and ("少了" in x or "凭空" in x or "没有" in x) for x in _dr),
+                f"反向对照：工具把一个名字改写到别的地，必须被对拍抓出来（实际={_dr}）")
+    else:
+        print("   · 这台机器没有 ditto：第 ⑤ 步跳过（Linux CI 就是这样；交付链上 Mac 那一路"
+              "的门跑在 macos runner 上，那边有）")
+
     shutil.rmtree(_ztmp, ignore_errors=True)
 
     # 续行写法（`extract_zip x \` 换行 `|| {…}`）是真实脚本里就在用的形状：按行判却不
