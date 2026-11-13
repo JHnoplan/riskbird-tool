@@ -397,9 +397,19 @@ check("④ 采集参数区不超过 2 行控件", len(_lrows) <= 2, str(len(_lro
 check("④ 第一行是采集间隔与三个开关",
       _widgets(_lrows[0]) >= {w.spin_delay, w.chk_guard, w.chk_incr, w.chk_bg},
       sorted(type(x).__name__ for x in _widgets(_lrows[0])))
-check("④ 第二行只有自动扩词与历史任务",
-      _widgets(_lrows[1]) == {w.chk_auto_kw, w.btn_history},
+# 第二行的口径：放「数据口径开关 + 次要入口」，不放主动作按钮。
+# 原来写成「只有自动扩词与历史任务」是功能④⑤之前的形状；清洗档位（⑤）与手动补采
+# （④）都归这一类：都是「先设口径/随时补一次」，不是「开工/收工」。这条判据真正要守的
+# 是**主动作按钮不许挤回配置行**（那正是「开始采集要左右滑才能点到」的成因），
+# 所以按黑名单判而不是按白名单枚举——新增一个合规开关不该逼人回来改期望值。
+check("④ 第二行是口径开关与次要入口（自动扩词/清洗档位/历史任务/补采官网）",
+      _widgets(_lrows[1]) == {w.chk_auto_kw, w.chk_strict, w.btn_history, w.btn_site_now},
       sorted(type(x).__name__ for x in _widgets(_lrows[1])))
+check("④ 第二行绝不含主动作按钮（开工/停/洗/导/新任务都留在常驻行）",
+      not _widgets(_lrows[1]) & {w.btn_start, w.btn_pause, w.btn_stop,
+                                 w.btn_clean, w.btn_export, w.btn_reset},
+      sorted(x.text() for x in _widgets(_lrows[1]) & {w.btn_start, w.btn_pause, w.btn_stop,
+                                                      w.btn_clean, w.btn_export, w.btn_reset}))
 check("④ 页数说明并入采集间隔 tooltip（不新开控件）",
       "翻页一律不限制" in w.spin_delay.toolTip())
 

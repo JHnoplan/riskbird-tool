@@ -1,0 +1,15 @@
+# 交付链的依赖清单（单一真源）：由 .github/scripts/pip_install.py 读，各平台的 workflow 只写「装哪一份清单」。
+# 为什么不在 workflow 里 inline 包名：同一份依赖此前在 mac 与 Windows 两份 workflow 里各抄一遍，靠注释「逐行对齐」
+# 人肉同步——加一个包漏一处，构建照样全绿，缺的那只在用户点击功能时才崩（见 pip_install.py 顶部说明）。
+PyQt5
+selenium
+openpyxl
+requests
+websocket-client
+beautifulsoup4
+lxml
+pillow
+pyinstaller
+phonenumbers
+pandas
+xlrd

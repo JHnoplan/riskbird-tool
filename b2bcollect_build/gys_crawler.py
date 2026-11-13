@@ -262,7 +262,7 @@ class GysCrawler(CdpSiteCrawler):
                     return
             else:
                 empty = 0
-            new = skipped = 0
+            new = skipped = seen = 0
             for e in entries:
                 mid = e["公司ID"]
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -270,6 +270,8 @@ class GysCrawler(CdpSiteCrawler):
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
@@ -285,7 +287,7 @@ class GysCrawler(CdpSiteCrawler):
                 new += 1
                 yield e
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 家，新增 {new}"
-                      + (f"，早过滤 {skipped}" if skipped else ""))
+                      + self._page_tail(skipped, seen))
             if new == 0:
                 stale += 1
                 if stale >= 1:

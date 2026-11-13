@@ -509,7 +509,7 @@ class GiCrawler(CdpSiteCrawler):
                     return
                 continue
             empty = 0
-            new = skipped = 0
+            new = skipped = seen = 0
             for e in entries:
                 mid = e["公司ID"]
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -517,6 +517,8 @@ class GiCrawler(CdpSiteCrawler):
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
@@ -531,7 +533,7 @@ class GiCrawler(CdpSiteCrawler):
                 e["关键词"] = kw
                 new += 1
                 yield e
-            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 条，新增 {new} 家{tail}")
             if new == 0:
                 stale += 1

@@ -184,9 +184,12 @@ mkdir -p "$LOG_DIR" 2>/dev/null || { echo "❌ 日志目录建不出来：${LOG_
 # 批跑期间改动过这些文件的，不论出自哪一路套件，都在这里当场判红并点名是哪一份——
 # 「谁的用例干的」要能从证据读出来，不许靠人回想这一轮跑了什么。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-_state_snapshot() {   # $1 = 输出文件
+# 「代码自己声明的那一半」名单整批取一次就够（离线用例不会改源码），数据目录里现有的
+# 文件每次重新走一遍：新增一份必须在下一张快照里现身，否则「多出来的文件」这一类污染
+# 正好看不见——本轮那两份「爱企查_结果页证据_*.txt」就是这么冒出来的。
+_state_declared_names() {   # $1 = 输出文件
   $PY - "$ROOT" "$1" <<'PY'
-import hashlib, re, sys
+import re, sys
 from pathlib import Path
 root, out = Path(sys.argv[1]), Path(sys.argv[2])
 NAME_PAT = re.compile(r'^[A-Z_]*(?:NAME|FILENAME)\s*=\s*[\'"]([^\'"]+\.(?:json|log|txt))[\'"]', re.M)
@@ -195,7 +198,18 @@ names = set()
 for d in WATCHED_DIRS:
     for py in sorted((root / d).glob("*.py")):
         names.update(NAME_PAT.findall(py.read_text(encoding="utf-8", errors="replace")))
-    for sub in sorted((root / d).glob("*_data")):      # 开发态数据目录（Cookie、种子库）
+out.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
+PY
+}
+_state_snapshot() {   # $1 = 输出文件，$2 = 上面那份声明名单
+  $PY - "$ROOT" "$1" "$2" <<'PY'
+import hashlib, sys
+from pathlib import Path
+root, out, declared = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+WATCHED_DIRS = ("b2bcollect_build", "riskbird_build", "ali1688_build")
+names = {n for n in declared.read_text(encoding="utf-8").splitlines() if n}
+for d in WATCHED_DIRS:                          # 开发态数据目录（Cookie、种子库）
+    for sub in sorted((root / d).glob("*_data")):
         for f in sorted(sub.rglob("*")):
             if f.is_file():
                 names.add(str(f.relative_to(root / d)))
@@ -236,13 +250,27 @@ PY
 }
 STATE_BEFORE="$BASE/state_before.tsv"
 STATE_AFTER="$BASE/state_after.tsv"
+STATE_NAMES="$BASE/state_names.txt"
 leak=0
-if ! _state_snapshot "$STATE_BEFORE"; then
+leak_suites=""
+if ! _state_declared_names "$STATE_NAMES"; then
+  echo "❌ 状态文件名单取不了：批跑失去「监视范围从哪来」这一问，这一步不放行"
+  exit 2
+fi
+if ! _state_snapshot "$STATE_BEFORE" "$STATE_NAMES"; then
   echo "❌ 状态文件快照取不了：批跑失去「有没有污染开发机」这一问，这一步不放行"
   exit 2
 fi
 nwatch=$(wc -l < "$STATE_BEFORE" | tr -d ' ')
-echo "状态文件监视：开工前先记下 ${nwatch} 份（批跑结束时对拍，改一份就当场判红）"
+echo "状态文件监视：开工前先记下 ${nwatch} 份（每跑完一路套件就对拍一次，改一份就点名是谁干的）"
+
+# 逐套件对拍用的两张快照轮流当「上一张」和「这一张」：只保留一份文件会在下一轮被覆盖，
+# 于是「上一张」其实就是这一路套件跑完之后的样子——对拍的就不是这一路干的，而是隔壁。
+SNAP_A="$BASE/state_a.tsv"
+SNAP_B="$BASE/state_b.tsv"
+PREV="$SNAP_A"
+CUR="$SNAP_B"
+cp "$STATE_BEFORE" "$PREV" 2>/dev/null || { echo "❌ 快照复制不到 ${PREV}：逐套件归属这一步不放行"; exit 2; }
 
 for f in $FILES; do
   total=$((total+1))
@@ -306,17 +334,36 @@ for f in $FILES; do
     printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)|^AssertionError|^OSError|^FileNotFoundError" | head -20 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   fi
+
+  # ── 这一路跑完立刻对拍状态文件：污染要报在犯错的套件名下 ──────────────────
+  # 只在批跑收尾对拍整批的写法抓得到「有没有」，抓不到「是谁」——上一轮那两份
+  # 「爱企查_结果页证据_*.txt」就是这样：屏幕上是「改动了 2 份」，接下来要靠人回想
+  # 这一批跑过什么。回想出来的结论没有一条能复跑，所以判据必须自己带名字。
+  if ! _state_snapshot "$CUR" "$STATE_NAMES"; then
+    echo "   ⚠ $f 跑完之后快照取不了：这一路及其后的归属判断失去证据（总判定仍按收工对拍）"
+  else
+    if ! cmp -s "$PREV" "$CUR"; then
+      leak=1
+      leak_suites="$leak_suites $f"
+      echo "   ⚑ $f 改动了开发机的状态文件（收工对拍仍按总判定处理这一问）："
+      _state_leak_report "$PREV" "$CUR" | sed 's/^/        /' | head -12
+    fi
+    # 不论有没有改动都要推进「上一张」：不推进的话第一处污染之后的每一路都拿它比对，
+    # 同一个元凶会被点名几十次，真正的新增污染反而埋没在重复里。
+    cp "$CUR" "$PREV" 2>/dev/null
+  fi
 done
 echo "----------------------------------------------------------------"
 # 收工后再取一次快照对拍：这一问与「哪一路套件红了」是两条独立的判据——上一轮两条都绿
 # 着跑了几十次，污染却在攒着，直到下一个断言条数的用例被顶红。判据要盯的是环境本身。
-if ! _state_snapshot "$STATE_AFTER"; then
+if ! _state_snapshot "$STATE_AFTER" "$STATE_NAMES"; then
   echo "❌ 收工后的状态文件快照取不了：这一轮无法回答「有没有污染开发机」"
   leak=1
 elif ! cmp -s "$STATE_BEFORE" "$STATE_AFTER"; then
   leak=1
   echo "❌ 批跑改动了开发机的状态文件（离线用例的隔离没接在现行落点上）："
   _state_leak_report "$STATE_BEFORE" "$STATE_AFTER"
+  echo "   逐套件归属（⚑ 那些行）已经点名是谁写的：${leak_suites:-未定位到具体套件}"
   echo "   修法：让该套件把落点钉到临时目录（B2B_STATE_DIR），并当场自证 index_path 在它下面；"
   echo "   只改注释或把文件删掉不算修——下一次批跑还会写回来。"
 else

@@ -263,9 +263,44 @@ def _rows(g):
 
 g_lite = _group(w_lite, "采集参数")
 g_pro = _group(w_pro, "采集参数")
-check("丐版「④ 采集参数」里那行只有隐藏控件的空行**整行不再加入布局**（内部版仍是两行）",
-      len(_rows(g_lite)) == 1 and len(_rows(g_pro)) == 2,
-      (len(_rows(g_lite)), len(_rows(g_pro))))
+
+
+def _row_widgets(item):
+    """一行布局里真正挂在布局上的控件（嵌套子布局一起收）。"""
+    lay = item.layout()
+    out = []
+    if not lay:
+        return out
+    for i in range(lay.count()):
+        sub = lay.itemAt(i)
+        if sub is None:
+            continue
+        if sub.widget() is not None:
+            out.append(sub.widget())
+        out.extend(_row_widgets(sub))
+    return out
+
+
+# 判据换过一轮：原来钉的是「丐版把那行整行撤掉，所以只剩 1 行」。功能⑤的清洗档位与
+# 功能④的手动补采都恒定挂在这一行（数据口径开关不能跟着功能入口一起藏，见 GUI 注释），
+# 于是「行数」不再是可用的判据。真正要守的是**不留空行**：一行里必须至少有一个控件
+# 真的可见——只把控件 setVisible(False) 而整行照加，症状和用户说不清的那次一模一样。
+_lite_rows = [_row_widgets(x) for x in _rows(g_lite)]
+check("丐版「④ 采集参数」不留空行：每一行都得有真的可见控件"
+      "（只藏控件不撤行 = 界面莫名其妙空了一块）",
+      bool(_lite_rows) and all(any(x.isVisibleTo(g_lite) for x in ws) for ws in _lite_rows),
+      [(i, [f"{x.metaObject().className()}:{x.text()}" for x in ws])
+       for i, ws in enumerate(_lite_rows)])
+check("内部版「④ 采集参数」仍是两行（扩词/历史任务没被挤到别处）",
+      len(_rows(g_pro)) == 2, len(_rows(g_pro)))
+check("丐版同样看得见「严格按关键词清洗」与「补采官网联系方式」：数据口径开关不是功能入口，"
+      "藏掉它就会出现「界面上没这项、值却还在生效」那种最难解释的账",
+      any(x.text() == "严格按关键词清洗" and x.isVisibleTo(w_lite)
+          for x in g_lite.findChildren(QCheckBox))
+      and any(x.text() == w_lite.BTN_SITE_ENRICH and x.isVisibleTo(w_lite)
+              for x in g_lite.findChildren(QPushButton)),
+      [x.text() for x in g_lite.findChildren(QCheckBox)]
+      + [x.text() for x in g_lite.findChildren(QPushButton)])
 _co_lite = _group(w_lite, "公司名单")
 check("丐版公司名单区仍然有内容（按钮 + 说明 + 一个勾选框），不是一块空板",
       len(_rows(_co_lite)) >= 3
@@ -954,6 +989,60 @@ _ag_src = (_ROOT / "b2bcollect_build" / "access_guard.py").read_text(encoding="u
 check("上述判据有效：把 access_guard 的 import os 去掉后它确实会报错（不是永远绿）",
       bool(_missing_imports(_ag_src.replace("\nimport os\n", "\n")))
       and not _missing_imports(_ag_src))
+
+# ── 控制流转移之后还挂着语句＝整段死代码（2026-11-13 实机级事故的一手成因）──────
+# solarbe_crawler._iter_keyword 里「跳过已采」那个 if 被补判据时改动过一行，continue 落在了
+# if 外面：语法合法、py_compile 全绿、模块导入全绿、日志照旧写「第 1 页：20 家，新增 0」，
+# 看上去只是「这批都采过了」，实际是**这一路一家都不可能再产出**。这种形状不会因为
+# 改的是哪个站而只影响那个站，所以扫描范围铺到三个交付目录而不是只盯 b2bcollect_build。
+_TERMINALS = (ast.Continue, ast.Break, ast.Return, ast.Raise)
+
+
+def _unreachable(src):
+    """返回「跳转语句之后同块还跟着真语句」的位置列表（纯字符串表达式当占位注释跳过）。"""
+    tree = ast.parse(src)
+    out = []
+    for node in ast.walk(tree):
+        for label in ("body", "orelse", "finalbody"):
+            lst = getattr(node, label, None)
+            if not isinstance(lst, list):
+                continue
+            for i, st in enumerate(lst):
+                if not isinstance(st, _TERMINALS):
+                    continue
+                rest = [r for r in lst[i + 1:]
+                        if not (isinstance(r, ast.Expr) and isinstance(r.value, ast.Constant))]
+                if rest:
+                    out.append(f"{type(st).__name__}@L{st.lineno}→"
+                               f"{type(rest[0]).__name__}@L{rest[0].lineno}")
+    return out
+
+
+_dead = []
+for _d in ("b2bcollect_build", "riskbird_build", "ali1688_build"):
+    for _p in sorted((_ROOT / _d).glob("*.py")):
+        _dead += [f"{_d}/{_p.name}: {x}" for x in _unreachable(_p.read_text(encoding="utf-8"))]
+check("三个交付目录里没有任何「跳转之后还挂着语句」的死代码"
+      "（if 少缩进一行的 continue 会把整路采集成零，而且一路都不报错）",
+      not _dead, _dead)
+# 反向对照：判据必须真能抓红——把事故那一手的形状原样做成夹具（包在 def 里，
+# 否则 yield 出现在模块层，ast.parse 先抛 SyntaxError，红的是夹具不是判据）
+_dead_probe = """
+def it(entries):
+    for e in entries:
+        if e in seen:
+            skipped += 1
+        skipped += 1
+        continue
+        yield e
+"""
+check("上述判据有效：事故那个形状（continue 落在 if 外面）做成夹具确实报红",
+      bool(_unreachable(_dead_probe)), _unreachable(_dead_probe))
+check("上述判据不误伤正常写法：跳转在 if 里、后续语句在 if 外，一个都不报",
+      not _unreachable("def it(entries):\n    for e in entries:\n"
+                       "        if e in seen:\n            continue\n        yield e\n"),
+      _unreachable("def it(entries):\n    for e in entries:\n"
+                   "        if e in seen:\n            continue\n        yield e\n"))
 
 # ── 后台权限事件现场验一次「绝不弹模态」（2026-11-11 实测：v2→v3 迁移后第一次
 #    开机，等级从旧名单的 LEGACY 回填成 0，_acl_prompt_restart 的 question 框在

@@ -182,6 +182,9 @@ class Ali1688Crawler:
         self._profile_dir = self._profile_path()
         self._seen_members = set()   # 本轮已处理公司（memberId）去重
         self._early_skipped = 0      # 本轮列表页早过滤计数（未进详情即判无关）
+        # 本轮「增量库已含所以跳过」计数：没有这一笔账，界面上就只剩「新增公司 0 家」，
+        # 用户分不清「已经采全了」和「去重口径把活锁死了」——后者恰恰是本轮 1688 出 0 的形态
+        self._incremental_skipped = 0
         self._guard_kw = ""          # 类目过滤：当前关键词
         self._guard_pred = None      # 类目过滤：关键词级 PRECISE 预测类目集（id+名）
 
@@ -205,6 +208,16 @@ class Ali1688Crawler:
     def snapshot_results(self):
         with self.results_lock:
             return [dict(r) for r in self.results]
+
+    def results_live(self):
+        """收尾阶段**就地补字段**用的实时视图（返回 results 里的原字典，不是副本）。
+
+        口径与 b2bcollect_build/cdp_base.py 的同名方法一致：官网回采联系方式必须
+        写回真身，整体替换 results 会把并发 append 盖掉；只在采集线程已结束的
+        收尾阶段用。对拍见 test_data_dir_offline.py 第 15 节。
+        """
+        with self.results_lock:
+            return list(self.results)
 
     def _apply_province_filter(self, rec):
         """省份精准采集的入库关卡（基类默认不拦）。
@@ -234,6 +247,46 @@ class Ali1688Crawler:
     # 一律不记，下一轮会重新尝试——这样既不重复戳已处理过的家（省请求防封），
     # 又不会把「这次没采成」的公司永久漏掉（保数据最全）。
     TRANSIENT_MARKS = ("拦截", "未解除", "导航失败", "未登录", "待重试")
+    # 「这次没取到联系人」不是终审结论：站点可能临时反爬、页面可能改版。空联系人的条目
+    # 下一轮重采补一次，最多补 CONTACT_RETRY_MAX 次就永久锁住——与 cdp_base 同口径（两处
+    # 必须同规则，对拍见 test_data_dir_offline.py 第 14 节）。1688 这一路以前没有这套：
+    # 它把「所有」种子库键都当去重依据，等于「只要进过种子库就永不重采」，于是早期被反爬
+    # 空页判成「无联系方式」的公司被永久盖章，之后每次重跑同一个词都是「59 条offer，新增
+    # 公司 0 家」——用户看到的就是「以前还能采到，现在一直是 0」，而日志里一个字都没提
+    # 「为什么是 0」。
+    CONTACT_RETRY_MAX = 2
+
+    @staticmethod
+    def _has_any_contact(rec) -> bool:
+        """这条记录到底有没有联系方式：联系人/电话/手机/邮箱 四者取一。
+
+        刻意不看 ``网站``：有官网只说明「还能再试试」，不说明联系方式已经取到；而它正是
+        新加的「官网回采联系方式」要处理的对象，把它算进「已有联系方式」会让那一轮永远
+        排不到活。
+        """
+        return any(str(rec.get(k) or "").strip()
+                   for k in ("联系人", "电话", "手机", "邮箱"))
+
+    @classmethod
+    def _entry_locked(cls, entry) -> bool:
+        """种子库条目是否仍应「命中即跳过」。空联系人且重试未用尽者不锁定，
+        让下一轮重跑自动补采。旧版本写入了无 ct 字段的条目一律按已完整处理：
+        否则一次普通重跑会把历史的上千家公司的详情页重新访一遍，反而加重风控。"""
+        if not isinstance(entry, dict) or "ct" not in entry:
+            return True
+        if entry.get("ct"):
+            return True
+        return int(entry.get("rt") or 0) >= cls.CONTACT_RETRY_MAX
+
+    def _locked_keys(self):
+        return {k for k, v in self._seen_store.items() if self._entry_locked(v)}
+
+    def _seen_store_pending(self):
+        """种子库还欠着几次「补联系人」的家数（收尾账目与渠道体检都用它）。"""
+        try:
+            return sum(1 for v in self._seen_store.values() if not self._entry_locked(v))
+        except Exception:
+            return 0
 
     def _is_terminal(self, rec):
         st = rec.get("状态", "") or ""
@@ -283,7 +336,12 @@ class Ali1688Crawler:
                 self._seen_store[f"{rec.get('关键词','')}#{mid}"] = {"at": ts, "st": st}
             return
         for k in self._rec_seen_keys(rec):
-            self._seen_store[k] = {"at": ts, "st": st}
+            old = self._seen_store.get(k) or {}
+            has_contact = self._has_any_contact(rec)
+            entry = {"at": ts, "st": st, "ct": 1 if has_contact else 0}
+            if not has_contact:
+                entry["rt"] = int(old.get("rt") or 0) + 1
+            self._seen_store[k] = entry
 
     def clear_seen_store(self):
         """清空跨运行种子库（用户想对同一批词从头重采时用）。"""
@@ -313,9 +371,17 @@ class Ali1688Crawler:
                                       dev_dir=str(Path(__file__).resolve().parent))
 
     def _profile_path(self):
-        if sys.platform == "win32":
-            return Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_1688_profile"
-        return Path("/tmp/chrome_1688_profile")
+        """Chrome 配置目录（登录态真正的家）的落点：口径全交给 runtime_paths。
+
+        以前这里写在 ``%TEMP%\\chrome_1688_profile``，而 TEMP 每个用户各一份、清理程序
+        随时可删、注销即弃：2026-11-13 实机换了 Windows 账号之后，1688 一直 0 家而八个
+        不需要登录的站照常出数，界面与日志都没有一句「因为登录」。持久位置与老位置接管
+        由口径那一处决定（老目录里有 Cookies 就先复制过来，绝不删源），本函数只声明
+        「这个工具的老位置在哪」。
+        """
+        legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_1688_profile",
+                  Path("/tmp/chrome_1688_profile")]
+        return _paths.browser_profile_dir("chrome_1688_profile", legacy_dirs=legacy)
 
     def _find_chrome(self):
         candidates = {
@@ -1028,12 +1094,16 @@ class Ali1688Crawler:
             if not offers:
                 self._log(f"  「{kw}」第 {page} 页无数据，停止翻页")
                 return
-            new = skipped = 0
+            new = skipped = seen = 0
             for o in offers:
                 mid = str(o.get("memberId") or o.get("loginId") or o.get("company") or "")
                 cname = self._norm_name(o.get("company") or "")
-                if not mid or mid in self._seen_members or (cname and cname in self._seen_members) \
+                if not mid:
+                    continue     # 卡片没有任何主体标识：无法去重也无法进详情，不算「增量库跳过」
+                if mid in self._seen_members or (cname and cname in self._seen_members) \
                         or f"{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue     # 第四个条件：同一个关键词下已判过「不相关」的，翻页时不重复统计
                 subject = o.get("subject") or o.get("simpleSubject") or ""
                 if self.relevance_guard and not self._list_relevant(o.get("company") or "", subject):
@@ -1056,7 +1126,7 @@ class Ali1688Crawler:
                        "price": o.get("price"),
                        "subject": subject,
                        "guard": True}   # 站外页结果参差，与主搜同样进详情前做类目复核
-            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(offers)} 条，新增公司 {new} 家{tail}")
             # 连续多页 0 新增即枯竭（主搜渠道跑过后尤其如此），别把页数预算耗在轮回的浅池上
             if new == 0:
@@ -1069,6 +1139,21 @@ class Ali1688Crawler:
             self._sleep()
             if len(offers) < 8:   # 尾页
                 return
+
+    @staticmethod
+    def _page_tail(skipped=0, seen=0):
+        """把「本页 0 新增」的两种原因拼成一句尾巴：商品/主搜/供应商三条渠道共用同一拼法。
+
+        早过滤=判它跟关键词不相关；增量库已含=这家已经采过或重试已用尽。以前只有前一种
+        有尾巴，「增量库跳过」是完全静默的，于是界面上就只剩一句「59 条offer，新增公司 0 家」
+        ——用户无从分辨「真的采全了」和「去重口径把活锁死了」，只能整站重采（更贵、更招风控）。
+        """
+        parts = []
+        if skipped:
+            parts.append(f"早过滤 {skipped} 家(未进详情)")
+        if seen:
+            parts.append(f"增量库已含 {seen} 家(跳过)")
+        return ("，" + "，".join(parts)) if parts else ""
 
     @staticmethod
     def _norm_name(name):
@@ -1101,10 +1186,13 @@ class Ali1688Crawler:
                 continue
             empty_streak = 0
             new = 0
+            seen = 0
             for e in entries:
                 key = "shop:" + e["shop"]
                 cname = self._norm_name(e["company"])
                 if key in self._seen_members or (cname and cname in self._seen_members):
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 self._seen_members.add(key)
                 if cname:
@@ -1113,7 +1201,8 @@ class Ali1688Crawler:
                 e["keyword"] = kw
                 e["page"] = page
                 yield e
-            self._log(f"  「{kw}」供应商渠道第 {page} 页：{len(entries)} 家，新增公司 {new} 家")
+            self._log(f"  「{kw}」供应商渠道第 {page} 页：{len(entries)} 家，"
+                      f"新增公司 {new} 家{self._page_tail(0, seen)}")
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 3:
@@ -1322,11 +1411,14 @@ class Ali1688Crawler:
             empty_streak = 0
             new = 0
             page_skipped = 0
+            page_seen = 0
             for p in pairs:
                 mid = p["memberId"]
                 # 命中全局已采公司 或 本关键词下已判「类目不符」的公司 → 跳过，
                 # 连详情页都不必再进（省请求=防封）；换关键词时后者不生效，仍会重评估。
                 if mid in self._seen_members or f"{kw}#{mid}" in self._seen_members:
+                    page_seen += 1
+                    self._incremental_skipped += 1
                     continue
                 self._seen_members.add(mid)
                 # 列表页早过滤：卡片自带的公司名+标题明显与关键词/预测类目无关 → 不进详情
@@ -1342,7 +1434,7 @@ class Ali1688Crawler:
                        "memberId": mid, "loginId": "", "price": "",
                        "subject": p.get("title", ""),
                        "guard": True}   # 主搜结果参差，进联系方式前做类目相关性过滤
-            tail = f"，早过滤 {page_skipped} 家(未进详情)" if page_skipped else ""
+            tail = self._page_tail(page_skipped, page_seen)
             self._log(f"  「{kw}」主搜渠道第 {page} 页：{len(pairs)} 条offer，新增公司 {new} 家{tail}")
             if new == 0:
                 stale_streak += 1
@@ -1598,13 +1690,22 @@ class Ali1688Crawler:
         self._seen_members = set()
         self._filtered_count = 0
         self._early_skipped = 0
+        # 每轮重新起账：这个数跨轮累加会把「上一轮的跳过」算进本轮，界面读数就废了
+        self._incremental_skipped = 0
         self._guard_debug = []
         self._block_times = []
         self._current_delay = self.delay_between
         seeded = 0
         if self.incremental:
             seeded = self._load_seen_store()
-            self._seen_members |= set(self._seen_store.keys())
+            # 只把「已完整 / 重试已用尽」的条目当去重依据，缺联系人的历史条目自动解锁
+            # （口径与 cdp_base 一致：把整张种子库当去重依据，等于一次反爬空页就把一家公司
+            # 永久盖章，之后每轮都是「新增公司 0 家」——那是本轮 1688 出 0 家的真凶）
+            locked = self._locked_keys()
+            self._seen_members |= locked
+            refill = len(self._seen_store) - len(locked)
+            if refill:
+                self._log(f"🔓 增量库内有 {refill} 家条目联系人曾取空，本轮重采补联系人")
 
         if self.driver is None or not self._is_session_alive():
             if not self.start_browser():
@@ -1735,8 +1836,14 @@ class Ali1688Crawler:
                 tail += f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
         early = (f"，列表页早过滤 {self._early_skipped} 家(未进详情即省请求)"
                  if self._early_skipped else "")
+        # 「0 新增」必须有一句解释从哪来：跳过多少家、其中多少家还欠一次补联系人。
+        # 只有「种子库累计 N 家」这一句是不够的——它说的是库有多大，不是这轮为什么没活。
+        incr = (f"，增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)"
+                if self._incremental_skipped else "")
+        pend = self._seen_store_pending() if self.incremental else 0
+        pending = (f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
-        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{early}{tail}{saved}")
+        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{early}{incr}{pending}{tail}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）

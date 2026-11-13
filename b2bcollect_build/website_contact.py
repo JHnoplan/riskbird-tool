@@ -1,0 +1,910 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""官网回采联系方式：数据里有官网的，就去它自己的官网把电话/邮箱补回来。
+
+用户诉求原话：「如果数据有官网，同步去它的官网把电话和邮箱采集下来，如果数据本来
+就有电话或邮箱，可以合并去重用英文逗号隔开」。本模块就是这句话的实现，但「实现得
+正确」的部分全在下面的判据里，不在抓取动作里。
+
+【为什么这是个判据问题而不是请求问题】
+同一份官网补采在离线分析链路上（深海装备潜客/enrich_from_website.py +
+enrich_cumulative.py）被实机打回过六次，每次都留下一条永久判据，本模块把它们全部
+收在**一处实现**（同一条规则写两份迟早各判各的，这是那批脚本用注释反复强调的教训）：
+  ① 证据分级：号码/邮箱出现在页面哪里是一等判据。tel:/mailto: 链接=3 分（页面作者
+     明确标注这是联系方式），可见文本命中处 ±40 字有「电话/邮箱/Tel/Fax」等标签词=2 分，
+     可见但无标签语境=1 分，**只存在于 <script>/<style> 里=0 分直接丢弃**。不做分级
+     就会把 JS 里的日期数组/统计代码当电话回填（实测 05172743000、01041426525）。
+  ② 负向语境：专利号/备案号/信用代码/邮编里的数字串不是电话（实测从
+     「专利号：ZL201310628718.0」抽出两个假号，从「辽IPC备16461343416-2」抽出
+     一个合法形态的假手机号），命中即降为 0 分。
+  ③ 停放/被抢注/挂马劫持：域名易主后页面照样返回 200 并写着假电话邮箱（实测
+     gzyhship.com 变成电竞俱乐部、sdri.com 变成待售页）。所以「200 可达 + 页面写了
+     电话」不等于「这是这家公司的电话」，PARKED_RE 命中即整站不采信。
+     先 unescape 实体再判：灰产标题常写成 &#39;&#x8bad; 形式，正则看不见原文。
+  ④ 号码形态闸：区号族/位数/叠词/演示号/版权年，见 plausible_phone。
+  ⑤ 排版盲区：一个号码被切成两个 <span>（区号后、本地号 4-4 分段处这两类真实分界）、
+     区号后隔一个空格、4-3-3 写法的 400、带分机的总机只留主号——抽取器要同时扫 raw
+     （属性里的 tel: 靠它）与剥标签后的纯文本，判据一点没放宽，只是看得全了。
+  ⑥ 邮箱垃圾闸：example.com/test@/图片名/sentry/wixpress/纯数字 IP 域，以及
+     「技术支持：某某网络」这类建站商署名邮箱。
+
+【出口治理】补来的值只写进同名字段并按英文逗号去重合并（用户要的正是合并），
+绝不覆盖成单一值；每次写入都在「官网回采」列留下可复核的账（几家/新增几个/为什么没出），
+失败原因分类计数进日志——「回采了 0 家」必须能一句话说清为什么，和采集账目同一条纪律。
+
+【安全边界】只走 http(s)；拒私网/回环/链路本地/元数据地址（.local、127.*、10.*、
+169.254.169.254 等），重定向落地后复核一次——采集数据里的 URL 是**外部可控输入**，
+直接交给 requests 等于让被采集方探测本机内网。单次请求有界超时、响应体封顶、不重试；
+整体有预算上限与并发上限，到点就停并把剩余量说清楚。任何异常都不许冒泡影响采集主流程。
+"""
+
+from __future__ import annotations
+
+import html as html_mod
+import ipaddress
+import re
+import socket
+import threading
+import time
+from urllib.parse import urljoin, urlparse
+
+__all__ = [
+    "norm_site", "is_platform_host", "is_public_host", "extract", "score_contacts",
+    "plausible_phone", "plausible_email", "merge_values", "enrich_site",
+    "enrich_records", "pick_site", "reset_caches", "WEBSITE_KEYS", "SITE_MARK",
+    "RETRY_MARK", "MAX_ATTEMPTS", "needs_retry", "attempts_of", "is_transient_why",
+]
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+HEADERS = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
+TIMEOUT = 12                 # 单页硬超时：企业站慢，但慢到 12s 以上不如算失败
+MAX_BYTES = 1_200_000        # 响应体封顶：页面再大也用不到后面的内容，别让带宽拖死预算
+SITE_MARK = "官网回采"       # 写进记录「官网回采」列的来源标记（可复核，不静默回填）
+
+# 记录里可能存官网的键（各平台命名不统一，按优先级取第一个像官网的）
+WEBSITE_KEYS = ("公司网址", "官网", "企业网站", "网站", "店铺URL", "详情URL")
+
+# ── 平台域黑名单 ────────────────────────────────────────────────
+# 「官网」字段经常是平台租户页（马可波罗的 xxx.jdzj.com、企知道的 qizhidao.com），
+# 那上面的电话是平台客服号，不是厂家号。这类域一律不回采。
+# 边界口径：只有 host 等于该域或以 ".域名" 结尾才算命中——用裸子串会把
+# www.loco-china.cn（企业自有域名）这类一起误杀，这在离线链路上是实测踩过的坑。
+PLATFORM_HOSTS = (
+    "1688.com", "alibaba.com", "aliexpress.com", "made-in-china.com", "micc168.com",
+    "qizhidao.com", "aiqicha.baidu.com", "qichacha.com", "tianyancha.com",
+    "b2b168.com", "expobbs.com", "51sole.com", "coovee.com", "jdzj.com",
+    "famens.com", "jinpaihuaxia.com", "dyjiazhi.com", "hi1718.com",
+    "huangye88.com", "maigoo.com", "gongkong.com", "zbytb.com", "gkzhan.com",
+    "b2b.hc360.com", "hc360.com", "yellowurl.cn", "11467.com", "qy.hc360.com",
+    "sooxue.com", "eshop.com", "ecvv.com", "ec82.com", "tradekey.com",
+    "globalsources.com", "dmread.com", "sunbuhuo.com", "nzyugong.com",
+    "ydp.cncn.com", "cncn.com", "86gs.com.cn", "cnpp.cn", "zhaoshang114.com",
+    "300.cn", "qianji.cn", "jinshu.cn", "smokexj.com", "linkforms.com",
+)
+
+# ── 号码/邮箱抽取（口径与离线链路一致，实测写法盲区都在这儿）────────
+MOBILE_RE = re.compile(r'(?<!\d)(1[3-9]\d)[-\s]?(\d{4})[-\s]?(\d{4})(?!\d)')
+# 分隔符允许 0~3 个字符：「010- 64229311」这种连字符后还空一格的排法必须能命中；
+# 尾部 (?:[-转]\d{1,5})? 收分机，交校验时主号与整串都试，只留得下合法的那条。
+LANDLINE_RE = re.compile(r'(?<!\d)(?:0\d{2,3}[-\s()—－–]{0,3}\d{7,8})(?:[-转]\d{1,5})?(?!\d)')
+HOTLINE_RE = re.compile(r'\b([48]00)[-\s]?(\d{3})[-\s]?(\d{4})\b')
+# 总机排成两段（0571 8812 3456 / 86-21-3612 9977）与 400 的 4-3-3 分段
+LANDLINE_SP_RE = re.compile(r'(?<!\d)(?:\+?86[-\s]*)?(?:0?(\d{2,3}))[-\s](\d{3,4})\s(\d{3,4})(?!\d)')
+HOTLINE_ALT_RE = re.compile(r'\b(400\d)[-\s]?(\d{3})[-\s]?(\d{3})(?!\d)')
+EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+HREF_RE = re.compile(r'(?:tel|mailto):([^"\'>\s]+)', re.I)
+# 站内噪声黑名单（JS 数组/编号被误抽，人工复核定性后永久拉黑，防反复回填）
+BLACKLIST_PHONES = {'069642069733', '09681746404', '06567954062', '02271999999'}
+BAD_EMAIL_RE = re.compile(
+    r'example\.com|test@|\.png$|\.jpg$|\.gif$|\.webp$|\.css$|\.js$|sentry|wixpress|@2x'
+    r'|(?:^|@)(?:\d{1,3}\.){3}\d{1,3}|@\d+(?:\.\d+)+\.|dayuyun|alibaba\.com', re.I)
+# 建站商署名：「技术支持：某某网络 400-xxx」不是厂家热线
+WEB_AGENCY_RE = re.compile(r"(技术支持|网站建设|建站|designed\s*by|维护支持|推广支持|制作由|服务由)", re.I)
+CONTACT_HREF_RE = re.compile(r'contact|lianxi|about|guanyu|footer|reach', re.I)
+CONTACT_TEXT_RE = re.compile(r'联系我们|联系方式|关于我们|联系人|服务热线|客服中心')
+# 猜路径与每站请求封顶：判不出主体/整页没号码的站，猜得越多越像「乱爬」，
+# 而真实收益集中在前一两个命名上（contact / contactus 占绝大多数）。
+GUESS_MAX = 4
+MAX_PAGES_PER_SITE = 6
+GUESS_PATHS = ("contact.html", "contact_us.html", "contactus.html", "contact/",
+               "contact-us.html", "lianxi.html", "lianxiwomen.html", "lxwm",
+               "about.html", "gywm", "guanyu.html", "gsxq.html")
+
+CONTACT_CTX_RE = re.compile(
+    r'电话|联系方式|服务热线|手机|传真|邮箱|信箱|地址|客服|Tel|MOB|PHONE|FAX|E-?MAIL|Call|Contact', re.I)
+NEG_CTX_RE = re.compile(
+    r'专利|注册号|登记号|备案|著作权|信用代码|订单|编号|版本|版权|邮编|Postal|Copyright|Version|ICP'
+    r'|I[CP]C\s*备|备(?!用)\s*[:：]?\s*\d{6,}|公网安备', re.I)
+# 被抢注/停放/挂马劫持/灰产站特征：命中即判官网已失效，页面里的号码一律不采信
+PARKED_RE = re.compile(
+    r'此域名{0,6}(正在出售|出售|已暂停)|域名{0,4}(正在)?出售|正在出售|this domain (is )?(for sale|parked)'
+    r'|domain for sale|coming soon|页面已暂停|站点已暂停|默认站点|apache2 ubuntu default page'
+    r'|nginx 欢迎|万网已停|未备案'
+    r'|the domain name|域名展示|域名交易|购买此域名|buy this domain|make an offer|域名已注册'
+    r'|sedo\.com|afternic|dan\.com|godaddy\.com/park|parkingcrew|domainapps|hp\.cafe24'
+    r'|该网站正在建设|site is under construction|placeholder page'
+    r'|体育直播|足球直播|德甲|英超|nba.{0,4}直播|篮球直播|直播吧|开奖|博彩'
+    r'|电子竞技|电竞(俱乐部|比赛|平台|官网)|投注|彩票|六合彩|棋牌|真人视讯'
+    r'|开云(?=体育|官网|平台|登录|注册|入口|app|APP)|华体会|威尼斯人|新葡京|raybet|ob体育|爱游戏'
+    r'|p[go]电子|首充|注册送', re.I)
+
+_LOCK = threading.Lock()
+# 同一域名在一张表里常出现多次（同一公司多条产品记录）：进程内缓存结果，
+# 既省请求也保证「同一个站」在多行上给出完全一致的值。
+_HOST_CACHE = {}
+# DNS 解析结论按域缓存：SSRF 闸每条记录查一次 DNS 会把整轮回采拖成 DNS 瓶颈
+_DNS_CACHE = {}
+
+
+def reset_caches():
+    """离线用例/新任务开始前清进程内缓存（缓存跨任务留着，会让改过的官网字段
+    在下一轮看起来「没生效」——那种「明明改了却看不出变化」最难查）。"""
+    with _LOCK:
+        _HOST_CACHE.clear()
+        _DNS_CACHE.clear()
+
+
+# ── URL 规整与安全闸 ───────────────────────────────────────────
+def norm_site(raw):
+    """把记录里的官网值规整成可请求的 http(s) 地址；不是官网形态就返回空。"""
+    s = str(raw or "").strip().strip('"\'“”’')
+    if not s or s in ("-", "无", "暂无"):
+        return ""
+    if "@" in s.split("/")[0]:          # user:pass@host 这种带凭据的绝不发请求
+        return ""
+    if not re.match(r'^https?://', s, re.I):
+        if not re.match(r'^[\w.-]+\.[a-z]{2,}(/|$)', s, re.I):
+            return ""                   # 不是「域名/地址」形态（中文备注、公司名等）
+        s = "https://" + s
+    p = urlparse(s)
+    if not (p.hostname or ""):
+        return ""
+    try:
+        port = p.port
+    except ValueError:
+        return ""
+    if port not in (None, 80, 443):
+        return ""                       # 非 web 端口不是官网，是扫描目标
+    return s if p.scheme.lower() in ("http", "https") else ""
+
+
+def host_of(url):
+    try:
+        return (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _reg_domain(host):
+    """粗粒度注册域：取最后两段（三段结尾是 com.cn/gov.cn 等的取三段）。"""
+    parts = host.split(".")
+    if len(parts) >= 3 and parts[-2] in (
+            "com", "net", "org", "gov", "edu", "ac", "co"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def is_platform_host(host):
+    """官网字段其实指向 B2B 平台/企查站自己的页面 → 那不是企业官网，不回采。"""
+    h = (host or "").lower()
+    if not h:
+        return True
+    return any(h == d or h.endswith("." + d) for d in PLATFORM_HOSTS)
+
+
+def is_public_host(host):
+    """SSRF 边界：外部可控的 URL 不能把请求带进内网/元数据地址。
+
+    只在**能肯定**是私网/回环/链路本地/保留段时才拒；解析失败（NXDOMAIN、无网络）
+    不等于危险——那样判会把「今天没网」说成「地址不安全」，也会让整轮回采空转。
+    真正的不可达由 fetch 自己报。解析结果按域缓存，避免每条记录都发一次 DNS 查询。
+    """
+    h = (host or "").lower().rstrip(".")
+    if not h or h in ("localhost",) or h.endswith((".local", ".internal", ".lan", ".localdomain")):
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        pass
+    else:
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast)
+    with _LOCK:
+        cached = _DNS_CACHE.get(h)
+    if cached is not None:
+        return cached
+    verdict = True
+    try:
+        infos = socket.getaddrinfo(h, None, socket.AF_INET)
+        verdict = not any(
+            ipaddress.ip_address(x[4][0]).is_private
+            or ipaddress.ip_address(x[4][0]).is_loopback
+            or ipaddress.ip_address(x[4][0]).is_link_local
+            for x in infos)
+    except (OSError, UnicodeError, ValueError):
+        verdict = True                 # 判不出：不拦，让请求自己去失败
+    with _LOCK:
+        if len(_DNS_CACHE) > 8000:
+            _DNS_CACHE.clear()
+        _DNS_CACHE[h] = verdict
+    return verdict
+
+
+# ── 形态校验 ───────────────────────────────────────────────────
+def plausible_landline(p):
+    """固话形态校验：区号族 + 位数双重规则，剔掉页面日期/编号被误抽的假号。"""
+    d = re.sub(r'\D', '', str(p or ""))
+    if d.startswith('0086'):
+        d = '0' + d[4:]
+    if not d.startswith('0') or len(d) not in (10, 11, 12):
+        return False
+    if d[1] == '0' or '0000' in d:
+        return False                      # 00xx 不是区号
+    if d[1] == '9' and d[2] not in '134579':
+        return False                      # 09xx 只放行西北五省在用的段
+    if d[1:3] == '10' or d[1] == '2':
+        ac = 3
+    elif d[1] == '3' and d[2] not in '13579':
+        return False                      # 03XX 次位只存 1/3/5/7/9
+    elif d[1] in '3456789':
+        if d[2] == '0':
+            return False
+        ac = 4
+    else:
+        return False
+    local = d[ac:]
+    if len(local) == 8 and local[:4] == local[4:]:
+        return False                      # 32563256 类页面数字叠词
+    if not (7 <= len(d) - ac <= 8):
+        return False
+    if len(d) == 10 and not re.search(r'[-(（]', p):
+        return False                      # 区号+7 位已基本退役，无分隔一律拒
+    return True
+
+
+def plausible_phone(p):
+    digits = re.sub(r'\D', '', str(p or ""))
+    if len(set(digits)) < 4:
+        return False                      # 111.../0000... 演示号
+    if digits in ('12345678901', '13800138000', '10086', '10010', '4000000000'):
+        return False
+    if re.match(r'^(1[3-9])\1{3}', digits):
+        return False                      # 13813813813 类连排
+    if digits.startswith(('0123', '0202', '075500')):
+        return False
+    if digits in (str(time.localtime().tm_year), str(time.localtime().tm_year - 1)):
+        return False                      # 版权年
+    if digits[0] == '1' and len(digits) == 11:
+        return bool(re.match(r'1[3-9]\d{9}$', digits))
+    if digits[0] == '4' or (digits[0] == '8' and len(digits) == 10):
+        return True                       # 400/800
+    if digits[0] == '0':
+        return plausible_landline(p)
+    return len(digits) >= 7               # 境外号保留（本工具不做国内形态强校验）
+
+
+def plausible_email(e):
+    e = str(e or "")
+    if BAD_EMAIL_RE.search(e):
+        return False
+    local, _, dom = e.partition('@')
+    if len(dom) < 4 or '.' not in dom:
+        return False
+    if re.match(r'^(image|img|icon|logo|static|noreply|no-?reply)', local, re.I):
+        return False
+    return True
+
+
+def strip_tags(html_text):
+    """「人眼可见文本」的唯一实现：先解实体再剥标签与脚本样式。"""
+    t = re.sub(r'(?is)<(script|style|noscript)\b.*?</\1>', ' ',
+               html_mod.unescape(html_text or ''))
+    return re.sub(r'\s+', ' ', re.sub(r'(?s)<[^>]+>', ' ', t))
+
+
+# ── 抽取 ──────────────────────────────────────────────────────
+def _extract_one(text):
+    phones, emails = [], []
+    for m in HOTLINE_RE.finditer(text):
+        p = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        if plausible_phone(p) and re.sub(r'\D', '', p) not in BLACKLIST_PHONES:
+            phones.append(p)
+    for m in MOBILE_RE.finditer(text):
+        p = m.group(1) + m.group(2) + m.group(3)
+        if plausible_phone(p) and p not in BLACKLIST_PHONES:
+            phones.append(p)
+    for m in LANDLINE_RE.finditer(text):
+        p = m.group(0)
+        tail = re.search(r'(?:[-转])\d{1,5}$', p)
+        base = p[:tail.start()] if tail else p
+        cand = base if tail and plausible_phone(base) else p
+        if plausible_phone(cand) and re.sub(r'\D', '', cand) not in BLACKLIST_PHONES:
+            phones.append(cand)
+    for m in LANDLINE_SP_RE.finditer(text):
+        p = f"0{m.group(1)}-{m.group(2)}{m.group(3)}"
+        if plausible_phone(p) and re.sub(r'\D', '', p) not in BLACKLIST_PHONES:
+            phones.append(p)
+    for m in HOTLINE_ALT_RE.finditer(text):
+        p = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        if plausible_phone(p) and re.sub(r'\D', '', p) not in BLACKLIST_PHONES:
+            phones.append(p)
+    for m in EMAIL_RE.finditer(text):
+        e = m.group(0).lower().rstrip('.')
+        if plausible_email(e):
+            emails.append(e)
+    seen, out = set(), []
+    for x in phones:                       # 同一号码的两种排版只留第一次出现
+        k = re.sub(r'\D', '', x)
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    phones = out
+    emails = list(dict.fromkeys(emails))
+    return phones, emails
+
+
+def extract(text):
+    """同时扫 raw（tel:/mailto: 只在属性里）与剥标签纯文本（被标签切断的号码）。"""
+    phones, emails = [], []
+    plain = strip_tags(text)
+    for t in (text, plain):
+        if not t:
+            continue
+        p, e = _extract_one(t)
+        phones += p
+        emails += e
+    seen, out = set(), []
+    for x in phones:
+        k = re.sub(r'\D', '', x)
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out, list(dict.fromkeys(emails))
+
+
+# ── 证据打分 ──────────────────────────────────────────────────
+def score_contacts(html, phones, emails):
+    """返回 ([(值, 分数)], [(值, 分数)])，0 分（看不见/只在脚本里）不返回。"""
+    html = html or ''
+    href_raw = " ".join(HREF_RE.findall(html))
+    href_digits = re.sub(r'\D', '', href_raw)
+    href_mails = {m.lower().strip('/') for m in HREF_RE.findall(html)}
+    vis = strip_tags(html)
+
+    def context_ok(pos, width):
+        return bool(CONTACT_CTX_RE.search(vis[max(0, pos - 40):pos + width + 40]))
+
+    def pat_of(digits):
+        return re.compile(r'(?<!\d)' + r'\D{0,2}'.join(map(re.escape, digits)) + r'(?!\d)')
+
+    def grade(value, pattern, is_phone):
+        if is_phone:
+            d = re.sub(r'\D', '', value)
+            if len(d) >= 7 and d in href_digits:
+                return 3
+        elif value.lower() in href_mails:
+            return 3
+        hits = [m.start() for m in pattern.finditer(vis)] if pattern else []
+        if not hits:
+            return 0
+        # 建站商/第三方署名：命中处前 24 字里出现「技术支持/网站建设/designed by」
+        # 就不是这家企业自己的联系方式（实测「技术支持：某某网络 400-888-1234」——
+        # 有标签语境能给到 2 分，不认署名这一条就会把建站公司的热线当厂家热线交付）
+        if any(WEB_AGENCY_RE.search(vis[max(0, h - 24):h + len(value) + 8]) for h in hits):
+            return 0
+        if any(context_ok(h, len(value)) for h in hits):
+            return 2
+        if any(NEG_CTX_RE.search(vis[max(0, h - 20):h + len(value) + 12]) for h in hits):
+            return 0
+        return 1
+
+    out_p = []
+    for p in phones:
+        d = re.sub(r'\D', '', p)
+        sc = grade(p, pat_of(d), True) if d else 0
+        if not sc and d.startswith('0'):
+            # 抽取器会把「86-21-3612 9977」补成 021-…，页面原文没有那个长途字冠，
+            # 按补全后的串找证据必然找不到，去掉前导 0 再找一次（判据没放宽，只是别找错串）
+            alt = pat_of(d[1:])
+            if d[1:] and alt and any(alt.finditer(vis)):
+                sc = 1
+        if sc:
+            out_p.append((p, sc))
+    out_e = [(e, grade(e, re.compile(re.escape(e), re.I), False)) for e in emails]
+    out_e = [(e, s) for e, s in out_e if s]
+    return out_p, out_e
+
+
+# ── 归属弱证据（判定「这页还是不是这家公司」）────────────────────
+def brand_grams(name):
+    """公司名里可当品牌段的二字组：去掉区划与组织形式，剩下的成对取字。"""
+    s = re.sub(r'\s+', '', str(name or ''))
+    s = re.sub(r'[\(\)（）\[\]【】]', '', s)
+    s = re.sub(r'(有限公司|股份有限公司|有限责任公司|集团|厂|中心|公司|企业|'
+               r'(北京|上海|天津|重庆|广东|广州|深圳|东莞|佛山|江苏|苏州|浙江|杭州|'
+               r'山东|青岛|河北|河南|湖北|武汉|湖南|四川|成都|陕西|福建|厦门|安徽|'
+               r'江西|辽宁|大连|吉林|黑龙江|内蒙古|广西|海南|贵州|云南|西藏|甘肃|'
+               r'青海|宁夏|新疆|中国|全国)省?市?县?区?)', '', s)
+    s = re.sub(r'[^0-9A-Za-z\u4e00-\u9fa5]', '', s)
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+
+def has_attr(name, vis, host):
+    """归属证据：正文含公司名前 2 字 / 域名品牌段见于正文 / 两者都无。"""
+    grams = brand_grams(name)
+    if not grams:
+        return True                       # 名字规整后没剩可判的段，不强卡（fail-open）
+    if any(g in vis for g in grams):
+        return True
+    brand = _reg_domain(host).split('.')[0]
+    return bool(brand) and brand.lower() in vis.lower()
+
+
+# ── 抓取 ──────────────────────────────────────────────────────
+def fetch_html(url, timeout=TIMEOUT):
+    """有界抓取：返回 (html, final_url, 失败原因)。
+
+    TLS 校验**一律不关**。企业站证书链不全确实常见，但「关闭主机名/证书校验」等于
+    把补回来的号码交给中间人说了算——本工具是把值直接写进交付表格、后面没有人工复核
+    环节，所以宁可少几家也要守住这条：证书失败就如实计入「证书校验失败」这个原因，
+    让操作者看得见数量，而不是悄悄采信一条可能被篡改的号码。
+    """
+    import requests
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout,
+                         allow_redirects=True)
+        try:
+            final = r.url or url
+            code = int(r.status_code)
+            body = r.content or b""
+            enc, guess = r.encoding, r.apparent_encoding
+        finally:
+            # 响应一定要收口：线程池里每路都攥着一个连接，几十家之后就是
+            # 「Too many open files」这种和代码逻辑毫无关系的红。
+            try:
+                r.close()
+            except Exception:
+                pass
+    except requests.exceptions.SSLError:
+        return None, "", "证书校验失败"
+    except requests.RequestException as e:
+        return None, "", f"不可达({type(e).__name__})"
+    except Exception as e:                    # 解析响应本身的怪异常也不能冒泡
+        return None, "", f"抓取异常({type(e).__name__})"
+    if not is_public_host(host_of(final)):        # 重定向也可能把请求带进内网
+        return None, final, "重定向到非公网地址"
+    if code != 200:
+        return None, final, f"HTTP{code}"
+    raw = body[:MAX_BYTES]
+    if len(raw) < 120:
+        return None, final, "页面过小"
+    if enc in (None, '', 'ISO-8859-1'):
+        enc = guess or 'utf-8'
+    try:
+        text = raw.decode(enc or 'utf-8', errors='replace')
+    except (LookupError, TypeError):
+        text = raw.decode('utf-8', errors='replace')
+    return text, final, ""
+
+
+def find_contact_links(html, base_url, limit=2):
+    """首页里的联系/关于页（最多 limit 个）：正则取 a 标签，不引第三方解析器。"""
+    out = []
+    for m in re.finditer(r'(?is)<a\b([^>]*)>(.*?)(?:</a>|$)', html or ''):
+        attrs, text = m.group(1), strip_tags(m.group(2))
+        hm = re.search(r'href\s*=\s*["\']?([^"\'>\s]+)', attrs, re.I)
+        if not hm:
+            continue
+        href = hm.group(1)
+        if href.startswith(('javascript:', '#', 'mailto:', 'tel:')):
+            continue
+        blob = f"{href} {text}"
+        if CONTACT_HREF_RE.search(blob) or CONTACT_TEXT_RE.search(text):
+            u = urljoin(base_url, href)
+            if u.rstrip('/') == base_url.rstrip('/') or u in [x[0] for x in out]:
+                continue
+            out.append((u, text[:12] or '联系页'))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _grade_pages(pages, name):
+    """多页取同一值的最高分；返回按分数降序的 (电话, 邮箱)。"""
+    best_p, best_e = {}, {}
+    order_p, order_e = [], []
+    parked = False
+    attr_any = False
+    for html, url, label in pages:
+        vis = strip_tags(html)
+        if PARKED_RE.search(vis[:8000]):
+            parked = True
+            break                       # 判定已经成立，后面的页不必再看
+        if not attr_any and has_attr(name, vis, host_of(url)):
+            attr_any = True
+        ph, em = extract(html)
+        gp, ge = score_contacts(html, ph, em)
+        for v, s in gp:
+            k = re.sub(r'\D', '', v)
+            if k not in best_p or s > best_p[k][1]:
+                if k not in best_p:
+                    order_p.append(k)
+                best_p[k] = (v, s)
+        for v, s in ge:
+            k = v.lower()
+            if k not in best_e or s > best_e[k][1]:
+                if k not in best_e:
+                    order_e.append(k)
+                best_e[k] = (v, s)
+    if parked:
+        # dead=这个站不用再请求了：停放/被抢注/挂马页照样返回 200、照样写号码，
+        # 但它已经不是这家公司的官网，整页内容一律不采信（实测 gzyhship.com 变成
+        # 电竞俱乐部后页面上明写 186-7035-1662 与 QQ 邮箱）。
+        return [], [], "官网疑似停放/被劫持（整站不采信）", True
+    ranked_p = sorted((best_p[k] for k in order_p), key=lambda x: -x[1])
+    ranked_e = sorted((best_e[k] for k in order_e), key=lambda x: -x[1])
+    # 归属证据一条都没有 → 整站不采信（fail-closed）。这不是保守，是「谁的值写给谁」
+    # 这条底线：页面里既找不到公司名的品牌段、也找不到域名品牌段，就说明这页
+    # 不是这家公司的官网（填错、易主、同名异业、集团挂子公司都在这类），
+    # 此时 tel:/mailto: 再"硬证据"也只是「这个站的联系方式」，不是「这家的」。
+    if not attr_any:
+        return [], [], "页面认不出主体（官网可能已易主或填错）", False
+    return ranked_p, ranked_e, "", False
+
+
+def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
+    """单个官网：首页 + 最多 2 个联系页（首页没出东西再兜底猜 contact 路径）。
+
+    返回 {"phones": [(值,分)], "emails": [(值,分)], "why": 人话原因, "pages": 页数}
+
+    缓存的粒度是**抓到的页面**，不是打分结果：一张表里同一家公司常有几十条产品记录
+    （同一官网），网络只花一次；但归属判定跟「这一行的公司名」有关，必须每行重算——
+    按域名缓存打分结果会把 A 公司的电话盖到同站的 B 公司头上（同域名挂多主体的站
+    真实存在：集团官网、行业频道页），那种错最贵。
+    """
+    t0 = time.time()
+    url = norm_site(site)
+    if not url:
+        return {"phones": [], "emails": [], "why": "官网字段不是网址", "pages": 0}
+    host = host_of(url)
+    if is_platform_host(host):
+        return {"phones": [], "emails": [], "why": "字段指向平台页（非企业官网）", "pages": 0}
+    if not is_public_host(host):
+        return {"phones": [], "emails": [], "why": "非公网地址（已拦截）", "pages": 0}
+    get = opener or (lambda u: fetch_html(u, timeout=timeout))
+    with _LOCK:
+        cached = _HOST_CACHE.get(url)
+    if cached is not None:
+        pages, dead_why = cached
+        if dead_why:
+            return {"phones": [], "emails": [], "why": dead_why, "pages": 0, "cached": True}
+        ph, em, note, dead = _grade_pages(pages, name)
+        why = note or ("" if (ph or em) else "页面未见可用号码/邮箱")
+        return {"phones": ph, "emails": em, "why": why, "pages": len(pages), "cached": True}
+
+    pages = []
+    html, final, err = get(url)
+    if html is None:
+        _cache_pages(url, [], err or "首页不可达")
+        return {"phones": [], "emails": [], "why": err or "首页不可达", "pages": 0}
+    pages.append((html, final, "首页"))
+    ph, em, note, dead = _grade_pages(pages, name)
+    base_reg = _reg_domain(host_of(final))     # 落地域（可能被重定向过）
+
+    def same_site(u):
+        """后续页面只认**同一个站**：联系页链接完全可能指向第三方（平台、地图、
+        社交媒体、甚至内网地址），照着 href 一路抓下去等于把「回采这一家」变成
+        「顺着这一家随便爬」，既越界又失控。"""
+        h = host_of(u)
+        return bool(h) and _reg_domain(h) == base_reg and not is_platform_host(h) \
+            and is_public_host(h)
+
+    # 没出值且站点没有被判死，才值得再花请求：先看页面上的联系/关于页，
+    # 仍空再按企业站 CMS 的命名习惯猜几个 contact 路径（很多站首页确实不写号码）。
+    if not (ph or em) and not dead:
+        for u, label in find_contact_links(html, final):
+            if time.time() - t0 > budget or not same_site(u) or len(pages) >= MAX_PAGES_PER_SITE:
+                continue
+            h2, f2, _e2 = get(u)
+            if h2:
+                pages.append((h2, f2, label))
+            ph, em, note, dead = _grade_pages(pages, name)
+            if (ph or em) or dead:
+                break
+        if not (ph or em) and not dead:
+            parsed = urlparse(final)
+            root = f"{parsed.scheme}://{parsed.netloc}/"
+            for gp in GUESS_PATHS[:GUESS_MAX]:
+                if time.time() - t0 > budget or len(pages) >= MAX_PAGES_PER_SITE:
+                    break
+                gurl = root + gp
+                if not same_site(gurl):
+                    break
+                h3, f3, _e3 = get(gurl)
+                if h3:
+                    pages.append((h3, f3, gp))
+                ph, em, note, dead = _grade_pages(pages, name)
+                if (ph or em) or dead:
+                    break
+    why = note or ("" if (ph or em) else "页面未见可用号码/邮箱")
+    _cache_pages(url, pages, "")
+    return {"phones": ph, "emails": em, "why": why, "pages": len(pages)}
+
+
+def _cache_pages(url, pages, dead_why):
+    """页面缓存写入（封顶清一次：一次任务几千个 URL，每个存几页 HTML 会吃掉几百 MB）。"""
+    with _LOCK:
+        if len(_HOST_CACHE) > 800:
+            _HOST_CACHE.clear()
+        _HOST_CACHE[url] = (pages, dead_why)
+
+
+# ── 合并（用户要的「英文逗号去重」）──────────────────────────────
+# 分隔符集合只许这一处定义：合并出口、算「本来就有的值」、算净新增，
+# 三处都要按同一套分隔符切分。写三份的结局是迟早各判各的——比如在某一处
+# 补了全角「／」而另一处没补，同一行的「净新增」就会跟真正写进表格的值对不上。
+_SPLIT_RE = re.compile(r"[,;/／、，；]+")
+
+
+def _value_key(v):
+    """去重键：号码只看数字串（021-3612 9977 与 021-36129977 同号），邮箱看小写全文。"""
+    s = str(v or "").strip()
+    if "@" in s:
+        return s.lower()
+    d = re.sub(r'\D', '', s)
+    return d if len(d) >= 5 else s.lower()
+
+
+def normalize_display(v):
+    """把页面里的排版写法收成可直接外呼的标准写法：「010- 64229311」→「010-64229311」、
+    「+86 21 36129977」→「021-36129977」。只对**能确定是同一种号的不同排版**的形态动手，
+    其余保留原样——宁可写得不好看，也不要把一个号改写成另一个号。"""
+    s = re.sub(r'[\s\u3000]+', ' ', str(v or "")).strip()
+    if not s:
+        return ""
+    if "@" in s:
+        return s.lower()
+    s = re.sub(r'\s*-\s*', '-', s)
+    # 反向引用一律写 \g<N>：写 \1 时前面若紧贴数字，会被解析成八进制转义；
+    # 分组编号也要数对（这里两个捕获组就是 1 与 2）。
+    s = re.sub(r'^\+?86[\-\s]?0?(1[3-9]\d{9})$', r'\g<1>', s)
+    if not s.startswith("400"):
+        s = re.sub(r'^\+?86[\-\s]?(0?\d{2,3})[\-\s]?(\d{7,8})$', r'0\g<1>-\g<2>', s)
+    return s.strip()
+
+
+def merge_values(existing, incoming):
+    """按「值本身」去重后用英文逗号拼接：021-36129977 与 021-3612 9977 算同一个号。
+
+    分隔符只认 `，、;；/／` 这几种**值之间**的写法，刻意不含空格：号码自己就常带
+    空格（0755-8612 3456），按空格拆会把一个号劈成两半，去重与回填就全错了。
+    """
+    out, keys = [], set()
+    for part in _SPLIT_RE.split(str(existing or "")):
+        part = part.strip().strip("()（）")
+        if not part:
+            continue
+        k = _value_key(part)
+        if not k or k in keys:
+            continue
+        keys.add(k)
+        out.append(part)
+    for v in (incoming or []):
+        v = normalize_display(v)
+        if not v:
+            continue
+        k = _value_key(v)
+        if not k or k in keys:
+            continue
+        keys.add(k)
+        out.append(v)
+    return ",".join(out)
+
+
+def split_mobile(phone):
+    """手机号判定：只有 11 位 1[3-9] 才算手机，其余归「电话」列。"""
+    d = re.sub(r'\D', '', str(phone or ""))
+    return bool(re.match(r'^1[3-9]\d{9}$', d))
+
+
+# ── 留痕列的两种结局：终态 vs 待重试 ──────────────────────────
+# 「官网回采」列不是给人看的备注，它是**下一轮的排队依据**，所以必须能区分两类失败：
+#   终态  （停放站、主体不符、字段不是网址、非公网）——再请求一百次也是那个答案，
+#          永久跳过，把预算留给还没试过的站；
+#   待重试（不可达、超时、TLS 抽风、5xx、内部异常）——企业站停机/换证书是常态，
+#          下次任务该再给一次机会，但**次数要封顶**：一个真死掉的站不该每轮都
+#          白占一份预算，试到第 MAX_ATTEMPTS 次就转终态（想重启它，清空这一列即可）。
+RETRY_MARK = SITE_MARK + "待重试"
+MAX_ATTEMPTS = 3
+TRANSIENT_WHY_RE = re.compile(
+    r'^(?:不可达|抓取异常|证书校验失败|首页不可达|内部异常|HTTP(?:408|429|5\d\d)$|超时)')
+
+
+def is_transient_why(why):
+    """这个失败原因是「环境暂时不给力」还是「这站就这样了」。"""
+    return bool(TRANSIENT_WHY_RE.search(str(why or "").strip()))
+
+
+def attempts_of(mark):
+    """从留痕里读出已经试过几次（`官网回采待重试(2次)：…` → 2）；没标次数按 1 次算。"""
+    m = re.search(r'\((\d+)\s*次\)', str(mark or ""))
+    return int(m.group(1)) if m else (1 if str(mark or "").startswith(RETRY_MARK) else 0)
+
+
+def needs_retry(mark):
+    """留痕为空（没试过）或仍是待重试且未到次数上限 → 这一行还值得花预算。"""
+    s = str(mark or "").strip()
+    if not s:
+        return True
+    return s.startswith(RETRY_MARK) and attempts_of(s) < MAX_ATTEMPTS
+
+
+# ── 批量回采（会话层调用的唯一入口）────────────────────────────
+def pick_site(rec):
+    """按优先级取第一个「像企业官网」的字段值。"""
+    for k in WEBSITE_KEYS:
+        v = norm_site(rec.get(k))
+        if v and not is_platform_host(host_of(v)):
+            return v
+    return ""
+
+
+def _has_any(rec, keys=("电话", "手机", "邮箱")):
+    return any(str(rec.get(k) or "").strip() for k in keys)
+
+
+def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT,
+                   stop=None, limit=1500, only_missing=False):
+    """就地补写 records 的电话/手机/邮箱（英文逗号去重合并），并写「官网回采」账。
+
+    排队口径：**缺联系方式的先做**（收益最高），其次才是本来就有号码的做补充——
+    预算到点时优先保证「缺的」被照顾到，而不是按表格顺序做到哪儿算哪儿。
+    同一域名在进程内只请求一次（一张表里同一公司常有几十条产品记录）。
+    预算用完/用户点停止后置 halt，**未落笔的结果一律不写**：绝不能出现
+    「导出已经在跑了、还有野线程往记录里塞值」这种查无可查的数据污染。
+    返回统计字典；任何单条失败都不影响其它记录，函数本身不抛异常。
+    """
+    log = log or (lambda m: None)
+    recs = [r for r in (records or []) if isinstance(r, dict)]
+    cand = [r for r in recs if pick_site(r)]
+    if only_missing:
+        cand = [r for r in cand if not _has_any(r)]
+    # 留痕已判定为终态的记录不再花第二次预算；待重试的（且未到次数上限）重新排队
+    todo = [r for r in cand if needs_retry(r.get(SITE_MARK))]
+    skip_done = len(cand) - len(todo)
+    todo.sort(key=lambda r: 0 if not _has_any(r) else 1)
+    targets = todo[:max(0, int(limit))]
+    stats = {"total": len(recs), "eligible": len(targets), "cached": skip_done,
+             "ok": 0, "added": 0, "no_site": len(recs) - len(cand),
+             "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0}
+    if not targets:
+        return stats
+
+    lock = threading.Lock()
+    idx = {"n": 0}
+    done_sites = set()
+    added_keys = set()      # 本轮真正新增的「值」全集（跨行去重后才是可交付的净新增）
+    halt = {"on": False}          # 预算/停止：置位后工作线程只退出，不再落笔
+
+    def stopped():
+        return halt["on"] or bool(stop and stop())
+
+    def work():
+        while True:
+            if stopped():
+                return
+            with lock:
+                i = idx["n"]
+                if i >= len(targets):
+                    return
+                idx["n"] += 1
+                rec = targets[i]
+            # 整段包起来：工作线程里任何一条异常若冒泡出去，线程池就少一路，剩下
+            # 的家数由更少的线程去跑（表现为「越跑越慢」而日志一句不提）——本轮
+            # 真实踩过一次 TypeError，正是这样被静默吞掉的。
+            try:
+                one(rec)
+            except Exception as e:
+                with lock:
+                    why = f"内部异常({type(e).__name__})"
+                    stats["reasons"][why] = stats["reasons"].get(why, 0) + 1
+
+    def one(rec):
+        site = pick_site(rec)
+        name = str(rec.get("公司名称") or rec.get("公司名") or "")
+        res = enrich_site(site, name, timeout=timeout)
+        if stopped():
+            return                           # 预算已用完：本轮不写这一条
+        phones = [v for v, _s in res.get("phones") or []]
+        emails = [v for v, _s in res.get("emails") or []]
+        mobs = [v for v in phones if split_mobile(v)]
+        tels = [v for v in phones if not split_mobile(v)]
+        old = {"电话": str(rec.get("电话") or ""), "手机": str(rec.get("手机") or ""),
+               "邮箱": str(rec.get("邮箱") or "")}
+        had = {_value_key(x) for part in old.values()
+               for x in _SPLIT_RE.split(part) if x}
+        new = {"电话": merge_values(old["电话"], tels),
+               "手机": merge_values(old["手机"], mobs),
+               "邮箱": merge_values(old["邮箱"], emails)}
+        gained = 0
+        fresh = []
+        for k in new:
+            for x in _SPLIT_RE.split(new[k]):
+                if x and _value_key(x) not in had and _value_key(x):
+                    gained += 1
+                    fresh.append(_value_key(x))
+        with lock:
+            # 跨行去重的账必须在锁内并进来：多路线程各自算各自的「净新增」，
+            # 同一个号出现在两行上会被统计成两个净新增，交付时数字就对不上。
+            fresh = [x for x in fresh if x not in added_keys]
+            added_keys.update(fresh)
+            gained = len(fresh)
+            for k in new:
+                if new[k] != old[k]:
+                    rec[k] = new[k]
+            if phones or emails:
+                stats["ok"] += 1
+                stats["added"] += gained
+                rec[SITE_MARK] = (f"官网回采({res.get('pages', 0)}页)："
+                                  f"电话{len(tels)}/手机{len(mobs)}/邮箱{len(emails)}，"
+                                  f"净新增{gained}")
+            else:
+                why = res.get("why") or "无可用值"
+                stats["reasons"][why] = stats["reasons"].get(why, 0) + 1
+                if is_transient_why(why):
+                    # 暂时失败：留下「待重试(N次)」，下一轮收尾还会排上它。
+                    # 写成终态就是把「今天停机」当成「这家永远没官网」，
+                    # 那种数据要用户手工清列才能重跑——不可接受的静默劣化。
+                    n = attempts_of(rec.get(SITE_MARK)) + 1
+                    if n >= MAX_ATTEMPTS:
+                        # 到上限就**如实写成终态**：留痕既是下一轮的排队依据，也是
+                        # 给用户看的解释。继续写「待重试(3次)」而 needs_retry 已经判否，
+                        # 等于在表格里留一句永远兑不到的承诺——用户会一直等一个不会再来的
+                        # 重试轮；改成终态并写明怎么重开，这一行才自洽。
+                        rec[SITE_MARK] = (f"{SITE_MARK}：{why}（已试 {n} 次仍不通，"
+                                          f"本轮起不再花预算；清空这一列可重新排队）")
+                    else:
+                        stats["retry"] = stats.get("retry", 0) + 1
+                        rec[SITE_MARK] = f"{RETRY_MARK}({n}次)：{why}"
+                else:
+                    rec[SITE_MARK] = f"{SITE_MARK}：{why}"
+            done_sites.add(_reg_domain(host_of(site)))
+            stats["marked"] += 1
+
+    n_workers = max(1, min(int(workers), 16))
+    ths = [threading.Thread(target=work, name=f"site-enrich-{i}", daemon=True)
+           for i in range(n_workers)]
+    t0 = time.time()
+    for t in ths:
+        t.start()
+    beat = {"n": 0, "t": t0}
+    while any(t.is_alive() for t in ths):
+        for t in ths:
+            t.join(timeout=0.5)
+        # 心跳：一轮回采动辄几分钟，界面只有「开始」和「结束」两行的话，用户没法
+        # 判断是在跑还是卡死了（采集主链路同一条纪律：长任务必须自证还在推进）。
+        if (idx["n"] - beat["n"] >= 40 or
+                (time.time() - beat["t"] >= 60 and idx["n"] > beat["n"])):
+            beat["n"], beat["t"] = idx["n"], time.time()
+            log(f"🌐 官网回采进行中：{idx['n']}/{len(targets)} 家，"
+                f"净新增 {len(added_keys)} 个联系方式")
+        if time.time() - t0 > budget:
+            halt["on"] = True
+            stats["budget_hit"] = max(0, len(targets) - idx["n"])
+            log(f"⏳ 官网回采预算（{int(budget // 60)} 分钟）用完：已跑 {idx['n']}/{len(targets)} 家，"
+                f"剩余 {stats['budget_hit']} 家本轮不写（下次收尾会自动接着做）")
+            break
+        if stopped():
+            halt["on"] = True
+            break
+    for t in ths:
+        t.join(timeout=timeout + 60)     # halt 已置位：线程最慢也只把手上这一家做完就退
+    stats["seconds"] = int(time.time() - t0)
+    stats["sites"] = len(done_sites)
+    stats["new_values"] = len(added_keys)
+    # 以「真正落笔的条数」为准：被 halt 拦在半路的（已认领但没写）也算没做完，
+    # 用认领数当进度会少报「剩余 N 家下次接着做」，而那正是用户决定要不要再跑一轮的依据。
+    stats["skipped"] = max(0, len(targets) - stats["marked"])
+    return stats
+

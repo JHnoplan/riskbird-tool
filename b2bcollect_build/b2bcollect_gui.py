@@ -9,7 +9,8 @@ b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI
   · 名单驱动（企知道）：从「待采集公司名单」逐家补采，看门狗语义——名单空则休眠，
     关键词采集清洗掉的无联系方式废数据会自动回流到名单、唤醒企知道补采（变废为宝）。
 导入或粘贴一批关键词（或上传公司名单）→ 智能匹配行业列表页 → 进详情页取联系方式 →
-边采边自动保存 → 导出「原始 + 清洗后入库 + 国内只留手机号」三份 Excel；支持断点续采、被验证码/风控拦截时
+边采边自动保存 → 收尾顺手去各家自己官网回采电话/邮箱（可勾选，合并去重不覆盖）→
+导出「原始 + 清洗后入库 + 国内只留手机号」三份 Excel；支持断点续采、被验证码/风控拦截时
 弹窗等人工过验证后自动继续、导入云展动力客户库。
 
 运行：python b2bcollect_gui.py
@@ -998,6 +999,29 @@ class CrawlWorker(QThread):
             self.session.crawl(self.keywords, start_index=0)
         except Exception as e:
             self.session._log(f"❌ 采集线程异常：{e}")
+
+
+# ── 手动补采官网联系方式（功能④的手动入口）────────────────────────────────
+class SiteEnrichWorker(QThread):
+    """把「去各家官网补电话/邮箱」这一整轮联网搬到后台线程。
+
+    为什么不直接在 GUI 线程里跑：这一轮按预算最长 12 分钟、几十上百次请求，放在界面
+    线程上就是整窗白屏无响应（系统还会判程序卡死），而用户此刻最想做的是继续看日志。
+    异常一律自己收口并发 done：这个线程是用户点出来的，卡住「补采中…」不给回是
+    最坏的失败形态——按钮必须恢复，账必须写出来。
+    """
+    done = pyqtSignal(object)     # enrich_websites 的账目 dict；没跑成时是 None
+
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+
+    def run(self):
+        try:
+            self.done.emit(self.session.enrich_websites(reason="手动补采", force=True))
+        except Exception as e:
+            self.session._log(f"⚠ 手动补采异常（已结束，不影响已采数据）：{type(e).__name__}: {e}")
+            self.done.emit(None)
 
 
 # ── 自动保存线程：各平台合并写「原始 + 清洗后入库 + 国内只留手机号」三份 ──────
@@ -2174,6 +2198,14 @@ class MainWindow(QMainWindow):
         # 「自动扩词」的**生效值**（不是控件状态）：对外档位没有勾选框，读控件会直接
         # AttributeError；把状态存成数据，控件在不在都由同一份判据说话。
         self._auto_expand = edition.auto_expand_default()
+        # 「严格按关键词清洗」的**生效值**（同样不读控件）：洗过的数据从四个出口流出去
+        # （自动保存的两份表、导出、云展导入客户库、手动重洗），四个出口都经 session.clean_records
+        # 读会话上那一份档位；「清洗数据」按钮洗的是外部表格，不走这条链路。
+        # 默认正常清洗——严格档会剔数据，必须是用户明确表示的意思，不能是升级带来的默认。
+        self._clean_strict = False
+        # 「补采官网联系方式」的在途线程：只允许一个在跑。记线程而不是记布尔，因为退出时
+        # 要靠它 wait 住那一轮联网——丢掉这一轮就是「日志说补到了、表格里没有」那类对不上的账。
+        self._site_worker = None
         # 后台静默同步数据池的在途状态（只有对外档位会走到，内部版走弹窗）：
         # worker 只允许一个在跑，跑完期间又采集完成时把最新一份挂到 pending 排队。
         self._silent_worker = None
@@ -2850,6 +2882,19 @@ class MainWindow(QMainWindow):
         self.chk_incr.setChecked(True)
         self.chk_incr.setToolTip("跨运行记住已采到/已判不相关的商家，再跑同一批关键词命中即跳过、不重复请求"
                                  "（省请求=防封），只补新出现的商家；因拦截没采成的不记，下轮仍重试。")
+        self.chk_site = QCheckBox("采集后回采官网联系方式")
+        self.chk_site.setChecked(True)
+        # 文案要点全在「凭什么可信」上：这一轮补回来的号码是直接进交付表格的，后面没有
+        # 人工复核环节，所以用户必须先看见那几条硬规矩，才不会把补来的号当平台号码打。
+        self.chk_site.setToolTip(
+            "采集收尾时，「公司网址」是企业自有域名的，就去它自己官网把电话/邮箱补回来，\n"
+            "与已有号码按英文逗号合并去重（只追加、不覆盖），每行在「官网回采」列留下可复核的账。\n"
+            "只认企业官网：1688/马可波罗/企知道这类平台页不当官网抓（那上面写的是平台客服号）。\n"
+            "宁缺毋滥的硬规矩：页面认不出这家公司→整站不采信；域名已停放/被抢注/挂马→整站不采信；\n"
+            "只出现在 JS 里的数字、专利号/备案号/邮编里的数字串、建站商署名的 400 热线→都不算电话。\n"
+            "预算上限 12 分钟，同一个官网只请求一次；没轮到的行下次收尾自动接着做。\n"
+            "已经采完才想起来要补？直接点下一行的「补采官网联系方式」——不用重跑采集，\n"
+            "补到的值照样写进同一个任务文件夹的表格里。")
         self.chk_bg = QCheckBox("后台运行·最小化浏览器")
         # 默认勾选：多平台并行时用户根本不需要盯浏览器，挂着自动最小化才能真「无人值守」；
         # 命中验证码仍会自动还原窗口把验证递到眼前。
@@ -2858,7 +2903,8 @@ class MainWindow(QMainWindow):
                                "命中验证码时会自动还原窗口提醒人工过验证，过后重新最小化；\n"
                                "启动浏览器已带防后台节流开关，最小化不影响页面渲染。\n"
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
-        hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr); hp.addWidget(self.chk_bg)
+        hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr)
+        hp.addWidget(self.chk_site); hp.addWidget(self.chk_bg)
         hp.addStretch(1)
         # 「清空历史种子库」是内部运维入口（一把删光跨运行去重成果，下轮全量重请反而
         # 抬高防封风险）。对外档位不创建该按钮；复位对话框里的同名勾选项一并撤掉——
@@ -2890,6 +2936,53 @@ class MainWindow(QMainWindow):
             self.chk_auto_kw.toggled.connect(self._set_auto_expand)
             hp2.addWidget(self.chk_auto_kw)
             self._acl_reg(edition.CAP_AUTO_EXPAND_UI, self.chk_auto_kw)
+        # 清洗档位（功能⑤）做成**常驻勾选框**，而不是点某个按钮时才弹窗：洗完的数据要从
+        # 四个出口流出去（自动保存的两份表、导出、云展导入客户库、手动重洗），弹窗只拦得住
+        # 其中一个，另外三个照旧按上次的档位跑——同一批数据两种口径是最难解释的账。做成勾选框
+        # + 会话上单一生效值，四个出口必然同步（与「过滤行业不相关商家」「增量模式」同一纪律）。
+        # 两条跟着档位来的硬规矩：
+        #  · 这一行**恒定挂进布局**：口径开关不是「可选功能入口」，丐版藏掉它就会出现
+        #    「界面上看不到、值却还在生效」——那是比多一行更难解释的界面；
+        #  · tooltip 里不许出现被藏功能的名字（丐版/受限账号的文案交底判据）：写「企知道/
+        #    爱企查/风鸟」「同步数据池」这种具体入口名，等于按钮藏住了、话没藏。
+        self.chk_strict = QCheckBox("严格按关键词清洗")
+        self.chk_strict.setToolTip(
+            "两档清洗口径，区别只有一条：判不出相关性时放不放弃。\n"
+            "· 正常清洗（不勾）：相关性判不出就放过，宁可多留一家——与采集时那道关门一致；\n"
+            "· 严格清洗（勾选）：《清洗后入库数据》里只留「公司名/主营/经营范围」能正面命中\n"
+              "关键词的行，命不中的剔掉。判据与采集时是同一份实现（cdp_base.relevance_hit），\n"
+              "不会出现「采集认这套、清洗认那套」。\n"
+            "关键词依据：行自带「关键词」列 ∪ 关键词框 ∪ 本轮任务关键词，日志里写明用的哪一份。\n"
+            "管四个出口：自动保存的《清洗后入库数据》与《国内只留手机号》、导出、云展导入客户库。\n"
+            "《企业数据_原始》不受影响：那一列写的就是原始记录——\n"
+            "收紧的是入库口径，不是把线索销毁。\n"
+            "注意：按公司名逐家查工商的那几路，只有公司名或经营范围里带这个词才留得下，\n"
+            "那一路可能被大量剔掉——日志会按数据来源分开报账，并点名哪一路被清空。\n"
+            "对外部表格的「上传 Excel/CSV 智能清洗」不影响：那些表没有关键词来源，\n"
+            "硬套本轮关键词只会把用户没要求过的行洗掉。")
+        self.chk_strict.setChecked(self._clean_strict)
+        self.chk_strict.toggled.connect(self._set_clean_strict)
+        if self.chk_auto_kw is not None:
+            hp2.addSpacing(16)
+        hp2.addWidget(self.chk_strict)
+        # 手动补采入口（功能④）。放在第二行而不是紧挨着上面那条同名勾选框：第一行已有
+        # 「采集间隔 + 4 个勾选」，再加一个按钮会把配置内容最小宽顶到 1100 以上——那正是
+        # 上次「开始采集要左右滑才能点到」的成因（见 _apply_width_floor 的说明）。
+        self.btn_site_now = QPushButton(self.BTN_SITE_ENRICH)
+        self.btn_site_now.setToolTip(
+            "把现在表里「公司网址」是企业自有域名的行，挨个去它自己官网补电话/邮箱，\n"
+            "补到的值与已有号码按英文逗号合并去重（只追加、不覆盖），每行在「官网回采」列\n"
+            "留下可复核的账（为什么没出值也写在那一列）。\n"
+            "与上面那条「采集后回采官网联系方式」的区别只有一条：那个是采集收尾自动跑一轮，\n"
+            "这个是你什么时候想起来都能立刻跑一次——不用重跑采集，也不会改动那条勾选。\n"
+            "只认企业官网：1688/马可波罗/企知道这类平台页不当官网抓（那上面写的是平台客服号）。\n"
+            "宁缺毋滥的硬规矩：页面认不出这家公司→整站不采信；域名已停放/被抢注/挂马→整站不采信；\n"
+            "只出现在 JS 里的数字、专利号/备案号/邮编里的数字串、建站商署名的 400 热线→都不算电话。\n"
+            "同一个官网只访问一次，已判定过的行不重复花预算；预算上限 12 分钟，没轮到的行下次接着做。\n"
+            "上面那条勾选没勾上也能点：那条只管「要不要自动跑」，你亲手点这一次就是同意。\n"
+            "这一轮跑在后台线程，界面照常能看日志；跑完自动保存一次表格。")
+        self.btn_site_now.setMinimumHeight(30)
+        self.btn_site_now.clicked.connect(self._on_site_enrich_now)
         if edition.history_visible():
             self.btn_history = QPushButton("历史任务")
             self.btn_history.setToolTip(
@@ -2901,9 +2994,15 @@ class MainWindow(QMainWindow):
                 hp2.addSpacing(16)
             hp2.addWidget(self.btn_history)
             self._acl_reg(edition.CAP_HISTORY_TASKS, self.btn_history)
-        if self.chk_auto_kw is not None or self.btn_history is not None:
-            hp2.addStretch(1)
-            vp.addLayout(hp2)
+        # 两个次要动作按钮排在这一行末尾：勾选项在左、动作在右，读起来就是「先设口径，
+        # 再做事」。历史任务入口按档位可能不存在，间距也就跟着有条件地加。
+        if self.btn_history is not None:
+            hp2.addSpacing(16)
+        hp2.addWidget(self.btn_site_now)
+        # 这一行现在**恒定**挂进布局：清洗档位在任何档位都必须可见（它是数据口径开关，
+        # 不是可选功能入口）。以前整行只在扩词/历史任务存在时才加入，对外档位会空一行。
+        hp2.addStretch(1)
+        vp.addLayout(hp2)
         cfg.addWidget(gb_p)
 
         hb = QHBoxLayout()
@@ -3886,6 +3985,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示",
                                     "采集进行中。请先点「停止」并等日志出现「采集完成/已停止」后再开新任务。")
             return
+        if self._site_worker is not None and self._site_worker.isRunning():
+            # 复位会清空内存结果并 reset_caches()：正在跑的补采线程手里还握着上一批字典，
+            # 让它继续跑就等于让它把号码写进一批已经从表里消失的行——补到的值当场蒸发。
+            # 与其让它悄悄蒸发，不如当场说清「等它跑完」（最长 12 分钟预算，越到后面越快）。
+            QMessageBox.information(self, "请等一下",
+                                    "「补采官网联系方式」正在进行中。请等日志出现「手动补采结束」"
+                                    "（或采集收尾那一轮跑完）再开新任务，否则这一轮补到的值会被复位丢掉。")
+            return
         total = len(self.session.snapshot_results())
         dlg = QDialog(self)
         dlg.setWindowTitle("开始新任务 · 确认复位范围")
@@ -3998,6 +4105,16 @@ class MainWindow(QMainWindow):
             return
         if self.worker and self.worker.isRunning():
             return
+        if self._site_worker is not None and self._site_worker.isRunning():
+            # 采集与手动补采共用同一份官网缓存与那段预算：同时跑会让补采轮一边跑一边看到
+            # 「这站刚访问过」而提前收摊，账面上却各说各的。这一条比「让它并行省时间」值钱。
+            self._on_log("⚠ 「补采官网联系方式」正在进行中，请等它结束再开始采集"
+                         "（同一份官网缓存和预算，同时跑只会互相抢）")
+            QMessageBox.information(self, "请等一下",
+                                    "「补采官网联系方式」正在进行中。\n"
+                                    "请等日志出现「手动补采结束」再点「开始采集」，"
+                                    "否则这一轮补到的号码会和采集收尾那一轮互相抢预算。")
+            return
         # 自动启动浏览器（原「打开浏览器」按钮功能，现在集成到开始采集里）
         self._on_log("正在启动共享浏览器…")
         self.btn_start.setEnabled(False)
@@ -4029,7 +4146,15 @@ class MainWindow(QMainWindow):
                                max_pages=0,      # 不限页数：翻到没有新数据自然切下一个关键词
                                relevance_guard=self.chk_guard.isChecked(),
                                incremental=self.chk_incr.isChecked(),
-                               province=self.selected_provinces)
+                               province=self.selected_provinces,
+                               # 生效值走勾选框本身：引擎层默认是关的（离线用例的护栏），
+                               # 这一行漏传就等于功能整体不生效，而且没有任何报错。
+                               site_enrich=self.chk_site.isChecked(),
+                               # 清洗档位同样在这里下发：采集过程中每批自动保存就会写
+                               # 《清洗后入库数据》，等用户点按钮再同步就晚了（第一份表已经
+                               # 是按旧档位洗出来的）。
+                               clean_strict=self.chk_strict.isChecked(),
+                               clean_keywords=self._strict_keyword_source())
         if self.selected_provinces:
             names = "、".join(self.selected_provinces)
             self._on_log(f"🗺 本次按 {len(self.selected_provinces)} 个省「{names}」精准采集："
@@ -4204,7 +4329,11 @@ class MainWindow(QMainWindow):
 
     def _on_clean_now(self):
         """「清洗数据」：直接选文件 → 选输出目录 → 增强清洗输出三文件（国内/国内手机/国外）。
-        不再弹模式选择对话框，用户只管上传文档即可。"""
+        不再弹模式选择对话框，用户只管上传文档即可。
+        边界：这里洗的是**上传的外部表格**（clean_external_records），不经 session.clean_records，
+        所以「严格按关键词清洗」那一档对它没有影响——那些表本来就没有关键词来源，硬套
+        本轮关键词只会剔掉用户没要求过要剔的行。
+        """
         if getattr(self, "_cleaning", False):
             QMessageBox.information(self, "提示", "正在清洗数据，请等当前清洗完成")
             return
@@ -4313,6 +4442,7 @@ class MainWindow(QMainWindow):
     def _clean_session_data(self):
         """把当前已采数据立即跑一遍清洗，落盘原始+清洗入库两份，
         废数据经 clean_records 的 waste_sink 回流待采名单。数据量有限，同步执行秒级完成。"""
+        self._sync_clean_strict()
         rows = self.session.snapshot_results()
         if not rows:
             QMessageBox.information(self, "提示", "还没有采集到数据，无法清洗。")
@@ -4357,6 +4487,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "清洗失败", str(e))
 
     def _on_export(self):
+        # 导出走的也是 session.clean_records，档位先同步（用户可能刚改完勾选或词框）
+        self._sync_clean_strict()
         rows = self.session.snapshot_results()
         if not rows:
             QMessageBox.information(self, "提示", "还没有采集到数据。")
@@ -4903,11 +5035,154 @@ class MainWindow(QMainWindow):
         if w is not None and w.isChecked() != self._auto_expand:
             w.setChecked(self._auto_expand)   # toggled 会回调本方法，值相同即止
 
+    def _strict_keyword_source(self):
+        """严格档能用的关键词依据（界面侧）：当前关键词框的解析结果 ∪ 本轮任务关键词。
+        现解析而不是读 self.keywords：用户改完框里的词没点「开始采集」时 self.keywords 还是
+        旧的，按旧词清洗等于拿用户已经删掉的词去剔他的数据。"""
+        try:
+            kws = list(ParallelSession.parse_keywords(self.kw_text.toPlainText()))
+        except Exception:
+            kws = list(self.keywords or [])
+        for k in (getattr(self.session, "_last_keywords", None) or []):
+            if k and k not in kws:
+                kws.append(k)
+        return kws
+
+    def _rows_have_keyword(self):
+        """已采数据里有没有「关键词」列可作依据（只看前 200 行，够判“有没有”就够了）。"""
+        try:
+            for i, r in enumerate(self.session._all_live_records()):
+                if i >= 200:
+                    break
+                if isinstance(r, dict) and str(r.get("关键词") or "").strip():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _sync_clean_strict(self):
+        """把档位与关键词依据推给会话：四个出口都读会话上这一份值，漏推一处就是
+        「同一批数据两种口径」。依据每次一并刷新——用户可能在采集后改关键词框再清洗。"""
+        self.session.clean_strict = bool(self._clean_strict)
+        self.session.clean_keywords = self._strict_keyword_source()
+
+    def _set_clean_strict(self, on):
+        """严格档的唯一写入口：值、控件、会话三处都从这里过（同 _set_auto_expand）。
+        勾上之前先问一句“拿什么判”：一档按关键词筛的开关在没有关键词时是空转的，
+        让用户以为筛过了比不筛更坏——所以当场回弹并把缺什么说清楚。"""
+        want = bool(on)
+        if want and not self._strict_keyword_source() and not self._rows_have_keyword():
+            self._clean_strict = False
+            self._sync_clean_strict()
+            if self.chk_strict is not None:
+                # 回弹时掐掉信号：不然 setChecked(False) 又回调进来，日志里会多出
+                # 一句「已切到正常清洗」，读起来像用户自己关的。
+                self.chk_strict.blockSignals(True)
+                self.chk_strict.setChecked(False)
+                self.chk_strict.blockSignals(False)
+            self._on_log("⚠ 严格档开不了：关键词框是空的、本轮任务也没有关键词、"
+                         "采集数据里也没有「关键词」列——没有任何依据可判，保持「正常清洗」")
+            QMessageBox.information(
+                self, "暂时开不了严格档",
+                "这一档是「按关键词把不相关的行剔掉」，现在手上没有任何关键词可比：\n\n"
+                "· 「① 关键词」框是空的；\n"
+                "· 本轮任务也没记着关键词（没开始过采集或采的是纯名单）；\n"
+                "· 已采数据里「关键词」列全空。\n\n"
+                "请先在关键词框里填上要按的词（一行一个）再勾选。\n"
+                "《企业数据_原始》不受这一档影响，随时可以取消勾选重洗一次拿回全量。")
+            return
+        self._clean_strict = want
+        if self.chk_strict is not None and self.chk_strict.isChecked() != want:
+            self.chk_strict.setChecked(want)
+        self._sync_clean_strict()
+        self._on_log("🔎 清洗档位："
+                     + ("严格按关键词清洗（只动《清洗后入库数据》，原始表全量保留）"
+                        if want else "正常清洗（判不出相关性时放过，与采集时同一口径）"))
+
+    # ── 手动补采官网联系方式（功能④的手动入口）──────────────────────────────
+    # 这个按钮存在的全部理由：`site_enrich` 那条勾选管的是「采集**收尾**要不要自动跑一轮」，
+    # 而「已经采完了才想起来要补」是另一件事。以前只能靠重跑采集去触发收尾轮（增量模式会把
+    # 历史行装回来），那等于让用户为了补号码再烧一轮请求——省请求本来就是这条链路的目标。
+    BTN_SITE_ENRICH = "补采官网联系方式"
+
+    def _site_restore_button(self):
+        """把按钮从「补采中…」放回原样。恢复路径只许有这一个出口：线程异常或被中断时漏
+        恢复，按钮就永久停在灰着的「补采中…」，用户除了重启工具没有别的办法——而这一轮
+        其实早就跑完了。"""
+        if self.btn_site_now is not None:
+            self.btn_site_now.setEnabled(True)
+            self.btn_site_now.setText(self.BTN_SITE_ENRICH)
+
+    def _on_site_enrich_now(self):
+        """「补采官网联系方式」：对现在表里带官网的行手动跑一次回采。
+
+        前置判定四条，每条都当场回一句话，绝不做「点了没反应」这种事：
+          · 上一轮还在跑 → 同一份预算不叠第二轮（此时按钮本来也是灰的，走到这里只可能是竞态）；
+          · 采集进行中 → 收尾轮自己会做（勾了的话），中途插队只会跟它抢同一份预算；
+          · 表里没数据 / 一行可用官网都没有 → 把「为什么没得补」说清楚。回一句「没补到」
+            和「其实压根没东西可补」是两回事，后者用户必须知道，不然会怀疑工具坏了；
+          · 那条勾选没勾 → 照样放行：勾的是「要不要自动跑」，亲手点这一次就是同意
+            （会话侧用 force 表达，界面绝不偷偷改他的勾选状态）。
+        """
+        if self._site_worker is not None and self._site_worker.isRunning():
+            return
+        if self.worker is not None and self.worker.isRunning():
+            self._on_log("⚠ 采集还在跑：勾了「采集后回采官网联系方式」的话，采完收尾会自动补一轮；"
+                         "中途再插一轮只会跟收尾轮抢同一份预算，这次不动")
+            return
+        try:
+            total, with_site, missing = self.session.site_enrich_preview()
+        except Exception as e:
+            self._on_log(f"⚠ 补采前置检查没做成（未开始补采）：{type(e).__name__}: {e}")
+            return
+        if not total:
+            QMessageBox.information(
+                self, "没有数据",
+                "当前没有已采数据，没有可补采的行。\n"
+                "先采一轮（或「开始新任务」后接着采），有了数据再点这个按钮。")
+            return
+        if not with_site:
+            QMessageBox.information(
+                self, "没有可回采的官网",
+                f"当前 {total} 行里，一行可用的企业官网都没有，这一次不会访问任何网站。\n\n"
+                "「公司网址」里这几类地址是不回采的：\n"
+                "· 1688 / 马可波罗 / 企知道 / 顺企网这类**平台页**——那上面写的电话是平台客服号；\n"
+                "· 空值、只有公司名没网址、明显不是企业主页的链接。\n\n"
+                "想核对哪些值被当成官网，可以先点「导出 Excel」看《企业数据_原始》的「公司网址」列。")
+            return
+        self._on_log(f"🌐 手动补采开始：{total} 行里 {with_site} 行带可回采官网"
+                     f"（其中 {missing} 行本来就缺联系方式，优先补它们）")
+        if not self.chk_site.isChecked():
+            self._on_log("   注：「采集后回采官网联系方式」没勾上，这一轮只按你这次点击执行，"
+                         "勾选状态不变")
+        self.btn_site_now.setEnabled(False)
+        self.btn_site_now.setText("补采中…")
+        self._site_worker = SiteEnrichWorker(self.session)
+        self._site_worker.done.connect(self._on_site_enrich_done)
+        self._site_worker.start()
+
+    def _on_site_enrich_done(self, stats):
+        """补采回来：恢复按钮、报账、落盘。
+
+        账目本体是会话那一轮打的（同一份实现，界面不再重复一套口径）；这里只补一句
+        「现在落表了没有」，因为用户关心的是表格，不是内存。stats 为空时**不**落盘：
+        没跑成一件事却要用户等一次写盘，是在给他不存在的进度。
+        """
+        self._site_restore_button()
+        if not isinstance(stats, dict):
+            self._on_log("🌐 手动补采结束：这一轮没有实际访问官网，原因见上面那条日志")
+            return
+        self._on_log(f"🌐 手动补采结束：访问 {stats.get('sites', 0)} 个官网、"
+                     f"{stats.get('ok', 0)} 行补到值、净新增 {stats.get('new_values', 0)} 个联系方式")
+        self.request_autosave()
+
     def _params_snapshot(self):
         """采集参数快照：续采时照原样恢复，不该让用户为接着采再调一遍参数。"""
         return {"delay_between": float(self.spin_delay.value()),
                 "relevance_guard": bool(self.chk_guard.isChecked()),
                 "incremental": bool(self.chk_incr.isChecked()),
+                "site_enrich": bool(self.chk_site.isChecked()),
+                "clean_strict": bool(self._clean_strict),
                 "background": bool(self.chk_bg.isChecked()),
                 "auto_keyword_expand": bool(self._auto_expand),
                 "province": list(self.selected_provinces or [])}
@@ -4920,6 +5195,8 @@ class MainWindow(QMainWindow):
                 self.spin_delay.setValue(float(params["delay_between"]))
             for key, widget in (("relevance_guard", self.chk_guard),
                                 ("incremental", self.chk_incr),
+                                ("site_enrich", self.chk_site),
+                                ("clean_strict", self.chk_strict),
                                 ("background", self.chk_bg)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
@@ -6173,6 +6450,9 @@ class MainWindow(QMainWindow):
         return jobs
 
     def _start_yzd_import(self, group, tasks):
+        # 导入前定档：worker 里每份表都会调 session.clean_records，档位必须在提交前同步，
+        # 否则「界面勾着严格、传上去的是正常档」这种账只能在后台对出来。
+        self._sync_clean_strict()
         if self._yzd_importing:
             return
         if tasks is None:
@@ -6295,6 +6575,21 @@ class MainWindow(QMainWindow):
             self.session.stop_crawl()
             if self.autosave and self.autosave.isRunning():
                 self.autosave.wait(3000)
+            # 手动补采还在联网时退出：上面那句 stop_crawl 会把这一轮劝停（enrich 每访问
+            # 一个官网都查这个标志），这里再等它把已经补到的值落进内存。不等就退出，症状是
+            # 「日志明明说补到了 30 个号、表格里一个也没有」。
+            # 落盘必须在这里同步做完：done 是排队信号，事件循环就此结束的话它永远不会跑。
+            sw = self._site_worker
+            if sw is not None and sw.isRunning():
+                if not sw.wait(8000):
+                    sw.terminate()
+                    sw.wait(1000)
+                self._site_worker = None
+                self._site_restore_button()
+                # 只要这一轮真在跑过就落一次盘，不去分辨「到底补到几个号」：中途被强停时
+                # 已经访问成功的那几家照样在内存里，按 stats 条件跳过的话它们就凭空消失了。
+                # _final_save_sync 自己会先看 session_dir、先看有没有行，没有数据时是空转。
+                self._final_save_sync()
             # 静默上传还在路上时先等它把这片写完：upload_session 是「临时 key → copy →
             # delete」的原子写，中途被强杀最多在池子里留一个临时对象，不会写坏池子里的数据。
             # 但等这几秒能让这批内容正常落进台账；不等就是「其实传上去了、本地却记成没传」，

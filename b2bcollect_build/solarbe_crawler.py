@@ -320,7 +320,7 @@ class SolarbeCrawler(CdpSiteCrawler):
                 prev_sig = sig
                 total = max(total, self.slice_total(html))
                 got += len(sig)
-                new = skipped = 0
+                new = skipped = seen = 0
                 for e in entries:
                     mid = e["公司ID"]
                     key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -328,6 +328,8 @@ class SolarbeCrawler(CdpSiteCrawler):
                     nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                     if key in self._seen_members or nkey in self._seen_members \
                             or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                        seen += 1
+                        self._incremental_skipped += 1
                         continue
                     # 早过滤只看卡片的主营产品（拿不到就 fail-open），判定交给详情页复核
                     # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
@@ -352,7 +354,7 @@ class SolarbeCrawler(CdpSiteCrawler):
                     stale = 0
                 self._log(f"  「{kw}」行业{catid or '不限'}/地区{areaid or '不限'}"
                           f" 第 {page} 页：{len(entries)} 家，新增 {new}"
-                          + (f"，早过滤 {skipped}" if skipped else ""))
+                          + self._page_tail(skipped, seen))
                 self._sleep()
             # 本片已经翻到底，标称数却比拿到手的多＝被 120 上限截断：再切一刀补量
             if total > got and (catid, areaid) not in split:

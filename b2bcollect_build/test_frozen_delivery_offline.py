@@ -90,6 +90,26 @@
      检出的还是同一棵树。本节自己就是这条的由来——两个夹具写成 `…_noe.sh` / `…_noE.sh`，
      mac 上其实是同一个文件，判据读出隔壁那份内容，红了一条不相干的话，而 Linux CI 全绿。
      除了拿合成路径判仓库那一半，收尾还硬判本套件自己的夹具名不许撞车
+  AB. pip 安装不许挂在一个外部门口：硬门第 18 条。2026-11-13 云端两个 run 同时红在
+     `pip install <包名…> -i 清华源` 那一行（5 次 ReadTimeout 后 pip 只留一句
+     `No matching distribution found`，一个字都没提「源不通」）。冗余与有界收进
+     .github/scripts/pip_install.py，清单收进 .github/requirements/*.txt（Mac 与 Windows
+     读同一份，「逐行对齐」的人肉同步就此失去立足点）。本节三层都验：判据接线、七种坏写法
+     各红一次、拿假 pip **真起子进程**验回退顺序、成功即早停、每源有界、全挂才非零、命令行
+     真的带上 --timeout / --retries / --no-input、子进程的 stdin 拿到的是 EOF，并做一次差分实测
+     （同一行读 stdin 的代码，接 DEVNULL 秒回、接一根没人写的管道就挂住）——只看文本的门报绿时
+     你分不清是实现对还是判据没看懂实现。18e 是同一族的另一半：清单收成一份文件后「抄漏一个包」
+     的位置变了、症状没变，所以进包源码 import 到的每个第三方包都必须能在清单里找到
+     （别名 pip 名≠import 名、连带由某发行包提供、仓库内目录包三条放行路线都必须在案，
+     并且要自证真被走过）
+  AC. 注释里那句「判据见某套件 第 N 节」必须真的走得通：硬门第 19 条。本轮把「择路不许跟着
+     本机历史走」写进 tool_config / runtime_paths 时，两边都补了指路注释，而当时那个套件只
+     编到第 9 节——一共 13 处悬空指路，其中四个函数（页尾拼法、联系方式判据、补采上限、收尾
+     取真身）在全部离线套件里 0 覆盖，正是用户报「以前能采到、现在一直是 0」那条链的守卫
+     缺口。「判据在哪一节」这句话本身不是判据，可达性得机械化：本节验接线、验四种写法（单号
+     / 并列 / 区间 / 全角数字）与折行都点得出，验三条不许误报的口径（句子被句号断开、间距超
+     过 12 字符、套件自己的内部编号），并拿「当时那 13 处」的原句形状做反向对照——一句走不通
+     的指路必须红，而且要把缺的那几个节逐个点名
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -3202,6 +3222,25 @@ def test_workflow_shell_syntax():
                "删证据的判据本身必须被关在自己的沙箱里")
     _assert((sandbox / "logs").is_dir(), "沙箱落点真的在用（没在用=上面那条等价校验是空的）")
 
+    # 5c-III) 污染要报在**犯错的套件名下**：只在收工那句「改动了 N 份」里说总数，接下来
+    # 就得靠人回想这一批跑了什么——上一轮那两份「爱企查_结果页证据_*.txt」正是这么找的，
+    # 而回想出来的结论没有一条能复跑。这里注入一份真的往开发机数据目录写字节的夹具：
+    # 入口既要拦住（套件全绿也不放行），又要把这一路套件的名字打出来。
+    polluted = _REPO / "b2bcollect_build" / "b2bcollect_data" / "zz_batch_attribution.json"
+    polluted.unlink(missing_ok=True)
+    try:
+        proc = _run_probe('from pathlib import Path\n'
+                          f'Path({str(polluted)!r}).write_text("污染归属夹具", encoding="utf-8")\n'
+                          'print("结果：1 通过 / 0 失败")\n')
+        _assert_eq(proc.returncode, 1,
+                   f"往开发机数据目录写字节的套件不许算放行（实际 rc={proc.returncode}）")
+        _assert("zz_regression_probe.py" in proc.stdout,
+                f"污染必须点名到是哪一路套件写的（实际：{proc.stdout.strip()[-300:]}）")
+    finally:
+        polluted.unlink(missing_ok=True)
+    _assert(not polluted.exists(),
+            "污染归属跑完必须自己收尾：留着这份文件，外层这一批就会把它算成开发机被改动")
+
     # 反向对照：同一落点上的两批必须互斥。锁只在文档里写着、实际不生效，症状与
     # 「从来没并发过」完全一样——所以先把锁真的摆上，再要求入口当场拒绝并给出下一步。
     (sandbox / ".lock").mkdir(parents=True, exist_ok=True)
@@ -6015,11 +6054,40 @@ def test_batch_state_watch_gate():
     _assert("leak=1" in runner and "[ $leak -ne 0 ]" in runner,
             "对拍不等要置 leak 并且 leak 进最终退出码（只打印不拦路的判据等于没有判据）")
 
-    # 2) 行为侧：把脚本里内嵌的那两段 Python 抽出来，在一个假仓库上真跑
-    blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", runner, re.S)
-    _assert_eq(len(blocks), 2,
-               "批跑脚本里内嵌的 Python 段数（第 1 段取快照、第 2 段点名改动）")
-    snap_code, report_code = blocks
+    # 1b) 逐套件归属侧：只在收工对拍的写法答得出「有没有」，答不出「是谁」。上一轮屏幕
+    # 上是「改动了 2 份」，接下来靠人回想这一批跑过什么——回想出来的结论一条都不能复跑。
+    _assert('_state_snapshot "$CUR" "$STATE_NAMES"' in runner,
+            "每跑完一路套件就要取一张新快照（只在收工时取＝归属这一问没接线）")
+    _assert('cmp -s "$PREV" "$CUR"' in runner,
+            "这一张和上一张要逐字节对拍（同一张跟自己比恒等，报出来的归属永远是空）")
+    _assert('cp "$CUR" "$PREV"' in runner,
+            "对拍完必须推进「上一张」：不推进则第一处污染之后的每一路都被点名，噪音埋掉真元凶")
+    _assert('leak_suites="$leak_suites $f"' in runner and "⚑" in runner,
+            "改动要打在犯错的那一路套件名下（只有总数没有名字的报告＝把人引去猜方向）")
+    _at = runner.find("⚑")
+    _assert("leak=1" in runner[max(0, _at - 400):_at],
+            "逐套件那一条也要就地置 leak：只有收工对拍进退出码的话，归属红了仍会「ALL SUITES PASS」")
+    _assert("逐套件归属" in runner and "未定位到具体套件" in runner,
+            "收工那句结论要把归属带上（名字只出现在中间流水里，人看的是最后一行）")
+
+    # 2) 行为侧：把脚本里内嵌的 Python 段抽出来，在一个假仓库上真跑。
+    # 这一段原先按「段数 == 2 + 位置元组解包」写，本轮为了「污染要报在犯错的套件名下」
+    # 加了第 3 段（一次性取声明名单），顶出来的是一条 ValueError——和产品毫不相干，还会
+    # 把人引去改判据。现在按**所在 shell 函数名**绑定：多一个具名函数就多一段，各自点名；
+    # 而任何没挂在具名函数里的裸 heredoc 由下面的 orphan 断言抓住（分段职责不能靠自觉）。
+    def _block_of(fn: str) -> str:
+        m = re.search(rf"^{re.escape(fn)}\(\)[^\n]*\n(.*?)^\}}\n", runner, re.S | re.M)
+        _assert(m, f"批跑脚本里要有具名函数 {fn}（判据散在循环里就没法逐段真跑）")
+        found = re.findall(r"<<'PY'\n(.*?)\nPY\n", m.group(1), re.S)
+        _assert_eq(len(found), 1, f"{fn} 里应恰好内嵌一段 Python（多段＝职责没分段）")
+        return found[0]
+
+    names_code = _block_of("_state_declared_names")
+    snap_code = _block_of("_state_snapshot")
+    report_code = _block_of("_state_leak_report")
+    _assert_eq(len(re.findall(r"<<'PY'\n", runner)), 3,
+               "三段内嵌 Python 都要挂在上面那三个具名函数里（数出来的段数对不上＝有人新加了一段"
+               "没归属的脚本，逐段真跑覆盖不到它）")
 
     def _run_block(code: str, argv, capture=False) -> str:
         old_argv = sys.argv
@@ -6034,7 +6102,12 @@ def test_batch_state_watch_gate():
 
     fake = Path(tempfile.mkdtemp(prefix="statewatch_"))
     pkg = fake / "b2bcollect_build"
-    pkg.mkdir(parents=True)
+    # 数据目录也在假仓库里造一份：本轮真实污染就发生在这里（riskbird_build/riskbird_data
+    # 多出两份「爱企查_结果页证据_*.txt」），而那种文件名是运行时长出来的，代码里根本没有
+    # 常量可声明——监视范围只靠「读常量」必然漏掉这一类。
+    data = pkg / "b2bcollect_data"
+    data.mkdir(parents=True)
+    (data / "seen_store_1688.json").write_text("{}", encoding="utf-8")
     # 状态文件名从**代码里的常量**来：夹具故意用一个本轮新造的常量名，它要是没被认出来，
     # 就说明「新加一份状态文件自动进监视范围」这句话没有依据（那样守卫会随改名失效）。
     (pkg / "registry_stub.py").write_text(
@@ -6046,33 +6119,49 @@ def test_batch_state_watch_gate():
     newone.write_text("{}", encoding="utf-8")
     other_py = pkg / "tool_body.py"
     other_py.write_text("print(1)\n", encoding="utf-8")
+    names_txt = fake / "names.txt"
     before_tsv = fake / "before.tsv"
     after_tsv = fake / "after.tsv"
 
-    _run_block(snap_code, [fake, before_tsv])
+    _run_block(names_code, [fake, names_txt])
+    declared = names_txt.read_text(encoding="utf-8")
+    _assert("_采集任务索引.json" in declared and "新加的状态.json" in declared,
+            f"声明名单从代码常量里扫出来（实际名单：{declared.strip() or '空'}）")
+    _assert("tool_body.py" not in declared, "扫的是声明出来的状态文件，不是整仓源码")
+
+    _run_block(snap_code, [fake, before_tsv, names_txt])
     listed = before_tsv.read_text(encoding="utf-8")
     _assert("_采集任务索引.json" in listed and "新加的状态.json" in listed,
             "两份既有状态文件都在监视范围内（含一个新造常量名，靠的是读常量而不是抄清单）")
+    _assert("b2bcollect_data/seen_store_1688.json" in listed,
+            f"数据目录里现有的文件也要进监视范围（这是本轮新加的口径，漏了它下面那条就抓不到）："
+            f"{listed.strip() or '空'}")
     _assert("tool_body.py" not in listed, "监视的是状态文件，不是整仓源码（不然一跑就全是噪音）")
 
     # 改动判得出：这是「有牙」那一半，前面所有接线断言都不能替代它
     idx.write_text('[{"id":"假任务"}]', encoding="utf-8")
     newone.unlink()                                  # 被删也是改动：监视范围里「不见了」同样要说
     other_py.write_text("print(2)\n", encoding="utf-8")   # 非状态文件的改动不该被算进来
-    _run_block(snap_code, [fake, after_tsv])
+    # 现场证据类污染：运行时长出来的文件名，代码里没有任何常量声明它
+    (data / "现场证据_183426.txt").write_text("污染", encoding="utf-8")
+    _run_block(snap_code, [fake, after_tsv, names_txt])
     report = _run_block(report_code, [before_tsv, after_tsv], capture=True)
     _assert("_采集任务索引.json" in report,
             f"被改写的状态文件必须点名（实际报告：{report.strip() or '空'}）")
     _assert("新加的状态.json" in report and "跑完不见了" in report,
             f"被删掉的也要点名并说清是哪一种改动（实际报告：{report.strip() or '空'}）")
+    _assert("现场证据_183426.txt" in report,
+            f"数据目录里**新长出**的一份也要点名（本轮真实污染就是这一类，旧口径按常量名单扫，"
+            f"它看不见）：{report.strip() or '空'}")
     _assert("tool_body.py" not in report,
             f"非状态文件的改动不许混进报告（那会把人引去查错方向：{report.strip()}）")
 
     # 反向对照：不动任何状态文件时报告必须为空。少了这一条，上面三条都可能是在报噪音。
-    _run_block(snap_code, [fake, before_tsv])
-    _run_block(snap_code, [fake, after_tsv])
+    _run_block(snap_code, [fake, before_tsv, names_txt])
+    _run_block(snap_code, [fake, after_tsv, names_txt])
     _assert_eq(_run_block(report_code, [before_tsv, after_tsv], capture=True).strip(), "",
                "状态文件一字未动时报告是空的（不空就说明守卫在自说自话）")
+    shutil.rmtree(fake, ignore_errors=True)
 
 
 def test_errexit_silent_death_gate():
@@ -6489,6 +6578,580 @@ def test_case_insensitive_filesystem_gate():
         shutil.rmtree(_tmp, ignore_errors=True)
 
 
+def test_pip_source_resilience_gate():
+    print("\n═══ AB. 交付链不许挂在一个外部门口：第 18 条硬门（冗余 + 清单覆盖）═══")
+    # 由来（2026-11-13 云端实发）：push 之后 Mac 与 Windows 两个 run 同时红，失败步都是
+    # `Install dependencies`。日志里的字节是：
+    #     Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+    #     5 次 ReadTimeout 重试耗尽
+    #     ERROR: No matching distribution found for PyQt5 (from versions: none)
+    # 那句话一个字都没提「源不通」，读日志的人先怀疑的是依赖写错了——而**代码没改坏、
+    # 构建脚本没写错**，交付链只是挂在了一个外部门口。四份 workflow 当时全都写成
+    # `pip install <一长串包名> -i 清华源`：一个镜像的可用性 = 整条交付链的单点；两份
+    # b2bcollect 的包名清单还各自抄一份，靠注释「逐行对齐」人肉同步。
+    # 大厂在这一格的做法只有两条：冗余（多源顺序回退）+ 有界（每个源都有尽头）。安装逻辑
+    # 因此收进 .github/scripts/pip_install.py，清单收进 .github/requirements/*.txt。
+    # 本节按三条线验：判据本身（文本结构）、判据的牙（反向对照必须红）、**实现真的那么跑**
+    # （拿假 pip 真起子进程，验回退顺序、早停、有界超时、全挂才非零、命令行真的带上
+    # --timeout/--retries/--no-input、stdin 真的拿到 EOF）。只看文本的「门」和没有门一样
+    # 危险——它报绿的时候你分不清是安装器对，还是判据没看懂安装器。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    installer_path = _REPO / ".github" / "scripts" / "pip_install.py"
+    installer_src = installer_path.read_text(encoding="utf-8")
+
+    # 1) 接线：两路判据都在 main() 里被调用，且结果并进不合格计数
+    for fn in ("check_pip_source_resilience", "check_requirements_coverage"):
+        _assert(callable(getattr(gate, fn, None)),
+                f"硬门模块里有 {fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("pip_problems = check_pip_source_resilience()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 18 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进不合格计数并影响退出码")
+    _assert("pip_problems += check_requirements_coverage()" in gate_src[_at:_at + 1200],
+            "18e（清单覆盖进包源码的第三方 import）接在同一段判定里，不能只挂个函数名")
+    _assert(installer_path.is_file(), "pip_install.py 在位（workflow 引用的实现本体）")
+    for rel in gate.WORKFLOWS:
+        _assert((_REPO / rel).is_file(), f"{rel} 在位：第 18 条登记了它却读不到文件，等于没判")
+    for name in ("b2bcollect.txt", "riskbird.txt", "build-1688.txt"):
+        _assert((_REPO / ".github" / "requirements" / name).is_file(),
+                f"依赖清单 {name} 在位：清单不在位时安装器会红，但红在构建中途比红在门禁晚一步")
+
+    # 2) 现状：四份 workflow + 安装器 + 清单都合格（这条红的时候，就是有人把单源又写回去）
+    _assert_eq(gate.check_pip_source_resilience(), [],
+               "第 18 条：交付链没有单点索引源、没有绕开安装器、清单都在位")
+    _assert_eq(gate.check_requirements_coverage(), [],
+               "第 18 条 e 路：进包源码 import 到的第三方包全在依赖清单里")
+    _assert_eq(gate.check_pip_source_resilience(workflows=gate.WORKFLOWS), [],
+               "同一判据按登记的 workflow 全量再跑一遍（默认参数与显式参数结果必须一致）")
+
+    # 3) 自证：正例不是「什么都没扫所以全绿」。四条放行路线——pip 名≠import 名、由清单里
+    #    某发行包连带提供、仓库内目录包、名字直接对上——都必须真的在当前这份代码上被走过。
+    #    缺这一格，下一节新加的门即使把整张表读错也会报 ✅（本轮已经栽过五次这一类）。
+    files = gate._packaged_source_files()
+    _assert(len(files) >= 40,
+            f"进包源码口径真的展开了（{len(files)} 个文件）：扫 0 个文件的「全覆盖」是自欺")
+    names = {n for p in files for n in gate._top_level_imports(p)}
+    dists = gate._requirement_dists(_REPO / gate.B2B_REQUIREMENTS)
+    _alias = sorted(n for n in gate.IMPORT_TO_DIST if n in names and n.lower() not in dists)
+    _assert(len(_alias) >= 3,
+            f"正例走的必须包含「pip 名≠import 名」这一格：至少三条别名要真的在代码里出现、"
+            f"且清单里写的是另一个名字（实际在用的={_alias}；表里全部={sorted(gate.IMPORT_TO_DIST)}）"
+            f"——表里用不上的那几条不是缺陷，它们是给下一个加依赖的人留的路标")
+    _assert(any(n in names and n not in dists and gate.IMPORT_FROM_LISTED.get(n)
+                and gate._dist_key(gate.IMPORT_FROM_LISTED[n][0]) in dists
+                for n in gate.IMPORT_FROM_LISTED),
+            "正例走的必须包含「由清单里某发行包连带提供」这一格（否则这张表从没被执行过）")
+    _dirpkg = sorted(n for n in names
+                     if n not in dists and (_REPO / n / "__init__.py").is_file())
+    _assert(_dirpkg,
+            f"正例走的必须包含「仓库内目录包随 --add-data 进包」这一格（实际={_dirpkg}）")
+    _direct = sorted(n for n in names if n.lower() in dists)
+    _assert(len(_direct) >= 6,
+            f"直接同名的第三方 import 也扫到了一大片（{len(_direct)} 条，实际={_direct}）")
+
+    _tmp = Path(tempfile.mkdtemp(prefix="pipgate_"))
+    try:
+        # ── 4) workflow 侧反向对照：七种坏写法各红一次，好写法放行 ──────────────
+        def _wf(rel: str, body_lines: tuple) -> str:
+            """拼一份最小 workflow 夹具：只有一个 run 步，脚本体就是传进来的那几行。"""
+            p = _tmp / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                "name: fixture\non:\n  push:\n    branches: [main]\njobs:\n  build:\n"
+                "    runs-on: ubuntu-latest\n    steps:\n      - name: Install dependencies\n"
+                "        run: |\n"
+                + "".join(f"          {ln}\n" for ln in body_lines), encoding="utf-8")
+            return str(p)
+
+        _REQ_OK = ".github/requirements/b2bcollect.txt"      # 仓库里那份真清单
+        _good = _wf("good.yml", ("python .github/scripts/pip_install.py --upgrade pip",
+                                 f"python .github/scripts/pip_install.py -r {_REQ_OK}"))
+        _assert_eq(gate.check_pip_source_resilience(workflows=(_good,), installer_text=installer_src),
+                   [], "正例：夹具里这两行（升级 pip + 按清单安装）就是当前链路的写法，必须放行")
+        # a) 事故原句：直接 pip install 挂在单个镜像上
+        _one = _wf("single.yml",
+                   ("pip install PyQt5 selenium -i https://pypi.tuna.tsinghua.edu.cn/simple",))
+        _got = gate.check_pip_source_resilience(workflows=(_one,), installer_text=installer_src)
+        _assert_eq(len(_got), 2,
+                   f"反向对照：单源直装要同时报「直接调用 pip」与「没调用安装器」两条（实际={_got}）")
+        _assert(any("直接调用 pip" in x for x in _got) and any("没有调用" in x for x in _got),
+                f"报的两条要各自可照做（实际={_got}）")
+        # b) 调了安装器，但 -r 指向仓库里没有的清单
+        _miss = _wf("missing.yml", ("python .github/scripts/pip_install.py "
+                                    "-r .github/requirements/nope_fixture.txt",))
+        _got = gate.check_pip_source_resilience(workflows=(_miss,), installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：清单不在仓库里要恰好报一条（实际={_got}）")
+        _assert("不在仓库里" in _got[0], f"报的必须是清单缺席（实际={_got[0][:60]}）")
+        # c) 清单在，但落在 requirements/ 之外：两个平台读同一份这件事就没人判得得了
+        _elsewhere = _tmp / "misc" / "deps_elsewhere.txt"
+        _elsewhere.parent.mkdir(parents=True, exist_ok=True)
+        _elsewhere.write_text("requests\n", encoding="utf-8")
+        _loc = _wf("location.yml", (f"python .github/scripts/pip_install.py -r {_elsewhere}",))
+        _got = gate.check_pip_source_resilience(workflows=(_loc,), installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：清单落点散开要恰好报一条（实际={_got}）")
+        _assert("requirements" in _got[0], f"报的必须是落点（实际={_got[0][:60]}）")
+        # d) 空清单：只有注释。装得出个寂寞，产物缺包却在用户点上才崩
+        _empty_dir = _tmp / "requirements"
+        _empty_dir.mkdir(parents=True, exist_ok=True)
+        (_empty_dir / "deps_empty.txt").write_text("# 还没写包名\n", encoding="utf-8")
+        _em = _wf("empty.yml", (f"python .github/scripts/pip_install.py "
+                                f"-r {_empty_dir / 'deps_empty.txt'}",))
+        _got = gate.check_pip_source_resilience(workflows=(_em,), installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：空清单要恰好报一条（实际={_got}）")
+        _assert("一个包都没有" in _got[0], f"报的必须是清单内容为空（实际={_got[0][:60]}）")
+        # e) 清单路径由 Actions 表达式现拼：判据确认不了文件在不在，等于这一路没判
+        _expr = _wf("expr.yml", (r"python .github/scripts/pip_install.py "
+                                 r"-r .github/requirements/${{ matrix.os }}.txt",))
+        _got = gate.check_pip_source_resilience(workflows=(_expr,), installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：运行时才拼出来的清单路径要恰好报一条（实际={_got}）")
+        _assert("运行时才拼出来" in _got[0], f"报的必须是路径不可静态确认（实际={_got[0][:60]}）")
+        # f) 整条链压根不调安装器（新加一个 workflow 时最容易忘的一步）
+        _none = _wf("noinstaller.yml", ("echo 直接开始构建",))
+        _got = gate.check_pip_source_resilience(workflows=(_none,), installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：没调用安装器要恰好报一条（实际={_got}）")
+        _assert("没有调用 pip_install.py" in _got[0],
+                f"报的必须是这一路没人管冗余（实际={_got[0][:60]}）")
+        # g) 登记了 workflow 名字却文件不在：静默少判一条
+        _got = gate.check_pip_source_resilience(workflows=(".github/workflows/zz_absent.yml",),
+                                                installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：登记表里的文件不在位必须红，不能跳过（实际={_got}）")
+        _assert("没跑" in _got[0], f"报的要说明这条门在这份文件上从没执行（实际={_got[0][:60]}）")
+        # h) 两份 b2bcollect 各指一份清单：人肉同步就此回来，加一个包漏一处照样全绿
+        _other = _empty_dir.parent / "requirements" / "deps_other.txt"
+        _other.write_text("selenium\n", encoding="utf-8")
+        _wfwin = _wf("build-b2bcollect-win.yml",
+                     (f"python .github/scripts/pip_install.py -r {_REQ_OK}",))
+        _wfmac = _wf("build-b2bcollect-mac.yml",
+                     (f"python .github/scripts/pip_install.py -r {_other}",))
+        _got = gate.check_pip_source_resilience(workflows=(_wfwin, _wfmac),
+                                                installer_text=installer_src)
+        _assert_eq(len(_got), 1, f"反向对照：两个平台读不同清单要恰好报一条（实际={_got}）")
+        _assert("不是同一份" in _got[0], f"报的必须是「同一份清单」这件事破了（实际={_got[0][:70]}）")
+        # i) 注释顶替真调用：整份 workflow 只在 run 步的注释里提了一句 pip_install.py，
+        #    真正执行的行只有 echo。第一版判据是拿**整份 yml 文本** grep 的，这一份照样
+        #    报绿——同一族的另一半是 `-r` 也能被注释顶替（把不存在的清单说成在位）。这是
+        #    本轮夹具第一次验第 18 条时抓到的真缺陷（另一处由 docstring 顶替 --timeout，
+        #    见下面 5) 段），所以现在两路都只认 run 步里真会执行的行。
+        _cmt = _wf("comment.yml", ("# 为什么走 pip_install.py 而不是直接 pip：见门禁说明",
+                                   "# python .github/scripts/pip_install.py -r nope.txt",
+                                   "echo 假装装好了"))
+        _got = gate.check_pip_source_resilience(workflows=(_cmt,), installer_text=installer_src)
+        _assert_eq(len(_got), 1,
+                   f"反向对照：注释里的调用不算调用，要恰好报「没调用安装器」一条（实际={_got}）")
+        _assert("没有调用 pip_install.py" in _got[0],
+                f"报的必须是「没人管冗余」这件事（实际={_got[0][:60]}）")
+
+        # ── 5) 安装器文本反向对照：九种坏样子各拆一次，拆了就红 ────────────────
+        #    第 4 条与第 9/10 条是本轮夹具自己抓出来的：判据第一版拿整份文本 grep，
+        #    `install()` 的 docstring 里那句「没有 --timeout」就把删掉的参数顶替了（假绿），
+        #    现在两路都改读 ast 的字面值/去注释后的代码，注释再也替代码说不了话。
+        _MUT = (
+            (("INDEX_SOURCES = (\n"
+              '    ("pypi（pip 默认源）", ""),\n'
+              '    ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),\n'
+              '    ("阿里云", "https://mirrors.aliyun.com/pypi/simple/"),\n'
+              ")",
+              "INDEX_SOURCES = (\n"
+              '    ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),\n'
+              ")"),
+             "只有 1 个源", "整张表只剩一条路：单点可用性又回来了"),
+            (("    (\"清华\", \"https://pypi.tuna.tsinghua.edu.cn/simple\"),",
+              "    (\"清华镜像二号\", \"https://mirrors.aliyun.com/pypi/simple/\"),"),
+             "重复 URL", "看着两条路其实是一条"),
+            (("timeout=PER_SOURCE_TIMEOUT", "timeout=None"),
+             "timeout=PER_SOURCE_TIMEOUT", "挂住的源会把 job 拖到 Actions 超时"),
+            (('PIP_NET_FLAGS = ("--timeout", "30", "--retries", "2")',
+               'PIP_NET_FLAGS = ()'),
+             "--timeout", "单个连接自己就是无界的"),
+            (("stdin=subprocess.DEVNULL", "stdin=None"),
+             "stdin=DEVNULL", "pip 觉得需要答复就回头问人，后台没人答"),
+            (("    if len(INDEX_SOURCES) < 2:", "    if False:"),
+             "少了一道自守卫", "源被删到一条时 workflow 那边看不出来"),
+            (("        return 1\n    return 0", "        return 0\n    return 0"),
+             "没有 return 1", "只会逐源打印失败、退出码照样 0"),
+            (("    if not attempted:", "    if False:"),
+             "一个源都没试", "sources 为空时一次 pip 都没跑却被当成装上了"),
+            # 9/10 是把「写死的字面量」改成运行时拼出来的：判据读不到那张表就必须明说
+            # 读不到，而不是接着数出「0 个源」——数出来的那句会把人引去改源清单，
+            # 真要修的却是「这张表不再是字面量」。
+            (('PIP_NET_FLAGS = ("--timeout", "30", "--retries", "2")',
+              'PIP_NET_FLAGS = tuple(x for x in ("--timeout", "30", "--retries", "2"))'),
+             "读不到 PIP_NET_FLAGS 的字面值", "网络参数变成运行时拼出来的，判据只能读注释"),
+            (("    (\"清华\", \"https://pypi.tuna.tsinghua.edu.cn/simple\"),",
+              "    (\"清华\", str(\"https://pypi.tuna.tsinghua.edu.cn/simple\")),"),
+             "读不到 INDEX_SOURCES 的字面值",
+             "源清单里出现一次调用，整张表就不再是字面量了（判据只认写死的那份）"),
+        )
+        for (old, new), keyword, why in _MUT:
+            _assert(old in installer_src,
+                    f"夹具自证：安装器源码里得有 {old[:40]!r} 这一段，不然下面的反向对照是空跑")
+            _got = gate.check_pip_source_resilience(workflows=(_good,),
+                                                    installer_text=installer_src.replace(old, new))
+            _assert_eq(len(_got), 1,
+                       f"反向对照：{why}必须恰好报一条（实际={_got}）")
+            _assert(keyword in _got[0], f"报的必须点名 {keyword}（实际={_got[0][:70]}）")
+
+        # ── 6) 行为仿真：真起子进程跑 pip_install.install()，判据是调用序列 ─────────
+        #    上面两节判的是「话术与结构」，这一节判的是「真的那么跑没有」。假 pip 只记录
+        #    被叫到的顺序、带上的参数、按剧本决定成不成功/磨蹭多久——它一次网络都不碰，
+        #    所以这一节在无网 CI 上同样可靠。
+        spec = importlib.util.spec_from_file_location("_pip_install_sim", installer_path)
+        sim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sim)
+
+        def _fake_pip(plan: dict) -> Path:
+            script = _tmp / "fake_pip.py"
+            script.write_text(textwrap.dedent(f"""\
+                # -*- coding: utf-8 -*-
+                \"\"\"假 pip：把每次被调用的事实写进 calls.jsonl，再按剧本决定成败与耗时。\"\"\"
+                import json, sys, time
+                LOG = {str(_tmp / 'calls.jsonl')!r}
+                PLAN = {json.dumps(plan, ensure_ascii=False)!r}
+                a = sys.argv[1:]
+                url = a[a.index("-i") + 1] if "-i" in a else "(默认源)"
+                rc, _, nap = str(json.loads(PLAN).get(url, json.loads(PLAN).get("*", "0"))).partition(":")
+                with open(LOG, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({{
+                        "url": url,
+                        "flags": [x for x in a if x.startswith("--")],
+                        "reqs": [a[i + 1] for i, x in enumerate(a) if x == "-r"],
+                        "upgrade": "--upgrade" in a,
+                        "stdin": "tty" if sys.stdin.isatty() else repr(sys.stdin.read(1)),
+                    }}, ensure_ascii=False) + "\\n")
+                if nap:
+                    time.sleep(float(nap))
+                if int(rc):
+                    sys.stdout.write("Looking in indexes: " + url + "\\n")
+                    sys.stdout.write("ERROR: No matching distribution found for PyQt5 "
+                                     "(from versions: none)\\n")
+                sys.exit(int(rc))
+                """), encoding="utf-8")
+            return script
+
+        def _calls() -> list:
+            p = _tmp / "calls.jsonl"
+            if not p.is_file():
+                return []
+            out = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            p.unlink()
+            return out
+
+        _req = _empty_dir / "deps_sim.txt"
+        _req.write_text("requests\nselenium\n", encoding="utf-8")
+        _SRC3 = (("pypi（pip 默认源）", ""), ("清华", "https://tuna"), ("阿里", "https://ali"))
+
+        # a) 第一个源挂了要换下一个，且成功就早停（不许把三个源都装一遍）
+        _r = sim.install(requirements=(_req,), sources=_SRC3,
+                         pip=(sys.executable, str(_fake_pip({"(默认源)": "1", "https://tuna": "0"}))))
+        _c = _calls()
+        _assert_eq(_r, [], f"正例：默认源失败、清华成功，install 必须报「装上了」（实际={_r}）")
+        _assert_eq([x["url"] for x in _c], ["(默认源)", "https://tuna"],
+                   "回退按顺序试、装上就停（第三个源不该被叫到：白烧一遍下载时间）")
+        _assert(set(_c[1]["flags"]) >= {"--timeout", "--retries", "--no-input",
+                                        "--disable-pip-version-check"},
+                f"每次调用都真的带上网络参数（第 18 条的文本判据在字节上兑现，实际={_c[1]['flags']}）")
+        _assert_eq(_c[1]["reqs"], [str(_req)],
+                   f"清单是以 -r 传下去的（不是把包名重新拼回命令行，实际={_c[1]['reqs']}）")
+        _assert(all(x["stdin"] == "''" for x in _c),
+                f"子进程拿到的 stdin 必须是 EOF（问人就会挂住；第 12/11 条那一族的实证，"
+                f"实际={[x['stdin'] for x in _c]}）")
+
+        # b) 全挂才非零：三条路各留一句「它说了什么」，最后一句直接抄 pip 的原话
+        _r = sim.install(requirements=(_req,), sources=_SRC3,
+                         pip=(sys.executable, str(_fake_pip({"*": "1"}))))
+        _c = _calls()
+        _assert_eq(len(_r), 3, f"反向对照：三个源全挂必须逐源点名（实际={_r}）")
+        _assert_eq([x["url"] for x in _c], ["(默认源)", "https://tuna", "https://ali"],
+                   "全部试过一遍才允许判失败（少试一个源就报「全挂」是把结论押在猜上）")
+        _assert(all("No matching distribution found" in x for x in _r),
+                f"每条都要带上 pip 的最后一句原话，否则下一轮还是要人重新猜根因（实际={_r[0][:80]}）")
+
+        # c) 有界：一个源装到一半不响应，到点就换下一个，不许把 job 拖死
+        #    接缝（PER_SOURCE_TIMEOUT）在这里被真的喂进夹具现场：真跑 30 秒的慢源，
+        #    3 秒就该被踢掉——不是我把 900 这个数字读了一遍。
+        with _patch(sim, "PER_SOURCE_TIMEOUT", 3):
+            _t0 = time.monotonic()
+            _r = sim.install(requirements=(_req,),
+                             sources=(("慢", "https://slow"), ("快", "https://fast")),
+                             pip=(sys.executable, str(_fake_pip({"https://slow": "0:30",
+                                                                  "https://fast": "0"}))))
+            _spent = time.monotonic() - _t0
+        _c = _calls()
+        _assert_eq(_r, [], f"正例：慢源被超时踢掉之后，快源装上就算成功（实际={_r}）")
+        _assert_eq([x["url"] for x in _c], ["https://slow", "https://fast"],
+                   "慢源必须留下一次尝试记录，然后换下一个（没试过就说「换」是押注在猜上）")
+        _assert(_spent < 12,
+                f"整段必须在有界时间内结束：慢源剧本是 30 秒、上限 3 秒，实测 {_spent:.1f} 秒"
+                f"（接近 30 秒就说明 timeout 没生效，是等子进程自己跑完的）")
+
+        # d) 只有慢源时，超时要变成一句说得清的话，而不是空白的成功
+        with _patch(sim, "PER_SOURCE_TIMEOUT", 2):
+            _r = sim.install(requirements=(_req,), sources=(("慢", "https://slow"),),
+                             pip=(sys.executable, str(_fake_pip({"https://slow": "0:30"}))))
+        _calls()
+        _assert_eq(len(_r), 1, f"反向对照：唯一的源超时必须报一条（实际={_r}）")
+        _assert("超过" in _r[0] and "2 秒" in _r[0],
+                f"报的要写清等了多久、下一步是什么（实际={_r[0][:80]}）")
+
+        # e) fail-closed 三格：没有源、没有清单、清单为空——都不能被当成「装上了」
+        _r = sim.install(requirements=(_req,), sources=(), pip=(sys.executable, str(_fake_pip({"*": "0"}))))
+        _assert_eq([x["url"] for x in _calls()], [], "空源清单时一次 pip 都不许起（起了就是口径漂移）")
+        _assert(_r, "反向对照：一个源都没试绝不能返回空问题清单（空清单在调用方等于「装上了」）")
+        _r = sim.install(requirements=(_tmp / "nope.txt",), sources=_SRC3,
+                         pip=(sys.executable, str(_fake_pip({"*": "0"}))))
+        _assert_eq([x["url"] for x in _calls()], [],
+                   "反向对照：清单不在位时连网络都不该碰（先问文件在不在，再谈装什么）")
+        _assert(_r and "不在位" in _r[0], f"清单缺席要说得出口（实际={_r}）")
+        _r = sim.install(requirements=(_tmp / "requirements" / "deps_empty.txt",), sources=_SRC3,
+                         pip=(sys.executable, str(_fake_pip({"*": "0"}))))
+        _assert(_r and "一个包都没有" in _r[0], f"空清单要说得出口（实际={_r}）")
+        _r = sim.install(requirements=(), sources=_SRC3, pip=(sys.executable, str(_fake_pip({"*": "0"}))))
+        _calls()
+        _assert(_r and "不知道该装什么" in _r[0], f"既没清单也没包名时必须红（实际={_r}）")
+
+        # f) 退出码这一路真跑：main() 只认 install 的结果，成功 0 / 失败 1 / 源太少不干
+        with _patch(sim, "install", lambda **kw: ["夹具：所有源都失败"]):
+            _assert_eq(sim.main(["-r", str(_req)]), 1, "反向对照：全挂时退出码必须非零")
+        with _patch(sim, "install", lambda **kw: []):
+            _assert_eq(sim.main(["-r", str(_req)]), 0, "正例：装上时退出码为 0")
+        with _patch(sim, "INDEX_SOURCES", (("清华", "https://tuna"),)):
+            _assert_eq(sim.main(["-r", str(_req)]), 1,
+                       "反向对照：源少于两条时安装器自己就不干（不靠 workflow 替它守）")
+
+        # g) 差分实测：同一行 `sys.stdin.read(1)`，接 DEVNULL 拿到 EOF、接一根没人写的管道
+        #    就真的挂住。这一格是给上面那条 stdin=DEVNULL 判据**补证据**的：没有它，那句
+        #    判据的理由就还是我写在注释里的一句话，而不是实测。
+        _ask = _fake_pip({"*": "0"})
+        _t0 = time.monotonic()
+        _r = subprocess.run([sys.executable, str(_ask)], stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=20, encoding="utf-8", errors="replace")
+        _calls()
+        _assert_eq(_r.returncode, 0, "正例：DEVNULL 下假 pip 读完 EOF 就往下走")
+        _assert(time.monotonic() - _t0 < 5, "DEVNULL 那一次必须秒回（慢了就说明差分没跑起来）")
+        # 第一版这里我写的是 `subprocess.run(stdin=PIPE)` 不加 input，实测**不挂**：
+        # run() 走 communicate(input=None)，一进门就把写端关了，等于给了个更快的 EOF。
+        # 真形状要自己留着写端——这才是「后台那条路没人答」的现实（管道在、没人写、也没关）。
+        _hr, _hw = os.pipe()
+        _hp, _hang = None, False
+        try:
+            _hp = subprocess.Popen([sys.executable, str(_ask)], stdin=_hr,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                _hp.wait(timeout=2)
+                _hang = False                      # 2 秒内自己退了 = 根本没挂住
+            except subprocess.TimeoutExpired:
+                _hang = True
+        finally:
+            os.close(_hr)                          # 先把读端的父进程副本收掉
+            if _hp is not None:                    # Popen 自己炸了就不该再拿 AttributeError 掩盖它
+                if _hang:
+                    _hp.kill()
+                _hp.wait()                         # 不留孤儿进程
+            os.close(_hw)
+        _calls()
+        _assert(_hang,
+                "反向对照：没人应答的那根管道必须真的挂住——否则「pip 会回头问人」整条理由就"
+                "是空的，第 18 条的 stdin 判据也就成了押注在想象上的门")
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+    # ── 7) 清单覆盖（18e）反向对照：漏一个包、名字对不上、连带关系断掉，各红一次 ──
+    #    方向只有一个（代码里有 import 而清单里没有），反向不判：清单里的 pyinstaller 是
+    #    构建工具、xlrd 是被 pandas 间接读的，按「没 import 就删」判会得到一堆修不掉的假红。
+    _cov = _tmp / "coverage"
+    (_cov / "requirements").mkdir(parents=True, exist_ok=True)
+    _src_py = _cov / "mod_a.py"
+
+    def _cov_case(req_lines: tuple, src_text: str) -> list:
+        rq = _cov / "requirements" / "deps_cov.txt"
+        rq.write_text("".join(f"{x}\n" for x in req_lines), encoding="utf-8")
+        _src_py.write_text(textwrap.dedent(src_text), encoding="utf-8")
+        return gate.check_requirements_coverage(requirement_files=(str(rq),),
+                                                source_files=(_src_py,))
+
+    _assert_eq(_cov_case(("requests", "pillow", "beautifulsoup4", "websocket-client",
+                          "PyQt5"), "import requests\nfrom PIL import Image\nimport bs4\n"
+                                     "import websocket\nimport sip\nimport os\n"),
+               [], "正例：直名 + 三条别名 + 连带(sip←PyQt5) + stdlib 混在一起，全部放行")
+    _got = _cov_case(("requests",), "import requests\nimport pandas\n")
+    _assert_eq(len(_got), 1, f"反向对照：清单漏一个包要恰好报一条（实际={_got}）")
+    _assert("pandas" in _got[0] and "依赖清单" in _got[0],
+            f"报的要点名缺哪个包、该写进哪份文件（实际={_got[0][:80]}）")
+    _got = _cov_case(("PIL",), "from PIL import Image\n")
+    _assert_eq(len(_got), 1,
+               f"反向对照：清单里写 import 名（PIL）而不是发行名（pillow）也要报——"
+               f"装不上才是这一格的真语义（实际={_got}）")
+    _got = _cov_case(("pillow",), "from photo_import import x\n")
+    _assert_eq(len(_got), 1, f"反向对照：代码里的第三方名一个都对不上清单时报一条（实际={_got}）")
+    _assert("photo_import" in _got[0], f"报的必须是那个 import 名（实际={_got[0][:70]}）")
+    _got = _cov_case(("requests",), "import sip\n")
+    _assert(_got and "连带" in _got[0],
+           f"反向对照：连带关系的宿主不在清单里时，要报「连带关系断了」而不是「sip 没登记」"
+           f"（后者没法照做，实际={_got}）")
+    _got = _cov_case((), "import requests\n")
+    _assert(_got, f"反向对照：空清单上必须红（实际={_got}）")
+    _got = gate.check_requirements_coverage(requirement_files=(str(_cov / "nope.txt"),),
+                                            source_files=(_src_py,))
+    _assert(_got and "不在位" in _got[0], f"反向对照：清单文件不在位要说出口（实际={_got}）")
+    _got = gate.check_requirements_coverage(source_files=())
+    _assert(_got and "一个源文件都没扫到" in _got[0],
+            f"反向对照：扫不到任何源码时绝不能报「覆盖完全」（实际={_got}）")
+    _bad_py = _cov / "broken_syntax.py"
+    _bad_py.write_text("def (:\n", encoding="utf-8")
+    _assert_raises(SystemExit, lambda: gate._top_level_imports(_bad_py),
+                   "反向对照：源码读不进去时必须炸，不能安静少扫一个文件（少扫一个的下场是"
+                   "「✅ 全部覆盖」底下藏着一个从没被看过的模块）")
+
+
+def test_section_pointer_gate():
+    print("\n═══ AC. 注释里那句「见某套件 第 N 节」得走得通：第 19 条硬门 ═══")
+    # 由来（2026-11-13 本机自审）：把「择路不许跟着本机历史走」写进 tool_config 与
+    # runtime_paths 时，两边都补了一句「对拍判据见 test_data_dir_offline.py 第 10~13 节」，
+    # 而那个文件当时只编到第 9 节。清点下来一共 13 处这样的指路，全都指向从没写出来的小节；
+    # 顺着这份缺口查下去，_page_tail / _has_any_contact / CONTACT_RETRY_MAX / results_live
+    # 四个函数在**全部**离线套件里 0 覆盖——正是用户报「以前能采到、现在一直是 0」那条链上
+    # 的守卫缺口。
+    # 「判据在哪一节」这句话本身不是判据：读注释的人按节号走过去，找不到也只会以为是自己没
+    # 翻到。本节把那句话钉成可达性核对，并且先证明这条门**看得见新写法**（区间、并列、全角、
+    # 折行四种），再证明它不误报（句号断开、间距超限、套件自己的内部编号三格放行）。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 1) 接线：函数在、被 main() 调用、结果并进不合格计数、云端留下 annotation ──
+    for fn in ("check_section_pointer_references", "_expand_section_items",
+               "_load_ref_texts", "_load_ref_suites", "_ref_scan_text"):
+        _assert(callable(getattr(gate, fn, None)),
+                f"硬门模块里有 {fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("section_refs = check_section_pointer_references()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 19 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进不合格计数并影响退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::指路节号对拍" in gate_src[_at:_at + 1200],
+            "云端每条问题都要写成 annotation：这一步在 CI 上红的时候，日志里得能直接照做")
+    for d in gate.SECTION_REF_DIRS:
+        _assert((_REPO / d).is_dir(),
+                f"{d}：第 19 条登记了这份扫描目录却不在位（登记了却不判＝这条门安静空转，"
+                f"而日志照样打 ✅）")
+
+    # ── 2) 现状：当前仓库里每一句指路都真的走得通 ──
+    _assert_eq(gate.check_section_pointer_references(), [],
+               "第 19 条：交付链注释里的指路节号全部对得上真实小节")
+
+    # ── 3) 自证：全绿不是因为「什么都没扫到」。三个量都要有数：扫到的文本份数、被指路
+    #    一侧的套件、仓库里真实存在的指路条数。AB 节量过同一格——扫 0 个文件的「全覆盖」
+    #    是自欺，而这里更隐蔽：交付目录一旦改名，默认口径会扫到 0 份并照样报绿。
+    texts, load_problems = gate._load_ref_texts()
+    _assert_eq(load_problems, [], "扫描范围内没有读不进去的文件（读不到≠不用判）")
+    _assert(len(texts) >= 40,
+            f"扫描口径真的展开了（{len(texts)} 份文本）：份数掉下 40 就是目录口径和交付脱节了")
+    suites = gate._load_ref_suites(texts)
+    _assert("test_data_dir_offline.py" in suites,
+            "本轮补写小节的那份套件在「被指路」的一侧（不在＝那句指路谁也走不通）")
+    real_refs = sum(len(list(gate.SECTION_REF_RE.finditer(gate._ref_scan_text(t))))
+                    for rel, t in texts.items()
+                    if not rel.rsplit("/", 1)[-1].startswith(gate.TEST_PREFIX))
+    _assert(real_refs >= 10,
+            f"仓库里现役的指路注释有 {real_refs} 处：这条门看守的是正在被引用的话术，"
+            f"不是空表（数出 0 处却报 ✅ 与没有这条门等价）")
+
+    # ── 4) 展平口径：四种写法都要落到逐个节号上 ──
+    _assert_eq(gate._expand_section_items("10~13"), ["10", "11", "12", "13"],
+               "区间展平成每一个节号：只取两端会把中间那两节盖住，而本轮悬空的正是 10~13 整段")
+    _assert_eq(gate._expand_section_items("1、2、3、8"), ["1", "2", "3", "8"], "顿号并列逐个判")
+    _assert_eq(gate._expand_section_items("10、12"), ["10", "12"], "并列里缺哪个报哪个")
+    _assert_eq(gate._expand_section_items("１０"), ["10"], "全角数字折算半角（源码里两种都出现过）")
+    _assert_eq(gate._expand_section_items("13~10"), ["10", "11", "12", "13"],
+               "倒着写的区间不猜作者想说什么，两端都并进待验集合：当成只有一个数会把笔误盖住")
+    _assert_eq(gate._expand_section_items("7"), ["7"], "单号")
+    # 反向对照：第 19 条**初版**（只认单号与顿号）对历史原句不相——留这份旧口径在案，是为了
+    # 让下一位改正则的人看得见「加区间支持」这一步到底补上了什么，而不是只看见新口径全绿。
+    _old_re = re.compile(r"([A-Za-z0-9_]{4,}\.py)(?:(?!\.py)[^。；\n\"]){0,12}?第\s*"
+                         r"([0-9０-９]+(?:\s*[、,，]\s*[0-9０-９]+)*)\s*节")
+    _hist = "对拍判据见 test_data_dir_offline.py 第 10~13 节"
+    _assert(not _old_re.search(_hist),
+            "反向对照：旧口径对区间那句根本不相（若第 19 条没带区间展开，本轮悬空的那一句"
+            "照样会被安静放行——那正是它唯一要抓的东西）")
+    _assert(gate.SECTION_REF_RE.search(_hist), "新口径同一句要匹配得到（上面那条差分才成立）")
+
+    # ── 5) 夹具注入的正反对照：一句走不通的指路必须红，且要把缺的节逐个点名 ──
+    _SUITE_AC = "".join(f"# ── {i}. 第{i}节夹具 ──\nx{i} = {i}\n" for i in (1, 2, 3, 7))
+    _LETTER_AC = "# ═══ A. 甲 ═══\n\n# ═══ B. 乙 ═══\n"
+
+    def _case_ac(comment: str, suite_name: str = "test_fixture_ac.py",
+                 suite_body: str = _SUITE_AC) -> list:
+        """把一条注释喂给第 19 条：夹具自己拼，不依赖本机仓库状态（第 16/17 条同规矩）。"""
+        return gate.check_section_pointer_references(
+            texts={"pkg_ac/mod_ac.py": f"# {comment}\nx = 1\n"},
+            suites={suite_name: suite_body})
+
+    _assert_eq(_case_ac("择路口径的对拍见 test_fixture_ac.py 第 1 节"), [],
+               "正例：指到真实存在的节必须放行")
+    _got = _case_ac("择路口径的对拍见 test_fixture_ac.py 第 9 节")
+    _assert_eq(len(_got), 1, f"反向对照：悬空单号要恰好报一条（实际={_got}）")
+    _assert("第 9 节" in _got[0] and "[1, 2, 3, 7]" in _got[0],
+            f"报的要同时给出「指的是哪一节」和「那套件里实际有哪些节」（实际={_got[0]}）")
+    _got = _case_ac("接管三规矩见 test_fixture_ac.py 第 7~9 节")
+    _assert_eq(len(_got), 1, f"反向对照：区间右端越界要报一条（实际={_got}）")
+    _assert("第 8、9 节" in _got[0],
+            f"缺的两节要逐个点名，不能只说「区间越界」（实际={_got[0]}）")
+    _got = _case_ac("四节一起看 test_fixture_ac.py 第 1、2、3、8 节")
+    _assert("第 8 节" in (_got[0] if _got else ""),
+            f"反向对照：并列里缺哪一节就点哪一节（实际={_got}）")
+    _got = _case_ac("全角写法见 test_fixture_ac.py 第８节")
+    _assert_eq(len(_got), 1, f"反向对照：全角节号也要判到（旧写法在这里会静默放行）（实际={_got}）")
+    _got = _case_ac("指错文件见 test_nope_ac.py 第 1 节")
+    _assert_eq(len(_got), 1, f"反向对照：被指路的套件文件不在案要报一条（实际={_got}）")
+    _assert("没有这份文件" in _got[0], f"报的要是「文件不存在」而不是「节不存在」（实际={_got[0]}）")
+    _got = _case_ac("字母编号的套件见 test_fixture_ac.py 第 1 节", suite_body=_LETTER_AC)
+    _assert(_got and "用字母编的" in _got[0],
+            f"反向对照：数字指路撞到一份按字母编号的套件上必须红——那句「见第 1 节」"
+            f"在那里根本不存在（实际={_got}）")
+
+    # 折行：中文注释按列折行是常态，逐行匹配会把「折了行」当成「没引用」放过，而放过
+    # 的方向是漏报。这一格是把 _ref_scan_text 的存在理由钉成行为判据。
+    _got = gate.check_section_pointer_references(
+        texts={"pkg_ac/mod_ac.py": "# 择路口径的对拍见\n# test_fixture_ac.py 第\n"
+                                   "# 9 节，改动要两边一起\nx = 1\n"},
+        suites={"test_fixture_ac.py": _SUITE_AC})
+    _assert_eq(len(_got), 1, f"反向对照：折成三行的同一条指路也要抓到（实际={_got}）")
+    _assert("第 9 节" in _got[0], f"折行抓到之后报的仍是那一节（实际={_got[0]}）")
+
+    # 三条不许误报的口径。误报的代价和漏报一样：人开始跳过这一步（第 9 条同款教训）。
+    _assert_eq(_case_ac("这段说明在 test_fixture_ac.py。下一句才说第 9 节不存在"), [],
+               "放行：句号把话说断了，后半句和那份文件不是同一条指路")
+    _assert_eq(_case_ac("见 test_fixture_ac.py 里那份夹具自带的说明文字这里刻意"
+                        "把间距写到十二个字符以外 第 9 节"), [],
+               "放行：离得太远的「第 N 节」不是给这句 `.py` 指的路（收紧间距才不误伤叙述文字）")
+    _assert_eq(gate.check_section_pointer_references(
+        texts={"b2bcollect_build/test_fixture_ac.py": "# 内部编号见 test_fixture_ac.py 第 99 节\n"},
+        suites={"test_fixture_ac.py": _SUITE_AC}), [],
+        "放行：套件自己注释里的节号是本文件内部编号，改动时同文件一起改，不构成跨文件指路")
+
+    # ── 6) 本轮真发生过的那一次：一句「第 10~13 节」撞到只有 1~9 节的套件上 ──
+    _nine = "".join(f"# ── {i}. 第{i}节 ──\ny{i} = {i}\n" for i in range(1, 10))
+    _got = gate.check_section_pointer_references(
+        texts={"b2bcollect_build/tool_config.py":
+               "# 对拍判据见 test_data_dir_offline.py 第 10~13 节，改口径要两边一起\n"},
+        suites={"test_data_dir_offline.py": _nine})
+    _assert_eq(len(_got), 1, f"反向对照：本轮那 13 处里的任意一处形状都要红（实际={_got}）")
+    _assert("第 10、11、12、13 节" in _got[0],
+            f"缺的四节逐个点名，读的人才知道要补写哪几节（实际={_got[0]}）")
+    _assert("[1, 2, 3, 4, 5, 6, 7, 8, 9]" in _got[0],
+            f"要把那套件现有的节号一并印出来（实际={_got[0]}）")
+
+    # ── 7) fail-closed：扫描目录被改名 / 扫到 0 份文本时，这条门必须红而不是报绿 ──
+    with _patch(gate, "SECTION_REF_DIRS", ("nope_dir_ac",)):
+        _got = gate.check_section_pointer_references()
+    _assert(any("扫描目录" in x for x in _got),
+            f"反向对照：登记的扫描目录不在位要说出口（默认口径全靠这几个目录，静默少一路＝"
+            f"少一路没人知道）（实际={_got}）")
+    _assert(any("只读到 0 份" in x for x in _got),
+            f"反向对照：一份文本都没扫到时绝不能报「全部走得通」（实际={_got}）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -6504,6 +7167,8 @@ SECTIONS = (
     test_batch_state_watch_gate,
     test_errexit_silent_death_gate,
     test_case_insensitive_filesystem_gate,
+    test_pip_source_resilience_gate,
+    test_section_pointer_gate,
 )
 
 

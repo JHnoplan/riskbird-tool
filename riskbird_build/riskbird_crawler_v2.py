@@ -223,6 +223,16 @@ class RiskBirdCrawlerV2:
         with self.results_lock:
             return [dict(r) for r in self.results]
 
+    def results_live(self):
+        """收尾阶段**就地补字段**用的实时视图（返回 results 里的原字典，不是副本）。
+
+        口径与 b2bcollect_build/cdp_base.py 的同名方法一致：官网回采联系方式必须
+        写回真身，整体替换 results 会把并发 append 盖掉；只在采集线程已结束的
+        收尾阶段用。对拍见 test_data_dir_offline.py 第 15 节。
+        """
+        with self.results_lock:
+            return list(self.results)
+
     # ── 登录态确认 ──
     def _emit_blocked(self, reason: str):
         if self.signals:
@@ -403,52 +413,21 @@ class RiskBirdCrawlerV2:
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
 
-            # 使用 Chrome 配置文件保持登录状态
-            # Mac 上直接用原始配置会锁定冲突，使用临时副本
-            if sys.platform == "darwin":
-                temp_profile = Path("/tmp/chrome_debug_profile")
-                original_profile = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-                
-                # 检查临时配置是否有效（存在且 Cookies 文件大小合理）
-                profile_valid = False
-                if temp_profile.exists() and (temp_profile / "Default" / "Cookies").exists():
-                    cookies_size = (temp_profile / "Default" / "Cookies").stat().st_size
-                    if cookies_size > 10000:  # 至少 10KB，避免空文件
-                        profile_valid = True
-                    else:
-                        self._log(f"临时配置 Cookies 文件过小({cookies_size}字节)，重新复制...")
-                
-                if profile_valid:
-                    opts.add_argument(f"--user-data-dir={temp_profile}")
-                    opts.add_argument("--profile-directory=Default")
-                    self._log("使用 Chrome 临时配置（登录态）")
-                elif os.path.exists(original_profile):
-                    # 重新复制配置
-                    import shutil
-                    if temp_profile.exists():
-                        shutil.rmtree(temp_profile, ignore_errors=True)
-                    self._log("正在复制 Chrome 配置...")
-                    try:
-                        shutil.copytree(original_profile, str(temp_profile), dirs_exist_ok=True)
-                        opts.add_argument(f"--user-data-dir={temp_profile}")
-                        opts.add_argument("--profile-directory=Default")
-                        self._log("Chrome 配置已重新复制（登录态）")
-                    except Exception as e:
-                        self._log(f"复制配置失败: {e}，使用默认配置")
-                else:
-                    self._log("未找到 Chrome 配置，使用默认配置")
+            # 登录态配置目录：落点、老目录接管、副本刷新三件事全交给 runtime_paths 一处
+            # （旧写法分 Mac/Windows 两支各写一遍「Cookies 太小或目录不存在才重复制」，
+            # 真实浏览器里重新登录之后副本永不刷新；与企知道还共用同一个 chrome_debug_profile,
+            # 同一时间只能被一个 Chrome 实例占用，第二路上去就撞单实例锁。口径见
+            # runtime_paths.login_chrome_profile）
+            temp_profile, refreshed = runtime_paths.login_chrome_profile(
+                "chrome_riskbird_profile",
+                legacy_dirs=[Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile",
+                             Path("/tmp/chrome_debug_profile")])
+            opts.add_argument(f"--user-data-dir={temp_profile}")
+            opts.add_argument("--profile-directory=Default")
+            if refreshed:
+                self._log("已从 Chrome 刷新登录态副本（真实浏览器里的登录更新过了）")
             else:
-                # Windows: 复制 Chrome 配置到临时目录，避免单实例锁冲突
-                chrome_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-                temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile"
-                if os.path.exists(chrome_profile):
-                    import shutil
-                    if not temp_profile.exists():
-                        self._log("正在复制 Chrome 配置...")
-                        shutil.copytree(chrome_profile, str(temp_profile), dirs_exist_ok=True)
-                    opts.add_argument(f"--user-data-dir={temp_profile}")
-                    opts.add_argument("--profile-directory=Default")
-                    self._log("使用 Chrome 配置（登录态）")
+                self._log(f"使用 Chrome 配置（{runtime_paths.profile_login_state(temp_profile)}）")
 
             # 使用本地 ChromeDriver（避免版本不匹配，更避免每次联网向 Selenium Manager 查版本）
             self.driver = chrome_driver.create(opts, self._log)

@@ -267,6 +267,12 @@ def source_for(key: str) -> str:
 # 更糟的是只读时会直接抛 OSError。判据与 cdp_base/site_adapters 的持久目录同口径。
 
 _STATE_DIR_ENV_VAR = "B2B_STATE_DIR"
+# 数据目录的指定落点开关（**容器目录**：每个消费者在其下各占一个 ``<name>`` 子目录）。
+# 这一档以前只有 riskbird 那一侧有（``runtime_paths.DATA_DIR_ENV_VAR``），CDP 那 12 路
+# 的种子库与 Cookie 压根没有开关可用——症状是「远程排障说要指一个目录看看，指了不生效」，
+# 以及更实际的：离线套件想把自己写的字节钉出仓库，只有半边能钉。两边现在是同一个语义：
+# 指了就是唯一答案，不再往下探候选链（口径对拍见 test_data_dir_offline.py 第 10 节）。
+DATA_DIR_ENV_VAR = "B2B_COLLECT_DATA_DIR"
 
 # 持久状态容器的目录名：所有「按文件名落盘的运行期数据」共用这一级（缓存、审计日志、
 # 列映射历史、自检报告）。写成常量而不是散落字面量，是为了让 state_file 的退路也能
@@ -340,6 +346,265 @@ def is_protected_user_dir(path) -> bool:
     except Exception:
         paths = (Path(str(path)),)
     return any(_protected_first_segment(p, h) in names for h in homes for p in paths)
+
+
+# ── 择路口径：顺序即优先级，落点只由**形态**决定 ────────────────────────────
+# 与 ``riskbird_build/runtime_paths.py`` 同名同语义（两份实现是本项目明知并接受的形状，
+# 理由见那个文件的模块 docstring；对拍判据在 test_data_dir_offline.py 第 10、12 节）。
+# 这一处管的是 b2bcollect 侧的三条链：数据目录（cdp_base）、状态目录（本文件
+# ``state_dir``）、浏览器配置目录（shared_chrome）。
+# 曾经有过一版「谁手里已经有文件就选谁」，本轮改掉的原因不是它不好心，而是它把
+# 「这台机器以前发生过什么」当成了落点的一部分：开发机上 ``~/.b2bcollect`` 里只要有过
+# 往留下的任何一个文件，「打包态数据优先落在程序同级（看得见、也拷得走）」这条硬判据
+# 就当场红，而换一台干净机器又绿——同一份包在两台电脑上数据住在两个地方，用户拷走工具
+# 目录就拷不走数据，正是本项目立过无数次判据要防的那件事。
+# 不可再生数据（Cookie、种子库、登录态）的「升级之后还在」因此挪到**显式接管**这一步：
+# 见 :func:`adopt_missing_files` 与 :func:`browser_profile_dir`。
+HOUSEKEEPING_FILES = {".write_test", ".DS_Store", "desktop.ini", "Thumbs.db"}
+# 一次接管的上限：文件数与单文件体积。数据目录里正常只有几个 Cookie 与种子库 json，
+# 撞到上限说明这个「老落点」根本不是本工具的目录（用户把环境变量指到了一堆无关文件上），
+# 那种时候宁可少接也要停下来，别把别人的目录复制进落点。
+ADOPT_MAX_FILES = 200
+ADOPT_MAX_BYTES = 512 * 1024 * 1024
+# 本进程接管过哪些文件（``<老目录> -> <文件名>``）：接管必须留得下账，
+# 「悄悄接完不吭声」和「接没接上」是同一类故障的两种收场。
+ADOPTED: list = []
+PROFILE_ENV_VAR = "B2B_CHROME_PROFILE_DIR"
+PROFILE_LOGIN_MARKER = ("Default/Cookies",)
+PROFILE_SKIP_PATTERNS = ("Cache", "Code Cache", "GPUCache", "Service Worker",
+                         "DawnCache", "DawnGraphiteCache", "GrShaderCache", "ShaderCache",
+                         "IndexedDB", "File System", "Platform Notifications",
+                         "Origin Trials", "Trust Tokens", "blob_storage", "Download Service",
+                         "optimization_guide_model_store", "AutofillAiModelCache",
+                         "SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def holds_tool_data(d: Path, markers: tuple = ()) -> bool:
+    """这个候选目录里是不是已经有本工具写过的东西（接管判据用它，落点本身不用它）。
+
+    ``markers`` 非空时按「目录下的相对路径」逐个查：浏览器配置目录不能只看「有没有
+    文件」——一次崩溃后的半截 profile 里也有几十个 json，真正说明「这里登录过」的是
+    ``Default/Cookies`` 那一个 SQLite。
+    """
+    try:
+        if markers:
+            return any((d / m).is_file() for m in markers)
+        return any(p.is_file() and p.name not in HOUSEKEEPING_FILES
+                   for p in d.iterdir())
+    except Exception:
+        return False
+
+
+def choose_writable(cands, markers: tuple = ()):
+    """候选链里第一个**真能写**的目录；``markers`` 保留给调用方做接管判据，不参与择路。
+
+    一个都写不进去时返回 ``None``——那是「这台机器连落点都给不出」的结论，必须由调用方
+    自己决定退路（状态目录退用户目录、配置目录退持久位置），而不是在这里替它挑一个
+    写不进去的目录：上一轮 Mac 崩在启动那一下的同一种收场，就是「择路函数把不可写的
+    目录原样返回，调用方一句 mkdir 就炸」。
+    """
+    for d in cands:
+        if probe_writable(d):
+            return d
+    return None
+
+
+def adopt_missing_files(srcs, dst) -> list:
+    """新落点还是空的、而某个老落点里已经有数据时，把那些文件**复制**过来。
+
+    三条硬规矩，都是为了「接管」这两个字不许顺手变成「搬家」或「合并」：
+      · 只在新落点真的没有过一个像样文件时动手（:func:`holds_tool_data` 为空）——
+        新落点已经在被使用，就说明现役数据在那儿，往里面倒旧数据只会把最新的盖掉；
+      · 只补缺、绝不覆盖同名文件，绝不删源：老位置很可能还躺着另一个版本的工具在用；
+      · 只搬顶层普通文件，不递归：数据目录里全是平铺的 Cookie/种子库，递归合并会把
+        「接了三份 Cookie」说成「搬了一次家」，出问题时谁也讲不清接了什么。
+    返回复制过来的 ``"源 -> 文件名"`` 列表，并累计进模块级 ``ADOPTED`` 台账。
+    """
+    out = []
+    import shutil
+    try:
+        dst = Path(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        if holds_tool_data(dst):
+            return out
+        have = {p.name for p in dst.iterdir()}
+    except Exception:
+        return out
+    for src in srcs:
+        try:
+            src = Path(src)
+            if src == dst or src.resolve() == dst.resolve():
+                continue
+            for p in sorted(src.iterdir()):
+                try:
+                    if not p.is_file() or p.name in have or p.name in HOUSEKEEPING_FILES:
+                        continue
+                    if p.stat().st_size > ADOPT_MAX_BYTES or len(out) >= ADOPT_MAX_FILES:
+                        continue
+                    shutil.copy2(str(p), str(dst / p.name))
+                    have.add(p.name)
+                    out.append(f"{src} -> {p.name}")
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    ADOPTED.extend(out)
+    return out
+
+
+def durable_profile_root() -> Path:
+    """用户级持久配置的根：Windows 用 %LOCALAPPDATA%，其余用 ``~/.b2bcollect``。
+
+    不用 ``%APPDATA%``（roaming 剖面在域环境里跟着账号在网络盘上漂），也不用
+    ``%PROGRAMDATA%``（机器级=同一台电脑上别的账号能读到你的付费账号会话，那是合规
+    问题不是便利问题）。与 runtime_paths 同名函数同口径。
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        # Windows 上没有「点开头=隐藏」这层约定，留着 ``.b2bcollect`` 只会让用户在资源
+        # 管理器里找一个不像目录名的目录。类 Unix 那一侧仍用同一个隐藏容器名，两边共用
+        # 一个派生式而不是各写一个字面量——两份实现各写一遍正是本轮对拍要抓的形状。
+        return Path(base) / USER_CONFIG_DIR_NAME.lstrip(".")
+    return Path.home() / USER_CONFIG_DIR_NAME
+
+
+def adopt_profile(src: Path, dst: Path) -> bool:
+    """把老位置的登录态**复制**到新位置：只复制、绝不删源，失败就继续用老位置。
+
+    不用 ``os.rename``：老位置很可能正被一个活着的 Chrome 占着（单实例锁），跨卷的
+    rename 本来也会退化成复制；复制坏一半比「还在用老位置」糟得多。
+    """
+    import shutil
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(src), str(dst),
+                        ignore=shutil.ignore_patterns(*PROFILE_SKIP_PATTERNS),
+                        dirs_exist_ok=True)
+        return holds_tool_data(dst, PROFILE_LOGIN_MARKER)
+    except Exception:
+        return False
+
+
+def browser_profile_dir(name: str, legacy_dirs=()) -> Path:
+    """浏览器配置目录（登录态真正的家）的落点：持久位置优先，老位置有登录态就先接过来。
+
+    为什么这件事值得单独有一处口径（2026-11-13 Windows 实机）：配置目录原先写在
+    ``%TEMP%`` 里，而 TEMP 有三条与「登录态要活多久」完全相反的性质——每个用户各一份
+    （换 Windows 账号=换目录）、清理程序随时可删（磁盘清理/存储感知默认就会动它）、
+    注销即弃。症状不是报错，是「需要登录的那几路（1688/企知道/爱企查）一家都采不到，
+    不需要登录的八站照常出数」——从日志上完全看不出和登录有关，所以这条纪律必须由
+    代码保证，而不是由下一次排查的运气保证。
+    """
+    name = str(name or "chrome_profile")
+    env_dir = str(os.environ.get(PROFILE_ENV_VAR) or "").strip()
+    if env_dir:
+        return Path(env_dir) / name
+    new = durable_profile_root() / name
+    legacy = [Path(str(x)) for x in legacy_dirs if x]
+    if not holds_tool_data(new, PROFILE_LOGIN_MARKER):
+        # 老位置里登录过就先**复制**过来再走持久位置：接管不改变落点，只是把登录态
+        # 搬进那个确定的落点（口径见文件头的「择路口径」注释）。
+        src = next((d for d in legacy if holds_tool_data(d, PROFILE_LOGIN_MARKER)), None)
+        if src is not None:
+            if adopt_profile(src, new):
+                ADOPTED.append(f"{src} -> （整个 Chrome 配置目录）")
+            elif probe_writable(src):
+                # 接不过来就继续用老位置：登录态比「落点统一」重要得多。静默换成一个
+                # 空 profile 的表现为「今天怎么又要扫码登录」，与用户报的那条一模一样。
+                return src
+    chosen = choose_writable([new] + legacy)
+    if chosen is None:
+        # 一个候选都写不进去：仍报持久位置那一级。这里不返回 None 是因为调用方在
+        # 「启动 Chrome」那条链上，它要的是一个路径而不是一个结论；真写不进去时
+        # Chrome 会在自己的日志里把原因说出来，比在这里静默换一个目录诚实。
+        return new
+    return chosen
+
+
+def real_chrome_profile():
+    """用户自己那个 Chrome 的「User Data」目录；没有就返回 None（没装 Chrome 的机器）。
+
+    与 ``riskbird_build/runtime_paths.real_chrome_profile`` 同名同口径（对拍见
+    test_data_dir_offline.py 第 12 节）：判据用 ``Default/Cookies`` 在不在，而不是目录
+    在不在——装了 Chrome 从没开过的机器那个目录也存在，拿它当「有真实配置」会让刷新
+    每次启动都白跑一遍。
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        p = Path(base) / "Google" / "Chrome" / "User Data"
+    elif sys.platform == "darwin":
+        p = Path(os.path.expanduser("~/Library/Application Support/Google/Chrome"))
+    else:
+        p = Path(os.path.expanduser("~/.config/google-chrome"))
+    try:
+        return p if (p / PROFILE_LOGIN_MARKER[0]).is_file() else None
+    except Exception:
+        return None
+
+
+def cookies_mtime(d: Path) -> float:
+    try:
+        return (Path(d) / PROFILE_LOGIN_MARKER[0]).stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _safe_copy(src, dst, **kwargs):
+    """copytree 的单文件复制器：读不动的文件跳过而不是把整次复制带走。
+
+    用户的 Chrome 很可能正开着，``Default/Cookies`` 这类 SQLite 在 Windows 上是独占的：
+    一次 PermissionError 不该让「刷新登录态」整件失败，更不该把调用它的启动链路带崩。
+    """
+    import shutil
+    try:
+        shutil.copy2(src, dst, **kwargs)
+    except Exception:
+        pass
+
+
+def refresh_profile_from_real_chrome(dst: Path, src=None) -> bool:
+    """真实 Chrome 里的登录态**比工具那份新**时刷进工具那份；否则一行都不动。
+
+    老写法是「目标目录不存在才复制」，那份副本从此**永不刷新**：用户在浏览器里重新登录、
+    续了期，工具还在用几周前那份过期 Cookie，站点当它未登录，界面上的表现是「这一路今天
+    一家都没采到」，而日志里连一句「我在用旧 Cookie」都没有。反向的风险同样真：工具里
+    人工登录出来的会话不许被一份更旧的真实配置盖掉，所以**只在源更新时才刷**。口径与
+    runtime_paths 同名函数一致（两份实现的由来见 runtime_paths 模块 docstring）。
+    """
+    import shutil
+    src = real_chrome_profile() if src is None else Path(str(src))
+    try:
+        if not src or not (src / PROFILE_LOGIN_MARKER[0]).is_file():
+            return False
+        dst = Path(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        if cookies_mtime(dst) >= cookies_mtime(src):
+            return False
+        shutil.copytree(str(src), str(dst), dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(*PROFILE_SKIP_PATTERNS),
+                        copy_function=_safe_copy)
+        return holds_tool_data(dst, PROFILE_LOGIN_MARKER)
+    except Exception:
+        return False
+
+
+def profile_login_state(d: Path) -> str:
+    """一句人话说明这个配置目录里的登录态状态（渠道体检日志用，绝不抛异常）。
+
+    Cookie 的**年龄**是这一句里最有用的那半个信息：1688/企知道/爱企查 掉登录时界面上
+    没有任何报错，只有「这一路今天一家都没采到」，而「目录里有 Cookies」这句话证明不了
+    那份 Cookie 还被站点认。把它写进日志，下一次排查就不用再靠猜。口径与
+    runtime_paths 同名函数一致。
+    """
+    import time
+    try:
+        ck = Path(d) / PROFILE_LOGIN_MARKER[0]
+        if not ck.is_file():
+            return "无登录态（目录里没有 Cookies）"
+        age = time.time() - ck.stat().st_mtime
+        return f"有登录态（Cookies 距今 {int(age // 86400)} 天 / {int(age % 86400 // 3600)} 小时）"
+    except Exception:
+        return "登录态未知（目录读不到）"
 
 
 def call_bounded(fn, timeout: float = BOUNDED_WAIT_SECONDS):
@@ -664,6 +929,20 @@ def reveal_in_finder(paths) -> bool:
     return ok
 
 
+def env_data_dir(name: str) -> Optional[Path]:
+    """数据目录的指定落点（环境变量 ``B2B_COLLECT_DATA_DIR``）：给了就是唯一答案。
+
+    容器语义与 ``runtime_paths.candidate_dirs`` 里那一档 ``B2B_RISKBIRD_DATA_DIR`` 逐字
+    一致：一个开关、下面每个消费者各占一个 ``<name>`` 子目录，多个采集器共用也不会把
+    Cookie 与种子库混进同一个文件夹。这一侧以前没有这个开关——12 路 CDP 采集器的种子库
+    因此没有任何办法被钉出仓库，「想指一个目录看看」与「压根指不了」在日志里是同一句话。
+    指定落点**不过**受保护目录那道滤：那是排障与回归用例显式说出来的，指了照办，否则
+    「我明明指了目录」与「实际写在别处」又成了两句互相矛盾的说法（同 runtime_paths）。
+    """
+    env_dir = str(os.environ.get(DATA_DIR_ENV_VAR) or "").strip()
+    return Path(env_dir) / str(name or "") if env_dir else None
+
+
 def state_dir_candidates(subdir: str = "") -> List[Path]:
     """状态目录的候选链（按优先级，不保证可写、也不保证存在）。
 
@@ -714,9 +993,15 @@ def state_dir(subdir: str = "") -> Path:
     env_dir = str(os.environ.get(_STATE_DIR_ENV_VAR) or "").strip()
     if env_dir:
         return Path(env_dir) / (subdir or "")
-    for d in state_dir_candidates(subdir):
-        if probe_writable(d):
-            return d
+    # 择路只看「顺序 + 真能写」：审计日志、列映射历史与 30 天卡片缓存住哪儿由形态决定，
+    # 不由「这台机器以前跑过什么」决定（原因见文件头那段择路口径）。老落点里已有的
+    # 文件在新落点还是空目录时**复制**过来，历史因此不会每次换落点就归零，而落点本身
+    # 仍然是那一个确定的目录。
+    cands = state_dir_candidates(subdir)
+    chosen = choose_writable(cands)
+    if chosen is not None:
+        adopt_missing_files([d for d in cands if d != chosen], chosen)
+        return chosen
     # 全链路都写不进去（极端环境）：仍报用户目录那一级，由调用方的写失败播报去说这件事
     name = STATE_DIR_NAME
     if subdir:

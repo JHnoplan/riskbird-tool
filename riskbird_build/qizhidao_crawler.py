@@ -135,6 +135,16 @@ class QiZhiDaoCrawler:
         with self.results_lock:
             return [dict(r) for r in self.results]
 
+    def results_live(self):
+        """收尾阶段**就地补字段**用的实时视图（返回 results 里的原字典，不是副本）。
+
+        口径与 b2bcollect_build/cdp_base.py 的同名方法一致：官网回采联系方式必须
+        写回真身，整体替换 results 会把并发 append 盖掉；只在采集线程已结束的
+        收尾阶段用。对拍见 test_data_dir_offline.py 第 15 节。
+        """
+        with self.results_lock:
+            return list(self.results)
+
     def _emit_blocked(self, reason: str):
         if self.signals:
             try:
@@ -481,35 +491,20 @@ class QiZhiDaoCrawler:
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             opts.add_experimental_option("useAutomationExtension", False)
 
-            # 使用 Chrome 配置文件保持登录状态
-            if sys.platform == "darwin":
-                temp_profile = Path("/tmp/chrome_debug_profile")
-                original_profile = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-                if temp_profile.exists() and (temp_profile / "Default" / "Cookies").exists():
-                    opts.add_argument(f"--user-data-dir={temp_profile}")
-                    opts.add_argument("--profile-directory=Default")
-                    self._log("使用 Chrome 临时配置（登录态）")
-                elif os.path.exists(original_profile):
-                    import shutil
-                    if temp_profile.exists():
-                        shutil.rmtree(temp_profile, ignore_errors=True)
-                    self._log("正在复制 Chrome 配置...")
-                    shutil.copytree(original_profile, str(temp_profile), dirs_exist_ok=True)
-                    opts.add_argument(f"--user-data-dir={temp_profile}")
-                    opts.add_argument("--profile-directory=Default")
-                    self._log("使用 Chrome 配置（登录态）")
+            # 登录态配置目录：落点、老目录接管、副本刷新三件事全交给 runtime_paths 一处
+            # （旧写法在这里分 Mac/Windows 两支各写一遍「目录不存在才复制」，副本从此永不
+            # 刷新，且与风鸟共用同一个 chrome_debug_profile——同一时间只能被一个 Chrome
+            # 实例占用，第二路上去就撞单实例锁；口径见 runtime_paths.login_chrome_profile）
+            temp_profile, refreshed = runtime_paths.login_chrome_profile(
+                "chrome_qizhidao_profile",
+                legacy_dirs=[Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile",
+                             Path("/tmp/chrome_debug_profile")])
+            opts.add_argument(f"--user-data-dir={temp_profile}")
+            opts.add_argument("--profile-directory=Default")
+            if refreshed:
+                self._log("已从 Chrome 刷新登录态副本（真实浏览器里的登录更新过了）")
             else:
-                # Windows: 复制 Chrome 配置到临时目录，避免单实例锁冲突
-                chrome_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-                temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile"
-                if os.path.exists(chrome_profile):
-                    import shutil
-                    if not temp_profile.exists():
-                        self._log("正在复制 Chrome 配置...")
-                        shutil.copytree(chrome_profile, str(temp_profile), dirs_exist_ok=True)
-                    opts.add_argument(f"--user-data-dir={temp_profile}")
-                    opts.add_argument("--profile-directory=Default")
-                    self._log("使用 Chrome 配置（登录态）")
+                self._log(f"使用 Chrome 配置（{runtime_paths.profile_login_state(temp_profile)}）")
 
             # 使用本地 ChromeDriver（避免每次联网向 Selenium Manager 查版本）
             self.driver = chrome_driver.create(opts, self._log)

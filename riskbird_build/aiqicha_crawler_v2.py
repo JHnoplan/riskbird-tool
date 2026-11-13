@@ -155,6 +155,16 @@ class AiQiChaCrawlerV2:
         with self.results_lock:
             return [dict(r) for r in self.results]
 
+    def results_live(self):
+        """收尾阶段**就地补字段**用的实时视图（返回 results 里的原字典，不是副本）。
+
+        口径与 b2bcollect_build/cdp_base.py 的同名方法一致：官网回采联系方式必须
+        写回真身，整体替换 results 会把并发 append 盖掉；只在采集线程已结束的
+        收尾阶段用。对拍见 test_data_dir_offline.py 第 15 节。
+        """
+        with self.results_lock:
+            return list(self.results)
+
     def _emit_blocked(self, reason: str):
         if self.signals:
             try:
@@ -482,38 +492,25 @@ class AiQiChaCrawlerV2:
             pass
     
     def _get_temp_profile(self):
-        """获取临时 Chrome 配置目录（只复制必要文件，跳过缓存加速）"""
-        if sys.platform == "win32":
-            real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-            temp_profile = Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile"
-        else:
-            real_profile = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-            temp_profile = Path("/tmp/aiqicha_chrome_profile")
-        
-        # 如果临时配置不存在或损坏，从真实配置复制
-        cookies_file = temp_profile / "Default" / "Cookies"
-        if not temp_profile.exists() or (cookies_file.exists() and cookies_file.stat().st_size < 1000):
-            if os.path.exists(real_profile):
-                self._log("正在准备 Chrome 配置（仅复制必要文件，跳过缓存）...")
-                if temp_profile.exists():
-                    shutil.rmtree(str(temp_profile), ignore_errors=True)
-                
-                # 只复制必要文件，跳过巨大的缓存目录
-                skip_patterns = [
-                    "SingletonLock", "SingletonSocket", "SingletonCookie",
-                    "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    "DawnCache", "GrShaderCache", "ShaderCache",
-                    "IndexedDB", "File System", "Platform Notifications",
-                    "Network", "Origin Trials", "Trust Tokens",
-                    "optimization_guide_model_store",
-                ]
-                shutil.copytree(
-                    real_profile, str(temp_profile),
-                    ignore=shutil.ignore_patterns(*skip_patterns)
-                )
-                self._log("Chrome 配置准备完成")
-        
-        return str(temp_profile)
+        """爱企查用的 Chrome 配置目录：落点与「继承真实 Chrome 登录态」全交给 runtime_paths。
+
+        旧写法有三处都是本轮实测换来的：①目录钉在 ``%TEMP%\\aiqicha_chrome_profile``，
+        换一个 Windows 账号就换一个目录、清理程序一删就没，界面上的表现是「爱企查补采 0 家」
+        而不是任何报错；②只在「目录不存在」时才从真实 Chrome 复制一次，副本从此**永不刷新**
+        ——用户在浏览器里重新登录、续期，工具还在拿几周前那份过期 Cookie；③复制用裸
+        ``copytree``，用户的 Chrome 正开着时被锁住的文件会把整段带走。现在三件事都由
+        :func:`runtime_paths.login_chrome_profile` 一处管：持久位置 + 老位置登录态接管 +
+        「真实 Chrome 更新才刷」的副本刷新。
+        """
+        legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile",
+                  Path("/tmp/aiqicha_chrome_profile")]
+        profile, refreshed = runtime_paths.login_chrome_profile(
+            "chrome_aiqicha_profile", legacy_dirs=legacy)
+        if refreshed:
+            self._log("已从 Chrome 刷新登录态副本（真实浏览器里的登录更新过了）")
+        elif not (profile / "Default" / "Cookies").is_file():
+            self._log("⚠ 爱企查配置目录里还没有登录态：若本页弹出未登录，请在浏览器窗口里登录一次")
+        return str(profile)
     
     def start_browser(self, headed: bool = True, attach: bool = False):
         """启动浏览器（自动管理 Chrome 进程）

@@ -229,7 +229,7 @@ class AipageCrawler(CdpSiteCrawler):
             if not entries:
                 self._log(f"  「{kw}」第 {page} 页无公司结果，停止翻页")
                 return
-            new = skipped = 0
+            new = skipped = seen = 0
             for e in entries:
                 mid = e["公司ID"]
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -237,6 +237,8 @@ class AipageCrawler(CdpSiteCrawler):
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 早过滤只用产品信号（prodTag 弱信号时 fail-open），判定交给详情复核
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
@@ -253,7 +255,7 @@ class AipageCrawler(CdpSiteCrawler):
                 new += 1
                 yield e
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 家，新增 {new}"
-                      + (f"，早过滤 {skipped}" if skipped else ""))
+                      + self._page_tail(skipped, seen))
             if new == 0:
                 stale += 1
                 if stale >= 2:

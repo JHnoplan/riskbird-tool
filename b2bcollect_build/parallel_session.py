@@ -40,7 +40,9 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     import customer_library_cleaner as _cleaner
 
-from cdp_base import clean_cell, CdpSiteCrawler
+from cdp_base import clean_cell, CdpSiteCrawler, strict_keyword_filter
+# 官网回采联系方式的唯一口径实现（采集收尾与手动补采都走它，不在本文件重复写判据）。
+import website_contact as _site_wc
 from mic_crawler import MicCrawler
 from b2b168_crawler import B2b168Crawler
 from qihuo11467_crawler import Qihuo11467Crawler
@@ -96,7 +98,7 @@ STATUS_ORDER = tuple(SITE_ORDER) + LIST_CHANNEL_SLUGS
 
 RAW_HEADERS = ["序号", "关键词", "公司名称", "联系人", "岗位", "电话", "手机", "邮箱",
                "地址", "主营产品", "经营模式", "所在区域", "公司网址", "详情URL", "memberId",
-               "数据来源", "采集时间", "状态"]
+               "数据来源", "采集时间", "状态", _site_wc.SITE_MARK]
 
 if HAS_PYQT:
     class SessionSignals(QObject):
@@ -135,6 +137,28 @@ class ParallelSession:
         # 续采靠它而不是靠 start_index——五个站并行推进速度不同，下标根对不齐。
         self._kw_ledger = {}
         self._last_keywords = []
+        # ── 官网回采联系方式（功能④）────────────────────────────────
+        # 采集结束后顺手去各家自己的官网把电话/邮箱补齐。判据全在 website_contact
+        # 一个模块里（证据分级/停放判定/SSRF 闸/合并去重），这里只管**何时跑、跑多久、
+        # 怎么把账说清楚**：预算封顶是因为收尾后面还挂着导出与入库，不能让它变成无底洞；
+        # 上限封顶是因为一张表可能有上万行，一轮只照顾最该照顾的那批（缺联系方式的）。
+        # 引擎层默认**关**、界面勾选默认**开**，这不是疏忽，是离线用例的护栏：
+        # 生产路径唯一入口是 GUI（它一定带 site_enrich= 下发），而十几个离线套件会直接
+        # new 一个会话跑 crawl()——默认开就等于「自称离线的用例真的联网开爬」，那是本项目
+        # 已经记过账的缺陷形态（2026-11-10 抓到过 ParallelSession(enabled=[]) 那类）。
+        self.site_enrich = False
+        self.site_enrich_budget = 12 * 60
+        self.site_enrich_workers = 6
+        self.site_enrich_limit = 800
+        # 清洗档位（功能⑤）：正常档＝只按联系方式四项全空剔；严格档＝再要求每行
+        # 「公司名+主营」正面命中关键词。判据与采集期同一份（cdp_base.relevance_hit），
+        # 差别只在严格档不 fail-open——入库交付是最后一道闸门，判不出就当不相关。
+        # 关键词依据两处：行自带「关键词」列 ∪（界面关键词框 / 本轮任务关键词）。
+        self.clean_strict = False
+        self.clean_keywords = []
+        self._strict_stats = None
+        self._site_enrich_stats = None   # 最近一轮账目（看板/日志/离线用例都读这一份）
+        self._user_stop = False          # 用户点过「停止」：收尾回采据此直接跳过
         self.task_folder = ""
         self.progress_path = ""
         self._lock = threading.RLock()
@@ -349,7 +373,8 @@ class ParallelSession:
 
     # ── 配置下发 ───────────────────────────────────────────────
     def configure(self, delay_between=None, max_pages=None, relevance_guard=None,
-                  incremental=None, max_records=None, province=None):
+                  incremental=None, max_records=None, province=None, site_enrich=None,
+                  clean_strict=None, clean_keywords=None):
         for c in self._active_crawlers():
             if delay_between is not None:
                 d = float(delay_between)
@@ -395,6 +420,16 @@ class ParallelSession:
             # 一家就能同时定属地＋补联系方式，比人工黑盒重试便宜。
             if hasattr(c, "province_unknown_sink"):
                 c.province_unknown_sink = self._unverified_sink
+        if site_enrich is not None:
+            # 回采开关是**会话级**的（它不属于任何一站，作用在合并后的结果集上），
+            # 所以不下发给各爬虫，只记在这里。下发点见 GUI 的 configure 调用。
+            self.site_enrich = bool(site_enrich)
+        # 清洗档位与会话同寿（不是「本轮参数」）：采集结束后再点清洗、导出、同步数据池
+        # 都要按同一档位走。界面勾选变化时也会即时写这里（单一写入口见 GUI _set_clean_strict）。
+        if clean_strict is not None:
+            self.clean_strict = bool(clean_strict)
+        if clean_keywords is not None:
+            self.clean_keywords = [str(k).strip() for k in clean_keywords if str(k).strip()]
         # 名单通道（企知道/风鸟/爱企查）：逐家查询没有翻页/相关性的概念，但属地关卡
         # 必须接上——它们不参与关键词并行、也不经过 cdp_base 漏斗，不拦就会把外省公司
         # 放进「清洗后入库数据」（企知道本轮就放进过 1 条浙江公司，属监管空白）。
@@ -556,6 +591,7 @@ class ParallelSession:
     def crawl(self, keywords, start_index=0):
         kws = [str(x).strip() for x in (keywords or []) if str(x).strip()]
         self._kw_count = len(kws)
+        self._user_stop = False      # 新一轮开始：上一轮的「停止」不该扣住本轮收尾回采
         with self._lock:
             self._last_keywords = list(kws)
         actives = self._active_crawlers()
@@ -691,6 +727,10 @@ class ParallelSession:
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
                       f"无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
                       f"早过滤 {s['early']}｜详情不相关 {s['filtered']}{pf}")
+        # 收尾回采官网联系方式（功能④）：放在**全部账目之后、crawl_finished 之前**——
+        # 界面是在 crawl_finished 上触发导出与入库的，回采晚一步就等于这批补值永远进不了
+        # 本轮交付文件；早一步则会在采集还没停稳时和野线程抢同一批记录。
+        self.enrich_websites(reason="采集收尾")
         self._emit("crawl_finished_signal")
 
     def _pending_keywords(self, crawler, keywords):
@@ -1367,6 +1407,106 @@ class ParallelSession:
                 out.extend(self.channels[slug].snapshot_results())
         return out
 
+    def _all_live_records(self):
+        """各通道结果的**原字典**列表（就地补字段只能拿原字典）。
+
+        为什么不能用 snapshot_results：那返回的是副本，写它等于写空气——采集结束时
+        导出的仍是爬虫自己那份，补到的号码一行都不会出现。那种「日志说补了 30 个号、
+        表格里一个也没有」的账对不上，比不补更糟。
+        results_live 是本轮新加的契约（各爬虫/适配器同名实现），没有它的老对象退回
+        snapshot_results，最多是这一路补不上值，绝不能让整个收尾轮抛异常。
+        """
+        out = []
+        for c in self._all_result_crawlers():
+            live = getattr(c, "results_live", None)
+            try:
+                out.extend(list(live()) if callable(live) else list(c.snapshot_results()))
+            except Exception as e:
+                self._log(f"⚠ {getattr(c, 'PLATFORM_NAME', '某一路')}结果视图取不到，"
+                          f"本轮跳过该路（{type(e).__name__}）")
+        return out
+
+    def enrich_websites(self, reason="采集收尾", only_missing=False,
+                        budget=None, workers=None, limit=None, force=False):
+        """官网回采联系方式：采集收尾自动跑一次，界面「补采官网联系方式」也可手动跑。
+
+        账目口径（和采集账目同一条纪律：**没做也要说清为什么没做**）：
+          · 几家有可回采官网、其中几家本来就缺联系方式（先做它们）；
+          · 几家补到了值、净新增几个号码/邮箱（跨行去重后的真收益）；
+          · 为什么没出（停放/主体不符/不可达…分类计数，最多的三种直接写进日志）；
+          · 几家是「上轮已判定、本轮不再花预算」，几家是「预算到点没轮到、下轮接着做」。
+        任何异常都不许冒泡：这一轮挂在采集末尾，抛出异常等于把已经采好的数据一起丢掉。
+
+        ``force`` 只给界面上的手动入口用：`site_enrich` 是「采集后自动回采」这条**链路**
+        的开关（引擎默认关，防的是自称离线的用例真联网），而用户亲手点一次「补采」本身就是
+        同意，不该被那条链路开关拦住。拦住之后界面只会说「没补」，用户完全无法理解——
+        所以这里放行 force，但放行时把这件事写进日志，账上仍看得出是谁要求跑的。
+        """
+        stats = None
+        if not self.site_enrich and not force:
+            self._log(f"🌐 {reason}：未勾选「采集后回采官网联系方式」，本轮不回采")
+            return None
+        if force and not self.site_enrich:
+            self._log(f"🌐 {reason}：自动回采没勾选，但这是你手动点的，照跑")
+        if self._user_stop:
+            self._log(f"🌐 {reason}：已点停止，官网回采本轮跳过（已采数据照常导出）")
+            return None
+        records = self._all_live_records()
+        if not records:
+            self._log(f"🌐 {reason}：本轮没有数据，无需回采")
+            return None
+        try:
+            with_site = [r for r in records if _site_wc.pick_site(r)]
+            missing = [r for r in with_site if not _site_wc._has_any(r)]
+            fresh = [r for r in with_site if _site_wc.needs_retry(r.get(_site_wc.SITE_MARK))]
+            self._log(f"🌐 {reason}：{len(records)} 行里 {len(with_site)} 行带可回采官网"
+                      f"（其中 {len(missing)} 行本来就缺联系方式，优先补它们）｜"
+                      f"本轮待试 {len(fresh)} 行、{len(with_site) - len(fresh)} 行沿用上次结论")
+            if not fresh:
+                return {"total": len(records), "eligible": 0, "cached": len(with_site),
+                         "ok": 0, "added": 0, "no_site": len(records) - len(with_site),
+                         "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0,
+                         "skipped": 0, "sites": 0, "new_values": 0, "seconds": 0}
+            stats = _site_wc.enrich_records(
+                records, log=self._log,
+                workers=int(self.site_enrich_workers if workers is None else workers),
+                budget=float(self.site_enrich_budget if budget is None else budget),
+                stop=lambda: bool(self._user_stop),
+                limit=int(self.site_enrich_limit if limit is None else limit),
+                only_missing=bool(only_missing))
+            self._site_enrich_stats = stats
+            bits = []
+            for why, n in sorted(stats["reasons"].items(), key=lambda x: -x[1])[:3]:
+                bits.append(f"{why} {n} 家")
+            tail = f"｜没出值：{'、'.join(bits)}" + \
+                   (f" 等 {len(stats['reasons'])} 类" if len(stats["reasons"]) > 3 else "") \
+                if bits else ""
+            self._log(f"🌐 {reason}完成：访问 {stats['sites']} 个官网、{stats['ok']} 行补到值，"
+                      f"净新增 {stats['new_values']} 个联系方式（{stats['seconds']} 秒）{tail}"
+                      + (f"｜预算到点还剩 {stats['skipped']} 行，下次收尾自动接着做"
+                         if stats.get("skipped") else ""))
+            if stats.get("retry"):
+                self._log(f"♻ 其中 {stats['retry']} 行是暂时失败（停机/超时/证书），"
+                          f"已标「待重试」，下轮会自动再试（最多 {_site_wc.MAX_ATTEMPTS} 次）")
+        except Exception as e:
+            # 兜底不等于吞掉：把异常类型与消息写进日志，否则「回采一行没跑」在案卷上
+            # 是一片空白，将来排障只能重跑一遍碰运气。
+            self._log(f"⚠ {reason}异常（已跳过，不影响已采数据）：{type(e).__name__}: {e}")
+        return stats
+
+    def site_enrich_preview(self):
+        """手动补采前的账：``(总行数, 带可回采官网的行数, 本来就缺联系方式的行数)``。
+
+        界面点按钮时先问这一句，是为了把「没数据」「有数据但都没官网」「官网都是平台页」
+        分开说清——这三种在用户眼里都是「点了没反应」，在案卷上却是三个不同原因。
+        判据必须走 ``_site_wc.pick_site``（与会话真跑时同一份实现）：界面自己再写一遍
+        「什么算官网」，就会出现「按钮说能补、真跑时一家没补」这种对不上的账。
+        """
+        records = [r for r in self._all_live_records() if isinstance(r, dict)]
+        with_site = [r for r in records if _site_wc.pick_site(r)]
+        missing = [r for r in with_site if not _site_wc._has_any(r)]
+        return len(records), len(with_site), len(missing)
+
     def per_site_results(self):
         """按站分组的原始结果。名单通道只要有过产出就单列（含本轮关掉的开关）：
         「已补到但没进本轮视图」和「没补到」在两处报表里必须一致，否则原始表会少行。"""
@@ -1376,6 +1516,72 @@ class ParallelSession:
             if self._list_active(slug):
                 out[slug] = c.snapshot_results()
         return out
+
+    def _strict_gate(self, recs, acc):
+        """清洗严格档的行级闸门：只在勾选时生效，账目累加进 acc（各组共用一份累加器，
+        日志最后并成一句——两路各打一行就会变成「同一个档位两种说法」）。
+
+        账目必须**按数据来源分开记**：严格档在搜索类站点上是「去掉蹭词的同行」，
+        在名单通道（企知道/爱企查/风鸟）上是「公司名与工商文本里有没有这个词」——
+        后一路本来就没有主营信息，一刀切汇总成「剔了 N 行」会把「某一路被整条清空」
+        这种最危险的情形藏在大数里（1688 恒 0 家那次就是这么被漏过去的）。"""
+        if not self.clean_strict or not recs:
+            return recs
+        kws = list(self.clean_keywords or [])
+        for k in self._last_keywords or []:
+            if k and k not in kws:
+                kws.append(k)
+        kept, dropped, unknown = strict_keyword_filter(recs, kws, log=None)
+        acc["dropped"] += len(dropped)
+        acc["unknown"] += len(unknown)
+        acc["kept"] += len(kept)
+        acc["total"] += len(recs)
+        acc.setdefault("samples", [])
+        for r in dropped[:6]:
+            name = str((r or {}).get("公司名称") or (r or {}).get("公司名") or "")[:24]
+            if name and name not in acc["samples"] and len(acc["samples"]) < 6:
+                acc["samples"].append(name)
+        acc["judged"] = bool(kws)
+        by = acc.setdefault("by_source", {})
+        for tag, rows in (("kept", kept), ("dropped", dropped), ("unknown", unknown)):
+            for r in rows:
+                src = (str(r.get("数据来源") or "").strip() or "未知来源") if isinstance(r, dict) else "未知来源"
+                slot = by.setdefault(src, {"kept": 0, "dropped": 0, "unknown": 0})
+                slot[tag] += 1
+        return kept
+
+    def _strict_report(self, acc, log):
+        """严格档账目：剔了多少、为什么有几行没判、依据的词从哪儿来，一次说全。
+        「无依据可判」单独成句是因为它决定这一档到底有没有生效——用户勾了严格档
+        却一行都没过滤，和悄悄没生效是同一件事，必须让他看得见（不静默降级）。
+        某一路被剔到几乎不剩时单独点名：汇总数看不出一路归零。"""
+        if not self.clean_strict or not acc.get("total"):
+            self._strict_stats = None
+            return
+        self._strict_stats = dict(acc)
+        basis = "行内「关键词」列＋任务关键词" if acc.get("judged") else "没有可用关键词"
+        log(f"🔎 清洗严格档：{acc['total']} 行按关键词留 {acc['kept']} 行、"
+            f"剔 {acc['dropped']} 行（依据：{basis}）"
+            + (f"｜{acc['unknown']} 行没有任何关键词依据，未判、照留" if acc["unknown"] else ""))
+        by = acc.get("by_source") or {}
+        if len(by) > 1:
+            for src in sorted(by, key=lambda s: -(by[s]["kept"] + by[s]["dropped"])):
+                s = by[src]
+                log(f"🔎 严格档分来源：{src} 留 {s['kept']}、剔 {s['dropped']}"
+                    + (f"、未判 {s['unknown']}" if s["unknown"] else ""))
+        wiped = [s for s, v in by.items()
+                 if v["kept"] == 0 and v["dropped"] + v["unknown"] >= 5]
+        if wiped:
+            log("⚠ 严格档把这几路剔到一条不剩：" + "、".join(sorted(wiped))
+                + "（名单通道只有公司名与工商文本可比，名字里不带关键词就会被判不相关；"
+                  "这类数据本来就没有正面证据，属预期。要留就取消勾选重洗，原始表始终全量保留）")
+        if acc.get("samples"):
+            log("🔎 被严格档剔掉的公司名样本：" + "、".join(acc["samples"])
+                + "（原始表仍全量保留，觉得误杀就取消勾选重洗一次）")
+        if not acc.get("judged") and acc["total"]:
+            log("🔎 严格档本轮没有关键词可比（关键词框与数据里的「关键词」列都是空的）："
+                "只按行自带关键词判过；想按词筛请先在关键词框里填上再清洗")
+
 
     def clean_records(self, records=None, log=None):
         """跨站清洗：各站用自己的 _to_cleaner_record 映射（数据来源正确），
@@ -1390,18 +1596,20 @@ class ParallelSession:
         含当前未勾选的站，若仍按 enabled 过滤会静默丢掉这些行）。"""
         log = log or self._log
         cleaner_recs = []
+        gate = {"dropped": 0, "unknown": 0, "kept": 0, "total": 0}
         slugs = SITE_ORDER if records is not None else [s for s in SITE_ORDER if s in self.enabled]
         for slug in slugs:
             c = self.crawlers[slug]
             recs = c.snapshot_results() if records is None else \
                 [r for r in records if (r.get("数据来源") or "") == c.PLATFORM_NAME]
-            cleaner_recs.extend(c._to_cleaner_record(r) for r in recs)
+            cleaner_recs.extend(c._to_cleaner_record(r) for r in self._strict_gate(recs, gate))
         for slug, c in self.channels.items():
             if records is None and not self._list_active(slug):
                 continue
             recs = c.snapshot_results() if records is None else \
                 [r for r in records if (r.get("数据来源") or "") == c.PLATFORM_NAME]
-            cleaner_recs.extend(c._to_cleaner_record(r) for r in recs)
+            cleaner_recs.extend(c._to_cleaner_record(r) for r in self._strict_gate(recs, gate))
+        self._strict_report(gate, log)
         rows = _cleaner.build_clean_rows(cleaner_recs, log=log, waste_sink=self._waste_sink)
         return self.filter_import_rows(rows, log=log)
 
@@ -1415,6 +1623,10 @@ class ParallelSession:
     def reset_results(self):
         """「开始新任务」用：清掉本次已采数据、各站本轮账目与聚合进度，
         不动跨运行历史种子库（要不要清由界面里的选项单独决定）。"""
+        # 回采的页面缓存/DNS 结论是**进程内**的：留着的话「改了官网字段再跑一轮」
+        # 会拿旧页面对答案，那种「明明改了却看不出变化」最难查。新任务一律清零。
+        _site_wc.reset_caches()
+        self._site_enrich_stats = None
         for c in list(self.crawlers.values()) + list(self.channels.values()):
             try:
                 c.reset_run_state()
@@ -1490,6 +1702,7 @@ class ParallelSession:
         """停止本轮：所有站与所有名单通道都置停止位。
         通道侧的退避等待（限流 10 分钟、登录 10 分钟）都做成可打断的，
         所以点「停止」不会真的等满——那正是用户抱怨的「停了还在转」。"""
+        self._user_stop = True      # 会话级：收尾回采据此立即收手（不写没写完的值）
         for c in list(self.crawlers.values()) + list(self.channels.values()):
             c._stop_requested = True
 

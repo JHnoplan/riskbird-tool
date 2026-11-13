@@ -523,7 +523,7 @@ class MakepoloCrawler(CdpSiteCrawler):
                     return
                 continue
             empty = 0
-            new = skipped = 0
+            new = skipped = seen = 0
             for e in entries:
                 mid = e["公司ID"]
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -531,6 +531,8 @@ class MakepoloCrawler(CdpSiteCrawler):
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 早过滤：产品卡上的公司名/主营与关键词无关的，连联系方式页都不进（省请求＝提速＋防封）
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
@@ -546,7 +548,7 @@ class MakepoloCrawler(CdpSiteCrawler):
                 e["关键词"] = kw
                 new += 1
                 yield e
-            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 家，新增 {new} 家{tail}")
             if new == 0:
                 stale += 1

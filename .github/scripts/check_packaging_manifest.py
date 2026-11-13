@@ -94,6 +94,27 @@
      静默盖掉先写的，判据读出的是隔壁那份内容，红了一条不相干的话；Linux CI 大小写敏感，
      同一份用例在云端全绿。同一形状落到交付上更贵：`Foo.py` 与 `foo.py` 同时入库，Windows
      检出的那棵树里只有一个，装进包的就是「最后被写入的那一份」，而 CI 永远不会为此变红。
+ 17 交付 zip 的**门本身**在不在链路上（结构判据，逐个接线点拔一次验证）：字节级那次
+     （绿色版 zip 条目名必须 ASCII，根因是中央目录 create_system 那一字节）定下的教训是
+     「构建全绿、包照样解不开」。判据有四路：条目名门 + 目标系统真解一次门都在；生产者打完
+     zip 立刻调用、结果并进 problems；Mac workflow 也带 --os-extract；门里「这台机器没有该
+     工具」必须是问题而不是打印。接线一旦断了，日志照样打 ✅——所以这一条判的是链路，
+     不是字节（字节那一路在 check_release_zip.py 与离线套件 G 节里各验一次）。
+ 18 pip 安装不许挂在一个外部门口：2026-11-13 云端两个 run 同时红在
+     `pip install <包名…> -i <单一镜像>` 那一行（清华源 5 次 ReadTimeout，pip 只留一句
+     `No matching distribution found`，看日志的人先怀疑依赖写错了）。冗余与有界收进
+     .github/scripts/pip_install.py：多源顺序回退、每源有界超时、全挂才非零、逐源点名它
+     说了什么；包名清单收进 .github/requirements/*.txt，Mac 与 Windows 读同一份文件
+     （此前靠注释「逐行对齐」人肉同步）。18e 是同一族的另一半：清单收成一份文件后「抄漏
+     一个包」的位置变了、症状没变，所以进包源码 import 到的每个第三方包都必须能在清单里
+     找到（pip 名≠import 名、以及由清单里某发行包连带提供的，都要在案上写明凭什么）。
+ 19 注释里指路的「某套件 第 N 节」必须真的走得通。2026-11-13 本机自审：把「择路不许跟着
+     本机历史走」写进 tool_config / runtime_paths 时，两边都写了「对拍判据见某套件第 10~13
+     节」，而那文件当时只编到第 9 节——一共 13 处这样的指路，全部指向从没写出来的小节，其
+     中四个函数（页尾拼法、联系方式判据、补采上限、收尾取真身）在全部离线套件里 0 覆盖，
+     正是用户报「以前能采到、现在一直是 0」那条链上的守卫缺口。「判据在哪一节」这句话本身
+     不构成判据：可达性必须机械化核对（被指路的套件在不在交付目录、它的节是不是数字编号、
+     每一个节号——含并列与区间两种写法——在不在案），改编号时两边一起改，与第 10 条同族。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -138,6 +159,11 @@ NOT_PACKAGED = {
     "solarbe_crawler": "已下线，不再打包（见 workflow 注释）",
 }
 TEST_PREFIX = "test_"
+
+# 打包入口：NOT_PACKAGED 记的是「不进 hidden-import 那张表」，而入口脚本本身确实是
+# PyInstaller 的位置参数、确实进包。第三方 import 对拍（第 18 条 e 路）要把它们算进
+# 「进包源码」，所以这里单独列一份——它不在位时报红，不静默少扫一个文件。
+ENTRY_SCRIPTS = ("b2bcollect_gui",)
 
 # 第三方包名（--hidden-import 里合法、但本目录没有同名 .py 的那些）。
 # 这份表只用于「反向检查」：登记了一个既不是本地模块、又不在这里的名字，就说明
@@ -797,6 +823,12 @@ ANY_RUN_KEY = re.compile(r"^\s*run:\s*")
 SHELL_KEY = re.compile(r"^\s*shell:\s*(\w+)")
 RUNS_ON = re.compile(r"^\s*runs-on:\s*[\w-]*windows[\w-]*", re.M)
 GH_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
+# `${{ ... }}` 被替换掉之后留下的记号。它必须是**在案的常量**而不是随手写的一串字：
+# 下游判据（第 18 条 c 路「-r 的清单路径是运行时才拼出来的」）要靠它认出「这里原本是个
+# 表达式」。上一版那一判直接搜 `${{`，而脚本早在切块阶段就被替换成了占位符，于是夹具里
+# `-r .github/requirements/${{ matrix.os }}.txt` 报成「清单不在仓库里」——话是说对了方向，
+# 归因却错了，读日志的人会去补文件而不是去写死路径。
+GH_PLACEHOLDER = "GH_EXPR"
 
 # 判据覆盖的文件。登记在表里的东西不在位就响：一条静默不跑的判据比没有判据更危险
 # （会让人以为这一项被验过）。workflow 全收：另外两条（1688、riskbird）虽然不走
@@ -862,7 +894,7 @@ def run_blocks_in_workflow(text: str) -> list:
             else:
                 continue
             out.append((name, start + j + 1, shell,
-                        GH_EXPRESSION.sub("GH_EXPR", script)))
+                        GH_EXPRESSION.sub(GH_PLACEHOLDER, script)))
     return out
 
 
@@ -1870,6 +1902,511 @@ def check_caller(label: str, text: str, externals: tuple, modules: list,
     return problems
 
 
+# ── 第 18 条：交付链的 pip 安装不许挂在一个外部门口 ──────────────────────────
+# 2026-11-13 云端两个 run 同时红在同一行：`pip install <包名…> -i
+# https://pypi.tuna.tsinghua.edu.cn/simple` 连吃 5 次 ReadTimeout，pip 说的是
+# `No matching distribution found for PyQt5 (from versions: none)`。那句话完全没提
+# 「源不通」，看日志的人先怀疑的是依赖写错了；而 Mac 与 Windows 两个制品同时没有——
+# **一条外部镜像的可用性，就是我们交付链的单点**。这种地方大厂只有两条做法：冗余 + 有界。
+# 于是安装逻辑收进 .github/scripts/pip_install.py（多源顺序回退、每源有界超时、全挂才
+# 非零、逐源点名它说了什么），包名清单收进 .github/requirements/*.txt（Mac 与 Windows
+# 读同一个文件，「逐行对齐」那种人肉同步就此失去立足点）。这一条判的是**结构**：任何一处
+# 又退回单源、又 inline 包名、或者安装器自己变成只会说话不会拦人，都在这里响。
+PIP_INSTALLER = ROOT / ".github" / "scripts" / "pip_install.py"
+PIP_REQUIREMENTS_DIR = ".github/requirements"
+# `pip install` / `python -m pip install` / `pip3 install` 都算直接下命令；
+# `python .github/scripts/pip_install.py …` 那一行不算（它就是安装器本身）。
+PIP_DIRECT = re.compile(r"(?:^|[;&|]\s*)python\d*(?:\.\d+)?\s+-m\s+pip3?\s+install\b|"
+                        r"(?:^|[;&|]\s*)\bpip3?\s+install\b")
+
+
+# 「读不到这个赋值」与「这个赋值的值是 None」必须能分开：拿 None 当缺位哨兵的话，
+# 有人把 INDEX_SOURCES 写成 None 就会得到一句「只有 0 个源」——听起来像数错了，其实
+# 是那份文件里根本没有这张表。和 NOT_PACKAGED/GENERATED_AT_BUILD 同理：报错要说得可照做。
+_MISSING = object()
+
+
+def _str_or(value, index: int) -> str:
+    """取 (label, url) 这一项的第 index 个元素；形状不对就按空串走，由上层数量判据兜住。"""
+    try:
+        return str(value[index])
+    except (TypeError, IndexError, KeyError):
+        return ""
+
+
+def _ast_literal(tree: ast.Module, name: str):
+    """取模块顶层某个赋值的字面值；读不到返回 _MISSING（和「值是 None」区分开）。"""
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                val = _literal(node.value)
+                return _MISSING if val is None and not isinstance(node.value, ast.Constant) else val
+    return _MISSING
+
+
+def _code_only_text(text: str) -> str:
+    """把源码里的**散文**剔干净，只留真会执行的部分（注释由 ast 丢弃、docstring 显式跳过）。
+
+    为什么不能拿整份文本 grep：本轮离线夹具第一次验第 18 条就抓到我自己的判据被骗——
+    `install()` 的 docstring 里写着「一个『没有 --timeout』的假安装现场」，把真正的
+    `PIP_NET_FLAGS` 删成 `()` 之后那条判据照样闭口不言、报绿。注释与 docstring 是写给下一个
+    读代码的人的，不该替代码作证（第 11 条把 shell 交给 `bash -n` 真解析器是同一个道理）。
+    """
+    tree = ast.parse(text)
+    for node in list(ast.walk(tree)):
+        body = getattr(node, "body", None)
+        if isinstance(body, list):
+            while (body and isinstance(body[0], ast.Expr)
+                   and isinstance(body[0].value, ast.Constant)
+                   and isinstance(body[0].value.value, str)):
+                body.pop(0)                     # 逐个剔掉函数/模块开头的 docstring
+    return "\n".join(ast.unparse(stmt) for stmt in tree.body)
+
+
+def check_pip_source_resilience(workflows: tuple = None, installer_text: str = "") -> list:
+    """pip 安装的冗余判据：workflow 不许绕开安装器，安装器不许只有一个源（空=合格）。
+
+    两份清单做成参数是为了**判据自己可被反向对照**：离线用例要能喂一份「改回 -i 单源」的
+    假 workflow 与一份「源被删到一条」的假安装器，并要求它们必须红。一条从不报警的判据
+    比漏一条更糟——它会让后面的人以为这一项被验过。
+    """
+    problems: list = []
+    codes: dict = {}
+    for rel in (WORKFLOWS if workflows is None else workflows):
+        path = Path(rel) if Path(rel).is_absolute() else ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 读不到：第 18 条在这份 workflow 上没跑（登记了却没文件）")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        label = path.name
+        # a) 不许再出现直接的 pip install：那一行等于把交付链重新挂到单个索引源上
+        #    b) 装没装安装器、-r 指的是哪份清单——两路都只认 run 步里真会执行的行。
+        #    拿整份 yml grep 的话，一句注释「为什么走 pip_install.py 而不是直接 pip」就能
+        #    顶替真的调用（假绿），也能顶替真的 -r（把不存在的清单说成在位）；本轮的注释里
+        #    就真有这两句话，夹具第一版就差点点不亮。
+        kept_lines = []
+        for name, base, shell, script in run_blocks_in_workflow(text):
+            for k, ln in enumerate(script.splitlines(), 1):
+                body = ln.strip()
+                if not body or body.startswith("#"):
+                    continue
+                kept_lines.append(body)
+                if PIP_DIRECT.search(body):
+                    problems.append(
+                        f"{label}「{name}」第 {base + k} 行直接调用 pip（{body[:120]}）："
+                        "绕开 .github/scripts/pip_install.py 就等于绕开多源回退与有界超时——"
+                        "2026-11-13 两个 run 同时没有制品，红就落在这样的一行上")
+        codes[rel] = "\n".join(kept_lines)
+        calls = re.findall(r"pip_install\.py[^\n]*", codes[rel])
+        if not calls:
+            problems.append(f"{label} 没有调用 pip_install.py：这一路的依赖安装没人管冗余，"
+                            "镜像一超时就是整个平台没有交付")
+        # c) -r 指向的清单必须在仓库里、落在 requirements/ 下、非空
+        for call in calls:
+            for req in re.findall(r"-r\s+(\S+)", call):
+                # 先分清「路径不是静态可确认的」与「静态路径但文件不在」：把后者当成前者，
+                # 或反过来，都会把人支去错的方向——一句「清单不在仓库里」的去补文件，而真正
+                # 要改的是那一行还带着 `${{ }}` / `$变量` / 通配。GH_PLACEHOLDER 是切块阶段
+                # 就替换出来的记号，所以这里必须一起认（见它的定义处注释）。
+                dynamic = [t for t in (GH_PLACEHOLDER, "${{", "$", "`", "*", "?")
+                           if t in req]
+                if dynamic:
+                    problems.append(f"{label}：-r 的清单路径是运行时才拼出来的（{req}，"
+                                    f"含 {sorted(set(dynamic))}），判据没法确认文件在不在——"
+                                    "清单与 workflow 一起入库就写死路径")
+                    continue
+                rp = ROOT / req
+                if not rp.is_file():
+                    problems.append(f"{label} 引用的依赖清单 {req} 不在仓库里：安装器会在这一步红，"
+                                    "但红在构建中途比红在门禁晚一步")
+                    continue
+                if rp.parent.name != "requirements":
+                    problems.append(f"{label}：依赖清单 {req} 没放在 {PIP_REQUIREMENTS_DIR}/ 下："
+                                    "清单落点一散开，「Mac 与 Windows 是不是同一份」就没人判得了")
+                    continue
+                pkgs = [x.strip() for x in rp.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if x.strip() and not x.strip().startswith("#")]
+                if not pkgs:
+                    problems.append(f"{label}：依赖清单 {req} 里一个包都没有——空清单装不出依赖，"
+                                    "产物缺包只在用户点击功能时才崩")
+    # d) 两个 b2bcollect 入口必须读同一份清单。这条的存在理由就是原先那句注释「清单与
+    #    Windows 版逐行对齐」：人肉同步换成文件级同步之后，一旦哪天两边各指一份，当场响。
+    per_b2b = {rel: set(re.findall(r"pip_install\.py[^\n]*?-r\s+(\S+)", c))
+               for rel, c in codes.items() if "build-b2bcollect" in Path(rel).name}
+    if len(per_b2b) == 2 and all(per_b2b.values()):
+        if len({frozenset(v) for v in per_b2b.values()}) > 1:
+            problems.append("Mac 与 Windows 的 b2bcollect 读的不是同一份依赖清单"
+                            f"（{ {k: sorted(v) for k, v in per_b2b.items()} }）：两份清单就要靠人"
+                            "逐行对齐，加一个包漏一处时构建全绿、产物缺包")
+    # e) 安装器本体：冗余、有界、不挂住、失败必须进退出码
+    if not installer_text:
+        if not PIP_INSTALLER.is_file():
+            problems.append(f"{_rel(PIP_INSTALLER)} 不在位：pip 安装没有实现，"
+                            "上面那些引用它的 workflow 全都跑不起来")
+            installer_text = ""
+        else:
+            installer_text = PIP_INSTALLER.read_text(encoding="utf-8", errors="replace")
+    if installer_text:
+        try:
+            tree = ast.parse(installer_text)
+            code = _code_only_text(installer_text)
+        except SyntaxError as exc:
+            problems.append(f"pip_install.py 第 {exc.lineno} 行语法过不去（{exc.msg}）："
+                            "结构判据读不出它，这一步不能当成过了")
+            return problems
+        srcs = _ast_literal(tree, "INDEX_SOURCES")
+        if srcs is _MISSING:
+            problems.append("pip_install.py 里读不到 INDEX_SOURCES 的字面值：源清单必须是写死的"
+                            "元组字面量——运行时拼出来的话，这一条门连判什么都没了（判据只认"
+                            "ast 里的字面值，不认注释与 docstring，见 _code_only_text）。"
+                            "读不到就到此为止：再报一句「只有 0 个源」会把人引去数源，"
+                            "而真正要修的是那张表没了")
+            srcs = None
+        else:
+            srcs = [(_str_or(x, 0), _str_or(x, 1)) for x in srcs] \
+                if isinstance(srcs, (tuple, list)) else []
+        if srcs is not None:
+            if len(srcs) < 2:
+                problems.append(f"pip_install.py 的 INDEX_SOURCES 只有 {len(srcs)} 个源："
+                                "一条外部镜像的可用性又一次变成交付链的单点（今天那种红会原样回来）")
+            urls = [u for _, u in srcs if u]
+            if len(set(urls)) != len(urls):
+                problems.append("pip_install.py 的索引源里有重复 URL：看着两条路其实是一条")
+        flags = _ast_literal(tree, "PIP_NET_FLAGS")
+        if flags is _MISSING:
+            problems.append("pip_install.py 读不到 PIP_NET_FLAGS 的字面值：给 pip 的网络参数必须是"
+                            "写死的元组（拿它当变量拼来拼去，这一条就退回到读注释判）")
+        else:
+            pairs = list(flags)
+
+            def _bounded(flag: str) -> bool:
+                if flag not in pairs:
+                    return False
+                nxt = pairs.index(flag) + 1
+                return nxt < len(pairs) and str(pairs[nxt]).isdigit()
+
+            _lost = [f for f in ("--timeout", "--retries") if not _bounded(f)]
+            if _lost:
+                # 一条报出来点名缺了哪几个：两处缺的是同一行的同一个修法，拆成两条会让人以为
+                # 是两个缺陷（本条门的其他几路都是一缺陷一报，口径要一致）。
+                problems.append(f"pip_install.py 没有把 {' / '.join(_lost)} 带数字传给 pip："
+                                "单个连接自己就是无界的，外层超时只是兜底（今天那种整段 "
+                                "ReadTimeout 就是把时间花在一个不会自己停的连接上）")
+        if not re.search(r"timeout\s*=\s*PER_SOURCE_TIMEOUT", code):
+            problems.append("pip_install.py 的 subprocess.run 没有 timeout=PER_SOURCE_TIMEOUT："
+                            "挂住的源会把 job 一直拖到 Actions 超时，日志里一句原因都留不下")
+        if not re.search(r"stdin\s*=\s*subprocess\.DEVNULL", code):
+            problems.append("pip_install.py 没接 stdin=DEVNULL：pip 一旦觉得需要答复就回头问人，"
+                            "后台那条路上没人答，于是不结束（取制品那一链刚红过同一件事）")
+        if not re.search(r"if\s+len\(INDEX_SOURCES\)\s*<\s*2", code):
+            problems.append("pip_install.py 少了一道自守卫（源少于两条就不干）：有人把源删到一条时，"
+                            "workflow 那边完全看不出来")
+        if not re.search(r"if\s+problems:\s*\n(?:.*\n)*?\s+return\s+1", code):
+            problems.append("pip_install.py 全挂时没有 return 1：一条只会逐源打印失败、退出码照样 0"
+                            "的安装器，等于把「没装上」交给后面每一步去猜")
+        if not re.search(r"if\s+not\s+attempted", code):
+            problems.append("pip_install.py 没有「一个源都没试」这一路的兜底：sources 传空或被改成"
+                            "空表时，循环一次都不跑、返回的问题清单也就是空的——「没装」会被当成"
+                            "「装上了」，这条链上最坏的失败样子就是这个样子")
+    return problems
+
+
+# ── 第 18 条的 e 路：清单收拢成一份文件之后，「抄漏一个包」必须当场响 ─────────
+# 依赖清单从两份 workflow 的 inline 包名收拢成 .github/requirements/b2bcollect.txt 之后，
+# 抄漏的位置从 workflow 挪到了清单里，症状却一模一样：pip 装成功、PyInstaller 全绿
+# （它对缺的包只打一行 warning，不拦构建），制品到了用户机上、点到那个功能才崩——用户
+# 报上来的那两条实机栈（Mac 打开即崩、Windows 重启后崩）都长着这张脸。所以清单不能只
+# 靠「我记得写全了」，要和**进包源码里真的 import 到的第三方名**对拍一次。
+# 方向只有一个：代码里有 import、清单里没有 = 红。反过来不红——清单里写着的 pyinstaller
+# 是构建工具、xlrd 是被 pandas 间接读老 xls 的，按「没被 import 就删掉」去判会报一堆
+# 修不掉的假红，而假红的下场是这条门被人整条关掉（本轮已经栽过两次，不再栽第三次）。
+B2B_REQUIREMENTS = ".github/requirements/b2bcollect.txt"
+
+# import 名 ≠ 发行包名的那些。这不是我们的选择，是 PyPI 的历史包袱：pip 装的名字和代码
+# 里能 import 的名字对不上。每一项都写明「装哪个发行包、为什么对不上」，下一个人往这张
+# 表里加东西时才知道自己加的是什么性质的一条。
+IMPORT_TO_DIST = {
+    "PIL": ("pillow", "图像库 import 名是包内的 PIL，发行名叫 pillow"),
+    "bs4": ("beautifulsoup4", "BeautifulSoup 的发行名带版本号，import 名不带"),
+    "websocket": ("websocket-client", "客户端发行名带 -client，模块名只到 websocket"),
+    "pkg_resources": ("setuptools", "读包元数据的库随 setuptools 提供，没有叫 pkg_resources 的发行包"),
+}
+
+# 由清单里**另一个发行包连带提供**的 import：不单独登记，但把连带关系写在案上。
+# 判据会确认「它靠的那个发行包还在清单里」——哪天 PyQt5 被删，sip 这类立刻没着落，
+# 这一条就当场红；不写这张表的话，那种时候报出来的是「sip 没登记」这种没法照做的话。
+IMPORT_FROM_LISTED = {
+    "sip": ("PyQt5", "sip 是 PyQt5 的 wheel 里带的 CPython 绑定，PyPI 上没有可单装的 sip"),
+}
+
+
+def _dist_key(name: str) -> str:
+    """发行包名的比较键：PEP 503 的归一化（大小写、`-`/`_`/`.` 都算同一个名字）。"""
+    return re.sub(r"[-_.]+", "-", str(name)).lower()
+
+
+def _requirement_dists(path: Path) -> set:
+    """清单里的发行包名（剔注释与空行，带上限者与 extras 之前的那一段）。"""
+    out = set()
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.add(_dist_key(re.split(r"[<>=!;\[\s]", line, maxsplit=1)[0]))
+    return out
+
+
+def _packaged_source_files(externals: tuple = None) -> list:
+    """真正会进包的那批源码：本目录模块 + 打包入口 + 跨目录模块。
+
+    口径直接复用 `module_manifest()` / `local_modules()`：这张「谁进包」的表已经有四处
+    消费方，再在这里抄一遍模块清单，就等于把本轮刚立的那条「单一真源」当场破掉。
+    入口脚本要单独补：`local_modules()` 按「它不是 hidden-import 项」把它排除了
+    （NOT_PACKAGED 说的是「不进那张登记表」），可它明明是 PyInstaller 的位置参数。
+    """
+    if externals is None:
+        externals, _ = module_manifest()
+    files = [BUILD_DIR / f"{name}.py" for name in local_modules()]
+    files += [BUILD_DIR / f"{name}.py" for name in ENTRY_SCRIPTS]
+    files += [ROOT / rel for rel in externals]
+    return [p for p in files if p.is_file()]
+
+
+def _top_level_imports(path: Path) -> set:
+    """一个源文件里所有**顶层** import 名（`from a.b import c` 取 a，相对导入不参与）。"""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+    except (SyntaxError, ValueError):
+        raise SystemExit(f"{path} 语法过不去：第三方 import 对拍读不到东西，"
+                         "这一步不能安静跳过（读不到就是没验）")
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if not node.level and node.module:
+                names.add(node.module.split(".")[0])
+    return names
+
+
+def _rel(p: Path) -> str:
+    """报告里写路径：仓库内写成相对路径（短、可比），仓库外原样写绝对路径。
+
+    仓库外不是异常——离线用例就是把夹具建在系统临时目录里喂进来的（G 节的 `_ztmp`、
+    第 17 条的 `_t17` 都是同一个手法）。用 `p.relative_to(ROOT)` 裸写的话，夹具一放到仓库外
+    就先抛一个 ValueError，报出来的是「对拍没跑成」而不是它本来要判的那件事。
+    """
+    try:
+        return str(p.relative_to(ROOT))
+    except ValueError:
+        return str(p)
+
+
+def check_requirements_coverage(requirement_files: tuple = None,
+                                source_files: tuple = None) -> list:
+    """进包源码 import 到的第三方包，必须都能在依赖清单里找到（空列表=合格）。"""
+    problems: list = []
+    req_paths = tuple(ROOT / rel for rel in (requirement_files or (B2B_REQUIREMENTS,)))
+    dists: set = set()
+    for rp in req_paths:
+        if not rp.is_file():
+            problems.append(f"依赖清单 {_rel(rp)} 不在位：没有清单就没法对拍，"
+                            "这一路不能当成「过了」")
+            continue
+        dists |= _requirement_dists(rp)
+    files = list(source_files) if source_files is not None else _packaged_source_files()
+    if not files:
+        problems.append("第三方 import 对拍一个源文件都没扫到：进包源码的口径没了，"
+                        "这时候报「全部覆盖」是自欺")
+        return problems
+    if source_files is None:
+        for name in ENTRY_SCRIPTS:
+            if not (BUILD_DIR / f"{name}.py").is_file():
+                problems.append(f"打包入口 {name}.py 不在位：它对拍就少扫一个文件，"
+                                "而入口恰恰是 import 最密的那一份")
+    seen: dict = {}
+    for path in files:
+        for name in _top_level_imports(path):
+            seen.setdefault(name, []).append(path)
+    stdlib = set(sys.stdlib_module_names)
+    repo_names = {p.stem for p in files}
+    for name in sorted(seen):
+        where = ", ".join(sorted({_rel(x) for x in seen[name][:3]}))
+        if name in stdlib or name in repo_names:
+            continue
+        # 仓库里的**目录包**（enf_clean 这类随 --add-data 一起打进包的源码目录）不是第三方
+        # 依赖；判据是「有没有 __init__.py」，不是「有没有同名的目录」——同名目录可能只是
+        # dist/、debug/ 这种压根不该被 import 的东西，放行就等于把这一路又开一个洞。
+        if (BUILD_DIR / name / "__init__.py").is_file() or (ROOT / name / "__init__.py").is_file():
+            continue
+        dist = IMPORT_TO_DIST.get(name, (name, ""))[0]
+        if _dist_key(dist) in dists:
+            continue
+        provider = IMPORT_FROM_LISTED.get(name)
+        if provider and _dist_key(provider[0]) in dists:
+            continue
+        if provider:
+            problems.append(f"{name}（{where}）靠 {provider[0]} 连带提供，"
+                            f"但 {provider[0]} 不在依赖清单里：连带关系断了，"
+                            "这个 import 在产物里就是运行时 FileNotFoundError")
+            continue
+        problems.append(f"进包源码 import 了第三方包 {name}（见 {where}），"
+                        f"但依赖清单里没有它（发行名 {dist}）：pip 与 PyInstaller 都不会拦这一步"
+                        "（构建照样全绿），缺的那一只到用户点上那个功能才崩——"
+                        f"要么加进 {B2B_REQUIREMENTS}，要么在 IMPORT_TO_DIST/"
+                        "IMPORT_FROM_LISTED 里写明它凭什么不算漏")
+    return problems
+
+
+# ── 第 19 条：注释里指路的「某套件 第 N 节」必须真指到那套件里存在的小节 ──────────
+# 由来（2026-11-13 本机自审）：本轮把「择路不许跟着本机历史走」这条口径写进 tool_config
+# 与 runtime_paths 时，两边都补了「对拍判据见 test_data_dir_offline.py 第 10~13 节」，而
+# 那个文件当时只有 1~9 节——「判据在哪一节」这句话本身就是纸上纪律：读注释的人按节号找
+# 过去，找不到也只会以为是自己没翻到，而真正缺的是那份从没写出来的对拍（_page_tail、
+# _has_any_contact、CONTACT_RETRY_MAX、results_live 四个函数在全部离线套件里 0 覆盖，正
+# 是用户报「以前能采到、现在一直是 0」那条链的守卫缺口）。
+# 这条判据把「指路」与「路存在」钉成同一件事：它不判注释写得好不好，只判那句「见第 N 节」
+# 现在能不能真的走过去。改小节编号时必须两边一起改，这与第 10 条（同名拷贝分叉）同族。
+# 分隔符三式都得收下，因为它们在同一份注释里都出现过，而漏一式的后果是**漏报**：
+#   「第 1、2、3、8 节」并列   「第 10~13 节」区间   「第 10、12 节」混着写
+# 区间的写法尤其不能放过：本轮那句悬空引用原文就是「第 10~13 节」，而当时套件只到第 9 节
+# ——只认单号与并列的门对这一句会安静放行，恰好在最需要它的那一次失灵。
+SECTION_REF_RE = re.compile(
+    r"([A-Za-z0-9_]{4,}\.py)(?:(?!\.py)[^。；\n\"]){0,12}?第\s*"
+    r"([0-9０-９]+(?:\s*[、,，~～\-–]\s*[0-9０-９]+)*)\s*节")
+SECTION_HEAD_RE = re.compile(r"(?:═══|─{2,})\s*([0-9]+|[A-Z])\s*[\.、]")
+_FW_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+_SECTION_ITEM_RE = re.compile(r"([0-9０-９]+)\s*([、,，~～\-–]?)\s*")
+
+
+def _expand_section_items(raw: str) -> list:
+    """把「1、10~13，20」这类写法展平成单个节号字符串列表（区间两端都含）。
+
+    倒着写的区间（``13~10``）不猜作者想说什么，只把两端都并入待验集合：这样任何一端不
+    存在都会照旧报红，而「安静当成只有一个数」会把笔面漏掉的那一节盖住。
+    """
+    toks = [(int(a.translate(_FW_DIGITS)), b)
+            for a, b in _SECTION_ITEM_RE.findall(raw) if a]
+    out, i = [], 0
+    while i < len(toks):
+        num, sep = toks[i]
+        if sep in ("~", "～", "-", "–") and i + 1 < len(toks):
+            lo, hi = sorted((num, toks[i + 1][0]))
+            out.extend(str(x) for x in range(lo, min(hi, lo + 40) + 1))
+            i += 2
+        else:
+            out.append(str(num))
+            i += 1
+    return out
+
+
+# 扫描范围：交付目录、本机交付链脚本与门禁脚本。为什么不扫整仓：仓库根下有大量一次性
+# 脚本与文档，它们不参与交付，把它们的注释也纳进来只会让这条门在无关文本上误报，
+# 而误报的代价和漏报一样——人开始跳过这一步。
+SECTION_REF_DIRS = tuple(list(SHARED_SOURCE_DIRS) + ["debug", ".github/scripts", ".github/workflows"])
+SECTION_REF_SUFFIXES = (".py", ".sh", ".yml", ".md")
+
+
+def _ref_scan_text(text: str) -> str:
+    """把注释折回一行：折行的「见某回归套件 ／ 第 11 节」是同一条指路。
+
+    中文注释在源码里按 79 列折行是常态，逐行匹配会把「折了行」当成「没引用」放过，
+    而放过的方向恰好是漏报——漏报比没有判据更危险（它让人以为这一项被验过）。
+    """
+    return " ".join(re.sub(r"^\s*#\s?", "", ln) for ln in text.splitlines())
+
+
+def _load_ref_texts() -> tuple:
+    """默认扫描范围：交付目录 + 交付链脚本 + workflow，按 git 索引取（不 walk 文件系统）。
+
+    为什么用索引而不是 glob：第 7 条已经证明「本机有、检出没有」是真实存在的一种坏，
+    指路注释如果只在本机那份没提交的草稿里，CI 检出的树里根本没有那句话，判它没有意义；
+    反过来，索引里有而磁盘上读不到，必须**报一条问题**而不是安静少扫一份——扫不到的
+    那一格里如果正好有悬空引用，它就是这条门唯一没看守的地方。
+    """
+    problems, texts = [], {}
+    index, _head = _tracked_sets()
+    for rel in sorted(index or []):
+        if not any(rel == d or rel.startswith(d + "/") for d in SECTION_REF_DIRS):
+            continue
+        if "/dist/" in f"/{rel}" or rel.endswith("/build"):
+            continue                      # 构建产物里的注释是上一版的，不该拿来判今天
+        if not rel.endswith(SECTION_REF_SUFFIXES):
+            continue
+        try:
+            texts[rel] = (ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            problems.append(f"{rel}：读不进去，这一条指路没法核对（读不到≠不用判）")
+    return texts, problems
+
+
+def _load_ref_suites(texts: dict) -> dict:
+    """被指路的套件本体：优先用扫到的文本，再按目录补齐（注释可以指到同目录之外的套件）。"""
+    suites = {}
+    for rel, text in texts.items():
+        name = rel.rsplit("/", 1)[-1]
+        if name.startswith(TEST_PREFIX):
+            suites.setdefault(name, text)
+    for d in SECTION_REF_DIRS:
+        dp = ROOT / d
+        if dp.is_dir():
+            for p in sorted(dp.glob(f"{TEST_PREFIX}*.py")):
+                try:
+                    suites.setdefault(p.name, p.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass                  # 上一段已经把读不进去的那份报过，这里不重复刷
+    return suites
+
+
+def check_section_pointer_references(texts=None, suites=None) -> list:
+    """texts: {相对路径: 源码} 待扫的文本；suites: {文件名: 源码} 被指路的套件本体。
+
+    两个参数都留出注入面：离线夹具不许依赖本机仓库状态（第 16/17 条同一条纪律），
+    否则「反向对照」这一步在别的机器上就跑不出来。
+    """
+    problems = []
+    if texts is None:
+        texts, problems = _load_ref_texts()
+        # 登记的扫描目录必须真的在位：目录改名或被删之后，这一条会「扫到 0 份文本」并报
+        # ✅，而 ✅ 的分量和没有这条门不一样——AB 节量过同一格（扫 0 个文件的「全覆盖」是自欺）。
+        for d in SECTION_REF_DIRS:
+            if not (ROOT / d).is_dir():
+                problems.append(f"{d}：第 19 条登记了这份扫描目录，可它不在了（这一路安静空转）")
+        if len(texts) < 40:
+            problems.append(f"指路扫描只读到 {len(texts)} 份文本：口径大概已经和交付目录脱节，"
+                            f"这时报「全部走得通」没有任何担保（至少应有交付三目录 + 脚本 + workflow）")
+    if suites is None:
+        suites = _load_ref_suites(texts)
+    for rel, text in sorted(texts.items()):
+        if rel.rsplit("/", 1)[-1].startswith(TEST_PREFIX):
+            continue          # 套件自己的注释里写「第 13 节」是内部编号，不指路
+        prose = _ref_scan_text(text)
+        for m in SECTION_REF_RE.finditer(prose):
+            suite, raw_nums = m.group(1), m.group(2)
+            wanted = _expand_section_items(raw_nums)
+            body = suites.get(suite)
+            if body is None:
+                problems.append(f"{rel}：注释把判据指到 {suite}，但交付目录里没有这份文件"
+                                "（那句「见某某套件」现在谁也走不通）")
+                continue
+            labels = set(SECTION_HEAD_RE.findall(body))
+            digits = sorted(int(x) for x in labels if x.isdigit())
+            if not digits:
+                problems.append(f"{rel}：注释说判据在 {suite} 第 {'、'.join(wanted)} 节，"
+                                f"但那套件的节是用字母编的（{sorted(labels)[:6]}），"
+                                "数字指路在那里根本不存在")
+                continue
+            miss = [n for n in wanted if n not in labels]
+            if miss:
+                problems.append(
+                    f"{rel}：注释说判据在 {suite} 第 {'、'.join(miss)} 节，"
+                    f"而那套件现有的数字小节是 {digits}——那句指路走过去不存在"
+                    "（「判据见第 N 节」写成一句走不通的话，就等于那份对拍从没存在过）")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -2034,6 +2571,44 @@ def main(argv=None) -> int:
         print("✅ 交付 zip 的门：条目名与真解一次两路都在、生产者用派生的 ASCII 条目名并"
               "在打完 zip 后立刻调用、Mac workflow 也带 --os-extract")
 
+    # pip 安装的冗余（第 18 条）：2026-11-13 两个 run 同时没有制品，红在一行
+    # `pip install … -i <单一镜像>` 上——外部依赖的可用性不是我们能控制的，能控制的是
+    # 「它失效时这条链还有第二条路，且每条路都有尽头」。这一条把那句话变成结构判据。
+    pip_problems = check_pip_source_resilience()
+    # 同一族的另一半（18e）：清单从两份 workflow 的 inline 包名收成一份文件之后，
+    # 「抄漏一个包」的位置变了、症状没变。这一路和上面的冗余路各报各的，因为修法是
+    # 两件事：一个改源与超时，一个改清单内容；混成一条会让人只改一半。
+    # 读不进源码必须是红、不能是跳过：这一路靠 ast 解析整棵进包源码，一份文件语法过不去
+    # 就少扫一份，安静跳过的下场是「✅ 覆盖完全」底下藏着一个从没被扫过的模块。
+    try:
+        pip_problems += check_requirements_coverage()
+    except (OSError, ValueError, SystemExit) as exc:
+        pip_problems.append(f"第三方 import 对拍没跑成：{exc}")
+    if pip_problems:
+        bad += 1
+        print("❌ pip 安装不合格（单点索引源 / 绕开安装器 / 清单缺席 / 清单漏包）：")
+        for p in pip_problems:
+            print(f"   · {p}")
+            print(f"::error::pip 安装与依赖清单：{p}")
+    else:
+        print("✅ pip 安装冗余：四份 workflow 都走 pip_install.py，多源回退 + 每源有界超时 + "
+              "全挂才非零；b2bcollect 两个平台读同一份依赖清单（不再是两份各自抄写的包名），"
+              "且那份清单覆盖进包源码 import 到的每一个第三方包")
+
+    # 注释里指路的「某套件 第 N 节」必须走得通（第 19 条）：这一条判的不是文案，是
+    # 「那份对拍存不存在」。本轮写出 13 处这样的指路而对应小节压根没写，用户报的
+    # 「以前能采到、现在一直是 0」那条链上四个函数就是那时候没有守卫的。
+    section_refs = check_section_pointer_references()
+    if section_refs:
+        bad += 1
+        print("❌ 交付链源码/脚本/workflow 里有指路注释走到不存在的小节（那句「见第 N 节」"
+              "现在谁也走不通＝那份对拍从没存在过）：")
+        for p in section_refs:
+            print(f"   · {p}")
+            print(f"::error::指路节号对拍：{p}")
+    else:
+        print("✅ 指路节号对拍：注释里每一句「某套件 第 N 节」都能在那套件里走到真实小节")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -2062,7 +2637,8 @@ def main(argv=None) -> int:
           "shell 里没有被 set -e 静默带走的裸赋值、装了的 ERR 陷阱也都带着 -E、"
           "入库路径在大小写不敏感文件系统上也不撞车、"
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
-          "交付 zip 的门两侧都在链路上")
+          "交付 zip 的门两侧都在链路上、"
+          "注释里每一句指路节号都走得通")
     return 0
 
 

@@ -323,7 +323,7 @@ class GongchangCrawler(CdpSiteCrawler):
                     return
                 continue
             empty = 0
-            new = skipped = 0
+            new = skipped = seen = 0
             for e in entries:
                 mid = e.get("公司ID") or e.get("memberId") or e.get("公司名称", "")
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -331,6 +331,8 @@ class GongchangCrawler(CdpSiteCrawler):
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
                 if key in self._seen_members or nkey in self._seen_members \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 早过滤
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
@@ -345,7 +347,7 @@ class GongchangCrawler(CdpSiteCrawler):
                 e["关键词"] = kw
                 new += 1
                 yield e
-            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 条，新增 {new} 家{tail}")
             if new == 0:
                 stale += 1

@@ -29,8 +29,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install PyQt5 selenium openpyxl pyinstaller requests websocket-client phonenumbers pandas -i https://pypi.tuna.tsinghua.edu.cn/simple
+        python .github/scripts/pip_install.py --upgrade pip
+        python .github/scripts/pip_install.py -r .github/requirements/riskbird.txt
 
     - name: Download chromedriver (Stable win64)
       run: |

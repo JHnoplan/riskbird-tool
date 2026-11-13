@@ -32,10 +32,24 @@ _ALLOC_LOCK = threading.RLock()       # 保证标签分配互斥
 _CLAIMED = {}
 
 
+PROFILE_DIR_NAME = "chrome_b2bcollect_profile"
+
+
 def shared_profile_dir() -> Path:
-    if sys.platform == "win32":
-        return Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_b2bcollect_profile"
-    return Path("/tmp/chrome_b2bcollect_profile")
+    """共享 Chrome 的配置目录落点：口径全交给 tool_config，本函数只声明「老位置在哪」。
+
+    以前这里直接写 ``%TEMP%\\chrome_b2bcollect_profile``，而 TEMP 有三条与「登录态要活
+    多久」完全相反的性质：**每个用户各一份**（换 Windows 账号=换目录）、**清理程序随时
+    可删**（磁盘清理/存储感知默认就会动它）、**注销即弃**。2026-11-13 实机那次换账号后
+    「需要登录的几路一家都采不到、不需要登录的八站照常出数」就是这么来的——界面没有
+    报错，日志里也看不出和登录有关。持久位置（Windows ``%LOCALAPPDATA%\\b2bcollect``、
+    其余 ``~/.b2bcollect``）由 tool_config 一处决定，老位置作为 legacy 传进去：那边要是
+    还留着登录态就先**复制**接管过来，绝不删源、绝不让用户重做一遍登录。
+    """
+    import tool_config as _tc
+    legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / PROFILE_DIR_NAME,
+              Path("/tmp") / PROFILE_DIR_NAME]
+    return _tc.browser_profile_dir(PROFILE_DIR_NAME, legacy_dirs=legacy)
 
 
 def _find_chrome() -> str:

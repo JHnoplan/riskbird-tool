@@ -24,12 +24,35 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# ── 落点自钉：本套件写的每一个字节都留在临时目录里 ──────────────────────────
+# 起因（2026-11-13 批跑）：现场证据那一路在没有会话目录时退到**数据目录**
+# （``aiqicha_crawler_v2._dump_search_page_evidence`` 里 ``diag_dir or _data_dir``），
+# 而开发态的数据目录就是仓库里的 ``riskbird_build/riskbird_data``。于是每跑一次这个
+# 套件，仓库里就多两份「爱企查_结果页证据_*.txt」：批跑的状态文件对拍抓到了它，可红
+# 报在批跑收尾、不在犯错的套件里——「谁写的」还得靠人回想。
+# 只把文件删掉不算修（下一次照写），所以钉的是**出口**：环境变量把整条数据目录链指到
+# 本轮临时目录（现行出口，不是早已失效的旧落点钩子），末尾再自证仓库那份目录没被添过。
+_DATA_SANDBOX = tempfile.mkdtemp(prefix="aqc_data_")
+os.environ["B2B_RISKBIRD_DATA_DIR"] = _DATA_SANDBOX
+# 会话证据的默认落点：每一节各占一个子目录，谁触发了落盘都在沙箱里，不必每节记得设
+_DIAG_ROOT = tempfile.mkdtemp(prefix="aqc_diag_")
+# 仓库数据目录的开跑前快照（对比的是**文件名集合**：Cookie 被正常读写不算污染，
+# 多出「结果页证据」这种一次性产物才算）
+_REPO_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "riskbird_data")
+_REPO_NAMES_BEFORE = ({f for f in os.listdir(_REPO_DATA_DIR) if os.path.isfile(
+    os.path.join(_REPO_DATA_DIR, f))} if os.path.isdir(_REPO_DATA_DIR) else set())
+
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 app = QApplication([])
 
+import runtime_paths  # noqa: E402
 import block_guard as bg  # noqa: E402
 import aiqicha_crawler_v2 as A  # noqa: E402
+
+# 钉完环境变量必须清进程内择路缓存：上面这些 import 里已经有人问过数据目录，
+# 不清的话本套件测的还是老落点，环境变量等于白设（reset_cache 存在的唯一理由）。
+runtime_paths.reset_cache()
 
 HOME = "https://aiqicha.baidu.com/"
 NAME = "深圳市腾讯计算机系统有限公司"
@@ -137,6 +160,12 @@ class Browser:
 
 def make_crawler(browser, pin=None):
     c = A.AiQiChaCrawlerV2()
+    # 会话目录默认给一个沙箱子目录：不设的话「结果页认不出条目」那一路走满 6 次就会
+    # 往数据目录落一份现场证据（真实运行时这个值由界面设为本次会话目录，见
+    # riskbird_gui 里 ``aiqicha_crawler.diag_dir = str(folder)``）。默认值写在工厂里，
+    # 新增用例就不必记得设——记一次不算防，忘一次就污染环境且几周看不出来。
+    make_crawler.n += 1
+    c.diag_dir = os.path.join(_DIAG_ROOT, f"session{make_crawler.n}")
     c.signals = None
     c.attach_mode = False
     c.max_retries = 1              # search_company 的循环体只在重试次数 ≥1 时才跑
@@ -154,6 +183,9 @@ def make_crawler(browser, pin=None):
     c._log = lambda msg: logs.append(str(msg))
     c.logs = logs
     return c
+
+
+make_crawler.n = 0
 
 
 # ── 1. 限流不能"1 秒即算解除" ────────────────────────
@@ -425,4 +457,19 @@ assert not c._detect_block("WS1"), "正常页面不能因为文案里带这些�
 print("⑬ 插页识别：短页文案能判拦截，长页同字样不误伤 ✓")
 
 time.sleep = real_sleep
+
+# ── 14. 落点自证：仓库的数据目录里一份都没多 ────────────────────────────────
+# 这条不是「再验一次行为」，而是把污染**报在本套件里**：上一轮同样的事是批跑收尾的
+# 状态文件对拍抓到的，报的是一句「开发机的状态文件变了」，谁写的要靠人回想这一轮跑了
+# 什么——回想出来的结论没有一条能复跑。判据取文件名集合：Cookie 与种子库被正常读写
+# 不算污染，多出「现场证据」这种一次性产物才算。
+_now = sorted(f for f in (os.listdir(_REPO_DATA_DIR) if os.path.isdir(_REPO_DATA_DIR) else [])
+              if os.path.isfile(os.path.join(_REPO_DATA_DIR, f)))
+_extra = sorted(set(_now) - _REPO_NAMES_BEFORE)
+assert not _extra, (
+    f"本套件往仓库的 riskbird_data 里多写了 {len(_extra)} 份：{_extra}——落点没钉住。"
+    f"修法是让犯错的这一路把出口钉到临时目录（B2B_RISKBIRD_DATA_DIR / diag_dir 默认值），"
+    f"删掉这些文件不算修：下一次批跑还会写回来")
+print(f"⑭ 落点自证：仓库 riskbird_data 全程没多出一份文件（本轮数据沙箱：{_DATA_SANDBOX}） ✓")
+
 print("AQC_RECOVER_OFFLINE_OK")

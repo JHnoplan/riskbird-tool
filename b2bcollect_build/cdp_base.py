@@ -37,6 +37,10 @@ import province_filter as _pf
 # Contents/MacOS 的深度写死在代码里，PyInstaller 布局一变（风鸟那一路的实际数据目录
 # 就在 Contents/Frameworks 下）就会把包内当成包外，同族缺陷就又活一份。
 import tool_config as _tc
+# 官网回采联系方式的**唯一口径实现**（证据分级/停放判定/SSRF 闸/合并去重都只写在那
+# 一个模块里）。这里引进来只是为了让 _base_rec 给出「官网回采」列的初始空值——列必须
+# 在记录诞生时就存在，否则回采写进去的行和没回采的行表结构不一致，导出会错列。
+import website_contact
 
 try:
     import websocket  # websocket-client
@@ -486,6 +490,101 @@ def normalize_spaces(val):
     return s.strip()
 
 
+# ── 相关性判定的唯一底层实现（采集时与清洗时共用一套，差别只在要不要放行）────
+# 抽取成模块级函数有两个原因：
+#  ① 清洗档（功能⑤「严格按关键词清洗」）作用在**清洗后的行**上，那时已经没有爬虫
+#     实例了；把判据留在方法里，就只能再抄一份函数，两条规则迟早各判各的。
+#  ② 「正常」与「严格」的差别必须**只有一个开关**：信号取不到时放不放弃。判定
+#     本体（二字组/完整词组/同族类目桥）两边完全一致，才谈得上「同一口径的松紧两档」。
+def kw_grams(kw):
+    """关键词 → (去尾缀词干, 中文二字组集合)。"""
+    base = re.sub(r"(批发|供应|厂家|定制|加工|工厂|价格|报价|大全|网)$", "", kw or "")
+    return base, {base[i:i + 2] for i in range(len(base) - 1)}
+
+
+def relevance_hit(kw, text):
+    """text 里有没有这个词的**正面证据**：二字组重叠 / 完整词组命中 / 同族类目桥。
+
+    与 is_relevant 的分工：这里只回答「命中没有」，不替调用方决定「没信号怎么办」。
+    采集时的 is_relevant 在命中不了时还要看中文信号强弱（fail-open，宁多采一家），
+    清洗时的严格档则把「没有正面证据」直接判为不相关——同一份判定，松紧两档。
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    base, kg = kw_grams(kw)
+    if not base:
+        return False
+    # 两种归一文本各有用处，不能用一份代替另一份：
+    #   compact（连空格都去掉）给中文二字组用——中文词在页面上常被空格切断；
+    #   flat（只压空白、保留词间空格）给英文整词边界用——把空格删掉以后
+    #   "Oil Works" 会变成 "OilWorks"，词尾的正向断言永远不成立（本机实测踩过）。
+    compact = re.sub(r"\s+", "", text)
+    if not re.search(r"[\u4e00-\u9fa5]", base):
+        try:
+            return bool(re.search(r"(?<![A-Za-z])" + re.escape(base) + r"(?![A-Za-z])",
+                                  re.sub(r"\s+", " ", text).strip(), re.I))
+        except re.error:
+            return False
+    if kg and kg & {compact[i:i + 2] for i in range(len(compact) - 1)}:
+        return True
+    if base in compact:
+        return True
+    for peer in CdpSiteCrawler._peer_words(kw):
+        if peer and peer in compact:
+            return True
+    return False
+
+
+def strict_keyword_filter(records, keywords, log=None):
+    """严格档：只留下「公司名 + 主营产品」里能**正面命中关键词**的行。
+
+    与采集时那道相关性关门的区别就在 fail-open：采集是「判不出就放过、宁可多采一家」
+    （采回来还能人工看），清洗是「准备入库交付的」，这一档要的正是把没证据的挡在外面。
+    关键词依据 = 行自带的「关键词」列 ∪ 本次任务关键词；**两个都没有**的行才保留并单独
+    计数（那是真没得判，比如没填关键词的纯名单任务）——有依据时名单补采来的行同样要过
+    这一档：它名字里带不带关键词，正是用户开这一档想知道的事。
+    严格档只动「清洗后入库数据」，原始表照旧全量保留（和四项联系方式全空那条同一纪律：
+    收紧的是入库口径，不是把线索销毁）。
+    返回 (kept, dropped, undetermined)；dropped 全是可复核的样本名，日志里给前几家，
+    误杀看得见才敢开这一档。
+    """
+    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    kept, dropped, unknown = [], [], []
+    for r in records or []:
+        if not isinstance(r, dict):
+            kept.append(r)
+            continue
+        own = str(r.get("关键词") or "").strip()
+        cand = list(kws)
+        if own and own not in cand:
+            cand.insert(0, own)
+        if not cand:
+            unknown.append(r)
+            continue
+        # 证据字段必须覆盖**两类来源**，否则严格档会误杀一整路：
+        #   搜索类站点（1688/马可波罗/顺企网…）记录里有「主营产品/主营商品/标题」；
+        #   名单通道（企知道/爱企查/风鸟）是照公司名查工商的，记录里根本没有主营字段，
+        #   能证明相关性的只有工商文本（经营范围/所属行业/简介）。
+        # 只取前一组去判，「太阳能路灯」这种词在企知道那路上永远命中不了——那不是
+        # 严格，那是把一整条通道凭空清零（本机核对 aiqicha/qizhidao 的记录结构后定下）。
+        text = " ".join(str(r.get(k) or "") for k in
+                        ("公司名称", "公司名", "company", "主营产品", "主营商品", "标题",
+                         "经营范围", "所属行业", "简介"))
+        if any(relevance_hit(k, text) for k in cand):
+            kept.append(r)
+        else:
+            dropped.append(r)
+    if log and (dropped or unknown):
+        samples = "、".join(str((r or {}).get("公司名称") or (r or {}).get("公司名") or "")[:24]
+                            for r in dropped[:6])
+        log(f"🔎 严格档：按关键词剔掉 {len(dropped)} 行出《清洗后入库数据》（{samples}"
+            f"{('…' if len(dropped) > 6 else '')}）"
+            + (f"｜另有 {len(unknown)} 行既无自带关键词也不在本任务关键词里，保留未判"
+               if unknown else ""))
+    return kept, dropped, unknown
+
+
 class CdpSiteCrawler:
     """站点采集器基类。子类须设置类属性并实现钩子方法。"""
 
@@ -631,6 +730,9 @@ return '';})()"""
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
+        # 本轮「增量库已含所以跳过」计数：没有这一笔账，界面上就只剩「新增 0 家」，
+        # 用户分不清「已经采全了」和「去重口径把活锁死了」（本轮 1688 出 0 家的形态）
+        self._incremental_skipped = 0
 
         # 请求间隔统一记账（见 _sleep）：锚定「上一次真实请求完成」的时刻，
         # 同一条记录处理链路里连续多次 _sleep 不会重复支付整段等待。
@@ -678,6 +780,17 @@ return '';})()"""
     def snapshot_results(self):
         with self.results_lock:
             return [dict(r) for r in self.results]
+
+    def results_live(self):
+        """收尾阶段**就地补字段**用的实时视图（返回的是 results 里的原字典）。
+
+        为什么需要第二个视图：snapshot_ 给的是副本，回采官网联系方式这类链路必须
+        写回真身，否则写完还得整体替换 results（那会把并发的 append 盖掉）。
+        只在采集线程已全部结束的收尾阶段用；取出列表这一动作在锁内，逐个字典的
+        写入是原子赋值，读侧（自动保存/导出）每次都持锁取整表，看不到半条记录。
+        """
+        with self.results_lock:
+            return list(self.results)
 
     def _apply_province_filter(self, rec):
         """省份精准采集的入库关卡（所有站都经 _add_result 这一条漏斗）。
@@ -804,6 +917,43 @@ return '';})()"""
     def _locked_keys(self):
         return {k for k, v in self._seen_store.items() if self._entry_locked(v)}
 
+    def _seen_store_pending(self):
+        """种子库还欠着几次「补联系人」的家数（收尾账目与渠道体检都用它）。"""
+        try:
+            return sum(1 for v in self._seen_store.values() if not self._entry_locked(v))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _page_tail(skipped=0, seen=0):
+        """把「本页 0 新增」的两种原因拼成一句尾巴（各条渠道共用同一拼法）。
+
+        早过滤=判它跟关键词不相关；增量库已含=这家已经采过或重试已用尽。以前只有前一种
+        有尾巴，「增量库跳过」完全静默，界面上就只剩一句「59 条，新增 0 家」——用户无从
+        分辨「真的采全了」和「去重口径把活锁死了」，只能整站重采（更贵、更招风控）。拼法与
+        ``ali1688_crawler._page_tail`` 逐字一致（对拍见 test_data_dir_offline.py 第 14 节）。
+        """
+        parts = []
+        if skipped:
+            parts.append(f"早过滤 {skipped} 家(未进详情)")
+        if seen:
+            parts.append(f"增量库已含 {seen} 家(跳过)")
+        return ("，" + "，".join(parts)) if parts else ""
+
+    @staticmethod
+    def _has_any_contact(rec) -> bool:
+        """这条记录到底有没有联系方式：联系人/电话/手机/邮箱 四者取一。
+
+        以前这里只看「联系人」——那是**人名**列（第 190 行的占位词表就是为它准备的），
+        于是「有电话、没人名」的条目被记成 ct=0，白重采两轮才锁；反过来「有人名、啥都没
+        有」被记成 ct=1，永久锁死一家其实没有联系方式的公司。种子库的 ct 是「这家的活干完
+        没有」的唯一凭据，它必须对准活的目标本身。刻意不看「公司网址」：有官网只说明「还能
+        再试试」，那正是「官网回采联系方式」那一轮的活。口径与 ali1688_crawler 同名函数
+        一致（对拍见 test_data_dir_offline.py 第 14 节）。
+        """
+        return any(str(rec.get(k) or "").strip()
+                   for k in ("联系人", "电话", "手机", "邮箱"))
+
     def _commit_to_store(self, rec):
         if not self.incremental or not self._is_terminal(rec):
             return
@@ -818,7 +968,7 @@ return '';})()"""
             return
         for k in self._rec_seen_keys(rec):
             old = self._seen_store.get(k) or {}
-            has_contact = bool(normalize_spaces(rec.get("联系人") or ""))
+            has_contact = self._has_any_contact(rec)
             entry = {"at": ts, "st": st, "ct": 1 if has_contact else 0}
             if not has_contact:
                 entry["rt"] = int(old.get("rt") or 0) + 1
@@ -851,22 +1001,42 @@ return '';})()"""
             本轮 Mac 故障的同一种收场，只是触发条件更苛刻（主目录被文件夹保护/占满）。
         """
         name = "b2bcollect_data"
+        # 指定落点（环境变量 B2B_COLLECT_DATA_DIR）就是唯一答案，不再往下探候选链：
+        # 远程排障与回归用例靠它把 12 路的种子库与 Cookie 钉出仓库（口径与 riskbird 那
+        # 一侧的 B2B_RISKBIRD_DATA_DIR 逐字一致，见 tool_config.env_data_dir）。
+        pinned = _tc.env_data_dir(name)
+        if pinned is not None:
+            return pinned
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).resolve().parent
             app = _tc.app_bundle_dir()
             primary = (app.parent / name) if app is not None else (exe_dir / name)
+            # .app 形态下「exe 同级」就是 Contents/MacOS＝包内：按形态排除，不等写探针
+            # 去碰运气（口径见 :func:`tool_config.inside_app_bundle`）。
+            cands = [primary] if not _tc.inside_app_bundle(primary) else []
+            dev_anchor = None
         else:
-            primary = Path(__file__).resolve().parent / name
-        for d in (primary, Path.home() / _tc.USER_CONFIG_DIR_NAME / name,
-                  Path(tempfile.gettempdir()) / f"b2bcollect_{name}"):
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-                probe = d / ".write_test"
-                probe.write_text("1", encoding="utf-8")
-                probe.unlink()
-                return d
-            except Exception:
-                continue
+            primary = dev_anchor = Path(__file__).resolve().parent / name
+            cands = [primary]
+        cands.append(Path.home() / _tc.USER_CONFIG_DIR_NAME / name)
+        cands.append(Path(tempfile.gettempdir()) / f"b2bcollect_{name}")
+        # 受系统隐私保护的目录从候选链里摘掉（判据见 :func:`tool_config.is_protected_user_dir`），
+        # 但**源码态锚点除外**：锚点是代码自己所在的目录，进程刚从那里 import 成功，访问权
+        # 已经成立；而本仓库就放在 ``~/Desktop/PythonDemo`` 下面，整条链通吃的那一版会把
+        # 数据目录悄悄挪走，症状是「Cookie 与种子库突然都不认了」。这条滤与 tool_config
+        # 的 ``state_dir_candidates``、riskbird_build 的 ``runtime_paths.candidate_dirs`` 同口径，
+        # 三处以前有两处没滤（本处）与一处多滤（开发态锚点）——两个方向都会红，见
+        # test_data_dir_offline.py 第 11 节。
+        cands = [d for d in cands if d == dev_anchor or not _tc.is_protected_user_dir(d)]
+        # 择路（顺序 + 真能写）只在 tool_config 那一处实现：本目录的种子库、状态目录、
+        # 浏览器配置三条链共用一个说法，改一处就三处一起生效。**落点不跟着「哪一级已经
+        # 存着数据」走**，老落点里的 Cookie/种子库在新落点还是空目录时由
+        # :func:`tool_config.adopt_missing_files` 复制过来——两头都要：既不许同一份包在
+        # 两台电脑上落到不同目录，也不许升级一次就把用户攒下的登录态留在原地。
+        chosen = _tc.choose_writable(cands)
+        if chosen is not None:
+            _tc.adopt_missing_files([d for d in cands if d != chosen], chosen)
+            return chosen
         return primary
 
     @staticmethod
@@ -2000,8 +2170,8 @@ return '';})()"""
     _PEER_FN = None      # keyword_expander.peer_words 的惰性缓存（None=未取过，False=没有）
 
     def _kw_grams(self, kw):
-        base = re.sub(r"(批发|供应|厂家|定制|加工|工厂|价格|报价|大全|网)$", "", kw or "")
-        return base, {base[i:i + 2] for i in range(len(base) - 1)}
+        # 委托模块级实现：判定本体只许有一份（子类想改口径就覆写 is_relevant）
+        return kw_grams(kw)
 
     def is_relevant(self, kw, text):
         """关键词与「公司名+主营+标题」的相关性：中文二字组重叠或完整词组命中即相关。
@@ -2015,18 +2185,11 @@ return '';})()"""
         text = (text or "").strip()
         if not text or not re.search(r"[\u4e00-\u9fa5]", text):
             return True
-        base, kg = self._kw_grams(kw)
-        if not kg:
+        # 判定本体走模块级 relevance_hit（与清洗严格档共用同一份规则），本方法只多
+        # 做采集侧特有的两件事：没有可靠中文信号一律放行、关键词退化到不成词也放行。
+        if relevance_hit(kw, text):
             return True
-        compact = re.sub(r"\s+", "", text)
-        if kg & {compact[i:i + 2] for i in range(len(compact) - 1)}:
-            return True
-        if base and base in compact:
-            return True
-        for peer in self._peer_words(kw):
-            if peer in compact:
-                return True
-        return False
+        return not self._kw_grams(kw)[1]
 
     @classmethod
     def _peer_words(cls, kw):
@@ -2129,6 +2292,7 @@ return '';})()"""
             empty_streak = 0
             new = 0
             skipped = 0
+            seen = 0
             for e in entries:
                 mid = str(e.get("memberId") or e.get("公司ID") or e.get("详情URL") or e.get("公司名称") or "")
                 key = f"{self.PLATFORM_SLUG}:{mid}"
@@ -2136,6 +2300,8 @@ return '';})()"""
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}" if name else ""
                 if key in self._seen_members or (nkey and nkey in self._seen_members) \
                         or f"{self.PLATFORM_SLUG}:{kw}#{mid}" in self._seen_members:
+                    seen += 1
+                    self._incremental_skipped += 1
                     continue
                 # 列表页早过滤：明显与关键词无关的连详情页都不进（省请求=提速+防封）
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
@@ -2152,7 +2318,7 @@ return '';})()"""
                 e["关键词"] = kw
                 new += 1
                 yield e
-            tail = f"，早过滤 {skipped} 家(未进详情)" if skipped else ""
+            tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 条，新增 {new} 家{tail}")
             if new == 0:
                 stale_streak += 1
@@ -2204,6 +2370,8 @@ return '';})()"""
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
+        # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
+        self._incremental_skipped = 0
         self.stat_pages = self.stat_listed = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         if not self.resume:
@@ -2323,8 +2491,16 @@ return '';})()"""
                      f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
                      if self._pf_unknown else f"、{self._pf_dropped} 家非{pv_display}已排除")
         early = f"，列表页早过滤 {self._early_skipped} 家" if self._early_skipped else ""
+        # 「这一路今天一家都没出」必须有一句解释从哪来：跳过多少家、还欠多少家补联系人。
+        # 只报「种子库累计 N 家」不够——它说的是库有多大，不是本轮为什么没活（拼法与
+        # ali1688_crawler 的收尾账目一致，对拍见 test_data_dir_offline.py 第 14 节）。
+        incr = (f"，增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)"
+                if self._incremental_skipped else "")
+        pend = self._seen_store_pending() if self.incremental else 0
+        pending = f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
-        self._log(f"✅ {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家{early}{tail}{saved}")
+        self._log(f"✅ {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家"
+                  f"{early}{incr}{pending}{tail}{saved}")
         s = self.stats()
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
@@ -2348,6 +2524,10 @@ return '';})()"""
             "数据来源": self.PLATFORM_NAME,
             "采集时间": time.strftime("%Y-%m-%d %H:%M:%S"),
             "状态": "",
+            # 官网回采的账（回采到几个/为什么没出）：留痕列，空=本轮没对它跑过回采。
+            # 「值写进正式列、来源另有账」是一条纪律——没有这一列，合并进来的号码就
+            # 和站方给的号码长得一模一样，事后无法复核是哪来的。
+            website_contact.SITE_MARK: "",
         }
 
     # ── 控制 ───────────────────────────────────────────────────
@@ -2367,6 +2547,8 @@ return '';})()"""
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
+        # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
+        self._incremental_skipped = 0
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         self.kw_yield = {}
@@ -2390,9 +2572,11 @@ return '';})()"""
         self._log("已恢复")
 
     # ── 导出 / 清洗（复用成熟模块）────────────────────────────
+    # 表头里「官网回采」这个名字取自 website_contact.SITE_MARK：列名在导出侧、记录侧、
+    # 回采实现侧必须是同一个字符串常量，写三份迟早各叫各的（回采写进去的值就会掉出表外）。
     EXPORT_HEADERS = ["序号", "关键词", "公司名称", "联系人", "岗位", "电话", "手机", "邮箱",
                       "地址", "主营产品", "经营模式", "所在区域", "公司网址", "详情URL", "memberId",
-                      "数据来源", "采集时间", "状态"]
+                      "数据来源", "采集时间", "状态", website_contact.SITE_MARK]
 
     def export_excel(self, output_path, rows=None):
         rows = self.snapshot_results() if rows is None else rows
