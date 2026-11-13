@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -121,12 +122,17 @@ def check_zip_entries(path: Path, top: str = "", root_files: tuple = ()) -> list
                             f"在用户那块盘上是同一个文件（例如 {a!r} 与 {b!r}）：后解的那个会吃掉"
                             f"先解的那个，工具报成功而用户少一个文件")
         if top:
+            # 顶层这一格按**层级与身份**判，不按尾斜杠的拼写判（理由见 ``_is_under``：拼写那
+            # 一路把「目录条目怎么拼」当成了交付内容，反向那一格还会放过根上同名的普通文件）。
+            _norm = {n.rstrip("/") for n in root_files}
             stray = [i.filename for i in infos
-                     if not i.filename.startswith(top + "/") and i.filename not in root_files]
+                     if i.filename.rstrip("/") not in _norm
+                     and not _is_under(i, top)]
             if stray:
                 problems.append(f"{path.name} 的顶层不止 {top}/ 这一层（散出来的有 {stray[:3]}）："
                                 f"用户会把它解压到桌面摊一桌，安装目录和数据目录被摊进用户可见区域")
-        absent = [n for n in root_files if n not in {i.filename for i in infos}]
+        _present = {i.filename.rstrip("/") for i in infos if not _is_dir_entry(i)}
+        absent = [n for n in root_files if n.rstrip("/") not in _present]
         if absent:
             problems.append(f"{path.name} 根上少了 {absent}：源文件在、条目却没写进包里，"
                             f"这就是打包那一步**静默少交付**一样东西——zip 的门只看了解不开、"
@@ -179,6 +185,33 @@ def _tool_names(zp: Path) -> tuple:
     return tuple(label for label, _, _, _ in _tool_specs(zp))
 
 
+def _is_dir_entry(i: zipfile.ZipInfo) -> bool:
+    """这一条在 zip 里是不是「目录」这个身份。
+
+    ``ZipInfo.is_dir()`` 只看尾斜杠，而身份同时写在 ``external_attr`` 的高 16 位里（mode）。
+    两个都认，是因为门只在这里读工具自己的字段，读到哪一格都要说得出实测过什么（下面
+    ``_expected_files`` 的注释里记着本机对着真制品与真 ditto 数出来的结果）。
+    """
+    return i.filename.endswith("/") or stat.S_ISDIR(i.external_attr >> 16)
+
+
+def _is_under(i: zipfile.ZipInfo, top: str) -> bool:
+    """这个条目是不是落在 ``top/`` 这一层里面——按**层级与身份**判，不按尾斜杠的拼写判。
+
+    按 ``startswith(top + "/")`` 判有两格会错：
+    · ``top/`` 本身这一条（目录条目）——它的名字是 ``top/`` 还是 ``top`` 取决于打包邮的
+      工具怎么拼，拼法不是交付内容；
+    · 反过来，根上躺着一个**与顶层目录同名但身份是普通文件**的条目时，``startswith`` 判它
+      不在 top 里、层级判它在里面——这时候必须报散出来，因为它根本不是那个目录，用户解压
+      后拿到的是「一个文件 + 一个同名目录」，工具在大小写不敏感的盘上还会撞车。
+    所以：拆层比第一段，第二段以后都算在里面；只剩第一段时问身份（目录才算顶层目录本身）。
+    """
+    parts = [p for p in i.filename.split("/") if p]
+    if not parts or parts[0] != top:
+        return False
+    return len(parts) > 1 or _is_dir_entry(i)
+
+
 def _ancestors(names) -> set:
     """这些路径的全部父目录（zip 里以 / 分隔，落地后也是同一层结构）。"""
     out: set = set()
@@ -197,6 +230,11 @@ def _missing_paths(want: set, got: set) -> list:
     交付，这正是用户想要的（Finder 里看到的包和打包时一模一样）；unzip 不认识它，于是老实
     落一个 `._X`。同一批字节在两个工具下给出两种落地清单，恰好是本轮反复踩的那条线：拿别人
     工具的实现差异当交付缺陷。所以这里只问「它描述的那个基文件到没到」，基文件也没到才报红。
+
+    这一支在**当前这份交付上从不触发**：对着真制品数过，`._` 侧车条目 0 个、`__MACOSX`
+    0 个（ditto 打包时那几个文件没有扩展属性可存）。留着是因为夹具里会触发（本机 ditto
+    造的那份包有 10 条侧车），而且哪天交付带上 xattr 就是它挡在中间——但别把它记成
+    「我们的包里有侧车，所以门要豁免」，那是没发生的事。
     """
     miss = []
     for n in sorted(want - got):
@@ -209,17 +247,28 @@ def _missing_paths(want: set, got: set) -> list:
 
 
 def _expected_files(zp: Path) -> tuple:
-    """条目清单：(包里的所有路径, 重名条目数)。
+    """条目清单：(包里的所有路径, 重名条目数)。目录条目也算一条路径。
 
-    **目录条目也算一条路径**，而且不靠尾斜杠分类：Apple 的 ditto 写目录条目时**不带**
-    尾斜杠（2026-11-13 云端 Mac run 正是这里假红——`解出来少了 168 个文件`，例如
-    `B2bCollectTool.app/Contents/Frameworks/PIL/.dylibs`；那 168 条全是目录，交付物一个
-    字节都没少），而 CPython 的装配脚本写目录条目时带。只认尾斜杠就等于把「这份包是哪个
-    工具打的」当成「用户手里的包少了东西」——判据红在自己的分类口径上，比不红更糟：它拦下
-    的是一个好包，还占了「门抓到真问题」的信用。
-    落地那一侧同样按**路径在不在**收（文件、目录、符号链接都算），两侧口径一致才对得起
-    「对拍」两个字；某个关键路径是不是真的可执行/非空，由 require 那一路单独判（那里用
-    is_file 与字节数），不在这里混进同一条判据。
+    云端那条假红（2026-11-13 Mac run：`ditto/unzip 解出来各少了 168 个路径`，第一例
+    ``B2bCollectTool.app/Contents/Frameworks/PIL/.dylibs``）当初被我记成「ditto 写目录条目
+    不带尾斜杠，门按尾斜杠分类」——**那句话是错的**，错在拿推理顶替实测。对着真制品的字节
+    数过之后（本机同一份源码打的包，4943 个条目）：
+      · 3297 条普通文件、1078 条符号链接、568 条目录条目，目录条目**全部带**尾斜杠，
+        不带的一条都没有；本机 ``ditto -c -k --keepParent`` 造出来的包同样全带；
+      · 那 168 条是**落地后是目录的符号链接**。PyInstaller 在 mac 上把隐藏目录 ``.dylibs``
+        另存成 ``__dot__dylibs``，再留一条 ``.dylibs`` → ``__dot__dylibs`` 的链接；本机拿
+        旧口径把这份真制品重跑一遍，条目侧 4375、落地侧 4207，差的 168 条 external_attr
+        全是 ``S_IFLNK``，第一条正是 ``…/PIL/.dylibs``（解出来 islink 与 isdir 同时为真）；
+      · 门旧版落地侧 ``for r, _, fs in os.walk(dst) for f in fs`` 只收 files，而 os.walk
+        按跟随符号链接后的 isdir 分类——指向目录的链接被分到 dirs 那一格，于是条目里
+        有、落地清单里「没有」。红的是**落地清单的收法**，交付物一个字节都没少。
+    所以两侧都按「这条路径在不在」算：条目侧一律去掉尾斜杠计入（不靠拼法分类），落地侧
+    files 与 dirs 一起收。某个关键路径是不是真的可执行/非空，由 require 那一路单独判
+    （那里用 is_file 与字节数），不在这里混进同一条判据。
+    顺带把「目录条目不带斜杠」这一格也钉死：本机试过用它造包（dir-mode 属性 + 不带斜杠，
+    compress_type 与 DOS 目录位四种组合都试），ditto 与 unzip **两个都拒绝**（rc=1
+    ``Unknown compression type``／rc=2 ``unable to process …``），所以那不是交付形状，
+    不该拿它当正例去解——本轮第 5 次犯的错就是让夹具的形状冒充生产者的形状。
     """
     with zipfile.ZipFile(zp) as zf:
         names = [n for n in (i.filename.rstrip("/") for i in zf.infolist()) if n]
@@ -271,9 +320,9 @@ def extract_with_os_tools(zp: Path, require: tuple = (), platform: str = "",
                                 f"{(r.stdout or '').strip().splitlines()[-1][:120] if r.stdout else '(没有输出)'}")
             miss = _missing_paths(want, got)
             # 「落地比条目多」本身不是缺陷：包里有 a/b/c.txt 而没有 a/b/ 这一条时，任何工具
-            # 都得把 a 与 a/b 现建出来；ditto 的包里 __MACOSX 这一层也是这么冒出来的。上一版
-            # 我在这里把计数差异直接当成「用户手里多了东西」——那是我刚在上面那条注释里批评过的
-            # 同一个错（拿计数差异推断包坏，没先问每一个名字的身份），离线夹具 ⑤ 立刻把它抓了出来。
+            # 都得把 a 与 a/b 现建出来。上一版我在这里把计数差异直接当成「用户手里多了东西」
+            # ——那是我刚在下面那条注释里批评过的同一个错（拿计数差异推断包坏，没先问每一个
+            # 名字的身份），离线夹具 ⑤ 立刻把它抓了出来。
             # 所以只有**既不是条目、也不是任何条目的父目录**的名字才算工具凭空造出来的东西。
             extra = sorted(got - want - _ancestors(want))
             if miss:
