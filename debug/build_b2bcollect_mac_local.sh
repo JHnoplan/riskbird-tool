@@ -333,6 +333,23 @@ if [ -z "$LIVE_PID" ] && [ -n "${BEFORE_PIDS:-}" ]; then
     [ -n "$LIVE_PID" ] && break
   done
 fi
+# 收尾：只收本次新起的实例和它带出来的子进程，绝不动交付前就在跑的那些（别人可能正在用）。
+# 这一步**成败都要做**：旧写法只在通过那条路上收，失败那条直接 exit——于是一次判红就在
+# 机器上留下一枚没人知道的实例（本轮实测留下的那枚一直卡在 open() 里，四分钟不放界面）。
+_harvest_live() {
+  for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
+    case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
+    for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -TERM "$_c" 2>/dev/null || true; done
+    kill -TERM "$_p" 2>/dev/null || true
+  done
+  sleep 3
+  for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
+    case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
+    for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -KILL "$_c" 2>/dev/null || true; done
+    kill -KILL "$_p" 2>/dev/null || true
+  done
+}
+
 if [ -n "$LIVE_PID" ]; then
   echo "✅ 真双击路径验过：产物自己记到 ${LEDGER_STAGE}（pid ${LIVE_PID}，第 ${_i} 次轮询）"
   # 数窗口这一段现在只是附加信息：数得出最好（人眼能核对），数不出说明的是这台机器的
@@ -345,14 +362,20 @@ if [ -n "$LIVE_PID" ]; then
 fi
 if [ -z "$LIVE_PID" ]; then
   # 数不出窗口不再等于失败（那是这台机器的会话状态），但**台账里没有本次的 shown**
-  # 一定是失败：台账是产物自己写的，它说没走到那一步，就是没走到。三种成因分开说，
+  # 一定是失败：台账是产物自己写的，它说没走到那一步，就是没走到。成因分开说，
   # 因为修法完全相反：
-  echo "❌ 40 次×2 秒都没等到本次的 ${LEDGER_STAGE} 记录。判据不看屏幕，只看这份台账——"
+  echo "❌ 轮询 ${_i} 次（每次 2 秒）都没等到本次的 ${LEDGER_STAGE} 记录。判据不看屏幕，只看这份台账——"
   echo "   台账（${LEDGER}）最近 6 条："
   if [ -f "$LEDGER" ]; then
     tail -6 "$LEDGER" | sed 's/^/     /'
   else
     echo "     （文件不存在：这台机器上一次台账都没落过盘，产物连第一步都没走到）"
+  fi
+  # 产物自己被卡住时写下的那一份栈：比这里任何推测都直接，读到哪一行就是卡在哪一行
+  STALL_FILE="$(dirname "$LEDGER")/startup_stall.txt"
+  if [ -f "$STALL_FILE" ]; then
+    echo "   本次启动的卡点栈（产物自己写的，${STALL_FILE}）前 24 行："
+    head -24 "$STALL_FILE" | sed 's/^/     /'
   fi
   echo "   ①有 begin 没 shown：走到建界面就断了，堆栈在崩溃日志里（_fatal_log_dirs 那两处）；"
   echo "   ②连 begin 都没有，两种现实长得一样，先看有没有那份崩溃日志："
@@ -360,7 +383,14 @@ if [ -z "$LIVE_PID" ]; then
   echo "     · 没日志＝本次根本没有新进程起来（上面有旧实例时脚本已经自己换过 open -n"
   echo "       强制起新字节，仍然起不来就是产物或系统这一侧的问题；旧写法会把「唤到前台"
   echo "       的旧实例」当通过，那是「为了绿灯而少验」：验的是上一次那个包）；"
-  echo "   ③进程在但状态是 U（不可中断等待）：这台机器的 exec 评估/磁盘被堵住，不是包坏了。"
+  echo "   ③进程在但状态是 U（不可中断等待）：这台机器的 exec 评估/磁盘被堵住，不是包坏了；"
+  echo "   ④台账里有 stalled：界面没交出去不是因为报错，是因为**没人回答系统弹窗**。"
+  echo "      macOS 把桌面/文稿/下载里的文件访问扣在内核里等用户点「允许」，而双击起的"
+  echo "      进程由 launchd 拉起（与从终端跑是同一条命令、却不是同一个 TCC 主体）——"
+  echo "      这正是「终端里全绿、用户双击没界面」那一族。核对哪一次访问被扣住："
+  echo "        log show --last 10m --predicate 'eventMessage CONTAINS \"System Policy: B2bCollectTool\"'"
+  echo "      修法不是在这里加等待，而是**启动路径不碰受保护目录**（机器状态一律落状态目录，"
+  echo "      老位置的读一律有界；判据见离线套件 X 节）。"
   pgrep -ax B2bCollectTool 2>/dev/null | head -5 || true
   # 格式依据（本机 2026-11-13 实测）：`ps -axo pid,stat,command` 的第二列就是 STAT，僵死
   # 进程在那里印 U（那次把这台机器拖死的一整排进程就是 U 态）。老写法是 `grep -c "U"`，
@@ -368,26 +398,18 @@ if [ -z "$LIVE_PID" ]; then
   # 所以按字段取，并且只报条数与几个 pid：这一步是给人分成因的，不是判据。
   /bin/ps -axo pid,stat,command 2>/dev/null | awk '$2 ~ /^U/ { n++; if (n <= 3) print "     U 态：" $1 " " $3 }
     END { print "   STAT 首字母为 U（不可中断等待）的进程：" n + 0 " 个" }' || true
+  _harvest_live
   exit 1
 fi
 GREW=$(find "$APP_LIVE" -newer "$STAMP_FILE" 2>/dev/null | head -3)
 if [ -n "${GREW:-}" ]; then
   echo "❌ 真跑起来的那一会儿往应用包里写了东西（用户机器上这就是 App Translocation"
   echo "   只读卷里的 OSError 30）：$(printf '%s\n' "$GREW")"
+  _harvest_live
   exit 1
 fi
 echo "✅ 包内一字节没多（${APP_LIVE}）：台账落在包外的 ${STATE_DIR}"
 # 收尾：只收这次新起的实例和它的子进程，绝不动交付前就在跑的那些（别人可能正在用）。
-for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
-  case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
-  for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -TERM "$_c" 2>/dev/null || true; done
-  kill -TERM "$_p" 2>/dev/null || true
-done
-sleep 3
-for _p in $(pgrep -x B2bCollectTool 2>/dev/null || true); do
-  case " ${BEFORE_PIDS:-} " in *" $_p "*) continue ;; esac
-  for _c in $(pgrep -P "$_p" 2>/dev/null || true); do kill -KILL "$_c" 2>/dev/null || true; done
-  kill -KILL "$_p" 2>/dev/null || true
-done
+_harvest_live
 echo "✅ 验证用的实例已收干净（不留孤儿进程——本轮把机器堵死的就是孤儿）"
 echo "✅ 打包完成并通过产物自检：$(pwd)/dist/B2bCollectTool.app"

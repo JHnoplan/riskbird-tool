@@ -1,9 +1,22 @@
 """采集任务索引与云展绑定状态的本地持久化。
 
 为什么要有这个模块：界面上「导入其他」要列出历史采集任务（按采集时间倒序），
-而 exe 是 PyInstaller onefile，`Path(__file__).parent` 指向每次运行都会变的 _MEI
-临时目录，放程序目录等于不持久。所以任务索引与绑定账号都落在用户一定看得见、
-也一定跨重启存在的「桌面/企业数据自动采集工具/」里（与自动保存同一目录）。
+而界面拿到的是「这台机器上有哪些历史任务、绑的是哪个号」，这些必须在重启后
+还在，所以不能放随包目录（Windows onefile 的 _MEI、Mac 只读转置卷都是退出即没）。
+
+落点在 2026-11-13 从桌面搬到了状态目录（``tool_config.state_file``），原因不是
+整洁，而是**双击打不开工具**：macOS 的隐私保护（「系统设置 → 隐私与安全性 → 文件
+与文件夹」）把 ``~/Desktop`` 里的文件访问扣在内核里等用户点「允许」，而这两份文件
+是在**建界面的路上**读的——用户没看见弹窗、或在远程会话里、或点了不允许，界面就
+永远出不来，一行报错都没有。同一条命令从终端起却一切正常（那时 TCC 的主体是终端，
+早已授权），所以 CI 与本机命令行永远复现不出来。纪律因此是：
+
+  · **启动路径上的机器状态一律放非受保护目录**（``~/.b2bcollect/b2bcollect_state``
+    这一族，与审计日志、启动台账同一个家）；
+  · 桌面上的老位置继续认，但用**有边界的读**（最多等 1.2 秒），读不到就按没绑过
+    处理，绝不让界面陪着系统弹窗等（见 :func:`_read_legacy`）；
+  · 桌面仍然留着**会话产出**（``tool_dir`` 那些 xlsx）——那是用户主动采集时才写的、
+    看得见摸得着的东西，弹一次授权窗是正常交互，不是启动障碍。
 
 任务口径（与用户确认过）：一次「开始采集 → 采集完成」= 一个任务，任务名取本次
 导入的采集文档名称；暂停、续采、切换数据源都不拆新任务；采集途中新增文件并入
@@ -15,10 +28,18 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+try:                                    # 落点只许问 tool_config 一处（缺了就退到家目录那一级）
+    import tool_config as _tc
+    HAS_TOOL_CONFIG = True
+except Exception:
+    _tc = None
+    HAS_TOOL_CONFIG = False
+
 TOOL_DIR_NAME = "B2B三站企业数据自动采集工具"
 TASK_INDEX_NAME = "_采集任务索引.json"
 ACCOUNT_FILE_NAME = "_云展账号.json"
 RAW_FILE_NAME = "企业数据_原始.xlsx"      # 会话目录里的原数据文件（自动保存固定名）
+
 
 TASK_STATUS_RUNNING = "采集中"
 TASK_STATUS_DONE = "已完成"
@@ -62,11 +83,41 @@ def tool_dir(desktop_dir=None) -> Path:
     return d
 
 
+def state_path(name: str) -> Path:
+    """机器状态文件的落点：与审计日志、启动台账、自检报告同一个家。
+
+    只许问 tool_config 一处（口径见 ``tool_config.state_file``：候选链 + 写探针，
+    且**永不在应用包内**）。它自己那一级写不进去时退到 ``~/.b2bcollect``——那正是
+    本次要的目标：一个不需要用户在系统弹窗上点任何东西的目录。
+    """
+    if HAS_TOOL_CONFIG:
+        try:
+            return _tc.state_file(name)
+        except Exception:
+            pass
+    return Path.home() / ".b2bcollect" / "b2bcollect_state" / name
+
+
 def index_path(desktop_dir=None) -> Path:
-    return tool_dir(desktop_dir) / TASK_INDEX_NAME
+    """任务索引的现行落点（状态目录，**不在桌面**，理由见模块头）。
+
+    ``desktop_dir`` 这个参数保留着：老调用方与离线夹具都按位置传它，忽略它比
+    让几十处调用点各写一遍 if 要诚实——参数已经不代表落点了。
+    """
+    return state_path(TASK_INDEX_NAME)
 
 
 def account_path(desktop_dir=None) -> Path:
+    return state_path(ACCOUNT_FILE_NAME)
+
+
+def legacy_index_path(desktop_dir=None) -> Path:
+    """老版本写在桌面上的那份任务索引（只为迁移而存在，不再往里写）。"""
+    return tool_dir(desktop_dir) / TASK_INDEX_NAME
+
+
+def legacy_account_path(desktop_dir=None) -> Path:
+    """老版本写在桌面上的那份绑定账号（同上：只读、只搬、不再当第二份真源）。"""
     return tool_dir(desktop_dir) / ACCOUNT_FILE_NAME
 
 
@@ -77,6 +128,95 @@ def _read_json(path: Path, default):
             return json.load(f)
     except Exception:
         return default
+
+
+# 读老位置最多等多久（秒）。这个数不是「性能调优」，是「界面最多为用户等一次多久」：
+# macOS 的授权弹窗什么时候出现、有没有人点，都不是这个进程能决定的事。
+LEGACY_READ_WAIT_SECONDS = 1.2
+# 本进程里已经「等过但没等到」的老位置：记下来就不再重试。第二次 1.2 秒换不来任何
+# 新信息（授权什么时候点是系统的事），却会让每次 check() 都拖一下界面。
+_legacy_blocked = set()
+
+
+def legacy_blocked() -> tuple:
+    """这次运行里有哪些老位置没读出来（界面据此说明「为什么看不到历史绑定」）。"""
+    return tuple(sorted(_legacy_blocked))
+
+
+def reset_legacy_state_for_tests() -> None:
+    """清掉「已卡住」的名单：离线夹具逐例独立，不许带上一次的结论。"""
+    _legacy_blocked.clear()
+
+
+def _legacy_exists_bounded(path: Path) -> bool:
+    """老位置上到底有没有这个文件——这一问同样**有界**。
+
+    ``stat`` 不像 ``open`` 那样是本轮实测被扣住的那一次，但判据不能建立在「通常
+    不会」上：建立在「通常」上的判据，遇到一台特别的机器就变成无限等待，而那一次
+    等待就排在界面出现之前。
+
+    为什么值得单独问一次：没有这一步，每个**从没绑过号**的新用户每次启动都会去
+    敲一次桌面（读不到也照样要等满 1.2 秒）。文件不在就直接跳过，一次系统调用都
+    不发给那个目录。
+    """
+    if not HAS_TOOL_CONFIG:
+        return path.exists()
+    answered, value = _tc.call_bounded(lambda: path.exists(), LEGACY_READ_WAIT_SECONDS)
+    return bool(value) if answered else False
+
+
+def _read_legacy(path: Path, default):
+    """**有边界地**读桌面老位置上的一份 JSON：没按时读到就当作没有。
+
+    为什么必须包这一层（2026-11-13 本机实测）：受保护目录里的 ``open()`` 会被内核
+    扣住等用户点「允许」，实测扣了 4 分钟以上，界面上一个字都没有。老位置的读因此
+    只许发生在「等不到也能继续」的地方，且绝不允许出现在建界面之前的裸调用里。
+    探针模块没加载上（那种包本来就是坏的）时退回直读——宁可可疑地慢，不可静默地错。
+    """
+    key = str(path)
+    if key in _legacy_blocked:
+        return default
+    if not _legacy_exists_bounded(path):
+        return default        # 没有这份文件：一次 open 都不必发给那个目录
+
+    def _do():
+        return _read_json(path, default)
+
+    if HAS_TOOL_CONFIG:
+        answered, data = _tc.call_bounded(_do, LEGACY_READ_WAIT_SECONDS)
+        if not answered:
+            _legacy_blocked.add(key)
+            return default
+        return data
+    return _do()
+
+
+def _adopt_legacy(legacy_path: Path, target_path: Path, default):
+    """把老位置那份读出来、落到新位置，并删掉老的那一份。
+
+    删老文件不是洁癖：**同时存在两份真源**时，下一次读到哪个由「新位置在不在」决定，
+    而用户改绑、清绑、换机都会让新位置先没掉——老那份就把已经作废的绑定又捞回来。
+    删不动（没授权、只读、被占用）不算失败：新位置已经落了盘，判据仍然只有一份。
+
+    新位置**已经有**的时候一个字都不覆盖：那才是真源，老副本可能是几周前的等级
+    （甚至是一个已经解绑的号）。这一支正常情况下走不到（调用方都先看新位置在不在），
+    留着是为了两处调用之间的竞态，以及让这条纪律有一个能被测到的地方。
+    """
+    if _legacy_exists_bounded(target_path):
+        try:
+            legacy_path.unlink()
+        except Exception:
+            pass
+        return default
+    data = _read_legacy(legacy_path, default)
+    if not data or data == default:
+        return default
+    if _write_json(target_path, data):
+        try:
+            legacy_path.unlink()
+        except Exception:
+            pass
+    return data
 
 
 def _write_json(path: Path, data) -> bool:
@@ -98,6 +238,12 @@ def _write_json(path: Path, data) -> bool:
 # ── 任务索引 ────────────────────────────────────────
 def load_tasks(desktop_dir=None) -> list:
     data = _read_json(index_path(desktop_dir), [])
+    if not isinstance(data, list) or not data:
+        # 新位置**还没有这个文件**才去捞老位置：判据是「文件在不在」而不是「列表
+        # 空不空」——用户把所有历史任务删干净之后，空列表是他自己的决定，不该被
+        # 桌面上那份老索引复活。
+        if not index_path(desktop_dir).exists():
+            data = _adopt_legacy(legacy_index_path(desktop_dir), index_path(desktop_dir), [])
     return [t for t in data if isinstance(t, dict) and t.get("id")] if isinstance(data, list) else []
 
 
@@ -355,9 +501,24 @@ def read_records_from_xlsx(path: str) -> list:
 
 
 # ── 云展绑定账号 ─────────────────────────────────────
+def account_data(desktop_dir=None) -> dict:
+    """绑定记录的完整内容（现行落点 → 没有这个文件时才看老落点）。
+
+    老落点那一次读是**有边界的**：升级后第一次启动会走到这里，而 macOS 上这可能
+    正卡在系统授权弹窗里。等不到就按「这台机器还没绑过」继续开界面——绑定的代价是
+    用户重点一次手机号，而挂住的代价是双击打不开工具，两件事不是一个量级。
+    """
+    p = account_path(desktop_dir)
+    data = _read_json(p, {})
+    if isinstance(data, dict) and data:
+        return data
+    if not p.exists():
+        data = _adopt_legacy(legacy_account_path(desktop_dir), p, {})
+    return data if isinstance(data, dict) else {}
+
+
 def load_account(desktop_dir=None) -> str:
-    data = _read_json(account_path(desktop_dir), {})
-    return str((data or {}).get("phone") or "") if isinstance(data, dict) else ""
+    return str(account_data(desktop_dir).get("phone") or "")
 
 
 def save_account(phone: str, desktop_dir=None) -> bool:
@@ -366,10 +527,10 @@ def save_account(phone: str, desktop_dir=None) -> bool:
 
 
 def clear_account(desktop_dir=None) -> bool:
-    try:
-        p = account_path(desktop_dir)
-        if p.exists():
-            p.unlink()
-        return True
-    except Exception:
-        return False
+    """清绑：写一条**空手机号**的记录，而不是把文件删掉。
+
+    删掉的话，下一次启动就又被判成「这个落点还从来没有过绑定记录」，于是又去捞桌面
+    老位置那份——刚被用户解绑的号原地复活。留一个空记录，「解绑」这件事才是持久的。
+    """
+    return _write_json(account_path(desktop_dir),
+                       {"phone": "", "cleared_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})

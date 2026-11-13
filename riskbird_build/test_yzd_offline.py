@@ -33,8 +33,21 @@ from riskbird_gui import MainWindow, YzdGroupDialog  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="yzd_test_")
 T = G._tasks
+# ── 状态落点单独钉一次（2026-11-13 批跑红在本套件才挖出来）──
+# 下面那句 `T.tool_dir = ...` 的注释写着「测试数据只写临时目录」，但它管的是**桌面**那
+# 一级：现行任务索引/绑定账号根本不经过 tool_dir（task_registry.state_path 问的是
+# tool_config.state_file，开发态就是模块目录）。于是本套件一路 upsert 都写进了开发机
+# 真实的 `b2bcollect_build/_采集任务索引.json`——`G._tasks` 到底是哪一份还不一定：
+# riskbird_gui 里 `import task_registry` 会因为 enhanced_cleaner 的退路把
+# b2bcollect_build 插到 sys.path 最前，同名模块分叉让这里拿到的是**隔壁那一份**实现。
+# 所以隔离只认现行落点的那个开关（环境变量），并且当场自证：拿不到自证就说明落点又搬了，
+# 宁可此刻红，也不许把假任务写进用户的真实索引里（上一轮就是这么把数据攒到 8 条的）。
+os.environ["B2B_STATE_DIR"] = str(Path(TMP) / "state")
+assert str(T.index_path()).startswith(str(Path(TMP) / "state")), (
+    f"隔离没生效：任务索引指向 {T.index_path()}——落点口径又搬了，本套件的假数据会"
+    f"写进开发机的真实索引")
 ORIG_TOOL_DIR = T.tool_dir               # ⑧ 要拿回真实现验 set_desktop_dir，不能拿到下面被换掉的
-T.tool_dir = lambda desktop_dir=None: Path(TMP)   # 测试数据只写临时目录，不碰真桌面
+T.tool_dir = lambda desktop_dir=None: Path(TMP)   # 老桌面落点：只为⑧的迁移判据存在
 
 
 # ══════════════ ① ~ ④ 客户端层（mock requests） ══════════════

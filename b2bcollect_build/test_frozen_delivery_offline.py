@@ -66,6 +66,17 @@
      落点问产物（--state-dir），门禁按 pid+阶段 取字段；数窗口在锁屏/远程会话下对
      所有进程都报 0，只能当附加信息。「唤旧实例也算通过」那种绿法必须判红——它验的
      是上一份字节
+  X. macOS 受系统隐私保护的目录不许把启动扣住：app 放在桌面时，候选链的「包旁」那一级
+     就是 ~/Desktop/…，而定落点靠写探针——内核会把这次 open 扣住等用户点「允许」（实测
+     四分钟以上），症状是「双击图标，什么也没发生，也没有报错」，而从终端起永远全绿
+     （授权主体不同）。判据用假 open 精确扣住那一处：启动路径上任何一次访问都不许替
+     用户决定要等多久，等不到也要把界面交出去；落点因此按语义离开受保护目录，老位置的
+     数据只做一次性迁移（已有目标绝不覆盖）
+  Y. 批跑入口的状态文件对拍：离线用例的隔离钩子挂在旧落点上时，假任务会写进开发机真实
+     的 _采集任务索引.json——犯错的那一路一直是绿的，被顶红的是隔壁套件。批跑因此对
+     「代码自己声明的状态文件」做前后快照对拍，改动进退出码；本节还抽出脚本里内嵌的那
+     两段 Python 在假仓库上真跑一遍，验这道守卫确实点得出被改写/被删除的文件，且在
+     什么都没改时报告为空（只查它在不在＝用一条假绿换掉另一条假绿）
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -76,6 +87,7 @@
 运行：QT_QPA_PLATFORM=offscreen .venv/bin/python b2bcollect_build/test_frozen_delivery_offline.py
 """
 import ast
+import builtins
 import contextlib
 import importlib.util
 import inspect
@@ -89,6 +101,7 @@ import sys
 import tempfile
 import tokenize
 import textwrap
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -4667,6 +4680,17 @@ def test_launch_ledger_gate():
                  f'LEDGER_STAGE="{_gui.LAUNCH_STAGE_SHOWN}"'):
         _assert(_lit in local_sh,
                 f"本机脚本里的 {_lit} 与 Python 常量逐字一致（各写一份迟早对不上字段）")
+    # 卡点文件名也要对拍：脚本第④条成因说的是「去读那份栈」，名字漂了它就去数一个
+    # 不存在的路径，而这一步照样绿。本轮那二十分钟的现场取证（``sample`` 数栈 +
+    # lldb 读寄存器才问出被扣住的路径）之所以不必在用户机器上重跑，全靠产物自己
+    # 把这个名字写进了台账。
+    _assert(f'/{_gui.LAUNCH_STALL_FILE_NAME}"' in local_sh,
+            f"本机脚本数的卡点文件与产物写的是同一个名字（{_gui.LAUNCH_STALL_FILE_NAME}）")
+    _assert(_gui.LAUNCH_STAGE_STALLED in local_sh,
+            "本机脚本的成因清单点名了 stalled：产物写了这一行而脚本不读，等于白记")
+    _assert(_gui.LAUNCH_STALL_SECONDS >= 30,
+            f"取证时限不许缩进正常冷启动的时间里（机械硬盘冷启动 + 系统弹窗等人，"
+            f"当前 {_gui.LAUNCH_STALL_SECONDS} 秒）")
 
     # 2) 开关侧：--state-dir 认得出、不与自检同族、分派最早
     _assert_eq(_gui.STATE_DIR_FLAG, "--state-dir", "取落点的开关写法（门禁抄的是同一个字符串）")
@@ -4690,7 +4714,31 @@ def test_launch_ledger_gate():
             "冒烟不写台账：它验的是「窗口建得出」这条代码路径，写进台账会让门禁把 CI "
             "的自检当成用户那一次双击")
 
+    # 卡点取证的接线：这三处顺序错了，都会得到一份「写了也没人能用」的记录
+    _assert("_launch_stall_guard_start()" in msrc,
+            "main() 真放起了看门狗：只有函数没有调用＝到点没人写证据")
+    _assert(msrc.index("_launch_record(LAUNCH_STAGE_BEGIN")
+            < msrc.index("_launch_stall_guard_start()")
+            < msrc.index("QApplication(sys.argv)"),
+            "看门狗在 begin 之后、建界面之前放起：begin 之前那一段是 import（归崩溃日志管），"
+            "建界面之后再放就正好等不到最可能卡住的那一段")
+    _assert(msrc.index("_launch_shown_or_failed.set()")
+            < msrc.index("_launch_record(LAUNCH_STAGE_SHOWN"),
+            "记 shown 之前先叫停看门狗：反过来会留下一对自相矛盾的记录"
+            "（同一次启动既有 shown 又有 stalled，而两者的修法相反）")
+    _assert('name="launch-stall-watchdog"' in _code_only(_gui._launch_stall_guard_start),
+            "看门狗必须是守护线程：不是守护的话，它会让进程替自己多活一次「退出」")
+
     # 3) 行为侧：真写一行、写不进去不抛异常只报信、超长自动截断、落点绝不在包内
+    def _trim_ok(path: Path) -> bool:
+        """台账的有界不变式：读它的人最多要读多少字节（刚写完一行留一行余量）。
+
+        正向用它、反向对照（把裁剪摘掉）也用它：判的是同一条性质，不是某一句断言。
+        """
+        return _gui._launch_bytes(
+            path.read_text(encoding="utf-8", errors="replace").splitlines()
+        ) <= _gui.LAUNCH_LOG_MAX_BYTES + _gui.LAUNCH_LOG_MAX_LINE_BYTES
+
     root = Path(tempfile.mkdtemp(prefix="ledger_"))
     saved_env = {k: os.environ.get(k) for k in ("B2B_STATE_DIR",)}
     old_home = Path.home
@@ -4707,14 +4755,94 @@ def test_launch_ledger_gate():
             _assert_eq(fields[1], str(os.getpid()), "第 2 段是 pid：门禁按 pid 认「本次那一个」")
             _assert_eq(fields[2], _gui.LAUNCH_STAGE_SHOWN, "第 3 段是阶段：门禁按阶段认走到哪")
 
-            # 截断：台账每行都重写一遍整份文件，不封顶就是拿用户的磁盘换一个取证功能
-            p.write_text("\n".join(f"t|{i}|begin|x" for i in range(_gui.LAUNCH_LOG_MAX_LINES + 60))
-                         + "\n", encoding="utf-8")
+            # 截断：台账对这台机器承诺的是**有界**，不是「永远只留 400 行」。字节线
+            # 管磁盘和「读它的人要等多久」；没到线故意不动老记录——每写一行就重读整份
+            # 文件的话，取证功能自己会变成随使用时长变慢的东西（读-改-写的老写法如此，
+            # 它还顺带把并发那一次启动的记录冲掉）。
+            short_all = _gui.LAUNCH_LOG_MAX_LINES + 60
+            p.write_text("\n".join(f"t|{i}|begin|x" for i in range(short_all)) + "\n",
+                         encoding="utf-8")
+            _assert(_trim_ok(p), "夹具本身没顶到字节线（不然下面那条「不动老记录」测不到东西）")
             _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN)
             kept = p.read_text(encoding="utf-8").splitlines()
-            _assert_eq(len(kept), _gui.LAUNCH_LOG_MAX_LINES,
-                       f"超过上限就丢最老的（实际留了 {len(kept)} 行，上限 {_gui.LAUNCH_LOG_MAX_LINES}）")
+            _assert_eq(len(kept), short_all + 1,
+                       f"没到字节线就不裁（实际留了 {len(kept)} 行，夹具 {short_all} 行）")
+
+            # 顶过字节线之后，两道收口都必须生效：条数上限 + 字节上限。
+            # 只按条数收口是不够的——行一长，400 行照样能超 64KB（下面这个夹具就是）。
+            fat = "\n".join(f"t|{i}|begin|" + "x" * 200 for i in range(2000)) + "\n"
+            p.write_text(fat, encoding="utf-8")
+            _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN)
+            kept = p.read_text(encoding="utf-8").splitlines()
+            _assert(len(kept) <= _gui.LAUNCH_LOG_MAX_LINES,
+                    f"顶过字节线就丢最老的（实际留了 {len(kept)} 行，上限 {_gui.LAUNCH_LOG_MAX_LINES}）")
+            _assert(_trim_ok(p), f"裁完字节也必须达标（长行时只按条数收口会漏，实际 {len(kept)} 行）")
             _assert_eq(kept[-1].split("|")[2], _gui.LAUNCH_STAGE_SHOWN, "截断不丢刚记的那一行")
+
+            # 反向对照：把裁剪摘掉，上面两道必须红。留着这条是因为判据会因为写法而
+            # 失去牙齿——本轮台账正是从「读整份再重写」换成「追加」，裁剪挪了位置，
+            # 如果只留正向断言，谁都能把它改成永不触发的一支而测试照旧全绿。
+            old_trim = _gui._launch_trim
+            try:
+                _gui._launch_trim = lambda path: None
+                p.write_text(fat, encoding="utf-8")
+                _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN)
+                _assert(not _trim_ok(p),
+                        "把 _launch_trim 摘掉必须判红（不然上面两道管不住裁剪被删）")
+            finally:
+                _gui._launch_trim = old_trim
+
+            # 单行上界：按条数收口成立的前提是「一行不会比整份文件还长」。哪天一行人
+            # 把栈摘要塞进 extra，400 行的上限就形同虚设，所以超长必须先在写入前截掉。
+            _gui._launch_record(_gui.LAUNCH_STAGE_SHOWN, "y" * (_gui.LAUNCH_LOG_MAX_BYTES * 2))
+            last = p.read_text(encoding="utf-8").splitlines()[-1]
+            _assert(len(last.encode("utf-8")) <= _gui.LAUNCH_LOG_MAX_LINE_BYTES,
+                    f"超长的一行写入前就截到单行上限内（实际 {len(last.encode('utf-8'))} 字节）")
+            _assert(_trim_ok(p), "一行超长也不能把台账顶过字节线")
+
+            # 卡点取证真跑到点：这是本轮 Mac 那次「台账只有 begin、界面没出来」唯一
+            # 能在用户机器上自证的通道。夹具用 0.2 秒代替 45 秒——判的是「到点就写」
+            # 这件事本身；时限的量级由上面那条常量判据钉住，不必让测试睡 45 秒。
+            saved_stall = _gui.LAUNCH_STALL_SECONDS
+            try:
+                _gui.LAUNCH_STALL_SECONDS = 0.2
+                _gui._launch_shown_or_failed.clear()
+                # 另起一根活着、但没在跑代码的线程：只有这一根在夹具里，才能证明
+                # dump 出来的**不止**当前线程（CPython 给当前线程的标题是 "Current
+                # thread"，其余才是 "Thread 0x…"，所以判据必须按这个差别写，
+                # 按 "Thread" 比会被 "Current thread" 蒙过去）。
+                holder = threading.Event()
+                other = threading.Thread(target=holder.wait, name="stall-probe-thread")
+                other.start()
+                try:
+                    _gui._launch_stall_watchdog()   # 直接调线程体：夹具要的是结论，不是线程
+                finally:
+                    holder.set()
+                    other.join()
+                stall = _gui._launch_stall_path()
+                tail = p.read_text(encoding="utf-8").splitlines()[-1]
+                _assert_eq(tail.split("|")[2], _gui.LAUNCH_STAGE_STALLED,
+                           f"到点没动静就在台账里记一笔 stalled（实际最后一行={tail}）")
+                _assert(stall.is_file(), f"卡点文件落了盘（{stall}）")
+                text = stall.read_text(encoding="utf-8", errors="replace")
+                _assert("Current thread" in text,
+                        f"卡点文件里有当前线程的栈（实际开头={text.splitlines()[:2]}）")
+                _assert(re.search(r"^Thread 0x", text, re.M) is not None,
+                        "卡点文件里还有**别的线程**：只 dump 当前线程的话，卡在别的线程"
+                        "上那一族就永远没有证据（判据按 CPython 的两种标题写）")
+                # 反向对照：已经交出界面（或已经失败）之后到点，一个字都不许再记。
+                # 否则台账会出现 shown 与 stalled 并存，而这两种成因的修法完全相反。
+                _gui._launch_shown_or_failed.set()
+                stall.unlink()
+                _gui._launch_stall_watchdog()
+                _assert(not stall.exists(),
+                        "叫停之后看门狗不再补写卡点文件（矛盾记录比没有记录更难解释）")
+                _assert_eq(p.read_text(encoding="utf-8").splitlines()[-1].split("|")[2],
+                           _gui.LAUNCH_STAGE_STALLED,
+                           "叫停只拦今后，不删已经取到的证据")
+            finally:
+                _gui.LAUNCH_STALL_SECONDS = saved_stall
+                _gui._launch_shown_or_failed.clear()
 
             # 写不进去：绝不抛异常，但必须把这件事说出来——静默失败会让「没记过这条」和
             # 「这台机器写不进」两件事长成一个样，本轮 Mac 的 OSError 30 撞的正是这一族。
@@ -4797,6 +4925,226 @@ def test_launch_ledger_gate():
             "整段被删掉时要点名「这一步压根不存在」（空串不能被当成合格）")
 
 
+def _hanging_open(gate, wanted, counter=None):
+    """把命中 ``wanted`` 的那几条路径上的 ``open()`` 换成「扣住不放」。
+
+    为什么必须这样仿真（2026-11-13 本机实测）：macOS 的隐私保护把受保护目录里的
+    ``open()`` 扣在内核里等用户点「允许」，实测扣了四分钟以上。磁盘满、权限拒绝、
+    路径不存在都造不出「**等待没有上限**」这一种形状，而这一族的全部要害就在这一句。
+    其余路径继续走真实的 open，夹具才能只挡住那一条路。
+    """
+    real = builtins.open
+
+    def fake(file, *a, **k):
+        s = str(file)
+        if any(w and w in s for w in wanted):
+            if counter is not None:
+                counter.append(s)
+            gate.wait()
+            raise OSError("这次 open 不该返回")
+        return real(file, *a, **k)
+
+    return fake
+
+
+def test_protected_dir_never_blocks_startup():
+    print("\n═══ X. 受保护目录不许把启动扣住：等不到也要把界面交出去 ═══")
+    import b2bcollect_gui as _gui
+    import task_registry as _tr
+
+    root = Path(tempfile.mkdtemp(prefix="protected_"))
+    home = root / "home"
+    (home / "Desktop").mkdir(parents=True)
+    old_home = Path.home
+    Path.home = lambda *a, **k: home
+    try:
+        # 1) 判据本身：哪些目录受保护，两侧都要说清（漏判的代价是「一次没有超时的访问」，
+        #    误判的代价是首选落点在好机器上白白降级）
+        with _sys(platform="darwin"):
+            _assert(tc.is_protected_user_dir(home / "Desktop" / "a.json"), "桌面里的文件受保护")
+            _assert(tc.is_protected_user_dir(home / "Desktop"), "桌面目录本身受保护")
+            _assert(tc.is_protected_user_dir(home / "desktop" / "x"),
+                    "大小写不同也是同一个桌面（macOS 默认文件系统不分大小写）")
+            _assert(tc.is_protected_user_dir(home / "Desktop" / "子目录" / "x"),
+                    "受保护目录的**子目录**同样受保护：只挡一层等于没挡")
+            _assert(tc.is_protected_user_dir(home / "Documents" / "x"), "文稿受保护")
+            _assert(tc.is_protected_user_dir(home / "Downloads" / "x"), "下载受保护")
+            _assert(not tc.is_protected_user_dir(home / "PythonDemo" / "x"),
+                    "家目录下的其他目录不受保护")
+            _assert(not tc.is_protected_user_dir(home),
+                    "家目录本身不受保护（否则整条候选链会被自己过滤空）")
+            _assert(not tc.is_protected_user_dir(root / "state" / "x"), "临时/状态目录不受保护")
+        with _sys(platform="win32"):
+            _assert(not tc.is_protected_user_dir(home / "Desktop" / "a.json"),
+                    "Windows 不套这一层：没有「等用户点允许」这一级，算进去只会白白降级")
+
+        # 2) 候选链：app 被放在桌面上时，「包旁」那一级就是受保护目录，必须整条摘掉
+        app = home / "Desktop" / "B2bCollectTool.app"
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        (macos / "B2bCollectTool").write_text("MZ", encoding="utf-8")
+        with _sys(platform="darwin", frozen=True, executable=str(macos / "B2bCollectTool")):
+            cands = tc.state_dir_candidates()
+            _assert_eq([str(c) for c in cands if tc.is_protected_user_dir(c)], [],
+                       f"状态目录候选一条都不许在受保护目录（实际={cands}）")
+            _assert(not tc.is_protected_user_dir(tc.state_dir()),
+                    f"落点自己也不许在受保护目录（实际={tc.state_dir()}）")
+            for _n in (_gui.LAUNCH_LOG_NAME, _gui.LAUNCH_STALL_FILE_NAME,
+                       _tr.ACCOUNT_FILE_NAME, _tr.TASK_INDEX_NAME):
+                _assert(not tc.is_protected_user_dir(tc.state_file(_n)),
+                        f"{_n} 的落点不在受保护目录：它是在建界面的路上被读的")
+            # 反向对照：把这条过滤摘掉，上面那几道立刻失效——留着它是为了证明
+            # 「过滤真的在起作用」，而不是「这台机器恰好把 app 装在别处」
+            old_guard = tc.is_protected_user_dir
+            tc.is_protected_user_dir = lambda p: False
+            try:
+                back = [str(c) for c in tc.state_dir_candidates() if "Desktop" in str(c)]
+                _assert(back,
+                        f"摘掉过滤之后桌面那一级会回到候选链（说明上面那道过滤不是空转，实际={back}）")
+            finally:
+                tc.is_protected_user_dir = old_guard
+
+            # 3) 权限模块的机器状态也跟着搬家：三份里丢了设备指纹最要命，用户会被
+            #    「该账号已在另一台设备使用」拦在门外，而他从来没换过电脑
+            with _clean_state_dir():
+                want = ag._preferred_state_dir()
+                _assert(not tc.is_protected_user_dir(want),
+                        f"权限本地状态的首选落点不在受保护目录（实际={want}）")
+                _assert(tc.is_protected_user_dir(ag._legacy_state_dir()),
+                        "老首选仍然认得桌面那一级：不认得就没法把已经存在的设备指纹搬走")
+
+        # 4) 有界原语：等不到 ≠ 失败，异常 ≠ 超时
+        gate = threading.Event()
+        try:
+            t0 = time.monotonic()
+            with _patch(builtins, "open", _hanging_open(gate, [str(home / "Desktop")])):
+                answered, value = tc.call_bounded(
+                    lambda: open(home / "Desktop" / "x.json"), 0.2)
+            took = time.monotonic() - t0
+            _assert_eq((answered, value), (False, None),
+                       "被扣住的访问如实报成「没答上来」，而不是「失败」")
+            _assert(took < 3.0, f"有界等待真的有界（这次用了 {took:.2f} 秒）")
+        finally:
+            gate.set()
+        _assert_eq(tc.call_bounded(lambda: 7, 0.5), (True, 7), "正常路径要给出答案")
+        _assert_raises(ValueError, lambda: tc.call_bounded(_raise_value_error, 0.5),
+                       "异常也是一种答案，不许被当成超时（那种包本来就是坏的）")
+
+        # 5) 老位置的读：扣住就按没有处理，且本进程只试一次
+        #    这一段把状态落点也钉在夹具目录里：开发态的候选链第一级是模块目录，
+        #    不钉住的话，下面的 save_account/save_tasks 会写进**仓库里那两份真文件**。
+        saved_state_env = os.environ.get("B2B_STATE_DIR")
+        os.environ["B2B_STATE_DIR"] = str(root / "state")
+        old_wait = _tr.LEGACY_READ_WAIT_SECONDS
+        _tr.LEGACY_READ_WAIT_SECONDS = 0.2
+        _tr.reset_legacy_state_for_tests()
+        try:
+            legacy = _tr.legacy_account_path()
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps({"phone": "13800000000"}), encoding="utf-8")
+            gate = threading.Event()
+            try:
+                with _patch(builtins, "open", _hanging_open(gate, [str(legacy)])):
+                    t0 = time.monotonic()
+                    data = _tr._read_legacy(legacy, {})
+                    took = time.monotonic() - t0
+                _assert_eq(data, {}, "老位置被扣住时按「没有」继续开界面")
+                _assert(took < 3.0, f"老位置的读按时收口（这次用了 {took:.2f} 秒）")
+                _assert(str(legacy) in _tr.legacy_blocked(),
+                        "记下「这次没读到」：界面据此要说一句，不然像历史绑定凭空没了")
+                t0 = time.monotonic()
+                with _patch(builtins, "open", _hanging_open(gate, [str(legacy)])):
+                    _tr._read_legacy(legacy, {})
+                _assert(time.monotonic() - t0 < 0.05,
+                        "同一个老位置本进程只试一次：每次 check() 都拖一下界面就是拿功能换取证")
+            finally:
+                gate.set()
+
+            # 6) 迁移：搬得动就搬走并删老；目标已有则绝不覆盖；两种「已经作废」的状态
+            #    都不许被桌面那份捞回来
+            _tr.reset_legacy_state_for_tests()
+            new_acc = _tr.account_path()
+            if new_acc.exists():
+                new_acc.unlink()
+            data = _tr._adopt_legacy(legacy, new_acc, {})
+            _assert_eq(str(data.get("phone") or ""), "13800000000", "把老绑定读出来")
+            _assert(new_acc.is_file(), "新落点落了盘")
+            _assert(not legacy.exists(), "老的那一份删掉：同时存在两份时，读到哪一份由运气决定")
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps({"phone": "13800000000"}), encoding="utf-8")
+            new_acc.write_text(json.dumps({"phone": "13900000000"}), encoding="utf-8")
+            _tr._adopt_legacy(legacy, new_acc, {})
+            _assert_eq(json.loads(new_acc.read_text(encoding="utf-8"))["phone"], "13900000000",
+                       "新落点已有记录时绝不拿老的覆盖（副本可能是几周前的）")
+            _tr.reset_legacy_state_for_tests()
+            _tr.save_account("13800000000")
+            _tr.clear_account()
+            legacy.write_text(json.dumps({"phone": "13800000000"}), encoding="utf-8")
+            _assert_eq(_tr.load_account(), "",
+                       "解绑是持久的：清绑写一条空记录而不是删文件，桌面那份捞不回来")
+            legacy_idx = _tr.legacy_index_path()
+            legacy_idx.parent.mkdir(parents=True, exist_ok=True)
+            legacy_idx.write_text(json.dumps([{"id": "t1", "name": "旧任务"}]), encoding="utf-8")
+            _tr.save_tasks([])
+            _assert_eq(_tr.load_tasks(), [],
+                       "用户删干净历史任务之后，老索引不许复活（空列表是他自己的决定）")
+            _idx = _tr.index_path()
+            if _idx.exists():
+                _idx.unlink()
+            _tr.reset_legacy_state_for_tests()
+            _assert_eq([t.get("id") for t in _tr.load_tasks()], ["t1"],
+                       "升级后第一次启动：桌面上的历史任务搬进状态目录")
+            _assert(not legacy_idx.exists(), "历史任务也一并删老，不留第二份真源")
+
+            # 两份新落点都齐了之后，启动路径上一次也不该敲桌面（新用户的常态：
+            # 每次都去试一次，等于把已经修好的挂死换成一次固定的等待）
+            counter = []
+            _tr.reset_legacy_state_for_tests()
+            with _patch(builtins, "open", _hanging_open(gate, [str(home / "Desktop")], counter)):
+                _tr.account_data()
+                _tr.load_tasks()
+            _assert_eq(counter, [], "落点搬家之后，启动路径不再访问受保护目录")
+
+            # 7) 权限模块的三份：设备指纹必须跟着搬，且同一个老目录本进程只试一次
+            old_dir, new_dir = root / "acl_old", root / "acl_new"
+            old_dir.mkdir(parents=True, exist_ok=True)
+            (old_dir / ag.DEVICE_FILE_NAME).write_text(json.dumps({"device_id": "D-1"}),
+                                                       encoding="utf-8")
+            (old_dir / ag.CACHE_FILE_NAME).write_text(json.dumps({"level": 1}), encoding="utf-8")
+            saved_tried = set(ag._LEGACY_TRIED)
+            ag._LEGACY_TRIED.clear()
+            try:
+                ag._adopt_from_legacy(old_dir, new_dir)
+                _assert((new_dir / ag.DEVICE_FILE_NAME).is_file(),
+                        "设备指纹跟着搬：丢了它这台机器自认新设备，用户看到的是「已在另一台设备使用」")
+                _assert(not (old_dir / ag.DEVICE_FILE_NAME).exists(), "搬完删老，不留第二份真源")
+                (old_dir / ag.CACHE_FILE_NAME).write_text(json.dumps({"level": 2}), encoding="utf-8")
+                ag._adopt_from_legacy(old_dir, new_dir)
+                _assert_eq(json.loads((new_dir / ag.CACHE_FILE_NAME).read_text(encoding="utf-8"))["level"], 1,
+                           "第二次调用不动已有的一份（老副本不许覆盖新落点）")
+                (new_dir / ag.CACHE_FILE_NAME).unlink()
+                ag._adopt_from_legacy(old_dir, new_dir)
+                _assert(not (new_dir / ag.CACHE_FILE_NAME).exists(),
+                        "同一个老目录本进程只试一次：不许每次落盘都去敲一次受保护目录")
+            finally:
+                ag._LEGACY_TRIED.clear()
+                ag._LEGACY_TRIED.update(saved_tried)
+        finally:
+            _tr.LEGACY_READ_WAIT_SECONDS = old_wait
+            gate.set()
+            if saved_state_env is None:
+                os.environ.pop("B2B_STATE_DIR", None)
+            else:
+                os.environ["B2B_STATE_DIR"] = saved_state_env
+    finally:
+        Path.home = old_home
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _raise_value_error():
+    raise ValueError("夹具：调用方自己抛的异常")
+
+
 def _switches_state() -> dict:
     """运行形态开关的当前值（None = 这一项没拨过）。"""
     return {k: getattr(sys, k, None) for k in _SYS_SNAPSHOT}
@@ -4820,6 +5168,85 @@ def _run(section):
                          "（拨走不收回＝下一节测的是邻居的环境）")
 
 
+def test_batch_state_watch_gate():
+    print("\n═══ Y. 批跑不许污染开发机：那道状态文件对拍要真判得出改动 ═══")
+    # 由来：一路离线用例的隔离钩子挂在**旧落点**上（tool_dir 早就不决定任务索引在哪），
+    # 于是它把假任务 upsert 进开发机真实的 _采集任务索引.json。它自己一直是绿的（按 id
+    # 找回自己那条就行），被顶红的是隔壁套件——而屏幕上那两条 ❌ 看起来和产品毫无关系。
+    # 「每个套件都记得钉落点」不是防：忘一次就污染几周。批跑入口因此加了一道环境级对拍，
+    # 这里验的是**这道守卫本身有没有牙**：只查它在不在，等于用一条假绿换掉另一条假绿。
+    runner = (_REPO / "debug" / "run_offline_regression.sh").read_text(encoding="utf-8")
+
+    # 1) 接线侧：取两次、逐字节比、差异进退出码，三处少一处都拿不到「拦得住」这句话
+    _assert('_state_snapshot "$STATE_BEFORE"' in runner,
+            "开工前真的记了一次快照（只在收工时记＝没有基准，比不出「本轮改的」）")
+    _assert('_state_snapshot "$STATE_AFTER"' in runner,
+            "收工后真的记了第二次（只记不比对，守卫就只是一句注释）")
+    _assert('cmp -s "$STATE_BEFORE" "$STATE_AFTER"' in runner,
+            "两份快照逐字节对拍：只看文件在不在，会漏掉内容被改写那一半故障")
+    _assert("leak=1" in runner and "[ $leak -ne 0 ]" in runner,
+            "对拍不等要置 leak 并且 leak 进最终退出码（只打印不拦路的判据等于没有判据）")
+
+    # 2) 行为侧：把脚本里内嵌的那两段 Python 抽出来，在一个假仓库上真跑
+    blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", runner, re.S)
+    _assert_eq(len(blocks), 2,
+               "批跑脚本里内嵌的 Python 段数（第 1 段取快照、第 2 段点名改动）")
+    snap_code, report_code = blocks
+
+    def _run_block(code: str, argv, capture=False) -> str:
+        old_argv = sys.argv
+        buf = io.StringIO()
+        try:
+            sys.argv = ["<批跑内嵌段>"] + [str(a) for a in argv]
+            with contextlib.redirect_stdout(buf):
+                exec(compile(code, "run_offline_regression.sh:内嵌段", "exec"), {})
+        finally:
+            sys.argv = old_argv
+        return buf.getvalue() if capture else ""
+
+    fake = Path(tempfile.mkdtemp(prefix="statewatch_"))
+    pkg = fake / "b2bcollect_build"
+    pkg.mkdir(parents=True)
+    # 状态文件名从**代码里的常量**来：夹具故意用一个本轮新造的常量名，它要是没被认出来，
+    # 就说明「新加一份状态文件自动进监视范围」这句话没有依据（那样守卫会随改名失效）。
+    (pkg / "registry_stub.py").write_text(
+        'TASK_INDEX_NAME = "_采集任务索引.json"\nNEW_STATE_NAME = "新加的状态.json"\n'
+        'RAW_SUFFIX = ".xlsx"\n', encoding="utf-8")
+    idx = pkg / "_采集任务索引.json"
+    idx.write_text("[]", encoding="utf-8")
+    newone = pkg / "新加的状态.json"
+    newone.write_text("{}", encoding="utf-8")
+    other_py = pkg / "tool_body.py"
+    other_py.write_text("print(1)\n", encoding="utf-8")
+    before_tsv = fake / "before.tsv"
+    after_tsv = fake / "after.tsv"
+
+    _run_block(snap_code, [fake, before_tsv])
+    listed = before_tsv.read_text(encoding="utf-8")
+    _assert("_采集任务索引.json" in listed and "新加的状态.json" in listed,
+            "两份既有状态文件都在监视范围内（含一个新造常量名，靠的是读常量而不是抄清单）")
+    _assert("tool_body.py" not in listed, "监视的是状态文件，不是整仓源码（不然一跑就全是噪音）")
+
+    # 改动判得出：这是「有牙」那一半，前面所有接线断言都不能替代它
+    idx.write_text('[{"id":"假任务"}]', encoding="utf-8")
+    newone.unlink()                                  # 被删也是改动：监视范围里「不见了」同样要说
+    other_py.write_text("print(2)\n", encoding="utf-8")   # 非状态文件的改动不该被算进来
+    _run_block(snap_code, [fake, after_tsv])
+    report = _run_block(report_code, [before_tsv, after_tsv], capture=True)
+    _assert("_采集任务索引.json" in report,
+            f"被改写的状态文件必须点名（实际报告：{report.strip() or '空'}）")
+    _assert("新加的状态.json" in report and "跑完不见了" in report,
+            f"被删掉的也要点名并说清是哪一种改动（实际报告：{report.strip() or '空'}）")
+    _assert("tool_body.py" not in report,
+            f"非状态文件的改动不许混进报告（那会把人引去查错方向：{report.strip()}）")
+
+    # 反向对照：不动任何状态文件时报告必须为空。少了这一条，上面三条都可能是在报噪音。
+    _run_block(snap_code, [fake, before_tsv])
+    _run_block(snap_code, [fake, after_tsv])
+    _assert_eq(_run_block(report_code, [before_tsv, after_tsv], capture=True).strip(), "",
+               "状态文件一字未动时报告是空的（不空就说明守卫在自说自话）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -4831,6 +5258,8 @@ SECTIONS = (
     test_switch_discipline_gate,
     test_window_smoke_gate,
     test_launch_ledger_gate,
+    test_protected_dir_never_blocks_startup,
+    test_batch_state_watch_gate,
 )
 
 

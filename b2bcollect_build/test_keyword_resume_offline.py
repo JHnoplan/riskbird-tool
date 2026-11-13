@@ -14,12 +14,28 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 无头跑 Qt，不打扰用户桌面
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# ── 状态落点必须钉在临时目录（2026-11-13 批跑红了一条用例才挖出来的）──
+# 本套件的 A~C 段按老习惯 `_tasks.set_desktop_dir(desk)` 来隔离，但任务索引的现行落点
+# 早已不经过桌面目录（见 task_registry.state_path：它问的是 tool_config.state_file）。
+# 于是这句隔离**变成了空操作**：测试把假任务一条条 upsert 进开发机真实的
+# `_采集任务索引.json`。它在很长一段时间里仍然是绿的——因为它按下 id 找回自己那条，
+# 脏数据多几条不影响它自己判定；被顶红的是隔壁套件（test_yzd_offline 断言
+# `len(load_tasks()) == 2`，而那时磁盘上已经有 8 条）。这类缺陷的形状不是「代码坏了」，
+# 是「夹具的钩子还挂在旧落点上」，所以只改这一句不够：既要把落点钉到真正生效的那一级，
+# 也要**当场自证钉住了**（下面的断言），批跑入口还有一道前后快照对拍兜住所有套件。
+_STATE_SANDBOX = Path(tempfile.mkdtemp(prefix="kw_state_"))
+os.environ["B2B_STATE_DIR"] = str(_STATE_SANDBOX)
 
 import keyword_expander as kwexp
 from parallel_session import ParallelSession, SITE_NAMES
 from b2b168_crawler import B2b168Crawler
 import task_registry as _tasks
+
+assert str(_tasks.index_path()).startswith(str(_STATE_SANDBOX)), (
+    f"隔离没生效：任务索引仍指向 {_tasks.index_path()}（不是 {_STATE_SANDBOX}）——"
+    f"说明落点又换地方了，本套件的假数据会写进开发机的真实索引里")
 
 ok = 0
 

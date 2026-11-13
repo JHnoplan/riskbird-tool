@@ -171,6 +171,79 @@ if [ "$CLEAN_BASE" -eq 1 ]; then
 fi
 rm -rf "$LOG_DIR" 2>/dev/null
 mkdir -p "$LOG_DIR" 2>/dev/null || { echo "❌ 日志目录建不出来：${LOG_DIR}（判定看不到证据就没法诚实）"; exit 2; }
+
+# ── 开发态状态文件的前后快照对拍（2026-11-13：红的那条不在犯错的套件里）────────────
+# 症状是隔壁套件断言 `len(load_tasks()) == 2` 而磁盘上有 8 条。查下去发现：某一路用例
+# 的隔离钩子挂在**旧落点**上（`set_desktop_dir` / `tool_dir` 早已不决定任务索引在哪，
+# 现行落点问的是 tool_config.state_file），于是它把假任务一条条 upsert 进开发机真实的
+# `b2bcollect_build/_采集任务索引.json`。犯错的套件自己一直是绿的——它按 id 找回自己那条
+# 就行；被顶红的是下一个，而用户打开源码版工具时会在任务列表里看到一批指向 /tmp 的假会话。
+# 这类缺陷不能靠「每个套件都记得钉落点」防：记得一次不算防，忘一次就污染环境且几周看不出来。
+# 判据取「代码自己声明的状态文件名」——各 .py 里形如 `X_NAME = "*.json|log|txt"` 的常量，
+# 新加一份状态文件就自动进监视范围，不必再维护一份人工清单（清单式的守卫第一次改名就失效）。
+# 批跑期间改动过这些文件的，不论出自哪一路套件，都在这里当场判红并点名是哪一份——
+# 「谁的用例干的」要能从证据读出来，不许靠人回想这一轮跑了什么。
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+_state_snapshot() {   # $1 = 输出文件
+  $PY - "$ROOT" "$1" <<'PY'
+import hashlib, re, sys
+from pathlib import Path
+root, out = Path(sys.argv[1]), Path(sys.argv[2])
+NAME_PAT = re.compile(r'^[A-Z_]*(?:NAME|FILENAME)\s*=\s*[\'"]([^\'"]+\.(?:json|log|txt))[\'"]', re.M)
+WATCHED_DIRS = ("b2bcollect_build", "riskbird_build", "ali1688_build")
+names = set()
+for d in WATCHED_DIRS:
+    for py in sorted((root / d).glob("*.py")):
+        names.update(NAME_PAT.findall(py.read_text(encoding="utf-8", errors="replace")))
+    for sub in sorted((root / d).glob("*_data")):      # 开发态数据目录（Cookie、种子库）
+        for f in sorted(sub.rglob("*")):
+            if f.is_file():
+                names.add(str(f.relative_to(root / d)))
+rows = []
+for d in WATCHED_DIRS:
+    for name in sorted(names):
+        f = root / d / name
+        if f.is_file():
+            rows.append(f"{f.relative_to(root)}\t{hashlib.sha256(f.read_bytes()).hexdigest()}")
+out.write_text("\n".join(rows) + "\n", encoding="utf-8")
+PY
+}
+# 点名哪一份状态文件变了。格式由这份脚本自己定义（上面写出去的 TSV），bash 只把结果
+# 原样转给人看：不解析 diff/grep 的行首符号，也就不拿外部工具的输出去猜字节长什么样
+# （同一类坑在第 14 道硬门里已经立过判据：按外部工具的输出取值就必须写明格式出处）。
+_state_leak_report() {   # $1 = 前一份快照，$2 = 后一份快照
+  $PY - "$1" "$2" <<'PY'
+import sys
+from pathlib import Path
+
+
+def load(path):
+    out = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        name, _, digest = line.partition("\t")
+        if name and digest:
+            out[name] = digest
+    return out
+
+
+before, after = load(sys.argv[1]), load(sys.argv[2])
+for name in sorted(set(before) | set(after)):
+    b = before.get(name, "原来没有这份")[:12]
+    a = after.get(name, "跑完不见了")[:12]
+    if before.get(name) != after.get(name):
+        print(f"   · {name}：开工前 {b} → 收工后 {a}")
+PY
+}
+STATE_BEFORE="$BASE/state_before.tsv"
+STATE_AFTER="$BASE/state_after.tsv"
+leak=0
+if ! _state_snapshot "$STATE_BEFORE"; then
+  echo "❌ 状态文件快照取不了：批跑失去「有没有污染开发机」这一问，这一步不放行"
+  exit 2
+fi
+nwatch=$(wc -l < "$STATE_BEFORE" | tr -d ' ')
+echo "状态文件监视：开工前先记下 ${nwatch} 份（批跑结束时对拍，改一份就当场判红）"
+
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
@@ -235,6 +308,20 @@ for f in $FILES; do
   fi
 done
 echo "----------------------------------------------------------------"
+# 收工后再取一次快照对拍：这一问与「哪一路套件红了」是两条独立的判据——上一轮两条都绿
+# 着跑了几十次，污染却在攒着，直到下一个断言条数的用例被顶红。判据要盯的是环境本身。
+if ! _state_snapshot "$STATE_AFTER"; then
+  echo "❌ 收工后的状态文件快照取不了：这一轮无法回答「有没有污染开发机」"
+  leak=1
+elif ! cmp -s "$STATE_BEFORE" "$STATE_AFTER"; then
+  leak=1
+  echo "❌ 批跑改动了开发机的状态文件（离线用例的隔离没接在现行落点上）："
+  _state_leak_report "$STATE_BEFORE" "$STATE_AFTER"
+  echo "   修法：让该套件把落点钉到临时目录（B2B_STATE_DIR），并当场自证 index_path 在它下面；"
+  echo "   只改注释或把文件删掉不算修——下一次批跑还会写回来。"
+else
+  echo "✅ 状态文件对拍：批跑全程没改动开发机的 ${nwatch} 份状态文件（用例的假数据都留在临时目录）"
+fi
 echo "套件：$pass 通过 / $fail 失败 / $skip 跳过（缺实机夹具），本轮共展开 $total 项"
 # 一项都没跑就等于「全绿」：清单解析空了、目录改名了，症状都和「真的全过」一模一样。
 if [ "$total" -eq 0 ]; then
@@ -245,9 +332,19 @@ if [ $((pass + fail + skip)) -ne "$total" ]; then
   echo "❌ 计数不自洽（$pass + $fail + $skip ≠ ${total}）：有一项没被归类，判定不可信"
   exit 1
 fi
-[ $fail -eq 0 ] && echo "ALL SUITES PASS" || echo "FAILED:$failed"
+if [ $fail -eq 0 ] && [ $leak -eq 0 ]; then
+  echo "ALL SUITES PASS"
+else
+  [ -n "$failed" ] && echo "FAILED:$failed"
+fi
 [ -n "$hung" ] && echo "HANG:$hung"
 # 总判定必须进退出码：这一句之前，「跑绿」只有人眼盯屏幕那一次算数，CI 与任何脚本
 # 拿到的都是 0——红着 6 条也一样绿。SKIP 不算失败（缺的是实机夹具，不是代码）。
 [ $fail -eq 0 ] || exit 1
+# 污染开发机单独是一条不放行的红线：套件全绿也拦。上一轮就是「全绿 + 真实索引被写脏」
+# 跑了很久，症状推迟到隔壁套件才出现，所以这里不能让它换一种形式继续存在。
+if [ $leak -ne 0 ]; then
+  echo "❌ 状态文件被改动：本轮即使套件全绿也不放行（写脏开发机的用例迟早红在隔壁套件）"
+  exit 1
+fi
 exit 0

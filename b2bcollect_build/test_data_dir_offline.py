@@ -12,7 +12,13 @@
 8 兜住口径的最后一档与「一个形状只许一份实现」：包旁与用户目录都写不进去时必须退到
 系统临时目录且**真写得进去**（旧写法把不可写的目录原样返回，调用方一句 mkdir 就崩）、
 不赌 .app 内部布局深度、环境变量指的是容器而不是唯一目录，最后把口径本身换成哨兵问
-每一路「有没有去问它」——行为比对抓得住写错的实现，抓不住同一形状各写四遍的实现。
+每一路「有没有去问它」——行为比对抓得住写错的实现，抓不住同一形状各写四遍的实现；
+9 管 macOS 那三个受系统隐私保护的目录：app 放在桌面时「包旁」那一级就是 ~/Desktop/…，
+而定落点靠写探针，等于让内核把启动扣住等用户点「允许」（本轮实机四分钟以上那次）。
+候选链按语义摘掉这类目录，判据在两个独立打包的树里各有一份，于是第 9 节立三条对拍：
+名单同字、同一批样例逐例答案一致（含 Windows 上两份都不降级、同一个目录的两种写法
+两份都得认——只按字面比的实现会漏判，而漏判的方向恰好是「不加超时」）、以及把判据摘
+成恒 False 之后桌面那一级必须回到候选链（不然「链里干净」可能只是本来就没有）。
 运行：python test_data_dir_offline.py
 """
 import os
@@ -648,6 +654,143 @@ try:
 finally:
     cdp_base.CdpSiteCrawler._stable_data_dir = _real_cdp_sdd
     ali1688_crawler._paths.stable_data_dir = _real_paths_sdd
+
+# ── 9. 「受系统隐私保护的目录」这一档口径：两份实现必须长成同一种样子 ──
+# 动机是本轮 Mac 实机那次「双击图标，什么也没发生，也没有报错」：app 放在桌面时，
+# 候选链的「包旁」那一级就是 ~/Desktop/…，而定落点靠**写探针**——在桌面上创建一个文件
+# 正是被内核扣住等用户点「允许」的那类动作（实测扣住四分钟以上）。修法是在两条候选链
+# 上各加一道语义滤网，但这份判据必须写两遍：riskbird_build 与 b2bcollect_build 是两个
+# 独立打包的树，反向 import 就要在「谁先 import」上赌运气（同 8d 那套纪律，只是这里
+# 重复是被接受的形状）。既然接受重复，就必须有对拍：谁改出自己的说法就红在这里。
+print("\n═══ 9. 受保护目录判据：名单同字、答案同口径、滤网真接线 ═══")
+
+check("9a 两份实现的受保护名单逐字一致（改名要一起改，不许一边先跑）",
+      tuple(runtime_paths.PROTECTED_USER_DIRS) == tuple(tool_config.PROTECTED_USER_DIRS),
+      f"runtime_paths={runtime_paths.PROTECTED_USER_DIRS} tool_config={tool_config.PROTECTED_USER_DIRS}")
+
+_desktop = FAKE_HOME / "Desktop"
+_samples = [
+    # (样例路径, 期望：True=受保护，False=不受保护)
+    (_desktop, True),
+    (_desktop / "Fake.app", True),                      # 子目录同样受保护
+    (_desktop / "b2bcollect_data" / "riskbird_data", True),
+    (FAKE_HOME / "desktop", True),                      # 大小写不敏感（卷可能不区分）
+    (FAKE_HOME / "Documents", True),
+    (FAKE_HOME / "Downloads" / "x", True),
+    (FAKE_HOME, False),                                  # 家目录本身不受保护
+    (FAKE_HOME / "other_dir", False),                    # 不是那三个语义目录
+    (Path(tempfile.gettempdir()) / "b2bcollect_riskbird_data", False),
+    (Path("/Applications/Fake.app/Contents/MacOS"), False),
+]
+for _sp, _want in _samples:
+    with _switches(platform="darwin"):
+        _a = runtime_paths.is_protected_user_dir(_sp)
+        _b = tool_config.is_protected_user_dir(_sp)
+    check(f"9b 样例判据两份一致且符合语义：{_sp} → {_want}",
+          _a == _b == _want, f"runtime_paths={_a} tool_config={_b} 期望={_want}")
+
+with _switches(platform="win32"):
+    _w = [runtime_paths.is_protected_user_dir(_desktop),
+          tool_config.is_protected_user_dir(_desktop)]
+check("9c Windows 上两份都判不受保护（把桌面也降级会让首选落点白白废掉）",
+      _w == [False, False], str(_w))
+
+# 9d 口径一致性：候选链里 exe 那一级是 **resolve 过**的，而 Path.home() 未必。Mac 上
+# /var 与 /private/var 是同一个地方的两个名字，只按一边比会得到「两边都明明是桌面、
+# 就是对不上」的漏判，而漏判的方向恰好是「不加超时」——正是要防的那次挂死。
+# 这个前提不靠本机 temp 目录碰巧有软链：夹具自己给假家目录挂一个别名链接，两种写法
+# 就是同目录的两个名字（造不出来时如实报跳过，不拿恒真的断言冒充验过）。
+_link_home = TMP / "home_link"
+try:
+    os.symlink(FAKE_HOME, _link_home)
+except OSError:                                    # Windows 默认不给普通用户建符号链接
+    _link_home = None
+if _link_home is None:
+    print("  ⏭  9d 跳过：本机建不出符号链接，「同一个目录的两种写法」这个前提造不出来"
+          "（判的是 macOS 那一档，缺夹具时不拿假绿代替）")
+else:
+    _old_home_fn = Path.home
+    Path.home = classmethod(lambda cls: _link_home)      # 家目录用**未解析**的别名写法
+    _literal_desktop = str(_link_home / "Desktop" / "b2bcollect_data")
+    _resolved_desktop = str((_link_home / "Desktop" / "b2bcollect_data").resolve())
+    try:
+        check("9d 夹具前提成立：同一个桌面目录确实有两种写法（不然下面白测）",
+              _literal_desktop != _resolved_desktop,
+              f"字面={_literal_desktop} 解析={_resolved_desktop}")
+        with _switches(platform="darwin"):
+            _both = [runtime_paths.is_protected_user_dir(_literal_desktop),
+                     runtime_paths.is_protected_user_dir(_resolved_desktop),
+                     tool_config.is_protected_user_dir(_literal_desktop),
+                     tool_config.is_protected_user_dir(_resolved_desktop)]
+        check("9d 两种写法都判受保护（只按一边比的实现会漏判，而漏判＝不加超时）",
+              _both == [True] * 4, str(_both))
+    finally:
+        Path.home = _old_home_fn
+
+# ── 9e/9f/9g：app 真放在桌面上时，两条链都必须躲开受保护目录 ──
+# 这里不新建第 9 条候选链，只把第 1~8 节那套 Fake.app 挪到假家目录的桌面上：形态判定
+# （_app_bundle_dir / app_bundle_dir）认的是「向上找 .app」，与它在哪无关，所以这条用例
+# 验的只有滤网一件事，正合「一个形状一份实现」里「滤网是真接在链上的」这一问。
+desk_app = _desktop / "Fake.app"
+desk_macos = desk_app / "Contents" / "MacOS"
+desk_macos.mkdir(parents=True, exist_ok=True)
+desk_exe = desk_macos / "B2bCollectTool"
+desk_exe.write_text("exe", encoding="utf-8")
+
+_saved_env = {k: os.environ.get(k) for k in
+              (runtime_paths.DATA_DIR_ENV_VAR, tool_config._STATE_DIR_ENV_VAR)}
+for _k in _saved_env:
+    os.environ.pop(_k, None)
+try:
+    runtime_paths.reset_cache()
+    with _switches(frozen=True, platform="darwin", executable=str(desk_exe)):
+        _rp_chain = runtime_paths.candidate_dirs("riskbird_data")
+        _tc_chain = tool_config.state_dir_candidates()
+        check("9e1 数据侧候选链一条都不在受保护目录（app 就在桌面上）",
+              not any(runtime_paths.is_protected_user_dir(d) for d in _rp_chain), str(_rp_chain))
+        check("9e2 状态侧候选链一条都不在受保护目录（同一句话的另一个消费者）",
+              not any(tool_config.is_protected_user_dir(d) for d in _tc_chain), str(_tc_chain))
+
+        # 9f 落到实处：定落点那两个函数在「桌面 app」形态下给出的目录不在受保护目录，
+        # 而且**真写得进去**（只说「换个目录」不说「换的那个能用」等于把故障挪个位置）。
+        _rp_got = runtime_paths.stable_data_dir("riskbird_data")
+        _tc_got = tool_config.state_dir()
+        for _lbl, _got, _fn in (("9f1 数据落点", _rp_got, runtime_paths.is_protected_user_dir),
+                                ("9f2 状态落点", _tc_got, tool_config.is_protected_user_dir)):
+            check(f"{_lbl}：避开受保护目录且不落在包内",
+                  not _fn(_got) and not _under(_got, desk_app), str(_got))
+            _probe = Path(_got) / ".probe9f"
+            _probe.write_text("1", encoding="utf-8")
+            _probe.unlink()
+            check(f"{_lbl}：换过去的落点真的写得进去（不是拿猜测当退路）", _probe.parent.is_dir(),
+                  str(_got))
+
+    # 9g 反向对照：把两份判据都摘成「永远不受保护」，桌面那一级必须回到候选链里。
+    # 少了这一条，9e 就只是「链里恰好没有桌面目录」的绿灯——滤网写没接线、接在哪一级、
+    # 名单有没有漂，三件事全都看不出来（8d 说的正是这一类：行为比对抓不住形状走样）。
+    _real_rp = runtime_paths.is_protected_user_dir
+    _real_tc = tool_config.is_protected_user_dir
+    runtime_paths.is_protected_user_dir = lambda p: False
+    tool_config.is_protected_user_dir = lambda p: False
+    try:
+        runtime_paths.reset_cache()
+        with _switches(frozen=True, platform="darwin", executable=str(desk_exe)):
+            _back = [d for d in runtime_paths.candidate_dirs("riskbird_data")
+                     if _real_rp(d)]
+            _back_tc = [d for d in tool_config.state_dir_candidates() if _real_tc(d)]
+        check("9g1 摘掉数据侧判据后桌面候选回来了（滤网确实接在这一级）", _back, str(_back))
+        check("9g2 摘掉状态侧判据后桌面候选回来了（两处接线都要真存在）", _back_tc, str(_back_tc))
+    finally:
+        runtime_paths.is_protected_user_dir = _real_rp
+        tool_config.is_protected_user_dir = _real_tc
+finally:
+    for _k, _v in _saved_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+    runtime_paths.reset_cache()
+    shutil.rmtree(_desktop, ignore_errors=True)
 
 Path.home = _real_home
 shutil.rmtree(TMP, ignore_errors=True)

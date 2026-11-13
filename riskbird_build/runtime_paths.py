@@ -98,6 +98,54 @@ def _app_bundle_dir() -> Optional[Path]:
     return None
 
 
+# 与 b2bcollect_build/tool_config.py 同名字段同口径（那一份管 state，这一份管 data）。
+# 两份实现是本项目明知并接受的形状：独立运行的风鸟/1688 看不到 b2bcollect_build，
+# 反向 import 就要在「谁先 import」上赌运气。对拍判据在 test_data_dir_offline.py，
+# 谁改出自己的说法就红在哪一路——没有这条判据，两份迟早长成两种口径。
+PROTECTED_USER_DIRS = ("Desktop", "Documents", "Downloads")
+
+
+def _protected_first_segment(path, home):
+    """按同一种口径算出「相对家目录的第一段」；不在家目录里则返回 None。"""
+    try:
+        rel = Path(os.path.abspath(str(path))).relative_to(os.path.abspath(str(home)))
+    except Exception:
+        return None
+    return rel.parts[0].lower() if rel.parts else ""
+
+
+def is_protected_user_dir(path) -> bool:
+    """这个目录在 macOS 上是否受「系统隐私保护」，访问它可能要等用户点一次「允许」。
+
+    为什么落点口径里要有这一条（2026-11-13 实机）：工具被放在桌面上时，候选链的
+    「包旁」那一级就是 ``~/Desktop/b2bcollect_data``，而定落点靠的是**写探针**——
+    在桌面上创建一个文件正是被内核扣住不动的那类动作。扣住的时间没有上限（实测四分
+    钟以上），而它排在界面出现之前，于是症状是「双击图标，什么也没发生，也没有报错」。
+    从终端起却一切正常（那时授权主体是终端），所以 CI 与命令行永远复现不出来。
+
+    与 tool_config 同名函数同口径，逐例对拍在 test_data_dir_offline.py：只管 darwin；
+    按相对家目录的第一段比（子目录同样受保护）；大小写不敏感；字面口径与解析后口径
+    两边各问一遍、任一命中即算受保护。最后这条是本处最容易写错的地方：候选链里
+    ``sys.executable`` 那一级是 resolve 过的（Mac 上 `/var` 与 `/private/var` 是同
+    一个地方的两个名字），家目录却不一定，只按一边比会得到「两边都明明是桌面、就是对
+    不上」的漏判，而漏判的方向恰好是「不加超时」——正是本轮实测那次挂死。保守的一侧
+    代价很小：最多是一个候选被跳过。
+    """
+    if sys.platform != "darwin":
+        return False
+    names = tuple(name.lower() for name in PROTECTED_USER_DIRS)
+    home = Path.home()
+    try:
+        homes = (home, home.resolve())
+    except Exception:
+        homes = (home,)
+    try:
+        paths = (Path(str(path)), Path(str(path)).resolve())
+    except Exception:
+        paths = (Path(str(path)),)
+    return any(_protected_first_segment(p, h) in names for h in homes for p in paths)
+
+
 def candidate_dirs(name: str = DEFAULT_DATA_DIR_NAME,
                    dev_dir: Optional[str] = None) -> List[Path]:
     """按优先级列出候选落点（不保证可写，也不保证存在）。
@@ -136,7 +184,14 @@ def candidate_dirs(name: str = DEFAULT_DATA_DIR_NAME,
         out.append(base / name)
     out.append(Path.home() / USER_DIR_NAME / name)
     out.append(Path(tempfile.gettempdir()) / f"b2bcollect_{name}")
-    return out
+    # 受系统隐私保护的目录一律摘掉（判据见 :func:`is_protected_user_dir`）：这一条链
+    # 是靠写探针定落点的，而「在桌面上创建一个文件」正是本轮实测被内核扣住的那类动作。
+    # 上面的环境变量分支**不**过这道滤——那是远程排障与回归测试显式指定的落点，
+    # 指定就照办，否则「我明明指了目录」与「实际写在别处」又会成了两句矛盾的话。
+    kept = [d for d in out if not is_protected_user_dir(d)]
+    if not kept:
+        kept = [Path.home() / USER_DIR_NAME / name]
+    return kept
 
 
 def stable_data_dir(name: str = DEFAULT_DATA_DIR_NAME,

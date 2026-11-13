@@ -297,6 +297,98 @@ def probe_writable(d: Path) -> bool:
         return False
 
 
+# macOS 上受「系统隐私保护」的用户目录：里面的**任何**文件访问都可能被系统扣住，
+# 等用户在「系统设置 → 隐私与安全性 → 文件与文件夹」里点一次「允许」。
+PROTECTED_USER_DIRS = ("Desktop", "Documents", "Downloads")
+# 有界探针/有界读默认的等待上限（秒）。这个数不参与功能判定，只决定「最多让界面
+# 等一次多久」，所以取一个用户还察觉不到的量级。
+BOUNDED_WAIT_SECONDS = 1.2
+
+
+def _protected_first_segment(path, home):
+    """按同一种口径算出「相对家目录的第一段」；不在家目录里则返回 None。"""
+    try:
+        rel = Path(os.path.abspath(str(path))).relative_to(os.path.abspath(str(home)))
+    except Exception:
+        return None
+    return rel.parts[0].lower() if rel.parts else ""
+
+
+def is_protected_user_dir(path) -> bool:
+    """这个路径在 macOS 上是不是落在受保护的用户目录里（桌面/文稿/下载）。
+
+    只管 darwin：Windows 上这三个目录不受同类约束（没有「等用户点允许」这一层），
+    把它也算进去会让首选目录在 Windows 上白白降级。判据按**相对家目录的第一段**
+    比，不比整串前缀——受保护的是那个**语义上的**桌面目录，而它可能被重定向。
+
+    字面口径与解析后口径**两边各问一遍，任一命中即算受保护**：调用方递进来的路径
+    可能已经 resolve 过（``sys.executable`` 那一条链就是，`/var` 与 `/private/var`
+    在 Mac 上是同一个地方的两个名字），家目录却不一定。只按一边比会得到「两个都
+    明明是桌面、却对不上」的漏判，而漏判的方向是「不加超时」——正是本轮实测那次挂死。
+    保守的一侧代价很小：最多是一个候选被跳过。
+    """
+    if sys.platform != "darwin":
+        return False
+    names = tuple(name.lower() for name in PROTECTED_USER_DIRS)
+    home = Path.home()
+    try:
+        homes = (home, home.resolve())
+    except Exception:
+        homes = (home,)
+    try:
+        paths = (Path(str(path)), Path(str(path)).resolve())
+    except Exception:
+        paths = (Path(str(path)),)
+    return any(_protected_first_segment(p, h) in names for h in homes for p in paths)
+
+
+def call_bounded(fn, timeout: float = BOUNDED_WAIT_SECONDS):
+    """在**守护线程**里跑一次 fn()，最多等 timeout 秒。返回 ``(是否给出结果, 结果)``。
+
+    为什么值得专门有一个函数（2026-11-13 本机实测换来的）：macOS 访问受保护目录时，
+    内核把 open() 扣在系统调用里等用户点「允许」——锁屏、远程会话、或者用户根本没
+    看见弹窗时，这一等就是几分钟，症状是「双击图标没界面、也没有任何报错」。而进程
+    由终端拉起时 TCC 的主体是终端（通常早已授权），于是同一条命令在 CI 与本机命令行
+    永远全绿，只有用户那一次双击会挂住：**观测手段与交付路径不是同一个主体**。
+    纪律因此只有一条：**启动路径上不许有任何一次访问能替用户决定要等多久**。读不到
+    就按读不到处理（调用方自己还有退路），超时的这一次留在守护线程里等，界面不等它。
+
+    超时返回 ``(False, None)``——它不是「失败」，是「现在还不知道」：调用方必须把它
+    和 ``(True, 失败)`` 分开对待，前者不该永久改变落点判定（授权之后同一目录可能就
+    可写了），后者才是真的不可用。
+    """
+    import threading
+    out: List = []
+
+    def _run():
+        try:
+            out.append((True, fn()))
+        except BaseException as e:      # 异常也是一种答案，不能把它当成超时
+            out.append((True, e))
+
+    t = threading.Thread(target=_run, daemon=True, name="bounded-call")
+    t.start()
+    t.join(max(0.0, float(timeout)))
+    if not out:
+        return False, None
+    answered, value = out[0]
+    if isinstance(value, BaseException):
+        raise value
+    return answered, value
+
+
+def probe_writable_bounded(d: Path, timeout: float = BOUNDED_WAIT_SECONDS) -> Optional[bool]:
+    """:func:`probe_writable` 的有界版本：True/False 是结论，None 是「没答上来」。
+
+    只给受保护目录加边界，其余目录走原来的快路径——无谓的线程包装会让探针在每台
+    机器上都多一次起线程的成本，而绝大多数落点根本不需要这一层。
+    """
+    if not is_protected_user_dir(d):
+        return probe_writable(d)
+    answered, value = call_bounded(lambda: probe_writable(d), timeout)
+    return bool(value) if answered else None
+
+
 def app_translocated() -> bool:
     """Mac 专属：本工具是不是正被 Gatekeeper 从只读随机路径转置运行。
 
@@ -598,7 +690,18 @@ def state_dir_candidates(subdir: str = "") -> List[Path]:
     cands.append(Path.home() / USER_CONFIG_DIR_NAME / name)
     import tempfile
     cands.append(Path(tempfile.gettempdir()) / name)
-    return cands
+    # **受系统隐私保护的目录一律从候选链里去掉**（判据见 :func:`is_protected_user_dir`）：
+    # app 被用户放在桌面（或文稿/下载）里时，「包旁」那一级就是 ``~/Desktop/...``，
+    # 而候选链是靠写探针定落点的——在桌面上创建一个文件正是本轮实测被内核扣住的那类
+    # 动作，一次扣住就把「双击打不开工具」换来换去地复现在最不该出现的地方：启动。
+    # 这里按**语义**排除，与上面「按形态排除包内」是同一条纪律的两种说法：不许把
+    # 数据的家交给权限、授权状态这类碰运气的东西决定。
+    kept = [c for c in cands if not is_protected_user_dir(c)]
+    if not kept:
+        # 整条链都被过滤掉（家目录本身在受保护目录里这种奇异配置）：保底仍是用户目录
+        # 那一级，它的可写性由调用方的写失败播报说，这里不猜。
+        kept = [Path.home() / USER_CONFIG_DIR_NAME / name]
+    return kept
 
 
 def state_dir(subdir: str = "") -> Path:

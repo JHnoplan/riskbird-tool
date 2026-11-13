@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import time
+import faulthandler          # 内置模块：启动卡住时把全线程的栈落盘（见 _launch_stall_dump）
 import hashlib
 import zipfile
 import threading
@@ -182,10 +183,27 @@ except ImportError:
 # 文件名与行格式只许有一份写法：交付门禁、离线测试、远程支持三方读的都是这一份。
 LAUNCH_LOG_NAME = "launch_history.log"
 LAUNCH_LOG_MAX_LINES = 400          # 只留最近这些条：磁盘写满本身也是另一类交付事故
+# 裁剪按**字节**触发、按**行数**收口：每行都重写整份文件的话，台账自己就变成了
+# 一个随使用时长变慢的东西，而且并发启动时后写的会把先写的整行冲掉（读-改-写的
+# 老写法正是如此）——门禁找的是「本次那个 pid 的那一行」，被谁冲掉都不能算它没发生。
+LAUNCH_LOG_MAX_BYTES = 64 * 1024
+# 单行的硬上界：收口按行数裁的话，前提是「一行不会比整份文件还长」。本轮新增的
+# stalled 那行要把卡点文件路径写进去，异常那行要写异常类名——都是短字段，但判据
+# 不能靠「目前都短」成立：哪天一行人把栈摘要塞进 extra，400 行的上限就形同虚设
+# （一行 8KB × 400 = 3.2MB，台账自己变成磁盘事故）。超限一律截断，中间的
+# 「…」是提示读的人这里被收过口，不是记录本身不完整。
+LAUNCH_LOG_MAX_LINE_BYTES = 2048
 # 阶段名同时写进台账和门禁判据，两处必须一起改
 LAUNCH_STAGE_BEGIN = "begin"        # 参数分派完、准备建界面
 LAUNCH_STAGE_SHOWN = "shown"        # 窗口已经 show 出去
 LAUNCH_STAGE_FAIL = "fail"          # 建界面这条路上抛异常（堆栈另有崩溃日志）
+LAUNCH_STAGE_STALLED = "stalled"    # 走到建界面之前/之中没了动静（堆栈见启动卡点文件）
+# 多久没动静算「卡住」。它是**取证**的时限，不是功能的时限：到点之后程序照旧继续，
+# 多出来的是一份能把「双击没界面」一次讲清的栈。取 45 秒是因为一次正常的冷启动在
+# 机械硬盘上也要十几秒，而用户开始觉得「这软件坏了」也在半分钟左右。
+LAUNCH_STALL_SECONDS = 45
+LAUNCH_STALL_FILE_NAME = "startup_stall.txt"
+_launch_shown_or_failed = threading.Event()
 
 
 def _launch_log_path() -> Path:
@@ -202,6 +220,57 @@ def _launch_log_path() -> Path:
     return Path.home() / ".b2bcollect" / "b2bcollect_state" / LAUNCH_LOG_NAME
 
 
+def _launch_stall_path() -> Path:
+    """启动卡点文件的落点：与台账同一个目录，远程支持只要问一个地方。"""
+    return _launch_log_path().parent / LAUNCH_STALL_FILE_NAME
+
+
+def _launch_trim(path: Path) -> None:
+    """超过字节上限就裁：收口同时看**条数**和**字节**，谁先顶到谁生效。
+
+    裁剪失败不算故障：留着旧行继续写，最多是这个文件大一点；把它升级成一次异常
+    反而会把「证据写不进去」的原因搅浑。
+
+    为什么两个都要卡：条数上限保证「最近的这些次启动都在档」，字节上限保证
+    「读它的人不用等」——单靠条数，长行能把文件撑大一个量级；单靠字节，一次
+    裁剪可能顺手丢掉几十次本可以留住的记录。
+    """
+    try:
+        if path.stat().st_size <= LAUNCH_LOG_MAX_BYTES:
+            return
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    kept = lines[-LAUNCH_LOG_MAX_LINES:]
+    while len(kept) > 1 and _launch_bytes(kept) > LAUNCH_LOG_MAX_BYTES:
+        del kept[0]
+    tmp = path.with_name(path.name + ".trim")
+    try:
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _launch_bytes(lines) -> int:
+    """这份记录占多少字节（含每行末尾那个换行）——收口判据只用这一个口径。"""
+    return sum(len(line.encode("utf-8")) + 1 for line in lines)
+
+
+def _launch_clamp(line: str) -> str:
+    """把一行压到 :data:`LAUNCH_LOG_MAX_LINE_BYTES` 以内（按字节量，不切碎多字节字符）。"""
+    raw = line.encode("utf-8", errors="replace")
+    if len(raw) <= LAUNCH_LOG_MAX_LINE_BYTES:
+        return line
+    # 预留 32 字节给标记本身：按字符切一刀再拼上去，长度就又超限了（判据要闭合，
+    # 不能靠「大概差一点」）。errors="ignore" 丢掉被切半的那个多字节字符。
+    cut = raw[:LAUNCH_LOG_MAX_LINE_BYTES - 32].decode("utf-8", errors="ignore")
+    return cut + "…〔已截断〕"
+
+
 def _launch_record(stage: str, extra: str = "") -> None:
     """记一行「这个 pid 走到了 <stage>」。**永不抛异常**：台账自己把程序带崩，
     等于把要留的证据和这次启动一起弄丢。
@@ -213,19 +282,28 @@ def _launch_record(stage: str, extra: str = "") -> None:
     ①门禁问产物 ``--state-dir`` 拿到台账落点（落点由产物回答，不在 shell 里重抄候选链）；
     ②按 **pid + 阶段** 认这一行。数窗口降级成附加信息：数得出就一并印出来，数不出不判红。
     行格式固定 ``时间|pid|阶段|细节``，字段以 | 分隔——门禁按字段取值，不读话术。
-    多实例同时启动时以最后写入为准：台账是给「这一次到底起来没有」作证的，不是审计流水。
+
+    写法是**追加**而不是读整份再重写：后者在两个实例同时启动时会把对方刚写的那一行
+    连着自己的份一起覆盖掉（重启链路、开机自启都会撞上），而「谁的那一行被谁冲掉」
+    这件事从门禁里看不出来，只会得到一句莫名其妙的「本次没有 shown」。追加之后仍然
+    复核一次自己那行在不在：被并发裁剪掉就重写一次，最多三次——这是取证，宁可重。
     """
-    line = (f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
-            f"|{os.getpid()}|{stage}|{extra}")
+    line = _launch_clamp(
+        f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
+        f"|{os.getpid()}|{stage}|{extra}")
     try:
         p = _launch_log_path()
-        try:
-            lines = p.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []                    # 第一次启动、或上一份根本不存在
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("\n".join((lines + [line])[-LAUNCH_LOG_MAX_LINES:]) + "\n",
-                     encoding="utf-8")
+        for _ in range(3):
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            _launch_trim(p)
+            try:
+                if line in p.read_text(encoding="utf-8", errors="replace"):
+                    return
+            except OSError:
+                return                # 读不回来说明整条路都不通，交给下面的播报
+        raise OSError("本次记录被并发启动或裁剪顶掉了")
     except Exception as e:
         # 写不进去也必须说得出：静默失败会让「台账没记过这一条」和「这台机器写不进
         # 台账」两件事长成一个样——本轮 Mac 的 OSError 30 撞的正是这一族。
@@ -234,6 +312,52 @@ def _launch_record(stage: str, extra: str = "") -> None:
                   flush=True)
         except Exception:
             pass
+
+
+def _launch_stall_dump() -> str:
+    """把所有线程的栈写进启动卡点文件，返回那个路径（失败也回一个可说的路径）。
+
+    为什么用 ``faulthandler`` 而不是自己 ``traceback.format_stack``：本轮实测那次卡死
+    卡在**系统调用**里（``open()`` 等 macOS 的桌面授权），Python 层的帧只有解释器自己
+    才 dump 得出来；而它是内置模块，不需要随包文件、也没有打包态找不到的风险。
+    """
+    path = _launch_stall_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# 启动超过 {LAUNCH_STALL_SECONDS} 秒还没把窗口交出去，"
+                    f"下面是每一根线程此刻的栈（{datetime.now().isoformat(timespec='seconds')}）\n")
+            f.flush()
+            faulthandler.dump_traceback(file=f, all_threads=True)
+            f.flush()
+    except Exception as e:
+        try:
+            print(f"⚠ 启动卡点的栈写不进 {path}（{type(e).__name__}: {e}）", flush=True)
+        except Exception:
+            pass
+    return str(path)
+
+
+def _launch_stall_watchdog() -> None:
+    """后台一根守护线程：到点还没走到 shown/fail，就把全线程的栈落盘并记一笔 stalled。
+
+    它**不**试图打断主线程，也不改变任何功能——一次挂死的启动照旧挂在那儿，唯一多了
+    的是这份证据。为什么这件事必须由产物自己做（2026-11-13 本机实测）：那次挂死我先
+    用「数窗口」判红、再用 ``sample`` 数到 ``__open``、最后拿 lldb 读寄存器才问出被卡
+    住的路径，前后二十分钟；而这三步在用户机器上一支都跑不起来，只能靠截图互相猜。
+    """
+    if _launch_shown_or_failed.wait(LAUNCH_STALL_SECONDS):
+        return
+    where = _launch_stall_dump()
+    _launch_record(LAUNCH_STAGE_STALLED,
+                   f"超过 {LAUNCH_STALL_SECONDS} 秒没走到 {LAUNCH_STAGE_SHOWN}"
+                   f"，全线程栈见 {where}")
+
+
+def _launch_stall_guard_start() -> None:
+    threading.Thread(target=_launch_stall_watchdog, daemon=True,
+                     name="launch-stall-watchdog").start()
+
 
 
 # 状态行站点状态标记（图标+颜色+文字三通道，对齐 GitHub Actions/Jenkins 任务实况惯例）：
@@ -6572,6 +6696,10 @@ def main():
     _launch_note = (f"frozen={'是' if getattr(sys, 'frozen', False) else '否'}"
                     f" platform={sys.platform}")
     _launch_record(LAUNCH_STAGE_BEGIN, _launch_note)
+    # 卡点取证同时开工：从这里起到 shown/fail 之间的任何一段「没有动静」都会留下一份
+    # 全线程的栈。它不改任何功能，只是让下一次「双击没界面」不再需要二十分钟的现场取证
+    # （判据与理由见 :func:`_launch_stall_watchdog`）。
+    _launch_stall_guard_start()
     try:
         app = QApplication(sys.argv)
         app.setStyleSheet(_app_stylesheet())
@@ -6594,11 +6722,27 @@ def main():
                 w._on_log("⚠ 权限校验模块（access_guard）未加载，本次运行不做白名单拦截")
             except Exception:
                 pass
+        # 老记录读不出来要说一句（只有 macOS 走得到这条：桌面受系统隐私保护，那一次
+        # 读最多等 LEGACY_READ_WAIT_SECONDS 秒就不再奉陪）。不说就等于「升级之后历史
+        # 任务与绑定凭空没了」，用户只能重来一遍，而实际上点一次「允许」就都回来了。
+        try:
+            _stale = _tasks.legacy_blocked() if HAS_YZD else ()
+            if _stale:
+                w._on_log("⚠ 桌面上那份旧的绑定/任务记录这次没读到（系统在等「允许访问桌面」，"
+                          "本机没为它多等）：本次按新落点继续，若要沿用请在"
+                          "「系统设置 → 隐私与安全性 → 文件与文件夹」里允许本工具访问桌面，"
+                          "然后重开工具")
+        except Exception:
+            pass
         w.show()
         # 交付门禁只认这一行：窗口是不是真交出去了，由进程自己说，不由外面的观测手段猜
         # （数窗口在锁屏/远程会话下对所有进程都报 0，那种场合它一个字也证不了）。
+        # 先叫停卡点取证再记账：反过来会留下一次「其实走到了、却同时被记成 stalled」的
+        # 自相矛盾记录，而自相矛盾的记录比没有记录更难解释。
+        _launch_shown_or_failed.set()
         _launch_record(LAUNCH_STAGE_SHOWN, _launch_note)
     except Exception as e:
+        _launch_shown_or_failed.set()
         _fatal_log(e)
         _launch_record(LAUNCH_STAGE_FAIL, f"{_launch_note} {type(e).__name__}")
         try:

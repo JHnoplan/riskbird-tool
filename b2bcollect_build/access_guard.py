@@ -172,8 +172,17 @@ def _now_text() -> str:
 # 三份文件各自只有一个写者（名单副本 / 设备指纹 / 认领记录），所以都不需要
 # 读-改-写合并；合成一份大文件反而会因为「刷新名单时把认领记录覆盖掉」出事故。
 
-# 首选落点写不进去时的备用落点：与丐版同一个应用数据目录，但不和数据池混在一起
+# 首选落点写不进去时的备用落点：与丐版同一个应用数据目录，但不和数据池混在一起。
+# 同一个子目录名也用在现行首选落点上（状态目录/这一级）：这三份都是**机器状态**，
+# 不是用户取用的数据，所以一律住在不受系统隐私保护扣住的目录里（纪律与理由见
+# task_registry 模块头）。
 BACKUP_STATE_SUBDIR = "acl"
+
+# 三份文件的名字只许在这一处出现：换落点时要把它们从老目录搬过去（见
+# :func:`_adopt_from_legacy`），写死在两个地方就一定会写成两个不同的名字。
+CACHE_FILE_NAME = ".acl_cache.json"
+DEVICE_FILE_NAME = ".acl_device.json"
+CLAIM_FILE_NAME = ".acl_claim.json"
 
 # 本地状态读写中如实记下的问题（只有路径与异常类型，绝不带文件内容）：断网时
 # 「沿用上一次的身份等级」全靠磁盘副本，它落不下去必须让自检看得见。
@@ -181,6 +190,11 @@ _STATE_PROBLEMS: List[str] = []
 # 一次运行只认一个落点（键 = 首选路径原文）：三份文件散在两个目录，比统一退到
 # 备用目录更糟——那会出现「名单副本在桌面、认领记录在备用目录」的拼接状态。
 _STATE_DIR_CACHE: Dict[str, Path] = {}
+# 本进程已经试过的**老落点**（一次也不许多试）：老落点在 macOS 上是受保护目录，
+# 每试一次就是最多一轮有界等待；而「再试一次」在授权没点下来的时候换不来任何
+# 新信息。跨进程要不要再试由目标文件在不在决定——搬成功之后目标里就有了，下次
+# 连读都不读（见 :func:`_adopt_from_legacy`）。
+_LEGACY_TRIED: set = set()
 
 
 def state_problems() -> List[str]:
@@ -223,18 +237,133 @@ def _writable(path: Path) -> Optional[bool]:
 
     判据复用 tool_config.probe_writable：「目录在不在」与「写不写得进去」是两件
     事，两处各写一份迟早对不上，而对不上时看到假阳性的永远是远程排障的人。
+
+    2026-11-13 换成**有界**版本（``probe_writable_bounded``）：这一处探针排在建界面
+    之前，而写探针的本来面目是**在目标目录里创建一个文件**——目标在桌面上时，
+    macOS 的隐私保护会把这一次创建扣在内核里等用户点「允许」，实测扣了四分钟以上，
+    界面一个字都没有。用户看到的症状是「双击图标，什么也没发生，也没有任何报错」。
+    有界探针把「等不到」如实报成 False（此刻拿不到结论，就当不可用，走备用落点），
+    并把原因写进问题清单，让 --acl-doctor 与远程支持看得见落点为什么变了。
+
+    现行首选落点已经不在受保护目录里（见 :func:`_preferred_state_dir`），所以这一层
+    边界主要是**兜住老机器**：那里留下的仍是桌面路径时（备用目录也被拦、无路可退的
+    分支），不许再把启动搭进去。
     """
     try:
-        from tool_config import probe_writable
+        from tool_config import probe_writable_bounded
     except Exception:
         return None
-    return probe_writable(path)
+    answered = probe_writable_bounded(path)
+    if answered is None:
+        # 只有受保护目录才可能给不出结论：其余路径走的是快路径，一定有答案
+        _note_state_problem(
+            f"系统还没回答「{path} 能不能写」（macOS 隐私保护正在等用户点「允许」："
+            f"系统设置 → 隐私与安全性 → 文件与文件夹），本机先按不可写处理，"
+            f"权限本地状态改用备用目录，功能不受影响")
+        return False
+    return answered
+
+
+def _exists_bounded(path: Path) -> bool:
+    """文件在不在，也必须**有界**：判据不许建立在「stat 通常不会被扣住」上。
+
+    这一步的存在不是为了正确，是为了**快**：老落点里根本没有这些文件的新用户，
+    如果直接读，每次启动都要为一次注定失败的 open 等满一轮超时。
+    """
+    try:
+        from tool_config import call_bounded, BOUNDED_WAIT_SECONDS
+    except Exception:
+        return path.exists()
+    answered, value = call_bounded(lambda: path.exists(), BOUNDED_WAIT_SECONDS)
+    return bool(value) if answered else False
+
+
+def _read_json_bounded(path: Path, default):
+    """有边界地读**老落点**上的身份文件（只在搬家那一次才会走到这里）。
+
+    三份里最要命的是 ``.acl_device.json``：它没了，这台机器就自认是新设备，用户会
+    突然看到「该账号已在另一台设备使用」。所以换落点之前必须先试这一次；但试就有
+    代价（可能一直等到超时），所以给它一个上限——卡住就放弃，绝不把界面搭进去。
+    """
+    if not _exists_bounded(path):
+        return default
+    try:
+        from tool_config import call_bounded, BOUNDED_WAIT_SECONDS
+    except Exception:
+        return _read_json(path, default)
+    answered, data = call_bounded(lambda: _read_json(path, default), BOUNDED_WAIT_SECONDS)
+    return default if not answered else data
+
+
+def _adopt_from_legacy(legacy: Path, chosen: Path) -> None:
+    """把老落点里已有的身份文件搬到现行落点（目标已存在一律不动）。
+
+    为什么必须搬而不只是「重新生成」：设备指纹重生成 = 这台机器自认新设备，用户会被
+    「该账号已在另一台设备使用」拦在门外，而他从来没换过电脑。
+
+    三道闸按代价从小到大挡掉多余的等待：同一个老目录本进程只试一次；老文件不在
+    就一个 open 都不发；目标已经有了就绝不覆盖（有两份时**保留新的那一份**，
+    否则老副本会把已经作废的等级又捞回来）。
+
+    搬成功就顺手删掉老的那一份：桌面上留一份 ``.acl_device.json`` 既透露机制，
+    又会在落点判定变化时被重新读到。删不动（没授权、只读）不算失败——目标已经
+    落了盘，之后永远不会再看那个目录。
+    """
+    if str(legacy) == str(chosen) or str(legacy) in _LEGACY_TRIED:
+        return
+    _LEGACY_TRIED.add(str(legacy))
+    for name in (CACHE_FILE_NAME, DEVICE_FILE_NAME, CLAIM_FILE_NAME):
+        try:
+            src, dst = legacy / name, chosen / name
+            if _exists_bounded(dst):
+                continue
+            data = _read_json_bounded(src, None)
+            if data is None:
+                continue
+            if _write_json(dst, data):
+                try:
+                    src.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+
+def _fallback_state_dir() -> Path:
+    """状态目录下那一级 acl。tool_config 没加载上时按同一口径写字面量退路。
+
+    报信的路径不能依赖正在被报信的模块——与启动台账、崩溃日志写字面量是同一理由。
+    """
+    try:
+        from tool_config import state_dir
+        return Path(state_dir()) / BACKUP_STATE_SUBDIR
+    except Exception:
+        return Path.home() / ".b2bcollect" / "b2bcollect_state" / BACKUP_STATE_SUBDIR
 
 
 def _preferred_state_dir() -> Path:
-    """档位投影后的首选落点（pro 在桌面数据池缓存目录，lite 在应用数据目录）。"""
-    default = Path.home() / "Desktop" / "数据池缓存"
-    return Path(_ed.pool_cache_dir(str(default)))
+    """现行首选落点：不受系统隐私保护扣住的状态目录（**不再落桌面**）。
+
+    2026-11-13 之前递给档位投影的默认值是桌面那一级数据池缓存，于是每次启动都要
+    在桌面上做一次写探针——那一次探针正是本轮「双击打不开工具」挂死的位置（写探针
+    要在目标目录创建一个文件，而 macOS 把桌面里的创建扣在内核里等用户点「允许」）。
+    数据池缓存本身仍在原处：那是用户主动采集时才写、也看得见摸得着的东西。搬走的
+    只有这三份**机器状态**，机器状态没有理由住在受保护目录里（同一条纪律见
+    task_registry 模块头）。
+
+    路径策略照旧只由档位投影说话（这里不写 if lite）：换的是递给它的默认值，
+    不是投影规则。
+    """
+    return Path(_ed.pool_cache_dir(str(_fallback_state_dir())))
+
+
+def _legacy_state_dir() -> Path:
+    """老版本的首选落点（pro 在桌面数据池缓存）：只为一次性迁移而存在，不再写入。
+
+    它继续走同一个投影函数，所以 lite 的老位置也一并认掉——两边都不许出现第二份
+    按档位写死的 if。
+    """
+    return Path(_ed.pool_cache_dir(str(Path.home() / "Desktop" / "数据池缓存")))
 
 
 def _backup_state_dir() -> Path:
@@ -242,18 +371,22 @@ def _backup_state_dir() -> Path:
 
 
 def _state_dir() -> Path:
-    """权限本地状态目录：与数据池缓存同目录、按构建档位投影，且必须**真写得进去**。
+    """权限本地状态目录：按构建档位投影，且必须**真写得进去**。
 
     外部用户的桌面上不该出现一个「数据池缓存」文件夹，里面还躺着
     .acl_cache.json 这种一眼就能看出「有白名单机制」的文件——路径判定同样
     只放在 edition 模块里，不在这里写 if lite。
 
-    为什么还要多走一次写探针：首选落点在**用户桌面**，而「桌面上写不进东西」在真实
-    机器上很常见——桌面被同步盘重定向、被安全软件的文件夹保护拦着、公司策略把用户目录
-    挂成只读。开发机一切正常，外部机器上三份文件一份也落不下去：断网时读不到上一次的
-    身份等级（只能退回丐版）、被顶号后的冷却时间归零，而界面上一个字都不提。
-    「静默失败 + 只在开发机成立」正是本轮缺陷的形状，所以这里宁可多探一次，也要把问题
-    记进 :func:`state_problems` 让自检看得见。
+    为什么还要多走一次写探针：「写不进东西」在真实机器上很常见——目录被同步盘
+    重定向、被安全软件的文件夹保护拦着、公司策略把用户目录挂成只读。开发机一切
+    正常，外部机器上三份文件一份也落不下去：断网时读不到上一次的身份等级（只能退回
+    丐版）、被顶号后的冷却时间归零，而界面上一个字都不提。「静默失败 + 只在开发机
+    成立」正是本轮缺陷的形状，所以这里宁可多探一次，也要把问题记进
+    :func:`state_problems` 让自检看得见。
+
+    落点定下来之后补一次搬家（老首选→现行落点）：三份里丢了设备指纹最要命，那台
+    机器会自认新设备，用户看到的是「该账号已在另一台设备使用」（见
+    :func:`_adopt_from_legacy`）。
     """
     want = _preferred_state_dir()
     key = str(want)
@@ -280,6 +413,7 @@ def _state_dir() -> Path:
             chosen = want
             _note_state_problem(f"权限本地状态目录不可写（{want}），备用目录同样不可写："
                                 f"断网时无法沿用上一次的身份等级")
+    _adopt_from_legacy(_legacy_state_dir(), chosen)
     _STATE_DIR_CACHE[key] = chosen
     return chosen
 
@@ -290,15 +424,15 @@ def _state_file(name: str) -> Path:
 
 def _cache_file() -> Path:
     """最近一次成功拉取的名单与等级副本（OSS 抖动时用它的旧值判定）。"""
-    return _state_file(".acl_cache.json")
+    return _state_file(CACHE_FILE_NAME)
 
 
 def _device_file() -> Path:
-    return _state_file(".acl_device.json")
+    return _state_file(DEVICE_FILE_NAME)
 
 
 def _claim_file() -> Path:
-    return _state_file(".acl_claim.json")
+    return _state_file(CLAIM_FILE_NAME)
 
 
 def _read_json(path: Path, default):
