@@ -199,6 +199,20 @@ jobs:
     - name: Zip app bundle (ditto preserves perms/attrs)
       run: ditto -c -k --keepParent b2bcollect_build/dist/B2bCollectTool.app B2bCollectTool_Mac_arm64.zip
 
+    - name: Verify release zip (条目名字节 + 本机系统工具真解一次)
+      # 为什么 Mac 也过这道门：判据只有一处真源（.github/scripts/check_release_zip.py），
+      # 两个平台的交付包都从它走一遍——「一边验过、另一边压根没验」正是本轮那个非 ASCII
+      # 条目能活到用户机器上的形状。这里验两件事：条目名与顶层形状的字节，以及在这台
+      # 机器上拿用户真会用的两条路（Finder 双击走 ditto、终端里手敲 unzip）各解一次，
+      # 把落地清单和条目清单对拍：少一个、名字被改写过、多一个，都不许上传。
+      shell: bash
+      run: |
+        python .github/scripts/check_release_zip.py B2bCollectTool_Mac_arm64.zip \
+          --top B2bCollectTool.app --os-extract \
+          --require B2bCollectTool.app/Contents/MacOS/B2bCollectTool \
+          --require B2bCollectTool.app/Contents/Resources/config.json \
+          || { echo "::error::Mac 交付 zip 没过门（条目名或解包对拍）：这一份不上传"; exit 1; }
+
     - name: Upload Mac artifact
       uses: actions/upload-artifact@v4
       with:

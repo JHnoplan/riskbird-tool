@@ -29,6 +29,14 @@
        ``SetOverwrite try`` 的语义是「目标被占用就跳过、不算失败」，于是新 exe 配旧运行时
        这种拼起来的版本照样报安装成功。这一条同时把 .nsi 里那份手抄的关键文件清单钉回
        REQUIRED_INTERNAL。
+    6) 绿色版 zip 的**条目名字节**必须是 ASCII，并且要在这台（就是用户那类）机器上拿
+       系统自带的解包工具真解一次对拍（见 check_portable_zip 与 check_release_zip）。
+       2026-11-13 本机对拍定出来的根因：zip 根上那份 ``使用说明.txt`` 名字字节与
+       UTF-8 标志位都正确，Apple 的 unzip 仍解不下去——决定项是中央目录记录里
+       ``version made by`` 的高字节（create_system），而 CPython 在 win32 上把它写死成
+       0（DOS）。那一个字节双向翻转实测过：0→3 时 3909 个文件全落地、3→0 时同一个条目
+       当场落不下去。给用户看的中文名由 ``File /oname=使用说明.txt`` 提供，那条路走的是
+       NTFS 文件名，与归档字节无关。
 
 用法（CI 在 b2bcollect_build 目录下调用，也可从仓库根调用，路径按参数给）：
     python .github/scripts/package_win_artifacts.py --root b2bcollect_build
@@ -41,7 +49,14 @@ import re
 import shutil
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+# 交付 zip 的门与这一份装配脚本放在一起执行（见 check_release_zip 的 docstring：
+# 那一字节 create_system 的实测）。同目录 import，不给它留「只在手工调用时才跑」的机会。
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import check_release_zip
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -53,8 +68,21 @@ APP_DIR_NAME = "B2bCollectTool"
 EXE_NAME = "B2bCollectTool.exe"
 SETUP_NAME = "B2bCollectToolSetup.exe"
 PORTABLE_NAME = "B2bCollectTool_Win_portable.zip"
-GUIDE_DEST = "使用说明.txt"          # 用户看到的名字（源文件用 ASCII 名，见下）
+GUIDE_DEST = "使用说明.txt"          # 安装目录里的名字：NTFS 上的文件名，与 zip 无关
 GUIDE_SRC = "installer/usage_guide.txt"
+# 绿色版 zip 根上那份说明的**条目名**。它必须是 ASCII，而且这不是洁癖：
+# 2026-11-13 本机对拍定出的事实——同一个条目名 `使用说明.txt`，字节上 UTF-8 名字与
+# 0x800 标志位都正确，Apple 的 unzip 6.00 仍然解不下去（rc=50，嘴里说
+# `write error (disk full?)`，那块卷还剩 9 GB）。决定成败的是中央目录记录里
+# 「version made by」的高字节（create_system）：3(Unix) 它按本地编码直取字节，
+# 0(DOS/FAT) 它把名字再过一遍 OEM→Native 转换。两个方向都实测翻转过：
+# 合成包 3→0 当场变红，真制品 0→3 当场变绿且 3909 个文件一个不少。
+# 而 CPython 的 zipfile 在 win32 上就是写死 create_system=0（zipfile/__init__.py
+# 的 ZipInfo.__init__），外部工具怎么处理这一字节我们说了不算，能说的算的只有
+# 「交付包的条目名不要依赖它的实现」。业界同类交付物（浏览器、编辑器、SDK 的
+# release zip）也都把条目名限制在 ASCII，本地化名字由安装器给。
+# 取源文件名而不是再抄一个字面量：哪天改源文件名，这里跟着走，不会出现两处不一致。
+GUIDE_ZIP_ENTRY = PurePosixPath(GUIDE_SRC).name
 NSI_PATH = "installer/b2bcollect_setup.nsi"
 # onedir 的运行时目录名。**只许有一处定义**：装配校验按它找文件、安装脚本按它清目录，
 # 写成两个字面量就等于「PyInstaller 改了布局名而我们的判据还盯着旧名字」——那正是
@@ -697,10 +725,38 @@ def build_portable_zip(root: Path, app: Path, guide: Path, out: Path, problems: 
                 z.writestr(zipfile.ZipInfo(
                     f"{APP_DIR_NAME}/" + base.relative_to(app).as_posix() + "/"), "")
         if guide.is_file():
-            z.write(guide, GUIDE_DEST)      # zip 根上的使用说明，用户解压第一眼就看到
+            # 条目名用 ASCII（见 GUIDE_ZIP_ENTRY 上面那段实测）；用户在安装目录里看到的
+            # 中文名由 NSIS 的 File /oname=使用说明.txt 给，那是 NTFS 上的文件名，不走 zip。
+            z.write(guide, GUIDE_ZIP_ENTRY)
     size_mb = out.stat().st_size / 1048576.0
     print(f"✅ 绿色版：{out.name}（{n} 个文件 + 1 份使用说明，{size_mb:.1f} MB）"
-          f"  顶层＝{APP_DIR_NAME}/ + {GUIDE_DEST}")
+          f"  顶层＝{APP_DIR_NAME}/ + {GUIDE_ZIP_ENTRY}")
+
+
+def check_portable_zip(out: Path, problems: list) -> None:
+    """刚打出来的绿色版 zip：条目名字节 + 这台机器系统自带工具真解一次，两样都对拍。
+
+    为什么排在装配脚本的最后而不是别处：这一步跑在**目标平台**的 runner 上（Windows），
+    拿的就是用户机器上那两条解包路（bsdtar 与 .NET System.IO.Compression）。在 mac 上
+    验「Windows 用户会不会解不开」永远验不到真东西——本轮那个非 ASCII 条目就是 mac 上
+    的差分探针先看见、Windows 那边却始终没有一条判据替用户说过话。
+    在 mac/Linux 上跑这一脚本时，条目名那一路照旧判；真解一次用的是本机工具，
+    工具不在位就点名「这一路没验」，不安静跳过。
+    """
+    if not out.is_file():
+        _fail(problems, f"绿色版 zip 没打出来（{out.name} 不在），交付包无从校验")
+        return
+    require = (f"{APP_DIR_NAME}/{EXE_NAME}",
+               f"{APP_DIR_NAME}/{INTERNAL_DIR}/config.json",
+               f"{APP_DIR_NAME}/{INTERNAL_DIR}/base_library.zip")
+    probs = check_release_zip.check_zip_entries(
+        out, top=APP_DIR_NAME, root_files=(GUIDE_ZIP_ENTRY,))
+    probs += check_release_zip.extract_with_os_tools(out, require=require)
+    for p in probs:
+        _fail(problems, p)
+    if not probs:
+        print(f"✅ 绿色版 zip 的门：条目名全 ASCII、顶层只有 {APP_DIR_NAME}/，"
+              f"且在本机系统自带工具上真解得开（落地清单与条目清单一字节不差）")
 
 
 def main(argv=None) -> int:
@@ -747,7 +803,13 @@ def main(argv=None) -> int:
         prune_runtime(app, problems)
 
     if not args.skip_zip:
-        build_portable_zip(root, app, guide, root / PORTABLE_NAME, problems)
+        portable = root / PORTABLE_NAME
+        build_portable_zip(root, app, guide, portable, problems)
+        # 打完立刻验这份字节：条目名与「本机工具真解一次」都对拍。放在这里而不是
+        # 另开一步，是因为这一步跑在 Windows runner 上——那才是用户会用来解压的机器。
+        check_portable_zip(portable, problems)
+    else:
+        print("ℹ --skip-zip：绿色版 zip 没重打，zip 的门这一轮跳过（交付前必须跑不带它的那一次）")
 
     setup = root / SETUP_NAME
     if setup.is_file():

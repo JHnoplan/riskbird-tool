@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""交付 zip 的门：条目名的字节 + 在目标系统上用系统自带的解包工具真解一次。
+
+为什么要有这一份脚本（2026-11-13 本机字节级对拍定出的根因）：
+云端打出来的 ``B2bCollectTool_Win_portable.zip`` 里只有一个条目落不下去——zip 根上的
+``使用说明.txt``。本机把同一份字节交给两个工具，跑出来的事实是：
+
+  · ditto：rc=0，3909 个文件全落地，中文名正确；
+  · unzip 6.00（Apple 改过的那份）：rc=50，只落地 3908 个，它自己说
+    ``write error (disk full?).  Continue? (y/n)``——**那块卷当时还剩 9 GB**，
+    这句是它写不下去时顺口说的猜测，不是结论。
+
+真正把成败定下来的字段，是把 zip 字节拆开才看见的：
+
+  · 条目的名字节是 UTF-8，本地头与中央目录的 0x800（UTF-8 名字）标志位都规规矩矩置着
+    ——这两样**都不是**决定项（只清中央目录那一位，unzip 照样解得开）；
+  · 决定项是中央目录记录里「version made by」的高字节（create_system）：
+      3 = Unix  → unzip 按本地编码直取名字字节，名字对、解得开；
+      0 = DOS/FAT → 它把名字再过一遍 OEM→Native 转换，得到一个写不下去的名字。
+    两个方向都实测过：把一份本来解得开的合成包那**一个字节**从 3 改成 0，当场变
+    rc=50、文件不落地；把真制品那一个字节从 0 改成 3，rc=50/3908 变 rc=0/3909、
+    名字正确。一条字节改出来的红与绿，比任何推理都硬。
+  · CPython 的 zipfile 在 win32 上把 create_system 写死成 0
+    （``zipfile/__init__.py``：``if sys.platform == 'win32': self.create_system = 0``），
+    而它写进 external_attr 的却是 Unix 风格的 mode（高 16 位）——也就是说 Windows runner
+    打出来的包，字节上本来就自相矛盾。这条我们改不动标准库，能改动的是**自己的纪律**。
+
+于是这份脚本判两件事，都不靠推理、只靠字节与真解一次：
+  1) ``check_zip_entries``：条目名必须 ASCII（不许依赖任何一个解包工具对非 ASCII 名的
+     理解），不许有 ``\\``、绝对路径、``..``；顶层形状必须是 ``<top>/``（绿色版根上只
+     额外允许那份说明）；条目名两两在「大小写不敏感 + Unicode 规范差异」下不许撞车——
+     撞车时后解的那个会把先解的吃掉，用户看到的是「少一个文件」而工具报成功。
+  2) ``extract_with_os_tools``：在这台机器上拿系统自带的工具真解一次（macOS：ditto 与
+     unzip；Windows：bsdtar 与 .NET System.IO.Compression，也就是资源管理器/PowerShell
+     走的那条），拿落地清单与条目清单**对拍**，少一个、名字不对、多一个都算不合格。
+     判「解出来的字节」而不是「我以为工具会怎么读」，是这一整轮事故换来的做法。
+
+用法：
+    python .github/scripts/check_release_zip.py <zip 路径> [--top B2bCollectTool]
+           [--root-file usage_guide.txt] [--require 相对路径 ...] [--os-extract]
+退出码：0 合格；1 不合格（逐条点名）；2 用法/文件问题。
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import zipfile
+from pathlib import Path, PurePosixPath
+
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# 解一次大包的有界时间：绿色版 160 MB / 约 3900 个文件，正常几十秒；给到 20 分钟
+# 是余量，但不许无界——取制品那一条链上「没人答的问句把整件事挂住」刚红过一次。
+EXTRACT_TIMEOUT = 1200
+
+
+def fs_key(name: str) -> str:
+    """在大小写不敏感、且 Unicode 规范化形式由文件系统决定的那块盘上，这个名字归一成什么。
+
+    Windows 的 NTFS 与 macOS 的 APFS 都按「大小写不敏感 + 保留首次写入的写法」处理，
+    mac 上是 NFD、Windows 上是 NFC：两个只差大小写或只差组合形式的条目，在 Linux CI
+    上是两个文件、在用户机器上就是同一个文件。
+    """
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def check_zip_entries(path: Path, top: str = "", root_files: tuple = ()) -> list:
+    """条目名与顶层形状的判据：返回不合格条目（空列表 = 合格）。
+
+    ``root_files`` 同时承担两件事，这是有意的：**允许**躺在顶层目录之外，且**必须存在**。
+    拆开成两个开关（一个白名单、一个必需清单）看着更通用，实际是把「只填了一个」做成
+    可达状态——漏填必需清单的那一路照样报绿。我们的交付根上只有那一份使用说明，它既
+    是白名单里的例外也是必需项，两个语义天然同源；调用方传的本来就是这个意思。
+    """
+    problems: list = []
+    try:
+        zf = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        return [f"{path.name} 不是一个能打开的 zip：{exc}"]
+    with zf:
+        infos = zf.infolist()
+        if not infos:
+            return [f"{path.name} 里一个条目都没有（空的交付包）"]
+        non_ascii = [i.filename for i in infos if not i.filename.isascii()]
+        if non_ascii:
+            problems.append(
+                f"{path.name} 里有 {len(non_ascii)} 个非 ASCII 条目名（例如 {non_ascii[0]!r}）："
+                f"解包工具对非 ASCII 名字的处理取决于中央目录里「version made by」的高字节，"
+                f"Windows runner 上 Python 打的包那一字节是 0（DOS），Apple 的 unzip 因此把名字"
+                f"再过一遍 OEM→Native 转换，最后说的是 `write error (disk full?)`——交付包不许"
+                f"把成败押在别人的实现上，条目名一律 ASCII，给用户看的中文名由安装脚本 /oname 给")
+        bad_shape = []
+        for i in infos:
+            n = i.filename
+            if "\\" in n or n.startswith("/") or n.startswith("~") or ".." in PurePosixPath(n).parts:
+                bad_shape.append(n)
+        if bad_shape:
+            problems.append(f"{path.name} 里有 {len(bad_shape)} 个条目名带反斜杠/绝对路径/..："
+                            f"{bad_shape[:3]}（这类条目在某些工具里写到包外，在另一些里直接落不下去）")
+        seen: dict = {}
+        collide = []
+        for i in infos:
+            k = fs_key(i.filename.rstrip("/"))
+            if k in seen and seen[k] != i.filename:
+                collide.append((seen[k], i.filename))
+            else:
+                seen[k] = i.filename
+        if collide:
+            a, b = collide[0]
+            problems.append(f"{path.name} 里有 {len(collide)} 对名字只差大小写或 Unicode 组合形式，"
+                            f"在用户那块盘上是同一个文件（例如 {a!r} 与 {b!r}）：后解的那个会吃掉"
+                            f"先解的那个，工具报成功而用户少一个文件")
+        if top:
+            stray = [i.filename for i in infos
+                     if not i.filename.startswith(top + "/") and i.filename not in root_files]
+            if stray:
+                problems.append(f"{path.name} 的顶层不止 {top}/ 这一层（散出来的有 {stray[:3]}）："
+                                f"用户会把它解压到桌面摊一桌，安装目录和数据目录被摊进用户可见区域")
+        absent = [n for n in root_files if n not in {i.filename for i in infos}]
+        if absent:
+            problems.append(f"{path.name} 根上少了 {absent}：源文件在、条目却没写进包里，"
+                            f"这就是打包那一步**静默少交付**一样东西——zip 的门只看了解不开、"
+                            f"没看少没少，用户解压完第一眼找不到使用说明，只能凭记忆操作")
+    return problems
+
+
+def _tool_specs(zp: Path, platform: str = "", name: str = "") -> list:
+    """这台机器上「用户会用的那几条解包路」：返回 (标签, 可执行名, 需要先建目录, argv 构造函数)。
+
+    ``platform`` / ``name`` 是留给离线用例的接缝：默认按当前机器取值，用例可以按别的机器
+    取值。为什么留这个口子而不是让用例去拨 ``sys.platform``/``os.name``：在 mac 上把
+    ``os.name`` 拨成 nt，``pathlib`` 立刻改成实例化 ``WindowsPath`` 并抛
+    ``UnsupportedOperation``，``sys.platform`` 拨成 win32 则 posix 的 ``shutil.which`` 会去摸
+    在 mac 上为 None 的 ``_winapi``——两处红的是**仿真自己的环境**，跟交付物无关。仿的是行为，
+    不是操作系统的名字，所以这一维由参数给，不由篡改全局给。
+
+    argv 构造函数收的是落地目录，避免把目录字符串塞进命令里再替换——替换一次就有一种
+    工具的命令被改坏（PowerShell 那条的目标本来在 -Command 里面）。
+
+    ``需要先建目录`` 这一维不是装饰：``bsdtar -x -C dir`` 要求 dir **已存在**，而
+    ``[ZipFile]::ExtractToDirectory(src, dst)`` 在 .NET Framework 上碰到已存在的 dst 直接抛
+    IOException（文档写的就是 "The directory ... already exists"）。统一预建目录会让 Windows
+    runner 上那一路**每次都假红**——红的是判据的写法，不是交付物。这类差异必须在写的时候就
+    分清，不能等云端替我们发现（那时代价是一整个交付没有安装包）。
+    """
+    z = str(zp)
+    platform = platform or sys.platform
+    name = name or os.name
+    if platform == "darwin":
+        # Finder 双击走的就是 ditto；终端里手敲的是 unzip。两条都是真实路径。
+        return [("ditto", "ditto", False, lambda d: ["ditto", "-x", "-k", z, d]),
+                ("unzip", "unzip", False, lambda d: ["unzip", "-q", z, "-d", d])]
+    if name == "nt":
+        # Win10+ 自带的 bsdtar，与 PowerShell/资源管理器背后的 System.IO.Compression。
+        return [("bsdtar", "tar", True, lambda d: ["tar", "-xf", z, "-C", d]),
+                ("dotnet", "powershell.exe", False,
+                 lambda d: ["powershell.exe", "-NoProfile", "-NonInteractive",
+                            "-ExecutionPolicy", "Bypass", "-Command",
+                            "Add-Type -AssemblyName System.IO.Compression.FileSystem;"
+                            "[System.IO.Compression.ZipFile]::ExtractToDirectory("
+                            f"'{z}','{d}')"])]
+    return [("python-zipfile", sys.executable, False,
+             lambda d: [sys.executable, "-c",
+                        "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])",
+                        z, d])]
+
+
+def _tool_names(zp: Path) -> tuple:
+    return tuple(label for label, _, _, _ in _tool_specs(zp))
+
+
+def _expected_files(zp: Path) -> tuple:
+    """条目清单：(要落地的相对路径集合, 目录条目数)——目录条目不算文件。"""
+    with zipfile.ZipFile(zp) as zf:
+        files = [i.filename for i in zf.infolist() if not i.filename.endswith("/")]
+    return set(files), len(files) - len(set(files))
+
+
+def extract_with_os_tools(zp: Path, require: tuple = (), platform: str = "",
+                          name: str = "") -> list:
+    """拿本机系统自带的解包工具真解一次，并把落地清单与条目清单对拍。
+
+    只在这台机器可用的工具上跑，跑不动就明说「这一路没验」而不是安静跳过：判据必须
+    说得出自己验了什么。``platform`` / ``name`` 与 ``_tool_specs`` 同一用途（离线用例
+    按另一台机器的工具组合真跑一次），默认取当前机器。
+    """
+    problems: list = []
+    want, dup = _expected_files(zp)
+    if dup:
+        problems.append(f"{zp.name} 条目清单里有 {dup} 个重名条目：对拍无从判起，先修生产者")
+        return problems
+    cmds = _tool_specs(zp, platform=platform, name=name)
+    base = Path(tempfile.mkdtemp(prefix="release_zip_check."))
+    try:
+        for label, tool, need_dir, mkargv in cmds:
+            if tool != sys.executable and shutil.which(tool) is None:
+                problems.append(f"{zp.name}：这台机器没有 {label}（{tool}），这一路没验到——"
+                                f"换一台带它的机器再跑，别把「没验」当成「过了」")
+                continue
+            dst = base / label
+            if need_dir:                                    # bsdtar 那一路要现成的目录
+                dst.mkdir(parents=True, exist_ok=True)
+            cmd = mkargv(str(dst))
+            try:
+                r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   encoding="utf-8", errors="replace",
+                                   timeout=EXTRACT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{zp.name}：{label} 解包超过 {EXTRACT_TIMEOUT} 秒没结束——"
+                                f"工具在等一个不会来的回答，这一路本身就不适合后台跑")
+                continue
+            except OSError as exc:
+                problems.append(f"{zp.name}：{label} 根本没能启动：{exc}")
+                continue
+            got = {os.path.relpath(os.path.join(r, f), dst).replace(os.sep, "/")
+                   for r, _, fs in os.walk(dst) for f in fs}
+            if r.returncode != 0:
+                problems.append(f"{zp.name}：{label} 解包退出码 {r.returncode}，它的最后一句："
+                                f"{(r.stdout or '').strip().splitlines()[-1][:120] if r.stdout else '(没有输出)'}")
+            miss = sorted(want - got)
+            extra = sorted(got - want)
+            if miss:
+                problems.append(f"{zp.name}：{label} 解出来少了 {len(miss)} 个文件（例如 {miss[0]!r}）："
+                                f"名字对不对是解包工具的事，少落地就是用户手里的包坏了")
+            if extra:
+                problems.append(f"{zp.name}：{label} 解出了条目清单里没有的 {len(extra)} 个名字"
+                                f"（例如 {extra[0]!r}）：多半是名字被工具改写后落的地")
+            for rel in require:
+                p = dst / rel
+                if not p.is_file():
+                    problems.append(f"{zp.name}：{label} 解完之后 {rel} 不在（这一项是交付判据点名的必需文件）")
+                elif p.stat().st_size == 0:
+                    problems.append(f"{zp.name}：{label} 解出来的 {rel} 是 0 字节")
+            shutil.rmtree(dst, ignore_errors=True)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return problems
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="交付 zip 的门：条目名字节 + 目标系统真解一次")
+    ap.add_argument("zip", help="要验的 zip 路径")
+    ap.add_argument("--top", default="", help="唯一允许的顶层目录名（绿色版传 B2bCollectTool）")
+    ap.add_argument("--root-file", action="append", default=[],
+                    help="允许躺在顶层目录之外的条目名（可重复；绿色版就是那份 ASCII 说明）")
+    ap.add_argument("--require", action="append", default=[],
+                    help="解出来必须存在且非空的相对路径（可重复）")
+    ap.add_argument("--os-extract", action="store_true",
+                    help="再用这台机器系统自带的解包工具真解一次并对拍")
+    args = ap.parse_args(argv)
+
+    zp = Path(args.zip).resolve()
+    if not zp.is_file():
+        print(f"❌ 要验的 zip 不在：{zp}")
+        return 2
+    problems = check_zip_entries(zp, top=args.top, root_files=tuple(args.root_file))
+    if problems:
+        print(f"❌ {zp.name} 条目名/形状不合格（{len(problems)} 条）：")
+        for p in problems:
+            print(f"   · {p}")
+    else:
+        with zipfile.ZipFile(zp) as zf:
+            n = len(zf.infolist())
+        print(f"✅ {zp.name} 条目名合格：{n} 个条目全 ASCII、顶层＝{args.top or '(不要求)'}/"
+              f"{('，根上必需项 ' + str(args.root_file) + ' 都在') if args.root_file else ''}，"
+              f"无重名撞车、无 .. 与反斜杠")
+    if args.os_extract:
+        ep = extract_with_os_tools(zp, require=tuple(args.require))
+        if ep:
+            print(f"❌ {zp.name} 用本机系统工具真解一次不合格（{len(ep)} 条）：")
+            for p in ep:
+                print(f"   · {p}")
+        else:
+            tools = " / ".join(_tool_names(zp))
+            print(f"✅ {zp.name} 在 {sys.platform} 上用系统自带工具（{tools}）各解一次："
+                  f"落地清单与条目清单一字节不差")
+        # 真解一次的后果必须进退出码：上一版这里只看条目名的 problems，于是「unzip 少
+        # 落地一个文件」在 CI 里打印了 ❌ 却退 0，上传照旧——一条只会说话不会拦人的门
+        # 比没有门更糟，因为它让后面的人以为有人拦过了。
+        problems += ep
+    if problems:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

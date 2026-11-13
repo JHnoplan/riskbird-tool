@@ -109,6 +109,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1112,9 +1113,11 @@ def test_delivery_chain():
         # 下面几条都是 2026-11-13 本机那次「盘只剩 2.0Gi + 内层绿色版解不开」的直接教训：
         # 症状不是报错，是**挂住**（unzip 回头问人，问句没人答）+ **越失败越占盘**（半截
         # 工作目录没人收）。那一次它嘴里说的是 `write error (disk full?)`，可把空间腾出来
-        # 以后照样红——真实原因**至今没有定论**（我先前写的「unzip 不认 UTF-8 名字」已被
-        # 本机实测推翻），所以脚本里留了 unzip_probe 差分探针：下次同一份字节让两个工具
-        # 各解一次，一次跑完就把事实钉死，不再让下一个人照着那句话去查磁盘。
+        # 以后照样红。真因后来按字节定了：中央目录 version made by 的高字节 create_system
+        # 为 0（Windows runner 上 CPython 写死）时，Apple unzip 把非 ASCII 条目名再过一遍
+        # OEM→Native 转换，得到一个写不下去的名字——修复在生产者那一头（条目名一律 ASCII），
+        # 本小节下面的字节手术就是正反两向的证据。我先前在此写过的两句（「unzip 不认 UTF-8
+        # 标志位」与「读中文名是对的、真因没有定论」）都已被实测改写，别再抄回去。
         if not re.search(r"\btrap\b[^\n]*\bEXIT\b", code):
             out.append("自动建的临时工作目录没有退出清理（崩一次留一份几百 MB 的半截目录，"
                        "下一次取制品更放不下——失败会攒成下一次的失败）")
@@ -1261,107 +1264,293 @@ def test_delivery_chain():
     _assert_eq(_workdir_problems(_ok_work + 'echo "写不下去时 unzip 是回头问人，不是报错"\n'), [],
                "反向对照：注释与话术里提到 unzip 不算一处违规（判的是被执行的动作，不是文中有这个词）")
 
-    # ── 行为侧：口径这句取舍站在实测上，其中一条**推翻了我自己先前写下的论断** ──
-    # 先前我把「为什么优先 ditto」写成「Apple unzip 不认中文名的 UTF-8 标志位」。本轮拿
-    # 真字节复测：它认（下面第 2 步，rc=0 且名字原样落地）。那句话是错的，就地改掉，同时
-    # 把门换到三条实测得住的事实上：
-    #   1) 生产者（package_win_artifacts.build_portable_zip）写的中文条目带 0x0800、按
-    #      UTF-8 读回就是原名——规范里正确的那一半在我们这边；
-    #   2) 本机 unzip 也读得对，所以那次 `write error (disk full?)` **不是**名字解错；
-    #      真实原因至今没有定论，交给脚本里的 unzip_probe 差分探针去同一份字节上问两个
-    #      工具，一次跑完就钉死，不再让下一个人照着错误论断去查磁盘；
-    #   3) unzip 觉得需要答复就**回头问人**：同名文件在位、stdin 是没人写的管道时它 6 秒
-    #      不结束（挂住）；同一句把 stdin 接到空设备就秒回、留下非零退出码。ditto 同一
-    #      场景不问、不挂、rc=0。
-    # 第 3 条才是「单一口径 + 接空设备 + 接住退出码」这三道门站着的地方，它与 zip 里的
-    # 文件名无关——所以纠正第 2 条那句错话不会动摇门本身，这也正是我要它真跑一遍的原因。
+    # ── 行为侧：口径这句取舍站在实测上；本轮把上一版写的「至今没有定论」也定论了 ──
+    # 这一小节先前写过两句半对半错的话，现在都按字节改完：
+    #   ✗「Apple unzip 不认中文条目名的 UTF-8 标志位」——错。标志位置着时它读得对。
+    #   △「macOS 的 unzip 读中文名是对的」——只在**中央目录声明这包是 Unix 打的**时成立。
+    # 决定项是 CD 记录里 version made by 的高字节（create_system）：
+    #   3 → 按本地编码直取名字字节；0 → 名字再过一遍 OEM→Native 转换，得到一个写不下去
+    #   的名字，工具嘴里说的是 `write error (disk full?)`（那块卷当时还剩 9 GB）。
+    # CPython 的 zipfile 在 win32 上把这个字节写死成 0，所以「Windows runner 打的包 +
+    # 非 ASCII 条目名」迟早红在用户那边，而构建日志全绿。下面把这个字节来回改两次，
+    # 红绿跟着换；最后再证明：条目名全 ASCII 时，这一个字节**影响不到**交付——那才是
+    # 修完的样子（判据站着的地方是这段字节，不是任何人的复述）。
+    # 另外三条与文件名无关的实测仍然成立，它们是「单一口径 + 接空设备 + 接住退出码」
+    # 三道门站着的地方：unzip 觉得需要答复就回头问人（管道 stdin 6 秒不结束）；同一句
+    # 接空设备就秒回并留下非零退出码；ditto 同场景不问、不挂、rc=0。
     asm = _win_assembler()
+    _gate = asm.check_release_zip            # 判据只认门那一份实现，用例里不抄第二条规矩
     _ztmp = Path(tempfile.mkdtemp(prefix="utf8name_zip_"))
-    try:
+
+    def _make_portable(entry_name: str, tag: str) -> Path:
+        """按**生产者的代码**打一份绿色版，夹具只把 GUIDE_ZIP_ENTRY 这一个常量拨到给定值。
+
+        为什么不自己 zipfile.writestr 造包：本轮我一度用夹具造包，结果 CPython 的
+        ``ZipFile.open(mode='w')`` 悄悄把 flag_bits 重置成 0x00，夹具自己把字节改坏了，
+        据此得出的结论整轮作废。让真生产者动手，夹具只管一个名字，测到的才是交付字节。
+        """
         _app = _ztmp / "dist" / asm.APP_DIR_NAME
-        (_app / "_internal").mkdir(parents=True)
-        (_app / "B2bCollectTool.exe").write_bytes(b"MZ\x90\x00")
-        (_app / "_internal" / "base_library.zip").write_bytes(b"PK\x03\x04")
-        _guide_src = _ztmp / "installer" / "usage_guide.txt"
-        _guide_src.parent.mkdir(parents=True)
-        _guide_src.write_text("B2B 采集工具使用说明\n", encoding="utf-8")
-        _probs: list = []
-        _zp = _ztmp / asm.PORTABLE_NAME
-        asm.build_portable_zip(_ztmp, _app, _guide_src, _zp, _probs)
-        _assert_eq(_probs, [], f"生产者自己打的这份绿色版必须无不合格（实际={_probs}）")
-        with zipfile.ZipFile(_zp) as _zf:
-            _info = next((i for i in _zf.infolist() if i.filename == asm.GUIDE_DEST), None)
-            _assert(_info is not None,
-                    f"zip 根上要找得到生产者写的那个中文说明名（实际条目={_zf.namelist()}）")
-            if _info is not None:
-                _assert(_info.flag_bits & 0x0800,
-                        f"非 ASCII 名字必须带 UTF-8 标志位（实际 flag={_info.flag_bits:#05x}）："
-                        f"没置位就是生产者自己写错了，与「工具读不读得对」是两件不同的事")
-                _raw = _info.filename.encode("utf-8")
-                _assert(_raw.decode("cp437") != _info.filename,
-                        "按 cp437 硬读必须给出别的名字，否则「两种读法」这句论证是空的"
-                        f"（实际={_raw.decode('cp437')!r} vs {_info.filename!r}）")
-                print(f"   · 同一个条目两种读法：{_info.filename!r} ↔ {_raw.decode('cp437')!r}"
-                      f"（先前那句错话说的就是后者，实测不是）")
-        unzip = shutil.which("unzip")
-        if not unzip:
-            print("   · 这台机器没有 unzip：第 2、3 步跳过（口径不变，交付链上两个工具都必装）")
+        (_app / asm.INTERNAL_DIR).mkdir(parents=True, exist_ok=True)
+        (_app / asm.EXE_NAME).write_bytes(b"MZ\x90\x00")
+        (_app / asm.INTERNAL_DIR / "base_library.zip").write_bytes(b"PK\x03\x04")
+        (_app / asm.INTERNAL_DIR / "config.json").write_text('{"ak": "", "sk": ""}\n',
+                                                              encoding="utf-8")
+        _gs = _ztmp / asm.GUIDE_SRC
+        _gs.parent.mkdir(parents=True, exist_ok=True)
+        _gs.write_text("B2B 采集工具使用说明\n", encoding="utf-8")
+        _out, _pr = _ztmp / f"portable_{tag}.zip", []
+        with _patch(asm, "GUIDE_ZIP_ENTRY", entry_name):
+            asm.build_portable_zip(_ztmp, _app, _gs, _out, _pr)
+        _assert_eq(_pr, [], f"生产者打 {tag} 这份包时自己报的问题（实际={_pr}）")
+        return _out
+
+    _good = _make_portable(asm.GUIDE_ZIP_ENTRY, "ascii")   # 修完的样子
+    _bad = _make_portable(asm.GUIDE_DEST, "cjk")           # 本轮之前的那个形状
+
+    # ① 交付形状本身：条目名全 ASCII；中文名只活在安装目录（NTFS 文件名，不走 zip 字节）
+    with zipfile.ZipFile(_good) as _zf:
+        _names = _zf.namelist()
+    _assert(all(n.isascii() for n in _names),
+            f"绿色版 zip 的条目名必须全 ASCII（实际非 ASCII="
+            f"{[n for n in _names if not n.isascii()]}）")
+    _assert(asm.GUIDE_ZIP_ENTRY in _names and asm.GUIDE_DEST not in _names,
+            f"根上那份说明的条目名要的是 ASCII 的 {asm.GUIDE_ZIP_ENTRY!r}，不是安装目录里那个 "
+            f"{asm.GUIDE_DEST!r}（实际顶层={sorted(n for n in _names if '/' not in n)}）")
+    _assert(asm.GUIDE_ZIP_ENTRY == asm.GUIDE_SRC.rsplit("/", 1)[-1],
+            "条目名由 GUIDE_SRC 派生：再手抄一份字面量就是第二真源，改一处漏一处")
+    _nsi = (_REPO / "b2bcollect_build" / "installer" / "b2bcollect_setup.nsi").read_text(
+        encoding="utf-8", errors="replace")
+    _assert(f"/oname={asm.GUIDE_DEST}" in _nsi,
+            "安装目录里那个中文名仍由 NSIS 的 File /oname 给——ASCII 化的是包内字节，"
+            "不是用户看到的那个文件名（把 /oname 一起删了就是拿交付格式限制用户界面）")
+    _assert_eq(_gate.check_zip_entries(_good, top=asm.APP_DIR_NAME,
+                                       root_files=(asm.GUIDE_ZIP_ENTRY,)), [],
+               "门对修复后这份包必须无话可说（它什么时候红，交付就什么时候红）")
+    _cp = _gate.check_zip_entries(_bad, top="", root_files=())
+    _assert_eq(len(_cp), 1, f"反向对照：条目名换回中文，门要恰好报一条（实际={_cp}）")
+    _assert("非 ASCII" in _cp[0], f"报的必须是条目名这件事，不是别的（实际={_cp[0][:60]}）")
+    _sp = _gate.check_zip_entries(_good, top="B2bCollectToolX",
+                                  root_files=(asm.GUIDE_ZIP_ENTRY,))
+    _assert_eq(len(_sp), 1, f"反向对照：唯一顶层目录名对不上时要恰好报散出这一条（实际={_sp}）")
+    _assert("顶层" in _sp[0], f"报的必须是顶层形状（实际={_sp[0][:60]}）")
+    # 根上那份说明「在不在包里」也要这道门说话，而不是只由测试盯着：装配脚本里写的是
+    # ``if guide.is_file(): z.write(...)``——源文件缺席时它静默跳过。CI 那条路上
+    # check_bom 已经先拦过缺席，所以这里要防的是**后面那一支**：有人改了写条目的那几行、
+    # 或者把名字算错成包里根本没有的形状。一条只会说「解不开」、不会说「少了一份」的门，
+    # 交付出去的是「解压后没有使用说明」这种没有报错的坏包。
+    _noguide = _ztmp / "portable_noguide.zip"
+    _ng = []
+    asm.build_portable_zip(_ztmp, _ztmp / "dist" / asm.APP_DIR_NAME,
+                           _ztmp / "installer" / "这份源文件不存在.txt", _noguide, _ng)
+    _assert_eq(_ng, [], f"生产者这份夹具不该自己报问题（实际={_ng}）")
+    _np = _gate.check_zip_entries(_noguide, top=asm.APP_DIR_NAME,
+                                  root_files=(asm.GUIDE_ZIP_ENTRY,))
+    _assert_eq(len(_np), 1, f"反向对照：包里没有根上那份说明，门必须恰好报一条（实际={_np}）")
+    _assert("根上少了" in _np[0], f"报的必须是「少交付」而不是别的（实际={_np[0][:60]}）")
+    _assert_eq(_gate.check_zip_entries(_good, top=asm.APP_DIR_NAME,
+                                       root_files=(asm.GUIDE_ZIP_ENTRY,)), [],
+               "正例：同一条判据在修好的包上无话可说（不然是判据自己在报红）")
+
+    unzip = shutil.which("unzip")
+    _cs0_cjk = None
+    if not unzip:
+        print("   · 这台机器没有 unzip：第 2、3 步跳过（口径不变，交付链上两个工具都必装）")
+    else:
+        # ② 问句这一半两平台都判：这是 Info-ZIP 自己的行为，与条目名、与哪台机器无关
+        _u2 = _ztmp / "u_prompt"
+        subprocess.run([unzip, "-oq", str(_good), "-d", str(_u2)],
+                       capture_output=True, stdin=subprocess.DEVNULL,
+                       timeout=120, check=True)      # 先落地，第二次才会撞上同名文件
+        _r, _w = os.pipe()                            # 没人写的管道＝后台那条路的现实
+        _hung = False
+        try:
+            subprocess.run([unzip, "-q", str(_good), "-d", str(_u2)],
+                           stdin=_r, capture_output=True, timeout=6)
+        except subprocess.TimeoutExpired:
+            _hung = True
+        finally:
+            os.close(_r); os.close(_w)
+        _assert(_hung, "反向对照：同名文件在位、stdin 拿不到输入时 unzip 必须挂住"
+                       "（没挂住=这条夹具什么都没测，门在赌运气）")
+        _t0 = time.time()
+        _p2 = subprocess.run([unzip, "-q", str(_good), "-d", str(_u2)],
+                             stdin=subprocess.DEVNULL, capture_output=True, timeout=6)
+        _assert(_p2.returncode != 0 and time.time() - _t0 < 3,
+                f"同一句接了空设备：既不挂（{time.time() - _t0:.1f}s）又要留下非零退出码"
+                f"（实际 rc={_p2.returncode}）——「不挂 + 接得住」才是后台能用的形状")
+        print(f"   · unzip 的问句实测：管道 stdin 6 秒未结束；空设备 {_p2.returncode} 退出，"
+              f"尾句={_p2.stderr.decode('utf-8', 'replace').strip()[-42:]!r}")
+
+        if sys.platform != "darwin":
+            print("   · 非 macOS：这一字节怎么被解释是 Apple unzip 的实现，本机只跑门不跑字节手术")
         else:
-            # 2) 名字这一半只在 macOS 上按它判：这条口径服务的就是 mac 交付链；Linux 的
-            #    Info-ZIP 另有 locale 口径（LC_ALL=C 时按本地编码读），拿它判会写出一条
-            #    修不掉的假红，那边只把事实印出来。
-            _u1 = _ztmp / "u_name"
-            _p = subprocess.run([unzip, "-oq", str(_zp), "-d", str(_u1)],
-                                capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-            _got_names = {q.name for q in _u1.iterdir()} if _u1.is_dir() else set()
-            if sys.platform == "darwin":
-                _assert_eq(_p.returncode, 0,
-                           f"macOS 的 unzip 解这份带 0x0800 的中文名 zip 要成功"
-                           f"（stderr={_p.stderr[-70:]!r}）")
-                _assert(asm.GUIDE_DEST in _got_names,
-                        f"macOS 的 unzip 读中文名是对的——「它不认 UTF-8 标志位」那句话已被实测推翻，"
-                        f"不许再写进注释（实际落地={sorted(_got_names)}）")
-            else:
-                print(f"   · 本机 unzip rc={_p.returncode}，落地名字={sorted(_got_names)}（非 mac，只印不判）")
-            # 3) 问句这一半两平台都判：这是 Info-ZIP 自己的行为，与交付平台无关
-            _u2 = _ztmp / "u_prompt"
-            subprocess.run([unzip, "-oq", str(_zp), "-d", str(_u2)],
-                           capture_output=True, stdin=subprocess.DEVNULL,
-                           timeout=120, check=True)      # 先落地，第二次才会撞上同名文件
-            _r, _w = os.pipe()                            # 没人写的管道＝后台那条路的现实
-            _hung = False
-            try:
-                subprocess.run([unzip, "-q", str(_zp), "-d", str(_u2)],
-                               stdin=_r, capture_output=True, timeout=6)
-            except subprocess.TimeoutExpired:
-                _hung = True
-            finally:
-                os.close(_r); os.close(_w)
-            _assert(_hung, "反向对照：同名文件在位、stdin 拿不到输入时 unzip 必须挂住"
-                           "（没挂住=这条夹具什么都没测，门在赌运气）")
+            # ③ 字节手术（只在 mac 上判）：把中央目录 version made by 的高字节来回改
+            def _cd_offsets(data: bytes, want: int) -> list:
+                e = data.rfind(b"PK\x05\x06")
+                _assert(e >= 0, "找不到 EOCD：字节手术无从做起（夹具坏了，不是交付坏了）")
+                p, offs = struct.unpack_from("<I", data, e + 16)[0], []
+                while data[p:p + 4] == b"PK\x01\x02":
+                    n, ex, cm = struct.unpack_from("<HHH", data, p + 28)
+                    offs.append(p)
+                    p += 46 + n + ex + cm
+                _assert_eq(len(offs), want, "中央目录记录数要与条目数对上（偏移算错时这里先露馅，"
+                                           "不该让后面的红绿去猜手术切在哪）")
+                return offs
+
+            def _flip_creator(zp: Path, value: int, tag: str) -> Path:
+                """只改那一个字节，别的字节一个不动；改完换个读法自证切对了字段。"""
+                raw = zp.read_bytes()
+                with zipfile.ZipFile(zp) as zf:
+                    n_entries = len(zf.infolist())
+                offs = _cd_offsets(raw, n_entries)
+                data = bytearray(raw)
+                for p in offs:
+                    data[p + 5] = value            # APPNOTE 4.3.6：低字节版本、高字节 creator
+                q = _ztmp / f"{tag}.zip"
+                q.write_bytes(bytes(data))
+                with zipfile.ZipFile(q) as zf:
+                    _assert(all(i.create_system == value for i in zf.infolist()),
+                            f"{tag}：改完 create_system 要全等于 {value}"
+                            f"（实际={sorted({i.create_system for i in zf.infolist()})}）——"
+                            "偏移写错时手术切的是别的字段，下面那条红绿就是自欺")
+                    _assert_eq({i.filename for i in zf.infolist()}, set(zipfile.ZipFile(zp).namelist()),
+                               f"{tag}：手术不该动条目清单（动了就是在改夹具，不是改那一个字节）")
+                _assert_eq(sum(1 for i in range(len(raw)) if raw[i] != data[i]), len(offs),
+                           f"{tag}：只许碰 {len(offs)} 个字节（中央目录每条一个），多碰就是夹具越权")
+                return q
+
+            def _unzip_to(zp: Path, tag: str):
+                dst = _ztmp / f"x_{tag}"
+                dst.mkdir(parents=True, exist_ok=True)
+                r = subprocess.run([unzip, "-oq", str(zp), "-d", str(dst)],
+                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+                got = {q.relative_to(dst).as_posix() for q in dst.rglob("*") if q.is_file()}
+                return r, got
+
+            # 本机（Unix creator=3）打的中文名包解得开——这正是上一版那句「半句真话」成立的条件
+            _r, _got = _unzip_to(_bad, "cs3")
+            _assert(_r.returncode == 0 and asm.GUIDE_DEST in _got,
+                    f"creator=3 时 Apple unzip 按本地编码直取名字字节，中文名解得开"
+                    f"（rc={_r.returncode} 落地={sorted(_got)}）：这句只在**这一字节是 3** 时成立")
+
+            _cs0_cjk = _flip_creator(_bad, 0, "cjk_cs0")      # Windows runner 就是这一字节
+            _r0, _got0 = _unzip_to(_cs0_cjk, "cs0")
+            _assert(_r0.returncode != 0 or asm.GUIDE_DEST not in _got0,
+                    f"反向对照：只把 create_system 从 3 改成 0，中文名就要出问题"
+                    f"（rc={_r0.returncode} 落地={sorted(_got0)}）——决定项不是标志位，是这一字节")
+
+            _back = _flip_creator(_cs0_cjk, 3, "cjk_back3")   # 再改回去
+            _r3, _got3 = _unzip_to(_back, "back")
+            _assert(_r3.returncode == 0 and asm.GUIDE_DEST in _got3,
+                    f"改回 3 就复原（rc={_r3.returncode} 落地={sorted(_got3)}）：上一行的红"
+                    "确实是那一个字节造成的，而不是这份包本来另有毛病")
+
+            # 修完的定义：条目名 ASCII 后，那一字节怎么写都影响不到交付
+            _a0 = _flip_creator(_good, 0, "ascii_cs0")
+            _ra, _gota = _unzip_to(_a0, "ascii0")
+            with zipfile.ZipFile(_a0) as zf:
+                _want = {i.filename for i in zf.infolist() if not i.filename.endswith("/")}
+            _assert(_ra.returncode == 0 and _gota == _want,
+                    f"ASCII 条目名 + creator=0（Windows runner 的形状）也要全解得开"
+                    f"（rc={_ra.returncode} 落地={sorted(_gota)} 条目={sorted(_want)}）："
+                    "交付不再依赖任何解包工具对这一字节的解释——这才是修复完成")
+            print(f"   · 字节手术实测：中文名包 3→0 变红、0→3 复原；ASCII 包 creator=0 仍 rc=0/"
+                  f"{len(_gota)} 个文件全落地")
+
+    ditto = shutil.which("ditto")
+    if not ditto:
+        print("   · 这台机器没有 ditto（Linux CI 就是这样）：口径对比这一步跳过")
+    else:
+        for _tag in ("out", "out2"):                  # 第二次就是「同名文件已在位」那一格
             _t0 = time.time()
-            _p2 = subprocess.run([unzip, "-q", str(_zp), "-d", str(_u2)],
-                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=6)
-            _assert(_p2.returncode != 0 and time.time() - _t0 < 3,
-                    f"同一句接了空设备：既不挂（{time.time() - _t0:.1f}s）又要留下非零退出码"
-                    f"（实际 rc={_p2.returncode}）——「不挂 + 接得住」才是后台能用的形状")
-            print(f"   · unzip 的问句实测：管道 stdin 6 秒未结束；空设备 {_p2.returncode} 退出，"
-                  f"尾句={_p2.stderr.decode('utf-8', 'replace').strip()[-42:]!r}")
-        ditto = shutil.which("ditto")
-        if not ditto:
-            print("   · 这台机器没有 ditto（Linux CI 就是这样）：口径对比这一步跳过")
-        else:
-            for _tag in ("out", "out2"):                  # 第二次就是「同名文件已在位」那一格
-                _t0 = time.time()
-                _p = subprocess.run([ditto, "-x", "-k", str(_zp), str(_ztmp / _tag)],
-                                    capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-                _assert(_p.returncode == 0 and time.time() - _t0 < 30,
-                        f"ditto 解两遍（第二遍同名文件在位）都不问、不挂、要成功"
-                        f"（rc={_p.returncode} 用时 {time.time() - _t0:.1f}s）")
-            _assert(asm.GUIDE_DEST in {q.name for q in (_ztmp / "out").iterdir()},
-                    "ditto 解出来的名字与生产者写的原样一致")
+            _p = subprocess.run([ditto, "-x", "-k", str(_good), str(_ztmp / _tag)],
+                                capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+            _assert(_p.returncode == 0 and time.time() - _t0 < 30,
+                    f"ditto 解两遍（第二遍同名文件在位）都不问、不挂、要成功"
+                    f"（rc={_p.returncode} 用时 {time.time() - _t0:.1f}s）")
+        _assert(asm.GUIDE_ZIP_ENTRY in {q.name for q in (_ztmp / "out").iterdir()},
+                "ditto 解出来的名字与生产者写的条目名原样一致")
+        if _cs0_cjk is not None:
+            # 同一批字节，两个工具给出不同结果——这条分歧才是「别押在别人实现上」的完整证据
+            _d = _ztmp / "ditto_cs0"
+            _d.mkdir(parents=True, exist_ok=True)
+            subprocess.run([ditto, "-x", "-k", str(_cs0_cjk), str(_d)],
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=120, check=True)
+            _assert(asm.GUIDE_DEST in {q.relative_to(_d).as_posix() for q in _d.rglob("*") if q.is_file()},
+                    "ditto 对 creator=0 的中文名照样解对：与 unzip 的分歧就在这一字节上，"
+                    "不在 UTF-8 标志位上（标志位两边都置着）")
+
+    # ④ Windows 那两路的「目录契约」用假工具真跑一次。本机到不了 Windows runner，但契约是
+    #    硬的、而且两边相反：bsdtar 的 `-C dir` 要目录**已存在**，.NET 的
+    #    ``ExtractToDirectory(src, dst)`` 碰到已存在的 dst 抛 IOException。门初版对每个工具都
+    #    先 mkdir，于是 Windows 那一路上「dotnet 解包退出码 1」会是每次必来的假红——红的不是
+    #    交付物，是判据自己的写法，而这种红最后的下场是被人在 CI 里整条关掉。
+    #    这里让两个假工具按各自的现实当场拒绝，一次跑完覆盖两种形状，不等云端替我们发现。
+    #    仿真走的是门自己留的接缝（``platform=`` / ``name=``），**不拨** ``sys.platform`` 也
+    #    不拨 ``os.name``：本轮第一版那么做，红的是仿真自己的环境——``os.name='nt'`` 让
+    #    pathlib 去实例化 WindowsPath 并抛 UnsupportedOperation，``sys.platform='win32'`` 让
+    #    posix 的 shutil.which 去摸 mac 上为 None 的 _winapi。仿的是工具的行为，不是机器名。
+    @contextlib.contextmanager
+    def _path_first(d: Path):
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{d}{os.pathsep}{old}"
+        try:
+            yield
+        finally:
+            os.environ["PATH"] = old                 # 漏收会污染后面所有小节（本仓库栽过一次）
+
+    _fw = _ztmp / "fake_win"
+    _fw.mkdir(parents=True, exist_ok=True)
+    _sheb = f"#!{sys.executable}\n"
+    (_fw / "tar").write_text(_sheb + (
+        "import sys, os, zipfile\n"
+        "a = sys.argv\n"
+        "d = a[a.index('-C') + 1]\n"
+        "if not os.path.isdir(d):\n"
+        "    sys.stderr.write('tar: ' + d + ': Cannot find directory\\n'); sys.exit(1)\n"
+        "zipfile.ZipFile(a[a.index('-xf') + 1]).extractall(d)\n"), encoding="utf-8")
+    (_fw / "powershell.exe").write_text(_sheb + (
+        "import sys, os, zipfile\n"
+        "q = chr(39)\n"
+        "c = [x for x in sys.argv if 'ExtractToDirectory' in x]\n"
+        "if not c:\n"
+        "    sys.stderr.write('夹具：-Command 里没有 ExtractToDirectory\\n'); sys.exit(1)\n"
+        "src, dst = c[0].split('ExtractToDirectory(')[1].split(')')[0].split(',')\n"
+        "src, dst = src.strip(q), dst.strip(q)\n"
+        "if os.path.exists(dst):\n"               # .NET Framework 的真实行为
+        "    sys.stderr.write('Exception calling ExtractToDirectory with 2 argument(s): "
+        "An item with the same name already exists.\\n'); sys.exit(1)\n"
+        "zipfile.ZipFile(src).extractall(dst)\n"), encoding="utf-8")
+    for _f in (_fw / "tar", _fw / "powershell.exe"):
+        _f.chmod(0o755)
+    # 分支本身先对一次拍：Windows 那一头的两条路与各自的目录要求。
+    _nt = _gate._tool_specs(_good, platform="win32", name="nt")
+    _assert_eq([(l, t, nd) for (l, t, nd, _mk) in _nt],
+               [("bsdtar", "tar", True), ("dotnet", "powershell.exe", False)],
+               "Windows 这一头跑的就是用户会用的两条路，而且要求相反：bsdtar 要现成目录、"
+               ".NET 不许预建（少一条=另一边没人问；标记弄反=每次必来的假红）")
+    _specs_real = _gate._tool_specs
+    try:
+        with _path_first(_fw):
+            _wp = _gate.extract_with_os_tools(_good, platform="win32", name="nt")
+            _assert_eq(_wp, [],
+                       f"正例：Windows 那两路各自按自己的目录契约都要真解一次并对拍上（实际={_wp}）")
+            # 反向对照·两个方向：把「预建目录」这件事统一做，必须被假 .NET 当场拒绝；
+            # 反过来统一不建，必须被假 bsdtar 当场拒绝。抓出的都是门自己的写法。
+            _gate._tool_specs = lambda zp, platform="", name="": [
+                (l, t, True, mk) for (l, t, nd, mk) in _nt]
+            _wr = _gate.extract_with_os_tools(_good, platform="win32", name="nt")
+            _assert(any("dotnet" in x and "退出码" in x for x in _wr),
+                    f"反向对照：给 .NET 预建目录必须被拒绝（实际={_wr}）")
+            _gate._tool_specs = lambda zp, platform="", name="": [
+                (l, t, False, mk) for (l, t, nd, mk) in _nt]
+            _wr2 = _gate.extract_with_os_tools(_good, platform="win32", name="nt")
+            _assert(any("bsdtar" in x and "退出码" in x for x in _wr2),
+                    f"反向对照：不给 bsdtar 建目录必须被拒绝（实际={_wr2}）")
     finally:
-        shutil.rmtree(_ztmp, ignore_errors=True)
+        _gate._tool_specs = _specs_real
+    shutil.rmtree(_ztmp, ignore_errors=True)
 
     # 续行写法（`extract_zip x \` 换行 `|| {…}`）是真实脚本里就在用的形状：按行判却不
     # 认续行，就会把接住了退出码的调用报成没接住——假阳性的下场是这条门被人整条关掉。
@@ -1372,6 +1561,115 @@ def test_delivery_chain():
                "正例：调用写成跨行 `|| {…}` 同样算接住了退出码（续行必须并成一句再判）")
     _assert_eq(len(_workdir_problems(_body + _cont.replace("|| {", "then {"))), 1,
                "反向对照：跨行调用没接住退出码（换成 `then {`）必须恰好报一条")
+
+    # ── 硬门第 17 条：交付 zip 的门必须真的挂在链路上（结构判据，逐个接线点拔一次）──
+    # 上面那一段验的是**字节与真解一次**；这一段验的是**链路**：门有几路、生产者接没接、
+    # Mac 侧调没调、退出码接没接住。字节会一直变，接线一旦断了却是「日志照样打 ✅」——
+    # 本轮我自己就写漏过一次（真解一次的 ep 没进 return，CI 判的是退出码）。
+    _g17 = _manifest_gate()
+    _asm17_path = _REPO / ".github" / "scripts" / "package_win_artifacts.py"
+    _zip17_path = _REPO / ".github" / "scripts" / "check_release_zip.py"
+    _asm17 = _asm17_path.read_text(encoding="utf-8", errors="replace")
+    _zip17 = _zip17_path.read_text(encoding="utf-8", errors="replace")
+    _assert_eq(_g17.check_release_zip_chain(_asm17, mac, asm), [],
+               "第 17 条对当前这条链路必须无话可说（它红的时候就是交付链上少了一环的时候）")
+
+    _t17 = Path(tempfile.mkdtemp(prefix="gate17_"))
+
+    def _mut_gate_script(mutated: str) -> list:
+        """把门脚本换成改过的副本再跑第 17 条（判据本体在磁盘上，副本只活在这一步）。"""
+        _p17 = _t17 / "check_release_zip.py"
+        _p17.write_text(mutated, encoding="utf-8")
+        with _patch(_g17, "RELEASE_ZIP_SCRIPT", _p17):
+            return _g17.check_release_zip_chain(_asm17, mac, asm)
+
+    # a) 真解一次那一路的结果不进退出码：workflow 判的就是退出码，门只会说话不会拦人
+    _got17 = _mut_gate_script(_zip17.replace("problems += ep", "pass"))
+    _assert_eq(len(_got17), 1, f"反向对照：删掉 ep 接进退出码那一行要恰好报一条（实际={_got17}）")
+    _assert("退出码" in _got17[0], f"报的必须是退出码这一路没接住（实际={_got17[0][:60]}）")
+    # b) 「这台机器没有该工具」从 append 退回 print：没验过的一次构建照样报绿
+    _got17 = _mut_gate_script(_zip17.replace(
+        'problems.append(f"{zp.name}：这台机器没有 {label}', 'print(f"{zp.name}：这台机器没有 {label}'))
+    _assert_eq(len(_got17), 1, f"反向对照：把「没验到」只印不报要恰好报一条（实际={_got17}）")
+    _assert("这台机器没有" in _got17[0], f"报的必须是「没验」被当成「过了」（实际={_got17[0][:60]}）")
+    # c) 装配主流程里不调这道门（同一条缺陷的两面，所以门报两条：没调 + 结果没接住）
+    _got17 = _g17.check_release_zip_chain(
+        _asm17.replace("        check_portable_zip(portable, problems)\n", ""), mac, asm)
+    _assert_eq(len(_got17), 2, f"反向对照：门定义了却不调用要报「没调用」这条（实际={_got17}）")
+    _assert(any("没被装配主流程调用" in x for x in _got17),
+            f"两条里必须有「没被调用」这一句（实际={_got17}）")
+    # d) 调用排在打 zip 之前：验的是上一轮留下的旧 zip
+    _got17 = _g17.check_release_zip_chain(
+        _asm17.replace("        build_portable_zip(root, app, guide, portable, problems)",
+                       "        check_portable_zip(portable, problems)\n"
+                       "        build_portable_zip(root, app, guide, portable, problems)"), mac, asm)
+    _assert_eq(len(_got17), 1, f"反向对照：门排在打包之前要恰好报一条（实际={_got17}）")
+    _assert("之前" in _got17[0], f"报的必须是先后次序（实际={_got17[0][:60]}）")
+    # e) 调了，但不合格项没接进 problems：门红了自己往下走，zip 照样上传
+    _got17 = _g17.check_release_zip_chain(
+        _asm17.replace("check_portable_zip(portable, problems)", "check_portable_zip(portable, [])"),
+        mac, asm)
+    _assert_eq(len(_got17), 1, f"反向对照：结果不接进 problems 要恰好报一条（实际={_got17}）")
+    _assert("接进 problems" in _got17[0], f"报的必须是结果没接住（实际={_got17[0][:60]}）")
+    # f) 生产者把中文名写回条目名（GUIDE_DEST 只属于安装目录那份 NTFS 文件名）
+    _got17 = _g17.check_release_zip_chain(
+        _asm17.replace("z.write(guide, GUIDE_ZIP_ENTRY)", "z.write(guide, GUIDE_DEST)"), mac, asm)
+    _assert_eq(len(_got17), 1, f"反向对照：条目名换回中文要恰好报一条（实际={_got17}）")
+    _assert("非 ASCII 条目名写进了 zip" in _got17[0], f"报的必须是条目名字节（实际={_got17[0][:60]}）")
+    # g) 条目名不再由源文件名派生（手抄第二份字面量：改一处漏一处）
+    with _patch(asm, "GUIDE_ZIP_ENTRY", "usage_guide_v2.txt"):
+        _got17 = _g17.check_release_zip_chain(_asm17, mac, asm)
+    _assert_eq(len(_got17), 1, f"反向对照：条目名与 GUIDE_SRC 脱钩要恰好报一条（实际={_got17}）")
+    _assert("GUIDE_SRC" in _got17[0], f"报的必须是派生关系断了（实际={_got17[0][:60]}）")
+    # h) Mac 侧整道门缺席 / 只剩半路（不带 --os-extract 就是只判名字、没真解过一次）
+    _got17 = _g17.check_release_zip_chain(_asm17, mac.replace("check_release_zip.py", "zip_tool.py"), asm)
+    _assert_eq(len(_got17), 1, f"反向对照：Mac workflow 不调这道门要恰好报一条（实际={_got17}）")
+    _assert(_g17.MAC_WORKFLOW_LABEL in _got17[0], f"报的必须点名 Mac 这一侧（实际={_got17[0][:60]}）")
+    _got17 = _g17.check_release_zip_chain(_asm17, mac.replace("--os-extract", ""), asm)
+    _assert_eq(len(_got17), 1, f"反向对照：Mac 调了门却没真解一次要恰好报一条（实际={_got17}）")
+    _assert("--os-extract" in _got17[0], f"报的必须是 --os-extract 缺席（实际={_got17[0][:60]}）")
+
+    # 取制品这一头也必须过同一道门：交付边界上的字节才是用户手里的字节。这里的门不是
+    # 第二份实现（调的还是 check_release_zip.py），但 **CLI 上那两个字面量是抄的**——
+    # shell 里抄一次可以接受，前提是抄错时当场响，而不是等门报出一条「顶层散出」让人去
+    # 怀疑生产者。
+    def _fetch_gate_problems(text: str) -> list:
+        _c = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+        _p = []
+        _call = re.search(r"if ! python3 \.github/scripts/check_release_zip\.py", _c)
+        if not _call:
+            _p.append("取制品没在交付边界上过交付 zip 的门（云端装配验过 ≠ 用户手里这批字节验过）")
+            return _p
+        if "--os-extract" not in _c:
+            _p.append("取制品调了 zip 的门却没带 --os-extract：只判名字，没在这台机器上真解一次")
+        # 值写在 `ZGATE_ARGS=(--top X --root-file Y)` 这种数组字面量里，收尾的 `)` 不属于
+        # 值。这里按「一个开关一个值」取，并把**取不到值**本身当成不合格：判据正则匹配不到
+        # 某一种写法时安静地当没这项，就等于这条门只在能解析的写法上有效——而抄错的那个
+        # 形状（本轮反向对照里的中文名）恰好就是解析不出来的形状。
+        _tops = [v.rstrip(")") for v in re.findall(r"--top\s+(\S+)", _c)]
+        _rf = [v.rstrip(")") for v in re.findall(r"--root-file\s+(\S+)", _c)]
+        if len(_tops) != len(re.findall(r"--top\b", _c)) or \
+                len(_rf) != len(re.findall(r"--root-file\b", _c)):
+            _p.append("取制品的 --top/--root-file 有开关没解析出值（判据在这种写法上空转，"
+                      "抄错了也不会红）：--tops=" + str(_tops) + " --root-file=" + str(_rf))
+        if not _tops or any(t not in (asm.APP_DIR_NAME, "B2bCollectTool.app") for t in _tops):
+            _p.append(f"取制品传的 --top 与装配常量 APP_DIR_NAME 对不上（实际={_tops}）："
+                      "目录名漂了，门会报一条让人去找生产者的假红")
+        if any(v != asm.GUIDE_ZIP_ENTRY for v in _rf):
+            _p.append(f"取制品传的 --root-file 与 GUIDE_ZIP_ENTRY 不再是同一个（实际={_rf}）")
+        return _p
+
+    _assert_eq(_fetch_gate_problems(fetch), [],
+               "正例：取制品在交付边界上过这道门，两个字面量与装配常量对得上")
+    _assert_eq(len(_fetch_gate_problems(fetch.replace("--os-extract", ""))), 1,
+               "反向对照：取制品这一路没真解一次必须报一条")
+    _assert_eq(len(_fetch_gate_problems(fetch.replace(
+        "--root-file usage_guide.txt", "--root-file 使用说明.txt"))), 1,
+               "反向对照：--root-file 抄成中文名（正是本轮那个坏形状）必须报一条")
+    _assert_eq(len(_fetch_gate_problems(fetch.replace(
+        "--top B2bCollectTool ", "--top B2bCollectToolV2 "))), 1,
+               "反向对照：--top 漂了必须报一条，而不是让门替它编一条误导的理由")
+    shutil.rmtree(_t17, ignore_errors=True)
 
 
     # 自检报告的落点由**产物自己回答**（--state-dir），两个 Mac 入口都不许在 shell 里猜目录：
@@ -3791,10 +4089,22 @@ def test_windows_onedir_delivery():
     # 报自己的红，栈里那一条不再有「唯一线索却是错线索」的威力。
     _assert(zpath.is_file(), f"校验通过才产出绿色版 zip（{zpath} 不存在）")
     names = zipfile.ZipFile(zpath).namelist() if zpath.is_file() else []
-    _assert(all(n.startswith(asm.APP_DIR_NAME + "/") or n == asm.GUIDE_DEST for n in names),
+    # 这条判据盯的是 **zip 里的字节**，不是安装目录里的文件名：绿色版根上那份说明
+    # 用的是 ASCII 条目名（GUIDE_ZIP_ENTRY，由 GUIDE_SRC 派生），`使用说明.txt` 只活在
+    # NSIS 的 /oname 上。以前这里抄的是 GUIDE_DEST，装配脚本改条目名以后它红了——
+    # 红的不是产物坏了，是判据跟着旧形状没改；留着一个字面量在测试里，下一次改动
+    # 还是要靠人记得同步。名字与「不许再出现非 ASCII 条目」一起钉在这里：那正是
+    # 本轮交付 zip 坏掉的实际原因，值得两处各留一条（另一处是 G 节的字节手术）。
+    _assert(all(n.isascii() for n in names),
+            f"装配产出的 zip 条目名全 ASCII（非 ASCII={[n for n in names if not n.isascii()]}）")
+    _assert(all(n.startswith(asm.APP_DIR_NAME + "/") or n == asm.GUIDE_ZIP_ENTRY
+                for n in names),
             f"zip 顶层只有 {asm.APP_DIR_NAME}/ 与根上的使用说明（解压出来是一堆散文件的话，"
-            f"用户会把它摊到桌面上）（实际={names[:3]}）")
-    _assert(asm.GUIDE_DEST in names, "绿色版 zip 根上有使用说明（第一眼就看到）")
+            f"用户会把它摊到桌面上）（实际={sorted({n.split('/')[0] for n in names})}）")
+    _assert(asm.GUIDE_ZIP_ENTRY in names, "绿色版 zip 根上有使用说明（第一眼就看到）")
+    _assert(asm.GUIDE_DEST not in names,
+            f"根上的条目名不许换回安装目录那个中文名 {asm.GUIDE_DEST!r}（本轮红在用户机器上的"
+            f"就是这一形状：解包工具对非 ASCII 名字的处置由中央目录一个字节决定）")
     _assert(not any(f"/{n}/" in f"/{x}" for x in names for n in asm.RUNTIME_DIRS),
             "运行期目录连一个条目都没进 zip")
 

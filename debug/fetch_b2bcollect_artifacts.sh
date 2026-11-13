@@ -133,8 +133,9 @@ done
 # 后台 nohup 跑的，没人敲键盘，整个取制品就挂在那里，看起来像「还在干活」；强杀之后
 # TMPDIR 里留下两个各 883MB 的 b2b_dl.* ，下一次取制品更放不下。失败会自己攒成
 # 下一次的失败，这种复利必须在脚本里断掉，不能靠人记得去打扫。
-# 注意那句 "disk full?" 只是它**写不下去时顺口说的猜测**，不是定论：这一批腾出空间后
-# 照样红过，真因由下面的 unzip_probe 差分探针在同一份字节上问两个工具，跑一次就钉死。
+# 注意那句 "disk full?" 只是它**写不下去时顺口说的猜测**，不是结论：同一批字节腾出空间后
+# 照样红，真因见下面解包口径那段（中央目录 create_system 那一字节 + 非 ASCII 条目名），
+# 生产者早已改成 ASCII 条目名；unzip_probe 只留在这里记账，谁再怀疑磁盘就跑一次。
 reclaimed=0
 for d in $(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'b2b_dl.*' 2>/dev/null); do
   [ "$d" = "$WORK" ] && continue
@@ -187,19 +188,26 @@ if [ -n "${B2B_FETCH_WORK:-}" ]; then
 fi
 echo "· 工作目录：$WORK"
 # 解包口径：优先 ditto，unzip 只作兜底。要钉的门是「不交互 + 接住退出码」这两条。
-# 三条实测（2026-11-13 本机，同一份带中文条目名的 zip，脚本 unzip_probe 里可复跑）：
+# 三条实测（2026-11-13 本机，同一份 zip，脚本 unzip_probe 里可复跑）：
 #   · unzip 6.00（Apple 改过的那份）会**回头问人**：凡是它觉得需要答复的场合（同名
 #     文件已存在、写不下去、路径不对），它把问题打到 stderr 然后等 stdin。把 stdin 接
 #     到一个没人写的管道上，8 秒它还没结束——整条取制品就挂在那里，看起来像「还在下载」。
 #   · 同一条命令把 stdin 接到空设备：0.2 秒按默认答复「[N]one」走人，rc=1。不挂，
 #     退出码还接得住，这才是后台（nohup / CI）能用的形状。
 #   · ditto 同一场景 0.018 秒解完、rc=0：它压根没有「问句」这个概念。
-# 曾经我把这里的理由写成「Apple unzip 不认中文名的 UTF-8 标志位」——**那句是错的**，
-# 实测它认：带 0x0800 标志位的 `使用说明.txt` 解出来名字原样正确。而 11-13 那次内层
-# 绿色版解不开、报 `write error (disk full?). Continue? (y/n)` 的真实原因到现在没有
-# 定论（腾出空间后照样红，红法一模一样）。别再靠猜下结论：unzip_probe 是同一条 zip 上
-# 让两个工具各解一次的差分探针，B2B_FETCH_DIFF=1 开一次，谁红谁绿、最后一行说了什么
-# 就写进日志；它只记账，不参与交付判据（所以函数里没有 exit）。
+# 这两条与文件名无关，所以口径不变。变的是第三句我先前写错的话，现在按字节改完：
+#   ✗ 先前写「Apple unzip 不认中文条目名的 UTF-8 标志位」——错，它认（标志位置着时名字
+#     解出来原样正确）。
+#   △ 上一轮又写成「macOS 的 unzip 读中文名是对的，真因至今没有定论」——只对一半：这句
+#     只在**中央目录声明这包是 Unix 打的**时成立。
+# 定论（2026-11-13 本机字节级对拍，同一批字节来回改一个字节）：决定成败的是中央目录记录
+# 里 version made by 的高字节 create_system——3(Unix) 时 unzip 按本地编码直取名字字节；
+# 0(DOS/FAT) 时它把名字再过一遍 OEM→Native 转换，得到一个写不下去的名字，于是报
+# `write error (disk full?). Continue? (y/n)`（那句只是它顺口说的猜测，那块卷还剩 9 GB）。
+# CPython 的 zipfile 在 win32 上把这个字节写死成 0，所以「Windows runner 打的包 + 非 ASCII
+# 条目名」迟早红在用户手里，而构建日志全绿。修复在生产者那一头（绿色版条目名一律 ASCII，
+# 中文名由 NSIS 的 /oname 给），并由 .github/scripts/check_release_zip.py 在两个平台的
+# 交付链上各拦一次；这一头的差分探针退化成纯记账：下次谁再怀疑磁盘，跑一次就看清事实。
 extract_zip() {  # $1=zip $2=目标目录
   mkdir -p "$2" || return 2
   if command -v ditto >/dev/null 2>&1; then
@@ -220,8 +228,11 @@ unzip_probe() {  # 差分探针：$1=zip $2=标签 $3=口径解出来的参照�
   elif [ -n "${3:-}" ]; then
     ref="，口径那份没落地（$3 不在）"
   fi
-  echo "[$2] 差分探针：unzip rc=${rc}、落地 ${mine} 个文件${ref}；它自己说的那句：$(tail -2 "$lg" | tr '\n' ' ')"
-  [ -s "$lg" ] || echo "   （无输出：这份字节 unzip 也解得动，当初那次红与工具无关）"
+  # 日志里混着解包工具按本地编码打出来的名字字节（不一定是合法 UTF-8）。mac 的 tr 在
+  # UTF-8 locale 下遇到非法字节会报 `Illegal byte sequence` 并把这一行丢掉——取证的那一句
+  # 恰恰在最需要的时候消失。tr 只按字节做事就够了，所以这里显式给它 C locale。
+  echo "[$2] 差分探针：unzip rc=${rc}、落地 ${mine} 个文件${ref}；它自己说的那句：$(tail -2 "$lg" | LC_ALL=C tr '\n' ' ')"
+  [ -s "$lg" ] || echo "   （unzip 一字节没抱怨：条目名全 ASCII 时就是这样，creator 那一字节影响不到它）"
   rm -rf "$p" "$lg"
   return 0
 }
@@ -262,9 +273,23 @@ for kv in "${IDS[@]}"; do
       exit 6
     fi
     unzip_probe "$INNER" "$key.inner" "$WORK/$key/root/dist"
-    echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "$WORK/$key/root/dist" | tr '\n' ' ')"
+    echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "$WORK/$key/root/dist" | LC_ALL=C tr '\n' ' ')"
   fi
-  echo "[$key] artifact 内容：$(find "$WORK/$key" -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
+  # 交付 zip 的门在「即将换进本地 dist 的这批字节」上再过一次。判据只有一处实现
+  # （.github/scripts/check_release_zip.py）：云端装配那一步跑的是它，这里跑的也是它。
+  # 为什么两处都要跑，而不是「云端验过就够了」：从 runner 到这台机器之间还隔着一次归档
+  # 换形（Actions 把产物重新打包）与一次网络传输，而用户拿到的正是这一头的字节。本轮
+  # 那次非 ASCII 条目名红在用户手里、构建日志全绿——缺的就是这一头的一道真解一次。
+  if [ "$key" = "mac" ]; then
+    ZGATE_ARGS=(--top B2bCollectTool.app)
+  else
+    ZGATE_ARGS=(--top B2bCollectTool --root-file usage_guide.txt)
+  fi
+  if ! python3 .github/scripts/check_release_zip.py "$INNER" "${ZGATE_ARGS[@]}" --os-extract; then
+    echo "[$key] ❌ 交付 zip 的门不合格（条目名字节或本机真解一次对拍）：这一批不换本地 dist"
+    exit 6
+  fi
+  echo "[$key] artifact 内容：$(find "$WORK/$key" -maxdepth 2 -type f | head -3 | LC_ALL=C tr '\n' ' ')"
 done
 
 # ── 随包凭证校验：产物里必须真的带着可用的 config.json ──

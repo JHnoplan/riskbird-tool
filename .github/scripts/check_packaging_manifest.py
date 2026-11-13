@@ -109,7 +109,7 @@ import shutil
 import subprocess
 import sys
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -1672,6 +1672,125 @@ def check_win_payload_manifest(win_text: str, asm) -> list:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# 第 17 条：交付 zip 的门必须真的挂在链路上，生产者也不许往包里写非 ASCII 条目名。
+#
+# 这条门的起因是一次字节级对拍（2026-11-13 本机）：Windows 绿色版 zip 里 3909 个条目，
+# 用 ditto 全解得开，用 Apple 的 unzip 少一个——就是根上那份 `使用说明.txt`。名字节是
+# 正确的 UTF-8、0x800 标志位在本地头与中央目录都置着，这些**都不是**决定项；把中央目录
+# 记录里「version made by」的高字节（create_system）单独改一个字节，红绿就互换：
+# 合成包 3→0 当场解不开，真制品 0→3 当场 3909 个全落地。而 CPython 的 zipfile 在 win32
+# 上把这一字节写死成 0（DOS），我们改不动标准库，也不该把「用户能不能把包装开」押在
+# 某个解包工具怎么解释这一字节上。
+#
+# 于是这条硬门判四件事，全部是**结构**判据（不看某一次构建的运气）：
+#   ① zip 的门只有一个实现（check_release_zip.py），条目名与「目标系统真解一次」两路都在
+#      它里面；「这台机器没有那个工具」必须写进不合格清单，不能只印一行就算跑过——
+#      静默不跑的判据比没有判据更危险（与第 11/13/15 条同一口径）。
+#   ② 生产者往 zip 根上写说明时，条目名必须 ASCII、且由 GUIDE_SRC 派生（不再抄第二份
+#      字面量）；安装目录里那个中文名归 NSIS 的 /oname 管，那是 NTFS 文件名，不走 zip 字节。
+#   ③ 装配脚本必须在打完 zip 之后立刻调用这道门（green 的 zip 与交付的 zip 是同一份字节）。
+#   ④ Mac workflow 也必须过这道门：只在 Windows 一侧验，等于承认「另一边没人问」。
+# ---------------------------------------------------------------------------
+
+RELEASE_ZIP_SCRIPT = ROOT / ".github" / "scripts" / "check_release_zip.py"
+MAC_WORKFLOW_LABEL = "Mac workflow"
+
+
+def release_zip_checker():
+    """把交付 zip 的门当模块载进来：这一条判据只认它自己那一份实现。"""
+    import importlib.util
+    if not RELEASE_ZIP_SCRIPT.is_file():
+        raise SystemExit(f"❌ 读不到交付 zip 的门 {RELEASE_ZIP_SCRIPT.relative_to(ROOT)}："
+                         "第 17 条没有对照面，这一步必须红而不是安静跳过")
+    spec = importlib.util.spec_from_file_location("_release_zip_gate", RELEASE_ZIP_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def check_release_zip_chain(asm_text: str, mac_text: str, asm=None) -> list:
+    """交付 zip 的门：实现、生产者接线、Mac 侧调用三头对拍。"""
+    problems = []
+    try:
+        gate = release_zip_checker()
+    except SystemExit as exc:                       # 门不在位：这一条必须红，不能安静跳过
+        return [str(exc).lstrip("❌ ")]
+    src = RELEASE_ZIP_SCRIPT.read_text(encoding="utf-8", errors="replace")
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+
+    # ① 门的两路判据都得在：条目名字节 + 目标系统真解一次。少了任何一路，日志里
+    #    看到的「✅ zip 合格」指的东西就少一半，而下一个人不会知道少的是哪一半。
+    for fn, why in (("check_zip_entries", "条目名与顶层形状那一路"),
+                    ("extract_with_os_tools", "拿系统自带工具真解一次并对拍那一路")):
+        if not getattr(gate, fn, None):
+            problems.append(f"check_release_zip.py 里没有 {fn}()（{why}没了）："
+                            f"这道门的日志照样会说自己过了，判的却是半件事")
+    # 「这台机器没有这个工具」必须进不合格清单。只 print 不 append 的写法会让一次
+    # 「压根没验」的构建报绿——与第 11/13/15 条反复钉的同一类假绿。
+    if not re.search(r"problems\.append\([^\n]*这一路没验", code):
+        problems.append("check_release_zip.py 把「这台机器没有该解包工具」只印进日志、"
+                        "没写进不合格清单：没验过的一次构建照样报绿")
+    # 命令行那一头的退出码必须吃下「真解一次」的结果。本轮我自己写的初版就是只把条目名
+    # 的 problems 接进 return，解包少落地只打印 ❌ 却退 0——workflow 判的是退出码，于是
+    # 这道门在我眼皮底下假绿了一整轮。一门有两路时，每一路都要问到「它进退出码了吗」。
+    if not re.search(r"problems\s*(\+=|\.extend\()\s*ep\b", code):
+        problems.append("check_release_zip.py 的命令行退出码没接住真解一次那一路（ep）："
+                        "Mac workflow 判的就是这一步的退出码，少落地一个文件也会照样上传")
+
+    # ② 生产者的条目名：ASCII、且由源文件名派生，不许再抄一份字面量。
+    #    asm_code 在这里就要算好：② 的 `z.write(...)` 判的是装配脚本，一开始误写成扫
+    #    门脚本的 `code`，那条判据抓谁都抓不到——是离线用例的反向对照（把 GUIDE_ZIP_ENTRY
+    #    换回 GUIDE_DEST 后端上一句都没有）把它抓出来的。一条从不报警的判据比漏一条更糟。
+    asm_code = "\n".join(ln for ln in asm_text.splitlines() if not ln.strip().startswith("#"))
+    entry = getattr(asm, "GUIDE_ZIP_ENTRY", None) if asm is not None else None
+    if entry is None:
+        problems.append("装配脚本里没有 GUIDE_ZIP_ENTRY："
+                        "绿色版 zip 根上那份说明的条目名没有单一来源，迟早有人把中文名直接写回去")
+    else:
+        if not str(entry).isascii():
+            problems.append(f"GUIDE_ZIP_ENTRY 不是 ASCII（{entry!r}）：Windows runner 上 Python 打的包，"
+                            "中央目录 create_system 那一字节是 0（DOS），Apple 的 unzip 会把这种名字"
+                            "再过一遍 OEM→Native 转换后落不下去（实测 rc=50，它说的是 disk full）")
+        if asm is not None and str(entry) != PurePosixPath(str(getattr(asm, "GUIDE_SRC", ""))).name:
+            problems.append(f"GUIDE_ZIP_ENTRY={entry!r} 与 GUIDE_SRC 的文件名不再是同一个："
+                            "条目名又变成手抄的第二份，改一处漏一处")
+    if re.search(r"z\.write\([^,]+,\s*GUIDE_DEST\s*\)", asm_code) or \
+            re.search(r"z\.write\([^,]+,\s*[\"'][^\"']*[一-鿿][^\"']*[\"']\s*\)", asm_code):
+        problems.append("生产者把非 ASCII 条目名写进了 zip（GUIDE_DEST 只属于安装目录那份 NTFS 文件名）："
+                        "绿色版的条目名字节必须是 ASCII，中文名交给 NSIS 的 /oname")
+
+    # ③ 装配脚本必须在打完 zip 之后立刻过这道门。看的是**调用点**的先后，不是定义点：
+    #    定义顺序在文件里天生是「先 build 后 check」，拿定义顺序判就等于永远判不出回归。
+    if "def check_portable_zip(" not in asm_code:
+        problems.append("package_win_artifacts.py 里没有 check_portable_zip()："
+                        "交付 zip 的门在装配这一步缺席，坏了的字节照样上传")
+    else:
+        m_build = re.search(r"^\s+build_portable_zip\(", asm_code, re.M)
+        m_check = re.search(r"^\s+check_portable_zip\(", asm_code, re.M)
+        if not m_check:
+            problems.append("check_portable_zip 没被装配主流程调用："
+                            "定义了却不跑的门等于没有门")
+        elif not m_build or m_build.start() > m_check.start():
+            problems.append("装配主流程里 check_portable_zip 的调用排在 build_portable_zip 之前："
+                            "验的是上一轮留下的旧 zip，本轮打出来的字节没人看过")
+        if not re.search(r"check_portable_zip\(\s*portable\s*,\s*problems\s*\)", asm_code):
+            problems.append("check_portable_zip 的调用没把不合格项接进 problems："
+                            "门红了自己往下走，zip 照样上传")
+    if "check_release_zip" not in asm_code:
+        problems.append("package_win_artifacts.py 没有引用 check_release_zip：这道门出现第二个实现"
+                        "（各自判一份）只是时间问题")
+
+    # ④ Mac 侧：交付包也得过同一道门。只验 Windows 就是承认 Mac 那边没人问。
+    if "check_release_zip.py" not in mac_text:
+        problems.append(f"{MAC_WORKFLOW_LABEL} 里没有交付 zip 的门（check_release_zip.py）："
+                        "Mac 的包上传前没有任何一处验过条目名与真解一次")
+    elif "--os-extract" not in mac_text:
+        problems.append(f"{MAC_WORKFLOW_LABEL} 调了 zip 的门却没带 --os-extract："
+                        "只判了名字，没在这台机器上真解过一次")
+    return problems
+
+
 def check_caller(label: str, text: str, externals: tuple, modules: list,
                  with_triggers: bool = False) -> list:
     """单个打包入口的体检，返回问题清单（空 = 合格）。"""
@@ -1873,6 +1992,7 @@ def main(argv=None) -> int:
 
     # Windows 装配清单与构建命令互相钉死（第 13 条）：第 1 条只管「运行时要什么 →
     # 构建命令抄了没有」，管不到反方向——构建命令放了进包的文件，装配校验却不知道。
+    _asm = None
     try:
         _asm = win_assembler()
         _wf = CALLERS[WIN_WORKFLOW_LABEL]
@@ -1893,6 +2013,26 @@ def main(argv=None) -> int:
     else:
         print(f"✅ Windows 装配清单对拍：REQUIRED_INTERNAL 与构建命令的 --add-data "
               f"双向一致（装配校验判的就是构建命令真正放进包的那些文件）")
+
+    # 交付 zip 的门在链路上（第 17 条）：字节级对拍定出的那个 create_system 教训——
+    # 「构建全绿、包照样解不开」的第三种形状。判的是结构：门有几路、生产者接线没有、
+    # Mac 侧调没调，任一处塌了都在这里响，而不是等用户的解压工具替我们响。
+    try:
+        _zip_problems = check_release_zip_chain(
+            WIN_ASSEMBLER.read_text(encoding="utf-8", errors="replace"),
+            Path(CALLERS[MAC_WORKFLOW_LABEL]).read_text(encoding="utf-8", errors="replace"),
+            _asm)
+    except (OSError, SystemExit) as exc:            # 任一份对照文件不在位：必须红，不安静跳过
+        _zip_problems = [str(exc)]
+    if _zip_problems:
+        bad += 1
+        print("❌ 交付 zip 的门不合格（条目名字节/真解一次/接线/两侧调用）：")
+        for p in _zip_problems:
+            print(f"   · {p}")
+            print(f"::error::交付 zip 的门：{p}")
+    else:
+        print("✅ 交付 zip 的门：条目名与真解一次两路都在、生产者用派生的 ASCII 条目名并"
+              "在打完 zip 后立刻调用、Mac workflow 也带 --os-extract")
 
     for label, path in CALLERS.items():
         if not path.exists():
@@ -1921,7 +2061,8 @@ def main(argv=None) -> int:
           "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
           "shell 里没有被 set -e 静默带走的裸赋值、装了的 ERR 陷阱也都带着 -E、"
           "入库路径在大小写不敏感文件系统上也不撞车、"
-          "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死")
+          "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
+          "交付 zip 的门两侧都在链路上")
     return 0
 
 
