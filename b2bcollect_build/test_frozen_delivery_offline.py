@@ -13,7 +13,9 @@
   F. --acl-doctor：退出码分类，且不通的原因说清楚
   G. 交付链：Secret 注入 → 随包 config.json → 产物门禁；三个打包出口（Windows
      workflow / Mac workflow / 本机打包脚本）的 PyInstaller 清单逐项一致，
-     .gitignore 里 config.json 仍在（密钥绝不入库）
+     .gitignore 里 config.json 仍在（密钥绝不入库）；取制品那一头的解包口径也在
+     这里钉：单一口径（ditto 优先）、工具不交互、调用接退出码、下载前问空间、
+     临时目录退出自收，口径的三条理由全部由真 unzip/ditto 实测撑住（不是论断）
   H. 本地状态落盘：首选目录写不进去要有备用落点，备用也没有就把后果说清楚；
      写失败不许静默（它是断网时唯一能用的身份凭据），且失败后能自愈回首选
   I. 时钟偏差与出网收口：签名时刻偏出容忍带时按服务端时间自愈重签（只重试一次）；
@@ -1107,8 +1109,12 @@ def test_delivery_chain():
             out.append("工作目录不是每次现建的（并发取制品会读到另一批解出来的字节）")
         if "/tmp/b2b_dl/" in code:
             out.append("还留着写死的共用落点 /tmp/b2b_dl/（校验的字节与交付的字节可能对不上）")
-        # 下面三条都是 2026-11-13 本机那次「盘只剩 2.0Gi」的直接教训：症状不是报错，
-        # 是**挂住**（unzip 回头问人）+ **越失败越占盘**（半截工作目录没人收）。
+        # 下面几条都是 2026-11-13 本机那次「盘只剩 2.0Gi + 内层绿色版解不开」的直接教训：
+        # 症状不是报错，是**挂住**（unzip 回头问人，问句没人答）+ **越失败越占盘**（半截
+        # 工作目录没人收）。那一次它嘴里说的是 `write error (disk full?)`，可把空间腾出来
+        # 以后照样红——真实原因**至今没有定论**（我先前写的「unzip 不认 UTF-8 名字」已被
+        # 本机实测推翻），所以脚本里留了 unzip_probe 差分探针：下次同一份字节让两个工具
+        # 各解一次，一次跑完就把事实钉死，不再让下一个人照着那句话去查磁盘。
         if not re.search(r"\btrap\b[^\n]*\bEXIT\b", code):
             out.append("自动建的临时工作目录没有退出清理（崩一次留一份几百 MB 的半截目录，"
                        "下一次取制品更放不下——失败会攒成下一次的失败）")
@@ -1121,13 +1127,59 @@ def test_delivery_chain():
         # 反过来也不许去猜「unzip 前面得是行首/if !/分号」才算调用：`! unzip …`、
         # `then unzip …` 这些一样在执行，猜位置就会把真违规漏成 0 条（本轮反向对照
         # 抓到的正是这个）。剔掉注释与引号之后还活着的 unzip，只能在执行。
-        _act = re.sub(r"'[^']*'|\"[^\"]*\"", " ", code)
-        _unguarded = [ln.strip() for ln in _act.splitlines()
-                      if re.search(r"\bunzip\b", ln)
-                      and ("< /dev/null" not in ln or ("if !" not in ln and "||" not in ln))]
+        # 续行也要先并成一句：`extract_zip "$INNER" x \` 换行 `|| { …; exit 6; }` 在 shell
+        # 里是**同一句**，按行判就会把接住了退出码的调用说成没接住（假阳性→被人关掉）。
+        _lines = [ln.strip() for ln in re.sub(r"\\\s*\n", " ",
+                                              re.sub(r"'[^']*'|\"[^\"]*\"", " ", code)
+                                              ).splitlines()]
+        # 解包必须有一个**口径**（优先 ditto、unzip 兜底），而不是每处各写一遍。理由是
+        # 实测出来的三条（本小节下面的行为证据就是这三条，不是任何人的复述）：unzip 觉得
+        # 需要答复就回头问人，问句拿不到 stdin 时 8 秒还没结束；接了空设备就 0.2 秒按默认
+        # 答复走人并留下退出码；ditto 同场景 0.018 秒解完、压根不问。
+        # 唯一允许的例外是一个**显式命名的差分探针**（unzip_probe）：同一份字节让另一个
+        # 工具再解一次、把事实印进日志。例外必须是例外——它不许决定这一趟成不成。
+        def _fn_body(name: str):
+            for _i, _ln in enumerate(_lines):
+                if _ln.startswith(name + "() {") or _ln.startswith(name + "()  {"):
+                    for _j in range(_i + 1, len(_lines)):
+                        if _lines[_j] == "}":
+                            return range(_i, _j + 1)
+                    return range(_i, len(_lines))
+            return None
+        _cal = _fn_body("extract_zip")
+        _probe = _fn_body("unzip_probe")
+        _allowed = (set(_cal) if _cal is not None else set()) | \
+                   (set(_probe) if _probe is not None else set())
+        if _cal is None:
+            out.append("解包没有单一口径（ditto 优先、unzip 兜底这一取舍必须只写在一处）："
+                       "unzip 觉得需要答复就回头问人，问句拿不到 stdin 会一直挂着——后台那条路没人答")
+        else:
+            _allowed = set(_cal) | (set(_probe) if _probe is not None else set())
+            _elsewhere = [ln for _k, ln in enumerate(_lines)
+                          if _k not in _allowed and re.search(r"\b(unzip|ditto)\b", ln)
+                          and "command -v" not in ln]
+            if _elsewhere:
+                out.append(f"解包动作漏在口径外面（{len(_elsewhere)} 处，例如：{_elsewhere[0][:56]}）："
+                           f"哪天只改了口径、这些地方照旧用错的那一个")
+        if _probe is not None and any(re.search(r"\bexit\b", ln)
+                                       for ln in (_lines[k] for k in _probe)):
+            out.append("差分探针里出现了 exit：探针只负责把「另一个工具在这一份字节上说了什么」"
+                       "记进日志，它一旦能决定成败，交付判据就多了一个没人审的第二真源")
+        # 两个方向分开判：接空设备是**工具那一句**的事（口径里面），接退出码是**调用那
+        # 一句**的事（口径外面）。合成一条就会互相掩盖：`unzip x < /dev/null` 裸跑、
+        # 或 `if ! unzip x`（没空设备）都只缺一半，各报各的才修得准。
+        _noeof = [ln for ln in _lines
+                  if re.search(r"\b(unzip|ditto)\b", ln) and "command -v" not in ln
+                  and "< /dev/null" not in ln]
+        if _noeof:
+            out.append(f"有 unzip/ditto 没把 stdin 接到空设备（{len(_noeof)} 处，例如：{_noeof[0][:56]}）："
+                       f"它回头问「Continue? (y/n)」时没人答就整条挂住（本机实测：拿不到 stdin 8 秒不结束）")
+        _unguarded = [ln for _k, ln in enumerate(_lines)
+                      if _k not in _allowed and re.search(r"\bextract_zip\b", ln)
+                      and "if !" not in ln and "||" not in ln and "&&" not in ln]
         if _unguarded:
-            out.append(f"有 unzip 没同时做到「stdin 接空设备 + 接住退出码」（{len(_unguarded)} 处，"
-                       f"例如：{_unguarded[0][:56]}）：问句拿不到答案就挂住，非零没被接住就拿半份字节去校验还报 ✅")
+            out.append(f"有 extract_zip 调用没接住退出码（{len(_unguarded)} 处，例如：{_unguarded[0][:56]}）："
+                       f"解包失败照样往下走，就是拿半份字节做完随包凭证校验还报 ✅")
         return out
 
     _assert_eq(_workdir_problems(fetch), [], "取制品落在自己现建的工作目录里")
@@ -1139,31 +1191,188 @@ def test_delivery_chain():
                 "下一次取制品更放不下——失败会攒成下一次的失败）",
                 "开下载前没问目标卷的可用空间（写满时 unzip 不报错退出而是问人，"
                 "后台那条路没人答；`-k` 不是可选的：`-k` 给的是 1K 块，按字节解析会在某些卷上算错）",
-                "有 unzip 没同时做到「stdin 接空设备 + 接住退出码」（1 处，"
-                "例如：unzip -oq x -d /tmp/b2b_dl/win）：问句拿不到答案就挂住，非零没被接住就拿半份字节去校验还报 ✅"],
+                "解包没有单一口径（ditto 优先、unzip 兜底这一取舍必须只写在一处）："
+                "unzip 觉得需要答复就回头问人，问句拿不到 stdin 会一直挂着——后台那条路没人答",
+                "有 unzip/ditto 没把 stdin 接到空设备（1 处，例如：unzip -oq x -d /tmp/b2b_dl/win）："
+                "它回头问「Continue? (y/n)」时没人答就整条挂住（本机实测：拿不到 stdin 8 秒不结束）"],
                "反向对照：本轮那种固定共用落点必须被判红（判据抓不住=这条门是空的）")
-    # 三条新门各自要能被单独摘掉再抓回来：只对照「全坏的那种」等于三条里任一单独失效
+    # 每条门各自要能被单独摘掉再抓回来：只对照「全坏的那种」等于任一单独失效
     # 都测不出来（与第 15 条拆三半同一个道理）。
     _ok_work = ('WORK=$(mktemp -d "${TMPDIR:-/tmp}/b2b_dl.XXXXXX")\n'
                 'trap \'rm -rf "$WORK"\' EXIT\n'
                 'AVAIL_KB=$(df -kP "$WORK" | awk \'NR==2 {print $4}\')\n'
-                'if ! unzip -oq a.zip -d "$WORK/win" < /dev/null; then exit 6; fi\n')
-    _assert_eq(_workdir_problems(_ok_work), [], "正例：现建目录 + 退出清理 + 空间预检 + 解包接码")
+                'extract_zip() {  # $1=zip $2=目标目录\n'
+                '  mkdir -p "$2" || return 2\n'
+                '  if command -v ditto >/dev/null 2>&1; then\n'
+                '    ditto -x -k "$1" "$2" < /dev/null\n'
+                '  else\n'
+                '    unzip -oq "$1" -d "$2" < /dev/null || return 1\n'
+                '  fi\n'
+                '}\n'
+                'if ! extract_zip a.zip "$WORK/win"; then exit 6; fi\n')
+    _assert_eq(_workdir_problems(_ok_work), [],
+               "正例：现建目录 + 退出清理 + 空间预检 + 单一口径 + 工具接空设备 + 调用接码")
     for _needle, _why in (
         (" EXIT\n", "退出清理那一句被摘掉要能单独被抓回"),
         ("df -kP", "空间预检被摘掉要能单独被抓回"),
-        (" < /dev/null", "解包不接 stdin 就会被 unzip 的问句挂住（后台跑没人答）"),
-        ("if !", "解包不接退出码就会拿半份字节去做校验"),
+        ('"$2" < /dev/null\n', "口径里 ditto 那一句不接 stdin 也要被抓回"),
+        ('"$2" < /dev/null || return 1', "兜底那一句不接空设备就要被抓回（换成 unzip 也一样的规矩）"),
+        ("if !", "调用不接退出码就会拿半份字节去做校验"),
     ):
         _mutated = _ok_work.replace(_needle, "", 1)
         _assert(_mutated != _ok_work, f"反向对照夹具真的动到了 {_needle}（没动成功=自己跟自己比）")
-        _assert_eq(len(_workdir_problems(_mutated)), 1,
-                   f"反向对照：摘掉「{_needle}」必须恰好报一条——{_why}")
+        _got = _workdir_problems(_mutated)
+        _assert_eq(len(_got), 1,
+                   f"反向对照：摘掉「{_needle}」必须恰好报一条——{_why}（实际={_got}）")
+    # 整条口径被删掉：只该报「没有单一口径」那一条（工具与调用都随函数一起消失，
+    # 再报别的就是把同一次改动数成三处缺陷）。
+    _nofn = _ok_work.replace(_ok_work[_ok_work.index("extract_zip() {"):
+                                      _ok_work.index("\nif ! extract_zip")], "", 1)
+    _assert("extract_zip() {" not in _nofn and "unzip" not in _nofn,
+            "反向对照夹具要真的把整条口径删掉（没删成=自己跟自己比）")
+    _got = _workdir_problems(_nofn)
+    _assert("没有单一口径" in "".join(_got),
+            f"删掉口径必须报出这一条（实际={_got}）")
+    # 反过来：调用改回「各写一遍」的散装写法。哪怕这一处规矩齐全（接了空设备、接了码），
+    # 也照样判红——本轮的真实故障就是「只会 unzip」，哪天改口径时这些地方照旧用错的那一个。
+    _stray = _ok_work + 'unzip -oq z.zip -d "$WORK/other" < /dev/null || exit 6\n'
+    _got = _workdir_problems(_stray)
+    _assert_eq(len(_got), 1,
+               f"反向对照：口径外面自己再写一处解包必须恰好报一条（实际={_got}）")
+    _assert(_got and _got[0].startswith("解包动作漏在口径外面"),
+            f"报的要说是漏在口径外面，不是别的（实际={_got[:1]}）")
+    # 例外只留一个，而且是**显式命名**的那个：差分探针（同一份字节让另一个工具再解一次，
+    # 把事实印进日志）。它必须既不被算成「漏在口径外面」，又不许决定这一趟成不成——
+    # 探针能决定交付成败的那一天，判据就有了第二个没人审过的真源。
+    _probe_def = ('unzip_probe() {  # 差分探针：$1=zip\n'
+                  '  command -v unzip >/dev/null 2>&1 || return 0\n'
+                  '  unzip -q "$1" -d "$WORK/probe" < /dev/null || return 0\n'
+                  '}\n'
+                  'unzip_probe a.zip\n')
+    _assert_eq(_workdir_problems(_ok_work + _probe_def), [],
+               "正例：差分探针是允许的第二处解包（工具、空设备、不判成败都齐全）")
+    _got = _workdir_problems(_ok_work + _probe_def.replace("|| return 0\n}\n", "|| exit 6\n}\n"))
+    _assert_eq(len(_got), 1,
+               f"反向对照：探针里写 exit 必须恰好报一条（实际={_got}）")
+    _assert("差分探针" in _got[0], f"报的要说是探针越权，不是别的（实际={_got[0][:50]}）")
     # 反向对照的另一半：只在**话说里**提到 unzip（解释「为什么这里要接 /dev/null」的
     # echo）不能被抓成违规行。抓了，下一来的人就会去删那句解释——而删掉的正是下次
     # 排查最需要的一行。
     _assert_eq(_workdir_problems(_ok_work + 'echo "写不下去时 unzip 是回头问人，不是报错"\n'), [],
                "反向对照：注释与话术里提到 unzip 不算一处违规（判的是被执行的动作，不是文中有这个词）")
+
+    # ── 行为侧：口径这句取舍站在实测上，其中一条**推翻了我自己先前写下的论断** ──
+    # 先前我把「为什么优先 ditto」写成「Apple unzip 不认中文名的 UTF-8 标志位」。本轮拿
+    # 真字节复测：它认（下面第 2 步，rc=0 且名字原样落地）。那句话是错的，就地改掉，同时
+    # 把门换到三条实测得住的事实上：
+    #   1) 生产者（package_win_artifacts.build_portable_zip）写的中文条目带 0x0800、按
+    #      UTF-8 读回就是原名——规范里正确的那一半在我们这边；
+    #   2) 本机 unzip 也读得对，所以那次 `write error (disk full?)` **不是**名字解错；
+    #      真实原因至今没有定论，交给脚本里的 unzip_probe 差分探针去同一份字节上问两个
+    #      工具，一次跑完就钉死，不再让下一个人照着错误论断去查磁盘；
+    #   3) unzip 觉得需要答复就**回头问人**：同名文件在位、stdin 是没人写的管道时它 6 秒
+    #      不结束（挂住）；同一句把 stdin 接到空设备就秒回、留下非零退出码。ditto 同一
+    #      场景不问、不挂、rc=0。
+    # 第 3 条才是「单一口径 + 接空设备 + 接住退出码」这三道门站着的地方，它与 zip 里的
+    # 文件名无关——所以纠正第 2 条那句错话不会动摇门本身，这也正是我要它真跑一遍的原因。
+    asm = _win_assembler()
+    _ztmp = Path(tempfile.mkdtemp(prefix="utf8name_zip_"))
+    try:
+        _app = _ztmp / "dist" / asm.APP_DIR_NAME
+        (_app / "_internal").mkdir(parents=True)
+        (_app / "B2bCollectTool.exe").write_bytes(b"MZ\x90\x00")
+        (_app / "_internal" / "base_library.zip").write_bytes(b"PK\x03\x04")
+        _guide_src = _ztmp / "installer" / "usage_guide.txt"
+        _guide_src.parent.mkdir(parents=True)
+        _guide_src.write_text("B2B 采集工具使用说明\n", encoding="utf-8")
+        _probs: list = []
+        _zp = _ztmp / asm.PORTABLE_NAME
+        asm.build_portable_zip(_ztmp, _app, _guide_src, _zp, _probs)
+        _assert_eq(_probs, [], f"生产者自己打的这份绿色版必须无不合格（实际={_probs}）")
+        with zipfile.ZipFile(_zp) as _zf:
+            _info = next((i for i in _zf.infolist() if i.filename == asm.GUIDE_DEST), None)
+            _assert(_info is not None,
+                    f"zip 根上要找得到生产者写的那个中文说明名（实际条目={_zf.namelist()}）")
+            if _info is not None:
+                _assert(_info.flag_bits & 0x0800,
+                        f"非 ASCII 名字必须带 UTF-8 标志位（实际 flag={_info.flag_bits:#05x}）："
+                        f"没置位就是生产者自己写错了，与「工具读不读得对」是两件不同的事")
+                _raw = _info.filename.encode("utf-8")
+                _assert(_raw.decode("cp437") != _info.filename,
+                        "按 cp437 硬读必须给出别的名字，否则「两种读法」这句论证是空的"
+                        f"（实际={_raw.decode('cp437')!r} vs {_info.filename!r}）")
+                print(f"   · 同一个条目两种读法：{_info.filename!r} ↔ {_raw.decode('cp437')!r}"
+                      f"（先前那句错话说的就是后者，实测不是）")
+        unzip = shutil.which("unzip")
+        if not unzip:
+            print("   · 这台机器没有 unzip：第 2、3 步跳过（口径不变，交付链上两个工具都必装）")
+        else:
+            # 2) 名字这一半只在 macOS 上按它判：这条口径服务的就是 mac 交付链；Linux 的
+            #    Info-ZIP 另有 locale 口径（LC_ALL=C 时按本地编码读），拿它判会写出一条
+            #    修不掉的假红，那边只把事实印出来。
+            _u1 = _ztmp / "u_name"
+            _p = subprocess.run([unzip, "-oq", str(_zp), "-d", str(_u1)],
+                                capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+            _got_names = {q.name for q in _u1.iterdir()} if _u1.is_dir() else set()
+            if sys.platform == "darwin":
+                _assert_eq(_p.returncode, 0,
+                           f"macOS 的 unzip 解这份带 0x0800 的中文名 zip 要成功"
+                           f"（stderr={_p.stderr[-70:]!r}）")
+                _assert(asm.GUIDE_DEST in _got_names,
+                        f"macOS 的 unzip 读中文名是对的——「它不认 UTF-8 标志位」那句话已被实测推翻，"
+                        f"不许再写进注释（实际落地={sorted(_got_names)}）")
+            else:
+                print(f"   · 本机 unzip rc={_p.returncode}，落地名字={sorted(_got_names)}（非 mac，只印不判）")
+            # 3) 问句这一半两平台都判：这是 Info-ZIP 自己的行为，与交付平台无关
+            _u2 = _ztmp / "u_prompt"
+            subprocess.run([unzip, "-oq", str(_zp), "-d", str(_u2)],
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=120, check=True)      # 先落地，第二次才会撞上同名文件
+            _r, _w = os.pipe()                            # 没人写的管道＝后台那条路的现实
+            _hung = False
+            try:
+                subprocess.run([unzip, "-q", str(_zp), "-d", str(_u2)],
+                               stdin=_r, capture_output=True, timeout=6)
+            except subprocess.TimeoutExpired:
+                _hung = True
+            finally:
+                os.close(_r); os.close(_w)
+            _assert(_hung, "反向对照：同名文件在位、stdin 拿不到输入时 unzip 必须挂住"
+                           "（没挂住=这条夹具什么都没测，门在赌运气）")
+            _t0 = time.time()
+            _p2 = subprocess.run([unzip, "-q", str(_zp), "-d", str(_u2)],
+                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=6)
+            _assert(_p2.returncode != 0 and time.time() - _t0 < 3,
+                    f"同一句接了空设备：既不挂（{time.time() - _t0:.1f}s）又要留下非零退出码"
+                    f"（实际 rc={_p2.returncode}）——「不挂 + 接得住」才是后台能用的形状")
+            print(f"   · unzip 的问句实测：管道 stdin 6 秒未结束；空设备 {_p2.returncode} 退出，"
+                  f"尾句={_p2.stderr.decode('utf-8', 'replace').strip()[-42:]!r}")
+        ditto = shutil.which("ditto")
+        if not ditto:
+            print("   · 这台机器没有 ditto（Linux CI 就是这样）：口径对比这一步跳过")
+        else:
+            for _tag in ("out", "out2"):                  # 第二次就是「同名文件已在位」那一格
+                _t0 = time.time()
+                _p = subprocess.run([ditto, "-x", "-k", str(_zp), str(_ztmp / _tag)],
+                                    capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+                _assert(_p.returncode == 0 and time.time() - _t0 < 30,
+                        f"ditto 解两遍（第二遍同名文件在位）都不问、不挂、要成功"
+                        f"（rc={_p.returncode} 用时 {time.time() - _t0:.1f}s）")
+            _assert(asm.GUIDE_DEST in {q.name for q in (_ztmp / "out").iterdir()},
+                    "ditto 解出来的名字与生产者写的原样一致")
+    finally:
+        shutil.rmtree(_ztmp, ignore_errors=True)
+
+    # 续行写法（`extract_zip x \` 换行 `|| {…}`）是真实脚本里就在用的形状：按行判却不
+    # 认续行，就会把接住了退出码的调用报成没接住——假阳性的下场是这条门被人整条关掉。
+    _cont = ('extract_zip a.zip "$WORK/win" \\\n'
+             '  || { echo bad; exit 6; }\n')
+    _body = _ok_work[:_ok_work.index("if ! extract_zip")]
+    _assert_eq(_workdir_problems(_body + _cont), [],
+               "正例：调用写成跨行 `|| {…}` 同样算接住了退出码（续行必须并成一句再判）")
+    _assert_eq(len(_workdir_problems(_body + _cont.replace("|| {", "then {"))), 1,
+               "反向对照：跨行调用没接住退出码（换成 `then {`）必须恰好报一条")
+
 
     # 自检报告的落点由**产物自己回答**（--state-dir），两个 Mac 入口都不许在 shell 里猜目录：
     # 猜出来的那份是第二真源——候选链或布局一变（本轮受保护目录改动后落点就搬去了 ~/.b2bcollect），

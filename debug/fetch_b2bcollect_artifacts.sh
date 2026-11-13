@@ -130,9 +130,11 @@ done
 # 就会指着一份根本不属于本次交付的字节说话。
 # 事故现场（2026-11-13 本机）：盘只剩 2.0Gi，取制品下到一半 unzip 报
 # "write error (disk full?) Continue? (y/n)"——它不是退出，是**回头问人**，而这条路是
-# 后台 nohup 跑的，没人敲键盘，整个取制品就挂在那里，看起来像「还在下载」；强杀之后
+# 后台 nohup 跑的，没人敲键盘，整个取制品就挂在那里，看起来像「还在干活」；强杀之后
 # TMPDIR 里留下两个各 883MB 的 b2b_dl.* ，下一次取制品更放不下。失败会自己攒成
 # 下一次的失败，这种复利必须在脚本里断掉，不能靠人记得去打扫。
+# 注意那句 "disk full?" 只是它**写不下去时顺口说的猜测**，不是定论：这一批腾出空间后
+# 照样红过，真因由下面的 unzip_probe 差分探针在同一份字节上问两个工具，跑一次就钉死。
 reclaimed=0
 for d in $(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'b2b_dl.*' 2>/dev/null); do
   [ "$d" = "$WORK" ] && continue
@@ -169,12 +171,12 @@ if [ "$UNKNOWN" -gt 0 ] && [ "$NEED_KB" -lt 2097152 ]; then
 fi
 AVAIL_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
 if [ -z "$AVAIL_KB" ]; then
-  echo "❌ 问不出 ${WORK} 所在卷的可用空间（df 没给数）：空间不够时 unzip 不会报错退出，而是回头问「Continue? (y/n)」——后台跑就挂死。判不了就不下载。"
+  echo "❌ 问不出 ${WORK} 所在卷的可用空间（df 没给数）：空间不够时 unzip 不会干净地报错退出——写不下去它会回头问「Continue? (y/n)」，后台那条路没人答就整条挂住（本机实测：问句拿不到 stdin 就 8 秒不结束）。判不了就不下载。"
   exit 7
 fi
 echo "· 磁盘：可用 $((AVAIL_KB / 1024)) MB，本次至少要 $((NEED_KB / 1024)) MB（制品×3 + 500MB 余量${UNKNOWN:+，含 $UNKNOWN 路 API 没答出大小}）"
 if [ "$AVAIL_KB" -lt "$NEED_KB" ]; then
-  echo "❌ 磁盘不够：${WORK} 所在卷只剩 $((AVAIL_KB / 1024)) MB，取这一批制品至少要有 $((NEED_KB / 1024)) MB。不在这里停下来的话，坏法不是「报一条错」，而是下到一半 unzip 回头问人、整条交付链挂住，或在半截字节上做完校验还报 ✅。"
+  echo "❌ 磁盘不够：${WORK} 所在卷只剩 $((AVAIL_KB / 1024)) MB，取这一批制品至少要有 $((NEED_KB / 1024)) MB。不在这里停下来的话，坏法不是「报一条错」，而是下到一半解包回头问人、整条交付链挂住，或在半截字节上做完校验还报 ✅。"
   echo "   · 可以先收的（都是可再生的）：TMPDIR 里往次的 b2b_dl.*（本脚本上面已按规则收过一轮）、b2bcollect_build/build/（PyInstaller 中间产物）、本机 dist 里不需要的旧包。"
   exit 7
 fi
@@ -184,6 +186,45 @@ if [ -n "${B2B_FETCH_WORK:-}" ]; then
   find "$WORK" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 fi
 echo "· 工作目录：$WORK"
+# 解包口径：优先 ditto，unzip 只作兜底。要钉的门是「不交互 + 接住退出码」这两条。
+# 三条实测（2026-11-13 本机，同一份带中文条目名的 zip，脚本 unzip_probe 里可复跑）：
+#   · unzip 6.00（Apple 改过的那份）会**回头问人**：凡是它觉得需要答复的场合（同名
+#     文件已存在、写不下去、路径不对），它把问题打到 stderr 然后等 stdin。把 stdin 接
+#     到一个没人写的管道上，8 秒它还没结束——整条取制品就挂在那里，看起来像「还在下载」。
+#   · 同一条命令把 stdin 接到空设备：0.2 秒按默认答复「[N]one」走人，rc=1。不挂，
+#     退出码还接得住，这才是后台（nohup / CI）能用的形状。
+#   · ditto 同一场景 0.018 秒解完、rc=0：它压根没有「问句」这个概念。
+# 曾经我把这里的理由写成「Apple unzip 不认中文名的 UTF-8 标志位」——**那句是错的**，
+# 实测它认：带 0x0800 标志位的 `使用说明.txt` 解出来名字原样正确。而 11-13 那次内层
+# 绿色版解不开、报 `write error (disk full?). Continue? (y/n)` 的真实原因到现在没有
+# 定论（腾出空间后照样红，红法一模一样）。别再靠猜下结论：unzip_probe 是同一条 zip 上
+# 让两个工具各解一次的差分探针，B2B_FETCH_DIFF=1 开一次，谁红谁绿、最后一行说了什么
+# 就写进日志；它只记账，不参与交付判据（所以函数里没有 exit）。
+extract_zip() {  # $1=zip $2=目标目录
+  mkdir -p "$2" || return 2
+  if command -v ditto >/dev/null 2>&1; then
+    ditto -x -k "$1" "$2" < /dev/null
+  else
+    unzip -oq "$1" -d "$2" < /dev/null || return 1
+  fi
+}
+unzip_probe() {  # 差分探针：$1=zip $2=标签 $3=口径解出来的参照目录；只印事实，不决定这一趟成不成
+  [ "${B2B_FETCH_DIFF:-0}" = "1" ] || return 0
+  command -v unzip >/dev/null 2>&1 || { echo "[$2] 差分探针：这台机器没有 unzip，跳过"; return 0; }
+  local p="$WORK/probe_$2" lg="$WORK/probe_$2.log" rc mine ref=
+  rm -rf "$p"; mkdir -p "$p" || return 0
+  unzip -q "$1" -d "$p" < /dev/null > "$lg" 2>&1; rc=$?
+  mine=$(find "$p" -type f 2>/dev/null | wc -l | tr -d ' ')
+  if [ -n "${3:-}" ] && [ -d "$3" ]; then
+    ref="，口径同一份解出 $(find "$3" -type f 2>/dev/null | wc -l | tr -d ' ') 个文件"
+  elif [ -n "${3:-}" ]; then
+    ref="，口径那份没落地（$3 不在）"
+  fi
+  echo "[$2] 差分探针：unzip rc=${rc}、落地 ${mine} 个文件${ref}；它自己说的那句：$(tail -2 "$lg" | tr '\n' ' ')"
+  [ -s "$lg" ] || echo "   （无输出：这份字节 unzip 也解得动，当初那次红与工具无关）"
+  rm -rf "$p" "$lg"
+  return 0
+}
 FAIL=0
 for kv in "${IDS[@]}"; do
   key=${kv%%:*}; id=${kv##*:}
@@ -191,14 +232,10 @@ for kv in "${IDS[@]}"; do
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["artifacts"][0]["id"])')
   curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "$WORK/$key.zip" \
     "$API/actions/artifacts/$AID/zip"
-  mkdir -p "$WORK/$key"
-  # `< /dev/null` 不是可选的：磁盘满或路径坏时 Info-ZIP 的第一反应是**问一句**
-  # （Continue? (y/n)），后台跑时这句话永远没人答。接上空设备，问句立刻拿到 EOF、
-  # unzip 非零退出，下面这句才说得出人话。外层解包的退出码过去没被接住——那等于
-  # 拿着半份字节去做「随包凭证」校验，而它照样能报 ✅。
-  if ! unzip -oq "$WORK/$key.zip" -d "$WORK/$key" < /dev/null; then
+  if ! extract_zip "$WORK/$key.zip" "$WORK/$key"; then
     NOW_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
     echo "[$key] ❌ 外层制品 zip 解不开（此刻可用 $(( ${NOW_KB:-0} / 1024 )) MB）：先看空间，再怀疑网络截断"
+    unzip_probe "$WORK/$key.zip" "$key.outer" "$WORK/$key"
     exit 6
   fi
   # 制品是「zip 里再套一层真实产物包」，两个平台都要解到内层才能验：
@@ -211,18 +248,20 @@ for kv in "${IDS[@]}"; do
   if [ "$key" = "mac" ]; then
     INNER=$(find "$WORK/$key" -maxdepth 2 -name "*.zip" -type f | head -1)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有内层产物 zip（workflow 的上传步骤变了？先修校验器再谈交付）"; exit 6; }
-    ditto -x -k "$INNER" "$WORK/$key/unpacked" \
-      || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; exit 6; }
+    extract_zip "$INNER" "$WORK/$key/unpacked" \
+      || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; unzip_probe "$INNER" "$key.inner" "$WORK/$key/unpacked"; exit 6; }
+    unzip_probe "$INNER" "$key.inner" "$WORK/$key/unpacked"
     echo "[$key] 已解开内层：$(basename "$INNER") → $(find "$WORK/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
   else
     INNER=$(find "$WORK/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有 B2bCollectTool_Win_portable.zip（onedir 交付的两个产物少了一个，先修 workflow 再谈交付）"; exit 6; }
-    mkdir -p "$WORK/$key/root/dist"
-    if ! unzip -oq "$INNER" -d "$WORK/$key/root/dist" < /dev/null; then
+    if ! extract_zip "$INNER" "$WORK/$key/root/dist"; then
       NOW_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
-      echo "[$key] ❌ 内层绿色版 zip 解不开：${INNER}（此刻可用 $(( ${NOW_KB:-0} / 1024 )) MB）：写不下去时 unzip 是回头问人而不是报错，这里已经把问题关掉再接退出码"
+      echo "[$key] ❌ 内层绿色版 zip 解不开：${INNER}（此刻可用 $(( ${NOW_KB:-0} / 1024 )) MB）"
+      unzip_probe "$INNER" "$key.inner" "$WORK/$key/root/dist"
       exit 6
     fi
+    unzip_probe "$INNER" "$key.inner" "$WORK/$key/root/dist"
     echo "[$key] 已解开内层：$(basename "$INNER") → $(ls "$WORK/$key/root/dist" | tr '\n' ' ')"
   fi
   echo "[$key] artifact 内容：$(find "$WORK/$key" -maxdepth 2 -type f | head -3 | tr '\n' ' ')"
