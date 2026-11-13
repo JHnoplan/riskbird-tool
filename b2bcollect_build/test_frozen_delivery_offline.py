@@ -110,6 +110,29 @@
      / 并列 / 区间 / 全角数字）与折行都点得出，验三条不许误报的口径（句子被句号断开、间距超
      过 12 字符、套件自己的内部编号），并拿「当时那 13 处」的原句形状做反向对照——一句走不通
      的指路必须红，而且要把缺的那几个节逐个点名
+  AD. 交付链上每一次 curl 都必须**自己会停**，写进文件的字节必须**跨次能用**：硬门第 20 条。
+     本机取制品连着两趟被外层超时杀掉（rc=124），日志停在「下载中」之后一句原因都没有。实测
+     单连接 Range 取 2 MiB 要 182.98 秒（11.5 KB/s）、四并发 166 秒拿到 8 MiB，其中一路还会
+     半路 Connection reset 只落 1899440/2097152 字节——所以「把 -m 调大」既救不了慢连接又会弄死
+     正常的慢链路，正确的形状是「停顿判定 + 按块续传 + 落点可复用」。旧写法还把 zip 放在 mktemp
+     工作目录里，trap EXIT 顺手删掉，于是每次重跑都从第 0 字节开始：慢可以接受，「永远完不成」
+     不行。本节按 20a/20b/20c/20d/20e/20f 六格逐个验（check_curl_bounds 管前三格，
+     check_no_prompt_hang 管 20d，check_shell_registration 管 20e，check_python_stdin 管 20f，
+     四族读同一张 SHELL_SOURCES）：反向对照用的是 HEAD
+     那两版的原句，落点认六种写法
+     （`-o 值`/`-o值`/`--output=值`/组合开关），NSIS 那一步「有界 + 就近核哈希、无 -C」的真字节
+     必须放行（免得为消红补一个用不上的 -C），注释里那句「也核哈希」不算收口，窗口边界第 40 行
+     与第 41 行一格之差，而扫到 0 份文本 / 0 条 curl / 登记的脚本不在位 三种情况都必须红。
+     20d 是 `git credential fill` 会去开 /dev/tty 问密码（喂 stdin 挡不住），HEAD 那三句原字节
+     必须响、注释里那句提及不许假红；20e 是交付链目录里每一份 .sh 都得在案——取证脚本
+     debug/fetch_run_log.sh 原本不在表里，四道门在它身上全是空的，20c 一接上就在它身上红了一条
+     真缺陷（下坏一半的日志包照样以 PK 开头，错误响应会被当成「日志里没有错误」）；20f 是手写
+     脚本里每一次独立起 python 都得自带 fd 0——本机后台取制品时启动它的终端被回收，fd 0 成了
+     已关闭的描述符，python 崩在解释器初始化（init_sys_streams / Bad file descriptor），日志里
+     只剩上一行的标题，「门不合格」被当成结论而真相是门没跑起来。管道右侧 / heredoc / 已有重定向
+     三种放行，变量装的执行（`"$PY"`、`${PY}`）与隔了看门狗的（`timeout … "$PY"`）都要认，而
+     引号文案、`command -v`/`which`、注释、赋值右值四种不许假红；workflow 的 bash 步刻意不判
+     （Actions 自己关好 stdin），这一格边界用「单独喂就响」自证过滤本身在做事
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -7152,6 +7175,411 @@ def test_section_pointer_gate():
             f"反向对照：一份文本都没扫到时绝不能报「全部走得通」（实际={_got}）")
 
 
+def test_curl_bounds_gate():
+    print("\n═══ AD. 每一次 curl 都得自己会停、写进文件的字节得跨次能用：第 20 条硬门 ═══")
+    # 由来（2026-11-13 本机实发，连着两趟一样的红）：取制品跑到外层超时被杀（rc=124），日志
+    # 停在「[$key] 下载中」之后，一句原因都没留下。字节级看是三件事叠在一起，缺任何一件都不会
+    # 让这件事「永远完不成」：
+    #   ① curl 默认只在**连不上**时自己退。实测同一个 artifact（14034890976）单连接 Range 取
+    #      2 MiB 用了 182.98 秒（11.5 KB/s），而它认为这完全正常；
+    #   ② 慢挂在单条连接上而不是链路上。实测四并发各取 2 MiB、总 166 秒拿到 8 MiB（≈50 KB/s），
+    #      其中一路还会半路报 `Recv failure: Connection reset by peer`，只落
+    #      1899440/2097152 字节。所以「把 -m 调大」既救不了这件事，又会顺手弄死正常的慢链路；
+    #   ③ zip 落在 mktemp 出来的工作目录里，trap EXIT 连它一起删——每次重跑都从第 0 字节开始。
+    # 同一趟还在派发脚本上抓到同族的裸 curl（派发失败长得和派发成功一模一样，人就开始等一个
+    # 从没起来过的 run）。慢可以接受，「永远完不成」不行：这一条判的是结构，不是这一分钟的网络。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    def _one(sh: str) -> list:
+        return gate.check_curl_bounds({"ad": sh})
+
+    # ── 1) 接线：判据在、被 main() 调用、结果进退出码、云端留下 annotation ──
+    for fn in ("check_curl_bounds", "shell_gate_inputs", "curl_sites", "_shell_tokens",
+               "_logical_lines", "_mktemp_vars", "_curl_out_value"):
+        _assert(callable(getattr(gate, fn, None)),
+                f"硬门模块里有 {fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("curl_bounds = check_curl_bounds()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 20 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进不合格计数并影响退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::curl 有界与可续传" in gate_src[_at:_at + 1200],
+            "云端每条问题都要写成 annotation：这一步红的时候，日志里得能直接照做")
+
+    # ── 1b) 「同一张登记表」要用行为证明，不是用函数名证明 ──
+    # 我在 20d 的注释里写过「两族用的是同一张登记表」——那句话本身不构成判据：真口径换成
+    # 两份各抄一遍的读取循环时，函数名照样都在，而加一份脚本只会补到其中一处（第 10 条同族）。
+    # 所以这里把登记表里的一份换成一个**不存在的名字**，要求 20a~20c 与 20d **同时**点名同一
+    # 个缺口。注意方向：从表里「摘掉」一份脚本两族都会安静放行（那本来就是不判），只有「登记
+    # 了却读不到」才是两族共用的那条 fail-closed。
+    _swapped = tuple("debug/zz_missing_ad.sh" if x == "debug/fetch_run_log.sh" else x
+                     for x in gate.SHELL_SOURCES)
+    with _patch(gate, "SHELL_SOURCES", _swapped):
+        _miss_curl = gate.check_curl_bounds()
+        _miss_hang = gate.check_no_prompt_hang()
+    _assert(any("zz_missing_ad.sh 不在位" in x for x in _miss_curl),
+            f"登记了却读不到，curl 那一族要说「不在位」（实际={_miss_curl}）")
+    _assert(any("zz_missing_ad.sh 不在位" in x for x in _miss_hang),
+            f"同一格缺口在 20d 上也要响一次——只有一族响，说明两族各自抄了表（实际={_miss_hang}）")
+
+    # ── 2) 现状 + 覆盖面：全绿不是因为什么都没扫到 ──
+    _assert_eq(gate.check_curl_bounds(), [],
+               "第 20 条：交付链今天每一次 curl 都自己会停，写进文件的字节都不在本次即弃的落点上")
+    texts, unreadable = gate.shell_gate_inputs()
+    _assert_eq(unreadable, [], "登记进第 20 条的脚本与 workflow 全部读得到（读不到≠不用判）")
+    # 覆盖面不写死「几份」：那份数量会随交付链加减，写成一个魔法数就等着下一次假红（今天
+    # 实测 5 份 / 11 条 curl，而我上一版钉的是 6 份，正是这样红的）。真正要担保的是
+    # 「登记表里含 curl 的每一份脚本都被扫到」，这个口径是从表本身派生的，永远不会过期。
+    _expect_shell = sorted(rel for rel in gate.SHELL_SOURCES
+                           if "curl" in (_REPO / rel).read_text(encoding="utf-8", errors="replace"))
+    _assert_eq(sorted(k for k in texts if k.endswith(".sh")), _expect_shell,
+               "登记表里每一份含 curl 的脚本都要出现在扫描结果里：多一份少一份都是扫描口径"
+               "和登记表分叉（第 10 条同族：抄两遍迟早分叉）")
+    _assert(any("build-b2bcollect.yml" in k and "Provision NSIS" in k for k in texts),
+            "workflow 那一侧必须收进 NSIS 装工具那一步（云端唯一一处真下载，红过一整轮交付）；"
+            "这里按步骤名认、不写行号——行号会随上面加删行漂移，漂移的期望就是下一次假红")
+    sites = sum(len(gate.curl_sites(t)) for t in texts.values())
+    _assert(sites >= 4,
+            f"这一条今天看到 {sites} 次 curl：下界只钉 4 次（四族脚本各至少一次），数出 0 次却报 ✅ "
+            "与没有这条门等价（AB 节量过同一格）")
+    # 本轮修好的那两条真字节也要能被点名：体下载那一条必须同时有停顿判定和按块 Range，
+    # 缺任何一个，「慢链路 + 断流」就还是会把整趟拖成永远完不成。
+    fetch_text = texts["debug/fetch_b2bcollect_artifacts.sh"]
+    body_dl = [(seg, {t for t in toks if t.startswith("-")})
+               for _, seg, toks in gate.curl_sites(fetch_text) if "--speed-limit" in seg]
+    _assert_eq(len(body_dl), 1,
+               f"取制品里靠停顿判定收口的那次体下载恰好一条（实际 {len(body_dl)} 条）：多了说明口径漂了")
+    _assert("--speed-time" in body_dl[0][1] and "-r" in body_dl[0][1],
+            f"那一条必须同时带 --speed-time 与按块 Range（实际={body_dl[0][0][:120]}）")
+
+    # ── 3) 反向对照用的是 HEAD 那两版的**原句**，不是我编的坏例子 ──
+    _OLD_FETCH = r"""WORK=$(mktemp -d)
+  SHA=$(curl -sS -m 30 -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.github+json" \
+        "$API/git/ref/heads/main" 2>/dev/null)
+  curl -sL --retry 8 --retry-all-errors -H "Authorization: Bearer $TOK" -o "$WORK/$key.zip" \
+    "$API/actions/artifacts/$AID/zip"
+  if ! extract_zip "$WORK/$key.zip" "$WORK/$key"; then
+    echo "解压失败"
+  fi
+"""
+    _OLD_DISPATCH = r"""  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $TOK" "$API/actions/workflows/$WF/dispatches")
+  curl -s -H "Authorization: Bearer $TOK" \
+    "$API/actions/workflows/$WF/runs?per_page=1"
+"""
+    _got = gate.check_curl_bounds({"旧取制品": _OLD_FETCH, "旧派发": _OLD_DISPATCH})
+    _assert_eq(sum(1 for x in _OLD_DISPATCH.splitlines() if "curl" in x), 2,
+               "夹具里派发那两句是真的两句（少切一句，下面那个数就没意义）")
+    _assert_eq(sum(1 for x in _got if "谁也不会让它停" in x), 3,
+               f"三条裸 curl 全响（实际={_got}）：带 -m 30 那一条不响，说明这条门不是见 curl 就报")
+    _assert(any("mktemp" in x for x in _got),
+            f"③那一格必须点名：写进 $WORK（本次即弃）（实际={_got}）")
+    _assert(any("既不续传" in x for x in _got),
+            f"同一条下载里 20c 也要各自响一次：光换落点不续传，断了还是整段重下（实际={_got}）")
+
+    # ── 4) 20a 的四种写法：粘写、成对、缺半边 ──
+    _assert_eq(_one('curl -sS -m 40 -C - -o "$CACHE/a.zip" "$u"\n'), [], "放行：-m 40")
+    _assert_eq(_one('curl -sS -m40 -C - -o "$CACHE/a.zip" "$u"\n'), [], "放行：-m40 粘写也算")
+    _assert_eq(_one('curl -sS --speed-limit 2048 --speed-time 180 -C - -o "$CACHE/a.zip" "$u"\n'),
+               [], "放行：--speed-limit + --speed-time 成对也算")
+    _got = _one('curl -sS --speed-limit 2048 -C - -o "$CACHE/a.zip" "$u"\n')
+    _assert_eq(len(_got), 1, f"反向对照：只有 --speed-limit、没有 --speed-time 必须响（实际={_got}）")
+    _assert("谁也不会让它停" in _got[0], "一个数不构成停顿判定，报的也得是这句话")
+
+    # ── 5) 折行与「逐行旧口径」的差分 ──
+    _folded = r"""curl -sS \
+  --max-time 60 \
+  -C - -o "$CACHE/a.zip" "$u"
+"""
+    _assert_eq(len(gate.curl_sites(_folded)), 1, "折成三行的一条 curl 只算一条")
+    _assert_eq(_one(_folded), [], "放行：--max-time 写在第二行也算有界")
+    _naive = [ln for ln in _folded.splitlines() if ln.strip().startswith("curl")]
+    _assert(len(_naive) == 1 and "--max-time" not in _naive[0],
+            "反向对照：逐行口径会把这一行判成「没界」——假红逼人在命令中间插一行注释，而那条"
+            "注释什么也不担保（第 11 条同一族教训）")
+
+    # ── 6) 20b 认落点的六种写法 + 三种不许误报 ──
+    _MK = "WORK=$(mktemp -d)\n"
+    for _spell in ('-o "$WORK/a.zip"', '-o "${WORK}/a.zip"', '-o"$WORK/a.zip"',
+                   '--output="$WORK/a.zip"', '--output "$WORK/a.zip"', '-sSo "$WORK/a.zip"'):
+        _assert(any("mktemp" in x for x in _one(_MK + f'curl -sS -m 40 -C - {_spell} "$u"\n')),
+                f"20b：`{_spell}` 这种写法也要认出落点是本次即弃")
+    # 旧写法（只看「前四个字符里有没有小写 o」）在粘写那一格会把**下一个 token（URL）**当成
+    # 落点：假归因正好绕开 mktemp 那一判，是漏报的方向。留这段差分给下一位改这里的人看。
+    def _old_out_value(toks):
+        for i, t in enumerate(toks):
+            if t in gate.CURL_OUT_FLAGS:
+                return toks[i + 1].strip("\"'") if i + 1 < len(toks) else ""
+            if t.startswith("-") and len(t) > 1 and t[1] != "-" and "o" in t[1:5]:
+                return toks[i + 1].strip("\"'") if i + 1 < len(toks) else ""
+        return ""
+    _toks = gate._shell_tokens('-sS -m 40 -o"$WORK/a.zip" "$u"')
+    _assert_eq(_old_out_value(_toks), "$u", "反向对照：旧口径在粘写那一格拿到的落点是 URL")
+    _assert_eq(gate._curl_out_value(_toks), ("path", "$WORK/a.zip"),
+               "新口径同一句拿到的是真落点（上面那条 mktemp 要抓的就是它）")
+    _assert_eq(_one(_MK + 'curl -sS -m 40 -o /dev/null -w "%{http_code}" "$u"\n'), [],
+               "放行：体没落地（-o /dev/null），那里没有要续传的字节")
+    _assert_eq(_one(_MK + 'curl -sS -m 40 -o - "$u" >> "$p"\n'), [], "放行：-o - 交给调用方")
+    _assert_eq(_one('curl -sS -m 40 -C - -o "$CACHE/a.zip" "$u"\n'), [],
+               "放行：落点是可复用的缓存目录，不是本次即弃")
+    _assert_eq(_one(_MK + 'curl -sS -m 40 -C - -XPOST "$u"\n'), [],
+               "放行：这一句压根没写文件（把 -X 取值 POST 里那个 O 当成 -O 会得到一句假归因）")
+    _assert_eq(_one(_MK + 'curl -sS -m 40 -C - -c cookies.txt -o "$CACHE/a.zip" "$u"\n'), [],
+               "放行：-c 的取值 cookies.txt 里那个 o 不是落点开关（带参数的短开关一律不当组合开关）")
+    _assert_eq(_one('curl -sS -m 40 -C - -O "$u"\n'), [],
+               "放行：-O 落到当前目录，20b 归因不出路径就不硬猜")
+    _got = _one('curl -sS -m 40 -O "$u"\n')
+    _assert_eq(len(_got), 1, f"反向对照：-O 只是判不出落点前缀，不豁免续传/完整性那一半（实际={_got}）")
+    _assert("既不续传" in _got[0], f"-O 那一格报的必须是「既不续传也没有收口」（实际={_got[0]}）")
+
+    # ── 7) 20c 的两条合法路，以及「就近」到底多近 ──
+    _assert_eq(_one('curl -sS -m 40 -C - -o "$CACHE/a.zip" "$u"\n'), [], "放行：会接着要（-C -）")
+    _assert_eq(_one('curl -sS --speed-limit 2048 --speed-time 180 -r 0-100 -o "$CACHE/a.zip" "$u"\n'),
+               [], "放行：按块 Range 取")
+    _got = _one('curl -sS -m 40 -o "$CACHE/a.zip" "$u"\n')
+    _assert(any("既不续传" in x for x in _got), f"反向对照：既不续传、近处也没收口 → 红（实际={_got}）")
+    # 云端 NSIS 那一步走的是后者（有界 + 每轮换镜像重下并核哈希，没有 -C）：拿**真字节**钉住
+    # 这条路合法，免得逼人为了消红去补一个用不上的 -C——没核过哈希的续传反而更危险。
+    _wf = (_REPO / ".github" / "workflows" / "build-b2bcollect.yml").read_text(encoding="utf-8")
+    _nsis = [s for _, _, sh, s in gate.run_blocks_in_workflow(_wf) if sh == "bash" and "curl" in s]
+    _assert_eq(len(_nsis), 1, f"Windows workflow 里带 curl 的 bash 步应当只有一步（实际 {len(_nsis)} 步）")
+    _assert_eq(_one(_nsis[0]), [], "放行：NSIS 那一步真字节——有界 + 就近核 sha256，没有 -C")
+    _assert("--max-time" in _nsis[0] and "-C " not in _nsis[0],
+            "这一步确实是「有界但不续传」那一类（两个条件缺一个，上面那条放行就没在验这格）")
+    _head = 'curl -sS -m 40 -o "$CACHE/a.zip" "$u"\n'
+    _assert_eq(_one(_head + "".join(f"echo {i}\n" for i in range(38))
+                   + 'sha256sum "$CACHE/a.zip"\n'), [],
+               "放行：收口隔到窗口边界那一行仍算（NSIS 的 curl 与 sha256 之间夹着换镜像的 if 块）")
+    _got = _one(_head + "".join(f"echo {i}\n" for i in range(39)) + 'sha256sum "$CACHE/a.zip"\n')
+    _assert(any("既不续传" in x for x in _got),
+            "反向对照：再隔一行就不算了——窗口没有边界，一句收口就能给全文件的下载当免检牌")
+    _got = _one(_head + "".join(f"# 说明 {i}\n" for i in range(10)) + "# 这里跑的也是 sha256sum\n")
+    _assert(any("既不续传" in x for x in _got),
+            "反向对照：注释里那句「也核哈希」不算收口。旧版取制品脚本第 244 行那条无续传下载，"
+            "就是被第 279 行这样一句免掉的，而真正那次调用在第 288 行——已经出了窗口")
+    _got = _one('sha256sum old.zip\n'
+                + "\n".join(f'curl -sS -m 40 -o "$CACHE/{i}.zip" "$u"' for i in range(3)) + "\n")
+    _assert_eq(sum(1 for x in _got if "既不续传" in x), 3,
+               "反向对照：文件顶上一句收口不给下面三次下载当护身符，要各自挨着各自写")
+
+    # ── 8) fail-closed：读到 0 份 / 扫到 0 条 curl / 登记的文件不在位，都必须是红 ──
+    _got = gate.check_curl_bounds({})
+    _assert_eq(len(_got), 1, f"反向对照：一份文本都没读到时不能报绿（实际={_got}）")
+    _assert("都没读到" in _got[0], f"报的要是「没读到」而不是「都合格」（实际={_got[0]}）")
+    _got = _one('echo 这里只有 echo\n')
+    _assert(any("一条 curl 都没找到" in x for x in _got),
+            f"反向对照：扫到 0 次 curl 也是红，不是绿（实际={_got}）")
+    with _patch(gate, "SHELL_SOURCES", ("debug/zz_nope_ad.sh",)):
+        _got = gate.check_curl_bounds()
+    _assert(any("不在位" in x for x in _got),
+            f"反向对照：登记的脚本读不到要说出口（默认口径全靠这张表）（实际={_got}）")
+
+    # ── 9) 判不到的形状写在案上，免得这条门给人「所有下载都被管住了」的错觉 ──
+    _assert_eq(gate.curl_sites('wget -q -O "$CACHE/a.zip" "$u"\n'), [],
+               "已知盲区：wget 不在这一条的视野里（它只会撞上上面那条「一条 curl 都没找到」，"
+               "而不是被安静放行）；同族盲区还有靠别的变量名间接拼出来的 curl 参数")
+
+    # ── 10) 20d：会「开口问人」的外部命令必须显式关掉交互 ──
+    # 由来（2026-11-13 本机自审，就在把 20a~20c 接上之后）：`git credential fill` 在
+    # helper 里没有 github.com 凭证时**不是报错**，而是去开 /dev/tty 问用户名密码。它读的
+    # 不是脚本喂给 stdin 的那条 printf，所以「管道里已经喂了东西」一点也挡不住它。这和 20a
+    # 判的是同一件事：进程不会自己停，日志一个字都不留，人只能对着「取制品」那行标题等。
+    # 清点下来仓库里四处调用（派发 / 取制品 / 轮询 / 取证）全都只喂了 stdin、没关交互。
+    for fn in ("check_no_prompt_hang", "shell_gate_inputs", "_drop_comment_lines"):
+        _assert(callable(getattr(gate, fn, None)), f"硬门模块里有 {fn}（能被单独喂夹具）")
+    _at = gate_src.find("prompt_hangs = check_no_prompt_hang()")
+    _assert(_at > 0, "硬门 main() 里真的调了 20d（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "20d 报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::外部命令交互收口" in gate_src[_at:_at + 1200],
+            "云端每条问题都要写成 annotation：这一步红的时候日志里得能直接照做")
+    _assert_eq(gate.check_no_prompt_hang(), [],
+               "20d：交付链今天每一处 credential fill 都带 GIT_TERMINAL_PROMPT=0")
+    _hang_texts, _hang_miss = gate.shell_gate_inputs(("credential fill",))
+    _assert_eq(_hang_miss, [], "20d 读的仍是第 20 条那张登记表（各抄一遍就会和交付链分叉）")
+    # 逐份点名「这一份里确实有一句真在取凭证」，而不是钉一个总数：总数会随交付链加减而假红
+    # （同一格里 20a 的份数就是这么红的），而逐份的期望只在自己担保的那一路失效时才响。
+    for _rel in ("debug/dispatch_b2bcollect_builds.sh", "debug/fetch_b2bcollect_artifacts.sh",
+                 "debug/poll_b2bci.sh", "debug/fetch_run_log.sh"):
+        _n = sum(1 for logical, _ln in
+                 gate._logical_lines(gate._drop_comment_lines(_hang_texts[_rel]))
+                 if "credential fill" in logical)
+        _assert(_n >= 1, f"{_rel} 里那句真取凭证的调用还在扫描视野里（数出 {_n} 句）")
+    _assert_eq(sum(1 for x in _hang_texts if x.endswith(".sh")), 4,
+               "今天取凭证的就是派发/取制品/轮询/取证这四份脚本：少一路没人知道，多一路要写进这张表")
+
+    def _hang(sh: str) -> list:
+        return gate.check_no_prompt_hang({"ad": sh})
+
+    # HEAD 那三句是原字节（取证脚本从未入库，它的原句和取制品那句同形）：反向对照必须响
+    _OLD_HANG = {
+        "派发（HEAD 第 5 行）":
+            "CRED=$(printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill)\n",
+        "取制品（HEAD 第 14 行）":
+            "TOK=$(printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill"
+            " | sed -n 's/^password=//p')\n",
+        "轮询（HEAD 第 30~31 行，折行）":
+            "TOK=$(printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill \\\n"
+            "      | sed -n 's/^password=//p')\n",
+    }
+    _got = gate.check_no_prompt_hang(_OLD_HANG)
+    _assert_eq(len(_got), 3, f"HEAD 那三句原字节必须三句全响（实际={_got}）")
+    _fold_hit = [x for x in _got if "轮询" in x]
+    _assert_eq(len(_fold_hit), 1,
+               f"折行那一句只响一次：拼回同一句再判，写在下一行的 `| sed` 不算第二条命令"
+               f"（实际={_fold_hit}）")
+    _assert("第 1 行" in _fold_hit[0],
+            f"行号要报**起始行**，让人一眼走到（实际={_fold_hit[0]}）")
+    _assert_eq(_hang("TOK=$(printf 'x\\n' | GIT_TERMINAL_PROMPT=0 git credential fill)\n"), [],
+               "放行：粘在命令前的 GIT_TERMINAL_PROMPT=0")
+    _assert_eq(_hang("export GIT_TERMINAL_PROMPT=0\n"
+                     "TOK=$(printf 'x\\n' | git credential fill)\n"), [],
+               "放行：文件级 export 一次写清，逐行不必再带（这条豁免只认 export 那种写法）")
+    _got = _hang("# helper 里没凭证时 git credential fill 会去开 /dev/tty\n"
+                 "TOK=$(printf 'x\\n' | GIT_TERMINAL_PROMPT=0 git credential fill)\n")
+    _assert_eq(_got, [],
+               "注释里那句「git credential fill」不是调用：不滤掉就会得到一条与真缺陷一模一样的"
+               "假红，而假红的代价从来都是人开始跳过这一步")
+    _got = gate.check_no_prompt_hang({})
+    _assert_eq(len(_got), 1, f"反向对照：一份含凭证调用的 shell 都没读到不能报绿（实际={_got}）")
+    _assert("都没读到" in _got[0], f"报的要是「没读到」而不是「都关好了」（实际={_got[0]}）")
+
+    # ── 11) 20e：交付链目录里的每一份 shell 都必须在登记表里 ──
+    # 由来（紧接着 20d，同一天）：取证脚本 debug/fetch_run_log.sh 一直不在 SHELL_SOURCES 里，
+    # 于是文案卫生、bash -n、curl 有界、外部输出出处这四道门在它身上**全是空的**——它是本轮
+    # 唯一一份「天天有人跑、却从没被任何一道门看过」的交付链脚本。20c 一接上就在那份脚本里
+    # 红了一条真缺陷（日志包下坏一半照样以 PK 开头，错误响应会被当成「日志里没有错误」）。
+    # 登记缺口不需要出事才修，需要的是让「新写一份没登记」当场红。
+    _at = gate_src.find("shell_reg = check_shell_registration()")
+    _assert(_at > 0, "硬门 main() 里真的调了 20e")
+    _assert("bad += 1" in gate_src[_at:_at + 1200], "20e 报出来的问题要并进退出码")
+    _assert("::error::交付链 shell 登记" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「没登记」而不是「内容有问题」")
+    _assert_eq(gate.check_shell_registration(), [],
+               "20e：扫描目录里每一份 .sh 都在登记表或豁免表里")
+    _seen = sum(1 for d in gate.SHELL_SCAN_DIRS for _p in (_REPO / d).glob("*.sh"))
+    _assert_eq(_seen, len(gate.SHELL_SOURCES) + len(gate.SHELL_EXEMPT),
+               f"扫到 {_seen} 份 .sh、登记 {len(gate.SHELL_SOURCES)} 份、豁免 "
+               f"{len(gate.SHELL_EXEMPT)} 份：三个数对不上就是表和目录已经分叉")
+    with _patch(gate, "SHELL_SOURCES",
+                tuple(x for x in gate.SHELL_SOURCES if x != "debug/fetch_run_log.sh")):
+        _got = gate.check_shell_registration()
+    _assert(any("fetch_run_log.sh" in x for x in _got),
+            f"反向对照：把取证脚本从表里摘掉必须当场点名（这就是本轮那个真实缺口）（实际={_got}）")
+    with _patch(gate, "SHELL_SOURCES",
+                tuple(x for x in gate.SHELL_SOURCES if x != "debug/fetch_run_log.sh")), \
+            _patch(gate, "SHELL_EXEMPT", ("debug/fetch_run_log.sh",)):
+        _assert_eq(gate.check_shell_registration(), [],
+                   "豁免表也算登记：但只有写进表才行，「我觉得这份不用判」不构成豁免")
+    with _patch(gate, "SHELL_SCAN_DIRS", ("debug/zz_no_such_dir_ad",)):
+        _got = gate.check_shell_registration()
+    _assert(any("不在位" in x for x in _got),
+            f"反向对照：扫描目录读不到要说出口（默认口径全靠这几个目录）（实际={_got}）")
+    _assert(any("一份 .sh 都没看到" in x for x in _got),
+            f"反向对照：扫 0 个文件的「登记齐全」是自欺，两条都要响（实际={_got}）")
+    _empty = Path(tempfile.mkdtemp(prefix="shell_reg_empty_"))
+    with _patch(gate, "SHELL_SCAN_DIRS", (str(_empty),)):
+        _got = gate.check_shell_registration()
+    _assert_eq(sum(1 for x in _got if "一份 .sh 都没看到" in x), 1,
+               f"空目录（目录在位、里面没 shell）也只响那一条自欺（实际={_got}）")
+
+    # ── 12) 20f：独立起来的 python 必须自己带 fd 0 ──
+    # 由来（2026-11-13 本机实发，就在分块续传把 261 MB 完整取回来之后）：脚本被后台启动、启动它
+    # 的那个终端随后被回收，于是 fd 0 是一个**已关闭**的描述符；python 在解释器初始化阶段就崩：
+    #   Fatal Python error: init_sys_streams: can't initialize sys standard streams
+    #   OSError: [Errno 9] Bad file descriptor
+    # 崩在 `-c`/脚本体第一行之前，所以门自己的 print 一句都不会出现，日志里只剩上一行的标题——
+    # 「交付 zip 的门不合格」成了唯一线索，而真正的失败是门根本没跑起来。这一条和 20a/20d 同族
+    # （都是「不会自己停 / 不会自己说话」），形状不同：那种是等待，这种是连启动都没完成。
+    for fn in ("check_python_stdin", "_python_command_at", "_quote_masks", "_py_interp_vars"):
+        _assert(callable(getattr(gate, fn, None)), f"硬门模块里有 {fn}（能被单独喂夹具）")
+    _at = gate_src.find("stdin_gaps = check_python_stdin()")
+    _assert(_at > 0, "硬门 main() 里真的调了 20f（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "20f 报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::解释器 stdin 独立" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「没带 fd 0」而不是「python 报错」")
+    _assert_eq(gate.check_python_stdin(), [],
+               "20f：交付链手写脚本今天每一次独立起 python 都自带 fd 0")
+    _py_texts, _py_miss = gate.shell_gate_inputs(("python",))
+    _assert_eq(_py_miss, [], "20f 读的仍是第 20 条那张登记表（各抄一遍就会和交付链分叉）")
+
+    def _pyin(sh: str) -> list:
+        return gate.check_python_stdin({"ad": sh})
+
+    # 逐份证明「这一份真的在门里跑」，而不是钉一个调用点总数（钉总数会在交付链加减时假红，
+    # 20a/20d 那两格都量过）。手法是把它的 stdin 界整段摘掉：摘完还全绿＝这份根本没被读到。
+    for _rel in ("debug/build_b2bcollect_mac_local.sh", "debug/fetch_b2bcollect_artifacts.sh",
+                 "debug/run_offline_regression.sh"):
+        _t = _py_texts[_rel]
+        _裸 = _t.replace(" < /dev/null", "").replace("</dev/null>", "")
+        _assert(_裸 != _t, f"{_rel} 今天带着 < /dev/null（一句都没有＝这份不在 20f 视野里）")
+        _got = gate.check_python_stdin({_rel: _裸})
+        _assert(len(_got) >= 1,
+                f"反向对照：{_rel} 摘掉 stdin 界必须当场响（实际={_got[:1]})")
+
+    # 本轮真实坏掉的那一句（取制品里跑交付 zip 门的那句，去掉界就是当时的原字节）
+    _zip_line = [ln for ln in _py_texts["debug/fetch_b2bcollect_artifacts.sh"].splitlines()
+                 if "check_release_zip.py" in ln and "--os-extract" in ln
+                 and ln.lstrip().startswith("if ! python3")]
+    _assert_eq(len(_zip_line), 1, f"交付链里跑 zip 门的那一句应当只有一处（实际 {len(_zip_line)} 处）")
+    _assert(" < /dev/null" in _zip_line[0],
+            "今天这一句自带 fd 0——它崩过一次才有这条门")
+    _got = _pyin(_zip_line[0].replace(" < /dev/null", "") + "\n")
+    _assert_eq(len(_got), 1, f"去掉界的那一句原字节必须响（实际={_got}）")
+
+    _assert_eq(_pyin('printf x | python3 -c "print(1)"\n'), [],
+               "放行：管道右侧的 stdin 由上一条命令的 stdout 给出，本来就不是「独立起来」")
+    _assert_eq(_pyin("python3 - <<'PY'\nprint(1)\nPY\n"), [],
+               "放行：heredoc 显式喂了 stdin（`<<` 和 `< /dev/null` 是同一件事的两面）")
+    _assert_eq(_pyin('echo "可选：PY=/path/to/python 指定解释器"\n'
+                     'python3 x.py < /dev/null\n'), [],
+               "放行：双引号里那句 PY=… 只是文案。把它当调用点就是一条假红，而假红的代价从来都是"
+               "人开始跳过这一步（本轮实测第一版就红在这一句上）")
+    _assert_eq(_pyin('PY=$(command -v python3 || true)\nwhich python3\n'
+                     'python3 x.py < /dev/null\n'), [],
+               "放行：`command -v` 与 `which` 只是在问解释器在哪儿，不启动解释器")
+    _assert_eq(_pyin('# 这一路以前跑的是 python3 build.py，不带 stdin\n'
+                     'python3 x.py < /dev/null\n'), [],
+               "放行：注释里那句不是调用（与 20a/20d 同一个「注释不算判据」的口径）")
+    _got = _pyin('PY=.venv/bin/python\n"$PY" x.py\n')
+    _assert_eq(len(_got), 1,
+               f"反向对照：装在变量里的解释器也要认——今天跑构建与批跑的正是 `\"$PY\"` 那几路，"
+               f"只认字面 python3 得到的是一条彻底的假绿（实际={_got}）")
+    _assert("第 2 行" in _got[0],
+            f"响的必须是那一行调用而不是上面的赋值行（这条门的读者照着行号去改脚本）（实际={_got[0]}）")
+    _assert_eq(_pyin('PY=python3\npython3 x.py < /dev/null\n'), [],
+               "放行：`PY=python3` 那一行是赋值右值，不是执行")
+    _got = _pyin('PY=${ROOT}/.venv/bin/python\n${PY} x.py\n')
+    _assert_eq(len(_got), 1, "反向对照：`${PY}` 花括号写法同认（实际=" + str(_got) + "）")
+    _got = _pyin('PY=.venv/bin/python\ntimeout -s ABRT -k 10 "$PY" -u -X faulthandler "$f" '
+                 '>"$log" 2>&1\n')
+    _assert_eq(len(_got), 1,
+               f"反向对照：隔了一层看门狗包装器仍然是被执行（批跑那条就是这个形状），"
+               f"按「前面有东西就不算」一刀切得到的就是假绿（实际={_got}）")
+
+    _got = gate.check_python_stdin({})
+    _assert_eq(len(_got), 1, f"反向对照：一份文本都没读到时不能报绿（实际={_got}）")
+    _assert("都没读到" in _got[0], f"报的要是「没读到」而不是「都独立了」（实际={_got[0]}）")
+    _got = _pyin('echo 这里只有 echo\n')
+    _assert(any("一处 python 调用都没找到" in x for x in _got),
+            f"反向对照：扫到 0 处调用也是红，不是绿（实际={_got}）")
+    with _patch(gate, "SHELL_SOURCES", ("debug/zz_nope_ad.sh",)):
+        _got = gate.check_python_stdin()
+    _assert(any("不在位" in x for x in _got),
+            f"反向对照：登记的脚本读不到要说出口（默认口径全靠这张表）（实际={_got}）")
+    # 已知边界（写在案上，免得这条门给人「所有 python 都被管住了」的错觉）：workflow 的 bash 步
+    # 刻意不判，因为 Actions 给每一步的 stdin 本身就是关好的——本机「终端被回收」这件事在云端
+    # 不存在，把它写成云端要求得到的只是 11 条噪音（判据越界和判据缺失一样会逼人绕过它）。
+    # 但「不判」不等于「看不到」：单独喂 workflow 那几段，它当场响，说明这一格过滤自己在做事。
+    _wf_only = {k: v for k, v in _py_texts.items() if not k.endswith(".sh")}
+    _assert(len(_wf_only) >= 2,
+            f"两份 workflow 的 bash 步确实在 shell_gate_inputs 视野里（实际 {len(_wf_only)} 段）")
+    _assert(len(gate.check_python_stdin(_wf_only)) >= 1,
+            "边界要能自证：workflow 侧不是「没有 python 调用」，而是被默认口径过滤掉了")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -7169,6 +7597,7 @@ SECTIONS = (
     test_case_insensitive_filesystem_gate,
     test_pip_source_resilience_gate,
     test_section_pointer_gate,
+    test_curl_bounds_gate,
 )
 
 

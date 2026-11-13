@@ -115,6 +115,18 @@
      正是用户报「以前能采到、现在一直是 0」那条链上的守卫缺口。「判据在哪一节」这句话本身
      不构成判据：可达性必须机械化核对（被指路的套件在不在交付目录、它的节是不是数字编号、
      每一个节号——含并列与区间两种写法——在不在案），改编号时两边一起改，与第 10 条同族。
+ 20 交付链 shell 里每一次 curl 都必须**自己会停**，写进文件的字节必须**跨次能用**：
+     2026-11-13 本机取制品连着两趟都是外层 timeout 把脚本杀掉（rc=124），日志一句原因都没
+     留。字节级拆开是三件事：curl 只在连不上时自己退（实测单连接 2 MiB 用 182.98 秒 =
+     11.5 KB/s，它认为这完全正常）；限速挂在单条连接而非链路上（实测四并发 166 秒拿到
+     8 MiB ≈ 50 KB/s，所以给大文件写 max-time 既救不了慢还会弄死正常的慢）；zip 落在 mktemp
+     出来的工作目录里、被 trap EXIT 删掉，于是每次重跑都从第 0 字节开始——跑一百次也不会有
+     进展。三判据：20a 每次 curl 要么有总时限（--max-time/-m）要么有停顿时限（--speed-limit
+     + --speed-time 两个都要）；20b 写进文件的目标不许来自同一份脚本里 mktemp 赋出的变量
+     （-o - 与 /dev/null 豁免）；20c 要么自己会接着要（-C/--continue-at/-r/--range），要么近旁
+     （40 行内）有完整性收口（sha256/certutil/check_release_zip/真解一次）——NSIS 那一步走
+     后者，续传在那儿反而是错的（每轮换镜像重下并核哈希）。同一趟还在派发脚本上抓到两条裸
+     curl：派发失败长得和成功一模一样，人就开始等一个从没起来过的 run。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -774,6 +786,7 @@ def check_shell_hygiene(text: str) -> list:
 HYGIENE_SCRIPTS = (
     "debug/dispatch_b2bcollect_builds.sh",
     "debug/fetch_b2bcollect_artifacts.sh",
+    "debug/fetch_run_log.sh",
     "debug/poll_b2bci.sh",
     "debug/run_offline_regression.sh",
 )
@@ -2407,6 +2420,539 @@ def check_section_pointer_references(texts=None, suites=None) -> list:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# 第 20 条：交付链上每一次 curl 都必须**自己会停**，写进文件的字节必须**跨次能用**，
+#          调出去的外部命令必须**不许问人**，而这几道门必须**看得见每一份脚本**。
+#
+# 由来（2026-11-13 本机实发，连着两趟一样的红）：取制品跑到外层 timeout 被杀（rc=124），
+# 日志停在「下载中」之后一句解释都没有。字节级看是三件事叠在一起，缺任何一件都不会让
+# 这件事「永远完不成」：
+#   ① curl 默认只在**连不上**的时候自己退；连上之后 11 KB/s 它认为完全正常。本机实测：
+#      同一个 artifact（14034890976）单连接 Range 取 2 MiB 用了 182.98 秒。
+#   ② 那个慢挂在**单条连接**上而不是链路上——实测四并发各取 2 MiB、总 166 秒拿到 8 MiB
+#      （≈50 KB/s）。所以给人一个大 max-time 既救不了它，又会同时弄死正常的慢链路：
+#      时间上限这条路对体下载是错的，正确的形状是「停顿判定 + 按块续传」。
+#   ③ zip 落在 mktemp 出来的工作目录里，trap EXIT 顺手把它删了——于是每一次重跑都从第
+#      0 字节开始，跑一百次也不会有进展。慢不是缺陷，「慢到永远完不成」才是。
+# 同一趟还在另一份脚本上顺手抓到一个同族的（dispatch 那两条 curl 原本都是裸的；本机这一刻
+# api.github.com 的连接时间实测会 15 秒过不去）：派发失败长得和派发成功一模一样，人就开始
+# 等一个从没起来过的 run。所以这一条判的是**结构**，不是这一分钟的网络：
+#   20a 每一次 curl 都要自己会停：有总时限（--max-time/-m）**或**停顿时限
+#       （--speed-limit 与 --speed-time 两个都要，只有一个就是没判）。
+#   20b 把响应体写进文件的那一次，落点不许是本次即弃的临时目录（同一份脚本里由 mktemp
+#       赋出来的变量开头就算）。`-o -`（交给调用方）与 /dev/null 不算：那里没有要续传的字节。
+#   20c 写进文件的下载必须跨次可用：要么自己会接着要（--continue-at/-C 或 Range/-r），
+#       要么就近有完整性收口（sha256/md5/certutil/check_release_zip/真解一次）。NSIS 那一步
+#       走的是后者（每轮换镜像重下并核哈希，续传在那儿反而是错的），两条合法路都在案上，
+#       免得逼人为了消红去写一个用不上的 -C。
+#   20d 会「开口问人」的外部命令必须显式关掉交互：`git credential fill` 在 helper 里没凭证时
+#       不是报错，而是去开 /dev/tty 问密码——它读的不是脚本喂给 stdin 的那条 printf，所以
+#       「管道里已经喂了东西」挡不住它。四处调用（派发/取制品/轮询/取证）原本全都只喂 stdin。
+#       文件级 `export GIT_TERMINAL_PROMPT=0` 也算关好；整行注释里的提及不算调用（不滤掉就是
+#       一条与真缺陷一模一样的假红，而假红的代价从来是人开始跳过这一步）。
+#   20e 交付链目录里每一份 .sh 都必须在 SHELL_SOURCES 或 SHELL_EXEMPT 里在案。由来：取证脚本
+#       debug/fetch_run_log.sh 一直不在表里，文案卫生、bash -n、curl 有界、外部输出出处四道门
+#       在它身上全是空的——它是本轮唯一一份「天天有人跑、却从没被任何一道门看过」的脚本；20c 一
+#       接上就在它身上红了一条真缺陷。登记缺口不需要出事才修，需要的是「新写一份没登记」当场红。
+#   20f 手写脚本里每一次**独立起来**的 python 都必须自带 fd 0（`< /dev/null`），除非它的 stdin
+#       来自单管道右侧或显式 heredoc。由来是本机实发的一起：脚本后台起跑、启动它的终端随后被回收，
+#       fd 0 成了已关闭的描述符，python 在解释器初始化阶段就崩（init_sys_streams / Bad file
+#       descriptor），门自己的 print 一句没留——「交付 zip 的门不合格」被当成结论，而真相是门根本
+#       没跑起来。workflow 的 bash 步刻意不判（Actions 自己就把 stdin 关好了），这条边界写在案上。
+# 判不到的形状也写明白，免得这条门给人「所有下载都被管住了」的错觉：wget、curl 通过别的
+# 变量名间接拼出来的参数、以及 .py 里 subprocess 调 curl（本仓没有，pip 那一路由第 18 条管）
+# 都不在这一条的视野里。
+# ---------------------------------------------------------------------------
+CURL_HEAD_RE = re.compile(r"^(?:[A-Za-z_]\w*=\S*\s+)*(?:command\s+)?curl(?:\s|$)")
+CURL_TOTAL_BOUND = ("--max-time", "-m")
+CURL_STALL_BOUND = ("--speed-limit", "--speed-time")
+CURL_OUT_FLAGS = ("-o", "--output", "-O", "--remote-name", "--remote-output")
+# 落到「当前目录 + URL 同名」的那几个开关：确实写了文件，但路径不是脚本写出来的，
+# 20b 归因不了（猜一个错路径比说「判不了」更糟），20c 照判。
+CURL_OUT_CWD_FLAGS = ("-O", "--remote-name", "--remote-name-all", "--remote-output")
+# 组合短开关里允许出现在 o 之前的字母：取自 curl -h 里**不带参数**的那些短开关
+# （-a -f -g -G -I -j -J -k -L -M -n -N -q -s -S -v，以及 -0..-9 与 -#）。带参数的那些
+# （-b -c -d -e -m -r -t -T -u -U -w -X -x -y -Y -z -H -K -F -D -C -o…）一律留在表外，
+# 表外的字母出现在 o 之前就不再把这一串当组合开关——`-XPOST` 里的 O、`-ccookiejar` 里
+# 的 o 都属于「别人的值」，把它们当成落点会得到一个假归因，而假归因正好绕开 mktemp
+# 那一判（漏报的方向）。
+CURL_NOARG_SHORTS = set("aGILMNafgjknqSsv0123456789#")
+CURL_NO_LANDING = ("/dev/null", "-")           # 体没落地：这一路没有要续传的东西
+CURL_RESUME_FLAGS = ("--continue-at", "-C", "--range", "-r")
+CURL_INTEGRITY_WORDS = ("sha256", "md5sum", "certutil", "check_release_zip",
+                        "--os-extract", "unzip -t", "gzip -t")
+# 20c 的就近窗口：完整性收口必须写在同一件事旁边。为什么不是全文找：窗口一大，文件顶上
+# 一句「我们核过哈希」就能给全文件的下载当免检牌——那就不再是收口，是护身符（第 14 条
+# 同一道理）。为什么不是紧邻下一行：NSIS 那一步里 `curl` 与 `got=$(sha256 …)` 之间还夹着
+# `|| { echo 换下一条; continue; }` 一行，40 行的代价是「隔几行的收口仍然算」。
+CURL_INTEGRITY_LOOKON = 40
+
+
+def _shell_tokens(text: str) -> list:
+    """按 shell 的空格分词，引号内整体保留（找 `-o` 的值要用，不能按空格乱切）。"""
+    out, buf, quote = [], [], ""
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _logical_lines(text: str) -> list:
+    """[(这一句命令, 起始行号 1 基)]，把 `\\` 折行拼回一行。
+
+    折行不拼回来，判据就会把 `curl -sSL` 与下一行的 `--connect-timeout 20 …` 当成两条，
+    于是每一条带续行的 curl 都被判成「没界」——假红逼人在中间插一行注释，而那条注释
+    什么也不担保。行号仍报起始行，让人一眼走到。
+    """
+    lines = text.splitlines()
+    out, buf, base = [], [], 1
+    for i, raw in enumerate(lines, 1):
+        if not buf:
+            base = i
+        if raw.endswith("\\"):
+            buf.append(raw[:-1])
+        else:
+            buf.append(raw)
+            out.append(("".join(buf), base))
+            buf = []
+    if buf:
+        out.append(("".join(buf), base))
+    return out
+
+
+def _mktemp_vars(text: str) -> set:
+    """这份脚本里由 mktemp 赋出来的变量名（20b 认的就是它们：那是本次即弃的落点）。"""
+    return {m.group(1) for m in re.finditer(r"^\s*([A-Za-z_]\w*)=[^\n]*\bmktemp\b", text, re.M)}
+
+
+def _curl_out_value(toks: list):
+    """返回 (落点种类, 值)：
+      ("", "")        这一句没往文件里写体（20b/20c 都不判）
+      ("path", "x")   写向一个明确路径；`-o -` 与 `/dev/null` 也走这里，由调用方豁免
+      ("cwd", "")     `-O`/`--remote-name`：确实落地了，但文件名由 URL 决定，路径前缀
+                      判不出来——20b 只能不判（说「判不了」比猜一个错归因诚实），20c 照判
+
+    三种写法都要认，认漏一种就是在那种写法上安静放行：
+      `-o 值` / `--output 值`（值在下一个 token）
+      `-o值` / `--output=值` / 组合短开关里带 o（`-so值`，值粘在同一 token 上）
+      `-O` / `--remote-name` / 组合开关里带大写 O（落到当前目录）
+    组合开关的规矩按 curl 自己的口径来：小写字母后面如果还有别的字符，那剩下的就是值
+    （`-so"$X"` 的值是 `"$X"`）；`o` 是最后一个字符才去读下一个 token。上一版只看
+    「前四个字符里有没有 o」，于是 `-o"$WORK/a.zip"` 把**下一个 token（URL）**当成了落点
+    ——那是个假归因，而且正好绕开 mktemp 那一判（漏报的方向）。
+    """
+    for i, t in enumerate(toks):
+        if t in CURL_OUT_FLAGS:                       # -o / --output / -O / --remote-name
+            if t in CURL_OUT_CWD_FLAGS:
+                return "cwd", ""
+            return ("path", toks[i + 1].strip("\"'")) if i + 1 < len(toks) else ("path", "")
+        if t.startswith("--") and "=" in t:           # --output=…
+            key, val = t.split("=", 1)
+            if key in CURL_OUT_FLAGS:
+                return "path", val.strip("\"'")
+            continue
+        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            body = t[1:]
+            for j, ch in enumerate(body):
+                if ch in ("o", "O"):
+                    if ch == "O":
+                        return "cwd", ""
+                    rest = body[j + 1:]
+                    if rest:
+                        return "path", rest.strip("\"'")
+                    return ("path", toks[i + 1].strip("\"'")) if i + 1 < len(toks) else ("path", "")
+                if ch not in CURL_NOARG_SHORTS:
+                    break                  # 带参数的短开关出现在 o 之前：后面那串是它的值
+            continue
+    return "", ""
+
+
+def curl_sites(text: str) -> list:
+    """[(行号, 那一句命令, [token])]：这份 shell 里的每一条 curl 调用（折行已拼回一行）。
+
+    单独做成一个函数，是为了让离线夹具能直接数「今天到底看到了几条 curl」——判据若只在
+    内部循环里数，测试就只能复述那段循环（复述出来的口径会和真口径分叉，第 10 条同族）。
+    """
+    out = []
+    for logical, lineno in _logical_lines(text):
+        for seg in _shell_segments(logical):
+            if CURL_HEAD_RE.match(seg):
+                out.append((lineno, seg, _shell_tokens(seg)))
+    return out
+
+
+def shell_gate_inputs(needles: tuple = ("curl",)):
+    """第 20 条各小判据真正要扫的那些 shell 文本：返回 ({标签: 文本}, 读不到时的清单)。
+
+    needles 决定「一段文本值不值得收进来」：curl 那一族只判含 curl 的，交互挂起那一族
+    只判含 `credential fill` 的。留成参数而不是各写一份读取循环，是为了让两族用的是
+    **同一张登记表**——一张表各抄一遍的话，加一份脚本只会补到其中一处（第 10 条同族坑）。
+    """
+    texts, problems = {}, []
+    for rel in SHELL_SOURCES:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        body = path.read_text(encoding="utf-8", errors="replace")
+        if not any(n in body for n in needles):
+            continue                     # 与 workflow 那一侧同一个口径：不含这个关键词就不必收
+        texts[rel] = body
+    for rel in WORKFLOWS:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for name, lineno, shell, script in run_blocks_in_workflow(text):
+            if shell != "bash":
+                continue                 # pwsh 步由离线测试 M 节按 PowerShell 口径判
+            if not any(n in script for n in needles):
+                continue
+            texts[f"{rel} 第 {lineno} 行「{name}」"] = script
+    return texts, problems
+
+
+def check_curl_bounds(texts=None) -> list:
+    """texts: {标签: shell 文本}。留注入面是给离线夹具的（第 16/17/19 条同一条纪律）：
+    判据若只能读本机仓库，「坏了会不会响」这一半就永远验不了。
+    """
+    problems = []
+    if texts is None:
+        texts, problems = shell_gate_inputs(("curl",))
+    # 这一句必须留在 `if texts is None` 之外。放里面的时候我踩过一次：注入 `{}` 的调用方
+    # 得到的是「一条问题都没有」，而它和「一份文件都没读到」是同一件事——留到默认口径外
+    # 就等于这条 fail-closed 只保护我自己写的那条路，夹具和将来任何别的调用方都在保护之外。
+    if not texts:
+        problems.append("第 20 条一份 shell 文本都没读到：这时报「所有 curl 都有界」"
+                        "没有任何担保（扫 0 个文件的全覆盖是自欺，AB 节量过同一格）")
+    total = 0
+    for label, text in sorted(texts.items()):
+        lines = text.splitlines()
+        mkvars = _mktemp_vars(text)
+        # 被注释掉的那句 curl 不会被执行：判它得到的是假红，而假红的代价是人开始跳过这一步。
+        # 20c 那个「就近收口」的窗口反过来要看原文（它自己在下面滤注释），所以这里只换调用点
+        # 这一侧；行号由 _drop_comment_lines 保位，报出来的行仍然走得通。
+        for lineno, seg, toks in curl_sites(_drop_comment_lines(text)):
+            total += 1
+            flags = {t for t in toks if t.startswith("-")}
+            shown = seg.strip()[:120]
+            # 20a 自己会停
+            has_total = any(f in flags for f in CURL_TOTAL_BOUND) or any(
+                t.startswith("-m") and len(t) > 2 and t[2:].isdigit() for t in toks)
+            has_stall = all(f in flags for f in CURL_STALL_BOUND)
+            if not (has_total or has_stall):
+                problems.append(f"{label} 第 {lineno} 行的 curl 谁也不会让它停（既没有 "
+                                f"--max-time/-m，也没有 --speed-limit + --speed-time）："
+                                f"「{shown}」——挂住的连接只会让外层超时来杀，而它杀完一句"
+                                f"原因都留不下（本机取制品那两趟 rc=124 就是这个形状）")
+            # 20b/20c 只有真的把体写进文件才判
+            kind, out = _curl_out_value(toks)
+            if kind == "":
+                continue                         # 这一句根本没往文件写体（响应交给调用方/丢弃）
+            if kind == "path" and (not out or out in CURL_NO_LANDING):
+                continue                     # -o - / -o /dev/null：没有要续传的字节，也没有落点
+            shown_out = out if kind == "path" else "当前目录（-O/--remote-name）"
+            if kind == "path":               # cwd 那一格路径不由脚本决定，20b 归因不了
+                for var in mkvars:
+                    if out.startswith(f"${{{var}") or out.startswith(f"${var}"):
+                        problems.append(f"{label} 第 {lineno} 行把响应体写进 ${var} 指的地方，而 "
+                                        f"{var} 是 mktemp 出来的（本次即弃）：进度随它一起被删，"
+                                        f"下一次重跑从第 0 字节开始——慢可以接受，「永远完不成」不行")
+            resume = any(f in flags for f in CURL_RESUME_FLAGS) or any(
+                t.startswith("-C") or (t.startswith("-r") and len(t) > 2) for t in toks)
+            if not resume:
+                # 注释行不算收口。这一格是本轮自审抓到的：旧版取制品脚本第 244 行那条无续传
+                # 下载，被第 279 行一句「这里跑的也是 check_release_zip.py」免掉了，而真正的
+                # 那次调用在第 288 行——早就出了 40 行窗口。收口必须是被**执行**的字节；一句
+                # 描述收口的话不是收口（和第 19 条「注释里的指路自己不构成判据」同一个道理）。
+                window = "\n".join(ln for ln in lines[lineno - 1: lineno - 1 + CURL_INTEGRITY_LOOKON]
+                                   if not ln.lstrip().startswith("#"))
+                if not any(w in window for w in CURL_INTEGRITY_WORDS):
+                    problems.append(f"{label} 第 {lineno} 行往「{shown_out}」写体，既不续传"
+                                    f"（--continue-at/-C 或 Range/-r 一个都没有），近 {CURL_INTEGRITY_LOOKON} "
+                                    f"行内也没有完整性收口（{'/'.join(CURL_INTEGRITY_WORDS)} 一个都没出现）："
+                                    f"断了就只能整段重下，或更坏——下了一半却没人能看出来")
+    if texts and total == 0:
+        problems.append(f"第 20 条在 {len(texts)} 份 shell 文本里一条 curl 都没找到：口径已经和"
+                        "交付链脱节（这一条判的是「每一次 curl」，一次都没有等于没判）")
+    return problems
+
+
+# ── 20d：会「开口问人」的外部命令必须显式关掉交互 ────────────────────────────
+# 由来（2026-11-13 本机自审，就在把第 20 条接上之后）：`git credential fill` 在 helper
+# 里没有 github.com 凭证时不是报错，而是去开 /dev/tty 问用户名密码。它读的不是脚本喂给
+# stdin 的那条 printf，所以「管道里已经喂了东西」一点也挡不住它。这一刻和 20a 管的是同一
+# 件事：进程不会自己停，日志一个字都不留，人只能对着「取制品」那行标题等。清点下来仓库里
+# 四处这样的调用（派发 / 取制品 / 轮询 / 取证）全都只喂了 stdin、没关交互。
+PROMPT_CAPABLE = (
+    ("git credential fill", "credential fill"),   # 没凭证时它开 /dev/tty，喂 stdin 没用
+)
+NO_PROMPT_ENV = "GIT_TERMINAL_PROMPT=0"
+FILE_WIDE_NO_PROMPT = "export GIT_TERMINAL_PROMPT=0"
+
+
+def _drop_comment_lines(text: str) -> str:
+    """把整行注释换成空行（行号不变）。注释里那句「走 git credential fill」不是调用，
+    不滤掉会得到一条与真缺陷一模一样的假红——而假红的代价从来都是「人开始跳过这一步」。
+    """
+    return "\n".join("" if ln.lstrip().startswith("#") else ln
+                     for ln in text.splitlines())
+
+
+def check_no_prompt_hang(texts=None) -> list:
+    """交付链 shell 里每一处会开口的命令都得带上「不许问人」的开关（第 20 条 20d）。"""
+    problems = []
+    if texts is None:
+        texts, problems = shell_gate_inputs(("credential fill",))
+    if not texts:
+        # 与 20a~20c 同一个 fail-closed：登记表里一份含凭证调用的 shell 都没读到，可能是
+        # 真的不再取凭证，也可能是扫描口径和交付链脱节——两种都得由人写一句话确认，不能让
+        # 这一条安静地报绿。
+        problems.append("第 20 条 20d 一份含 credential fill 的 shell 都没读到：报「交互都关掉了」"
+                        "没有担保（要么改这张表里的关键词，要么在判据里说明交付链已不取凭证）")
+        return problems
+    for label, text in sorted(texts.items()):
+        body = _drop_comment_lines(text)
+        if FILE_WIDE_NO_PROMPT in body:
+            continue                     # 文件级开关：一次写清，逐行就不必再带
+        # 那句 export 必须是被执行的字节：留在原文里，一句「# 记得 export GIT_TERMINAL_PROMPT=0」
+        # 就能给整份文件免检——和 20c 那个「注释里也核哈希」是同一个方向的洞（假绿比假红更贵）。
+        for logical, lineno in _logical_lines(body):
+            for human, needle in PROMPT_CAPABLE:
+                if needle in logical and NO_PROMPT_ENV not in logical:
+                    problems.append(f"{label} 第 {lineno} 行的 `{human}` 没带 {NO_PROMPT_ENV}："
+                                    "helper 里没凭证时它会去开 /dev/tty 问密码（stdin 里喂的"
+                                    "printf 挡不住它），整趟就此挂住，日志一句原因都不会留")
+    return problems
+
+
+# ── 20e：交付链目录里的每一份 shell 都必须在登记表里 ──────────────────────────
+# 由来（同一天，紧接着 20d）：取证脚本 debug/fetch_run_log.sh 一直不在 SHELL_SOURCES 里，
+# 于是文案卫生、bash -n、curl 有界、外部工具输出出处这四道门在它身上**全是空的**——它是
+# 本轮唯一一份「会被人天天跑、却从没被任何一道门看过」的交付链脚本。登记缺口不需要出事才
+# 修，需要的是让「新写一份没登记」当场红。
+SHELL_SCAN_DIRS = ("debug", ".github/scripts")
+SHELL_EXEMPT: tuple = ()          # 不判的 shell：写清理由才有资格进这张表（今天是空的）
+
+
+def check_shell_registration() -> list:
+    """扫交付链目录，凡是不在 SHELL_SOURCES / SHELL_EXEMPT 里的 .sh 都点名（第 20 条 20e）。"""
+    problems = []
+    registered = set(SHELL_SOURCES) | set(SHELL_EXEMPT)
+    seen = 0
+    for rel_dir in SHELL_SCAN_DIRS:
+        root = ROOT / rel_dir
+        if not root.is_dir():
+            problems.append(f"{rel_dir} 不在位：20e 的扫描目录读不到，这条登记缺口判据正在空转")
+            continue
+        for path in sorted(root.glob("*.sh")):
+            seen += 1
+            rel = path.relative_to(ROOT).as_posix()
+            if rel in registered:
+                continue
+            problems.append(f"{rel}：交付链目录里的 shell 没登记进 SHELL_SOURCES（也不在豁免表里）"
+                            f"——文案卫生、bash -n、curl 有界、外部输出出处这几道门在这一份上全是空的"
+                            f"（新写一份派发/取证脚本忘了登记，第一次上机才会看出来）")
+    if not seen:
+        problems.append("第 20 条 20e 在扫描目录里一份 .sh 都没看到：交付链 shell 要么真的没了，"
+                        "要么口径已经和交付链脱节（扫 0 个文件的「登记齐全」是自欺）")
+    return problems
+
+
+# ── 20f：独立起来的 python 不许继承调用方的 stdin ────────────────────────────
+# 由来（2026-11-13 本机实发，就在分块续传把 261 MB 完整取回来之后）：脚本被后台启动、启动它
+# 的那个终端随后被回收，于是 fd 0 是个**已关闭**的描述符；python 在解释器初始化阶段就崩了：
+#   Fatal Python error: init_sys_streams: can't initialize sys standard streams
+#   OSError: [Errno 9] Bad file descriptor
+# 崩在 `-c`/脚本体第一行之前，所以门自己的 print 一句都不会出现——日志里只剩上一行的标题。
+# 这一条和 20a/20d 同族（都是「不会自己停 / 不会自己说话」），但形状不同：那种是等待，这种是
+# **连启动都没完成**。写进文件的下载都完整了却过不了 zip 门，人只能看到「门不合格」四个字。
+# 判的是结构而不是这一刻：`| python3 -c`（stdin 来自管道）与 `python3 - <<'PY'`（显式喂）都
+# 自带 fd 0；只有「既不在管道右侧、也没有任何重定向」的那一类需要显式 `</dev/null`。
+# 为什么范围只限手写脚本、不含 workflow 的 bash 步：Actions 给每一步的 stdin 本身就是关好的，
+# 那边一处 11 个调用点全都要改却没有对应的风险——把「本机被终端回收」这件事写成云端的要求，
+# 得到的只是噪音（判据越界和判据缺失一样会逼人绕过它）。
+PY_INVOKE_RE = re.compile(r"(?:^|[\s=(\"'])("
+                          r"(?:[.\w+/~-]*python3?|/[\w.+-]*/python3?)"
+                          r"|\$\{?[A-Za-z_]\w*\}?"
+                          r")(?=[\s\"';|&)]|$)")
+PY_STDIN_MARKS = ("<<", "< /dev/null", "</dev/null", "< /dev/null/")
+# 断开一条命令的单字符分隔符：走到这里就是「本段的起点」。
+PY_SEG_BREAK = "|&;()"
+# 前面这几个词说明那个 python 是**被查询的名字**而不是被执行的命令（`command -v python3`
+# 找解释器、`which python3` 同理）：它们不启动解释器，也就没有 fd 0 的事。
+PY_LOOKUP_WORDS = ("-v", "-V", "--version", "whereis")
+# 这几个动词本身是「查询」而不是「执行」：后面跟着 -v 之类时，那个 python 只是被查的名字。
+# `command` 是唯一的例外，它不带 -v 时真的会执行后面的命令（`command python3 x.py`），
+# 所以要和 PY_LOOKUP_WORDS 配对才降级成查询。
+PY_LOOKUP_COMMANDS = {"command"}
+# 这几个动词**永远**只是在问「叫什么、在哪儿」，参数不带 -v 也一样：本轮夹具实测时
+# `which python3` 被当成调用点，就是一条例如有害的假红（这条门的读者会照着行号去改脚本）。
+PY_QUERY_ONLY = {"which", "where", "whereis", "type"}
+# 这几个动词自己不是解释器，但它们**会执行**后面的参数：看门狗、提权、缓冲包装都算。
+# `timeout -s ABRT -k 10 python3 -u x.py`（批跑那条就是这个形状）里 python 确实被执行，
+# 只是隔了一层；把它当「前面有别的东西所以不算」得到的不是假红就是假绿——两种都见过，
+# 所以按动词分类而不是按位置数。
+PY_WRAPPERS = {"timeout", "gtimeout", "nohup", "sudo", "env", "time", "stdbuf",
+               "nice", "ionice", "caffeinate", "xargs", "exec"}
+# 这些词出现在命令位之前不占用命令位：`if ! python3 …` 里 python 仍然是那条命令。
+PY_PREFIX_WORDS = {"if", "!", "then", "else", "elif", "while", "until", "for", "do", "in"}
+# 一个「词位上的变量展开」：`$PY`、`${PY}`、"$PY"、"$TMO"。
+PY_WORD_VAR_RE = re.compile(r'^"?\$\{?[A-Za-z_]\w*\}?"?$')
+
+
+def _quote_masks(text: str):
+    """返回 (inert, quoted) 两张位图：
+      inert[i]  —— 第 i 位落在**单引号**内容里：那整段是纯文本。`python3 -c '…; python3 y'`
+                   里那半个 python 不是调用，把它当调用点会得到一条和真缺陷一模一样的假红。
+      quoted[i] —— 落在单/双任一种引号内容里：双引号不改变命令位（`"$PY" build.py` 是真调用），
+                   但里面的 `;` `|` 只是字符，不能拿来切段。
+    """
+    inert, quoted = [False] * len(text), [False] * len(text)
+    quote, i = "", 0
+    while i < len(text):
+        ch = text[i]
+        if quote == "'":                       # 单引号里什么都没有转义
+            inert[i] = quoted[i] = True
+            if ch == "'":
+                quote = ""                     # 闭引号这一位已经标过，内容到它为止
+            i += 1
+            continue
+        if quote == '"':
+            quoted[i] = True
+            if ch == "\\" and i + 1 < len(text):
+                quoted[i + 1] = True           # `\"` 不闭引号
+                i += 2
+                continue
+            if ch == '"':
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch                         # 开引号：这一位算外面，里面从下一位开始
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            i += 2                             # 外面的转义：下一个字符不能当引号起点
+            continue
+        i += 1
+    return inert, quoted
+
+
+def _py_interp_vars(text: str) -> set:
+    """被赋成「含 python 的解释器」的变量名：`PY=.venv/bin/python` 与
+    `PY=$(command -v python3 || true)` 都算。不认这一路，这条门就只看得见字面 python3，
+    而交付链里真正跑构建与批跑的那几处走的正是 `"$PY"`/`$PY`（20b 认 mktemp 变量是同一道理：
+    判据要跟着脚本自己实际的写法走，不是跟着我以为的写法走）。
+    """
+    return {m.group(1) for m in re.finditer(
+        r"^\s*([A-Za-z_]\w*)=[^\n]*python[^\n]*$", text, re.M)}
+
+
+def _python_command_at(line: str, at: int, inert: list, quoted: list):
+    """返回 (这个 token 是不是「被执行的那条命令」, 它是否由单管道喂 stdin)。"""
+    if inert[at]:
+        return False, False
+    # 往回找本段起点：引号内的分隔符不算分隔符
+    seg_start, fed = 0, False
+    for i in range(at - 1, -1, -1):
+        if quoted[i]:
+            continue
+        if line[i] in PY_SEG_BREAK:
+            if (line[i] == "|"
+                    and (i == 0 or line[i - 1] != "|")
+                    and (i + 1 >= len(line) or line[i + 1] != "|")):
+                fed = True               # 单管道右侧：stdin 由上一条命令的 stdout 给出
+            seg_start = i + 1
+            break
+    pre = line[seg_start:at]
+    # `PY="/path/python"` 里那个路径是**赋值右值**：词表上一个词的尾巴是 `=` 就算（引号只是
+    # 包着右值，不算“前面有别的东西”）。判成调用会得到一条指向赋值行的假红，而这条门的读者
+    # 正是照着行号去改脚本的人。
+    if pre.rstrip("\"'").endswith("="):
+        return False, False              # `PY=.venv/bin/python` 是赋值右值，不是执行
+    words = [w for w in re.split(r"\s+", pre) if w]
+    # 词上的引号是**分词的一部分**而不是内容：`"$PY" build.py` 的第一个词就是变量展开，
+    # 带着引号去比对会把它当成「别的东西在前面」，于是这一路只剩假绿。
+    words = [w for w in (x.strip("\"'") for x in words) if w]
+    # 命令位由这一段的**第一个实义动词**决定，不是由「python 前面有没有别的东西」决定：
+    #   `timeout -s ABRT -k 10 python3 -u x.py`（批跑看门狗就是这个形状）里 python 确实被执行，
+    #   只是隔了一层包装器；`echo "… python3 …"` 里它只是文案。按后者那种「前面有东西就不算」
+    #   一刀切，得到的不是假红就是假绿——两种都见过，所以按动词分类而不是按位置数。
+    while words and (words[0] in PY_PREFIX_WORDS
+                     or re.match(r"^[A-Za-z_]\w*=\S*$", words[0])):
+        words.pop(0)                     # 控制词与环境前缀都在命令位之前，不占用命令位
+    if not words:
+        return True, fed                 # `python3 …` / `FOO=bar python3 …`：就在命令位上
+    head = words[0]
+    if head in PY_QUERY_ONLY:
+        return False, False              # `which python3`：动词本身就只是在问路径，不启动解释器
+    if head in PY_LOOKUP_COMMANDS:
+        if any(w in PY_LOOKUP_WORDS for w in words[1:]):
+            return False, False          # `command -v python3`：查询不是执行
+        return True, fed                 # `command python3 x.py`：还是被执行
+    if head in PY_WRAPPERS or PY_WORD_VAR_RE.match(head):
+        return True, fed                 # 包装器或「命令装在变量里」：后面那些参数不改这个事实
+    return False, False                  # 别的动词在前面：这个 token 只是某个参数
+
+
+def check_python_stdin(texts=None) -> list:
+    """手写交付脚本里每一次独立起 python 都必须自己带 fd 0（第 20 条 20f）。"""
+    problems = []
+    if texts is None:
+        # 只取手写脚本那一侧：workflow 的 bash 步由 GitHub Actions 自己关 stdin（见上面的说明）
+        all_texts, problems = shell_gate_inputs(("python",))
+        texts = {k: v for k, v in all_texts.items() if k in set(SHELL_SOURCES)}
+    if not texts:
+        problems.append("第 20 条 20f 一份含 python 的手写脚本都没读到：报「stdin 都独立了」没有"
+                        "担保（要么登记表漂了，要么这条真的不再需要——那也要写一句话确认）")
+        return problems
+    total = 0
+    for label, text in sorted(texts.items()):
+        # 解释器变量表读**原文**（含注释）：这里保守的方向和调用点相反——注释里出现过
+        # `PY=…python…` 就说明这份脚本确实用变量装解释器，多判一句真调用远比漏判一句便宜。
+        interp = _py_interp_vars(text)
+        for logical, lineno in _logical_lines(_drop_comment_lines(text)):
+            inert, quoted = _quote_masks(logical)
+            for m in PY_INVOKE_RE.finditer(logical):
+                tok = m.group(1)
+                if tok.startswith("$"):
+                    if tok.lstrip("$").strip("{}") not in interp:
+                        continue         # 通用 `$VAR`：不是解释器变量就不硬猜它是什么
+                command, fed = _python_command_at(logical, m.start(1), inert, quoted)
+                if not command:
+                    continue
+                total += 1
+                if fed:
+                    continue             # 管道右侧：stdin 由上一条命令给出
+                tail = logical[m.end(1):]
+                if any(k in tail for k in PY_STDIN_MARKS):
+                    continue             # 显式喂了 stdin（heredoc 或重定向）
+                problems.append(
+                    f"{label} 第 {lineno} 行的 `{tok}` 既不在管道右侧、也没带任何 stdin 重定向："
+                    "启动它的终端一旦被回收，fd 0 就是一个已关闭的描述符，解释器在跑第一行之前就崩"
+                    "（init_sys_streams / Bad file descriptor），日志里连门自己的 print 都不会出现；"
+                    "加 `< /dev/null` 让它自己带 fd 0")
+    if texts and total == 0:
+        problems.append(f"第 20 条 20f 在 {len(texts)} 份手写脚本里一处 python 调用都没找到：口径已经"
+                        "和交付链脱节（这一条判的是「每一次独立起 python」，一次都没有等于没判）")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -2608,6 +3154,57 @@ def main(argv=None) -> int:
             print(f"::error::指路节号对拍：{p}")
     else:
         print("✅ 指路节号对拍：注释里每一句「某套件 第 N 节」都能在那套件里走到真实小节")
+
+    # 交付链上每一次 curl 都必须自己会停、写进文件的字节必须跨次能用（第 20 条）：
+    # 本机取制品连着两趟 rc=124——外层超时把脚本杀了，日志一句原因都没有。判的是结构，
+    # 不是这一分钟的网络（判据与由来见 check_curl_bounds 上方注释块）。
+    curl_bounds = check_curl_bounds()
+    if curl_bounds:
+        bad += 1
+        print("❌ 交付链 shell 里的 curl 没有自己会停 / 写进本次即弃的落点（慢可以接受，"
+              "「永远完不成」不行）：")
+        for p in curl_bounds:
+            print(f"   · {p}")
+            print(f"::error::curl 有界与可续传：{p}")
+    else:
+        print("✅ curl 有界与可续传：交付链每一次 curl 都自己会停，写进文件的字节都不落在 "
+              "mktemp 那种本次即弃的落点上")
+
+    # 同一族的另外两格（判据与由来见各自函数上方注释块）：会开口问人的外部命令要显式关掉
+    # 交互；交付链目录里新写一份 shell 忘了登记进 SHELL_SOURCES，等于那道门从来不存在。
+    prompt_hangs = check_no_prompt_hang()
+    if prompt_hangs:
+        bad += 1
+        print("❌ 交付链 shell 里有会「开口问人」的外部命令没关掉交互（它不读 stdin、也不看"
+              "超时，挂住之后日志一个字都不留）：")
+        for p in prompt_hangs:
+            print(f"   · {p}")
+            print(f"::error::外部命令交互收口：{p}")
+    else:
+        print("✅ 外部命令交互收口：每一处 credential fill 都带 GIT_TERMINAL_PROMPT=0")
+
+    shell_reg = check_shell_registration()
+    if shell_reg:
+        bad += 1
+        print("❌ 交付链目录里有 shell 没登记进判据清单（那几道门在它身上是空的）：")
+        for p in shell_reg:
+            print(f"   · {p}")
+            print(f"::error::交付链 shell 登记：{p}")
+    else:
+        print(f"✅ 交付链 shell 登记：{len(SHELL_SOURCES)} 份脚本全部在案"
+              f"（扫描目录 {' / '.join(SHELL_SCAN_DIRS)}）")
+
+    # 独立起来的 python 不许继承调用方的 stdin（第 20 条 20f）：本机实发过一次——后台终端被回收
+    # 之后 fd 0 是个关闭的描述符，解释器在跑第一行之前就崩，门自己的 print 一句都不出现。
+    stdin_gaps = check_python_stdin()
+    if stdin_gaps:
+        bad += 1
+        print("❌ 交付链 shell 里有独立起的 python 没带自己的 fd 0（启动它的终端被回收就在初始化阶段崩）：")
+        for p in stdin_gaps:
+            print(f"   · {p}")
+            print(f"::error::解释器 stdin 独立：{p}")
+    else:
+        print("✅ 解释器 stdin 独立：手写脚本里每一次独立起 python 都在管道右侧或自带 < /dev/null")
 
     for label, path in CALLERS.items():
         if not path.exists():

@@ -276,9 +276,13 @@ for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
   if [ -n "$TMO" ]; then
-    "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1
+    # < /dev/null：解释器必须自己带 fd 0。批跑常在后台起、起它的终端随后被回收，那时
+    # fd 0 是个已关闭的描述符，python 在初始化阶段就崩（init_sys_streams / Bad file
+    # descriptor），日志里只剩上一行标题——硬门第 20 条 20f，夹具见
+    # b2bcollect_build/test_frozen_delivery_offline.py 的 AD 节。
+    "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null
   else
-    $PY -u -X faulthandler "$f" >"$log" 2>&1
+    $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null
   fi
   code=$?
   out=$(cat "$log" 2>/dev/null)

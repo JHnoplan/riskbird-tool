@@ -93,10 +93,13 @@ _run_bounded() {
 #     本脚本、两个 workflow 三处入口逐个对拍。这一道门是 2026-11-12 换来的教训：
 #     风鸟/爱企查的 .py 没进包，构建照样成功、自检照样绿，用户那边只是「② 公司名单
 #     少了两个平台」——少一个文件不报错、只少功能，必须在开建前拦住。
-"$PY" .github/scripts/check_packaging_manifest.py || exit 1
+# < /dev/null 由硬门第 20 条 20f 要求：本机后台跑这份脚本时，启动它的终端一被回收，
+# fd 0 就成了已关闭的描述符，python 在跑第一行之前就崩 init_sys_streams/Bad file
+# descriptor——「门没跑起来」会被读成「门判它不合格」（取制品那趟实发的就是这个形状）。
+"$PY" .github/scripts/check_packaging_manifest.py < /dev/null || exit 1
 
 # ── 1) 随包凭证：与 CI 的 inject_build_config.py 同一个脚本、同一份键名契约 ──
-"$PY" .github/scripts/inject_build_config.py --from-local
+"$PY" .github/scripts/inject_build_config.py --from-local < /dev/null
 
 # ── 2) chromedriver：打进包根（chrome_driver.candidates 的 frozen 首选位）──
 #     找不到只警告不拦停：驱动缺失运行时会用 Selenium Manager 现下，症状是「首次
@@ -164,7 +167,7 @@ fi
   --add-data "../riskbird_build/aiqicha_crawler_v2.py:riskbird_build" \
   --add-data "../riskbird_build/runtime_paths.py:riskbird_build" \
   "${DRIVER_ARG[@]+"${DRIVER_ARG[@]}"}" \
-  b2bcollect_gui.py
+  b2bcollect_gui.py < /dev/null
 
 # ── 4) 产物自检门禁：跑的是 .app 里的可执行文件，不是源码 ──
 #     只有它才同时具备「打包态 frozen 判定」与「随包 config.json」这两个真实条件。

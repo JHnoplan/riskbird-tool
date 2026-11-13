@@ -27,7 +27,10 @@ API="https://api.github.com/repos/$REPO"
 WINS=("build-b2bcollect.yml|Windows EXE" "build-b2bcollect-mac.yml|Mac App")
 ROUNDS="${ROUNDS:-40}"
 
-TOK=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill \
+# GIT_TERMINAL_PROMPT=0：没凭证时 `git credential fill` 会去开 /dev/tty 问密码，既不读
+# stdin 也不看超时——整趟轮询就这么挂住。口径见 debug/fetch_b2bcollect_artifacts.sh 开头
+# 那段与 b2bcollect_build/test_frozen_delivery_offline.py 的 AD 节。
+TOK=$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 git credential fill \
       | sed -n 's/^password=//p')
 [ -n "$TOK" ] || { echo "ABORT：git credential helper 里没有 github.com 凭证（旧脚本在这里退 0，等于没验）"; exit 1; }
 
