@@ -766,4 +766,25 @@ _bad_tip = [(type(x).__name__, (getattr(x, "text", lambda: "")() or "")[:12], x.
 check("⑪ 全窗口每一个控件的悬停文案都干净（运行时判据，覆盖拼接出来的那部分）",
       not _bad_tip, str(_bad_tip[:3]))
 
+# ── ⑫ 同一把尺子量到采集器：日志区也是纯文本渲染 ────────────────────────────
+# 上面那张表只管 GUI 的六个文件，可用户看到的另一半文字是采集器写进日志区的
+# （QPlainTextEdit 同样不渲染 markdown）。本轮 1688 那句「未登录」的提示就是在
+# 实机日志里被抓出来的 —— 它压根不在上面那张表的覆盖范围里，靠人记得改名字防不住。
+# 所以这里按目录扫全部 .py，只 exempt 两类合法场景：
+#   ① 给大模型看的提示词（deepseek_expander / pool_matcher：那边 ** 会被正常渲染）；
+#   ② 测试自己打印的断言名（test_*.py / *_test.py：那是开发者看的控制台，不上界面）。
+# 新增采集器不用登记，默认就被管住（与 ② 那份「新增一行自动被管住」的黑名单同一做法）。
+_REPO_ROOT = os.path.dirname(_BUILD)
+_MD_PROMPT_ONLY = ("deepseek_expander.py", "pool_matcher.py")     # 给大模型看的提示词
+_md12 = []
+for _base in ("b2bcollect_build", "riskbird_build", "ali1688_build"):
+    for _fn in sorted(os.listdir(os.path.join(_REPO_ROOT, _base))):
+        if not _fn.endswith(".py") or _fn in _MD_PROMPT_ONLY or _fn.startswith("test_") \
+                or _fn.endswith("_test.py"):
+            continue
+        _md12 += [(f"{_base}/{_fn}:{_l}", _m)
+                  for _l, _m in _md_leftovers(os.path.join(_REPO_ROOT, _base, _fn))]
+check("⑫ 三个交付目录每一句会进日志区的话都不带星号（新增采集器默认被管住）",
+      not _md12, str(_md12[:3]))
+
 print(f"\n全部通过：{ok} 项")

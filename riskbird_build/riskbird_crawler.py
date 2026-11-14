@@ -14,6 +14,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import chrome_driver          # 本目录唯一的驱动口径（收尾连子进程一起收，见 close_browser）
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -249,10 +251,9 @@ class RiskBirdCrawler:
 
     def close_browser(self):
         if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            # quit() 只删会话、不收 chromedriver（Selenium 4.51）：口径统一在
+            # chrome_driver.destroy（幂等、吞异常，会话与子进程一起收）
+            chrome_driver.destroy(self.driver, self._log)
             self.driver = None
             self._log("🔒 浏览器已关闭")
 

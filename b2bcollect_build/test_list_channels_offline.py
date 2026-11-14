@@ -7,6 +7,8 @@
 #   ② 零遗漏：凡「根本没查成」（额度/拦截/限流/链路/空壳/异常）一律回队首、不记 tried；
 #   ③ 分级熔断：一路摔倒不能把整份名单卡死，也不能把另两路一起拖停；
 #   ④ 合并口径：三路同名公司在清洗层并成一行，手机号/邮箱英文逗号取并集。
+# 末尾另钉一件事（2026-11-15 审计）：附加半途失败时已建好的会话必须收干净 ——
+# Selenium 4.51 的 quit() 不收 chromedriver 子进程，丢掉引用等于每重试一次漏一个进程。
 # 全程不联网、不启 Chrome：通道采集器全部注入假实现，Qt 走 offscreen，时间走虚拟时钟。
 import os
 import sys
@@ -790,6 +792,57 @@ check("风鸟的破坏性自愈挂在 revive、heal 只做「认领回自己的�
 _src_revive = _ins.getsource(ad.AiqichaSite._revive_after_block)
 check("爱企查 revive 自带两道护栏：验证页还挂着不动它、没认领回独占标签绝不动页面",
       "_detect_block" in _src_revive and "pin_tab_id" in _src_revive)
+
+# ── 附加半途失败：已经建好的会话必须收干净，不许只把引用丢掉 ───────────────
+# 2026-11-15 审计发现的同族缺陷：Selenium 4.51 的 driver.quit() 只结束会话、不收
+# chromedriver 子进程，而 QizhidaoSite.attach 的异常分支以前只写 self.driver = None。
+# QiZhiDaoCrawler.start_browser 的形状是「先 chrome_driver.create 建会话，再开独占
+# 标签 / 导航首页」——后半段一抛，那份会话就挂在 self 上被人为丢掉，而这里是看门狗
+# 会反复重试的位置，每重试一次漏一个进程（实机取证：本机挂着两个 PPID 已是 launchd
+# 的孤儿 chromedriver，一个空跑 5 小时）。判据口径见 chrome_driver 第 ⑭ 节。
+class _SvcQ:
+    def __init__(self):
+        self.stops = 0
+
+    def stop(self):
+        self.stops += 1
+
+
+class _DrvQ:
+    """照 create() 返回的真实形状写：quit 已被 _arm_quit 绑成「结束会话 + 收子进程」。
+    假 driver 少了这一层就测不到回收（这条教训来自 test_chrome_driver_offline ⑭）。"""
+
+    def __init__(self):
+        self.quits = 0
+        self.service = _SvcQ()
+
+    def quit(self):
+        self.quits += 1
+        self.service.stop()
+
+
+_qz = ad.QizhidaoSite()
+
+
+def _half_failed_start(headed=True, attach_port=None):
+    _qz.driver = _dq            # 会话建成了，挂在 self 上
+    raise RuntimeError("invalid argument: window type")
+
+
+_dq = _DrvQ()
+_qz.start_browser = _half_failed_start
+_alive_real = ad._sc.is_alive
+ad._sc.is_alive = lambda port: True        # 共享 Chrome 是活的，失败发生在附加之后
+try:
+    _rok = _qz.attach()
+finally:
+    ad._sc.is_alive = _alive_real
+check("附加半途失败：attach 照实返回 False（不把半死的会话当成已接上）", _rok is False)
+check("附加半途失败：已建好的会话按 close_tab 口径收掉（标签收回 + 会话结束 + 子进程回收）",
+      _dq.quits == 1 and _dq.service.stops == 1, f"quits={_dq.quits} stops={_dq.service.stops}")
+check("附加半途失败：driver 引用落地为 None（下一轮看门狗才会重新附加，而不是拿半死会话判活）",
+      _qz.driver is None and _qz._own_handle is None)
+
 print("\n═══ 三平台名单通道：%d 项断言 %s" % (
     PASS, "全部通过" if not FAILS else f"｜失败 {len(FAILS)} 项"))
 for f in FAILS:

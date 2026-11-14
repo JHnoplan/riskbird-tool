@@ -13,7 +13,9 @@
 10. 附加模式：共享 Chrome 一个标签都没开时先补开空白标签（实机挂死的根因）；
 11. 附加失败两类归因：不接连接原地退避重试、端口不通一句人话，两种都不联网；
 12. 驱动下载源连不上时不去阻塞等 Selenium Manager，几秒内给可照做的提示；
-13. 本机 CDP 探测用真 requests 跑一遍：代理劫持、接口参数用错都当场红。
+13. 本机 CDP 探测用真 requests 跑一遍：代理劫持、接口参数用错都当场红；
+14. 子进程回收：建会话即登记，quit()/destroy()/release() 都能收掉 chromedriver，
+    且幂等、吞异常、收完摘台账（Selenium 4.51 的 quit() 不管子进程，实机留过孤儿）。
 """
 import sys
 import tempfile
@@ -46,7 +48,9 @@ class FakeChrome:
             raise RuntimeError(self.fail_for[path])
         if self.fail_all:
             raise RuntimeError(self.fail_all)
-        return types.SimpleNamespace(used=path)
+        # quit 也要有：真实 WebDriver 一定有，缺了它第 ⑭ 节的「绑回收」就测不到；
+        # 而 chrome_driver 那边对没有 quit 的形状也只许安静跳过，不许把建会话带崩。
+        return types.SimpleNamespace(used=path, quits=0, quit=lambda: None)
 
 
 class FakeService:
@@ -430,6 +434,94 @@ try:
     print("⑬ 本机 CDP 探测用真 requests：代理劫持与接口用错都当场红 ✓")
 
     cd.requests, cd.time, cd.sm_source_reachable = _req_before, _time_before, _SMR_REAL
+
+    # ── ⑭ 子进程回收：quit() 只删会话，chromedriver 得我们自己收 ──
+    # 判据出处：Selenium 4.51 的 remote/webdriver.py 里 service.stop() 只出现在
+    # 「建会话失败」那条 except 分支，quit() 与空函数 stop_client() 都不管子进程；
+    # 剩下的唯一指望是 Service.__del__（要等 GC），进程被杀时更是永远不跑。
+    # 2026-11-15 实机取证：本机挂着两个父进程已是 launchd 的孤儿 chromedriver，一个空跑 5 小时。
+    reset()
+    # 这一节也要建会话：上面刚把 sm_source_reachable 还回真函数，这里再按一次stub，
+    # 免得哪天本地候选链变了形，这条用例会安静地跑去联网（离线套件不许碰外网）
+    cd.sm_source_reachable = lambda timeout=4.0: True
+
+    class _Svc:
+        def __init__(self, name="svc"):
+            self.name = name
+            self.stops = 0
+            self.boom = False
+
+        def stop(self):
+            self.stops += 1
+            if self.boom:
+                raise OSError("chromedriver 不肯退")
+
+    class _Drv:
+        def __init__(self, service=None, quit_err=""):
+            self.service = service
+            self.quit_err = quit_err
+            self.quits = 0
+
+        def quit(self):
+            self.quits += 1
+            if self.quit_err:
+                raise RuntimeError(self.quit_err)
+
+    # 建会话成功就必须登记 + 绑回收：老写法（调用方只写 driver.quit()）自动带上收进程
+    cd._started_services[:] = []
+    _stopped_before = len(FakeService.stopped)
+    _drv14 = cd.create(object(), log=lambda m: None, ports=[])
+    assert len(cd._started_services) == 1, \
+        f"建会话成功就要登记，否则退出兜底收不到它：{cd._started_services}"
+    _drv14.quit()
+    assert len(FakeService.stopped) == _stopped_before + 1, \
+        "调用方沿用老的 driver.quit() 也得把子进程收掉"
+    assert cd._started_services == [], "收完要从台账摘掉，不然退出时又收一遍"
+
+    _ns14 = types.SimpleNamespace()                    # 没有 quit 的形状（替身/半残对象）
+    _svc14b = _Svc("arm")
+    cd._arm_quit(_ns14, _svc14b)                       # 只许安静跳过，不许把建会话带崩
+    assert not hasattr(_ns14, "quit"), "绑不上就不绑，别造一个半成品 quit 出来"
+
+    _s = _Svc()
+    cd.stop_service(_s)
+    cd.stop_service(_s)
+    assert _s.stops == 1, f"stop 必须幂等（宁可少收一次，也不许把整条收尾链卡住）：{_s.stops} 次"
+    _sb = _Svc("boom")
+    _sb.boom = True
+    cd.stop_service(_sb)            # 停不掉也只许吞掉，不许把异常抛回收工路径
+    cd.stop_service(_sb)
+    assert _sb.stops == 1, "连抛异常的 service 也只尝试一次"
+
+    _d = _Drv(_Svc())
+    cd.destroy(_d)
+    assert _d.quits == 1 and _d.service.stops == 1, "destroy = 结束会话 + 收子进程"
+
+    _dq = _Drv(_Svc(), quit_err="invalid session id")     # 会话早没了：quit 必抛
+    _lg = []
+    cd.destroy(_dq, _lg.append)
+    assert _dq.service.stops == 1, "quit 抛异常也要收到子进程（自愈重启走的正是这条）"
+    assert any("结束浏览器会话时报错" in m for m in _lg), f"被吞的异常要在日志里留痕：{_lg}"
+
+    _dr = _Drv(_Svc())
+    cd.release(_dr)                 # 共享浏览器：不许替别人 quit，但自己这份进程要收
+    assert _dr.quits == 0 and _dr.service.stops == 1, "release 只收进程、不发 quit"
+    cd.release(None)
+    cd.destroy(None)                # 没建过会话的收尾不能炸
+
+    cd._started_services[:] = []
+    _a, _b = _Svc("a"), _Svc("b")
+    cd._track_service(_a)
+    cd._track_service(None)
+    assert cd._started_services == [_a], "None 不进台账"
+    cd._track_service(_b)
+    assert cd.reap_started_services() == 2, "退出兜底要把台账里没收到的一次收完"
+    assert cd._started_services == [] and cd.reap_started_services() == 0, "台账收完即空"
+    cd._track_service(_a)
+    cd.stop_service(_a)             # 已经收过的：不再收第二遍，但要摘出台账
+    assert cd._started_services == [], "收过/放弃过的服务不许滞留在台账里"
+    cd._started_services[:] = []
+    print("⑭ 子进程回收：登记、幂等、吞异常、release 不发 quit 都钉住 ✓")
 finally:
     for k in [k for k in sys.modules if k.startswith("selenium")]:
         sys.modules.pop(k, None)

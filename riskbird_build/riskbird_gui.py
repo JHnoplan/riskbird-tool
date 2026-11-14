@@ -26,6 +26,7 @@ from riskbird_crawler_v2 import RiskBirdCrawlerV2, is_chrome_installed, download
 from qizhidao_crawler import QiZhiDaoCrawler
 from aiqicha_crawler_v2 import AiQiChaCrawlerV2
 import block_guard   # 续采比对公司名要用同一套归一化规则，不能各写一份
+import chrome_driver  # 会话收尾口径：结束会话的同时把自己拉起的 chromedriver 收掉
 
 try:
     import dual_session as _dual
@@ -3675,10 +3676,10 @@ class _OpenBrowserWorker(QThread):
                 self.log_signal.emit("浏览器会话已断开，正在重启...")
                 try:
                     if self.crawler.driver:
-                        try:
-                            self.crawler.driver.quit()
-                        except Exception:
-                            pass
+                        # 会话已断，裸 quit() 必抛：老写法抛完就把那份 chromedriver 留在
+                        # 原地（每自愈一次漏一个）。destroy 吞异常并保证子进程被收。
+                        chrome_driver.destroy(self.crawler.driver,
+                                              lambda m: self.log_signal.emit(m))
                         self.crawler.driver = None
                 except Exception:
                     self.crawler.driver = None

@@ -409,8 +409,11 @@ class QiZhiDaoCrawler:
             if self.shared_session:
                 # 共享模式下绝不能 quit（可能连带关掉另一个会话正在用的浏览器），只关自己的标签
                 self._close_own_tab()
-            elif self.driver:
-                self.driver.quit()
+                # 但这份 chromedriver 子进程必须收：马上要 start_browser 新建一个会话，
+                # 老的一直不收就是「每重启一次漏一个进程」（收法见 chrome_driver.release）
+                chrome_driver.release(self.driver)
+            else:
+                chrome_driver.destroy(self.driver, self._log)
         except Exception:
             pass
         self.driver = None
@@ -567,7 +570,8 @@ class QiZhiDaoCrawler:
                 if self.shared_session:
                     # 共享浏览器：只关自己的标签，浏览器留给另一个会话继续用
                     self._close_own_tab()
-                self.driver.quit()
+                # destroy = 原来的 quit() + 收掉自己拉起的 chromedriver 子进程
+                chrome_driver.destroy(self.driver, self._log)
         except Exception:
             pass
         self.driver = None
@@ -659,10 +663,9 @@ class QiZhiDaoCrawler:
                 err_str = str(e)
                 if "invalid session" in err_str or "session deleted" in err_str or "disconnected" in err_str:
                     self._log(f"  会话异常，重启浏览器 (attempt {attempt+1}/2)...")
-                    try:
-                        self.driver.quit()
-                    except Exception:
-                        pass
+                    # 会话已经没了，裸 quit() 必抛、抛完就把 chromedriver 丢在原地
+                    # （这一带是自愈循环，跑一轮漏一个）；destroy() 吞异常并照收子进程。
+                    chrome_driver.destroy(self.driver, self._log)
                     self.driver = None
                     time.sleep(2)
                     if attempt == 1:

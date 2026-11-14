@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 
 import block_guard
 import runtime_paths          # 本目录唯一的数据落点口径（见 BaseCrawler.__init__）
+import chrome_driver as _chrome_driver   # 本目录唯一的驱动口径（收尾回收子进程见 close_browser）
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -141,7 +142,10 @@ class BaseCrawler(ABC):
     def close_browser(self):
         """关闭浏览器"""
         if self.driver:
-            self.driver.quit()
+            # 老写法是裸 self.driver.quit()：Selenium 4.51 的 quit() 不收 chromedriver
+            # 子进程，而且它一抛异常下面两行就都不执行（driver 还挂着、进程还在跑）。
+            # destroy() 幂等、吞异常，会话和子进程一起收。
+            _chrome_driver.destroy(self.driver, self._log)
             self.driver = None
             self._log(f"[{self.PLATFORM_NAME}] 浏览器已关闭")
     

@@ -699,7 +699,12 @@ if HAS_QZD:
                 self.start_browser(headed=True, attach_port=self.attach_port)
             except Exception as e:
                 self._log(f"❌ 企知道附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
-                self.driver = None
+                # 建会话成功、后面的步骤（新开独占标签 / 导航首页）才失败时，driver
+                # 已经挂在 self 上了：只把引用抹掉等于把那份 chromedriver 丢给 GC，
+                # 而这一带是看门狗会反复重试的地方（每重试一次漏一个进程）。close_tab
+                # 是本通道既有口径：只收回自己的标签、结束本会话并连子进程一起收，
+                # 全程吞异常，绝不在这条失败分支上再抛一次。
+                self.close_tab()
                 return False
             return self.driver is not None
 
@@ -1101,6 +1106,11 @@ if HAS_RB:
                     self._own_handle = self.driver.current_window_handle
                 except Exception as e:
                     self._log(f"❌ 风鸟开独占标签失败：{str(e).splitlines()[0][:120]}")
+                    # 刚建好的会话不能一丢了事：driver 引用断了之后只剩 GC 替我们收
+                    # chromedriver（见 chrome_driver 顶部那段），这条分支又常在浏览器
+                    # 正忙时连续走几次。这里不发 quit（共享浏览器不能由我们替它关），
+                    # 只把自己这份子进程收掉。
+                    _rb_mod.chrome_driver.release(self.driver)
                     self.driver = None
                     return False
                 try:

@@ -95,6 +95,32 @@ SAFE_TITLE_HINTS = ("批发", "阿里巴巴", "联系方式页", "供应商", "�
 
 # 未登录特征：联系方式页要登录才完整展示，未登录会跳登录或空值
 LOGIN_URL_MARKERS = ("login.1688.com", "login.alibaba.com", "/member2/login")
+# 登录标记 cookie：这几个是登录后才会写进 .1688.com 的会话身份，缺一个都不算登录。
+# 2026-11-15 实机对照：同一台共享 Chrome 里爱企查/企知道/风鸟三路都能查到各自的登录
+# cookie，1688 这边只有 cna/isg/_m_h5_tk 这类游客埋点 —— 也就是**没登录**，而它的
+# 联系方式页正是在这种状态下最容易吃风控（当天 1688 通道第一次取详情就撞「验证码拦截」）。
+LOGIN_COOKIE_MARKERS = ("cookie2", "lgc", "_l_g_", "tracknick", "sgcookie")
+
+
+def judge_login_cookie(cookies):
+    """从一份 cookie 判 1688 登录态：True 已登录 / False 确认没登录 / None 判不出。
+
+    「判不出」必须是独立的一档，不许塌成 False：cookie 取空、形状不对、当前页根本
+    不在这个域里，都只是**没看到证据**，不是**看到没登录的证据**。这里返回 None 时
+    上层就一个字都不多说 —— 误导用户去登录比不提示更糟（本轮改造同一个红线：
+    提示文案必须与实际行为一致）。
+    """
+    if not isinstance(cookies, (list, tuple)):
+        return None
+    names = set()
+    for c in cookies:
+        if isinstance(c, dict):
+            n = str(c.get("name") or "").strip()
+            if n:
+                names.add(n)
+    if not names:
+        return None
+    return any(m in names for m in LOGIN_COOKIE_MARKERS)
 
 SEARCH_URL = ("https://www.1688.com/zw/page.html?hpageId=old-sem-pc-list"
               "&keywords={kw}&beginPage={page}&n=y")
@@ -127,6 +153,33 @@ DETAIL_LEAF_ID_RE = re.compile(r'"leafCategoryId"\s*:\s*(\d{3,12})')
 DETAIL_LEAF_NAME_RE = re.compile(r'"leafCategoryName"\s*:\s*"([^"]{1,20})"')
 DETAIL_SHOP_CAT_RE = re.compile(r'shop-category-name">([^<]{2,40})<')   # 主营：xx / xx类目
 DETAIL_TITLE_RE = re.compile(r'<title>([^<]{4,80}?)\s*[-–—]?\s*(?:阿里巴巴|1688)?\s*</title>')
+
+
+def reap_driver_service(driver) -> bool:
+    """收掉 driver 自己拉起的那份 chromedriver 子进程，返回是否真收了一次。
+
+    为什么独立包要有这一手：Selenium 4.51 的 ``driver.quit()`` 只结束会话，子进程
+    回收（``service.stop()``）只剩「建会话失败」那条异常路径和 ``Service.__del__``
+    两个指望，而后者要等引用断了、GC 真跑一次才算 —— 实机取证本机就挂着两个
+    PPID 已是 launchd 的孤儿 chromedriver（见 chrome_driver 顶部那段）。
+    b2bcollect 包里有 riskbird_build/chrome_driver 的统一口径（create() 建会话时
+    就把 quit() 绑成「结束会话 + 收子进程」），但 Ali1688Tool 是单目录打包、
+    运行期才 append sys.path，那份模块在包里根本解析不到；本文件 _attach 的退回
+    分支又是自己 ``webdriver.Chrome(...)`` 建的会话，没地方绑回收，只能在这里显式补上。
+    幂等、吞异常：收工路径绝不能被回收失败带崩。
+    """
+    service = getattr(driver, "service", None)
+    if service is None or getattr(service, "_cd_reaped", False):
+        return False
+    try:
+        service._cd_reaped = True            # 先立牌：无论下面走到哪一步都不收第二遍
+    except Exception:
+        pass                                 # 立不上牌也不能挡回收（顶多被多收一次）
+    try:
+        service.stop()
+        return True
+    except Exception:
+        return False
 
 
 class Ali1688Crawler:
@@ -718,10 +771,19 @@ class Ali1688Crawler:
 
     def close_browser(self):
         if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            # 会话 + 子进程一起收：Selenium 4.51 的 quit() 不收 chromedriver，
+            # 而这里原先 try/except 一吞，进程就一直留着（口径见 chrome_driver.destroy）
+            if _chrome_driver is not None:
+                _chrome_driver.destroy(self.driver, self._log)
+            else:
+                # 独立的 Ali1688Tool 包里没打进 chrome_driver（打包期解析不到运行期
+                # 才 append 的 sys.path），这一路只能就地补收：quit() 保证会话结束，
+                # reap_driver_service() 保证那份 chromedriver 子进程也跟着没。
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                reap_driver_service(self.driver)
             self.driver = None
 
     def _is_session_alive(self):
@@ -951,6 +1013,42 @@ class Ali1688Crawler:
             pass
         return ""
 
+    def _login_state_by_cookie(self):
+        """这个 Chrome 会话里的 1688 到底登录了没（判据见 judge_login_cookie）。
+        问不到就返回 None（宁可不说，也不指错方向）。"""
+        try:
+            return judge_login_cookie(self.driver.get_cookies())
+        except Exception:
+            return None
+
+    def _unblock_login_hint(self) -> str:
+        """撞验证页时的归因补充：只有**确凿没登录**才多说这一句，其余一律闭嘴。
+        单独拆成一个小函数，是为了让离线用例能把「已登录/未登录/判不出」三档都钉住
+        —— 真机上一次只凑得齐一种状态。"""
+        if self._login_state_by_cookie() is False:
+            return ("   💡 这个 Chrome 里的 1688 目前「未登录」：联系方式页对未登录会话"
+                    "反复出验证、号码也是空的。建议先在这个 Chrome 里登录一次 1688，"
+                    "再顺手把验证过掉（登录后不用重启工具，本轮自动继续）。")
+        return ""
+
+    def _preflight_login_notice(self) -> bool:
+        """开局就把「这个 Chrome 里 1688 没登录」说在前面，返回是否确凿未登录。
+
+        为什么不等第一家撞验证页再说：联系方式页是本轮最先吃风控的那一步，实机上
+        0.6 秒附加成功、第一次取联系方式就被拦，用户在提示出现前已经白等了一整轮
+        （2026-11-15 取证）。为什么**只提示不拦路**：主搜/SEM/供应商三条列表渠道不
+        登录也拿得到公司名，用户一边登录一边采不冲突，真要取不到号码那里自会暂停等人
+        （见 _wait_unblock）。判不出（None）时一个字都不多说——没证据就不猜方向。
+        必须在全站首页之后调用：cookie 是按当前页面读的。"""
+        if self._login_state_by_cookie() is not False:
+            return False
+        self._log("🔑 这个 Chrome 里的 1688 目前「未登录」：公司名与商品照常采，"
+                  "但联系方式页很容易吃验证。建议现在在这个 Chrome 窗口里登录一次 1688"
+                  "（登录后不用重启工具、不用重新开始采集，本轮自动继续）。")
+        self._emit("login_required_signal",
+                   "1688 未登录：请在这个 Chrome 窗口里登录一次（不登录也能先采公司名）")
+        return True
+
     def _register_block(self):
         """记录一次拦截并返回统计窗口内的累计次数（熔断用）。"""
         now = time.time()
@@ -991,6 +1089,12 @@ class Ali1688Crawler:
             # 自动降速：每次被拦把间隔上调，最低 8s、最高 30s
             self._current_delay = min(30.0, max(8.0, self._current_delay * 1.6))
             self._log(f"   自动降速：采集间隔上调为约 {self._current_delay:.1f}s")
+            # 归因补一句：1688 的联系方式页在**未登录**会话上最容易吃风控，而这种情况
+            # 不会跳登录页（所以 _detect_block 只能报「验证页」），用户照着提示反复过码、
+            # 过完下一家又被拦 —— 2026-11-15 实机就是这个形状（话术见 _unblock_login_hint）。
+            hint = self._unblock_login_hint()
+            if hint:
+                self._log(hint)
 
         waited = 0
         while waited < max_wait:
@@ -1752,6 +1856,8 @@ class Ali1688Crawler:
                 self._crawling = False
                 self._emit("crawl_finished_signal")
                 return
+        # 「这个 Chrome 里 1688 没登录」必须在开局说清，而不是等第一家撞验证页再说
+        self._preflight_login_notice()
 
         total = len(keywords)
         chans = []

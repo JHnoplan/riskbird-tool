@@ -481,10 +481,9 @@ class RiskBirdCrawlerV2:
 
     def close_browser(self):
         if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            # 会话 + 自己拉起的 chromedriver 子进程一起收（quit() 只删会话，
+            # 且一抛异常就把 driver 挂在 self 上；口径见 chrome_driver.destroy）
+            chrome_driver.destroy(self.driver, self._log)
             self.driver = None
             self._log("浏览器已关闭")
 
@@ -1713,10 +1712,9 @@ class RiskBirdCrawlerV2:
         self._log("⚠️ 浏览器会话已断开，正在重启...")
         try:
             if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    pass
+                # 崩掉的会话 quit() 必抛，老写法抛完就把 chromedriver 留在原地；
+                # 这里是「自愈重启」，每走一次漏一个进程，必须用 destroy。
+                chrome_driver.destroy(self.driver, self._log)
                 self.driver = None
         except Exception:
             self.driver = None

@@ -7,6 +7,11 @@
 #   ② IP 限流被当“等人工”：断言 IP 类绝不拉浏览器、熔断阈值降到 3；
 #   ③ 探针自己打断冷却：断言探测间隔从 45s 起按被拦次数指数退避、听 Retry-After；
 #   ④ 记录级节流导致 3~5 倍超速：断言八方开了请求级节流且每个请求前都对齐节奏。
+# 第 9 节另钉一件事：1688 的「未登录」归因 —— 只有「确凿未登录」才说话，判不出就闭嘴，
+# 而且开局（crawl 开头）就要说在前面，不能等第一家撞验证页才归因（2026-11-15 实机：
+# 未登录会话在联系方式页反复吃验证，老提示只说「过验证」，用户照着反复过码白等）。
+# 第 10 节钉 1688 的收尾：Selenium 4.51 的 quit() 只删会话、不收 chromedriver 子进程，
+# 独立的 Ali1688Tool 包里又没有 chrome_driver 那套口径，必须就地补收（幂等、吞异常）。
 # 全程不联网、不启 Chrome：响应注入假会话，cdp_base 的 time 换成可推进的假时钟。
 import sys
 import inspect
@@ -21,9 +26,9 @@ from parallel_session import ParallelSession
 ok = 0
 
 
-def check(name, cond):
+def check(name, cond, extra=""):
     global ok
-    assert cond, f"FAIL: {name}"
+    assert cond, f"FAIL: {name}｜{extra}" if extra else f"FAIL: {name}"
     ok += 1
     print(f"  ✓ {name}")
 
@@ -588,4 +593,203 @@ ps.configure(delay_between=10.0)
 check("界面设得比下限大时不干预", ps.crawlers["b2b168"].delay_between == 10.0)
 check("未被钳制时不打扰日志", log_lines == [])
 
+# ══════════════════════════════════════════════════════════
+# 9) 1688 撞验证页时的归因：确凿未登录才说「先去登录」，判不出就闭嘴
+# ══════════════════════════════════════════════════════════
+# 2026-11-15 实机：1688 通道 0.6 秒附加成功、列表渠道正常，第一次去取联系方式页就撞
+# 「验证码拦截」（落在 shop*.1688.com/page/contactinfo.html）。这台共享 Chrome 里
+# 爱企查/企知道/风鸟都能查到登录 cookie，1688 只有游客埋点 —— 也就是没登录。
+# 老提示只会说「请手动过验证」，用户照着反复过码、下一家照样被拦，工具看着像坏掉。
+from pathlib import Path as _Path
+
+_REPO = _Path(__file__).resolve().parents[1]
+for _d in ("riskbird_build", "ali1688_build"):
+    sys.path.insert(0, str(_REPO / _d))
+import ali1688_crawler as _a1688                                  # noqa: E402
+
+_GUEST_1688 = [{"name": n} for n in ("cna", "isg", "_m_h5_tk", "_m_h5_tk_enc",
+                                     "tfstk", "JSESSIONID", "sid", "pid")]
+_LOGGED_1688 = _GUEST_1688 + [{"name": "cookie2"}, {"name": "lgc"}]
+
+check("1688 只有游客埋点 → 判「确认未登录」", _a1688.judge_login_cookie(_GUEST_1688) is False)
+check("1688 有会话身份 cookie → 判「已登录」", _a1688.judge_login_cookie(_LOGGED_1688) is True)
+check("cookie 取空/形状不对 → 判不出（独立一档，不许塌成未登录）",
+      all(_a1688.judge_login_cookie(x) is None
+          for x in ([], None, "cookie2", [{"nope": 1}], [None])))
+
+
+class _DrvStub:
+    def __init__(self, cookies=None, boom=False):
+        self._cookies, self._boom = cookies, boom
+
+    def get_cookies(self):
+        if self._boom:
+            raise RuntimeError("invalid session id")
+        return self._cookies
+
+
+class _CrawlerStub:
+    """只借真判据与真话术，不建会话（离线套件不许起浏览器）。"""
+    _login_state_by_cookie = _a1688.Ali1688Crawler._login_state_by_cookie
+    _unblock_login_hint = _a1688.Ali1688Crawler._unblock_login_hint
+
+    def __init__(self, driver):
+        self.driver = driver
+
+
+check("未登录 + 被拦 → 多说一句「先登录」（这正是过码反复白等的根因）",
+      "未登录" in _CrawlerStub(_DrvStub(_GUEST_1688))._unblock_login_hint())
+hint_ok = _CrawlerStub(_DrvStub(_LOGGED_1688))._unblock_login_hint()
+check("已登录时不误导用户去登录", hint_ok == "")
+for _tag, _drv in (("cookie 拿不到", _DrvStub(boom=True)), ("cookie 为空", _DrvStub([]))):
+    _silence = _CrawlerStub(_drv)._unblock_login_hint()
+    check(f"{_tag}时一个字都不多说（没证据就不猜方向）", _silence == "")
+_hint = _CrawlerStub(_DrvStub(_GUEST_1688))._unblock_login_hint()
+check("话术与实际行为一致：不声称已自动开页，只说清在哪登录、登录后不用重启工具",
+      "Chrome" in _hint and "登录" in _hint and "不用重启工具" in _hint and "已打开" not in _hint)
+
+
+class _Pre1688:
+    """只借真 preflight：记录界面话术与事件，离线不建会话、不发请求。"""
+    _login_state_by_cookie = _a1688.Ali1688Crawler._login_state_by_cookie
+    _preflight_login_notice = _a1688.Ali1688Crawler._preflight_login_notice
+
+    def __init__(self, driver):
+        self.driver, self.logs, self.emits = driver, [], []
+
+    def _log(self, m):
+        self.logs.append(m)
+
+    def _emit(self, name, payload=""):
+        self.emits.append((name, payload))
+
+
+_p_guest = _Pre1688(_DrvStub(_GUEST_1688))
+check("未登录 → 开局就把话说在前面（不等第一家撞验证页才归因）",
+      _p_guest._preflight_login_notice() is True
+      and len(_p_guest.logs) == 1 and "未登录" in _p_guest.logs[0])
+check("开局提示同时发 login_required_signal：界面上那条 🔐 提示与日志同一件事",
+      _p_guest.emits == [("login_required_signal", _p_guest.emits[0][1])]
+      and "登录" in _p_guest.emits[0][1])
+check("每轮只提醒一次：pre-flight 在 crawl 开头调用一次，不掺进关键词循环里",
+      inspect.getsource(_a1688.Ali1688Crawler.crawl).count("_preflight_login_notice()") == 1)
+for _tag, _drv in (("已登录", _DrvStub(_LOGGED_1688)),
+                   ("cookie 拿不到", _DrvStub(boom=True)),
+                   ("cookie 为空", _DrvStub([]))):
+    _p = _Pre1688(_drv)
+    check(f"{_tag}时开局一个字都不多说、也不发登录事件",
+          _p._preflight_login_notice() is False and not _p.logs and not _p.emits)
+check("开局话术不拦路：说清「公司名照常采」，不把未登录当成停止采集的理由",
+      "照常采" in _p_guest.logs[0] and "不用重新开始采集" in _p_guest.logs[0])
+
+print("⑨ 1688 未登录归因：开局说在前面 + 撞验证页补一句，判不出则全部闭嘴 ✓")
+
+# ── 10. 独立 Ali1688Tool 包也要收掉 chromedriver 子进程 ────────────────────
+# 同一件事的第二处口径缺口：b2bcollect 包里 1688 的会话出自 chrome_driver.create()
+# （quit 当场被绑成「结束会话 + 收子进程」），但 Ali1688Tool 是单目录打包，运行期才
+# append 的 sys.path 在包里解析不到那份模块，_attach 只能退回本文件自带的候选链，
+# 建会话用裸 webdriver.Chrome —— 没有地方绑回收。Selenium 4.51 的 quit() 只删会话，
+# 于是那包的每一次收工都留一个进程（与本轮实机取证的孤儿 chromedriver 同一根因）。
+class _Svc10:
+    def __init__(self, boom=False):
+        self.stops, self.boom = 0, boom
+
+    def stop(self):
+        if self.boom:
+            raise RuntimeError("process lookup failed")
+        self.stops += 1
+
+
+class _Drv10:
+    """独立包里的会话形状：quit 没被绑过（裸 webdriver.Chrome 建的），只管会话本身。"""
+
+    def __init__(self, svc=None, quit_err=""):
+        self.service, self.quits, self._quit_err = svc, 0, quit_err
+
+    def quit(self):
+        self.quits += 1
+        if self._quit_err:
+            raise RuntimeError(self._quit_err)
+
+
+class _Close10:
+    """只借真 close_browser：套一个假会话，离线不建任何浏览器。"""
+    close_browser = _a1688.Ali1688Crawler.close_browser
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    def _log(self, m):
+        pass
+
+
+def _run_close(driver, cd_none=True):
+    """按「包里有没有 chrome_driver」两种形态各跑一次收尾，返回 (会话数, 回收数)。"""
+    _cd_orig = _a1688._chrome_driver
+    _a1688._chrome_driver = None if cd_none else _cd_orig
+    try:
+        _Close10(driver).close_browser()
+    finally:
+        _a1688._chrome_driver = _cd_orig
+
+
+class _Cd10:
+    """有 chrome_driver 时的形态：口径在那边，本文件只许把会话交出去、不许自己再收。"""
+
+    def __init__(self):
+        self.destroys = []
+
+    def destroy(self, driver, log=None):
+        self.destroys.append(driver)
+
+
+def _run_close(driver, cd):
+    """在「包里有 / 没有 chrome_driver」两种形态下各跑一次收尾，现场按原值还回去。"""
+    box = _Close10(driver)
+    _orig = _a1688._chrome_driver
+    _a1688._chrome_driver = cd
+    try:
+        box.close_browser()
+    finally:
+        _a1688._chrome_driver = _orig
+    return box
+
+
+# ① 独立 Ali1688Tool 包（_chrome_driver is None）：quit 只管会话，子进程要显式补收
+_solo = _Drv10(_Svc10())
+_box = _run_close(_solo, None)
+check("独立包收尾：会话结束与子进程补收各发生一次（老写法只有关闭会话这一下）",
+      _solo.quits == 1 and _solo.service.stops == 1,
+      f"quits={_solo.quits} stops={_solo.service.stops}")
+check("独立包收尾：driver 引用落地为 None（留着引用下一轮就拿半死会话判活）",
+      _box.driver is None)
+# 会话早就没了的时候 quit 必抛：老写法 try/except 一吞，进程就一直留着
+_svc_err = _Svc10()
+_drv_err = _Drv10(_svc_err, quit_err="invalid session id")
+_run_close(_drv_err, None)
+check("独立包收尾：quit() 抛异常时子进程照样收到（自愈重启正是这一档）",
+      _drv_err.quits == 1 and _svc_err.stops == 1)
+
+# ② b2bcollect 包：同一句收尾必须交回 chrome_driver 的统一口径，别在本地长出第二套
+_cd10 = _Cd10()
+_shared = _Drv10(_Svc10())
+_run_close(_shared, _cd10)
+check("有 chrome_driver 时：只走 destroy 那一套，本地绝不另收一遍（两处判据迟早分叉）",
+      _cd10.destroys == [_shared] and _shared.quits == 0 and _shared.service.stops == 0,
+      f"destroys={len(_cd10.destroys)} quits={_shared.quits} stops={_shared.service.stops}")
+
+# ③ 回收原语本身的三条硬要求
+check("reap：driver 为 None / 没有 service 属性 → 什么都不做，也不抛",
+      _a1688.reap_driver_service(None) is False
+      and _a1688.reap_driver_service(object()) is False)
+_s2 = _Svc10()
+check("reap 幂等：同一份 Service 只收一次（destroy 与 atexit 两层会各叫一遍）",
+      _a1688.reap_driver_service(_Drv10(_s2)) is True
+      and _a1688.reap_driver_service(_Drv10(_s2)) is False and _s2.stops == 1)
+_s3 = _Svc10(boom=True)
+check("reap 吞异常：停不掉也只是少收一次，绝不把收工路径带崩",
+      _a1688.reap_driver_service(_Drv10(_s3)) is False
+      and _a1688.reap_driver_service(_Drv10(_s3)) is False)
+
+print("⑩ 独立 1688 包收尾：quit() 之外补收 chromedriver 子进程，幂等且吞异常 ✓")
 print(f"\n全部 {ok} 项断言通过 ✅")

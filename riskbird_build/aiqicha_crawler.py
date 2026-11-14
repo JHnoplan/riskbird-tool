@@ -12,6 +12,8 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
+import chrome_driver          # 本目录唯一的驱动口径（收尾连子进程一起收，见 close_browser）
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -89,10 +91,9 @@ class AiQiChaCrawler:
 
     def close_browser(self):
         if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+            # quit() 只删会话、不收 chromedriver（Selenium 4.51），try/except 一吞更是
+            # 连引用都留着；统一交给 chrome_driver.destroy（幂等、吞异常，见该模块顶部）
+            chrome_driver.destroy(self.driver, self._log)
             self.driver = None
 
     def _is_session_alive(self) -> bool:

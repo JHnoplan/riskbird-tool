@@ -11,6 +11,7 @@ Selenium Manager。它会先联网向 googlechromelabs、googleapis 查驱动版
 这里的约束很硬：先把「手头已有的驱动」全试一遍，只有本地一个都不行时才允许退给
 Selenium Manager，并且明确打出这一次慢在哪一步、用的是哪个驱动、花了几秒。
 """
+import atexit
 import contextlib
 import os
 import re
@@ -484,6 +485,124 @@ def sm_source_reachable(timeout: float = 4.0) -> bool:
     return False
 
 
+# ── 子进程回收：quit() 只删会话，chromedriver 得我们自己收 ──────────────────
+# Selenium 4.51 的 `driver.quit()` 里已经没有 `service.stop()` 了：整包里搜下来，
+# 只有「建会话失败」那一条异常路径会 stop（remote/webdriver.py new_session 的 except
+# 分支），正常收工那一路从头到尾没人管子进程；`stop_client()` 是个空函数。
+# 唯一还会替我们收进程的是 `Service.__del__` —— 它要等引用断了、GC 真跑一次才算，
+# 而采集器把 driver 挂在 self 上、会话自愈又是「换新一个、旧的丢掉」，什么时候断引用
+# 没人能承诺；进程被强杀/Ctrl-C 时更是永远不会跑（2026-11-15 实机取证：本机挂着两个
+# 父进程已经是 launchd 的孤儿 chromedriver，一个空跑了 5 小时）。
+# 单次代价看着不大（几十 MB + 一个端口），但 Windows 上它还攥着 chromedriver.exe 的
+# 文件句柄，且「会话自愈/换驱动重试」每发生一次就多一个，跑一下午就是几十个。
+# 口径统一在这里：谁建会话谁登记（create），谁收会话谁回收（destroy），
+# 进程退出时再兜一层（atexit），三条路都指向同一个 stop_service。
+# 注意 destroy()/stop_service() 收的都只是**我们自己拉起的 chromedriver**，
+# 与被附加的 Chrome 无关 —— 共享浏览器的会话该不该 quit 由调用方按标签策略决定。
+_started_services = []
+_services_lock = threading.Lock()
+
+
+def _track_service(service) -> None:
+    if service is None:
+        return
+    with _services_lock:
+        _started_services.append(service)
+
+
+def _untrack_service(service) -> None:
+    if service is None:
+        return
+    with _services_lock:
+        for i, s in enumerate(_started_services):
+            if s is service:
+                del _started_services[i]
+                return
+
+
+def stop_service(service) -> bool:
+    """收掉一个 chromedriver 子进程。重复调用只生效一次；停不掉也不抛
+    （收工路径上绝不能因为回收失败把整轮采集的收尾带崩）。返回是否真收了一次。"""
+    if service is None or getattr(service, "_cd_reaped", False):
+        _untrack_service(service)
+        return False
+    try:
+        service._cd_reaped = True            # 先立牌：下面无论走到哪一步都不再收第二遍
+    except Exception:
+        pass                                 # 立不上牌也不能挡回收（顶多被多收一次）
+    try:
+        service.stop()
+        return True
+    except Exception:
+        return False
+    finally:
+        _untrack_service(service)
+
+
+def _arm_quit(driver, service) -> None:
+    """把这个实例的 quit() 绑成「结束会话 + 收子进程」。
+    为什么绑在实例上而不是要求每个调用方改用 destroy()：仓库里有十来个 `driver.quit()`
+    （含异常自愈路径），漏一个就漏一份进程；绑在这里，老写法自动就是对的。"""
+    raw_quit = getattr(driver, "quit", None)
+    if not callable(raw_quit):
+        # 形状不对（不是我们认识的 WebDriver）就别绑：绑这一步绝不能反过来
+        # 把「会话已经建好了」的成功流程带崩。登记照旧，收尾由 destroy()/退出兜底负责。
+        return
+
+    def quit():                                  # noqa: A001 - 与 Selenium 同名，就是要在原地补收
+        try:
+            raw_quit()
+        finally:
+            stop_service(service)
+
+    driver.quit = quit
+
+
+def destroy(driver, log=None) -> None:
+    """结束会话并把 chromedriver 子进程一起收掉；新写的收尾请用它，别再用裸 quit()。"""
+    if driver is None:
+        return
+    log = log or (lambda m: None)
+    service = getattr(driver, "service", None)
+    t0 = time.monotonic()
+    try:
+        driver.quit()                            # 被 _arm_quit 绑过 → 顺带收进程（幂等）
+    except Exception as e:
+        log(f"   结束浏览器会话时报错（不影响收工，子进程照常回收）：{_short_err(e)[:90]}")
+    stop_service(service)
+    cost = time.monotonic() - t0
+    if cost > 2:
+        # 正常一秒内就完事；慢说明 chromedriver 对 /shutdown 没立刻退，值得在日志里留一行
+        log(f"   chromedriver 子进程回收用了 {cost:.1f} 秒（会话结束 + 进程退出）")
+
+
+def release(driver, log=None) -> None:
+    """只收自己这份 chromedriver 子进程，不发 quit。
+    给「共享浏览器、会话归别人用/标签已收回」这类收尾用：那里最忌讳的就是
+    替整个浏览器发 quit（见 qizhidao_crawler.close_browser 的分叉），但子进程
+    照样该收 —— 否则丢掉的 driver 只能等 GC 替我们收拾（见上面那段注释）。"""
+    if driver is None:
+        return
+    stop_service(getattr(driver, "service", None))
+
+
+def reap_started_services() -> int:
+    """把本进程拉起、还没收掉的 chromedriver 全部收掉，返回收掉几个。
+    给 atexit 用，也给「停止任务」这类收尾当兜底：中途被 Ctrl-C、窗口被直接关掉时，
+    close_browser 来不及跑，这一层保证不把孤儿进程留给下一轮。"""
+    with _services_lock:
+        pending = list(_started_services)
+        _started_services.clear()
+    n = 0
+    for s in pending:
+        if stop_service(s):
+            n += 1
+    return n
+
+
+atexit.register(reap_started_services)
+
+
 def create(options, log=None, ports=None, retries: int = 3):
     """用本地驱动建会话；本地全落空才退 Selenium Manager。返回 WebDriver。
 
@@ -513,15 +632,14 @@ def create(options, log=None, ports=None, retries: int = 3):
         try:
             service = Service(executable_path=p)
             driver = webdriver.Chrome(service=service, options=options)
+            _track_service(service)
+            _arm_quit(driver, service)
             log(f"🔧 已用本地 ChromeDriver（{Path(p).parent.name[:16]}）"
                 f"，耗时 {time.monotonic() - t0:.1f} 秒")
             return driver
         except Exception as e:
             if service is not None:
-                try:
-                    service.stop()
-                except Exception:
-                    pass
+                stop_service(service)          # 建会话失败也要收子进程（幂等，失败不抛）
             msg = _short_err(e)
             dver = driver_version(p)
             cver = chrome_major(ports)
@@ -589,6 +707,10 @@ def create(options, log=None, ports=None, retries: int = 3):
         # 报的还是那句最容易被误读的「cannot connect to chrome」（见 stale_driver_path_dirs）
         with sm_clean_path(ports, log):
             driver = webdriver.Chrome(options=options)
+        # 联网这一路的 Service 是 Selenium 自己建的，挂在 driver.service 上：
+        # 不登记不绑回收，这份进程照样会漏（口径与本地驱动那几条完全一致）
+        _track_service(getattr(driver, "service", None))
+        _arm_quit(driver, getattr(driver, "service", None))
         log(f"🔧 Selenium Manager 已备好驱动，耗时 {time.monotonic() - t0:.1f} 秒")
         return driver
     except Exception as e:
