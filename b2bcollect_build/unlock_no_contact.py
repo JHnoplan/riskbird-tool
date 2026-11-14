@@ -25,8 +25,23 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "b2bcollect_data"
-TASK_ROOT = Path("/Users/jhnoplan/Desktop/B2B三站企业数据自动采集工具")
-INDEX_FILE = TASK_ROOT / "_采集任务索引.json"
+# 两份落点都问产品自己，不在这里抄第二遍：
+#   · 任务索引 2026-11-13 已经从桌面搬到状态目录，这里再写死一个桌面路径，指的就是
+#     一份**早就不再更新**的旧索引——修的是用户数据，指错文件的后果不是报错，是
+#     「解锁 0 条然后告诉你修好了」；
+#   · 老桌面目录留着只做兜底搜原始表，且**惰性**求值：tool_dir() 会顺手 mkdir，
+#     一个命令行修复工具不该在 import 阶段制造目录（macOS 上那还是 TCC 保护的位置）。
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import task_registry as _registry                       # noqa: E402
+
+INDEX_FILE = Path(_registry.index_path())
+
+
+def legacy_task_root():
+    """老桌面工具目录（只在索引里拿不到 raw_file 时兜底搜一遍）；不存在就返回 None。"""
+    base = Path.home() / "Desktop" / _registry.TOOL_DIR_NAME
+    return base if base.is_dir() else None
 
 # 原始表「数据来源」→ 站点 PLATFORM_SLUG（种子库文件名 seen_store_<slug>.json）
 SITE_BY_SOURCE = {
@@ -60,7 +75,8 @@ def latest_raw_file():
         pass
     if cand:
         return sorted(cand)[-1][1]
-    dirs = sorted(p for p in TASK_ROOT.glob("*/企业数据_原始.xlsx"))
+    root = legacy_task_root()
+    dirs = sorted(p for p in root.glob("*/企业数据_原始.xlsx")) if root else []
     return dirs[-1] if dirs else None
 
 

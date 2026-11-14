@@ -1,7 +1,8 @@
 #!/bin/bash
 # 触发 b2bcollect 云端打包（Windows exe + Mac arm64），并轮询本次 run 状态。
 set -u
-cd /Users/jhnoplan/Desktop/PythonDemo
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 # GIT_TERMINAL_PROMPT=0：helper 里没凭证时 `git credential fill` 会去开 /dev/tty 问密码，
 # 那一刻它既不读 stdin 也不看超时——整趟派发就这么挂住，而屏幕上一句原因都没有。口径与
 # 判据见 debug/fetch_b2bcollect_artifacts.sh 开头那段，以及

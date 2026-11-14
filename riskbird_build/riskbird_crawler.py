@@ -72,7 +72,7 @@ def download_and_install_chrome(callback=None) -> bool:
         if callback: callback(msg)
         print(msg)
     _log("正在下载 Google Chrome...")
-    temp_dir = Path(os.environ.get("TEMP", "/tmp"))
+    temp_dir = runtime_paths.legacy_temp_root()
     installer_path = temp_dir / "ChromeSetup.exe"
     try:
         url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"

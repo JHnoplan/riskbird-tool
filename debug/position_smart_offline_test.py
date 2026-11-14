@@ -2,7 +2,7 @@
 """岗位智能匹配离线断言：dept_only 改道、compose_position 合成、岗位族归类、
 清洗层跨站回捞/岗位族进备注、b2b168「联系人是X」形态。"""
 import sys, os
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
 from cdp_base import (dept_only, norm_dept, compose_position, dept_from_email,
                       dept_from_company, position_family, parse_contact_field)
 import customer_library_cleaner as cl

@@ -3,7 +3,7 @@
 # ④供应商网 JSON-LD 权威字段 ⑤供应商网访问异常插页判定
 # ⑥八方资源网公司名尾部杂质 ⑦清洗器号码保护/备注残留/不截断 ⑧入库剔除四项全空行
 import sys, pathlib
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 
 from qihuo11467_crawler import Qihuo11467Crawler
 from gys_crawler import GysCrawler

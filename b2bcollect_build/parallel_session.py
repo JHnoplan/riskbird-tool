@@ -779,8 +779,11 @@ class ParallelSession:
                 t = threading.Thread(target=self._tracked(self._run_site),
                                      args=(c, kws, start_index),
                                      name=f"crawl-{c.PLATFORM_SLUG}", daemon=True)
-                self._threads[c.PLATFORM_SLUG] = t
+                # 先 start 再登记：登记早于 start 的话，site_status 在这一瞬拿到的
+                # 是「没进 _done_sites 且 is_alive()=False」的线程，会把刚开工的站
+                # 误报成「线程已死·异常终止」——真要区分的是「根本没跑起来过」。
                 t.start()
+                self._threads[c.PLATFORM_SLUG] = t
         for slug, c, rt in list_rts:
             # 每轮启动复位熔断位：上一轮因额度/断网让过路的，这一轮要重新试一次
             rt["halt"] = False

@@ -10,7 +10,8 @@
 # 再验一次——万一哪天有人改了 workflow 的 --add-data，本机就能立刻看出来，而不是等
 # 客户反馈。
 set -u
-cd /Users/jhnoplan/Desktop/PythonDemo
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 REPO_DIR=$(pwd)
 # GIT_TERMINAL_PROMPT=0 不是装饰：helper 里没有 github.com 凭证时，`git credential fill`
 # 会去开 /dev/tty 问用户名密码——它读的不是上面那条 printf 的 stdin，所以「管道里已经喂了

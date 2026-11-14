@@ -1,6 +1,6 @@
 # 离线自测：爱采购(b2b.aipage.com) 新站点关键逻辑（用真实页面缓存，不触网、不开浏览器）
 import sys, pathlib, json, re
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 
 from aipage_crawler import AipageCrawler
 from parallel_session import ParallelSession, SITE_ORDER, SITE_CLASSES, SITE_NAMES

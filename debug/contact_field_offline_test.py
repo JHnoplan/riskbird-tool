@@ -15,7 +15,7 @@ import sys
 import glob
 import os
 
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
 
 from cdp_base import parse_contact_field, is_placeholder_number, normalize_spaces  # noqa: E402
 from gys_crawler import GysCrawler, _is_platform_email                              # noqa: E402

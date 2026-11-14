@@ -265,6 +265,25 @@ def driver_version(path) -> str:
     return ver
 
 
+def _major_gap(drv_ver, chrome_ver):
+    """驱动与浏览器的**主版本差**；任何一边问不到就返回 None（未知≠不符）。
+
+    分类和「本机到底有没有配套驱动」两件事都必须用这一个算式，否则两处会分叉：
+    一边判成 version 去联网，另一边认不出其实手里就有一份配套驱动。"""
+    try:
+        if drv_ver and chrome_ver:
+            return abs(int(str(drv_ver).split(".")[0]) - int(str(chrome_ver).split(".")[0]))
+    except Exception:
+        pass
+    return None
+
+
+def has_matching_driver(drv_vers, chrome_ver):
+    """手底下是否真有一份「版本差在容差内」的驱动。未知一律不算配套。"""
+    return any(_major_gap(v, chrome_ver) is not None
+               and _major_gap(v, chrome_ver) <= DRIVER_MAJOR_SLACK for v in drv_vers)
+
+
 def classify_driver_error(msg, drv_ver="", chrome_ver="", pages=None) -> str:
     """建会话失败分两类，日志与上层重试判据都按这个分流：
 
@@ -293,13 +312,9 @@ def classify_driver_error(msg, drv_ver="", chrome_ver="", pages=None) -> str:
         return "version"
     if pages is not None and pages < 0:
         return "connect"          # 调试端口 HTTP 都问不到：浏览器没在跑，换驱动无用
-    try:
-        if drv_ver and chrome_ver:
-            d = abs(int(str(drv_ver).split(".")[0]) - int(str(chrome_ver).split(".")[0]))
-            if d > DRIVER_MAJOR_SLACK:
-                return "version"
-    except Exception:
-        pass
+    if _major_gap(drv_ver, chrome_ver) is not None \
+            and _major_gap(drv_ver, chrome_ver) > DRIVER_MAJOR_SLACK:
+        return "version"
     if ("cannot connect to chrome" in s or "session not created" in s
             or "websocket" in s or "failed to parse" in s):
         return "connect"
@@ -623,6 +638,7 @@ def create(options, log=None, ports=None, retries: int = 3):
             pages = ensure_attachable_pages(addr, log)
     tried = []
     kinds = []
+    drv_vers = []          # 每次尝试所用驱动的版本，配合 kinds 才能问出「有没有配套的那一份」
     paths = candidates(ports)[:retries]
 
     def _attempt(p):
@@ -646,6 +662,7 @@ def create(options, log=None, ports=None, retries: int = 3):
             kind = classify_driver_error(msg, dver, cver, pages)
             tried.append(msg)
             kinds.append(kind)
+            drv_vers.append(dver)
             where = f"{Path(p).parent.name}/{Path(p).name}"
             if kind == "version":
                 log(f"  本地驱动版本不符（{where} {dver or '?'}，Chrome {cver or '?'}）："
@@ -666,7 +683,13 @@ def create(options, log=None, ports=None, retries: int = 3):
                            "（浏览器可能已退出或不是带调试端口启动的）")
 
     # 本地全败且全是「浏览器不接连接」：联网换驱动治不了这个，先原地退避再试一遍本地
-    if paths and kinds and all(k == "connect" for k in kinds):
+    # 旧判据要求「全部失败都是 connect」才原地退避。可同一轮里常常还躺着一份早就
+    # 过期的旧驱动（本机实测 135 连 156 报的正是 cannot connect 那句），它把 kinds
+    # 掺进一个 version，于是整轮被判去联网 —— 而真正配套的那一份只是被浏览器临时
+    # 拒绝，退避重试 0.3 秒就好。联网下载源不可达时任务就永久挂在那儿。
+    connect_blocked = ("connect" in kinds
+                       and has_matching_driver(drv_vers, chrome_major(ports)))
+    if paths and kinds and (all(k == "connect" for k in kinds) or connect_blocked):
         for wait in (3, 6):
             log(f"   本地驱动都是「浏览器没接连接」这一类失败，{wait} 秒后原地重试一遍"
                 f"（不联网下载）…")
@@ -717,7 +740,7 @@ def create(options, log=None, ports=None, retries: int = 3):
         if tried:
             log(f"   （本地驱动失败原因：{tried[0]}）")
         tail = ""
-        if kinds and all(k == "connect" for k in kinds):
+        if kinds and (all(k == "connect" for k in kinds) or connect_blocked):
             tail = "（浏览器端口在但没接受驱动的连接，多为浏览器正忙/刚启动，稍后重试即可）"
         elif "version" in kinds:
             tail = (f"（驱动与 Chrome 版本不匹配：本机 Chrome {chrome_major(ports) or '?'}，"

@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 无头跑 Qt，不打扰用户桌面
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import parallel_session as ps
 import site_adapters as ad

@@ -445,7 +445,7 @@ class Ali1688Crawler:
         由口径那一处决定（老目录里有 Cookies 就先复制过来，绝不删源），本函数只声明
         「这个工具的老位置在哪」。
         """
-        legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_1688_profile",
+        legacy = [_paths.legacy_temp_root() / "chrome_1688_profile",
                   Path("/tmp/chrome_1688_profile")]
         return _paths.browser_profile_dir("chrome_1688_profile", legacy_dirs=legacy)
 

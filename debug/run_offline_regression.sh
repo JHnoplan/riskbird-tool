@@ -16,9 +16,11 @@
 # 非断言型的门禁也进这张表（debug/check_gui_fit.py：布局几何体检，退出码就是判定）：
 # 「一屏放不下主按钮」这类问题只有量几何才发现得了，而量几何的工具不登记，就会退化成
 # 只有改布局那天才会想起来跑一次的私人脚本。
-cd /Users/jhnoplan/Desktop/PythonDemo || exit 1
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，
+# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 export QT_QPA_PLATFORM=offscreen
-PY=.venv/bin/python
+PY=${PY:-.venv/bin/python}
 # 单套件看门狗超时（秒）：gui_smoke_test 曾因为收尾一个模态弹窗 offscreen 永久等待，
 # 把整批回归挂住 20 多分钟。挂死与代码坏是两回事，但都必须当场暴露、不能拖走全批。
 PER_TEST_TIMEOUT=${PER_TEST_TIMEOUT:-600}
@@ -70,15 +72,15 @@ debug/fix_offline_14_5.py|同上
 discovered=""
 for d in $DELIVERY_DIRS; do
   if [ ! -d "$d" ]; then
-    echo "❌ 交付目录 $d/ 不在了：它的离线套件将整体从批跑里消失（静默少一档回归）"
+    echo "❌ 交付目录 $d/ 不在了：它的离线套件将整体从批跑里消失（静默少一档回归）" >&2
     exit 1
   fi
   hits=$(ls "$d"/test_*_offline.py 2>/dev/null)
   if [ -z "$hits" ]; then
     case "$DIR_WITHOUT_SUITES" in
-      *"$d"*) echo "   ℹ ${d}：没有 *_offline.py 套件（已登记理由）";;
-      *) echo "❌ $d/ 里一个 test_*_offline.py 都没有，且没登记理由："
-         echo "   是目录改名了，还是套件被删了？要么补套件，要么在 DIR_WITHOUT_SUITES 写清理由"
+      *"$d"*) echo "   ℹ ${d}：没有 *_offline.py 套件（已登记理由）" >&2;;
+      *) echo "❌ $d/ 里一个 test_*_offline.py 都没有，且没登记理由：" >&2
+         echo "   是目录改名了，还是套件被删了？要么补套件，要么在 DIR_WITHOUT_SUITES 写清理由" >&2
          exit 1;;
     esac
     continue
@@ -101,14 +103,29 @@ for p in debug/*offline*.py; do
   missing="$missing $p"
 done
 if [ -n "$missing" ]; then
-  echo "❌ 回归清单不完整：下面这些离线套件在磁盘上，却既不在 FILES 也不在 EXCLUSIONS"
-  for p in $missing; do echo "   · $p"; done
-  echo "   加进 FILES（进批跑）或在 EXCLUSIONS 写清为什么不进——「写完只跑一次」等于没有回归"
+  echo "❌ 回归清单不完整：下面这些离线套件在磁盘上，却既不在 FILES 也不在 EXCLUSIONS" >&2
+  for p in $missing; do echo "   · $p" >&2; done
+  echo "   加进 FILES（进批跑）或在 EXCLUSIONS 写清为什么不进——「写完只跑一次」等于没有回归" >&2
   exit 1
 fi
-echo "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .) 个（${DELIVERY_DIRS}）" \
+# 清单里有、磁盘上没有 → 不开跑，并点名下一步。「少跑一路」不会让任何计数变红：
+# 那一路的缺陷从此没有守卫，日志里也连一行缺失都不留——本轮 5 份套件只活在这台机器上
+# （CI 检出的仓库里压根没有），批跑照跑、总数照对，症状和「跑全了」完全一样。
+absent=""
+for p in $FILES; do
+  [ -f "$p" ] || absent="$absent $p"
+done
+if [ -n "$absent" ]; then
+  echo "❌ 批跑清单里有 $(printf '%s\n' $absent | grep -c .) 份套件在磁盘上不存在：" >&2
+  for p in $absent; do echo "   · $p" >&2; done
+  echo "   要么文件被删/改名了，要么这一路本来就登记错了。缺失的那一路永远不会红，" >&2
+  echo "   只会让这一类缺陷从此没有守卫，所以这里拒绝开跑，不当它不存在。" >&2
+  exit 1
+fi
+
+echo >&2 "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .) 个（${DELIVERY_DIRS}）" \
      "+ 手写 ${_hand_count} 项 = 合计 $(printf '%s\n' $FILES | grep -c .) 项，" \
-     "另有 $(printf '%s\n' "$EXCLUSIONS" | grep -c .) 项按登记排除（都带理由）"
+     "另有 $(printf '%s\n' "$EXCLUSIONS" | grep -c .) 项按登记排除（都带理由）" >&2
 
 # 单跑几套（排查时不必等全批）：给了 B2B_REGRESSION_ONLY 就以它为准，其余判据
 # （清单完整性、计数自洽、总判定进退出码）一条都不少。为什么要开这个口子：批跑入口
@@ -116,14 +133,33 @@ echo "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .) �
 # 验活——不能验的判据和没有判据只差一句注释。
 if [ -n "${B2B_REGRESSION_ONLY:-}" ]; then
   FILES=$(printf '%s\n' $B2B_REGRESSION_ONLY)
-  echo "   ℹ 本轮只跑指定的 $(printf '%s\n' $B2B_REGRESSION_ONLY | grep -c .) 项（B2B_REGRESSION_ONLY）"
+  echo "   ℹ 本轮只跑指定的 $(printf '%s\n' $B2B_REGRESSION_ONLY | grep -c .) 项（B2B_REGRESSION_ONLY）" >&2
 fi
 
 # --list：只把解析完的批跑清单打出来（给回归入口自己的离线断言用：判据写在脚本里，
 # 核对写在用例里，两边共用同一份展开结果，不重复实现一遍发现逻辑）。
+# --list 的契约：stdout 每行一个**仓库相对的套件路径**，别的什么都没有（进度与诊断走
+# stderr）。硬门第 23/24 条与离线对拍读的就是这批字节，格式由下面这一行 printf 决定——
+# 改了它，那两处的判据必须一起改，这也是把契约写在出口旁边而不是别处的原因。
 if [ "${1:-}" = "--list" ]; then
   printf '%s\n' $FILES
   exit 0
+fi
+
+# 环境检查为什么必须排在 --list 之后：--list 不跑任何套件，它只是把清单声明读出来，
+# 而硬门第 23/24 条与离线对拍正是靠这一句拿「批跑到底覆盖哪几路」的权威答案。把它挡在
+# 解释器检查后面，等于让门禁的结论取决于跑不跑得动——那是两种完全不同的红。
+
+# 解释器必须先在场并且**带着 PyQt5**：批跑入口退到系统 python3 的话，54 套里三十几套会红成
+# ModuleNotFoundError，看着像代码坏了，其实是环境不对——「证据先在场，判定才有意义」这条也管环境。
+if [ ! -x "$PY" ]; then
+  echo "❌ 找不到可执行的 ${PY}（仓库根 $(pwd)）：先 python3 -m venv .venv && .venv/bin/pip install -r riskbird_build/requirements.txt"
+  exit 2
+fi
+if ! "$PY" -c "import PyQt5" >/dev/null 2>&1 < /dev/null; then
+  echo "❌ ${PY} 里没有 PyQt5：整批离线套件会假红成一堆 ModuleNotFoundError（不是代码坏了）。"
+  echo "   要么换成装了依赖的那个解释器（PY=/path/to/python），要么 .venv/bin/pip install -r riskbird_build/requirements.txt"
+  exit 2
 fi
 
 pass=0; fail=0; skip=0; failed=""; hung=""; total=0
@@ -315,20 +351,49 @@ for f in $FILES; do
     printf 'SKIP  %-52s %s\n' "$f" "$(printf '%s\n' "$out" | grep 'SKIP-FIXTURE' | head -1)"
   elif [ $code -eq 0 ]; then
     pass=$((pass+1)); printf 'PASS  %-52s %s\n' "$f" "$last"
-  elif [ $code -eq 134 ] || [ $code -eq 137 ]; then
+  elif [ $code -eq 124 ]; then
+    # 看门狗到点用 -s ABRT 打断，可退出码是 **timeout 自己的 124**。本机实测 coreutils 9.7
+    # 的三种死法：被 ABRT 打断→124、ABRT 叫不应升级 KILL→137、进程自己 abort→134。旧写法拿
+    # 134/137 当挂死，两支配对恰好贴反了：真挂死掉进「普通断言红」那一支，报出来的是最后一行
+    # 汇总而不是「超时」；进程自己 abort 反倒被喊成超时。两个结论都指向错的地方，而日志里不会
+    # 有任何一句话承认自己配错了——判外部工具的返回值就必须当场实测过它的格式（同第 14 道硬门）。
     fail=$((fail+1)); failed="$failed $f"; hung="$hung $f"
-    printf 'HANG  %-52s 超过 %ss 没跑完（已 SIGABRT，挂死栈见下）\n' "$f" "$PER_TEST_TIMEOUT"
+    # 「挂死点见下」这句承诺得当场上过证据才能给：本机实测 12 次里 9 次有 faulthandler 的栈
+    # ——SIGABRT 到达时主线程往往已经把 GIL 放掉，handler 有时来不及写。旧文案不分情形一律
+    # 说「见下」，没栈的那几次就等于又造一句「提示与实际行为不一致」的话，而读日志的人照着
+    # 那句去找行号，找不到就会开始跳过这一步的 output。
+    if printf '%s\n' "$out" | grep -q '^Fatal Python error: '; then
+      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断，挂死点栈见下）\n' "$f" "$PER_TEST_TIMEOUT"
+    else
+      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断；faulthandler 这次没来得及打栈，' "$f" "$PER_TEST_TIMEOUT"
+      printf '只能看日志末尾）\n'
+    fi
     printf '%s\n' "$out" | tail -22 | sed 's/^/        /'
-  elif [ -z "$nfail" ] && printf '%s\n' "$out" | grep -qE "全部 [0-9]+ 项断言通过|ALL ASSERTS PASSED" \
-       && ! printf '%s\n' "$out" | grep -qE "^Traceback|^AssertionError"; then
-    # 「矛盾」这一类是本轮 gui_smoke_test 的实况：屏幕最后一行写着「全部 54 项断言
-    # 通过 ✅」，退出码却不是 0（崩在解释器收尾阶段，Qt/线程的析构与判定毫无关系）。
-    # 旧写法把这一行照原样打出来，人看见的是「✅ 却 FAIL」，只能靠猜和重跑——
-    # 重跑又是绿的，于是这条真红被当成抖动放过去了。现在直接说清：断言全过，
-    # 崩的是收尾，并提醒「判定要与退出码同源」（套件自己收尾 os._exit）。
+  elif [ $code -eq 137 ]; then
+    # SIGKILL：只有「SIGABRT 都叫不应」的时候 -k 才会升级到这里。仍然是挂死，而且是最硬的一种
+    # ——连 faulthandler 的栈都来不及打，所以把已有的日志原样留给人看。
+    fail=$((fail+1)); failed="$failed $f"; hung="$hung $f"
+    printf 'HANG  %-52s 看门狗 SIGABRT 叫不应、升级 KILL 才停（137）：最后的输出见下\n' "$f"
+    printf '%s\n' "$out" | tail -22 | sed 's/^/        /'
+  elif [ $code -gt 128 ]; then
+    # 剩下所有 >128 都是「被信号打死」。这一支不再猜某一句中文汇总的措辞：旧写法只认
+    # 「全部 N 项断言通过」那一种，而 keyword_resume 打的是「全部通过：88 项断言」——于是
+    # 全绿的套件崩在收尾时被读成一条**没有名字的** FAIL，根因只能人工翻日志找（本轮实况）。
+    # 现在读两件当场就在的证据：①信号号（139=SIGSEGV、134=SIGABRT）判「怎么死的」；
+    # ②faulthandler 那句 `Fatal Python error:` 连同它的栈，判「死在哪一帧」。
+    # 「判定与退出码是否同源」用反证，同样不依赖措辞：日志里有没有任何一条红断言。一条红都没有
+    # 却被信号打死 = 崩在收尾，套件必须自己 flush 后 os._exit，否则这种绿永远会被读成失败。
+    sig=$((code-128))
+    redlines=$(printf '%s\n' "$out" | grep -cE "^  (FAIL|BAD|❌|✗)|^AssertionError|^OSError|^FileNotFoundError|^Traceback" || true)
     fail=$((fail+1)); failed="$failed $f"
-    printf 'FAIL  %-52s 断言全过但退出码 %s：崩在收尾阶段，不是判定阶段（套件的退出码必须和断言结果同源）\n' "$f" "$code"
-    printf '%s\n' "$out" | tail -6 | sed 's/^/        /'
+    if [ "$redlines" -eq 0 ]; then
+      printf 'CRASH %-52s 被信号 %s 打死（退出码 %s），日志里一条红断言都没有：崩在收尾阶段，与判定无关，' "$f" "$sig" "$code"
+      printf '但退出码把整套读成失败——判定要与退出码同源（收尾 flush 后 os._exit）\n'
+    else
+      printf 'CRASH %-52s 被信号 %s 打死（退出码 %s），日志里同时有 %s 处红：先按栈修判定，再谈收尾\n' "$f" "$sig" "$code" "$redlines"
+    fi
+    printf '%s\n' "$out" | sed -n '/^Fatal Python error: /,/^$/p' | head -14 | sed 's/^/        /'
+    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)|^AssertionError|^Traceback" | head -12 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   else
     fail=$((fail+1)); failed="$failed $f"; printf 'FAIL  %-52s %s\n' "$f" "$last"

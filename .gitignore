@@ -92,12 +92,18 @@ _云展账号.json
 _采集任务索引.json
 mapping_history.json
 采集进度.json
-# Chrome / CDP 配置目录里的登录态：目录名到处不一样（ab_cdp_profile、chrome_b2bcollect_profile、
-# 持久位置那些），所以按 Chrome 自己的内部文件形状拦，不按我们的目录名猜。
-**/Default/Cookies
-**/Default/Login Data
-**/Default/History
-**/Default/Local Storage/
+# Chrome / CDP 的 user-data-dir：**整个目录**都不许入库，不按内部文件名一条条列。
+# 原来那四行（Cookies / Login Data / History / Local Storage）是列不全的——本机实测四个
+# 开发用 profile 里还有 1528 个文件 git 看得见：`Local State`（顶层，里面有 Cookie 主密钥
+# 那一节）、`Default/Account Web Data`、`Default/Web Data`、`Default/Session Storage/`、
+# `Crashpad/`、`component_crx_cache/` 里几十个 .crx。Chrome 内部形状有上百种且随版本变，
+# 靠这里补一行等于等下一次漏。判的是性质：一份配置目录一旦被认出来，它下面的每个字节
+# 都必须被挡（硬门第 22 条拿 `git status -uall` 逐目录问过，见 check_profile_dirs_ignored）。
+**/Default/
+**/Local State
+# 配置目录本体：名字以 _profile 结尾的那几类（ab_cdp_profile、chrome_b2bcollect_profile、
+# chrome_1688_profile、chrome_debug_profile…）连顶层的 Variations / Safe Browsing / 缓存一起挡掉。
+*_profile/
 # 驱动二进制与压缩包由 .github/scripts/fetch_chromedrivers.py 现取，入库只会让 clone 变大
 chromedriver
 chromedriver.exe

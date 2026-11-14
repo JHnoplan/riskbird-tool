@@ -16,7 +16,7 @@
 import sys
 import inspect
 
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cdp_base
 from cdp_base import CdpSiteCrawler, BLOCK_TAG_IP, BLOCK_TAG_CAP

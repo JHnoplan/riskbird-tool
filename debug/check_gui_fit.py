@@ -21,7 +21,7 @@ import os
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
 
 from PyQt5.QtWidgets import QApplication, QScrollArea  # noqa: E402
 
@@ -147,4 +147,10 @@ for tag, scr_w, scr_h, ww, hh in CASES:
     app.processEvents()
 
 print(f"\n[{mod_name}] RESULT:", "ALL FIT（0 处挤压）" if not all_bad else f"挤压 -> {all_bad}")
-sys.exit(1 if all_bad else 0)
+# 判定到此为止：屏幕上这句和批跑读到的退出码必须是同一个来源。这套件自己建过
+# QApplication，而 Qt/线程在解释器收尾时的析构会随机段错误（本机实测：keyword_resume
+# 全绿 88 项之后 rc=139，被批跑读成一次失败，单跑又绿——真红就是这么被当成抖动的）。
+# flush 之后直接把退出码交给操作系统，不让任何收尾动作再改写判定。
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(1 if all_bad else 0)

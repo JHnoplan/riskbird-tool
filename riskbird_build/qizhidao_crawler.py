@@ -504,7 +504,7 @@ class QiZhiDaoCrawler:
             # 实例占用，第二路上去就撞单实例锁；口径见 runtime_paths.login_chrome_profile）
             temp_profile, refreshed = runtime_paths.login_chrome_profile(
                 "chrome_qizhidao_profile",
-                legacy_dirs=[Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile",
+                legacy_dirs=[runtime_paths.legacy_temp_root() / "chrome_debug_profile",
                              Path("/tmp/chrome_debug_profile")])
             opts.add_argument(f"--user-data-dir={temp_profile}")
             opts.add_argument("--profile-directory=Default")

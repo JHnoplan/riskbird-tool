@@ -452,6 +452,25 @@ def adopt_missing_files(srcs, dst) -> list:
     return out
 
 
+def legacy_temp_root() -> Path:
+    """老写法里「系统临时目录」的取值口径：Windows 读 ``%TEMP%``，其余一律 ``/tmp``。
+
+    为什么这一行取值值得有处口径（2026-11-15 本机自审抓到）：调用点原先普遍写成
+    ``Path(os.environ.get("TEMP", r"C:\\temp"))``。Mac/Linux 上根本没有 ``TEMP`` 这个变量，
+    兜底串 ``C:\\temp`` 于是变成一个**相对路径**，``Path("C:\\temp") / "chrome_1688_profile"``
+    真在仓库里长出一个名字就叫 ``C:\\temp`` 的目录（本机实证：仓库根与 b2bcollect_build/ 各一份，
+    谁建的都不知道，因为它们一直是空的）。难看只是表面，代价在后面：这些目录是当「老位置」
+    传进 :func:`browser_profile_dir` 的，而那条链上的 ``choose_writable`` 会先 mkdir 再挑
+    **第一个真能写的**——持久位置一旦写不进去（只读挂载、权限策略），付费账号的登录态就落进
+    仓库工作区，下一次 ``git add <目录>`` 会连同 Cookie 库一起扫进历史（第 22 条判的正是这一刻）。
+    POSIX 侧刻意给 ``/tmp`` 而不是 ``tempfile.gettempdir()``：各工具的老副本本来就在
+    ``/tmp/xxx`` 下（调用点另一半都显式列了它），换成 gettempdir() 会让「接管老登录态」落空。
+    """
+    if sys.platform == "win32":
+        return Path(os.environ.get("TEMP") or r"C:\temp")
+    return Path("/tmp")
+
+
 def durable_profile_root() -> Path:
     """用户级持久配置的根：Windows 用 %LOCALAPPDATA%，其余用 ``~/.b2bcollect``。
 

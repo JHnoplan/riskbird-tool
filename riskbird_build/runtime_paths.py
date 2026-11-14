@@ -371,6 +371,20 @@ PROFILE_SKIP_PATTERNS = ("Cache", "Code Cache", "GPUCache", "Service Worker",
                          "SingletonLock", "SingletonSocket", "SingletonCookie")
 
 
+def legacy_temp_root() -> Path:
+    """老写法里「系统临时目录」的取值口径：Windows 读 ``%TEMP%``，其余一律 ``/tmp``。
+
+    与 ``b2bcollect_build/tool_config.py`` 同名函数同口径，理由与实证都写在那一处的
+    docstring 里（一句话版本：``os.environ.get("TEMP", r"C:\\temp")`` 在非 Windows 上会得到
+    一个**相对**目录，于是「老登录态在哪」变成「仓库工作区里长出一个 ``C:\\temp`` 目录」，
+    而择路链会把写探针 mkdir 出来的这个目录当成候选落点）。本目录里的采集器与
+    ali1688_build 都从这里取，不再各自写一遍兜底串。
+    """
+    if sys.platform == "win32":
+        return Path(os.environ.get("TEMP") or r"C:\temp")
+    return Path("/tmp")
+
+
 def _durable_profile_root() -> Path:
     """用户级持久配置的根：Windows 用 %LOCALAPPDATA%，其余用 ``~/.b2bcollect``。
 

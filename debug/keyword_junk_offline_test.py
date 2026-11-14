@@ -206,4 +206,10 @@ for _junk_id in ("t", "stray1", "20261104_000000"):
 total = PASS + FAIL
 print("\n" + "=" * 62)
 print(f"关键词碎片剔除离线断言：{PASS} 项通过 / {FAIL} 项失败（共 {total}）")
-sys.exit(1 if FAIL else 0)
+# 判定到此为止：屏幕上这句和批跑读到的退出码必须是同一个来源。这套件自己建过
+# QApplication，而 Qt/线程在解释器收尾时的析构会随机段错误（本机实测：keyword_resume
+# 全绿 88 项之后 rc=139，被批跑读成一次失败，单跑又绿——真红就是这么被当成抖动的）。
+# flush 之后直接把退出码交给操作系统，不让任何收尾动作再改写判定。
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(1 if FAIL else 0)

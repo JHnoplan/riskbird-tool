@@ -3165,18 +3165,45 @@ def test_workflow_shell_syntax():
         probe = _REPO / "debug" / "b2bcollect_bad_hygiene_probe.sh"
         probe.write_text('echo "清单不完整：$missing（见上）"\n', encoding="utf-8")
         try:
-            _assert(any("紧跟" in p for p in g.check_script_hygiene()),
-                    "登记过的脚本里出现坏写法同样要红")
+            _bad = g.check_script_hygiene()
+            _assert(any("紧跟" in p for p in _bad), "登记过的脚本里出现坏写法同样要红")
+            # 每条问题自带类目标签（2026-11-15 本机自审抓到）：这一条门一次判三件事——文案写法、
+            # 脚本在位、是否已提交，三件事的处置完全不同。当时满屏都是【未提交】那一类，而标题
+            # 写的是「`$VAR` 紧跟中文会把报错那行本身弄坏」，照着标题去找文案 bug 的人会白找一轮；
+            # 一条报不准自己在报什么的门，下一次就是被人整条跳过的那一条。
+            _assert_eq(set(g.HYGIENE_TAGS), {"文案", "在位", "未提交"},
+                       "三类判据各自的类目要在案（新增一类而不登记，下一格就抓不到它）")
+            for _ps, _tag in ((_gone, "在位"), (_bad, "文案")):
+                _assert(all(p.startswith("【") and p.split("】", 1)[0].lstrip("【") in g.HYGIENE_TAGS
+                            for p in _ps),
+                        f"这一条门报出的每一行都得有类目，不许出现「不知道该归哪类」那一种：{_ps}")
+                # 「至少一条归到本格造的那一类」而不是「全部归那一类」：探针脚本自己没进过提交，
+                # 于是同一批结果里真会同时出现【未提交】——那是这条门该报的第三条线，把它当成
+                # 夹具的杂质要求消失，等于教下次写判据的人「一批结果里只许有一种问题」。
+                _assert(any(p.split("】", 1)[0].lstrip("【") == _tag for p in _ps),
+                        f"夹具造出来的那一类必须被归到【{_tag}】：{_ps}")
         finally:
             probe.unlink(missing_ok=True)
     finally:
         g.HYGIENE_SCRIPTS = _saved_scripts
+    _gsrc = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(encoding="utf-8")
+    _assert('::error::shell 文案：{p}' not in _gsrc,
+            "注解前缀不许写死成「文案」——那一行正是把【未提交】报成 shell 文案的源头")
+    _assert('partition("】")' in _gsrc and "::error::shell {" in _gsrc,
+            "main 里注解的类目要从这条问题自带的标签上取，不在那儿再猜一次「这批大概都是文案」")
 
     # 5b-ii) 第 7 条的最后一头：文件**在提交里，但工作区改过没提交**。老判据看它在 HEAD 里
     # 就放行，于是本机跑绿的是工作区、CI 检出并打包的是提交，两份内容不是同一份——验证结论
     # 对交付没有担保（这条链上最坏的假绿：所有断言都是真的，量的却是不会被交付的那份字节）。
     _scr = _REPO / g.HYGIENE_SCRIPTS[0]
     _orig = _scr.read_bytes()
+    # 进这一格之前它是什么状态、这一条门报什么，先记下来当基准。下面承诺的是「自己造的红不许
+    # 留给别人」，那基准就只能是自己动手之前那一份，而不是硬写的 "ok"/[]：本机仓库脏着的时候
+    # （本轮就是这样，几十份文件改过没提交），写回原字节之后仍然读得到【未提交】——那是别人的红，
+    # 硬写基准会把它读成「还原失败」，等于拿环境事实冒充用例缺陷，还逼人先去 commit 才能跑测试。
+    g.reset_git_cache()
+    _pre_state = g.tracked_state(_scr)
+    _pre_problems = g.check_script_hygiene()
     try:
         _scr.write_bytes(_orig + "\n# 探针：改过没提交\n".encode("utf-8"))
         g.reset_git_cache()                 # 三张 git 清单是进程内缓存的，不重置就是空跑
@@ -3185,15 +3212,23 @@ def test_workflow_shell_syntax():
         _gotd = g.check_script_hygiene()
         _assert(any(_scr.name in p and "两份内容不是同一份" in p for p in _gotd),
                 f"卫生判据也要报这一头（它读的是工作区那份，交付的却是提交那份）：{_gotd}")
+        _assert(all(p.startswith("【未提交】") for p in _gotd
+                    if _scr.name in p and "两份内容不是同一份" in p),
+                f"「改过没提交」这一类必须自带类目（注解要按它说的那件事去标）：{_gotd}")
         _gotd2 = g.check_tracked([(f"../{_scr.parent.name}/{_scr.name}", ".")])
         _assert(any(_scr.name in p and "git commit" in p for p in _gotd2),
                 f"进包输入同款判据（第 7 条本身）也要报，措辞给出下一步：{_gotd2}")
     finally:
         _scr.write_bytes(_orig)
         g.reset_git_cache()
-    _assert_eq(g.tracked_state(_scr), "ok",
-               "按原字节写回后立刻回到 ok（判据看内容，不看时间戳——touch 不会造出假红）")
-    _assert_eq(g.check_script_hygiene(), [], "自己造的红不许留给别人（还原干净后不再报）")
+    _assert_eq(_scr.read_bytes(), _orig, "写回的必须是进来那一份字节（下面两句都以它为前提）")
+    _assert_eq(g.tracked_state(_scr), _pre_state,
+               f"按原字节写回后回到**进这一格之前**的状态（判据看内容不看时间戳——touch 造不出"
+               f"假红；进格前它是 {_pre_state}）")
+    _assert_eq(g.check_script_hygiene(), _pre_problems,
+               "自己造的红不许留给别人：还原后与进这一格之前逐字一致（仓库干净时这一句就是 []）")
+    _assert(not any("探针" in p for p in g.check_script_hygiene()),
+            "探针那一行不许留在结果里——它才是这一格自己造出来的那条")
 
     # 5c) 批跑清单的完整性：交付目录里靠命名约定**自动发现**，这条判据核对「磁盘上有、
     # 清单里没有」。riskbird_build 那 13 个套件就是这么整目录消失了两年的——写完当天
@@ -3280,6 +3315,65 @@ def test_workflow_shell_syntax():
     _assert(_before, "默认落点上真的有一份份证据在被判（快照为空=上面那条「一份不许少」在判空气）")
     _assert((sandbox / "logs").is_dir(),
             "沙箱落点真的在用（没在用=上面两条判据都在判空气，而历史事故就出在这儿）")
+
+    # 5c-IIB) 死法分类按**实测的退出码**配对，不按日志措辞猜（本轮重写的那一支）。
+    # 上面那张表里所有非零码都是夹具**自己 os._exit(N)** 造的，而真实挂死与被信号打死分别
+    # 来自 timeout 与内核——这两支配对贴反了不会有任何一句说出口。本机实测 coreutils 9.7 的
+    # `timeout -s ABRT -k 10`：被 ABRT 打断→124、ABRT 叫不应升级 KILL→137、进程自己
+    # abort→134、自己段错误→139。旧写法把挂死配成 134/137，于是真挂死掉进「普通断言红」
+    # 那一支（报出来的是最后一行汇总，跟超时毫无关系），而进程自己 abort 被喊成超时——两个
+    # 结论都指向错的地方。所以这一格不用夹具造码，直接放**真的**挂死与**真的**信号进去。
+    for _tag, _src, _extra, _want, _not in (
+            ("挂死（到点被 SIGABRT 打断）",
+             'import time\nprint("结果：0 通过 / 0 失败")\ntime.sleep(300)\n',
+             {"PER_TEST_TIMEOUT": "3"},
+             ["HANG", "看门狗 124 打断"],
+             ["CRASH", "FAIL "]),
+            ("挂死且 SIGABRT 叫不应（升级 KILL）",
+             'import signal, time\nsignal.signal(signal.SIGABRT, signal.SIG_IGN)\n'
+             'print("结果：0 通过 / 0 失败")\ntime.sleep(300)\n',
+             {"PER_TEST_TIMEOUT": "3"},
+             ["HANG", "升级 KILL 才停（137）"],
+             ["CRASH", "FAIL "]),
+            ("真段错误、日志里一条红都没有",
+             'import ctypes\nprint("全部 1 项断言通过 ✅")\nctypes.string_at(0)\n',
+             {},
+             ["CRASH", "被信号 11 打死", "Fatal Python error: Segmentation fault",
+              "崩在收尾阶段", "判定要与退出码同源"],
+             ["HANG", "超过"]),
+            ("真 abort、日志里带着红断言",
+             'import os, signal\nprint("  ❌ 某条断言")\nprint("结果：2 通过 / 1 失败")\n'
+             'os.kill(os.getpid(), signal.SIGABRT)\n',
+             {},
+             ["CRASH", "被信号 6 打死", "处红：先按栈修判定"],
+             ["HANG", "超过"]),
+    ):
+        _proc = _run_probe(_src, _extra)
+        _assert_eq(_proc.returncode, 1,
+                   f"「{_tag}」必须算失败（尾部：{_proc.stdout.strip()[-120:]}）")
+        for _w in _want:
+            _assert(_w in _proc.stdout,
+                    f"「{_tag}」要报成「{_w}」这一类死法（实际：{_proc.stdout.strip()[-260:]}）")
+        for _w in _not:
+            _assert(_w not in _proc.stdout,
+                    f"「{_tag}」不许被读成「{_w}」——旧写法正是把这两支配对贴反了，"
+                    f"挂死报成断言红、自己 abort 报成超时（实际：{_proc.stdout.strip()[-260:]}）")
+        # 挂死那两支还要进 hung 汇总：分类报了但没收进「哪几路是挂死的」那张表，收尾看板上
+        # 就只剩一条 FAIL，超时与崩在收尾从此分不开。（`hung="$hung $f"` 前面带一个空格，
+        # 所以判的是「HANG: 之后的那段里有点名」，不是把整句写死。）
+        if "124" in _want[0] or "137" in _want[0] or "HANG" in _want[0]:
+            _tail_h = _proc.stdout.split("HANG:")[-1]
+            _assert("zz_regression_probe.py" in _tail_h,
+                    f"「{_tag}」要出现在收工的 HANG 清单里（实际：{_proc.stdout.strip()[-160:]}）")
+        # 「挂死点栈见下」这句承诺本身也得判：本机实测被 SIGABRT 打断时 faulthandler 只有
+        # 约七成概率把栈落盘（12 次 9 次），所以入口必须**按当场有没有栈**改口。这一格钉的
+        # 是那个同源性，不是那 30% 的运气——写死「一定要有栈」就是一条迟早自己变红的假红。
+        if "看门狗 124 打断" in _proc.stdout:
+            _promised = "栈见下" in _proc.stdout
+            _delivered = "Fatal Python error: " in _proc.stdout
+            _assert(_promised == _delivered,
+                    f"「{_tag}」承诺与证据必须同源：有栈才说「见下」（{_delivered}），"
+                    f"没栈就得当场改口（{_promised}）（实际：{_proc.stdout.strip()[-200:]}）")
 
     # 5c-III) 污染要报在**犯错的套件名下**：只在收工那句「改动了 N 份」里说总数，接下来
     # 就得靠人回想这一批跑了什么——上一轮那两份「爱企查_结果页证据_*.txt」正是这么找的，
@@ -7954,6 +8048,12 @@ def test_state_file_protection_gate():
             _assert(subprocess.run(["git", "init", "--quiet"], cwd=str(_bare),
                                    capture_output=True).returncode == 0, "夹具仓库建得起来")
             (_bare / "b2bcollect_build" / "acl").mkdir(parents=True)
+            # 第三格（配置目录整目录防护）在本夹具里也要拿到**完整输入**：五个扫描目录都建出来、
+            # 里面没有 Chrome 自己写的标志，于是它判到的结论是「这里确实没有配置目录」，
+            # 而不是「扫不到目录」。少了这一句，本节计数会被 5 条扫描层问题污染，而那种红
+            # 长得像「形状探针算错了」，逼人回去改期望值——改错了对象。
+            for _d in gate.PROFILE_SCAN_DIRS:
+                (_bare / _d).mkdir(parents=True, exist_ok=True)
             for _f, _c in ((".acl_claim.json", '{"13800000000":{"session":"夹具不是真号"}}'),
                            ("_云展账号.json", '{"phone":"13800000000"}'),
                            ("acl/.acl_device.json", '{"device_id":"夹具"}')):
@@ -7979,12 +8079,718 @@ def test_state_file_protection_gate():
                 f"「已跟踪」三条一条不许少：当时真就差一步进历史（实际={_got}）")
         _assert(not any("只拿到 0 个" in p for p in _got),
                 f"夹具仓库里确实有被跟踪的文件，fail-closed 那条不该被触发（实际={_got}）")
+        _assert(not any("扫不到" in p for p in _got),
+                f"第三格在本夹具里是「扫到了、没有配置目录」，不是「扫不到」：上面那句计数"
+                f"等式才只归名字与形状两侧管（实际={_got}）")
     finally:
         gate._INDEX.clear()
         gate._INDEX.update(_saved_index)
         gate._HEAD.clear()
         gate._HEAD.update(_saved_head)
 
+    # ── 9) 第三格：工作区里每一份 Chrome 配置目录，git 都必须看不见它下面的文件 ──
+    # 由来（2026-11-15 本机自审抓到）：上面 1~8 格问的都是「按形状列出来的那几类文件」。
+    # 而本机四个开发用 profile 里，`Local State`、`Default/Account Web Data`、
+    # `Default/Web Data`、`Default/Session Storage/`、各种缓存与 .crx 一共 **1528 个文件**
+    # 都没被挡住，门却报绿——形状清单式判据的失效方式从来不是报错，是列漏一类就安静漏一类。
+    # 这一格判性质：认「这是一份 user-data-dir」（里面有 Chrome 自己写的 Local State 或
+    # Default/），然后要求 `git status -uall` 对目录里每个文件都答「看不见」。
+    # 夹具必须是**真 git 仓库**：判据问的是 git 自己的解析结果，在 Python 里合成一份清单
+    # 就等于把 gitignore 又重抄一遍（正是第 1 段注释里说的那种分叉）。
+    _pd_root = Path(tempfile.mkdtemp(prefix="state_gate_profile_dirs_"))
+    _saved_idx, _saved_head = dict(gate._INDEX), dict(gate._HEAD)
+
+    def _pinit(ignore_body=None):
+        """夹具仓库：五个扫描目录都在位，.gitignore 默认取今天这份真规则。"""
+        (_pd_root / ".gitignore").unlink(missing_ok=True)
+        if ignore_body is not None:
+            (_pd_root / ".gitignore").write_text(ignore_body, encoding="utf-8")
+        for _d in gate.PROFILE_SCAN_DIRS:
+            (_pd_root / _d).mkdir(parents=True, exist_ok=True)
+
+    def _pmk(rel, names):
+        d = _pd_root / rel
+        for n in names:
+            (d / n).parent.mkdir(parents=True, exist_ok=True)
+            (d / n).write_text("夹具", encoding="utf-8")
+
+    _REAL_IGNORE = (_REPO / ".gitignore").read_text(encoding="utf-8")
+    # 本轮之前那份「按内部文件名一条条列」的规则，原样搬进夹具当反向对照的用材
+    _OLD_IGNORE = ("**/Default/Cookies\n**/Default/Login Data\n"
+                   "**/Default/History\n**/Default/Local Storage/\n")
+    try:
+        with _patch(gate, "ROOT", _pd_root):
+            _assert(subprocess.run(["git", "init", "--quiet"], cwd=str(_pd_root),
+                                   capture_output=True).returncode == 0,
+                    "配置目录夹具仓库建得起来")
+            (_pd_root / "README.md").write_text("夹具仓库\n", encoding="utf-8")
+            _pinit(_REAL_IGNORE)
+            _pmk("debug/ab_cdp_profile", ["Local State", "Default/Cookies", "junk.txt",
+                                          "component_crx_cache/a.crx"])
+            _pmk("b2bcollect_build/chrome_tool_profile", ["Local State", "Default/History"])
+            # 认标志不认名字：一个恰好带 _profile 的**源码目录**不该被当成配置目录
+            _pmk("riskbird_build/chrome_profile_src", ["main.py"])
+            gate.reset_git_cache()
+            _found, _miss = gate.find_profile_dirs()
+            _assert_eq(_miss, [], f"五个扫描目录都在位时不该有扫描层问题（实际={_miss}）")
+            _assert_eq(_found, ["b2bcollect_build/chrome_tool_profile", "debug/ab_cdp_profile"],
+                       "配置目录按 Chrome 自己写的标志认（Local State / Default/），与目录叫"
+                       "什么无关；只有 .py 的那个同名目录不算配置目录")
+            _assert_eq(gate.check_profile_dirs_ignored(), [],
+                       "带着今天这份 .gitignore，两份配置目录 git 一个文件都看不见")
+
+            # 反向对照①：整份 .gitignore 拿走 → 两份目录各响一条，一条都不许合并
+            _pinit("")
+            gate.reset_git_cache()
+            _got = gate.check_profile_dirs_ignored()
+            _assert_eq(len(_got), 2, f"两份配置目录各响一条「没被整目录挡住」（实际={_got}）")
+            _assert(all("没被 .gitignore 整目录挡住" in x for x in _got),
+                    f"报的每一条都要给下一步能照着做的句子（实际={_got}）")
+
+            # 反向对照②：只列内部文件名的旧规则（本轮之前的真实状态）——这就是 1528 那种量级
+            _pinit(_OLD_IGNORE)
+            gate.reset_git_cache()
+            _got = gate.check_profile_dirs_ignored()
+            _assert_eq(len(_got), 2, f"旧规则下两目录各自「看得见若干文件」（实际={_got}）")
+            _dbg = [x for x in _got if "debug/ab_cdp_profile" in x][0]
+            _assert("3 个文件" in _dbg,
+                   f"旧规则漏掉的是 Local State / junk.txt / a.crx 这三个形状，报数必须是 3"
+                   f"（列不全这件事要被量出来，而不是笼统一句「没挡住」）（实际={_dbg}）")
+            _assert("永远会漏" in _dbg,
+                    f"红话里要带上「为什么不是再补一行文件名的事」，否则下次还是补一行"
+                    f"（实际={_dbg}）")
+
+            # 反向对照③：真的进了历史 → 「已被跟踪」这一条要单独响
+            _pinit("")
+            gate.reset_git_cache()
+            _assert(subprocess.run(["git", "add", "-f", "debug/ab_cdp_profile"],
+                                   cwd=str(_pd_root), capture_output=True).returncode == 0,
+                    "夹具能把这些文件真加进索引（真仓库里这一步只差一句命令）")
+            gate.reset_git_cache()
+            _got = gate.check_profile_dirs_ignored()
+            _assert(any("debug/ab_cdp_profile" in x and "已经被 git 跟踪" in x for x in _got),
+                    f"登录态进了历史要说得出来并给出 git rm --cached（实际={_got}）")
+
+            # 反向对照④：扫描目录读不到 ≠「这里没有配置目录」
+            _pinit(_REAL_IGNORE)
+            gate.reset_git_cache()
+            (_pd_root / "debug").rename(_pd_root / "debug_moved")
+            _found2, _miss2 = gate.find_profile_dirs()
+            _assert(any("debug" in x and "按不合格算" in x for x in _miss2),
+                    f"扫描范围里少一个目录必须响，而不是安静地少判一路（实际={_miss2}）")
+            (_pd_root / "debug_moved").rename(_pd_root / "debug")
+
+            # 第三格确实接在第 22 条主函数上（不接就是写了一个没人调的判据）
+            _got = gate.check_state_files_not_tracked({}, (), ["b2bcollect_build/no_such_x"])
+            _assert(any("no_such_x" in x for x in _got) is False,
+                    f"喂一个空目录进主函数不该凭空造红（实际={_got}）")
+            _pinit("")
+            gate.reset_git_cache()
+            _got = gate.check_state_files_not_tracked({}, (), ["debug/ab_cdp_profile"])
+            _assert(any("ab_cdp_profile" in x for x in _got),
+                    f"第 22 条主函数要把第三格的结论并进自己那份列表里（实际={_got}）")
+    finally:
+        gate._INDEX.clear()
+        gate._INDEX.update(_saved_idx)
+        gate._HEAD.clear()
+        gate._HEAD.update(_saved_head)
+        gate.reset_git_cache()
+
+    # 真仓库这一侧：今天的结论 + 「这条门不是只在夹具里咬人」
+    _real_found, _real_miss = gate.find_profile_dirs()
+    _assert_eq(_real_miss, [], f"本机的五个扫描目录都在位（实际={_real_miss}）")
+    _assert_eq(gate.check_profile_dirs_ignored(), [],
+               f"工作区里每一份 Chrome 配置目录都被整目录挡住（本机发现 {len(_real_found)} 份）")
+
+def test_suite_exit_code_guard_gate():
+    print("\n═══ AG. 全绿不许被读成失败：套件退出码口径（第 23 条硬门）═══")
+    # 由来（2026-11-14 本机自审抓到）：test_keyword_resume_offline.py 打印完「全部通过：88 项
+    # 断言」仍以 rc=139 收场——Qt 与线程的析构留在解释器收尾里，那次段错误与判定毫无关系，却
+    # 把退出码改成非零。批跑只看退出码，一条全绿的套件就这样被读成一次失败，根因只能人工翻
+    # 日志定位。同族的另一格长在批跑入口自己身上（挂死被配成 134/137，而实测看门狗返回它自己
+    # 的 124），那一格由同一份文件里的 5c-IIB 用真信号钉住；这一节钉的是**静态口径**：清单里
+    # 每一份碰过 Qt 的套件都要在判定之后自己 flush + os._exit，而且范围必须来自批跑清单——
+    # 在门里重抄一份「哪些套件要跑」的表，就是下一次分叉的开始。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    def _run_gate(texts, suites=None, root=None):
+        """在临时目录里复现「清单就是这几份」：门读的是 ROOT/rel，夹具就得按相对路径落盘。"""
+        root = root or Path(tempfile.mkdtemp(prefix="ag_exit_gate_"))
+        for rel, body in texts.items():
+            dst = root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(body, encoding="utf-8")
+        with _patch(gate, "ROOT", root):
+            return gate.check_suite_exit_code_guard(list(texts) if suites is None else suites)
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    for _fn in ("check_suite_exit_code_guard", "regression_suites", "_regression_scope_problem"):
+        _assert(callable(getattr(gate, _fn, None)),
+                f"门模块里有 {_fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("exit_guard = check_suite_exit_code_guard()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 23 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 23 条报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::套件退出码口径" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：写明是「判定与退出码不同源」，不是「套件失败」")
+
+    # ── 2) 范围与批跑同源，而且真仓库今天全绿 ──
+    _rc, _files, _err = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _assert(len(_files) >= 50,
+            f"--list 展开出 {len(_files)} 项：少于 50 说明发现逻辑或 --list 的 stdout 契约坏了")
+    _assert(all(x.endswith(".py") and not x.startswith("/") and (_REPO / x).is_file()
+                for x in _files),
+            "--list 的 stdout 契约：每行一个仓库相对、磁盘上真实存在的 .py 路径（进度与诊断走 stderr）")
+    _qt = [x for x in _files
+           if gate._QT_SUITE_HINT.search(gate._qt_code_lines(
+               (_REPO / x).read_text(encoding="utf-8", errors="replace")))]
+    _assert(len(_qt) >= 20,
+            f"清单里 {len(_qt)} 份碰过 Qt（少于 20 = 「Qt 字样」这一口径已经和现实脱节，"
+            f"门会在自己没注意到的地方空转）")
+    _assert_eq(gate.check_suite_exit_code_guard(), [],
+               "第 23 条：今天清单里每一份 Qt 套件都以 sys.stdout.flush() + os._exit 收尾")
+
+    # ── 3) 逐份自证：把真文件里那行 os._exit 摘掉，门当场要响并且点它的名 ──
+    # 只钉「调用点在」是不够的：真仓库那条 ✅ 可能只是在判一个空集合。
+    _exit_re = re.compile(r"^\s*os\._exit\(.*$", re.M)
+    _shared_root = Path(tempfile.mkdtemp(prefix="ag_exit_gate_real_"))
+    for _rel in _qt:
+        _body = (_REPO / _rel).read_text(encoding="utf-8", errors="replace")
+        _assert(_exit_re.search(_body) is not None,
+                f"{_rel} 今天就带着 os._exit——摘得到，才谈得上证明它真在门里被读到")
+        _got = _run_gate({_rel: _exit_re.sub("", _body)}, root=_shared_root)
+        _assert(any(_rel in x and "没有 os._exit 收尾" in x for x in _got),
+                f"摘掉收尾那行，{_rel} 当场响（实际={_got[:1]}）")
+
+    # ── 4) 形态正反：口径严到「写法」这一层，否则同样的坑换一种写法就又躲过去了 ──
+    _QT_HEAD = ("import os\nimport sys\nfrom PyQt5.QtWidgets import QApplication\n\n")
+    _GOOD = (_QT_HEAD + "app = QApplication.instance() or QApplication(sys.argv)\n"
+             "print('结果：7 通过 / 0 失败')\nrc = 0\n"
+             "sys.stdout.flush()\nsys.stderr.flush()\nos._exit(rc)\n")
+    _assert_eq(_run_gate({"ag_ok.py": _GOOD}), [],
+               "放行：判定打完 → flush → os._exit 收尾（这一份就是清单里 25 份的共同形状）")
+    _assert_eq(_run_gate({"ag_ok2.py": _GOOD.replace("os._exit(rc)\n",
+                                                     "os._exit(rc)  # 把结论交给操作系统\n")}), [],
+               "放行：行尾注释不该把收尾读没（拆代码要连着尾注释一起剥，与第 21 条同一口径）")
+    _got = _run_gate({"ag_noclose.py": _GOOD.replace("os._exit(rc)\n", "")})
+    _assert_eq(len(_got), 1, f"反向对照：没有 os._exit 收尾要响（实际={_got}）")
+    _assert("sys.stderr.flush()" in _got[0],
+            f"要把「最后一行代码是什么」原样打出来，人才知道差在哪一句（实际={_got[0][:90]}）")
+    # 本轮 frozen 套件自己就是这一形状：结论打完交给解释器收尾，rc 随机 139。
+    _got = _run_gate({"ag_oldshape.py": _QT_HEAD + "app = QApplication(sys.argv)\n"
+                                                  "print('结果：7 通过 / 0 失败')\n"
+                                                  "sys.exit(main())\n"})
+    _assert_eq(len(_got), 1, f"反向对照：`sys.exit(main())` 结尾同样要响（实际={_got}）")
+    _assert("sys.exit(main())" in _got[0], f"报的要就是那一句（实际={_got[0][:90]}）")
+    _got = _run_gate({"ag_after.py": _GOOD + "print('这段永远跑不到')\n"})
+    _assert_eq(len(_got), 1, f"反向对照：os._exit 之后还有代码＝收尾是死代码（实际={_got}）")
+    _assert("之后还有会执行的代码" in _got[0], f"（实际={_got[0][:80]}）")
+    _got = _run_gate({"ag_noflush.py": _QT_HEAD + "print('结果：7 通过 / 0 失败')\nrc = 0\n"
+                                                 "os._exit(rc)\n"})
+    _assert_eq(len(_got), 1, f"反向对照：不 flush 就交退出码＝屏幕上是一套话、机器读到另一套（实际={_got}）")
+    _assert("sys.stdout.flush()" in _got[0], f"要指名缺哪一个动作（实际={_got[0][:90]}）")
+    # 只 flush stderr 不算：那段汇总打在 stdout 上，而 CPython 的 stderr 从 3.9 起就是行缓冲。
+    _got = _run_gate({"ag_stderr.py": _QT_HEAD + "print('结果：7 通过 / 0 失败')\nrc = 0\n"
+                                                 "sys.stderr.flush()\nos._exit(rc)\n"})
+    _assert_eq(len(_got), 1, f"反向对照：只 flush stderr 也要响（实际={_got}）")
+    _assert("sys.stdout.flush()" in _got[0],
+            f"报的话要与判据一致：这一格缺的是 stdout 那一路（实际={_got[0][:90]}）")
+    _got = _run_gate({"ag_far.py": _QT_HEAD + "print('结果：7 通过 / 0 失败')\nrc = 0\n"
+                                              "sys.stdout.flush()\na = 1\nb = 2\nc = 3\nd = 4\n"
+                                              "os._exit(rc)\n"})
+    _assert_eq(len(_got), 1,
+               f"反向对照：flush 离交退出码隔了 4 行也算没收尾——中间那几步随时可能自己崩（实际={_got}）")
+    _got = _run_gate({"ag_commented.py": _QT_HEAD + "print('结果：7 通过 / 0 失败')\nrc = 0\n"
+                                                    "sys.stdout.flush()\n# os._exit(rc)\n"})
+    _assert_eq(len(_got), 1, f"反向对照：把 os._exit 注释掉不算收尾（实际={_got}）")
+    _assert("没有 os._exit 收尾" in _got[0], f"（实际={_got[0][:80]}）")
+
+    # ── 5) 判据范围：只有注释提到 Qt 的文件不算「碰过 Qt」 ──
+    _assert_eq(_run_gate({"ag_ok3.py": _GOOD,
+                          "ag_qt_comment.py": "# from PyQt5.QtWidgets import QApplication\n"
+                                              "print('结果：1 通过 / 0 失败')\n"}), [],
+               "放行：那份只在注释里提 Qt 的套件不进判定（门读代码不读文案，与第 21/22 条同口径）")
+    _got = _run_gate({"ag_qt_comment.py": "# from PyQt5.QtWidgets import QApplication\n"
+                                          "print('结果：1 通过 / 0 失败')\n"})
+    _assert_eq(len(_got), 1, f"反向对照：一份 Qt 套件都没判到时要响，不许报绿（实际={_got}）")
+    _assert("都没判到" in _got[0], f"响的要是「口径脱节」而不是「这份没收尾」（实际={_got[0][:80]}）")
+
+    # ── 6) fail-closed：范围取不到时三条门一条都没跑，这种「没问题」必须响 ──
+    for _cmd, _want in (
+            (("bash", "-c", "echo 清单解析炸了 >&2; exit 3"),
+             ["批跑清单取不到", "退出码 3", "清单解析炸了"]),
+            (("bash", "-c", "exit 0"), ["清单是空的"]),
+            (("zz_ag_这个命令不存在",), ["起不来"]),
+    ):
+        with _patch(gate, "REGRESSION_LIST_CMD", _cmd):
+            _got = gate.check_suite_exit_code_guard()
+        _assert(len(_got) >= 1, f"反向对照：清单命令换成 {_cmd} 之后不许安静报绿")
+        for _w in _want:
+            _assert(_w in _got[0], f"清单坏掉的报告要带上「为什么」与「原始 stderr」（缺 {_w}，实际={_got[0][:120]}）")
+    with _patch(gate, "REGRESSION_LIST_CMD", ("bash", "-c", "printf 'debug/zz_ag_ghost.py\\n'")):
+        _got = gate.check_suite_exit_code_guard()
+    _assert(any("读不到源码" in x for x in _got),
+            f"反向对照：stdout 契约被污染（混进不存在的路径）要响在「这一路判不了」上（实际={_got}）")
+    _got = _run_gate({}, suites=["debug/ag_gate23_absent.py"])
+    _assert(any("读不到源码" in x for x in _got), f"在清单里、磁盘上没有：要说这一路判不了（实际={_got}）")
+    _assert(any("都没判到" in x for x in _got), f"同一条红链上 judged=0 也要响：空集合上的合格不算（实际={_got}）")
+
+
+def test_regression_suites_tracked_gate():
+    print("\n═══ AH. 本机绿的那一路回归，CI 里得真有：套件入库跟踪（第 24 条硬门）═══")
+    # 由来（2026-11-14 本轮清点批跑清单抓到）：54 路离线回归里有 **5 份只活在这台开发机上**
+    # ——git 历史里从来没有它们。批跑照跑、计数照对、日志一句缺失都不留，而 CI 检出的仓库因此
+    # 永远少 5/54 路覆盖。这一类比「套件坏了」更坏：坏套件会红，少一套件只会让「绿」的含义
+    # 悄悄变小。所以判据的范围直接取自批跑清单（与第 23 条同源），问的却是 git 自己的答案：
+    # 「CI 检出这个提交之后，这一路到底在不在」。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    @contextlib.contextmanager
+    def _git_state(index=(), head=(), dirty=()):
+        """把「git 眼里被跟踪/被改动的是哪些」换成给定清单（不碰真仓库的索引）。"""
+        _old_ts, _old_dp = gate._tracked_sets, gate._dirty_paths
+        gate._tracked_sets = lambda: (set(index), set(head))
+        gate._dirty_paths = lambda: set(dirty)
+        try:
+            yield
+        finally:
+            gate._tracked_sets, gate._dirty_paths = _old_ts, _old_dp
+
+    # ── 1) 接线 ──
+    _assert(callable(getattr(gate, "check_regression_suites_tracked", None)),
+            "门模块里有 check_regression_suites_tracked（能被单独喂清单）")
+    _at = gate_src.find("suite_track = check_regression_suites_tracked()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 24 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 24 条报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::离线套件入库跟踪" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：写明是「本机有、提交里没有」")
+
+    # ── 2) 真仓库：清单里每一路都已在提交里；当年漏掉的那 5 份单独钉一次 ──
+    _rc, _files, _err = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _assert_eq(gate.check_regression_suites_tracked(), [],
+               "第 24 条：清单展开出来的每一路套件都已在提交里（红了就照每条前面的 git 命令做）")
+    _scar = ("debug/verify_gys_offline.py", "debug/gi_mp_offline_check.py",
+             "debug/gi_pace_offline_test.py", "debug/local_scan_offline_test.py",
+             "debug/qzd_channel_offline_test.py")
+    for _rel in _scar:
+        _assert(_rel in _files, f"{_rel} 仍在批跑清单里（这一节钉的就是它们，移出清单要一并改这里）")
+        _assert_eq(gate.tracked_state(_REPO / _rel), "ok",
+                   f"{_rel} 曾经只活在这台开发机上（本机绿、CI 检出后压根没这个文件）")
+
+    # ── 3) 三种 git 状态各响一次，措辞与处置一一对应 ──
+    _one = _files[0]
+    _assert_eq(gate.check_regression_suites_tracked(_files), [],
+               "放行（合成）：清单里每一份都在提交里、都没被改过")
+    with _git_state(index=[x for x in _files if x != _one],
+                    head=[x for x in _files if x != _one]):
+        _got = gate.check_regression_suites_tracked(_files)
+    _assert_eq(len(_got), 1, f"反向对照：少一份就响一条，不多不少（实际={_got}）")
+    _assert(_one in _got[0] and "从未被 git 跟踪" in _got[0] and "git add" in _got[0],
+            f"「压根没跟踪」的措辞要给 git add（实际={_got[0][:100]}）")
+    with _git_state(index=_files, head=[x for x in _files if x != _one]):
+        _got = gate.check_regression_suites_tracked(_files)
+    _assert_eq(len(_got), 1, f"反向对照：只 add 没提交也要响（实际={_got}）")
+    _assert("已 git add 但还没提交" in _got[0],
+            f"这一类的处置是 commit，不是 add——写错一步就白跑一轮（实际={_got[0][:100]}）")
+    with _git_state(index=_files, head=_files, dirty=[_one]):
+        _got = gate.check_regression_suites_tracked(_files)
+    _assert_eq(len(_got), 1, f"反向对照：在提交里但工作区改过也要响（实际={_got}）")
+    _assert("两份内容不是同一份" in _got[0],
+            f"要说清为什么「本机跑绿」对交付没有担保（实际={_got[0][:110]}）")
+    _assert("它是批跑清单里的一路回归" in _got[0],
+            f"要把「为什么这一份值得判」带上，否则读起来像通用提交检查（实际={_got[0][:140]}）")
+
+    # ── 4) 范围真的等于批跑清单（门里没有第二套发现逻辑） ──
+    with _git_state():
+        _got = gate.check_regression_suites_tracked(_files)
+    _assert_eq(len(_got), len(_files),
+               f"清单里 {len(_files)} 项在空 git 状态下要逐条点名（实际 {len(_got)} 条）"
+               f"——只报一句「有文件没提交」就没人知道少的是哪几路")
+    _named = [x for x in _files if any(x in p for p in _got)]
+    _assert_eq(len(_named), len(_files),
+               f"每一条都要归得到具体文件（归属不干净＝批跑里少一路时看不出来）")
+
+    # ── 5) fail-closed：问不到 git 与问不到清单，都不许按合格返回 ──
+    with _patch(gate, "in_work_tree", lambda: False):
+        _got = gate.check_regression_suites_tracked()
+    _assert_eq(len(_got), 1, f"反向对照：不在 work tree 里就直接收（实际={_got}）")
+    _assert("不许按合格返回" in _got[0], f"响的话要说清这是「问不到」而不是「没问题」（实际={_got[0][:90]}）")
+    with _patch(gate, "REGRESSION_LIST_CMD", ("bash", "-c", "exit 7")):
+        _got = gate.check_regression_suites_tracked()
+    _assert(any("批跑清单取不到" in x for x in _got),
+            f"反向对照：清单取不到时第 24 条也要响（范围断了＝这一条从没跑过）（实际={_got}）")
+    _got = gate.check_regression_suites_tracked(["debug/ag_gate24_absent.py"])
+    _assert(any("磁盘上没有" in x for x in _got),
+            f"在清单里但磁盘上没有：批跑入口会拦，门也要同步点名（实际={_got}）")
+
+
+def test_no_dev_machine_paths_gate():
+    print("\n═══ AI. 只对一台机器成立的绝对路径：交付链禁止写死路径（第 25 条硬门）═══")
+    # 由来（2026-11-14 本轮自审）：批跑入口的第 20 行曾经写死一个开发机绝对路径再 `|| exit 1`
+    # ——换一台机器（含 CI 打包机）第一步就退；同族的写法散在 19 份套件（sys.path.insert(0,
+    # "/Users/…")）与几份 shell 里。这类缺陷的坏，不在于它难修，而在于**它在这台机器上永远不
+    # 响**：所有断言都是绿的，只有换机器那一刻才炸，而那时没人怀疑得到一行路径。判据要覆盖的
+    # 也不止 python：交付 shell、workflow、门禁脚本自己都在同一台机器上被读进来。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    def _shape(*parts: str) -> str:
+        """把「门要抓的那串字节」在运行时拼出来，源码里一个字面量都不留。
+
+        这一节的夹具本身就是第 25 条要拦的形状，而门扫的是**源码文本**：坏写法一字不差地写在
+        测试文件里，真仓库那一格就会响在自己的测试文本上（本轮实测响了 10 行）。拼起来之后喂进
+        门的字节完全一样，判据不打折，但源码里再没有一行会被扫成开发机路径——静态文本类判据的
+        夹具都该这么写。用豁免表给测试自己开后门是另一种做法，代价是那张表从此变成漏口的入口。
+        """
+        return "".join(parts)
+
+    # ── 1) 接线 ──
+    for _fn in ("check_no_dev_machine_paths", "_dev_path_inputs"):
+        _assert(callable(getattr(gate, _fn, None)), f"门模块里有 {_fn}（能被单独喂夹具）")
+    _at = gate_src.find("dev_paths = check_no_dev_machine_paths()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 25 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 25 条报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::开发机绝对路径" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：给出按脚本位置推 / 问环境这两种改法")
+
+    # ── 2) 真仓库全绿 ──
+    _assert_eq(gate.check_no_dev_machine_paths(), [],
+               "第 25 条：交付链的源码、批跑套件、shell 与 workflow 里没有写死某台机器的路径")
+
+    # ── 3) 四种形状都要抓（类 unix 家目录 ×2、Windows 家目录 ×2） ──
+    _UP = _shape("/", "Users", "/someone/Desktop/Repo/x")            # 类 unix：macOS 家目录
+    _HP = _shape("/", "home", "/someone/Repo/x")                     # 类 unix：Linux 家目录
+    _WB = _shape("C:", "\\", "Users", "\\", "Someone\\Repo\\x")     # Windows：反斜杠写法
+    _WF = _shape("C:/", "Users", "/Someone/Repo/x")                   # Windows：正斜杠写法
+    for _rel, _line in (
+            ("ag_users.py", 'sys.path.insert(0, "' + _UP + '")'),
+            ("ag_home.py", 'p = "' + _HP + '"'),
+            ("ag_win_b.py", 'p = r"' + _WB + '"'),
+            ("ag_win_f.py", 'p = "' + _WF + '"'),
+    ):
+        _got = gate.check_no_dev_machine_paths({_rel: _line + "\n"})
+        _assert_eq(len(_got), 1, f"反向对照：{_rel} 那种写法要响（实际={_got}）")
+        _assert("只对一台机器成立的绝对路径" in _got[0],
+                f"结论要说的是「换台机器它指向不存在的文件」（实际={_got[0][:90]}）")
+        _assert(_line.split("=")[-1].strip()[:18] in _got[0] or "sys.path.insert" in _got[0],
+                f"要把现场那一行原样打出来，人才不用回去找（实际={_got[0][:110]}）")
+
+    # ── 4) 不是路径的东西不许响（判据越界和判据缺失一样会逼人跳过这一步） ──
+    _assert_eq(gate.check_no_dev_machine_paths({
+        "ag_ok.py": (
+            'from pathlib import Path\n'
+            'HERE = Path(__file__).resolve().parent\n'
+            'DESKTOP = Path.home() / "Desktop" / "B2B三站企业数据自动采集工具"\n'
+            'legacy = os.path.expanduser("~/Desktop/x")\n'
+            'url = "https://cdn.example.com/home/a/b.png"\n'
+            'api = "https://api-site/Users/list"\n'
+            'rel = "b2bcollect_build/b2bcollect_data/x.json"\n'
+        )}), [],
+        "放行：按脚本位置推、问环境、URL 里的 /home/ 与 /Users/ 都不是文件系统路径")
+    _assert_eq(gate.check_no_dev_machine_paths({
+        "ag_doc.py": '# 旧写法是 "' + _shape("/", "Users", "/someone/Desktop/Repo")
+                     + '"，现在按 __file__ 推\np = 1\n'}), [],
+        "放行：整行注释里的举例路径不算现场代码（与第 21/23 条同一条「门读代码不读文案」）")
+    _assert_eq(len(gate.check_no_dev_machine_paths(
+                   {"ag_str.py": 'TIP = "在 ' + _shape("/", "Users", "/someone/Desktop")
+                                  + ' 那台机器上手改一次"\n'})), 1,
+               "反向对照（边界写在案上）：判据不区分注释与字符串——**说明文字**里的例子如果非要"
+               "留着，就去 DEV_PATH_EXEMPT 登记字样和理由，而不是把判据放宽到抓不住真代码")
+
+    # ── 5) 豁免按「文件 + 字样」生效，且登记表不许过期 ──
+    _JF = _shape("/", "Users", "/jhnoplan/Desktop/AI", "云展")       # 与真表里那条同款的形状
+    _two = ("p = '" + _JF + "/m'\n"
+            "q = '" + _shape("/", "Users", "/someone/Desktop/other") + "'\n")
+    with _patch(gate, "DEV_PATH_EXEMPT", {"ag_ex.py": [(_JF, "夹具：打包态绝不读它")]}):
+        _got = gate.check_no_dev_machine_paths({"ag_ex.py": _two})
+    _assert_eq(len(_got), 1,
+               f"反向对照：豁免只免那一行，同文件里的下一条同类写法照样响（实际={_got}）")
+    _assert("someone/Desktop/other" in _got[0], f"响的要是没登记的那一条（实际={_got[0][:110]}）")
+    with _patch(gate, "DEV_PATH_EXEMPT", {"ag_ex.py": [("zz_ag_字样已经改名", "夹具")]}):
+        _got = gate.check_no_dev_machine_paths({"ag_ex.py": _two})
+    _assert(any("今天已经不命中" in x for x in _got),
+            f"反向对照：豁免登记的字样今天找不到＝名单过期，要响（实际={_got}）")
+    # 登记给一份**根本不在视野里**的文件：子集扫描不判（不然每喂一份夹具都要连带报四行与本次
+    # 判定无关的「过期」，而噪音会把真信号盖掉——本轮第一跑就红在这一格上），但**全量**那一格
+    # 必须管得住：文件改了名、挪了目录，挂着理由的表就是下一条同类写法的入口。
+    with _patch(gate, "DEV_PATH_EXEMPT",
+                dict(gate.DEV_PATH_EXEMPT, **{"ag_never_here.py": [("anything", "夹具：没这份文件")]})):
+        _got = gate.check_no_dev_machine_paths({"ag_ex.py": _two})
+    _assert(not any("ag_never_here.py" in x for x in _got),
+            f"子集扫描不许替整张表背书（实际={_got}）")
+    with _patch(gate, "DEV_PATH_EXEMPT",
+                dict(gate.DEV_PATH_EXEMPT, **{"ag_never_here.py": [("anything", "夹具：没这份文件")]})):
+        _got = gate.check_no_dev_machine_paths()
+    _assert(any("ag_never_here.py" in x and "不在第 25 条的视野里" in x for x in _got),
+            f"反向对照：全量扫描下，登记给一份读不到的文件要当场响（实际={_got[:1]}）")
+    _got = gate.check_no_dev_machine_paths({"ag_ex.py": _two})
+    _assert_eq(len(_got), 2,
+               "反向对照：上面几格的豁免都是合成输入，不落到真名单里——同一份字节交给真表再判"
+               "一次，两条都得响（今天真表里没有 ag_ex.py 这一项）")
+
+    # ── 6) 表上每一条豁免都得是**承重**的：撤掉它，真仓库当场要响在那一行 ──
+    _table = dict(gate.DEV_PATH_EXEMPT)
+    _assert(_table, "豁免表非空（本节的第 5、7 格都靠它自证，空表时那两格在判空气）")
+    with _patch(gate, "DEV_PATH_EXEMPT", {}):
+        _got = gate.check_no_dev_machine_paths()
+    for _rel, _entries in _table.items():
+        for _token, _why in _entries:
+            _assert(any(_rel in x and _token in x for x in _got),
+                    f"{_rel} 里那条「{_token}」的豁免必须在承重：撤掉豁免后门要响在这一行上，"
+                    f"否则登记的是一条已经不存在的理由（实际={_got[:1]}）")
+
+    # ── 7) 范围：交付目录 + 批跑清单 + 交付 shell + workflow + 门禁自己，一个都不许漏 ──
+    _inputs = gate._dev_path_inputs()
+    _rels = {gate._rel_posix(p) for p in _inputs}
+    _rc, _files, _err = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _assert(set(_files) <= _rels,
+            f"清单里每一份套件都在第 25 条的视野内（缺 {sorted(set(_files) - _rels)[:4]}）"
+            f"——门与批跑分叉的方向永远是「少判一侧」")
+    _build = {p.relative_to(_REPO).as_posix() for d in sorted(_REPO.iterdir())
+              if d.is_dir() and d.name.endswith("_build") for p in d.glob("*.py")}
+    _assert(_build <= _rels, f"所有 *_build/*.py 进包源码都在视野内（缺 {sorted(_build - _rels)[:4]}）")
+    for _rel in tuple(gate.SHELL_SOURCES) + tuple(gate.WORKFLOWS):
+        _assert(_rel in _rels, f"{_rel} 在视野内：交付 shell 与 workflow 写死路径时，"
+                               f"坏的是**构建机**上那一步，不是本机")
+    _assert(".github/scripts/check_packaging_manifest.py" in _rels,
+            "门禁脚本自己也在视野内（它自己写死一台机器，其余 26 条判据就全都在那台机器上）")
+    _probe = "riskbird_build/test_qizhidao.py"
+    _assert(_probe in _rels, f"取一份「只从批跑清单进视野」的套件做注入：{_probe}")
+    _txt = _inputs[next(p for p in _inputs if gate._rel_posix(p) == _probe)]
+    _got = gate.check_no_dev_machine_paths(
+        {_probe: _txt + '\nLEAK = "' + _shape("/", "Users", "/someone/Desktop/x.py") + '"\n'})
+    _assert_eq(len(_got), 1, f"反向对照：往真套件文本里注一行开发机路径要响（实际={_got}）")
+    _assert(_probe in _got[0], f"要报到文件名（实际={_got[0][:80]}）")
+
+    # ── 8) fail-open 不许：一份源码都没读到时，「没有开发机路径」这句话没有含义 ──
+    _got = gate.check_no_dev_machine_paths({})
+    _assert_eq(len(_got), 1, f"反向对照：输入为空时必须响（实际={_got}）")
+    _assert("扫描范围断了" in _got[0], f"响的要是「范围断了」而不是「都合格」（实际={_got[0][:90]}）")
+    _empty = Path(tempfile.mkdtemp(prefix="ai_dev_path_empty_root_"))
+    with _patch(gate, "ROOT", _empty):
+        _assert_eq(gate._dev_path_inputs(), {}, "夹具：空仓库根下真的读不到任何输入")
+        _got = gate.check_no_dev_machine_paths()
+    _assert_eq(len(_got), 1, f"反向对照：ROOT 落空时同样不许报绿（实际={_got}）")
+
+
+
+def test_temp_dir_single_source_gate():
+    print("\n═══ AJ. 落点不许跟着兜底串漂：TEMP 取值一处口径（第 26 条硬门）═══")
+    # 由来（2026-11-15 本机自审抓到）：交付链里九处写成 ``Path(os.environ.get("TEMP",
+    # r"C:\\temp"))``。Mac/Linux 上根本没有 TEMP 这个环境变量，兜底串于是变成一个**相对**
+    # 路径——本机仓库里真长出过两个名为 ``C:\\temp`` 的目录（仓库根一个、b2bcollect_build/
+    # 一个，都是空的，谁建的看不出来）。难看只是表面：这些目录是当「老登录态在哪」传给
+    # browser_profile_dir 的，而那条链上的 choose_writable 会先 mkdir 写探针、再挑**第一个
+    # 真能写的**目录。持久位置一旦写不进去（只读挂载、权限策略、App Translocation），付费
+    # 账号的 Cookie 就落到工作区里，等着下一次 ``git add <目录>``——第 22 条判的正是那一刻，
+    # 但第 22 条只能兜住「已经长出来」，兜不住「为什么会长在这儿」。这条门判的是取值口径。
+    # 判法刻意不判「这一行外面有没有 win32 守卫」：静态判守卫迟早误报，而误报的代价是人
+    # 开始跳过这一步；换成「TEMP 只许在 legacy_temp_root 那一处被读」之后，判据是**位置**。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 1) 接线：判据在、被 main() 调用、结果进退出码、云端留下能照做的 annotation ──
+    for _fn in ("check_temp_dir_single_source", "_temp_read_sites", "_helper_body"):
+        _assert(callable(getattr(gate, _fn, None)),
+                f"硬门模块里有 {_fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("temp_dir_gaps = check_temp_dir_single_source()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 26 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::临时目录口径" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「又多了一处 TEMP 取值」并点名改法")
+    _assert_eq(sorted(gate.TEMP_HELPER_FILES),
+               ["b2bcollect_build/tool_config.py", "riskbird_build/runtime_paths.py"],
+               "唯一允许读 TEMP 的两处就是那两份同名镜像实现（登记表本身就是口径声明）")
+
+    # ── 2) 今天的真仓库：全绿，而且「只有一处」这句结论是有内容的 ──
+    _assert_eq(gate.check_temp_dir_single_source(), [],
+               "第 26 条：交付链里 TEMP 只在同口径的那两处被读")
+    for _rel, _mod_name in sorted(gate.TEMP_HELPER_FILES.items()):
+        _txt = (_REPO / _rel).read_text(encoding="utf-8")
+        _hits, _spans, _err = gate._temp_read_sites(_txt)
+        _assert_eq(_err, None, f"{_rel} 要解析得过，否则这条门在这一侧是空跑")
+        _assert(_hits, f"{_rel} 里要真能找到 TEMP 读取点（找不到＝扫描口径与源码写法已经分叉，"
+                       "「只有一处」就成了在判空气）")
+        _assert_eq(sorted({_spans.get(h) for h in _hits}), [gate.TEMP_HELPER_NAME],
+                   f"{_rel} 的每一处 TEMP 读取都必须在 {gate.TEMP_HELPER_NAME}() 函数体内"
+                   "（别处多一处就是又开一个口径）")
+
+    # ── 3) 疤痕判据：本轮真改过的那八个调用点，现在都必须走 helper ──
+    # 只判「没有坏写法」不够：把调用点整段删掉也能全绿，而那正好丢掉接管老登录态的功能
+    # （2026-11-13 Windows 实机那次「换个账号 1688 就 0 家」的回归就此复活）。
+    _must_call = ("b2bcollect_build/shared_chrome.py", "ali1688_build/ali1688_crawler.py",
+                  "riskbird_build/aiqicha_crawler_v2.py", "riskbird_build/riskbird_crawler_v2.py",
+                  "riskbird_build/qizhidao_crawler.py", "riskbird_build/dual_session.py",
+                  "riskbird_build/riskbird_gui.py", "riskbird_build/riskbird_crawler.py")
+    _rel_of = {(_p if isinstance(_p, str) else _p.relative_to(_REPO).as_posix()): _t
+               for _p, _t in gate._dev_path_inputs().items()}
+    for _rel in _must_call:
+        _txt = _rel_of.get(_rel)
+        _assert(_txt is not None, f"{_rel} 在第 26 条的视野里（不在＝这份从来没被判过）")
+        _assert("legacy_temp_root()" in _txt,
+                f"{_rel} 现在真的从 helper 取临时目录（本轮之前它自己读过 TEMP）")
+
+    # ── 4) 行为对拍：两侧 helper 在四种运行形态下给同一个答案 ──
+    # 静态判据只保证「一处口径」，保证不了那一处**算得对**。这里直接调生产函数，把
+    # sys.platform 与 TEMP 两件事都拨到给定形态。判的性质：非 Windows 上算出来的落点必须
+    # 是绝对路径（相对＝跟着当前工作目录跑，本轮的仓库污染就是这么来的）；Windows 那一支
+    # 在本机没法判绝对性（posixpath 不认识盘符），但它的答案本身被钉死成 %TEMP% / C:\\temp。
+    import types
+    # 这一节必须自己把 riskbird_build 导到手：sys.path 上那条路径是 site_adapters 在
+    # import 时 append 的，本节原先指望「前面某节已经导过」——单节驱动（只跑 AF+AJ）时
+    # 那条路径根本不存在，当场 ModuleNotFoundError。跨目录对拍的用例要能单独跑，
+    # 否则「这一节绿」取决于别的节跑没跑过。
+    import site_adapters as _sa       # noqa: F401  只借它把 riskbird_build 挂上 sys.path
+    import runtime_paths as _rp
+    _cases = (("win32", "D:\\work\\tmp", "D:\\work\\tmp", False),
+              ("win32", None, "C:\\temp", False),
+              ("darwin", "/should/be/ignored", "/tmp", True),
+              ("linux", None, "/tmp", True))
+    # 这一格里整个 os.environ 用 _patch 换掉，不写 environ[...] 那种字面形状：第 26 条对
+    # 「environ 下标」是一刀切的（它不去猜这一处是读还是写），夹具自踩这道门就是给自己找一条
+    # 解释不通的红；而给测试开门槛（豁免表加一行）更不行——那等于把这条门的视野弄假。
+    # 顺带好处：这一格从此不会真的改到这台机器的 TEMP。
+    for _plat, _temp, _want, _need_abs in _cases:
+        _env = {} if _temp is None else {"TEMP": _temp}
+        _vals = []
+        with _patch(os, "environ", _env):
+            for _mod in (tc, _rp):
+                with _patch(_mod, "sys", types.SimpleNamespace(platform=_plat)):
+                    _p = _mod.legacy_temp_root()
+                    _vals.append(str(_p))
+                    if _need_abs:
+                        _assert(_p.is_absolute(),
+                                f"{_mod.__name__} 在 {_plat} 给出的是相对路径「{_p}」——"
+                                "它会跟着当前工作目录跑（本轮就是长在仓库里）")
+                        _assert(not str(_p).lower().startswith("c:"),
+                                f"{_mod.__name__} 在 {_plat} 还带着 Windows 兜底串「{_p}」")
+        _assert_eq(_vals, [_want, _want],
+                   f"运行形态 {_plat}/TEMP={_temp}：两份同名实现要给同一个答案"
+                   "（不一样＝镜像实现分叉，而调用点各引一侧）")
+
+    # ── 5) 反向对照：坏写法各响一条，并点名行号与改法 ──
+    def _one(name, body):
+        return gate.check_temp_dir_single_source({name: body})
+
+    _head = "x = 1\n\ndef f():\n    "
+    for _tag, _src in (
+            ("environ.get 带 Windows 兜底", _head + 'p = os.environ.get("TEMP", r"C:\\temp")\n'),
+            ("environ.get 没有兜底串（外面套着 win32 守卫也算）",
+             _head + 'if sys.platform == "win32":\n        p = os.environ.get("TEMP")\n'),
+            ("os.getenv", _head + 'p = os.getenv("TEMP", "/tmp")\n'),
+            ("下标写法", _head + 'p = os.environ["TEMP"]\n'),
+            ("顶层（不在任何函数里）", 'import os\np = os.environ.get("TEMP")\n')):
+        _got = _one("aj_probe.py", _src)
+        _assert_eq(len(_got), 1, f"「{_tag}」要响恰好一条（实际={_got}）")
+        _assert("aj_probe.py 第" in _got[0] and "legacy_temp_root()" in _got[0],
+                f"「{_tag}」报的要带行号与改法，云端照着这一行就能动手（实际={_got[0]}）")
+
+    # ── 6) 放行格：注释与 docstring 里的举例不算判据（这条门其它格同一个口径） ──
+    _assert_eq(_one("aj_ok.py",
+                    '# 以前这里写 os.environ.get("TEMP", r"C:\\temp")\n'
+                    'p = os.getcwd()\n'), [],
+               "放行：注释里那句不是调用（红在文案上的门，最后都会被人整条跳过）")
+    _assert_eq(_one("aj_ok2.py",
+                    'def f():\n    """说明：os.environ.get("TEMP") 在 Mac 上取不到。"""\n'
+                    '    return 1\n'), [],
+               "放行：docstring 里的举例在 AST 上没有调用节点")
+    # helper 本体的文本先摆在这里：第 6、7 两节都要拿它当「合格那一侧」的基准，
+    # 定义必须挨着第一次用到它的地方，否则读的人要跳到几十行外才知道基准长什么样。
+    _good = ("def legacy_temp_root():\n"
+             '    if sys.platform == "win32":\n'
+             '        return Path(os.environ.get("TEMP") or r"C:\\temp")\n'
+             '    return Path("/tmp")\n')
+    # helper 本体那一处必须放行，而且只能在**登记文件 + 自己的函数体内**放行
+    _assert_eq(gate.check_temp_dir_single_source(
+                   {"b2bcollect_build/tool_config.py": _good}), [],
+               "放行：登记文件里 helper 函数体内那一处就是口径本体")
+    # 夹具必须**带着 helper 本体**再多一处读取：少了 helper，这一格会同时收到「helper 判不出结构」
+    # 那条真红，而本格要问的只是「豁免按函数还是按文件」。两件事混在一格里，计数就得接受 2 条
+    # （本机上一版正是这样），那时验的已经不是这一格说的那件事了。
+    _extra_read = "def other():\n    return os.environ.get(\"TEMP\")\n"
+    _got = gate.check_temp_dir_single_source(
+        {"b2bcollect_build/tool_config.py": _good + "\n" + _extra_read})
+    _assert_eq(len(_got), 1,
+               f"反向对照：登记文件里、helper 函数体之外的那一处不放行（豁免按函数不按文件）"
+               f"（实际={_got}）")
+    # 读取点落在哪一行从基准文本算出来（helper 那 4 行 + 1 个空行 + def 那 1 行），不写死数字
+    _assert(f"第 {len(_good.splitlines()) + 3} 行" in _got[0],
+            f"边界要报到行号，人才能在编辑器里落到那一行（实际={_got[0]}）")
+    _assert("legacy_temp_root()" in _got[0],
+            f"改法要直接点名 helper（实际={_got[0]}）")
+    _assert_eq(_one("aj_other_build/probe.py", 'import os\nx = os.environ.get("PATH")\n'
+                                             'y = os.getenv("TMPDIR")\n'), [],
+               "放行：读别的环境变量不在这条门范围内（判据越界和判据缺失一样会逼人绕过它）。"
+               "os.getenv 也要放行到**变量名**这一层：这一支认的是写法，不是「凡是 getenv 都响」")
+    _assert_eq(_one("aj_probe.yml", 'run: echo "$TEMP"\n'), [],
+               "放行：非 .py 不送去 ast.parse（门不在自己的视野边界上造噪音）")
+
+    # ── 7) 两侧实现分叉、helper 被改名/复制/搬进类里——都要响 ──
+    _fork = ("def legacy_temp_root():\n"
+             '    if sys.platform == "win32":\n'
+             '        return Path(os.environ.get("TEMP") or r"C:\\tmp2")\n'
+             '    return Path(tempfile.gettempdir())\n')
+    _files = {rel: _good for rel in gate.TEMP_HELPER_FILES}
+    _assert_eq(gate.check_temp_dir_single_source(dict(_files)), [],
+               "两份结构一致的 helper：这条门不响（先证明它不会因为「只剩 helper」而误报）")
+    _files["riskbird_build/runtime_paths.py"] = _fork
+    _got = gate.check_temp_dir_single_source(dict(_files))
+    _assert(any("结构不一致" in x for x in _got),
+            f"反向对照：只改一侧的镜像实现必须响（实际={_got}）")
+    _files["riskbird_build/runtime_paths.py"] = _good.replace("legacy_temp_root", "temp_root_x")
+    _got = gate.check_temp_dir_single_source(dict(_files))
+    _assert(any("恰好有一个" in x and "riskbird_build/runtime_paths.py" in x for x in _got),
+            f"反向对照：helper 被改名＝口径没了，要响在改名那一份文件上（实际={_got}）")
+    _files["riskbird_build/runtime_paths.py"] = _good + "\n" + _good
+    _got = gate.check_temp_dir_single_source(dict(_files))
+    _assert(any("实际 2 个" in x for x in _got),
+            f"反向对照：同名定义出现两次（后一份悄悄覆盖前一份）也要响（实际={_got}）")
+    _files["riskbird_build/runtime_paths.py"] = "class C:\n    " + _good.rstrip().replace("\n", "\n    ") + "\n"
+    _got = gate.check_temp_dir_single_source(dict(_files))
+    _assert(any("恰好有一个" in x for x in _got),
+            f"反向对照：搬进类里就不再是「那一处顶层口径」（实际={_got}）")
+
+    # ── 8) fail-closed：视野断了不许报绿 ──
+    _got = gate.check_temp_dir_single_source({})
+    _assert_eq(len(_got), 1, f"一份源码都没读到要说出口（实际={_got}）")
+    _assert("没有任何含义" in _got[0],
+            f"报的要是「视野断了」而不是「口径没问题」（实际={_got[0]}）")
+    _saved_inputs = gate._dev_path_inputs
+    try:
+        gate._dev_path_inputs = lambda: {"aj_a.py": "print(1)\n"}
+        _got = gate.check_temp_dir_single_source()
+        _assert(any("一处 TEMP 读取都没看到" in x for x in _got),
+                f"全量扫描下空集合要响（口径被人整段删掉时这条门不许绿）（实际={_got}）")
+        _got = gate.check_temp_dir_single_source({"aj_a.py": "print(1)\n"})
+        _assert_eq([x for x in _got if "一处 TEMP 读取都没看到" in x], [],
+                   "子集扫描不许替整条链背书（第 25 条同一课：拿全链的数量去要求一份夹具，"
+                   "得到的只是噪音）")
+        gate._dev_path_inputs = lambda: {"b2bcollect_build/tool_config.py": "def f(:\n"}
+        _got = gate.check_temp_dir_single_source()
+        _assert(any("解析不过" in x for x in _got),
+                f"反向对照：坏源码上判不出结构要响（实际={_got[:1]}）")
+    finally:
+        gate._dev_path_inputs = _saved_inputs
+    _saved_root = gate.ROOT
+    try:
+        gate.ROOT = _REPO / "aj_这个目录不存在"
+        _got = gate.check_temp_dir_single_source({"aj_x.py": "print(1)\n"})
+        _assert(sum(1 for x in _got if "读不到" in x) == 2,
+                f"反向对照：两份 helper 都读不到时各响一条（实际={_got}）")
+    finally:
+        gate.ROOT = _saved_root
 
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
@@ -8006,6 +8812,10 @@ SECTIONS = (
     test_curl_bounds_gate,
     test_qt_shutdown_teardown_gate,
     test_state_file_protection_gate,
+    test_suite_exit_code_guard_gate,
+    test_regression_suites_tracked_gate,
+    test_no_dev_machine_paths_gate,
+    test_temp_dir_single_source_gate,
 )
 
 
@@ -8038,4 +8848,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # 这一份自己也建过 QApplication（AE/AG 那些小节），而它是「套件的判定与退出码同不同源」
+    # 的对拍者——自己把最后一段留给解释器拆，就是举着一条自己正在拦的缺陷。硬门第 23 条对它
+    # 同样成立：结论打完，flush，然后由套件自己把退出码交给操作系统。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

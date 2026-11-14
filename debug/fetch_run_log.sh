@@ -9,7 +9,8 @@
 #      看起来成功的空文件）。
 #   ③ 失败原因不做「大概是这样」的猜测：把带 ::error:: / Traceback / ❌ 的行原样打出来。
 set -u
-cd /Users/jhnoplan/Desktop/PythonDemo || exit 2
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 RUN=${1:?用法: fetch_run_log.sh <run_id> [关键字]}
 KEY=${2:-}
 # GIT_TERMINAL_PROMPT=0：没凭证时 `git credential fill` 会去开 /dev/tty 问密码，既不读

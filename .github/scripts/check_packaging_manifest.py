@@ -137,6 +137,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -792,22 +793,32 @@ HYGIENE_SCRIPTS = (
 )
 
 
+# 这一条门一次判三件事，三件事的**处置完全不同**，所以每条问题都带类目标签：
+#   【文案】脚本里 `$VAR` 紧跟中文 → 改那一行的写法；
+#   【在位】登记表里的脚本读不到 → 要么把文件放回去，要么把登记删掉（不许留静默空转）；
+#   【未提交】工作区那份和提交里那份不是同一份 → 先 git commit，本机跑绿才算给交付担保。
+# 由来（2026-11-15 本机自审抓到）：今天满屏都是【未提交】那一类，而标题写的是
+# 「`$VAR` 紧跟中文会把报错那行本身弄坏」——照着标题去找文案 bug 的人会白找一轮，
+# 而这一条门报的红越「说不清自己在报什么」，下一次就越容易被整条跳过。
+HYGIENE_TAGS = ("文案", "在位", "未提交")
+
+
 def check_script_hygiene() -> list:
-    """第 9 条在「非打包入口」那几份脚本上的同样一份判据。"""
+    """第 9 条在「非打包入口」那几份脚本上的同样一份判据（三类问题各自带标签）。"""
     problems = []
     for rel in HYGIENE_SCRIPTS:
         path = ROOT / rel
         if not path.is_file():
-            problems.append(f"{rel} 不在位（登记了却读不到，这条判据正在空转）")
+            problems.append(f"【在位】{rel} 不在位（登记了却读不到，这条判据正在空转）")
             continue
         state = tracked_state(path) if in_work_tree() else "ok"
         if state != "ok":
             # 与第 7 条同一个坑，而且更阴：这里读的是**工作区**那份文本，CI 上跑的却是
             # 提交里那份。改过没提交时，「文案卫生」验的是不会被交付的内容，判据看着绿，
             # 真正上云的那份脚本可能正带着同一个 bug。所以脏也要红，措辞按状态分开。
-            problems.append(_state_hint(rel, state))
+            problems.append(f"【未提交】{_state_hint(rel, state)}")
         for msg in check_shell_hygiene(path.read_text(encoding="utf-8", errors="replace")):
-            problems.append(f"{rel} {msg}")
+            problems.append(f"【文案】{rel} {msg}")
     return problems
 
 
@@ -3139,7 +3150,102 @@ DEFAULT_SHAPES = (
      ("probe/chromedriver", "chromedriver.exe"),
      ("chromedriver", "chromedriver.exe"), ("", "")),
     ("chromedriver 压缩包", ("probe/chromedriver.zip",), (), ("chromedriver", ".zip")),
+    # 2026-11-15 本机自审补的三条：这三类当时**都在工作区里、都没被挡住**，而上一格
+    # （check_profile_dirs_ignored）只在目录真实存在时才判得到——CI 的干净检出里没有配置目录，
+    # 那里需要一条与磁盘无关的探针来保证 .gitignore 这几行还在。两侧都要有，缺任何一侧
+    # 得到的都是半条门：只有探针会漏「探针没列到的形状」，只有实扫会漏「CI 上被改坏的规则」。
+    ("Chrome 配置目录顶层的 Local State（Cookie 主密钥就在这一份里）",
+     ("probe/Local State", "a/b/probe/Local State"), ("Local State",), ("", "")),
+    ("Chrome 配置目录 Default/ 里的自动填充与账号数据",
+     ("probe/Default/Account Web Data", "probe/Default/Web Data"),
+     ("Account Web Data", "Web Data"), ("", "")),
+    ("Chrome 配置目录 Default/ 里的会话与标签状态",
+     ("probe/Default/Current Session", "probe/Default/Session Storage"),
+     ("Current Session", "Session Storage"), ("", "")),
 )
+
+
+# 第三格判据（2026-11-15 本机自审抓到）：**认「这是一份 Chrome user-data-dir」这件事**，
+# 不认我们自己起的目录名。上面那些按内部文件形状的探针列不全——本机四个开发用 profile
+# 里，除 Cookies/Login Data/History 之外还有 1528 个文件是 git 看得见的（`Local State`、
+# `Default/Account Web Data`、`Default/Web Data`、`Default/Session Storage/`、各种缓存与
+# .crx）。也就是说「下一次 `git add <目录>` 会不会把它们扫进索引」的真实答案是会，而门
+# 当时报的是绿：形状清单式判据的失效方式从来不是报错，是**列漏一类就安静漏一类**。
+# 所以这里判性质：目录里出现 Chrome 自己写的标志文件/子目录（`Local State`、`Default/`）
+# 就认定它是配置目录，然后要求 git 对它下面的**每一个**文件都说"看不见"。
+PROFILE_DIR_MARKERS = ("Local State", "Default")
+# 扫描范围：交付目录 + 开发脚本目录（A/B 探针在那里长 profile）+ 门禁自己的目录。
+PROFILE_SCAN_DIRS = ("b2bcollect_build", "riskbird_build", "ali1688_build", "debug", ".github")
+# 深度上限：配置目录只会是「某个项目目录里的一层」，更深就不是我们的落点；限深同时
+# 避免 walk 进 dist/ 这类几万文件的构建产物里空转。
+PROFILE_DIR_MAX_DEPTH = 3
+
+
+def find_profile_dirs(base=None, max_depth=PROFILE_DIR_MAX_DEPTH):
+    """工作区里现存的 Chrome 配置目录：返回 (仓库相对路径列表, 扫描本身的问题列表)。
+
+    只认标志、不认名字：``Local State``（文件）或 ``Default``（子目录）是 Chrome 自己写的，
+    我们的目录名随便改都逃不掉；反过来，一个恰好叫 ``xxx_profile`` 的源码目录不会被误判，
+    因为里面不会有那两个标志。
+    """
+    base = ROOT if base is None else Path(str(base))
+    found, misses = [], []
+    for top in PROFILE_SCAN_DIRS:
+        d = base / top
+        if not d.is_dir():
+            misses.append(f"第 22 条扫不到 {top}/：配置目录防护的扫描范围靠这几个目录，"
+                          "读不到不等于「没有配置目录」，按不合格算")
+            continue
+        base_depth = len(d.parts)
+        for cur, subdirs, files in os.walk(str(d)):
+            p = Path(cur)
+            if len(p.parts) - base_depth > max_depth:
+                del subdirs[:]
+                continue
+            subdirs[:] = [s for s in sorted(subdirs) if s not in (".git", "__pycache__")]
+            if "Local State" in files or "Default" in subdirs:
+                found.append(_rel_posix(p.relative_to(base)))
+                del subdirs[:]          # 配置目录内部不再往下找：整目录一起判
+    return sorted(set(found)), misses
+
+
+def check_profile_dirs_ignored(dirs=None, base=None) -> list:
+    """每份 Chrome 配置目录：git 必须对它下面的每个文件都说"看不见"（第 22 条第三格）。"""
+    problems = []
+    if dirs is None:
+        dirs, scan_misses = find_profile_dirs(base=base)
+        problems += scan_misses
+    else:
+        dirs = sorted(str(x) for x in dirs)
+    if not dirs:
+        return problems
+    for rel in dirs:
+        rc, out = _git("ls-files", "--", rel)
+        if rc != 0:
+            problems.append(f"配置目录 {rel} 问不出「有没有已进历史」：git ls-files 退出码 {rc}"
+                            "（0 才是结论，非 0 一律按不合格算）")
+        else:
+            inside = [x for x in out.splitlines() if x.strip()]
+            if inside:
+                problems.append(
+                    f"Chrome 配置目录 {rel} 里有 {len(inside)} 个文件已经被 git 跟踪"
+                    f"（{', '.join(inside[:3])}{' 等' if len(inside) > 3 else ''}）："
+                    "user-data-dir 里没有任何一个字节是源码，登录态进历史只能作废重发。"
+                    "先 git rm --cached 整个目录，再确认 .gitignore 挡住了目录本身")
+        rc, out = _git("status", "--porcelain", "--untracked-files=all", "--", rel)
+        if rc != 0:
+            problems.append(f"配置目录 {rel} 问不出「add 那一刻会不会被扫进来」："
+                            f"git status 退出码 {rc}（读不到结论按不合格算）")
+            continue
+        seen = [ln[3:] for ln in out.splitlines() if ln.startswith("?? ")]
+        if seen:
+            problems.append(
+                f"Chrome 配置目录 {rel} 没被 .gitignore 整目录挡住：git 现在看得见里面 "
+                f"{len(seen)} 个文件（{', '.join(x.rsplit('/', 1)[-1] for x in seen[:3])}"
+                f"{' 等' if len(seen) > 3 else ''}）——下一次 `git add` 到这一层就把它们连同"
+                "登录态一起扫进索引。按内部文件名一条条列永远会漏（本机实测漏了 1528 个），"
+                "要挡的是目录本身")
+    return problems
 
 
 def state_names_from_code(texts=None) -> dict:
@@ -3191,9 +3297,10 @@ def _check_state_shape(problems, index, label, origin, probes, exact=(), pfx="",
                         "不等于挡住，判的是 add 那一刻 git 怎么说")
 
 
-def check_state_files_not_tracked(names=None, shapes=None) -> list:
+def check_state_files_not_tracked(names=None, shapes=None, profile_dirs=None) -> list:
     """凭证/登录态/运行时状态那些文件：既不许已经在历史里，也不许等着被下一次 add 扫进去
-    （第 22 条）。"""
+    （第 22 条）。第三格（profile_dirs）判的是**性质**：工作区里每一份 Chrome 配置目录，
+    git 都必须看不见它下面的文件——按内部文件名一条条列永远会漏，本机实测漏了 1528 个。"""
     problems = []
     if not in_work_tree():
         return ["第 22 条读不到 git 工作区（不在 work tree 里）：这条门的两个判据都问的是 git，"
@@ -3215,6 +3322,409 @@ def check_state_files_not_tracked(names=None, shapes=None) -> list:
     for why, probes, exact, (pfx, sfx) in shapes:
         _check_state_shape(problems, index, probes[0].rsplit("/", 1)[-1], why,
                            probes, exact, pfx, sfx)
+    problems += check_profile_dirs_ignored(profile_dirs)
+    return problems
+
+
+# ── 第 23/24/25 条：给「离线回归这一层守卫」自己立门（2026-11-14 本机自审抓到三格）──────
+# 这三条判的都不是采集逻辑，而是那 54 份离线套件**还在不在、在不在跑、跑出来的结论机器能不能
+# 读对**。三格全是本轮人工翻日志才定位到的，而它们共同的形状是「一切正常」：
+#   ①退出码口径（23）：test_keyword_resume_offline.py 打印完「全部通过：88 项断言」仍以
+#     rc=139 收场（Qt/线程在解释器收尾时析构），批跑把一条全绿的套件读成一次匿名失败；同一族
+#     的另一格在批跑入口自己身上——它把「挂死」配成 134/137，而本机实测（coreutils 9.7 的
+#     `timeout -s ABRT -k`）看门狗返回的是它自己的 124。
+#   ②套件没提交（24）：5 份套件只活在这台开发机上，git 里从来没有它们。CI 检出的仓库因此少
+#     5/54 路覆盖，而批跑照跑、计数照对，没有任何一句会说「你少跑了」。
+#   ③开发机绝对路径（25）：批跑入口曾经第 20 行写死某个绝对路径再 `|| exit 1`——换一台机器
+#     （含 CI 打包机）第一步就退；同族的写法散在 19 份套件与 5 份 shell 里。
+# 三条的范围都取自同一个来源：**批跑清单**（`run_offline_regression.sh --list` 的 stdout）。
+# 不在门里重实现一遍发现逻辑（DELIVERY_DIRS + FILES + EXCLUSIONS）——重实现就会和批跑分叉，
+# 而分叉的方向永远是「门比批跑宽或窄」：窄了漏判，宽了红在门自己的口径上，人第一件事是把
+# 这一步跳过。第 24 条尤其依赖这条纪律：它要问的正是「批跑要跑的那些文件在不在提交里」。
+REGRESSION_LIST_CMD = ("bash", "debug/run_offline_regression.sh", "--list")
+# 「碰过 Qt」的口径：源码里出现 QApplication / QtWidgets 字样才判。为什么不是「造过主窗口」：
+# 本轮点过一遍批跑清单，29 份不提 Qt 的套件里只有 3 份出现 MainWindow 字样，而那 3 份都是
+# `W = gui.MainWindow`（取类引用）或 `MainWindow.__new__`（不建 C++ 对象），既没进事件循环也
+# 没有在收尾时拆的 wrapper，构不成退出段错误。边界写在案上，下一人才知道这一格管到哪。
+_QT_SUITE_HINT = re.compile(r"\bQApplication\b|\bQtWidgets\b")
+_OS_EXIT_RE = re.compile(r"^\s*os\._exit\(")
+# 只认 **stdout** 的 flush：缓冲区里那段「全部通过」是打在 stdout 上的，而 CPython 的
+# stderr 从 3.9 起就是行缓冲/write_through，不存在同样的丢失窗口。上一版把 stderr 也算过，
+# 于是「只 flush 了 stderr」的套件会躲过这一判，而报出来的那句话说的却是「没有
+# sys.stdout.flush()」——判据与文案不一致的门，红起来没人能照着修（今天 25 份里 25 份都
+# 显式 flush 了 stdout，收紧不会误伤，只会挡住将来那份漏写的一侧）。
+_FLUSH_RE = re.compile(r"^\s*sys\.stdout\.flush\(\)\s*$")
+# 交完退出码之后不该再有会执行的代码，所以判的是「最后一行代码」；往前 4 行内要看到 flush，
+# 否则缓冲区里那段汇总还没落盘就把结论交出去了——屏幕上绿、退出码红，正是第 23 条要拦的形状。
+_EXIT_FLUSH_WINDOW = 4
+
+
+def regression_suites() -> tuple:
+    """(退出码, 套件相对路径清单, stderr 摘要)。
+
+    stdout 的格式依据就地写明，不留给下一个人在这里凭想象：那批字节由
+    `run_offline_regression.sh` 里唯一一句 `printf '%s\\n' $FILES` 打印，约定是
+    「每行一个仓库相对的 .py 路径，进度与诊断一律走 stderr」。这句约定被离线对拍与
+    下面三条门共同依赖，改那句 printf 的人必须同时改这里。
+    """
+    try:
+        proc = subprocess.run(list(REGRESSION_LIST_CMD), cwd=str(ROOT), capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, [], f"起不来：{type(exc).__name__}: {exc}"
+    files = [ln.strip() for ln in proc.stdout.decode("utf-8", errors="replace").splitlines()
+             if ln.strip()]
+    err = proc.stderr.decode("utf-8", errors="replace").strip().replace("\n", " | ")
+    return proc.returncode, files, err
+
+
+def _regression_scope_problem(rc: int, files: list, err: str) -> list:
+    """清单读不到＝这三条门一条都没跑。这时候必须响，不能按「没问题」返回空表。"""
+    if rc != 0:
+        return [f"批跑清单取不到（`{' '.join(REGRESSION_LIST_CMD)}` 退出码 {rc}"
+                + (f"，stderr：{err[:200]}" if err else "") + "）：第 23/24/25 条的范围全长在"
+                "这一份清单上，读不到就一条都没判，不能报绿"]
+    if not files:
+        return ["批跑清单是空的（退出码 0，可一行路径都没打出来）：三条门会在空集合上各自"
+                "「通过」，那种通过等于这三条门从没跑过"]
+    return []
+
+
+def check_suite_exit_code_guard(suites=None) -> list:
+    """跑过 Qt 的离线套件必须自己在收尾把退出码交给操作系统（第 23 条）。"""
+    problems = []
+    if suites is None:
+        rc, files, err = regression_suites()
+        problems += _regression_scope_problem(rc, files, err)
+        suites = files if rc == 0 else []
+    judged = 0
+    for rel in suites:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel}：在批跑清单里却读不到源码，这条门判不了它，批跑也会在同一份"
+                            "文件上少跑一路（先把文件补齐，再谈退出码）")
+            continue
+        code = _qt_code_lines(path.read_text(encoding="utf-8", errors="replace"))
+        if not _QT_SUITE_HINT.search(code):
+            continue
+        judged += 1
+        lines = [ln for ln in code.split("\n") if ln.strip()]
+        exits = [i for i, ln in enumerate(lines) if _OS_EXIT_RE.match(ln)]
+        if not exits:
+            problems.append(
+                f"{rel}：建过 QApplication/QtWidgets 却没有 os._exit 收尾（最后一行代码是"
+                f" `{lines[-1].strip()[:56]}`）——Qt 与线程的析构留在解释器收尾里，段错误和判定"
+                "毫无关系却把退出码改成非零，一条全绿的套件就这样被批跑读成一次失败。"
+                "修法：把结论打完（flush）之后自己 os._exit(结论)")
+            continue
+        if not _OS_EXIT_RE.match(lines[-1]):
+            problems.append(
+                f"{rel}：os._exit 之后还有会执行的代码（最后一行 `{lines[-1].strip()[:56]}`）——"
+                "收尾写在交退出码之后就是死代码，最终退出码仍由解释器那一段决定")
+        for i in exits:
+            near = lines[max(0, i - _EXIT_FLUSH_WINDOW):i]
+            if not any(_FLUSH_RE.match(x) for x in near):
+                problems.append(
+                    f"{rel}：`{lines[i].strip()[:40]}` 往前 {_EXIT_FLUSH_WINDOW} 行里没有 "
+                    "sys.stdout.flush()——缓冲区里那段汇总还没落盘就把退出码交了出去，"
+                    "屏幕上是一套话、批跑读到的是另一套")
+    if judged == 0:
+        problems.append(f"第 23 条在 {len(suites)} 份套件里一份「碰过 Qt」的都没判到：口径已经和"
+                        "批跑脱节（清单读空、或 Qt 字样换了写法，两种都等于这条门从没跑过）")
+    return problems
+
+
+def check_regression_suites_tracked(suites=None) -> list:
+    """批跑清单里的每一份套件都必须已经在提交里（第 24 条）。"""
+    if not in_work_tree():
+        return ["第 24 条读不到 git 工作区（不在 work tree 里）：这条门问的就是「git 里有没有"
+                "这一份」，问不到不许按合格返回"]
+    problems = []
+    if suites is None:
+        rc, files, err = regression_suites()
+        problems += _regression_scope_problem(rc, files, err)
+        suites = files if rc == 0 else []
+    judged = 0
+    for rel in suites:
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel}：在清单里但磁盘上没有——批跑入口会在开跑前把它拦下来，"
+                            "这条门同步点名，别让「少一路覆盖」只留在 shell 的一句报错里")
+            continue
+        judged += 1
+        state = tracked_state(path)
+        if state != "ok":
+            problems.append(f"{_state_hint(rel, state)}——它是批跑清单里的一路回归：本机跑绿的"
+                            "那份断言，构建机和检出仓库里压根没有")
+    if judged == 0:
+        problems.append(f"第 24 条一份套件都没判（清单 {len(suites)} 项全读不到）：范围来源断了，"
+                        "空集合上的「合格」不算回归覆盖过了")
+    return problems
+
+
+# 开发机绝对路径的两种形状：类 unix 的用户目录、Windows 的用户目录。前面那串否定断言是为了
+# 不把 `https://site/home/xxx` 这类 URL 当成文件系统路径（词字符与 `/`、`:`、`.`、`~` 之后
+# 的 `/home/` 不是路径开头）；家目录一律要求「问环境」（Path.home()），它自己会跟着用户走。
+DEV_PATH_PAT = re.compile(r"(?<![A-Za-z0-9_/:.~])/(?:Users|home)/[A-Za-z0-9_.-]+/"
+                          r"|[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}")
+# 带理由的豁免：键是文件、值是「这一处允许的理由 + 认出它需要的字样」。
+# 登记成「文件 + 字样」而不是只登记文件，是因为整份文件免检会让下一条同类写法顺着这张表混进来；
+# 而每一处豁免都要求**今天仍然命中**，否则算名单过期（和 DIVERGENT_VENDORED、GENERATED_AT_BUILD
+# 同一套做法：登记表只管当下这一处，不管永远）。
+DEV_PATH_EXEMPT = {
+    # 门读到自己：豁免表要起作用，就必须把被豁免的那串字节原样写在这里。这不是漏网，是这条
+    # 判据必然的形状——所以也照样登记成「字样 + 理由」，把这一行删掉时名单会跟着响。
+    ".github/scripts/check_packaging_manifest.py": [
+        ("/Users/jhnoplan/Desktop/AI云展",
+         "本表里那条 oss_pool_client 豁免登记的原样字样（判据要能认出被豁免的行，就必须在案）"),
+    ],
+    # 说明文字里的 Windows 8.3 短路径示例：没有任何代码会去 open 它。让门去猜「这一句是不是
+    # 文案」迟早误报（误报的代价是把门跳过），所以这种走豁免表，理由写在表上而不是靠人记住。
+    "b2bcollect_build/b2bcollect_gui.py": [
+        ("ADMINI~1", "docstring 里举的 8.3 短路径例子（讲的是引号套引号的坑），不是被读取的路径"),
+    ],
+    "b2bcollect_build/test_frozen_delivery_offline.py": [
+        ("ADMINI~1", "断言文案里引的实机日志形状，不是被读取的路径"),
+    ],
+    "b2bcollect_build/oss_pool_client.py": [
+        ("/Users/jhnoplan/Desktop/AI云展",
+         "开发态兜底读 iOS 工程里的 OSS 密钥（_M_FILE_CANDIDATES）：打包态走 frozen 分支、"
+         "绝不读它，删掉只会让每台开发机手工往 config.json 粘密钥——这条豁免的是那一行本身，"
+         "不是整份文件"),
+    ],
+}
+
+
+def _dev_path_inputs() -> dict:
+    """第 25 条的视野：进包与交付目录源码 + 批跑清单 + 交付 shell + 门禁自己 + workflow。"""
+    out = {}
+
+    def add(path):
+        if path.is_file():
+            out[path] = path.read_text(encoding="utf-8", errors="replace")
+
+    for d in sorted(ROOT.iterdir()):
+        if d.is_dir() and d.name.endswith("_build"):
+            for p in sorted(d.glob("*.py")):
+                add(p)
+    rc, files, _err = regression_suites()
+    if rc == 0:
+        for rel in files:
+            add(ROOT / rel)
+    for rel in tuple(SHELL_SOURCES) + tuple(WORKFLOWS):
+        add(ROOT / rel)
+    for p in sorted((ROOT / ".github" / "scripts").glob("*.py")):
+        add(p)
+    return out
+
+
+def check_no_dev_machine_paths(files=None) -> list:
+    """交付链上不许出现只对一台机器成立的绝对路径（第 25 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    if not files:
+        return ["第 25 条一份源码都没读到（*_build 目录、批跑清单、交付 shell 全落空）："
+                "扫描范围断了的时候，「没有开发机路径」这句话没有任何含义"]
+    hits = {}
+    scanned = set()
+    for path, text in files.items():
+        rel = _rel_posix(path) if not isinstance(path, str) else path
+        scanned.add(rel)
+        code = _qt_code_lines(text)          # 注释里的举例路径不算现场代码：判的是会被执行的那行
+        bad = [ln for ln in code.split("\n") if DEV_PATH_PAT.search(ln)]
+        if bad:
+            hits[rel] = bad
+    for rel, bad in sorted(hits.items()):
+        exempt = DEV_PATH_EXEMPT.get(rel, [])
+        left = [ln for ln in bad if not any(token in ln for token, _why in exempt)]
+        for ln in left:
+            problems.append(
+                f"{rel}：`{ln.strip()[:88]}` 是只对一台机器成立的绝对路径——换一台机器或换一个"
+                "用户，它指向的就是不存在的文件，而症状长得像「代码坏了」。改成按脚本自己的位置推"
+                "（os.path.dirname(os.path.abspath(__file__))）或问环境（Path.home()）；"
+                "确实要在某台机器上读某一处的，就在 DEV_PATH_EXEMPT 登记字样和理由")
+    # 豁免表的「过期即响」：**这一份被扫到了**才谈得上判它过期。调用方喂进来的可以是任意子集
+    # （离线对拍就是这么喂夹具的），拿整张表去要求一个只有一份文件的子集，会得到一串与本次
+    # 判定无关的「过期」——那是门在自己造的噪音上把真信号盖掉（本轮对拍第一跑就红在这一格）。
+    # 整张表的完整性由默认那一次全量扫描负责：main() 走的就是 files=None，而它同时也是 CI 走
+    # 的那一条路。全量扫描下登记文件压根没进视野，同样按过期算（改名、挪目录、被排除掉三种
+    # 形状的症状都是「豁免还在、字节已经不在了」）。
+    for rel, entries in sorted(DEV_PATH_EXEMPT.items()):
+        if rel not in scanned:
+            if full_scan:
+                problems.append(f"DEV_PATH_EXEMPT 登记给 {rel}，可这一份压根不在第 25 条的视野里"
+                                "（改名、挪目录或换了交付目录）：豁免说的还是当年那一行，今天连读"
+                                "都读不到它了，请把这条登记一起删掉")
+            continue
+        got = hits.get(rel, [])
+        for token, why in entries:
+            if not any(token in ln for ln in got):
+                problems.append(f"DEV_PATH_EXEMPT 登记给 {rel} 的「{token}」今天已经不命中："
+                                f"豁免说的是这一处（{why[:40]}…），路径删了或改名了就该把这条一起"
+                                "删掉——挂着过期理由，下一条同类写法就会照着这张表混进来")
+    return problems
+
+
+
+# ── 第 26 条：临时目录的取值只许一处口径（2026-11-15 本机自审抓到）────────────────
+# 由来：交付链里九处写成 ``Path(os.environ.get("TEMP", r"C:\\temp"))``。Mac/Linux 上根本没有
+# ``TEMP`` 这个环境变量，于是兜底串 ``C:\\temp`` 变成一个**相对路径**，本机仓库里真长出过两个
+# 名为 ``C:\\temp`` 的目录（仓库根一个、b2bcollect_build/ 一个）。难看只是表面：这些目录是当
+# 「老登录态在哪」传给 :func:`browser_profile_dir` 的，而那条链上的 ``choose_writable`` 会先
+# mkdir 写探针、再挑**第一个真能写的**目录——持久位置一旦写不进去（只读挂载、权限策略），付费
+# 账号的 Cookie 就落到工作区里，等着下一次 ``git add <目录>``（第 22 条判的正是那一刻）。
+# 判法刻意不判「这一行外面有没有 win32 守卫」：静态判守卫迟早误报，而误报的代价是人开始跳过这
+# 一步；换成「TEMP 只许在 legacy_temp_root 那一处被读」之后，判据是**位置**而不是**上下文**，
+# 既不会红在文案上，也不给「再抄一遍兜底串」留口子。两侧实现（tool_config / runtime_paths）
+# 还要求结构一致：这两份是同名镜像实现，分叉的方向永远是「只有一侧被改对」。
+TEMP_HELPER_FILES = {"b2bcollect_build/tool_config.py": "tool_config",
+                     "riskbird_build/runtime_paths.py": "runtime_paths"}
+TEMP_HELPER_NAME = "legacy_temp_root"
+
+
+# 什么算「读了 TEMP」：AST 里的三个形状 —— ``os.environ.get("TEMP"…)``、
+# ``os.environ["TEMP"]``、``os.getenv("TEMP"…)``。按 AST 而不是按正则有两条硬理由：
+# ①注释与 docstring 里的举例不算判据（这条门的其它几格都是这个口径，红在文案上只会逼人跳过）；
+# ②源码解析不过要**响**，而不是安静地当作「没读到」——坏源码上的「没有第二处取值」是假绿。
+TEMP_ENV_READS = ("get", "getenv")
+
+
+def _temp_read_sites(text):
+    """代码里真实读取 TEMP 的位置：返回 (行号列表, 行号->最外层函数名, 解析错误)。
+
+    认三种写法：``os.environ.get("TEMP"…)`` / ``os.getenv("TEMP"…)`` / ``os.environ["TEMP"]``。
+    ``from os import environ`` 那种不认——今天交付链里没有这个形状，写一条判据去猜「将来可能
+    这么写」得到的多是假红；真出现了，补一行成本很低，而漏一条的成本是又长出一次 ``C:\\temp``。
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        return [], {}, f"第 {e.lineno} 行 {e.msg}"
+    spans = {}          # 行号 -> 所在最外层函数名（顶层代码不进这张表）
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for ln in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                spans[ln] = node.name
+
+    def _is_os_environ(z):
+        return (isinstance(z, ast.Attribute) and z.attr == "environ"
+                and isinstance(z.value, ast.Name) and z.value.id == "os")
+
+    def _is_plain_os_getenv(z):
+        # ``os.getenv("TEMP")`` 与 ``os.environ.get("TEMP")`` 是同一个坑的两种写法：
+        # 本机自审第一版只认了后一种，反向对照格（AJ 第 5 节）当场把这条门咬穿——
+        # 判据写全三种写法是靠夹具钉住的，不是靠 docstring 里那句声明。
+        return (isinstance(z, ast.Attribute) and z.attr == "getenv"
+                and isinstance(z.value, ast.Name) and z.value.id == "os")
+
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in TEMP_ENV_READS and _is_os_environ(node.func.value):
+            first = node.args[0] if node.args else None
+        elif isinstance(node, ast.Call) and _is_plain_os_getenv(node.func):
+            first = node.args[0] if node.args else None
+        elif isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            first = node.slice
+        else:
+            continue
+        if isinstance(first, ast.Constant) and first.value == "TEMP":
+            hits.append(node.lineno)
+    return sorted(set(hits)), spans, None
+
+
+def _helper_body(text, name):
+    """顶层 def name 的函数体（去掉 docstring）的结构指纹：(指纹或 None, 错误说明或 None)。"""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        return None, f"解析不过（第 {e.lineno} 行 {e.msg}）"
+    found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+    if len(found) != 1:
+        return None, f"应当**恰好有一个**顶层定义，实际 {len(found)} 个"
+    body = [n for n in found[0].body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                    and isinstance(n.value.value, str))]
+    return ast.dump(ast.Module(type_ignores=(), body=body)), None
+
+
+def check_temp_dir_single_source(files=None) -> list:
+    """TEMP 只许在 :func:`legacy_temp_root` 那一处被读，且两侧实现结构一致（第 26 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    if not files:
+        return ["第 26 条一份源码都没读到（交付目录、批跑清单、交付 shell 全落空）："
+                "扫描范围断了的时候，「没有第二处 TEMP 取值」这句话没有任何含义"]
+
+    def _rel(path):
+        return path if isinstance(path, str) else (_rel_posix(path) or str(path))
+
+    read_sites = 0
+    # 只判 .py：这一条管的是「代码里谁去读了 TEMP 这个环境变量」，shell 与 workflow 里
+    # 的 ``$TEMP`` 是另一种语言、另一种取值形状（那边由第 6/14 条的 shell 判据看着）。
+    # 不筛掉非 .py 的后果是本机实测那样：把 .yml 和 .sh 送去 ast.parse，得到十几条
+    # 「解析不过」——门在自己的视野边界上造噪音，而噪音的代价是整条门被跳过。
+    for path, text in sorted(files.items(), key=lambda kv: _rel(kv[0])):
+        rel = _rel(path)
+        if not rel.endswith(".py"):
+            continue
+        hits, spans, err = _temp_read_sites(text)
+        if err:
+            problems.append(f"{rel} 解析不过（{err}）：第 26 条读不到这一份里的取值点，"
+                            "按不合格算而不是按「这处没问题」算")
+            continue
+        for lineno in hits:
+            read_sites += 1
+            # 唯一允许的一处：两侧 helper 自己的函数体内
+            if rel in TEMP_HELPER_FILES and spans.get(lineno) == TEMP_HELPER_NAME:
+                continue
+            line = text.splitlines()[lineno - 1].strip()[:100]
+            # 该走哪一侧的 helper：按文件所在交付目录判，两镜像同口径（判据只有一处实现）
+            mod = ("tool_config" if rel.startswith("b2bcollect_build/") else "runtime_paths")
+            problems.append(
+                f"{rel} 第 {lineno} 行自己读 TEMP：{line}\n"
+                f"   → 非 Windows 上 ``TEMP`` 压根不存在，兜底串会变成一个**相对**目录，而这个"
+                f"目录是当「老登录态在哪」传给择路链的：写探针会把它在当前工作目录里 mkdir 出来"
+                f"（本机实证：仓库根与 b2bcollect_build/ 各长出过一个 ``C:\\temp`` 目录）。"
+                f"改走 {mod}.{TEMP_HELPER_NAME}()")
+
+    # 只在**全量扫描**下判空转：子集扫描（离线对拍喂进来的夹具）本来就只带一两份文件，
+    # 拿整条链的读取点总数去要求一个子集，得到的是一串与本次判定无关的红（第 25 条同一课）。
+    if full_scan and read_sites == 0:
+        problems.append("第 26 条一处 TEMP 读取都没看到，连 legacy_temp_root() 里那一处都没有："
+                        "取值口径被人整段删掉时这条门必须响，不许在空集合上报绿")
+
+    # 两侧实现：必须在、必须恰好一个顶层 def、结构必须一致（同名镜像实现最容易分叉）
+    bodies = {}
+    for rel, mod in sorted(TEMP_HELPER_FILES.items()):
+        text = None
+        for path, t in files.items():
+            if _rel(path) == rel:
+                text = t
+                break
+        if text is None:
+            try:
+                pth = ROOT / rel
+                text = pth.read_text(encoding="utf-8", errors="replace") if pth.is_file() else None
+            except OSError:
+                text = None
+        if text is None:
+            problems.append(f"第 26 条读不到 {rel}：那一份 {mod}.{TEMP_HELPER_NAME}() 是唯一"
+                            "允许读 TEMP 的地方，读不到就等于这条门在这一侧从没跑过")
+            continue
+        dump, err = _helper_body(text, TEMP_HELPER_NAME)
+        if err is not None:
+            problems.append(f"{rel} 里的 {TEMP_HELPER_NAME}() 判不出结构：{err}。"
+                            "被覆盖、被改名或搬进类里，取值口径就又回到「各处各写一遍」")
+            continue
+        bodies[rel] = dump
+    if len(bodies) == len(TEMP_HELPER_FILES) and len(set(bodies.values())) > 1:
+        _a, _b = sorted(TEMP_HELPER_FILES)
+        problems.append(f"两份 {TEMP_HELPER_NAME}() 的实现结构不一致（{_a} 与 {_b}）："
+                        "同名镜像实现分叉的方向永远是「只有一侧被改对」，而调用点各引一侧，"
+                        "换一台机器就换一种落点")
     return problems
 
 
@@ -3260,12 +3770,18 @@ def main(argv=None) -> int:
     hygiene = check_script_hygiene()
     if hygiene:
         bad += 1
-        print("❌ 交付链 shell 脚本不合格（`$VAR` 紧跟中文会把报错那行本身弄坏）：")
+        print("❌ 交付链 shell 脚本不合格（这一条判三件事：文案里 `$VAR` 紧跟中文会把报错那行"
+              "本身弄坏、登记表里的脚本在不在位、工作区那份是不是提交里那份）：")
         for p in hygiene:
             print(f"   · {p}")
-            print(f"::error::shell 文案：{p}")
+            # 类目跟着问题走：annotation 的标签是从这条问题自己的类目标签上来的，
+            # 不是在这里再猜一次「这一批大概都是文案问题」——猜的那一次就是今天满屏
+            # 【未提交】却写着「shell 文案」的那一次。
+            _tag, _sep, _body = p.partition("】")
+            print(f"::error::shell {(_tag[1:] if _sep else '卫生')}：{_body}")
     else:
-        print(f"✅ 交付链 shell 脚本：{len(HYGIENE_SCRIPTS)} 份文案卫生合格")
+        print(f"✅ 交付链 shell 脚本：{len(HYGIENE_SCRIPTS)} 份脚本的"
+              f"文案写法／在位／已提交三类都合格（{'、'.join(HYGIENE_TAGS)}）")
 
     # 交付链上所有手写 shell 的语法（第 11 条）：判据是 bash 自己的解析器，
     # 不是又一条「我猜到了哪几种写法会坏」的正则。
@@ -3495,7 +4011,54 @@ def main(argv=None) -> int:
             print(f"::error::状态文件防护：{p}")
     else:
         print("✅ 状态文件防护：代码里声明的每份 .json 状态文件与 Chrome/驱动形状都没被跟踪，"
-              "且逐条问过 git「add 那一刻你会不会挡」")
+              "逐条问过 git「add 那一刻你会不会挡」，工作区里每份 Chrome 配置目录也都整目录被挡")
+
+    # 离线回归这一层守卫自己的三格门（第 23/24/25 条，判据与由来见各自函数上方的注释块）。
+    # 范围都取自批跑清单，所以三条会一起响应同一件事：清单读不到 = 三条都没跑。
+    exit_guard = check_suite_exit_code_guard()
+    if exit_guard:
+        bad += 1
+        print("❌ 套件的判定与退出码不同源（跑过 Qt 的套件没在收尾自己 os._exit，"
+              "全绿也会被批跑读成一次失败）：")
+        for p in exit_guard:
+            print(f"   · {p}")
+            print(f"::error::套件退出码口径：{p}")
+    else:
+        print("✅ 套件退出码口径：批跑清单里每一份碰过 Qt 的套件都以 flush + os._exit 收尾")
+
+    suite_track = check_regression_suites_tracked()
+    if suite_track:
+        bad += 1
+        print("❌ 批跑清单里有套件不在提交里（本机跑绿的那一路回归，CI 检出的仓库里没有）：")
+        for p in suite_track:
+            print(f"   · {p}")
+            print(f"::error::离线套件入库跟踪：{p}")
+    else:
+        print("✅ 离线套件入库跟踪：批跑清单展开出来的每一路套件都已在提交里")
+
+    dev_paths = check_no_dev_machine_paths()
+    if dev_paths:
+        bad += 1
+        print("❌ 交付链里有只对一台机器成立的绝对路径（换一台机器就指向不存在的文件，"
+              "症状却长得像代码坏了）：")
+        for p in dev_paths:
+            print(f"   · {p}")
+            print(f"::error::开发机绝对路径：{p}")
+    else:
+        print("✅ 开发机绝对路径：交付链的源码、批跑套件、shell 与 workflow 里没有写死某台"
+              "机器的路径（豁免的每一处都在 DEV_PATH_EXEMPT 登记了字样和理由）")
+
+    temp_dir_gaps = check_temp_dir_single_source()
+    if temp_dir_gaps:
+        bad += 1
+        print("❌ 临时目录取值不止一处口径（非 Windows 上 ``C:\\temp`` 兜底会变成相对目录，"
+              "择路链会把登录态写进仓库工作区）：")
+        for p in temp_dir_gaps:
+            print(f"   · {p}")
+            print(f"::error::临时目录口径：{p}")
+    else:
+        print("✅ 临时目录口径：交付链里 TEMP 只在两侧同名的 legacy_temp_root() 里被读一次，"
+              "两份实现结构一致")
 
     for label, path in CALLERS.items():
         if not path.exists():
@@ -3527,6 +4090,8 @@ def main(argv=None) -> int:
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
           "交付 zip 的门两侧都在链路上、"
           "Qt 入口与离屏套件都按「窗口先于 QApplication」收尾、"
+          "离线套件的判定与退出码同源、批跑清单里的套件都在提交里、交付链没有开发机绝对路径、"
+          "临时目录只在同口径的那一处被读、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "注释里每一句指路节号都走得通")
     return 0

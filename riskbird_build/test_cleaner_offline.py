@@ -1,7 +1,15 @@
 """customer_library_cleaner 离线自测：模板对齐、电话/邮箱清洗、跨平台合并。"""
+import os
+import tempfile
+
 import customer_library_cleaner as C
 
-TEMPLATE = "/Users/jhnoplan/Downloads/客户库数据导入模板.xlsx"
+# 入库模板是**用户机器上的文件**（locate_template 在 cwd / Downloads / Desktop / Documents 里找）。
+# 原先这里写死一台开发机的绝对路径：换一台机器（含 CI）那一节不是「验不过」，而是「压根没跑到」，
+# 屏幕上又只有一行 FileNotFoundError，谁也分不清是清洗逻辑坏了还是机器上没这个文件。现在找不到就
+# 如实报 SKIP-FIXTURE（批跑入口认这个词、单独计一档不混进 FAIL），下面各节照跑。
+TEMPLATE = C.locate_template()
+_tpl_missing = not TEMPLATE or not os.path.isfile(TEMPLATE)
 
 results = [
     # 风鸟：正常记录，电话串混合格式
@@ -60,23 +68,26 @@ assert "18800001111" in huawei["手机号"] and "12345" not in huawei["固话"]
 assert huawei["邮箱"] == "sales@huawei.com,service@huawei.com", \
     "手机号/固话/邮箱多值统一用英文逗号分隔"
 
-out = "/tmp/清洗后客户库入库数据_test.xlsx"
-tpl = C.locate_template() or TEMPLATE
-print("\n模板定位:", tpl)
-C.write_clean_excel(rows, out, template_path=tpl, log=print)
+if _tpl_missing:
+    print("\nSKIP-FIXTURE 模板对齐这一节没跑：常用目录里没有客户库导入模板，表头逐列比对没法做")
+else:
+    out = os.path.join(tempfile.gettempdir(), "清洗后客户库入库数据_test.xlsx")
+    tpl = TEMPLATE
+    print("\n模板定位:", tpl)
+    C.write_clean_excel(rows, out, template_path=tpl, log=print)
 
-# 校验输出与模板表头逐列一致
-import openpyxl
-ws = openpyxl.load_workbook(out).active
-head = [c.value for c in ws[1]]
-tw = openpyxl.load_workbook(TEMPLATE).active
-t_header = [c.value if c.value is not None else "" for c in next(tw.iter_rows(min_row=1, max_row=1))]
-assert head == t_header, f"表头不一致\n{head}\n{t_header}"
-r2 = [c.value for c in ws[2]]
-print("\n输出行2:", r2)
-# A-I 与 J-R 两块数据一致
-assert r2[0] == r2[9] and r2[1] == r2[10] and r2[3] == r2[12] and r2[8] == r2[17]
-print("\nALL ASSERTS PASSED")
+    # 校验输出与模板表头逐列一致
+    import openpyxl
+    ws = openpyxl.load_workbook(out).active
+    head = [c.value for c in ws[1]]
+    tw = openpyxl.load_workbook(tpl).active
+    t_header = [c.value if c.value is not None else "" for c in next(tw.iter_rows(min_row=1, max_row=1))]
+    assert head == t_header, f"表头不一致\n{head}\n{t_header}"
+    r2 = [c.value for c in ws[2]]
+    print("\n输出行2:", r2)
+    # A-I 与 J-R 两块数据一致
+    assert r2[0] == r2[9] and r2[1] == r2[10] and r2[3] == r2[12] and r2[8] == r2[17]
+    print("\nALL ASSERTS PASSED")
 
 # ── 风鸟新增状态与多联系方式（详情页"更多"能给出 12-16 个电话） ──
 import re as _re

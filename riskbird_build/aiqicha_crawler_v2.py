@@ -502,7 +502,7 @@ class AiQiChaCrawlerV2:
         :func:`runtime_paths.login_chrome_profile` 一处管：持久位置 + 老位置登录态接管 +
         「真实 Chrome 更新才刷」的副本刷新。
         """
-        legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile",
+        legacy = [runtime_paths.legacy_temp_root() / "aiqicha_chrome_profile",
                   Path("/tmp/aiqicha_chrome_profile")]
         profile, refreshed = runtime_paths.login_chrome_profile(
             "chrome_aiqicha_profile", legacy_dirs=legacy)

@@ -3886,7 +3886,8 @@ def main():
         # 1.2 清理旧的临时目录（排除当前进程使用的）
         try:
             current_mei = getattr(sys, '_MEIPASS', '')
-            temp_dir = os.environ.get("TEMP", r"C:\temp")
+            import runtime_paths
+            temp_dir = str(runtime_paths.legacy_temp_root())
             for d in os.listdir(temp_dir):
                 if d.startswith("_MEI"):
                     full_path = os.path.join(temp_dir, d)

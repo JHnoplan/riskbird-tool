@@ -93,7 +93,7 @@ def download_and_install_chrome(callback=None) -> bool:
         _log("Mac 系统请手动安装 Chrome: https://www.google.com/chrome/")
         return False
     _log("正在下载 Google Chrome...")
-    temp_dir = Path(os.environ.get("TEMP", "/tmp"))
+    temp_dir = runtime_paths.legacy_temp_root()
     installer_path = temp_dir / "ChromeSetup.exe"
     try:
         import subprocess
@@ -420,7 +420,7 @@ class RiskBirdCrawlerV2:
             # runtime_paths.login_chrome_profile）
             temp_profile, refreshed = runtime_paths.login_chrome_profile(
                 "chrome_riskbird_profile",
-                legacy_dirs=[Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile",
+                legacy_dirs=[runtime_paths.legacy_temp_root() / "chrome_debug_profile",
                              Path("/tmp/chrome_debug_profile")])
             opts.add_argument(f"--user-data-dir={temp_profile}")
             opts.add_argument("--profile-directory=Default")

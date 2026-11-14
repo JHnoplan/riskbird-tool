@@ -9,7 +9,7 @@
 #   · 站方默认/灌填的假号、联系人栏写「未开」都不能入库；「公司官网」栏写着
 #     自己的商铺地址，不能当客户官网。
 import sys, pathlib, re, json, time
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 
 import cdp_base                                                   # noqa: E402
 from maimaib2b_crawler import Maimaib2bCrawler                    # noqa: E402

@@ -1,6 +1,7 @@
 # 离线自测：本轮 6 项改进的关键逻辑（不触网、不开浏览器）
 import sys, time, re
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
 
 from cdp_base import CdpSiteCrawler, clean_address
 from b2b168_crawler import B2b168Crawler

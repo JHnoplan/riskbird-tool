@@ -22,6 +22,8 @@ from pathlib import Path
 
 import requests
 
+import runtime_paths
+
 DUAL_PORT = 9233          # 共享 Chrome 的调试端口（与爱企查默认端口一致）
 CHROME_WAIT_SECONDS = 25  # 启动共享 Chrome 的最长等待
 # 会话结束后没人用的空白窗口：每个白占 30–50 MB，可以安全关掉
@@ -38,9 +40,7 @@ _SKIP_PATTERNS = [
 
 def shared_profile_dir() -> Path:
     """共享 Chrome 使用的配置目录（含用户真实登录态的副本）"""
-    if sys.platform == "win32":
-        return Path(os.environ.get("TEMP", r"C:\temp")) / "chrome_debug_profile"
-    return Path("/tmp/chrome_debug_profile")
+    return runtime_paths.legacy_temp_root() / "chrome_debug_profile"
 
 
 def _real_profile_dir() -> str:
@@ -63,8 +63,7 @@ def prepare_shared_profile(log) -> Path:
     if has_login_state(profile):
         return profile
     # 爱企查单跑时用的是另一个副本目录，能复用就复用（省一次大文件复制）
-    alt = Path("/tmp/aiqicha_chrome_profile") if sys.platform != "win32" else \
-        Path(os.environ.get("TEMP", r"C:\temp")) / "aiqicha_chrome_profile"
+    alt = runtime_paths.legacy_temp_root() / "aiqicha_chrome_profile"
     if has_login_state(alt):
         log(f"复用已有 Chrome 登录态副本：{alt}")
         return alt

@@ -5,7 +5,7 @@
 # ④「开始新任务」复位：本次数据/账目/熔断计数/聚合进度归零，历史种子库保持不动
 # 全程不联网、不启 Chrome：网络响应一律注入假会话，等待循环把 sleep 短路。
 import sys, time, inspect
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 
 import cdp_base
 from cdp_base import CdpSiteCrawler

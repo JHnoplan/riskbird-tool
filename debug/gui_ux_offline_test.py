@@ -13,7 +13,7 @@ import re
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
 
 from PyQt5.QtWidgets import (QApplication, QGroupBox, QLabel, QPushButton,
                              QPlainTextEdit)  # noqa: E402
@@ -21,7 +21,7 @@ from PyQt5.QtGui import QImage, QPainter                                        
 
 import b2bcollect_gui as gui  # noqa: E402
 
-SRC = io.open("/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build/b2bcollect_gui.py",
+SRC = io.open(os.path.join(_BUILD, "b2bcollect_gui.py"),
               encoding="utf-8").read()
 
 ok = 0
@@ -730,7 +730,7 @@ import ast                                                        # noqa: E402
 from PyQt5.QtWidgets import QWidget                               # noqa: E402
 import lead_scoring as _lsc                                       # noqa: E402
 
-_BUILD = "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build"
+_BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build")
 _MD = re.compile(r"\*\*[^*\n]{1,20}\*\*")
 
 
@@ -788,3 +788,11 @@ check("⑫ 三个交付目录每一句会进日志区的话都不带星号（新
       not _md12, str(_md12[:3]))
 
 print(f"\n全部通过：{ok} 项")
+
+# 判定到此为止：屏幕上这句和批跑读到的退出码必须是同一个来源。这套件自己建过
+# QApplication，而 Qt/线程在解释器收尾时的析构会随机段错误（本机实测：keyword_resume
+# 全绿 88 项之后 rc=139，被批跑读成一次失败，单跑又绿——真红就是这么被当成抖动的）。
+# flush 之后直接把退出码交给操作系统，不让任何收尾动作再改写判定。
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)

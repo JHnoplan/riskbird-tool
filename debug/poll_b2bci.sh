@@ -20,7 +20,7 @@
 #        若顶掉它的新提交一直没起来，就点名报错（静默等 40 轮不是答案）。
 set -u
 cd "$(dirname "$0")/.."
-PY="/Users/jhnoplan/Desktop/PythonDemo/.venv/bin/python"
+PY=".venv/bin/python"          # 上一行已经 cd 到仓库根，这里一律相对仓库根，不写机器路径
 [ -x "$PY" ] || PY="python3"
 REPO="JHnoplan/riskbird-tool"
 API="https://api.github.com/repos/$REPO"

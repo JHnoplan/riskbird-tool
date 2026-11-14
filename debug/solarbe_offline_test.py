@@ -10,7 +10,7 @@
 #   · 每个切片最多 6 页（120 家）→ 靠「行业×地区」细分展开；
 #   · 200 + 空正文＝可重采的导航失败（不写种子库锁死），「公司不存在」才是终态。
 import sys, pathlib, re
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 
 from solarbe_crawler import (SolarbeCrawler, _UA, _UA_MOBILE, CATIDS, AREAIDS,   # noqa: E402
                              _NAME_PLACEHOLDER)

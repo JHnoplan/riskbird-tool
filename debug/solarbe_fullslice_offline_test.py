@@ -21,8 +21,8 @@
 import sys, json, tempfile, pathlib, time
 from collections import deque
 
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/debug")
-sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "b2bcollect_build"))
 import scrape_solarbe_full as M      # noqa: E402
 
 checks, n = [], 0

@@ -77,7 +77,7 @@ def shared_profile_dir() -> Path:
     还留着登录态就先**复制**接管过来，绝不删源、绝不让用户重做一遍登录。
     """
     import tool_config as _tc
-    legacy = [Path(os.environ.get("TEMP", r"C:\temp")) / PROFILE_DIR_NAME,
+    legacy = [_tc.legacy_temp_root() / PROFILE_DIR_NAME,
               Path("/tmp") / PROFILE_DIR_NAME]
     return _tc.browser_profile_dir(PROFILE_DIR_NAME, legacy_dirs=legacy)
 

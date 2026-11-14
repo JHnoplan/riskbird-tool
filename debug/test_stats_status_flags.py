@@ -118,12 +118,18 @@ print("── 4. 重跑启动段会清空上一轮完成标记 ─────�
 import parallel_session as ps                              # noqa: E402
 
 
+SNAPS = []
+
+
 class _NoThread:                                            # 把采集线程换成空跑，只验编排逻辑
     def __init__(self, target=None, args=(), name=None, daemon=None):
         pass
 
     def start(self):
-        pass
+        # 只留第一次 start 的快照：那一刻既没有任何上一轮残留，也还没有任何
+        # 空跑线程被登记成「已死」，是唯一能同时验「标记已清」与「开局不误报死」的瞬间。
+        if not SNAPS:
+            SNAPS.append(sess.site_status())
 
     def is_alive(self):
         return False
@@ -143,8 +149,12 @@ try:
 finally:
     ps.threading.Thread = _old
 check("crawl() 启动已重置 _done_sites", sess._done_sites == set(), sess._done_sites)
-check("重跑后状态行不再残留旧完成/停止标记",
-      set(sess.site_status().values()) == {"running"}, sess.site_status())
+# 空跑线程 start 完就是死的，所以「跑完再看」一定是 stopped——那既证明不了标记被清，
+# 也会把真缺陷（登记早于 start 的窗口里 site_status 把刚开工的站读成「线程已死」）
+# 和「上一轮标记残留」混成一个症状。改在 start() 那一刻取快照：那一瞬每一站都该是
+# running（旧 done/stopped 已清、新线程还没被判死）。
+check("新一轮 start 那一刻各站回到 running（上一轮 done/stopped 标记不残留、开局也不误报死）",
+      bool(SNAPS) and set(SNAPS[0].values()) == {"running"}, SNAPS[0])
 
 print()
 print(f"通过 {PASS} 项，失败 {len(FAIL)} 项")
