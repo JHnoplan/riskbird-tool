@@ -15,7 +15,8 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build")
 
-from PyQt5.QtWidgets import (QApplication, QGroupBox, QLabel, QPushButton)  # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QGroupBox, QLabel, QPushButton,
+                             QPlainTextEdit)  # noqa: E402
 from PyQt5.QtGui import QImage, QPainter                                        # noqa: E402
 
 import b2bcollect_gui as gui  # noqa: E402
@@ -241,6 +242,35 @@ check("④ 展开态才把富余高度让给日志", w._root_lay.stretch(w._log_
 check("④ 折叠条文字跟着档位走（用户看得见还能收回去）",
       w.btn_log_toggle.text() == gui.MainWindow.LOG_TOGGLE_EXPANDED
       and "日志" in w.btn_log_toggle.text())
+# ── 日志控件与滚动跟随（2026-11-14 性能改造钉下的两条契约）──────────────
+# ①控件必须是 QPlainTextEdit：换回 QTextEdit 等于每行 0.26ms 退回 2.42ms
+#   （9 倍，实测口径见 debug/perf_gui_probe.py A 档），而屏幕上看不出任何区别，
+#   没有这条断言，将来谁"顺手改回富文本"都不会有人发现。
+# ②滚动条只在用户本来就贴着底时跟随：往上翻历史被新日志拽回底部，是采集挂机时
+#   最烦人的一种"抢操作"。
+check("④ 日志用 QPlainTextEdit（换回 QTextEdit 会白丢 9 倍每行性能）",
+      isinstance(w.log, QPlainTextEdit))
+check("④ 日志行数封顶（过夜采集两三万行不能无限吃内存）",
+      w.log.maximumBlockCount() == 3000, f"{w.log.maximumBlockCount()}")
+w._apply_log_area(True)
+w.log.clear()
+for i in range(400):
+    w._on_log(f"第 {i} 行 · 采集明细")
+app.processEvents()
+_sb = w.log.verticalScrollBar()
+check("④ 前提：日志确实溢出了（不溢出下面两条断言都是空转）", _sb.maximum() > 0,
+      f"maximum={_sb.maximum()}")
+_sb.setValue(0)
+for i in range(50):
+    w._on_log(f"用户翻历史时又来的一行 {i}")
+check("④ 用户翻到上面看历史时，新日志不把滚动条拽回底部",
+      w.log.verticalScrollBar().value() <= 4,
+      f"value={w.log.verticalScrollBar().value()}")
+w.log.verticalScrollBar().setValue(w.log.verticalScrollBar().maximum())
+w._on_log("贴着底时来的一行")
+check("④ 贴着底时新日志照常跟随（不然用户看不到最新一行）",
+      w.log.verticalScrollBar().value() >= w.log.verticalScrollBar().maximum() - 4)
+check("④ 最新那一行确实看得见了", "贴着底时来的一行" in w.log.toPlainText())
 w._apply_log_area(False)
 # 折叠的固有代价是「看不见就等于没有」：收起态里滚过去的告警必须留下计数，否则折叠
 # 自己就成了下一轮「静默少功能」的藏身处（本轮用户就是因为界面不吭声才去查权限）。
@@ -576,5 +606,164 @@ check("⑧ 日志标记与结论同源：保存失败时不许再打 ✅（同�
 check("⑨ 成功/失败两条弹窗路径都把结论写在正文首行（不依赖标题栏可见）",
       'f"{title}\\n\\n{body}"' in _bcode and "绑定失败\\n\\n" in _bcode,
       _bcode[-420:])
+
+# ── ⑩ 并发档位：界面上看得见、改了当场生效（性能优化轮的 GUI 侧）──────
+import perf_governor as pg          # noqa: E402
+import website_contact as wc        # noqa: E402
+
+_SUF = {"name": wc.GATE_NAME, "permits": 3, "max": 6, "in_use": 2, "waiters": 1,
+        "decrease": 2, "increase": 1, "avg_ms": 4200.0, "max_ms": 12000.0,
+        "acquire_timeout": 5, "samples": 12, "last_pressure_reason": "负载"}
+
+check("⑩ 纯函数在位（数字归治理层、文案归界面，这样不跑真回采也能断言文案）",
+      callable(getattr(gui, "build_perf_board_suffix", None))
+      and callable(getattr(gui, "build_perf_board_tip", None)))
+check("⑩ 回采没在跑时不显示那一栏（闸门账本是跨轮留存的，常驻一个不动的数字会被读成"
+      "「现在也在这么跑」，比不显示更误导）",
+      gui.build_perf_board_suffix([]) == ""
+      and gui.build_perf_board_suffix([dict(_SUF, in_use=0)]) == "")
+check("⑩ 在跑时这一栏报出「当前/上限」两个数（只报一个就会被读成固定的那一个）",
+      gui.build_perf_board_suffix([_SUF]) == "｜官网回采并发 3/6 路",
+      gui.build_perf_board_suffix([_SUF]))
+check("⑩ 闸门名换成界面话术（site_enrich 是内部名字，用户不需要认识它）",
+      "site_enrich" not in gui.build_perf_board_suffix([_SUF])
+      and "官网回采" in gui.build_perf_board_suffix([_SUF]))
+check("⑩ 账目残缺时整条不写、不猜一个数糊上去（猜出来的并发数会被当成实测数读）",
+      gui.build_perf_board_suffix([{"name": wc.GATE_NAME}]) == ""
+      and gui.build_perf_board_suffix([{"permits": 1, "max": 2, "in_use": 1}])
+      == "｜并发 1/2 路", gui.build_perf_board_suffix([{"permits": 1, "max": 2, "in_use": 1}]))
+# 没登记过界面叫法的闸门：照原名写，别编一个「官网回采」（编错了用户会拿官网的数去读
+# 另一个东西），也别把模板里自带的「并发」二字再兜一遍（上一版就是这么叫成「并发并发」的）。
+check("⑩ 新闸门忘登记叫法时照原名走，且不重复模板自带的「并发」",
+      gui.build_perf_board_suffix([{"name": "new_gate", "permits": 2, "max": 4, "in_use": 1}])
+      == "｜new_gate并发 2/4 路"
+      and "并发并发" not in gui.build_perf_board_suffix([{"permits": 2, "max": 4, "in_use": 1}]),
+      gui.build_perf_board_suffix([{"name": "new_gate", "permits": 2, "max": 4, "in_use": 1}]))
+check("⑩ 多个闸门同时在一行里也各自分得开（拼接不是覆盖，一个都不许被挤掉）",
+      gui.build_perf_board_suffix([_SUF, {"name": "new_gate", "permits": 2, "max": 4,
+                                         "in_use": 1}])
+      == "｜官网回采并发 3/6 路；new_gate并发 2/4 路",
+      gui.build_perf_board_suffix([_SUF, {"name": "new_gate", "permits": 2, "max": 4,
+                                         "in_use": 1}]))
+check("⑩ 悬停那行没名字时仍要有主语（同一段账目在两处是不同句式，兜底不能照抄）",
+      gui.build_perf_board_tip([{"permits": 1, "max": 2, "in_use": 1}]).startswith("· 并发："),
+      gui.build_perf_board_tip([{"permits": 1, "max": 2, "in_use": 1}])[:60])
+_tip = gui.build_perf_board_tip([_SUF], "CPU 8 核｜负载 4.00（0.50×核数）")
+check("⑩ 悬停里把「这里设的是上限、实际还会自己收放」说透（不写这句就长成设置不生效）",
+      "上限 6 路" in _tip and "当前给到 3 路" in _tip and "你不用设置" in _tip, _tip[:200])
+check("⑩ 悬停报出降档/升档次数、平均耗时与被限速跳过的次数（治理必须可核对）",
+      "自动降档 2 次、升档 1 次" in _tip and "平均 4200 毫秒" in _tip
+      and "被限速跳过 5 次" in _tip and "下次收尾会自动补做" in _tip, _tip[:300])
+check("⑩ 悬停把机器负担那行带上（同一屏里唯一的「为什么是这一档」依据）",
+      "机器当前负担：CPU 8 核" in _tip)
+check("⑩ 一段账目都没有时不给「对着空气的解释」（那句『这一档是软件自己定的』"
+      "必须跟着真实档位一起出现）",
+      gui.build_perf_board_tip([], "CPU 8 核") == "")
+
+# 控件与生效链
+check("⑩ 参数行有「同时查几家官网」这一格，默认停在自动档（默认必须是自适应，"
+      "手动只是应急覆盖）",
+      w.spin_site_workers.value() == 0
+      and w.spin_site_workers.specialValueText() == "自动"
+      and w.lbl_site_workers.text() == "同时查几家官网")
+check("⑩ 控件上限取会话那个单一真源（写死 16 的话，改上限时界面会静默比引擎宽）",
+      w.spin_site_workers.maximum() == w.session.site_workers_cap()
+      == pg.IO_WORKERS_MAX, str(w.spin_site_workers.maximum()))
+check("⑩ 说明写在 tooltip 里且不出现开发者术语（闸门/AIMD/限流这些词不许上界面）",
+      "上限" in w.spin_site_workers.toolTip()
+      and not any(t in w.spin_site_workers.toolTip()
+                  for t in ("闸门", "AIMD", "熔断", "轮询", "GIL")))
+
+_pg = pg.get_gate(wc.GATE_NAME, max_permits=6, initial=6)
+w.spin_site_workers.setValue(2)          # 模拟用户动手改档（走 valueChanged 那条真链路）
+check("⑩ 改档当场落到会话（不等点「开始采集」：用户要救的就是正在跑的这一轮）",
+      w.session.site_enrich_workers == 2 and w.session.site_workers_auto is False)
+check("⑩ 改档当场对齐闸门上界（上一版把新上限静默丢掉，表现成「设置不生效」）",
+      _pg.max_permits == 2)
+w.spin_site_workers.setValue(0)
+check("⑩ 调回自动时会话切回自适应口径，值取本机实测那一档（不是留一个旧数字）",
+      w.session.site_workers_auto is True
+      and w.session.site_enrich_workers == pg.recommended_io_workers(
+          cap=w.session.site_workers_cap()))
+_pg.acquire(timeout=0.1)
+check("⑩ 「闸门里有在途请求」是这一栏该不该出现的判据（复用看板那 0.4 秒节拍，"
+      "不为它新起一个定时器）", w._gates_busy() is True)
+w._refresh_board()
+check("⑩ 看板那一行真的带上档位（写了纯函数却没人调用＝等于没显示）",
+      "官网回采并发" in w.lbl_board.text() and "【本机并发】" in w.lbl_board.toolTip(),
+      w.lbl_board.text())
+_pg.release()
+check("⑩ 在途请求归零后这一栏跟着消失（不是留个静止数字让人觉得还在跑）",
+      w._gates_busy() is False and gui.build_perf_board_suffix(pg.gates_state()) == "")
+
+# 续采快照：记的是用户的选择，不是某一天算出来的数
+w.spin_site_workers.setValue(4)
+_sp = w._params_snapshot()
+check("⑩ 并发档位进续采快照，且记的是**选择**（存生效值会把『自动』固化成某天的机器读数）",
+      _sp.get("site_workers") == 4)
+w.spin_site_workers.blockSignals(True)
+w.spin_site_workers.setValue(0)
+w.spin_site_workers.blockSignals(False)
+w._apply_params({"site_workers": 4})
+check("⑩ 续采恢复时控件与会话一起落回（只回控件就是「界面写着 4 路、实际按 6 路跑」）",
+      w.spin_site_workers.value() == 4 and w.session.site_enrich_workers == 4)
+w._apply_params({})
+check("⑩ 老快照里没有这个键时不报错也不清空当前选择（坏一个只少一个，不牵连其余）",
+      w.spin_site_workers.value() == 4)
+w._apply_params({"site_workers": "不是数字"})
+check("⑩ 快照里这个键被写成脏值时退回自动档而不是抛异常（状态文件可能被手工改过）",
+      w.spin_site_workers.value() == 0 and w.session.site_workers_auto is True)
+pg.drop_gate()
+check("⑩ 本段夹具收口：闸门不留注册表（下一段用例读到的 gates_state 该是空）",
+      pg.gates_state() == [])
+
+# ── ⑪ 用户文案里不许有 markdown 强调残留 ──────────────────────────────
+# Qt 的 tooltip、弹窗正文、表格单元格要么按纯文本、要么按 HTML 渲染，`**词**` 两种都不
+# 认：它就原样显示成两个星号。本轮加「同时查几家官网」那格时就是这么把「**最多**」送上
+# 界面的（⑩ 里那条「上限」判据先响，才把它揪出来），顺着同一把尺子在 GUI 里又扫出 6 处
+# 历史残留、在 pool_dialogs / acl_admin_dialog / lead_scoring / access_guard 里另有 7 处，
+# 本轮一并清掉。
+# 光改本轮那一处不够——残留会一条一条长回来，所以钉成源码级硬门：以后在用户文案里写
+# markdown，这条当场红。docstring 不算（那是给读代码的人看的，markdown 在那儿是合法的）；
+# 给大模型看的提示词也不算（deepseek_expander / pool_matcher，那边 ** 会被正常渲染）。
+import ast                                                        # noqa: E402
+from PyQt5.QtWidgets import QWidget                               # noqa: E402
+import lead_scoring as _lsc                                       # noqa: E402
+
+_BUILD = "/Users/jhnoplan/Desktop/PythonDemo/b2bcollect_build"
+_MD = re.compile(r"\*\*[^*\n]{1,20}\*\*")
+
+
+def _md_leftovers(path):
+    tree = ast.parse(io.open(path, encoding="utf-8").read())
+    docs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docs.add(id(body[0].value))
+    hits = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in docs):
+            hits += [(node.lineno, m) for m in _MD.findall(node.value)]
+    return hits
+
+
+for _mod in ("b2bcollect_gui.py", "pool_dialogs.py", "acl_admin_dialog.py",
+             "access_guard.py", "website_contact.py", "parallel_session.py"):
+    _hits = _md_leftovers(os.path.join(_BUILD, _mod))
+    check(f"⑪ {_mod} 的用户文案零 markdown 残留（Qt 不渲染 **，用户看到的就是两个星号）",
+          not _hits, str(_hits[:3]))
+check("⑪ 报表《口径说明》写进 Excel 单元格的文字也不带星号（表格里冒星号＝像半成品）",
+      not any(_MD.findall("\n".join(_lsc.caliber_lines()))),
+      [m for m in _MD.findall("\n".join(_lsc.caliber_lines()))][:3])
+# 源码级判据只看得到字面量：运行时拼出来的文案（含从别处取来的字符串）靠这条兜住。
+_bad_tip = [(type(x).__name__, (getattr(x, "text", lambda: "")() or "")[:12], x.toolTip()[:24])
+            for x in w.findChildren(QWidget) if _MD.search(x.toolTip() or "")]
+check("⑪ 全窗口每一个控件的悬停文案都干净（运行时判据，覆盖拼接出来的那部分）",
+      not _bad_tip, str(_bad_tip[:3]))
 
 print(f"\n全部通过：{ok} 项")

@@ -3227,8 +3227,14 @@ def test_workflow_shell_syntax():
     shared = _REPO / "debug" / "regression_logs"
 
     def _shared_state():
-        return sorted(p.relative_to(shared).as_posix() for p in shared.rglob("*")) \
-            if shared.is_dir() else []
+        """默认落点上的**证据文件**快照（只看普通文件，不看目录）。
+
+        `.lock` 不进快照：它是「哪一批正在用这个落点」的互斥量，外层那一批收尾时
+        本来就会把它删掉。把它算进「一份都不许少」，就会把隔壁批次的正常收尾判成本轮
+        删了证据——判据自己造假红（本轮就是这么撞上的：同时开着两批）。
+        """
+        return {p.relative_to(shared).as_posix() for p in shared.rglob("*") if p.is_file()} \
+            if shared.is_dir() else set()
 
     def _run_probe(src: str, extra_env: dict | None = None):
         fixture.write_text(src, encoding="utf-8")
@@ -3258,10 +3264,22 @@ def test_workflow_shell_syntax():
             _assert(want_said in proc.stdout,
                     f"「{tag}」要红得说清为什么（期望含「{want_said}」，实际：{proc.stdout.strip()[-160:]}）")
         _assert(not fixture.exists(), f"夹具跑完就删，不许留在磁盘上冒充套件（{tag}）")
-    _assert_eq(_shared_state(), _before,
+    _after = _shared_state()
+    # 判的是**性质**而不是「那一刻的目录一字不变」：隔壁正开着的一批往默认落点里新增
+    # 自己那几份日志，是正常的；把它算成本轮越界，就成了只有「同一时刻全机器只跑我一批」
+    # 才不红的假红（本轮同时开两批就是这样撞红的）。真正要守的两条是：外层已有的证据一份
+    # 都不许少（历史事故：入口一开头 rm -rf 掉外层 31 份日志），以及内层自己的证据一份
+    # 都不许出现在这里（出现了＝沙箱没在用，上面那条「不许少」随时可能再犯）。
+    _missing = sorted(_before - _after)
+    _leak = sorted(x for x in _after if "zz_regression_probe" in x)
+    _assert_eq(_missing, [],
                "内层夹具批跑不许碰默认落点：外层那一批的证据（每套件一份日志）被删过一次，"
                "删证据的判据本身必须被关在自己的沙箱里")
-    _assert((sandbox / "logs").is_dir(), "沙箱落点真的在用（没在用=上面那条等价校验是空的）")
+    _assert_eq(_leak, [],
+               f"内层夹具的证据不许落在默认落点上（落在这儿说明沙箱没在用）：{_leak}")
+    _assert(_before, "默认落点上真的有一份份证据在被判（快照为空=上面那条「一份不许少」在判空气）")
+    _assert((sandbox / "logs").is_dir(),
+            "沙箱落点真的在用（没在用=上面两条判据都在判空气，而历史事故就出在这儿）")
 
     # 5c-III) 污染要报在**犯错的套件名下**：只在收工那句「改动了 N 份」里说总数，接下来
     # 就得靠人回想这一批跑了什么——上一轮那两份「爱企查_结果页证据_*.txt」正是这么找的，

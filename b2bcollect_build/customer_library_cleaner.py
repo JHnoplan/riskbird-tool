@@ -661,6 +661,30 @@ def read_template_layout(template_path: str, log=print):
     return outbound, remark_block, header
 
 
+def _reuse_body_style(ws, align, border, at=(2, 1)):
+    """算出「正文那一套样式」的样式号，返回可全表复用的 StyleArray；拿不到就返回 None。
+
+    为什么要有这个函数：逐格 `cell.alignment=` / `cell.border=` 每格都要把样式在 workbook
+    的样式表里查重一次，5000 行 × 18 列就是 9 万次查重（实测 2722ms），而全表本来就只用
+    一种样式。这里先在一格上把样式摆好、抄下它的样式号，之后每格直接复用那一份（1341ms），
+    写出的文件逐格读回样式完全一致。
+    抄样式号靠 openpyxl 的 _style/StyleArray 两个内部名字，它们改名就会抛异常——
+    那种情况返回 None 让调用方退回逐格老写法：慢一倍但绝不出错，比省时间重要。
+    """
+    try:
+        from openpyxl.styles.cell_style import StyleArray
+        probe = ws.cell(row=at[0], column=at[1])
+        probe.alignment = align
+        probe.border = border
+        # 抄之前先确认真的挂上了：读回来的样式和要设的样式不等，说明这一版 openpyxl
+        # 的样式描述符不是这么工作的，此时宁缺毋滥
+        if probe.alignment != align or probe.border != border:
+            return None
+        return StyleArray(probe._style)
+    except Exception:
+        return None
+
+
 def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=print):
     """按模板列结构写出清洗后的入库数据 Excel（两块列头均填充，保证入库兼容）。"""
     from openpyxl import Workbook
@@ -674,12 +698,14 @@ def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=pr
     header_font = Font(bold=True, size=11, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     thin = Border(*[Side(style="thin")] * 4)
+    body_align = Alignment(vertical="top", wrap_text=True)
+    head_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     for col_idx, title in enumerate(header, 1):
         cell = ws.cell(row=1, column=col_idx, value=title)
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = head_align
         cell.border = thin
 
     # 两块列头都填充同样数据：外呼块用「外呼备注」，备注块用「备注」
@@ -692,6 +718,16 @@ def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=pr
                 out[idx] = row.get(col, "")
         return out
 
+    # 正文样式号只算一次、全表共用一份 StyleArray：逐格 `cell.alignment=…`/`cell.border=…`
+    # 会把同一个样式在 workbook 的样式表里查重登记一遍（每次都要算整棵样式树的 hash），
+    # 5000 行 × 18 列 = 9 万次。实测同一份数据：逐格设样式 2722ms → 共用样式号 1341ms，
+    # 与完全不设样式的 1326ms 打平；存回的文件里 cellXfs 仍是 2 条、逐格读回的
+    # wrap_text/vertical/top/border 与老写法完全一致（外观没有任何变化）。
+    # 内部形状不符预期时（openpyxl 升级改名）返回 None，宁可退回逐格老写法，
+    # 也不能悄悄写出一张没有框线、没有换行的入库表。
+    # 数字与复跑入口：debug/perf_gui_probe.py --xlsx（统一入口 debug/run_perf_probe.sh）
+    body_style = _reuse_body_style(ws, body_align, thin) if rows else None
+
     for r, row in enumerate(rows, 2):
         cells = {}
         for block in (outbound, remark_block):
@@ -699,8 +735,11 @@ def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=pr
                 cells[idx] = val
         for idx in range(len(header)):
             cell = ws.cell(row=r, column=idx + 1, value=cells.get(idx, ""))
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = thin
+            if body_style is None:
+                cell.alignment = body_align
+                cell.border = thin
+            else:
+                cell._style = body_style
 
     widths = {"客户名称": 16, "企业名称": 34, "岗位": 12, "手机号": 20,
               "固话": 20, "邮箱": 32, "微信号": 14, "数据来源": 12,

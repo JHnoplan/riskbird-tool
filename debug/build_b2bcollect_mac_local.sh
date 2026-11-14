@@ -156,7 +156,7 @@ fi
   --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender \
   --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge \
   --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config \
-  --hidden-import website_contact \
+  --hidden-import website_contact --hidden-import perf_governor \
   --hidden-import field_evidence --hidden-import enrich_waterfall \
   --hidden-import lead_scoring --hidden-import channel_health \
   --add-data "config.json:." --add-data "mk_phone_font.json:." \

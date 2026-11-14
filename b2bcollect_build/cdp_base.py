@@ -37,6 +37,11 @@ import province_filter as _pf
 # Contents/MacOS 的深度写死在代码里，PyInstaller 布局一变（风鸟那一路的实际数据目录
 # 就在 Contents/Frameworks 下）就会把包内当成包外，同族缺陷就又活一份。
 import tool_config as _tc
+# 共享 Chrome 的**本机控制面通道**（local_session/local_url）从这里起是模块级导入：
+# _get_tabs 在建连时要列一次标签，那条 HTTP 必须走「不经代理 + 复用连接」的专用会话。
+# 本文件其余地方仍是函数内延迟导入（历史写法），site_adapters 早就在模块级导入过同一个
+# 模块，证明没有环、打包也收得到。
+import shared_chrome as _sc
 # 官网回采联系方式的**唯一口径实现**（证据分级/停放判定/SSRF 闸/合并去重都只写在那
 # 一个模块里）。这里引进来只是为了让 _base_rec 给出「官网回采」列的初始空值——列必须
 # 在记录诞生时就存在，否则回采写进去的行和没回采的行表结构不一致，导出会错列。
@@ -678,6 +683,14 @@ return '';})()"""
     BLOCK_OPEN_BROWSER = True
 
     def __init__(self, port=9255):
+        # ── CDP 连接状态必须最先建：下面两个字段是属性，setter 会用到 _io_lock/_ws
+        #    （顺序反过来就是在用一个还不存在的锁，冷启动路径上才炸最难查）
+        self._io_lock = threading.RLock()   # 一条连接上的命令必须串行
+        self._ws = None                     # 本站标签的持久 CDP 连接
+        self._ws_seq = 0                    # 自增命令 id（旧实现恒用 1，一连接就撞车）
+        self._ws_target = ""                # 当前连接连的是哪个 ws 地址
+        self._pin_tab_id = ""
+        self._ws_cache_value = ""
         self.port = port
         self.pin_tab_id = ""
         self._ws_cache = ""
@@ -1046,16 +1059,65 @@ return '';})()"""
     def _norm_name(name):
         return re.sub(r"[\s（）()・.、，,]+", "", name or "")
 
-    # ── CDP 通信（每条命令显式带本站标签 ws 地址）──────────────
+    # ── CDP 通信（每标签一条持久连接；断线自动重连一次）─────────────
+    # 旧实现是「每条命令：先 HTTP 列一次标签 → 现开一条 websocket → 发一条 → 关掉」。
+    # 2026-11-14 本机实测：一个页面周期（导航 + 就绪轮询 + 拦检 + 取整页）要打 8.9 条
+    # 命令，也就是每家公司付 9 次列标签 + 8 次 TCP/WS 握手；空载单条 4.8 ms，看着不多，
+    # 但它是**纯开销**（不做任何工作），而且低配机器上列标签要遍历所有标签、代理/VPN
+    # 还会把它变成 24 秒（见 shared_chrome.local_session）。现在：连接建立时列一次标签，
+    # 之后每条命令 0 次列标签、0 次握手。
+    CDP_WS_TIMEOUT = 20.0          # 连接级 I/O 超时兜底（每条命令另有自己的超时）
+
+    @property
+    def pin_tab_id(self):
+        return self._pin_tab_id
+
+    @pin_tab_id.setter
+    def pin_tab_id(self, value):
+        """标签身份变了就丢掉持久连接——连接属于「建立它时的那个标签」。
+        做成属性而不是去 14 个赋值点各补一次复位：漏一处就是拿旧连接发新标签，
+        表现是换标签之后莫名一直超时（这类账本项目已经记过）。"""
+        value = value or ""
+        if value != self._pin_tab_id:
+            self.drop_cdp_conn()
+        self._pin_tab_id = value
+
+    @property
+    def _ws_cache(self):
+        return self._ws_cache_value
+
+    @_ws_cache.setter
+    def _ws_cache(self, value):
+        if (value or "") != (self._ws_cache_value or ""):
+            self.drop_cdp_conn()
+        self._ws_cache_value = value or ""
+
+    def drop_cdp_conn(self):
+        """主动交出持久连接（关标签/换标签/会话自愈时调用）。幂等、绝不抛。"""
+        lock = getattr(self, "_io_lock", None)
+        if lock is None:                 # __init__ 头几行之前就被赋值：还没有连接可丢
+            return
+        with lock:
+            ws, self._ws, self._ws_target = self._ws, None, ""
+            self._ws_seq = 0
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
     def _get_tabs(self):
         try:
-            data = requests.get(f"http://127.0.0.1:{self.port}/json/list", timeout=4).json()
+            data = _sc.local_session().get(
+                _sc.local_url(self.port, "/json/list"), timeout=4).json()
             return data if isinstance(data, list) else []
         except Exception:
             return []
 
     def _ws_url(self):
-        """返回本站固定标签的 webSocketDebuggerUrl；标签没了返回空串。"""
+        """返回本站固定标签的 webSocketDebuggerUrl；标签没了返回空串。
+        只在**建连时**被调用一次（旧实现是每条命令一次），所以这里的列标签开销
+        从「每命令」降级为「每连接」。"""
         tabs = self._get_tabs()
         if self.pin_tab_id:
             for t in tabs:
@@ -1070,28 +1132,65 @@ return '';})()"""
                 return self._ws_cache
         return self._ws_cache
 
-    def _send(self, method, params=None, timeout=20):
+    def _open_conn(self):
+        """建立（或复用）本站的持久 CDP 连接。调用方必须已持有 _io_lock。"""
         ws_url = self._ws_url()
         if not ws_url:
             raise RuntimeError("no target tab websocket")
-        ws = websocket.create_connection(ws_url, timeout=timeout)
+        ws = websocket.create_connection(ws_url, timeout=self.CDP_WS_TIMEOUT)
+        self._ws = ws
+        self._ws_target = ws_url
+        self._ws_seq = 0
+        # Page 域按连接启用：旧实现每次导航都重发一遍 Page.enable（一条命令一笔握手），
+        # 现在一条连接只需一次。Runtime 域**故意不开**——开了 Chrome 会把 console 与
+        # -binding 事件全推到这条连接上，采集时只用到 Runtime.evaluate，不需要事件。
         try:
-            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
-            # 只取与本命令 id 匹配的响应，忽略事件帧
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                raw = ws.recv()
-                if not raw:
-                    continue
-                msg = json.loads(raw)
-                if msg.get("id") == 1:
-                    return msg
-            return {}
-        finally:
+            self._raw_call(ws, "Page.enable", {}, 8)
+        except Exception:
+            pass
+        return ws
+
+    def _raw_call(self, ws, method, params, timeout):
+        """在指定连接上发一条命令并等到它的响应。
+        事件帧（Page.lifecycleEvent 这种没有 id 的）与迟到响应一律跳过——
+        只认本次 id，等价于旧实现的「忽略事件帧」。"""
+        self._ws_seq += 1
+        mid = self._ws_seq
+        ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.time() + max(0.5, float(timeout or self.CDP_WS_TIMEOUT))
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                return {}                      # 与旧实现一致：超时返回空 dict，不抛
             try:
-                ws.close()
+                ws.settimeout(remain)
+                raw = ws.recv()
+            except (websocket.WebSocketTimeoutException, OSError, ValueError):
+                return {}
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
             except Exception:
-                pass
+                continue
+            if isinstance(msg, dict) and msg.get("id") == mid:
+                return msg
+
+    def _send(self, method, params=None, timeout=20):
+        """发一条 CDP 命令并等它的响应。整段持本站的锁：一条连接上的命令必须串行，
+        两个线程同发会让响应错配（旧实现靠「每条命令一条连接」绕开，代价是每命令一次握手）。"""
+        with self._io_lock:
+            for attempt in (1, 2):
+                try:
+                    ws = self._ws or self._open_conn()
+                    return self._raw_call(ws, method, params, timeout)
+                except Exception as e:
+                    # 连接断了（标签被关/Chrome 重启/对端 reset）：复位后**重连一次**再发；
+                    # 第 2 次仍失败就照旧抛出，交给上层既有的 try_restore_session 自愈。
+                    self.drop_cdp_conn()
+                    if attempt == 2 or not self._session_dead(str(e)):
+                        raise
+            raise RuntimeError("cdp send unreachable")
 
     def _eval(self, script, timeout=20):
         try:
@@ -1223,10 +1322,8 @@ return '';})()"""
 
     # ── 导航（Page.navigate + 回读 location 断言 + 就绪判据）───
     def _cdp_navigate(self, url):
-        try:
-            self._send("Page.enable", {}, timeout=8)
-        except Exception:
-            pass
+        # Page.enable 不在这里发：持久连接建立时已经启用过（见 _open_conn），
+        # 旧实现每条命令现开现关，所以才需要这一句「顺手把域打开」。
         try:
             self._send("Page.navigate", {"url": url}, timeout=20)
             return True

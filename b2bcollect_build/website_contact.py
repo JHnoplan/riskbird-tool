@@ -46,6 +46,7 @@ import re
 import socket
 import threading
 import time
+from collections import OrderedDict
 from urllib.parse import urljoin, urlparse
 
 # 命中层级/证据的单一真源（field_evidence 只依赖标准库，反向不 import 本模块，无环）。
@@ -54,11 +55,36 @@ from urllib.parse import urljoin, urlparse
 # 上层再判一次就是第二份判据——那是本仓库记过账的缺陷形态。
 import field_evidence as _fe
 
+# 资源闸门（并发数由本机负载/内存与这一轮的实测超时率现算，不靠硬编码）。
+# 只依赖标准库、反向不 import 本模块，无环；导入失败也不能拖垮回采——这层是治理，
+# 治理模块自己出问题时正确做法是**退回固定并发**继续干活，而不是让采集整轮红。
+try:
+    import perf_governor as _gov
+except Exception:                             # pragma: no cover - 打包漏收时的兜底
+    _gov = None
+
+# 共享闸门的名字：编排层（parallel_session.set_site_workers）改并发上限时要对齐的是
+# **同一个**闸门，所以这个名字不能有第二份写法。两处各写一遍字面量时，改一处就变成
+# 「界面调了档、闸门按另一个名字找不到」——设置静默不生效，日志还一句不提。
+GATE_NAME = "site_enrich"
+
+
+def io_workers_cap() -> int:
+    """联网工作线程的硬上限（单一真源：治理层的 IO_WORKERS_MAX，它不可用时退回 16）。
+
+    为什么函数放在这里而不是各自 `getattr` 一遍：界面上的滑块范围、编排层建几路线程、
+    回采这一轮的 clamp，三处问的是同一个问题。写成三份数字时，用户把滑块拉到 16、
+    回采把自己 clamp 到 8，差的那 8 路是**静默丢的**——界面上看不出来，日志里也不会有。
+    """
+    return int(getattr(_gov, "IO_WORKERS_MAX", 16)) if _gov is not None else 16
+
+
 __all__ = [
     "norm_site", "is_platform_host", "is_public_host", "extract", "score_contacts",
     "plausible_phone", "plausible_email", "merge_values", "enrich_site",
     "enrich_records", "pick_site", "reset_caches", "WEBSITE_KEYS", "SITE_MARK",
     "RETRY_MARK", "MAX_ATTEMPTS", "needs_retry", "attempts_of", "is_transient_why",
+    "GATE_NAME", "io_workers_cap",
 ]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -138,9 +164,46 @@ PARKED_RE = re.compile(
 _LOCK = threading.Lock()
 # 同一域名在一张表里常出现多次（同一公司多条产品记录）：进程内缓存结果，
 # 既省请求也保证「同一个站」在多行上给出完全一致的值。
-_HOST_CACHE = {}
-# DNS 解析结论按域缓存：SSRF 闸每条记录查一次 DNS 会把整轮回采拖成 DNS 瓶颈
+#
+# 为什么按**字节**封顶而不是按条数：一个条目存的是这个站抓到的整页 HTML
+# （最多 MAX_PAGES_PER_SITE=6 页、单页封顶 MAX_BYTES=1.2MB），最坏一条就是 7MB。
+# 旧口径「超过 800 条清空一次」在真实企业站上等于「最多可以攒 800×几 MB」——
+# 一台 8G 的机器上，官网回采这一路就能自己把内存吃穿（本项目跑在这台机上实测
+# 可用内存常年在 2~3G，还要留给 Chrome）。现在按预算淘汰最久没用的那些：
+# 默认 96MB 是个**区间**：贴着最坏体量算 96 ÷ 7.2 ≈ 13 个站，按几百 KB 一页的
+# 常见体量则是上百个站。命中率靠 LRU 保（同站多行连着处理），上限靠预算锁死。
+#
+# 为什么留 HTML 而不留「抽好的号码」：归属判定跟每一行的公司名有关（见 enrich_site
+# 的注释），按域名预存判定结果会把 A 公司的电话盖到同站的 B 公司头上——那种错比
+# 慢更贵。要再省内存只能省页面本身，不能省判定。
+HOST_CACHE_BUDGET_BYTES = 96 * 1024 * 1024
+_HOST_CACHE = OrderedDict()          # url -> (pages, dead_why)，按最近使用排序
+_HOST_CACHE_BYTES = [0]              # 可变盒子：模块级计数，避免每次写入都 global 声明
+# DNS 解析结论按域缓存：SSRF 闸每条记录查一次 DNS 会把整轮回采拖成 DNS 瓶颈。
+# 值只有几个 IP 字符串，8000 条约 1~2MB，按条数封顶就够，不值得再套一层预算。
 _DNS_CACHE = {}
+
+
+def _entry_bytes(pages, dead_why):
+    """一条缓存项占多少内存（估）。用 repr 长度量太慢，这里只加字符串/字节自身长度。"""
+    n = len(dead_why or "")
+    for p in (pages or []):
+        # 页面条目形状见 enrich_site：(整页 HTML, 落地 URL, 页面标签)。
+        # 估算只数 str/bytes 自身长度——真正的对象开销（str 表头、元组、字典）比这还大，
+        # 所以这是一个**偏小**的账：预算封的是数量级，不是精确 RSS。
+        for part in (p if isinstance(p, (tuple, list)) else (p,)):
+            if isinstance(part, (str, bytes)):
+                n += len(part)
+    return n
+
+
+def _cache_get(url):
+    """读缓存并把它挪到队尾（LRU：刚用过的最不该被淘汰）。"""
+    with _LOCK:
+        hit = _HOST_CACHE.get(url)
+        if hit is not None:
+            _HOST_CACHE.move_to_end(url)
+        return hit
 
 
 def reset_caches():
@@ -148,6 +211,7 @@ def reset_caches():
     在下一轮看起来「没生效」——那种「明明改了却看不出变化」最难查）。"""
     with _LOCK:
         _HOST_CACHE.clear()
+        _HOST_CACHE_BYTES[0] = 0        # 字节账必须跟着清：留着下次一进来就以为满了
         _DNS_CACHE.clear()
 
 
@@ -448,6 +512,65 @@ def has_attr(name, vis, host):
 
 
 # ── 抓取 ──────────────────────────────────────────────────────
+_THREAD_LOCAL = threading.local()
+
+
+def _http_session():
+    """本线程复用的 requests.Session（连接池按线程各一份，不跨线程共享）。
+
+    为什么必须是 Session 而不是 `requests.get`：`requests.get` 内部是
+    `with sessions.Session() as session: return session.request(...)`——每次调用**现建
+    一个 Session 再丢掉**，连接池跟着一起没了，于是每一个页面都要重新 TCP + TLS 握手。
+    一家官网最多抓 MAX_PAGES_PER_SITE=6 页，还要跟着重定向走，同站握手就要重复六到
+    十几次。复用之后同站第 2~6 页直接拿现成连接。
+
+    实测（本机 8 核，`bash debug/run_perf_probe.sh` 的 F 档，本地 HTTPS 夹具、
+    在服务器侧数出来的连接数）：同一主机连打 24 发，每次现建 Session 是
+    **16.9 毫秒/发、真开 24 条连接**；线程内复用是 **0.96 毫秒/发、25 发只开 1 条连接**，
+    快 17.6 倍。换算到业务单位：一家 6 页的官网从约 101 毫秒降到约 6 毫秒。
+    这两个数是**下界**——夹具跑在 127.0.0.1 上，握手只剩 TLS 的 CPU 成本，真公网每次
+    还要另付 1 个 TCP RTT + 1~2 个 TLS RTT；也就是说真实回采省下的只会更多。
+
+    为什么按线程各一份：`requests.Session` 不是线程安全的（cookie jar / 连接池状态
+    会被并发改写）。回采是多线程的，共享一份等于把并发问题请回来；而 urllib3 的
+    连接池本来就在线程内复用连接，按线程切一份正好——既保住复用，也不跨线程串状态。
+    """
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is not None:
+        return sess
+    import requests
+    from requests.adapters import HTTPAdapter
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    try:
+        # 池子开 8 条：单线程同一时刻只有一张页在手，8 条是给重定向与相邻站留的余量；
+        # max_retries=0 是刻意的——重试交给上层「待重试」台账，别在传输层偷偷再打三次，
+        # 那会把预算耗尽变成「谁也说不清这一家到底请求了几次」。
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+    except Exception:
+        pass                                   # 装不上就用默认适配器，不影响正确性
+    _THREAD_LOCAL.session = sess
+    return sess
+
+
+def close_thread_session():
+    """线程收工时把这一路的连接池关掉（工作线程退出前调一次）。
+
+    不关的后果不是泄漏到进程外，而是 Keep-Alive 连接一直占着对方服务的会话数——
+    企业站前面常有「一个 IP 最多 N 条并发连接」的限制，攒着不放会把后面的请求
+    顶成 503/超时，那种超时还会被误记成「这家官网不行」。
+    """
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is not None:
+        _THREAD_LOCAL.session = None
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
 def fetch_html(url, timeout=TIMEOUT):
     """有界抓取：返回 (html, final_url, 失败原因)。
 
@@ -458,16 +581,15 @@ def fetch_html(url, timeout=TIMEOUT):
     """
     import requests
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout,
-                         allow_redirects=True)
+        r = _http_session().get(url, timeout=timeout, allow_redirects=True)
         try:
             final = r.url or url
             code = int(r.status_code)
             body = r.content or b""
             enc, guess = r.encoding, r.apparent_encoding
         finally:
-            # 响应一定要收口：线程池里每路都攥着一个连接，几十家之后就是
-            # 「Too many open files」这种和代码逻辑毫无关系的红。
+            # 响应一定要收口：连接靠它回到池子里复用；不收口就是每页攥死一条连接，
+            # 几十家之后先红的是「Too many open files」这种和逻辑无关的东西。
             try:
                 r.close()
             except Exception:
@@ -579,8 +701,7 @@ def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
     if not is_public_host(host):
         return {"phones": [], "emails": [], "why": "非公网地址（已拦截）", "pages": 0}
     get = opener or (lambda u: fetch_html(u, timeout=timeout))
-    with _LOCK:
-        cached = _HOST_CACHE.get(url)
+    cached = _cache_get(url)
     if cached is not None:
         pages, dead_why = cached
         if dead_why:
@@ -639,11 +760,26 @@ def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
 
 
 def _cache_pages(url, pages, dead_why):
-    """页面缓存写入（封顶清一次：一次任务几千个 URL，每个存几页 HTML 会吃掉几百 MB）。"""
+    """按字节预算写缓存：超预算就淘汰最久没用的那些（LRU），不整表清空。
+
+    旧写法是「超过 800 条 clear 一次」——两个毛病：①800 条按条数算，而单条可
+    以是 7MB，封顶封不住内存；②clear 会把刚抓完的一整批热点站一起丢掉，接下来的
+    同站记录全部重新联网（弱机上表现为「越跑越慢」）。
+    """
+    size = _entry_bytes(pages, dead_why)
     with _LOCK:
-        if len(_HOST_CACHE) > 800:
-            _HOST_CACHE.clear()
+        old = _HOST_CACHE.pop(url, None)
+        if old is not None:
+            _HOST_CACHE_BYTES[0] -= _entry_bytes(old[0], old[1])
         _HOST_CACHE[url] = (pages, dead_why)
+        _HOST_CACHE_BYTES[0] += size
+        evicted = 0
+        # 预留一条的余量再淘汰：不然「刚清到预算内、下一条又超」会一直贴着上限抖动
+        while _HOST_CACHE_BYTES[0] > HOST_CACHE_BUDGET_BYTES and len(_HOST_CACHE) > 1:
+            gone = _HOST_CACHE.popitem(last=False)
+            _HOST_CACHE_BYTES[0] -= _entry_bytes(gone[1][0], gone[1][1])
+            evicted += 1
+        return evicted
 
 
 # ── 合并（用户要的「英文逗号去重」）──────────────────────────────
@@ -730,6 +866,25 @@ TRANSIENT_WHY_RE = re.compile(
 def is_transient_why(why):
     """这个失败原因是「环境暂时不给力」还是「这站就这样了」。"""
     return bool(TRANSIENT_WHY_RE.search(str(why or "").strip()))
+
+
+# 闸门只认「本机/链路撑不住」这一类信号，判据比 TRANSIENT_WHY_RE **窄**，这是刻意的：
+# · 不可达(ReadTimeout/ConnectTimeout)：requests 把超时也归进 RequestException，所以
+#   超时长这样——这是并发压过头的头号表现，必须算坏；
+# · HTTP408/429/5xx：对方在喊「你太快了」或已经站不住；
+# · 抓取异常：解析侧异常多半伴随内存/半包，也算压力。
+# 而「不可达(ConnectionError/DNSError)」「证书校验失败」「首页不可达」是**对方**的事，
+# 把并发砍下来一点用都没有；反过来，缓存命中也不算好样本（它没花网络，喂进健康窗口
+# 只会灌出一窗「全好」，让机器明明撑不住还在加路）。
+GATE_BAD_WHY_RE = re.compile(
+    r'^(?:不可达\((?:Read|Connect)?Timeout\w*\)|抓取异常|HTTP(?:408|429|5\d\d)$)')
+
+# 等许可的等待上限，2 秒。为什么不是「一直等」也不是 30 秒：线程只在回到循环顶部时
+# 才会复查「停止」和预算，卡在 acquire 里时谁都叫不动它。参照物是**已经在手的一家**：
+# 最坏 6 页 × 12 秒 = 72 秒本来就停不下来，所以这一档只要明显小于它，等许可就不会
+# 变成反应迟滞的主项；2 秒正是把「被限速」的反应拉回秒级。副作用只有一个——
+# stats["gated"] 会涨，而它是「限速次数」不是「丢了多少家」，日志里必须这么写。
+GATE_ACQUIRE_S = 2.0
 
 
 def attempts_of(mark):
@@ -820,7 +975,7 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     stats = {"total": len(recs), "eligible": len(targets), "cached": skip_done,
              "ok": 0, "added": 0, "no_site": len(recs) - len(cand),
              "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0,
-             "verified": 0, "tiers": {}, "discovered": 0}
+             "verified": 0, "tiers": {}, "discovered": 0, "gated": 0}
     if not targets:
         return stats
 
@@ -829,33 +984,118 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     done_sites = set()
     added_keys = set()      # 本轮真正新增的「值」全集（跨行去重后才是可交付的净新增）
     halt = {"on": False}          # 预算/停止：置位后工作线程只退出，不再落笔
+    board = _gov.DoneBoard() if _gov else None      # 进展广播（见下面等待循环的注释）
+    n_workers = max(1, min(int(workers), io_workers_cap()))   # 线程上限（=闸门上界）
+
+    # ── 自适应并发闸门 ────────────────────────────────────────
+    # 线程按**上限**建（界面那一档 workers），同时在网的家数由闸门说了算。这个分工
+    # 不是随意切的：线程数在跑起来之后改不了，而本机压力是随时变的；如果反过来
+    # 「按当前许可数建线程」，弱机上起步 2 路就永远只有 2 路——机器空下来了闸门想
+    # 上探也没人去占那个许可，表现成「越跑越慢且再也回不去」（和上一版清缓存踢热点
+    # 站是同一类错误：把动态量当成了静态量）。
+    # 闸门建不起来（导入失败/参数意外）就退回固定并发：治理层出问题不该让采集停摆。
+    gate = None
+    if _gov is not None:
+        try:
+            gate = _gov.get_gate(GATE_NAME, max_permits=n_workers,
+                                 initial=_gov.recommended_io_workers(cap=n_workers))
+        except Exception:
+            gate = None
+    if gate is not None:
+        # 治理必须可见：自动收放如果不打出来，用户只会觉得「这工具今天慢」而查不到原因。
+        log(f"🌐 官网回采并发档位：{gate.describe()}（上限 {n_workers} 路，实际同时在网"
+            f"由本机负载与实测超时率现算）")
 
     def stopped():
         return halt["on"] or bool(stop and stop())
 
-    def work():
-        while True:
-            if stopped():
-                return
+    def claim_and_run():
+        """认领一家并做完。返回 False = 没有待办了，这一路线程该退。"""
+        with lock:
+            i = idx["n"]
+            if i >= len(targets):
+                return False
+            idx["n"] += 1
+            rec, site, tier = targets[i]
+        # 整段包起来：工作线程里任何一条异常若冒泡出去，线程池就少一路，剩下
+        # 的家数由更少的线程去跑（表现为「越跑越慢」而日志一句不提）——本轮
+        # 真实踩过一次 TypeError，正是这样被静默吞掉的。
+        try:
+            one(rec, site, tier)
+        except Exception as e:
             with lock:
-                i = idx["n"]
-                if i >= len(targets):
+                why = f"内部异常({type(e).__name__})"
+                stats["reasons"][why] = stats["reasons"].get(why, 0) + 1
+        finally:
+            # 每做完一家就播一次：等待方靠这个决定「要不要醒来看一眼进度/预算」。
+            if board is not None:
+                board.ping()
+        return True
+
+    def work():
+        try:
+            while True:
+                if stopped():
                     return
-                idx["n"] += 1
-                rec, site, tier = targets[i]
-            # 整段包起来：工作线程里任何一条异常若冒泡出去，线程池就少一路，剩下
-            # 的家数由更少的线程去跑（表现为「越跑越慢」而日志一句不提）——本轮
-            # 真实踩过一次 TypeError，正是这样被静默吞掉的。
-            try:
-                one(rec, site, tier)
-            except Exception as e:
+                if gate is None:
+                    if not claim_and_run():
+                        return
+                    continue
+                # 队列空了就先退出，别为一个**不存在的活**去排队等许可：idx["n"] 只增
+                # 不减，判空是一次性的真结论；反过来先 acquire 再认领的话，压力大的时候
+                # 每路线程都要空等满 GATE_ACQUIRE_S 才知道没事干——一轮收尾平白多出
+                # 「线程数 × 2 秒」的尾巴（表现为"最后卡几秒才结束"）。
                 with lock:
-                    why = f"内部异常({type(e).__name__})"
-                    stats["reasons"][why] = stats["reasons"].get(why, 0) + 1
+                    if idx["n"] >= len(targets):
+                        return
+                # **先要许可，再认领**：反过来的话一家公司会在「已被队列占住」的状态下
+                # 卡在闸门外——什么都不做，却谁也看不见它（进度条停在原地最容易被读成
+                # 卡死）。拿不到许可不算失败，也不写任何留痕：这一行的「官网回采」列
+                # 仍是空的，needs_retry 下一轮照旧把它排上，一家都不会丢。
+                got = gate.acquire(timeout=GATE_ACQUIRE_S)
+                if not got:
+                    with lock:
+                        stats["gated"] += 1
+                    if stopped():
+                        return
+                    continue
+                try:
+                    if not claim_and_run():
+                        return
+                finally:
+                    # 释放在 finally：漏一次的后果是许可永久流失，闸门会把自己锁死，
+                    # 比没有闸门更糟（这是本模块对 slot()/try-finally 反复核对的那条）。
+                    gate.release()
+        finally:
+            close_thread_session()     # 线程退出前收掉 Keep-Alive 会话（见其文档）
+
+    def feed_gate(res, elapsed_ms):
+        """把一家的网络结果喂给闸门（自适应全靠这一口喂出来的数据，不喂就永远不动）。
+
+        三条口径，都是刻意的：
+        · **缓存命中不喂**——它没花网络，喂进去只会灌出一窗「全好」，机器明明撑不住
+          还在加路；一张表里同一公司有几十条产品记录时，命中的全是这种。
+        · **只认 GATE_BAD_WHY_RE 那一类失败**为坏：超时/429/5xx 才是「本机或链路撑不住」；
+          对方 DNS 死了、证书坏了、整站挂了，砍并发一点用都没有，反而把后面几家本来
+          能成功的公司一起拖慢。
+        · **异常路径不喂**（在 claim_and_run 里被接走）：代码 bug 不该让闸门以为
+          机器不行——那会把一个 TypeError 永久变成「越跑越慢」。
+        找到号码与否**不是**判据：页面压根没写电话是一家完全健康的公司，从资源角度
+        看这一路成功极了。
+        """
+        if gate is None or res.get("cached"):
+            return
+        bad = bool(GATE_BAD_WHY_RE.search(str(res.get("why") or "")))
+        try:
+            gate.record(ok=not bad, latency_ms=elapsed_ms)
+        except Exception:
+            pass                       # 治理自身出问题绝不能把回采带崩
 
     def one(rec, site, tier):
         name = str(rec.get("公司名称") or rec.get("公司名") or "")
+        _t = time.monotonic()
         res = enrich_site(site, name, timeout=timeout)
+        feed_gate(res, (time.monotonic() - _t) * 1000.0)
         if stopped():
             return                           # 预算已用完：本轮不写这一条
         phones = [v for v, _s in res.get("phones") or []]
@@ -941,16 +1181,24 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
             done_sites.add(_reg_domain(host_of(site)))
             stats["marked"] += 1
 
-    n_workers = max(1, min(int(workers), 16))
     ths = [threading.Thread(target=work, name=f"site-enrich-{i}", daemon=True)
            for i in range(n_workers)]
     t0 = time.time()
     for t in ths:
         t.start()
     beat = {"n": 0, "t": t0}
+    seen = 0
     while any(t.is_alive() for t in ths):
-        for t in ths:
-            t.join(timeout=0.5)
+        # 事件等待（P5）：旧写法是「对每条线程 join(timeout=0.5)」，一个周期 0.5×线程数
+        # 秒——6 路时点停止最慢 3 秒才有反应，预算到点同样拖 3 秒，而绝大多数那次唤醒
+        # 都是白问（并没有线程刚好在那一刻结束）。现在每做完一家就 ping 一次，等待方
+        # 立刻醒来看进度；1 秒兜底超时是给心跳和预算留的落脚点（一批线程全卡在网络
+        # 超时上时可能整整一分钟没有一次 ping，日志不能因此一行都不出）。
+        if board is not None:
+            seen = board.wait(1.0, seen)
+        else:
+            for t in ths:                       # 治理模块不可用时退回老口径，行为一模一样
+                t.join(timeout=0.5)
         # 心跳：一轮回采动辄几分钟，界面只有「开始」和「结束」两行的话，用户没法
         # 判断是在跑还是卡死了（采集主链路同一条纪律：长任务必须自证还在推进）。
         if (idx["n"] - beat["n"] >= 40 or
@@ -975,5 +1223,16 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     # 以「真正落笔的条数」为准：被 halt 拦在半路的（已认领但没写）也算没做完，
     # 用认领数当进度会少报「剩余 N 家下次接着做」，而那正是用户决定要不要再跑一轮的依据。
     stats["skipped"] = max(0, len(targets) - stats["marked"])
+    if gate is not None:
+        # 档位账目落到 stats 里（界面/日志都能取）：自适应如果不留痕，慢的时候
+        # 就只剩一句「今天有点慢」，谁也没法据此判断该不该把并发上限调低。
+        gs = gate.stats()
+        stats["permits"] = gs["permits"]
+        stats["gate"] = gs
+        stats["site_avg_ms"] = gs["avg_ms"]
+        if stats["gated"]:
+            log(f"🌐 本机档位本轮限速 {stats['gated']} 次（不是丢数据：没认领的公司留痕还是"
+                f"空的，下次收尾自动接着做）；收工档位 {gs['permits']}/{gs['max']} 路，"
+                f"单家平均 {gs['avg_ms']} 毫秒")
     return stats
 

@@ -483,7 +483,7 @@ class AclAdminDialog(QDialog):
             ret = QMessageBox.question(
                 self, "确认踢掉本机",
                 f"{phone} 是本机当前绑定的账号，而你现在就在这台机器上。\n"
-                "解绑后本机立刻失去使用权限，且**不会自动重新登记**——必须再点一次"
+                "解绑后本机立刻失去使用权限，且不会自动重新登记——必须再点一次"
                 "「绑定云展动力账号」才会恢复。\n\n确定要踢掉自己吗？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if ret != QMessageBox.Yes:

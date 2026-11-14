@@ -3296,7 +3296,7 @@ class LocalScanDialog(QDialog):
         self.btn_all_new = QPushButton("只选「待入库」")
         self.btn_all_new.setMinimumHeight(34)
         self.btn_all_new.setToolTip(
-            "只勾上「待入库 / 待复核」这些**该传**的行，其余（已传过、重复副本、"
+            "只勾上「待入库 / 待复核」这些该传的行，其余（已传过、重复副本、"
             "同系列旧版、不合格、读不了）一律取消勾选。")
         self.btn_all_new.clicked.connect(self._on_only_new)
         self.btn_check_all = QPushButton("全选（含重复/旧版）")
@@ -3763,7 +3763,7 @@ class PoolTombstoneDialog(QDialog):
 
         tip = QLabel(
             "适用于：联调测试数据、误传的说明文档、确认不该进池的企业。\n"
-            "打标记后**所有人**的搜索结果、导出、去重合并都会自动跳过这些企业；"
+            "打标记后所有人的搜索结果、导出、去重合并都会自动跳过这些企业；"
             "原始文件保持不动，审计与回溯能力不受影响。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666;")
@@ -3954,7 +3954,7 @@ class PoolTombstoneDialog(QDialog):
             f"将给下面 {len(names)} 家企业打「剔除标记」：\n\n{preview}{more}\n\n"
             f"原因：{reason}\n"
             + skipped +
-            "标记是**团队级**的：所有同事的数据池搜索结果与导出都会不再包含这些企业。\n"
+            "标记是团队级的：所有同事的数据池搜索结果与导出都会不再包含这些企业。\n"
             "原始文件不会被删除（保留审计与回溯），标记本身也是只追加、不可撤回。\n\n"
             "确认执行？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)

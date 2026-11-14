@@ -35,6 +35,36 @@ _CLAIMED = {}
 PROFILE_DIR_NAME = "chrome_b2bcollect_profile"
 
 
+# ── 本机调试端口的 HTTP 通道（全工具唯一入口）──────────────────────────
+# 为什么不能就地用 requests.get：requests 默认 trust_env=True，会读 HTTP_PROXY /
+# HTTPS_PROXY / ALL_PROXY 环境变量。开着系统代理、VPN、Clash/抓包工具的电脑上，
+# 连 http://127.0.0.1:9255/json/list 都要先丢给代理转一圈。2026-11-14 本机实测：
+# 一旦 HTTP_PROXY 指向一个不应答的地址，单条 CDP 命令从中位 **4.8 ms 变成 24000 ms**，
+# 并且列标签超时被 except 吞成 [] → 上层判成「页面是空的」→ 用户看到的是
+# 「一家也没采到」而不是任何报错。控制面是本机回环，任何情况下都不该经过代理
+# （Chrome 自家的 DevTools 客户端也是直连），所以这里显式把代理开关关掉。
+# 顺手拿到第二笔收益：会话复用＝TCP 连接复用，今天每条命令都重新建一次连接。
+# 线程本地：requests.Session 不是线程安全的，而采集是三~八路并行各自列标签。
+_LOCAL_SESSIONS = threading.local()
+
+
+def local_session() -> requests.Session:
+    """本机回环控制面专用会话：绝不走代理、连接复用、每线程一条。"""
+    s = getattr(_LOCAL_SESSIONS, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.trust_env = False     # 不读 *_PROXY 环境变量、不读 .netrc、不读 PAC
+        s.proxies = {}          # 再上一道：即使有人在别处塞了代理也不生效
+        _LOCAL_SESSIONS.session = s
+    return s
+
+
+def local_url(port: int, path: str) -> str:
+    """调试端口的完整地址。集中一处拼，避免哪天换 0.0.0.1/IPv6 时漏掉调用点。"""
+    return f"http://127.0.0.1:{port}{path}"
+
+
+
 def shared_profile_dir() -> Path:
     """共享 Chrome 的配置目录落点：口径全交给 tool_config，本函数只声明「老位置在哪」。
 
@@ -76,7 +106,7 @@ def is_alive(port: int = PORT) -> bool:
     """只探调试端口、不看页面数：Chrome 在跑但 0 窗口时也不能当成没在跑，
     否则会再拉一个同配置目录的进程，新进程只会把请求转交老进程后自己退出。"""
     try:
-        return requests.get(f"http://127.0.0.1:{port}/json/version", timeout=3).status_code == 200
+        return local_session().get(local_url(port, "/json/version"), timeout=3).status_code == 200
     except Exception:
         return False
 
@@ -163,7 +193,7 @@ def _launch_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
 def list_page_targets(port: int = PORT) -> list:
     """共享浏览器里所有可见页面（type=page）。查询失败返回 []。"""
     try:
-        data = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=3).json()
+        data = local_session().get(local_url(port, "/json/list"), timeout=3).json()
     except Exception:
         return []
     if not isinstance(data, list):
@@ -174,12 +204,12 @@ def list_page_targets(port: int = PORT) -> list:
 def open_tab(port: int = PORT, url: str = "about:blank"):
     """在共享 Chrome 里新开一个标签，返回 target dict（失败返回 None）。"""
     try:
-        r = requests.put(f"http://127.0.0.1:{port}/json/new?url={url}", timeout=6).json()
+        r = local_session().put(local_url(port, f"/json/new?url={url}"), timeout=6).json()
         return r if isinstance(r, dict) and r.get("id") else None
     except Exception:
         # 个别 Chrome 版本 /json/new 只接受 GET
         try:
-            r = requests.get(f"http://127.0.0.1:{port}/json/new?url={url}", timeout=6).json()
+            r = local_session().get(local_url(port, f"/json/new?url={url}"), timeout=6).json()
             return r if isinstance(r, dict) and r.get("id") else None
         except Exception:
             return None
@@ -189,7 +219,7 @@ def close_tab(port: int = PORT, target_id: str = ""):
     if not target_id:
         return
     try:
-        requests.get(f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=3)
+        local_session().get(local_url(port, f"/json/close/{target_id}"), timeout=3)
     except Exception:
         pass
 
@@ -260,7 +290,7 @@ def _browser_cmd(port, method, params, timeout=8):
     """向浏览器级 CDP 端点发一条命令（只取 id=1 的响应，忽略事件帧）。"""
     try:
         import websocket as _ws
-        info = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=4).json()
+        info = local_session().get(local_url(port, "/json/version"), timeout=4).json()
         url = info.get("webSocketDebuggerUrl") or ""
         if not url:
             return None

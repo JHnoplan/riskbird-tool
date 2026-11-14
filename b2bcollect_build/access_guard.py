@@ -2270,7 +2270,7 @@ def _path_discipline(frozen: bool) -> Tuple[int, List[str]]:
     lines.append("   · 症状：只读卷上启动即崩（Errno 30）；整包可写时不崩，但升级或卸载"
                  "会把 Cookie、审计日志、自检报告一起带走；Windows 写进退出即删的临时目录"
                  "＝登录态与缓存每次归零，界面却照样提示「已保存」。")
-    lines.append("   · 修法：按**形态**排除包内（tool_config.inside_app_bundle 与 "
+    lines.append("   · 修法：按形态排除包内（tool_config.inside_app_bundle 与 "
                  "runtime_paths.candidate_dirs），不许等写探针碰运气；离线判据见 "
                  "b2bcollect_build/test_data_dir_offline.py 第 7 节。")
     return (DOCTOR_EXIT_PATH if frozen else DOCTOR_EXIT_OK), lines

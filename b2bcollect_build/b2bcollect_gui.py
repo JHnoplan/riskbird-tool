@@ -31,7 +31,10 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent
 from PyQt5.QtGui import QFont, QPalette, QColor, QPainter, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QTextEdit, QFileDialog, QSpinBox, QDoubleSpinBox,
+    # QTextEdit 不再导入：主窗口日志区已换 QPlainTextEdit（实测依据见 _build_ui 里
+    # 创建 self.log 那段注释）。下面 QSS 里 `QTextEdit, QPlainTextEdit {}` 那条规则保留
+    # 着，是因为它是 app 级样式，而 acl_admin_dialog 的「换绑轨迹」框还在用富文本控件。
+    QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox,
     QProgressBar, QMessageBox, QGroupBox, QPlainTextEdit, QDialog,
     QLineEdit, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStackedWidget, QButtonGroup, QInputDialog, QDialogButtonBox, QFrame,
@@ -150,6 +153,11 @@ except Exception as _bootstrap_exc:               # noqa: BLE001 - 收口后按�
     #  fatal error 框，用户面对两个框、其中一个是天书。堆栈已经完整落进上面那份日志，
     # 退出码非零也照样能被 CI 抓到——证据一样不少，只少一个吓人的框。
     raise SystemExit(1) from _bootstrap_exc
+
+try:
+    import perf_governor as _gov      # 界面只**读**它的账目（现在同时几路），见下面
+except Exception:                     # build_perf_board_suffix。读不到就不显示那一栏，
+    _gov = None                       # 治理层是锦上添花，绝不能因为它而让主流程报错
 
 try:
     import enhanced_cleaner as _enhanced
@@ -842,17 +850,17 @@ SITE_TIPS = {
     "1688": "1688 www.1688.com：关键词→商品/店铺搜索→公司详情页。需先登录（有登录限制，故默认不勾选）；"
             "勾选后会弹窗提示并可一键打开 1688 登录页，请先在浏览器里确认已登录再开始采集。\n"
             "与其它需浏览器的站共享同一个 Chrome（各占自己标签），绝不会另开浏览器。",
-    "qzd": "企知道 www.qizhidao.com：**名单驱动**通道（不参与关键词并行）。从「待采集公司名单」逐家模拟人工查询，"
+    "qzd": "企知道 www.qizhidao.com：名单驱动通道（不参与关键词并行）。从「待采集公司名单」逐家模拟人工查询，"
            "拿工商详情/联系方式。需登录（点右侧「打开企知道」按钮先登录）。\n"
            "看门狗：名单空则休眠零占用，关键词采集清洗掉的无联系方式废数据自动回流入列后自动苏醒补采；"
            "采过/查不到的公司名会从名单剔除，避免重复采集。",
-    "riskbird": "风鸟 www.riskbird.com：**名单驱动**通道（与企知道/爱企查共用同一份待采名单）。"
+    "riskbird": "风鸟 www.riskbird.com：名单驱动通道（与企知道/爱企查共用同一份待采名单）。"
            "默认走搜索结果列表页拿 1 电话 1 邮箱，命中本地 30 天卡片缓存的公司不发请求；"
            "列表额度撞墙后自动降级用补全接口登记线索，还可用剩余的详情额度逐家补全。\n"
            "需登录（点「打开风鸟」按钮）。当天额度用尽时这一路会自动让路（不报错、不白烧请求），"
            "名单原样留着，明天或额度恢复后重新开始任务会自动接续。\n"
            "与另外两路共享同一个 Chrome（只占自己一个标签），绝不另开浏览器、也不关别人的标签。",
-    "aiqicha": "爱企查 aiqicha.baidu.com（百度旗下企业工商信息）：**名单驱动**通道（与企知道/风鸟共用同一份名单）。"
+    "aiqicha": "爱企查 aiqicha.baidu.com（百度旗下企业工商信息）：名单驱动通道（与企知道/风鸟共用同一份名单）。"
            "按公司名逐家查联想→详情页，拿工商登记地址/法定代表人/电话/邮箱；"
            "工商登记地址是全体系最硬的属地证据，选省份时按它把关，对不上的不入库。\n"
            "需登录（点「打开爱企查」按钮）。被拦或掉登录时这一路限时等人工（不会拖满半小时），"
@@ -955,6 +963,92 @@ def build_stats_html(text, site_status=None):
     _tip = '  ·  '.join(tooltip_parts)
     return '<span title="' + _tip + '">' + html + '</span>'
 
+# ── 看板上的「本机并发」文案（纯函数，脱离界面也能断言）────────────────────
+# 为什么要把自动收放显示出来：治理层在弱机上会把并发从 6 路砍到 2 路，界面上毫无痕迹
+# 的话，用户读到的就只是「今天有点慢」——一句都无法核对的主观感受（日志里那行 🌐 只在
+# 回采开始和心跳时打一次，看板才是常驻的那一行）。
+# 分工与 build_stats_html 一致：**数字归治理层，文案归界面**。这两个函数只做格式化，
+# 一条判据都不自己算，所以离线用例可以直接喂账目断言文案，而不必先跑一轮真回采。
+PERF_GATE_LABELS = {"site_enrich": "官网回采"}
+
+
+def perf_gate_label(name):
+    """闸门内部名字 → 界面叫法。返回的是**前缀**，可能是空串。
+
+    没在 PERF_GATE_LABELS 登记过的名字照原名显示：那是账目里带来的事实，比给它编一个
+    「官网回采」诚实——编错了用户就会拿官网的数去读另一个东西，而且多条未登记的账目之间
+    也还分得开。完全没有名字时返回空串而不是兜一个「并发」：下面的模板本身就带「并发」
+    二字，兜了会叫成「并发并发」（离线用例⑩就是这么抓到的）。
+    """
+    return PERF_GATE_LABELS.get(name) or str(name or "")
+
+
+def build_perf_board_suffix(gates):
+    """看板尾部的一段「官网回采并发 3/6 路」；回采没在跑时返回**空串**。
+
+    为什么静止时不写：闸门账本是跨轮次留存的，回采结束后那个数字就再也不变了——常驻
+    显示一个不动的「并发 6/6 路」会被读成「它现在也在这么跑」，比不显示更误导。
+    所以判据取「有没有在途请求」：这一行只在它真的有意义时占那十几个字
+    （看板是次要信息行，没内容就不占字，与 lbl_board 空隐藏同一条理由）。
+    """
+    segs = []
+    for g in gates or []:
+        try:
+            permits, cap, busy = int(g["permits"]), int(g["max"]), int(g.get("in_use") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue                              # 账目残缺就整条不写，不猜一个数糊上去
+        if busy <= 0:
+            continue
+        name = perf_gate_label(g.get("name"))
+        segs.append(f"{name}并发 {permits}/{cap} 路")
+    if not segs:
+        return ""
+    return "｜" + "；".join(segs)
+
+
+def build_perf_board_tip(gates, machine=""):
+    """悬停详情：这一档现在几路、为什么比上限小、机器现在什么负担。
+
+    口径要说透「这里是上限，实际同时几路还会自己收放」——不写这句，用户把上限调到 16
+    却发现只跑 6 路，得到的就是「设置不生效」这个本项目反复记过账的缺陷印象。
+    """
+    lines = []
+    for g in gates or []:
+        try:
+            permits, cap = int(g["permits"]), int(g["max"])
+            in_use = int(g.get("in_use") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if in_use <= 0:
+            continue                              # 与 build_perf_board_suffix 同一条口径
+        # 这里 name 是句子主语，没有名字时必须有个词顶着（看板那栏是前缀，空串正好）
+        name = perf_gate_label(g.get("name")) or "并发"
+        waiters = int(g.get("waiters") or 0)
+        seg = f"· {name}：现在同时查 {in_use} 家（这一档上限 {cap} 路，当前给到 {permits} 路）"
+        if waiters:
+            seg += f"，另有 {waiters} 路在等位"
+        lines.append(seg)
+        down, up = int(g.get("decrease") or 0), int(g.get("increase") or 0)
+        if down or up:
+            lines.append(f"  本轮已自动降档 {down} 次、升档 {up} 次"
+                         + (f"（最近一次降档原因：{g['last_pressure_reason']}）"
+                            if down and g.get("last_pressure_reason") else ""))
+        if g.get("avg_ms"):
+            lines.append(f"  一家官网平均 {float(g['avg_ms']):.0f} 毫秒"
+                         + (f"（最慢 {float(g['max_ms']):.0f} 毫秒）" if g.get("max_ms") else ""))
+        blocked = int(g.get("acquire_timeout") or 0)
+        if blocked:
+            lines.append(f"  被限速跳过 {blocked} 次——跳过的不算丢数据，下次收尾会自动补做")
+    if not lines:
+        return ""          # 一段账目都没拼出来时，那句「这一档是软件自己定的」就成了
+                           # 对着空气的解释——悬停框宁可不出现
+    lines.append("这一档是软件按你这台机器的负担自己定的：机器闲下来慢慢加，"
+                 "忙起来或超时变多就立刻减，你不用设置。")
+    if machine:
+        lines.append(f"机器当前负担：{machine}")
+    return "\n".join(lines)
+
+
 try:
     import yzd_client as _yzd
     import task_registry as _tasks
@@ -1033,6 +1127,24 @@ class SiteEnrichWorker(QThread):
 
 
 # ── 自动保存线程：各平台合并写「原始 + 清洗后入库 + 国内只留手机号」三份 ──────
+def rows_signature(rows) -> bytes:
+    """整批内存数据的内容指纹，用来判断「盘上那三份」是不是已经等于内存这一份。
+
+    判据必须是内容而不是条数：官网回采是**原地**给已有行补电话/邮箱的，
+    条数一点不变、内容却新了一截，按条数跳过就会把补到的号码永远丢在内存里。
+    5000 条实测 87 毫秒，比整轮重写三份 Excel（同规模 3.8 秒）便宜 40 倍。
+    """
+    h = hashlib.blake2b(digest_size=16)
+    for r in rows:
+        try:
+            h.update(repr(sorted(r.items())).encode("utf-8", "ignore"))
+        except Exception:
+            # 字段形状不齐（键不全是 str 之类）也要给出跟这一行内容对应的字节，
+            # 绝不能悄悄跳过某一行——那一行变了指纹就该变
+            h.update(repr(r).encode("utf-8", "ignore"))
+    return h.digest()
+
+
 class AutoSaveWorker(QThread):
     saved = pyqtSignal(str, int, int)   # 路径, 原始条数, 国内手机条数
     failed = pyqtSignal(str)
@@ -1042,23 +1154,40 @@ class AutoSaveWorker(QThread):
         self.session = session
         self.rows = rows
         self.session_dir = session_dir
+        # 三份表是否**真的**都写完了：收尾保存的跳过判据只认这个，不认「发起过」
+        self.ok = False
+        # 这一轮写出去的是哪一份内容（模块级 rows_signature 算的指纹，run() 里才落值）
+        self.snapshot_sig = b""
+        # 失败原因留一份给同步调用方看：run() 自己吞异常发信号，收尾保存那条路
+        # 没接信号，不记就成了「失败了但屏幕上一个字都不显示」
+        self.error = ""
 
     def run(self):
         try:
+            # 指纹在后台线程算：5000 条 87 毫秒，放在界面线程上就是白闪一下
+            self.snapshot_sig = rows_signature(self.rows)
             ts_dir = Path(self.session_dir)
             ts_dir.mkdir(parents=True, exist_ok=True)
             raw = ts_dir / (_tasks.RAW_FILE_NAME if HAS_YZD else "企业数据_原始.xlsx")
             self._write_raw(raw, self.rows)
+            # 清洗只算一次，两份派生表共用同一份结果：原先 _write_cleaned 与
+            # _write_cn_mobile_file 各调一遍 clean_records，5000 条实测多花 1157ms，
+            # 更糟的是 clean_records 的副作用会跑两遍——废数据两次 add_waste 落盘、
+            # 日志里同一批 ♻ 重复报数（口径没问题但用户看到的是重复行）。
+            clean_rows = self.session.clean_records(self.rows, log=lambda m: None)
             cl = ts_dir / "企业数据_清洗后入库数据.xlsx"
-            self._write_cleaned(cl, self.rows)
+            self._write_cleaned(cl, self.rows, clean_rows=clean_rows)
             # 精细化：额外生成「国内只留手机号」文件，与导入客户库同一口径
             cl_mobile = ts_dir / "企业数据_国内只留手机号.xlsx"
-            mobile_n = self._write_cn_mobile_file(cl_mobile, self.rows)
+            mobile_n = self._write_cn_mobile_file(cl_mobile, self.rows, clean_rows=clean_rows)
+            self.ok = True          # 三份都写成了才算这一轮真的落盘（收尾保存据此跳过）
             self.saved.emit(str(raw), len(self.rows), mobile_n)
         except PermissionError:
-            self.failed.emit("文件正被 Excel/WPS 打开占用，本次自动保存跳过，关闭后下轮补上")
+            self.error = "文件正被 Excel/WPS 打开占用，本次自动保存跳过，关闭后下轮补上"
+            self.failed.emit(self.error)
         except Exception as e:
-            self.failed.emit(f"自动保存失败：{e}")
+            self.error = f"自动保存失败：{e}"
+            self.failed.emit(self.error)
 
     @staticmethod
     def _write_raw(path, rows):
@@ -1075,20 +1204,26 @@ class AutoSaveWorker(QThread):
         wb.save(tmp)
         os.replace(tmp, str(path))
 
-    def _write_cleaned(self, path, rows):
-        clean_rows = self.session.clean_records(rows, log=lambda m: None)
+    def _write_cleaned(self, path, rows, clean_rows=None):
+        # clean_rows 是 run() 里已经算好的那一份；单独调用（收尾保存、外部入口）时
+        # 仍然在这里自己洗一遍，档位口径始终由 session.clean_records 说了算。
+        if clean_rows is None:
+            clean_rows = self.session.clean_records(rows, log=lambda m: None)
         template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
         tmp = str(path) + ".tmp"
         _cleaner.write_clean_excel(clean_rows, tmp, template_path=template, log=lambda m: None)
         os.replace(tmp, str(path))
 
-    def _write_cn_mobile_file(self, path, rows):
+    def _write_cn_mobile_file(self, path, rows, clean_rows=None):
         """清洗 → 过滤中国手机号 → 写 18 列模板 Excel，返回写入行数。
 
         与「清洗数据」三份文件中的「国内只留手机号」同一口径，
         自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。
+        clean_rows 传进来就复用自动保存那一次清洗结果，不再重洗一遍（省一半 CPU，
+        也不会把废数据回流和 ♻ 日志触发两次）。
         """
-        clean_rows = self.session.clean_records(rows, log=lambda m: None)
+        if clean_rows is None:
+            clean_rows = self.session.clean_records(rows, log=lambda m: None)
         mobile_rows = _yzd.filter_cn_mobile_rows(clean_rows, log=lambda m: None)
         template = _cleaner.locate_template([self.session_dir, str(Path.home() / "Downloads")])
         tmp = str(path) + ".tmp"
@@ -2193,6 +2328,9 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.autosave = None
         self._pending_save = False
+        # 盘上那三份 Excel 对应的是哪一份内容（rows_signature 的指纹）。初值空字节 =
+        # 「什么都没证明过」，收尾保存一定真写一遍；只有 AutoSaveWorker.ok 才会落这个值。
+        self._last_saved_sig = b""
         self._opening_browser = False
         self._paused = False
         self.keywords = []
@@ -2270,6 +2408,26 @@ class MainWindow(QMainWindow):
         # ②定时兜底（长时间单关键词深翻页也能按时间保存），另在开始/结束时各存一次。
         self.AUTOSAVE_EVERY = 20
         self._last_autosave_bucket = 0
+        # ①那条要再过一道**自适应限流**：一轮保存是「全表重洗 + 重写三份 Excel」，
+        # 表越大越贵（本机 5000 条实测：优化前一轮 14240ms，样式号复用 + 单次清洗后
+        # 5599ms，仍随条数线性涨），而「每满 20 条」
+        # 不看表格大小：采得越顺、攒得越快、每满 20 条来得越勤，后台就一直在写全表，
+        # 采集速度反被自己拖慢（大厂后台落盘的通用做法是给后台任务一个开销预算，
+        # 让「写盘占用的墙钟比例」恒定，而不是让触发频率恒定）。
+        # 判据：下一轮的间隔 = 上一轮实际耗时 / 5%（夹在 3s ~ 120s 之间）。
+        # 首轮不限流（_autosave_cost_ms=0 → 3s）；停止/退出仍走 _final_save_sync 必落盘，
+        # 所以最坏情况是「被强杀时最多丢掉这一段间隔内新增的数据」。
+        self.AUTOSAVE_COST_SHARE = 0.05
+        self.AUTOSAVE_MIN_GAP_S = 3.0
+        self.AUTOSAVE_MAX_GAP_S = 120.0
+        self._autosave_cost_ms = 0.0
+        self._last_autosave_at = 0.0
+        # 看板（各路账目汇总 + tooltip）按 0.4 秒节拍重画，脏标记合并：采集推进一秒
+        # 几十次时不必每次都重排富文本；任务结束那一路仍直接 _refresh_board() 刷终值。
+        self._board_dirty = False
+        self._board_timer = QTimer(self)
+        self._board_timer.timeout.connect(self._flush_board)
+        self._board_timer.start(400)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.request_autosave)
         self._timer.start(3 * 60 * 1000)
@@ -2921,8 +3079,33 @@ class MainWindow(QMainWindow):
                                "命中验证码时会自动还原窗口提醒人工过验证，过后重新最小化；\n"
                                "启动浏览器已带防后台节流开关，最小化不影响页面渲染。\n"
                                "注：对启动前已在跑的旧 Chrome 进程无效（开关只能启动时传入），会改用前置窗口方式。")
+        # ── 回采并发档位（默认「自动」）──────────────────────────────
+        # 为什么给这个入口、又为什么默认必须是自动：软件按这台机器的实际资源自己定路数
+        # （治理层 recommended_io_workers：8 核 8G 给 6 路、2 核机给 2 路），这是业界
+        # 同类工具的统一做法——自适应为默认，手动只是**应急覆盖**（弱机上网站一直超时
+        # 时，「少开几路」是用户唯一能自救的动作）。
+        # 这里改的是**上限**，不是同时在网的家数：后者由闸门按实测超时率与本机负载现算，
+        # 这句话必须写在 tooltip 里，不然「拉到 16」会被理解成「一定同时跑 16 家」，
+        # 跑出来不是那样就变成「设置没用」。
+        self.lbl_site_workers = QLabel("同时查几家官网")
+        self.spin_site_workers = QSpinBox(self)
+        self._workers_cap = max(2, int(getattr(self.session, "site_workers_cap", lambda: 16)()))
+        self.spin_site_workers.setRange(0, self._workers_cap)
+        self.spin_site_workers.setSpecialValueText("自动")   # 0 这一档显示成「自动」
+        self.spin_site_workers.setValue(0)
+        self.spin_site_workers.setFixedWidth(78)
+        self.spin_site_workers.setToolTip(
+            "采集收尾时同时去几家官网查联系方式。默认「自动」= 软件按你这台机器现在的\n"
+            "配置自己定（配置越低开得越少），一般不用动。\n"
+            "只有官网那一轮一直报「超时」的时候才往下调（比如改成 2），减少同时发出的请求。\n"
+            "注意：这里设的是上限（最多同时几路）。实际同时查几家还会随机器忙闲自动收放——\n"
+            "机器忙或超时变多就自己减下来，缓过来再慢慢加回去，所以数字比这里小是正常现象，\n"
+            "界面下面那行「本机并发」会实时显示当前是几路。")
+        self.spin_site_workers.valueChanged.connect(self._on_site_workers_changed)
         hp.addWidget(self.chk_guard); hp.addWidget(self.chk_incr)
-        hp.addWidget(self.chk_site); hp.addWidget(self.chk_bg)
+        hp.addWidget(self.chk_site)
+        hp.addWidget(self.lbl_site_workers); hp.addWidget(self.spin_site_workers)
+        hp.addWidget(self.chk_bg)
         hp.addStretch(1)
         # 「清空历史种子库」是内部运维入口（一把删光跨运行去重成果，下轮全量重请反而
         # 抬高防封风险）。对外档位不创建该按钮；复位对话框里的同名勾选项一并撤掉——
@@ -3068,7 +3251,7 @@ class MainWindow(QMainWindow):
         self.chk_lead.setToolTip(
             "每轮采完在任务文件夹里多落一张《线索分层与通道健康.xlsx》（四张表）。\n"
             "采集那两份表与《清洗后入库数据》模板一概不动：入库模板是接口契约，加一列就会破坏上传，\n"
-            "所以这三样全做成**附加报表**，不碰既有产出。\n"
+            "所以这三样全是附加报表，不碰既有产出。\n"
             "· 线索分层：一家一条（同主体多行先归并，逐字段取可信度最高的那一行并带它的出处），\n"
             "  按可信度 45 / 完整度 35 / 新鲜度 20 打分，分成「立即跟进 / 先培育 / 本轮别碰」，\n"
             "  分数怎么来的逐条写在「依据」列——只给分不给依据的分数没人敢用；\n"
@@ -3082,7 +3265,7 @@ class MainWindow(QMainWindow):
         self.chk_reverify = QCheckBox("到期字段自动重验")
         self.chk_reverify.setChecked(self._reverify_on)
         self.chk_reverify.setToolTip(
-            "勾选之前要先知道的一件事：这一档会**额外花网络请求**去重问已经答过的数据。\n"
+            "勾选之前要先知道的一件事：这一档会额外花网络请求去重问已经答过的数据。\n"
             # 保鲜期与倍率**从 field_evidence 里取**再拼进文案：写成死数字，下一轮调 TTL
             # 的时候界面还在讲旧天数（话术与口径分家，用户按界面上的天数去理解重验频率）。
             f"判过期看「最后核验时间」那一列，不是看采集时间："
@@ -3353,12 +3536,18 @@ class MainWindow(QMainWindow):
         self.btn_log_toggle.clicked.connect(self._toggle_log_area)
         lay.addWidget(self.btn_log_toggle)
 
-        self.log = QTextEdit(); self.log.setReadOnly(True)
+        # 日志用 QPlainTextEdit 而不是 QTextEdit：后者是富文本编辑器，每行 append 都要
+        # 走一遍 HTML/段落解析 + 文档布局。本机 offscreen 实测（debug/perf_gui_probe.py
+        # A 档：两边都灌到 3000 行稳态、每行都算上告警计数，只差控件）
+        # 每行 2.416ms → 0.260ms，快 9.3 倍；「优化前」那档首尾各量一次只差 4.1%，
+        # 说明倍数不是排队顺序造出来的。过夜采集刷两三万行，这笔钱全落在界面线程上——
+        # 正是同事反馈「挂机越久越卡」的第一现场。日志只有纯文本，用不到富文本能力。
+        self.log = QPlainTextEdit(); self.log.setReadOnly(True)
         self.log.setFont(QFont("Menlo", 10) if sys.platform != "win32" else QFont("Consolas", 9))
-        # 性能（同事反馈挂机后电脑卡）：过夜采集日志能刷上万行，QTextEdit 无上限
-        # 累积会让文档越来越大、每次 append 重排越来越慢、内存持续上涨。
+        # 性能（同事反馈挂机后电脑卡）：过夜采集日志能刷上万行，无上限累积会让
+        # 文档越来越大、每次 append 重排越来越慢、内存持续上涨。
         # 设最大块数：只保留最近 N 行，超出自动从头丢弃，渲染/内存恒定。
-        self.log.document().setMaximumBlockCount(3000)
+        self.log.setMaximumBlockCount(3000)
         lay.addWidget(self.log, 0)
         # 日志在常驻布局里的槽位下标：折叠时要把它的 stretch 归零，靠下标改最稳
         # （按 widget 找要遍历布局，按名字找更是把布局结构焊死在字符串里）。
@@ -3515,8 +3704,17 @@ class MainWindow(QMainWindow):
             self.btn_pool_search.clicked.connect(self._on_pool_search)
 
     def _on_log(self, msg):
-        self.log.append(msg)
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        # 先记下「追加前是不是已经贴底」再追加：用户在往上翻历史时，新日志不该把他
+        # 拽回底部（浏览器控制台/Slack 的同一条口径）。留 4px 容差——滚动条取值在
+        # 追加前后会有一帧抖动，卡 `== maximum()` 会莫名不跟。
+        # 这一条**不算性能收益**：offscreen 实测每行 0.260ms（每行硬拧到底）→
+        # 0.263ms（贴底才跟随），差在噪声里；真实屏幕上的省开销来自少刷的那几次 viewport，
+        # 而 offscreen 不做光栅化量不到。改它的理由是「别抢用户的滚动条」，仅此而已。
+        sb = self.log.verticalScrollBar()
+        stick = sb.value() >= sb.maximum() - 4
+        self.log.appendPlainText(msg)
+        if stick:
+            sb.setValue(sb.maximum())
         # 日志被折起来时，告警行不能跟着一起折没（见 _count_log_notice）
         self._count_log_notice(msg)
 
@@ -3553,6 +3751,33 @@ class MainWindow(QMainWindow):
         self._bar_pct = int(done_units / total_units * 100) if total_units else 0
         self._update_bar()
 
+    def _mark_board_dirty(self):
+        """看板只标脏，不立刻重画（每家公司一刷 → 采集快的路一秒重排界面几十次）。"""
+        self._board_dirty = True
+
+    def _flush_board(self):
+        # 回采正在跑时（闸门里还有在途请求）每拍都重算一次并发档位：这一路数字是
+        # 唯一「每秒都可能变」的看板内容，等脏标记会等不到——回采期间采集已经结束了，
+        # 没有别的事件会把看板标脏。
+        # 为什么判「闸门里有在途」而不是新起一个定时器：① 不新增一个可能忘关的源；
+        # ② 只有真在跑回采时这个数字才会变，其余时候重画是纯噪声（弱机上那一次 setText
+        # 才是真成本）。读账目本身的开销实测 0.0002 毫秒（探针 G 档），比一次 setText
+        # 便宜四个数量级，所以这一拍该花的不是读，而是刷。
+        if not self._board_dirty and self._gates_busy():
+            self._board_dirty = True
+        if self._board_dirty:
+            self._board_dirty = False
+            self._refresh_board()
+
+    def _gates_busy(self) -> bool:
+        """闸门里现在有没有在途请求（治理层不可用/读不出时一律按「没有」处理）。"""
+        if _gov is None:
+            return False
+        try:
+            return any(int(g.get("in_use") or 0) > 0 for g in _gov.gates_state())
+        except Exception:
+            return False
+
     def _refresh_board(self):
         """量化看板压成**一行**总计（成功/无联系方式/失败可重采/早过滤/详情不相关），
         逐站明细移到本行 tooltip 悬停可查。旧版每站一行共 5 行、且写死深色文字，
@@ -3568,30 +3793,65 @@ class MainWindow(QMainWindow):
         tot = {k: sum(s.get(k, 0) for s in stats.values()) for k in keys}
         pf = (f"｜省份把关 外省 {tot['pf_miss']}·待核实 {tot['pf_unknown']}"
               if (tot['pf_miss'] or tot['pf_unknown']) else "")
+        # 并发档位只在回采真的在跑时挂上来（判据与文案见 build_perf_board_suffix）。
+        # 治理层读不出来时这一栏就是不出现——账目行照常显示，绝不因为它让看板空白。
+        perf_gs, perf_tip = [], ""
+        if _gov is not None:
+            try:
+                perf_gs = _gov.gates_state()
+                perf_tip = build_perf_board_tip(perf_gs, _gov.snapshot().describe())
+            except Exception:
+                perf_gs, perf_tip = [], ""
+        perf = build_perf_board_suffix(perf_gs)
         self.lbl_board.setText(
             f"明细：成功 {tot['ok']}｜无联系方式 {tot['no_contact']}｜失败可重采 {tot['failed']}｜"
-            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条{pf}")
-        self.lbl_board.setToolTip("\n".join(
+            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条{pf}{perf}")
+        _site_tip = "\n".join(
             f"{name}：采到 {s.get('got', 0)} 家（成功 {s.get('ok', 0)}）｜翻 {s.get('pages', 0)} 页见 "
             f"{s.get('listed', 0)} 条｜无联系方式 {s.get('no_contact', 0)}｜失败/可重采 "
             f"{s.get('failed', 0)}｜早过滤 {s.get('early', 0)}｜详情不相关 {s.get('filtered', 0)}｜"
             f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转名单补采 {s.get('pf_unknown', 0)}"
-            for name, s in stats.items()))
+            for name, s in stats.items())
+        self.lbl_board.setToolTip(_site_tip + (f"\n\n【本机并发】\n{perf_tip}" if perf else ""))
         self.lbl_board.setVisible(True)
 
     def _render_stats(self, text, site_status=None):
         """状态行渲染：交给纯函数 build_stats_html（图标+颜色双通道），降级纯文本不报错。"""
         self.lbl_stats.setText(build_stats_html(text, site_status))
 
+    def _reset_autosave_gate(self):
+        """新一轮开始/复位：把自动保存的计数与限流一起归零。
+        只归零 bucket 而留着上一轮的耗时会更糟——上一批跑了 5000 条、限流已经涨到
+        120 秒，新任务即使只有 20 条也要白等两分钟才落盘。
+        内容指纹也一起作废：续采时内存数据会被清空/换目录，旧指纹不再对应「当前这三份
+        文件」，留着它就有可能让收尾保存跳过一次它不该跳过的写入。"""
+        self._last_autosave_bucket = 0
+        self._autosave_cost_ms = 0.0
+        self._last_autosave_at = 0.0
+        self._last_saved_sig = b""
+
+    def _autosave_gap_left(self) -> float:
+        """距离下一轮采集驱动的自动保存还要等几秒；≤0 表示现在就能存。
+
+        间隔按「上一轮真的写了多久」反推：写盘占墙钟的比例固定（AUTOSAVE_COST_SHARE），
+        表越大间隔越长，表小几乎不等。用「开始写的时刻 + 间隔」做基准，间隔本身就
+        大于耗时（预算 5% ⇒ 20 倍耗时），所以两轮写盘不会重叠。
+        """
+        gap = self._autosave_cost_ms / 1000.0 / max(0.01, self.AUTOSAVE_COST_SHARE)
+        gap = min(self.AUTOSAVE_MAX_GAP_S, max(self.AUTOSAVE_MIN_GAP_S, gap))
+        return self._last_autosave_at + gap - time.time()
+
     def _on_progress(self, cur, _total):
         self._bar_companies = cur
-        # 采集驱动自动保存：每满 AUTOSAVE_EVERY 条触发一次（与 3 分钟定时兜底双触发）
+        # 采集驱动自动保存：每满 AUTOSAVE_EVERY 条 + 过了自适应限流间隔才触发
+        # （与 3 分钟定时兜底双触发）。没到间隔时**不动** _last_autosave_bucket，
+        # 下一家公司进来还会再判一次，数据不会因此永远不落盘。
         bucket = cur // self.AUTOSAVE_EVERY
-        if bucket > self._last_autosave_bucket:
+        if bucket > self._last_autosave_bucket and self._autosave_gap_left() <= 0:
             self._last_autosave_bucket = bucket
             self.request_autosave()
         self._update_bar()
-        self._refresh_board()
+        self._mark_board_dirty()
 
     def _show_banner(self, text, bg, fg):
         self.banner.setText(text)
@@ -4045,9 +4305,23 @@ class MainWindow(QMainWindow):
             self.session.clear_seen_store()
             QMessageBox.information(self, "完成", "历史种子库已清空。")
 
+    def _final_files_present(self, ts_dir):
+        """三份产物是否都在：用户手动删过任一份，就不能再说「盘上是最新的」。"""
+        names = [_tasks.RAW_FILE_NAME if HAS_YZD else "企业数据_原始.xlsx",
+                 "企业数据_清洗后入库数据.xlsx", "企业数据_国内只留手机号.xlsx"]
+        return all((ts_dir / n).exists() for n in names)
+
     def _final_save_sync(self):
         """同步收尾保存：复用自动保存的写盘方法，把最后不满一个批次的尾部数据也落盘。
-        不然「停止→立刻开新任务」会让这批内存数据直接消失（自动保存是每 20 条才触发）。"""
+        不然「停止→立刻开新任务」会让这批内存数据直接消失（自动保存是每 20 条才触发）。
+
+        两个细节：
+        ① 走 AutoSaveWorker.run() 这**同一条**路径把三份表都写全。老实现在这里只写
+           两份，《国内只留手机号》就会比内存旧一份——「盘上等于内存」这个判据也就不能用了。
+        ② 盘上已经是这一份内容时直接跳过。这一路是在界面线程上同步写的，5000 条
+           实测要 3.8 秒的白屏（停止、关窗口那一刻用户体感最明显的一次）；
+           指纹比对 87 毫秒，且只在内容真的没变时才跳过，不会因此少存一条。
+        """
         if not self.session_dir:
             return False
         if self.autosave and self.autosave.isRunning():
@@ -4055,20 +4329,24 @@ class MainWindow(QMainWindow):
         rows = self.session.snapshot_results()
         if not rows:
             return False
+        ts_dir = Path(self.session_dir)
+        sig = rows_signature(rows)
+        if sig == self._last_saved_sig and self._final_files_present(ts_dir):
+            self._on_log(f"💾 收尾保存跳过：盘上 {len(rows)} 条已是最新一份")
+            return True
         try:
-            ts_dir = Path(self.session_dir)
-            ts_dir.mkdir(parents=True, exist_ok=True)
             raw = ts_dir / (_tasks.RAW_FILE_NAME if HAS_YZD else "企业数据_原始.xlsx")
-            cl = ts_dir / "企业数据_清洗后入库数据.xlsx"
             worker = AutoSaveWorker(self.session, rows, self.session_dir)
-            worker._write_raw(raw, rows)
-            worker._write_cleaned(cl, rows)
+            worker.run()               # 同步跑：调用方（停止/退出）等的就是这个确定结果
+            if not worker.ok:
+                self._on_log(f"⚠ 收尾保存失败：{worker.error or '未知原因'}")
+                return False
+            self._last_saved_sig = sig
             self._on_log(f"💾 收尾保存 {len(rows)} 条 → {raw}")
             return True
-        except PermissionError:
-            self._on_log("⚠ 收尾保存失败：Excel/WPS 正打开两份结果表占用，请关闭后手动点「导出 Excel」兼容尾部数据")
-            return False
         except Exception as e:
+            # 文件被 Excel/WPS 占用那一类已经在 worker.error 里报过了；这一路兜的是
+            # 指纹/建目录之外的意外，宁可报出来也不要静悄悄地丢掉尾部数据
             self._on_log(f"⚠ 收尾保存失败：{e}")
             return False
 
@@ -4141,7 +4419,7 @@ class MainWindow(QMainWindow):
             self.lbl_kw.setText("识别到 0 个关键词")
         if chk_log.isChecked():
             self.log.clear()
-        self._last_autosave_bucket = 0
+        self._reset_autosave_gate()
         self._bar_pct = 0
         self._bar_companies = 0
         # 进度条口径跟着「下一次开始采集」重新判定：复位后若还留着上一轮的名单标记，
@@ -4258,7 +4536,12 @@ class MainWindow(QMainWindow):
                                # 这里再按当前勾选覆盖一次（用户可能在界面上改过）。
                                waterfall=self.chk_waterfall.isChecked(),
                                lead_export=self.chk_lead.isChecked(),
-                               reverify=self.chk_reverify.isChecked())
+                               reverify=self.chk_reverify.isChecked(),
+                               # 并发档位同样在这里下发（生效值走控件本身，与 site_enrich
+                               # 同一纪律）：控件改动时已经即时下发过一次，这里再按当前值
+                               # 覆盖一遍，防的是「界面建好之后会话被换成新的」那种漏子。
+                               site_workers=(self.spin_site_workers.value()
+                                             if self.spin_site_workers is not None else None))
         if self.selected_provinces:
             names = "、".join(self.selected_provinces)
             self._on_log(f"🗺 本次按 {len(self.selected_provinces)} 个省「{names}」精准采集："
@@ -4293,7 +4576,7 @@ class MainWindow(QMainWindow):
         # 另外把三路台账的「家次」一起显示（家数×路数），不然用户看不到分母只能猜。
         self._bar_list_on = bool(want_slugs)
         self._bar_list_only = bool(want_slugs) and not self.keywords
-        self._last_autosave_bucket = 0
+        self._reset_autosave_gate()
         self._start_timer()
         self._update_bar()
         _sites = ("、".join(SITE_NAMES[s] for s in enabled) if enabled else "无关键词平台") \
@@ -4410,9 +4693,18 @@ class MainWindow(QMainWindow):
         self.autosave.saved.connect(self._on_saved)
         self.autosave.failed.connect(lambda m: self._on_log("⚠ " + m))
         self.autosave.finished.connect(self._after_autosave)
+        # 记下开始时刻：finished 时反推这一轮真的写了多久，作为下一轮限流的依据
+        # （写在 finished 那条路上，失败的那一轮同样要计时长，不然坏盘时会连环重试）
+        self._last_autosave_at = time.time()
         self.autosave.start()
 
     def _after_autosave(self):
+        self._autosave_cost_ms = max(0.0, (time.time() - self._last_autosave_at) * 1000.0)
+        # 只有三份表真的写完了才记下「盘上现在等于这一份内容」，收尾保存才有资格跳过；
+        # 失败的那一轮（文件被 Excel 占用等）指纹不落，收尾时一定会重试
+        worker = self.sender()
+        if isinstance(worker, AutoSaveWorker) and worker.ok:
+            self._last_saved_sig = worker.snapshot_sig
         if self._pending_save:
             self._pending_save = False
             self.request_autosave()
@@ -5268,6 +5560,30 @@ class MainWindow(QMainWindow):
         self.session.clean_strict = bool(self._clean_strict)
         self.session.clean_keywords = self._strict_keyword_source()
 
+    def _on_site_workers_changed(self, value):
+        """并发档位控件变了：当场下发（不等点「开始采集」）。
+
+        为什么要当场：用户是在「回采一直超时」的时候来调这个的，改完还要等下一轮采集
+        才生效的话，他这一轮就白等——而这一轮正好是他最想救的那一轮。
+        """
+        self._set_site_workers(value)
+
+    def _set_site_workers(self, n, from_user=True):
+        """并发档位的唯一写入口：控件、会话、闸门三处都从这里过（同 _set_clean_strict）。
+
+        生效值由会话算（它会 clamp 到上限、自动档还要现算本机建议），界面不自己重算——
+        重算就有两份判据，迟早各算各的（这条纪律在本模块已经记过几次账）。
+        会话那一侧负责把闸门上界当场对齐并如实打一行生效值，这里只负责把失败说出来：
+        下发失败必须留一行日志，否则「我调了但它没动」就只剩用户自己猜。
+        """
+        try:
+            return self.session.set_site_workers(n, announce=from_user)
+        except Exception as e:
+            self._on_log(f"⚠ 并发档位没设进去（{type(e).__name__}: "
+                         f"{str(e).splitlines()[0][:60]}）：仍按上一档跑，"
+                         f"不影响采集与回采本身")
+            return None
+
     def _set_clean_strict(self, on):
         """严格档的唯一写入口：值、控件、会话三处都从这里过（同 _set_auto_expand）。
         勾上之前先问一句“拿什么判”：一档按关键词筛的开关在没有关键词时是空转的，
@@ -5355,7 +5671,7 @@ class MainWindow(QMainWindow):
                    "全空通常说明：数据本身电话/邮箱已经齐了，或者「公司网址」「邮箱」两列都是平台页链接。\n\n"
                    if bool(self.session.waterfall) else "")
                 + "「公司网址」里这几类地址是不回采的：\n"
-                "· 1688 / 马可波罗 / 企知道 / 顺企网这类**平台页**——那上面写的电话是平台客服号；\n"
+                "· 1688 / 马可波罗 / 企知道 / 顺企网这类平台页——那上面写的电话是平台客服号；\n"
                 "· 空值、只有公司名没网址、明显不是企业主页的链接。\n\n"
                 "想核对哪些值被当成官网，可以先点「导出 Excel」看《企业数据_原始》的「公司网址」列。")
             return
@@ -5406,6 +5722,10 @@ class MainWindow(QMainWindow):
                 "reverify": bool(self._reverify_on),
                 "background": bool(self.chk_bg.isChecked()),
                 "auto_keyword_expand": bool(self._auto_expand),
+                # 并发档位记的是**用户选的档位**（0=自动），不是会话算出来的生效值：
+                # 存生效值会把「自动」这个选择固化成某一天的机器读数，换台机器就变了口径。
+                "site_workers": (int(self.spin_site_workers.value())
+                                 if self.spin_site_workers is not None else 0),
                 "province": list(self.selected_provinces or [])}
 
     def _apply_params(self, params):
@@ -5421,6 +5741,21 @@ class MainWindow(QMainWindow):
                                 ("background", self.chk_bg)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
+            # 并发档位：控件与会话都要落回上次那个**选择**（0=自动）
+            if "site_workers" in params and self.spin_site_workers is not None:
+                # 恢复时掐掉信号：valueChanged 会当场下发并打一行「本次按 N 路上限」，
+                # 而续采恢复参数是静默动作，每恢复一次报一行是噪声。
+                # 掐掉信号不等于不生效：下面仍显式下发一次（只是不报数）。只把控件改回去、
+                # 会话不动的话，就是「界面写着 2 路、实际按 6 路跑」那种当场看不见的错。
+                try:
+                    _sw = int(params.get("site_workers") or 0)
+                except (TypeError, ValueError):
+                    _sw = 0
+                self.spin_site_workers.blockSignals(True)
+                self.spin_site_workers.setValue(
+                    max(0, min(getattr(self, "_workers_cap", 16), _sw)))
+                self.spin_site_workers.blockSignals(False)
+                self._set_site_workers(self.spin_site_workers.value(), from_user=False)
             # 质量三开关单独一组、且不在这个 try 里面（见 _restore_quality_switches）
             # 扩词单独走 _set_auto_expand：控件在就顺带勾回界面，控件不在（对外档位）
             # 也要把生效值恢复出来——快照里记着什么就照用什么，不能让 None 控件吃掉它。

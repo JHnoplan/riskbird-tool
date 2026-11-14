@@ -849,7 +849,12 @@ GH_PLACEHOLDER = "GH_EXPR"
 WORKFLOWS = tuple(f".github/workflows/{n}" for n in (
     "build-b2bcollect.yml", "build-b2bcollect-mac.yml",
     "build-1688.yml", "build-riskbird.yml"))
-SHELL_SOURCES = tuple(list(HYGIENE_SCRIPTS) + ["debug/build_b2bcollect_mac_local.sh"])
+SHELL_SOURCES = tuple(list(HYGIENE_SCRIPTS) + [
+    "debug/build_b2bcollect_mac_local.sh",
+    # 性能探针的统一入口（优化前后同一把尺子）：它不产交付物，但它产「快了 8 倍」
+    # 这句话的证据，判据链上就得有它的位置。
+    "debug/run_perf_probe.sh",
+])
 
 
 def workflow_default_shell(text: str) -> str:

@@ -62,6 +62,14 @@ from makepolo_crawler import MakepoloCrawler
 from gongchang_crawler import GongchangCrawler
 from pending_companies import PendingCompanyList, extract_company_names
 import site_adapters as _adapters
+# 性能治理（资源探测 + 线程退出广播）。本文件只用 DoneBoard：等待各路采集线程时
+# 靠事件叫醒，不再对每条线程各问一次 join(timeout=0.5)。并发路数由 website_contact
+# 里的闸门决定，编排层不重复判一遍（同一条规则写两处迟早各判各的）。
+# 导入失败就退回老的轮询口径——治理层出问题绝不允许拖垮采集编排。
+try:
+    import perf_governor as _gov
+except Exception:
+    _gov = None
 
 # 站点顺序固定：日志/进度里显示顺序稳定，便于用户对照浏览器标签
 # （gys 供应商网已下线：验证码频发+限 IP，留着只会拖累整体成功率；文件保留备将来攻坚）
@@ -140,6 +148,10 @@ class ParallelSession:
             self.crawlers[slug] = SITE_CLASSES[slug](port=port)
         self.signals = SessionSignals() if HAS_PYQT else None
         self._threads = {}
+        # 线程退出广播板（每轮任务新建，见下面启动处）：None 表示 perf_governor 不可用，
+        # 各处等待循环自动退回「定时问一遍」的老口径，除叫醒时机外行为不变。
+        self._done_board = None
+        self._board_seen = 0
         self._done_sites = set()
         self._total_done = 0
         self._kw_progress = {}          # slug -> (已完成关键词数, 关键词总数)
@@ -158,7 +170,20 @@ class ParallelSession:
         # 已经记过账的缺陷形态（2026-11-10 抓到过 ParallelSession(enabled=[]) 那类）。
         self.site_enrich = False
         self.site_enrich_budget = 12 * 60
+        # 并发路数分两个量，这不是绕圈：``site_workers_auto`` 是**用户选的档位口径**
+        # （自动/手动），``site_enrich_workers`` 是**这一轮真的建几路线程**。
+        # 只显示后者会丢掉「它是自己算出来的还是你按的」，只留前者就得在每处用到的
+        # 地方重算一遍（两处编排路径各算一次＝两份判据，迟早各算各的）。
+        # 自动时按本机实测资源取起始路数（8 核 8G 上是 6 路，与改造前的写死值巧合一致，
+        # 弱机 2 路、强机最多 8 路）；治理层导入失败就退回 6——那是不变的旧行为。
+        self.site_workers_auto = True
         self.site_enrich_workers = 6
+        if _gov is not None:
+            try:
+                self.site_enrich_workers = _gov.recommended_io_workers(
+                    cap=_gov.IO_WORKERS_MAX)
+            except Exception:
+                self.site_enrich_workers = 6
         self.site_enrich_limit = 800
         # ── 瀑布式多源补全（功能 A）：同一个缺口按「成本升序」逐级问，命中即停 ──
         # 默认同样**关**，理由与 site_enrich 那条一模一样（离线套件的护栏），而且这两条
@@ -412,7 +437,7 @@ class ParallelSession:
     def configure(self, delay_between=None, max_pages=None, relevance_guard=None,
                   incremental=None, max_records=None, province=None, site_enrich=None,
                   clean_strict=None, clean_keywords=None, waterfall=None,
-                  lead_export=None, reverify=None):
+                  lead_export=None, reverify=None, site_workers=None):
         for c in self._active_crawlers():
             if delay_between is not None:
                 d = float(delay_between)
@@ -476,6 +501,12 @@ class ParallelSession:
             self.clean_strict = bool(clean_strict)
         if clean_keywords is not None:
             self.clean_keywords = [str(k).strip() for k in clean_keywords if str(k).strip()]
+        if site_workers is not None:
+            # 并发档位也是会话级（它管的是「回采这一轮开几路」，不属于任何一站）。
+            # 必须走 set_site_workers 而不是直接赋值：那个入口同时把闸门上界当场对齐。
+            # 这里 announce=False 不是「静默改设置」：真正生效的那一刻由回采自己打一行
+            # 档位（enrich_records 里的 gate.describe()），改一次刷两遍才是噪声。
+            self.set_site_workers(site_workers, announce=False)
         # 名单通道（企知道/风鸟/爱企查）：逐家查询没有翻页/相关性的概念，但属地关卡
         # 必须接上——它们不参与关键词并行、也不经过 cdp_base 漏斗，不拦就会把外省公司
         # 放进「清洗后入库数据」（企知道本轮就放进过 1 条浙江公司，属监管空白）。
@@ -495,6 +526,62 @@ class ParallelSession:
 
     def set_enabled(self, enabled):
         self.enabled = set(enabled or [])
+
+    # 界面上表示「让它自己按本机算」的那个档位值（跟并发上限一样，判据只在回采模块里
+    # 写一份，界面读这里、这里读它）
+    SITE_WORKERS_AUTO = 0
+
+    def site_workers_cap(self) -> int:
+        """并发上限能从几路到几路（转交回采模块的单一真源，界面滑块范围用它）。"""
+        try:
+            return _site_wc.io_workers_cap()
+        except Exception:
+            return 16
+
+    def set_site_workers(self, n, announce=True):
+        """设定官网回采的并发路数；``n`` 为 None/0/负数表示「自动，按本机配置算」。
+
+        一次调用做齐三件事，少做一件就长成「设置不生效」：
+        ① 记下口径（自动/手动）并把路数落到 ``site_enrich_workers``，下一轮编排读它；
+        ② 闸门已经建起来时**当场**对齐上限（``_gov.set_cap``）。线程是启动时建的、
+           跑一半改不了，但闸门上界完全可以现场改：不对齐的话正在跑的这一轮还按旧
+           上限走，用户改完看不到任何变化（上一版就是把新上限静默丢掉，见
+           perf_governor.get_gate 的注释）；
+        ③ 把生效值如实打出来，包括自动时本机算出来的那个数。日志里必须能回答
+           「我调了、它到底听没听、现在按几路跑」——这是本模块反复记过账的缺陷形态。
+
+        自动档按本机实测资源取**起始**路数（不是上限）：稳态由闸门的实测反馈决定，
+        所以这里错了也不会一路错到底；治理层不可用时退回 6 路，即改造前的固定值。
+        """
+        cap = self.site_workers_cap()
+        try:
+            v = int(n) if n is not None else self.SITE_WORKERS_AUTO
+        except (TypeError, ValueError):
+            v = self.SITE_WORKERS_AUTO
+        if v <= self.SITE_WORKERS_AUTO:
+            self.site_workers_auto = True
+            got = 6
+            if _gov is not None:
+                try:
+                    got = _gov.recommended_io_workers(cap=cap)
+                except Exception:
+                    got = 6
+            self.site_enrich_workers = max(1, min(cap, int(got)))
+        else:
+            self.site_workers_auto = False
+            self.site_enrich_workers = max(1, min(cap, v))
+        aligned = None
+        if _gov is not None:
+            try:
+                aligned = _gov.set_cap(_site_wc.GATE_NAME, self.site_enrich_workers)
+            except Exception:
+                aligned = None
+        if announce:
+            self._log(f"🌐 官网回采并发档位：{'自动（按本机配置）' if self.site_workers_auto else f'手动 {v} 路'}"
+                      f" → 本次按 {self.site_enrich_workers} 路上限"
+                      + (f"，正在跑的那一轮已同步到 {aligned} 路" if aligned else "")
+                      + "（同时在网的家数还会按本机负载与实测超时率自动收放）")
+        return self.site_enrich_workers
 
     # ── 任务进度台账（暂停/停止/关工具后下次接着采）───────────────
     PROGRESS_FILENAME = "采集进度.json"
@@ -668,13 +755,18 @@ class ParallelSession:
         self._log(f"🚀 多平台并行启动：{'、'.join(names) if names else '名单通道'}"
                   f"{list_note}{tail}")
         # 每站一个线程，真并行推进（命令通道独立）；名单通道每平台各一条看门狗线程
+        # 每轮新建一块线程退出广播板：计数从 0 起，等待方拿它当「我看到哪儿了」的锚点。
+        # 沿用上一轮那块的话，新任务头一觉会直接睡满超时（计数早就不是 0，白等）。
+        self._done_board = _gov.DoneBoard() if _gov else None
+        self._board_seen = 0
         self._threads = {}
         # 有关键词采集时，清洗会持续产生废数据→回流名单，名单通道需全程监听；
         # 纯名单模式（无关键词）无废数据产生，通道排空名单后自然休眠。
         self._crawling_active = bool(kws and actives)
         if kws:
             for c in actives:
-                t = threading.Thread(target=self._run_site, args=(c, kws, start_index),
+                t = threading.Thread(target=self._tracked(self._run_site),
+                                     args=(c, kws, start_index),
                                      name=f"crawl-{c.PLATFORM_SLUG}", daemon=True)
                 self._threads[c.PLATFORM_SLUG] = t
                 t.start()
@@ -688,13 +780,14 @@ class ParallelSession:
             rt["shell_streak"] = rt["net_streak"] = 0
             rt["throttle_streak"] = rt["blocked_streak"] = 0
             c._stop_requested = False
-            t = threading.Thread(target=self._run_list_channel, args=(slug,),
+            t = threading.Thread(target=self._tracked(self._run_list_channel),
+                                 args=(slug,),
                                  name=f"crawl-{slug}", daemon=True)
             rt["thread"] = t
             t.start()
         for t in self._threads.values():
             while t.is_alive():
-                t.join(timeout=0.5)
+                self._wait_any(1.0)
         # 关键词通道全停后再给各路名单通道一段收尾宽限（把在手的公司查完、等最后一次
         # 自动保存把废数据回流入列），到点仍未空则温和收通道。
         # 三路**并行等**，不是首尾相接各等 90 秒：串行等待会让收尾变成半小时。
@@ -708,8 +801,9 @@ class ParallelSession:
             self._log("📋 本轮只跑公司名单：补采通道各自把待采名单查到头（或让路）为止")
             alive = [rt for _slug, _c, rt in list_rts if rt["thread"] is not None]
             while alive:
-                for rt in alive:
-                    rt["thread"].join(timeout=0.5)
+                # 一觉等「有任何一路退出」，不是逐路各问一遍（旧写法一轮周期 =
+                # 0.5 秒 × 路数，看门狗排空名单后要空转好几拍才发现线程已经退了）。
+                self._wait_any(1.0)
                 alive = [rt for rt in alive if rt["thread"].is_alive()]
             finishing = []
         else:
@@ -718,19 +812,16 @@ class ParallelSession:
         if finishing:
             deadline = time.time() + 90
             while finishing and time.time() < deadline:
-                still = []
-                for slug, c, rt in finishing:
-                    rt["thread"].join(timeout=0.5)
-                    if rt["thread"].is_alive():
-                        still.append((slug, c, rt))
-                finishing = still
+                self._wait_any(1.0)
+                finishing = [(slug, c, rt) for slug, c, rt in finishing
+                             if rt["thread"].is_alive()]
             for slug, c, rt in finishing:
                 self._log(f"⏳ {c.PLATFORM_NAME}通道收尾：查完当前这家后本轮结束"
                           f"（未查的名单已落盘，下次接着采）")
                 c._stop_requested = True
             for slug, c, rt in finishing:
                 while rt["thread"].is_alive():
-                    rt["thread"].join(timeout=0.5)
+                    self._wait_any(1.0)
         total = sum(len(c.results) for c in actives)
         for c in self._active_list_channels():
             total += len(c.results)
@@ -851,6 +942,29 @@ class ParallelSession:
                 if prev_yield.get(str(k), 0) > 0:
                     done.add(str(k))
             self._kw_ledger[slug] = {"yield": y, "done": sorted(done)}
+
+    def _tracked(self, fn):
+        """把线程入口包一层「这一路退出了就广播一下」。
+
+        治理模块不可用时原样返回：等待方退回定时问一遍，除叫醒时机外什么都不变——
+        这一层是性能治理，不是正确性依赖，它不在的时候采集必须照旧跑。
+        """
+        b = self._done_board
+        return b.wrap(fn) if b is not None else fn
+
+    def _wait_any(self, seconds=1.0):
+        """等待各路采集线程期间打的一觉：有任何一路退出就立刻醒，否则最多 seconds 秒。
+
+        取代旧写法「对每条线程各 `join(timeout=0.5)` 问一遍」：那个周期是 0.5×线程数
+        秒（关键词三路＋名单三路时=3 秒），用户点「停止」要等这么久才在日志上见效，
+        而绝大多数那次唤醒都是白问——并没有线程刚好在那一刻结束。
+        留着超时而不是无限等，是因为等待循环之外还有心跳与 90 秒收尾宽限要按时看表。
+        """
+        b = self._done_board
+        if b is None:
+            time.sleep(0.5)                # 老口径：没事件就只能定时问，间隔保持 0.5 秒
+            return
+        self._board_seen = b.wait(seconds, self._board_seen)
 
     def _run_site(self, crawler, keywords, start_index):
         subset = self._pending_keywords(crawler, keywords)

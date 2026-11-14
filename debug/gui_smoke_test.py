@@ -123,6 +123,40 @@ check(f"清洗后入库表只剩有联系方式的 2 行（实际 {len(data_rows
 check("四项全空那条确实被剔除", "某从未公开联系方式的公司" not in "".join(names))
 check("有手机号那条仍在（不误杀）", any("甲乙" in n for n in names))
 
+# ══ ①b 收尾保存的「跳过/必写」判据：跳过用内容指纹，绝不用条数 ══
+# 这一组断言守的是数据丢失边界：误跳过 = 内存里最后一批数据永远蒸发（用户只会看到
+# 「日志说保存了，表里没有」）；误重写 = 只是多花几秒。两者代价不对等，所以正反两面
+# 都要钉住。（性能见 debug/perf_gui_probe.py E 档：一轮 5000 条 15513ms → 5721ms）
+saved2 = w._final_save_sync()
+mt_a = clean_p.stat().st_mtime_ns
+check("内容没变时收尾保存跳过（不同步重写 5000 条会让停止那一刻白屏几秒）",
+      saved2 and "收尾保存跳过" in w.log.toPlainText())
+check("跳过确实一个字节都没写（文件 mtime 未变）",
+      clean_p.stat().st_mtime_ns == mt_a)
+# 官网回采是「原地给已有行补电话」：条数一点不变、内容却新了一截。
+# 按条数判跳过就会把补到的号码永远丢在内存里——这里构造的正是这个场景。
+c11467 = w.session.crawlers["11467"]
+with c11467.results_lock:
+    _row = next(r for r in c11467.results if "甲乙" in str(r.get("公司名称", "")))
+_row["手机"] = "13800001111"
+saved3 = w._final_save_sync()
+mt_b = clean_p.stat().st_mtime_ns
+_raw2 = load_workbook(raw_p, read_only=True)
+_txt = "|".join(str(x) for r in _raw2.worksheets[0].iter_rows(values_only=True)
+                for x in r if x is not None)
+_raw2.close()
+check("原地补号码后必须重写（条数没变，只有内容指纹能看出区别）",
+      saved3 and mt_b != mt_a and "13800001111" in _txt)
+# 用户手动删过任一份产物时，「盘上是最新的」这句话就不成立了
+(clean_p).unlink()
+saved4 = w._final_save_sync()
+check("三份产物被删过一份也必须重写（不能拿旧指纹跳过）", saved4 and clean_p.exists())
+# 复位/新一轮开始时旧指纹作废（内存会被清空、目录会换，旧指纹不再对应当前三份文件）
+mt_c = clean_p.stat().st_mtime_ns
+w._reset_autosave_gate()
+check("复位后指纹作废（_reset_autosave_gate 一并清 _last_saved_sig）",
+      w._last_saved_sig == b"" and w._final_save_sync() and clean_p.stat().st_mtime_ns != mt_c)
+
 # ══ ②③ 被拦提醒：横幅 + 独立弹窗 + 计时接管；解除后全部收起 ══
 # 拦截分型（网站拦 IP vs 可人工过验证）走两套文案，而且必须是没技术背景也看得懂的大白话
 from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP
