@@ -393,7 +393,13 @@ def _widgets(row):
 
 # 行数从「必须 1 行」改成「最多 2 行且每行放什么」：自动扩词/历史任务后来从操作行
 # 迁到了这里，硬要求 1 行只会逼人把有用控件塞回按钮那一排（更挤）。
-check("④ 采集参数区不超过 2 行控件", len(_lrows) <= 2, str(len(_lrows)))
+# 2026-11-14 再放宽到 3 行（功能④⑤那三个口径开关进来那天）：这一格真正要守的一直是
+# ①主动作按钮不许被挤进配置行、②配置区不许宽到要左右滑才点得着「开始采集」——行数只是
+# 这两个性质的代理量。代理量一旦钉成硬数字，下一次加开关时人就会被推着把控件塞回按钮排，
+# 而那正是这条判据当初要防的病（判据自己成了病因）。两个真性质另有真判据：本节末尾的
+# _action_lay 宽度对拍与最小尺寸那条，以及 debug/check_gui_fit.py 那套按屏宽量的几何体检
+# （本轮加完三个勾选，它照样 PASS）。所以下面既放行数、也把新那一行本身判起来。
+check("④ 采集参数区不超过 3 行控件", len(_lrows) <= 3, str(len(_lrows)))
 check("④ 第一行是采集间隔与三个开关",
       _widgets(_lrows[0]) >= {w.spin_delay, w.chk_guard, w.chk_incr, w.chk_bg},
       sorted(type(x).__name__ for x in _widgets(_lrows[0])))
@@ -405,11 +411,25 @@ check("④ 第一行是采集间隔与三个开关",
 check("④ 第二行是口径开关与次要入口（自动扩词/清洗档位/历史任务/补采官网）",
       _widgets(_lrows[1]) == {w.chk_auto_kw, w.chk_strict, w.btn_history, w.btn_site_now},
       sorted(type(x).__name__ for x in _widgets(_lrows[1])))
-check("④ 第二行绝不含主动作按钮（开工/停/洗/导/新任务都留在常驻行）",
-      not _widgets(_lrows[1]) & {w.btn_start, w.btn_pause, w.btn_stop,
-                                 w.btn_clean, w.btn_export, w.btn_reset},
-      sorted(x.text() for x in _widgets(_lrows[1]) & {w.btn_start, w.btn_pause, w.btn_stop,
-                                                      w.btn_clean, w.btn_export, w.btn_reset}))
+# 主动作按钮那条判据原来只钉第二行，是当时的形状；第三行进来后同一条病在那儿一样会犯，
+# 而判据看不见那一行就等于没判。改成对**所有配置行**生效的黑名单：新增一行自动被管住，
+# 改期望值的只有「把主动作按钮搬进配置行」这种真违规。
+_ACTION_BTNS = {w.btn_start, w.btn_pause, w.btn_stop,
+                w.btn_clean, w.btn_export, w.btn_reset}
+check("④ 每一条配置行都不许含主动作按钮（黑名单覆盖全部行，不只第二行）",
+      not [i for i, r in enumerate(_lrows) if _ACTION_BTNS & _widgets(r)],
+      [(i, sorted(x.text() for x in _ACTION_BTNS & _widgets(r)))
+       for i, r in enumerate(_lrows) if _ACTION_BTNS & _widgets(r)])
+# 第三行是「采完之后怎么处理」那三条链路开关：它恒定挂进布局（数据口径开关不跟着功能入口
+# 一起藏），所以这一格既判它在位、也判它只装这三样。为什么单独一行而不是挤回第二行，GUI
+# 那边写着实测数字（hp2 再加三个长文案勾选框会把配置区最小宽顶过 1100）——把结论钉在这儿，
+# 下次有人为了「少一行」把它们塞回 hp2，这条会当场响。
+check("④ 第三行在位（三条口径开关恒定入布局，任何档位都不整行撤掉）",
+      len(_lrows) >= 3, str(len(_lrows)))
+if len(_lrows) >= 3:
+    check("④ 第三行只装瀑布补全/线索分层/到期重验三个勾选（不放按钮、不放标签、不放输入框）",
+          _widgets(_lrows[2]) == {w.chk_waterfall, w.chk_lead, w.chk_reverify},
+          sorted(f"{x.metaObject().className()}:{x.text()}" for x in _widgets(_lrows[2])))
 check("④ 页数说明并入采集间隔 tooltip（不新开控件）",
       "翻页一律不限制" in w.spin_delay.toolTip())
 

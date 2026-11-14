@@ -157,6 +157,8 @@ fi
   --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge \
   --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config \
   --hidden-import website_contact \
+  --hidden-import field_evidence --hidden-import enrich_waterfall \
+  --hidden-import lead_scoring --hidden-import channel_health \
   --add-data "config.json:." --add-data "mk_phone_font.json:." \
   --add-data "../enf_clean:enf_clean" \
   --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" \

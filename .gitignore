@@ -75,3 +75,31 @@ test_screenshots/
 xiaohongshu_recordings/
 ci_dl/
 qizhidao_gui_state.json
+
+# ── 运行几天后**自己长出来**的凭证与登录态（2026-11-14 本轮提交时实测抓到）──────
+# 上面那一栏管的是人手动放进来的密钥文件；这一栏管的是工具在包目录里写出的运行时状态：
+# 常规的一句 `git add b2bcollect_build riskbird_build`（不带 -A、不是危险命令）当场把
+# `_云展账号.json`（绑定手机号）、`acl/.acl_claim.json`（三个账号的 32 位 session）、
+# `acl/.acl_device.json`、chromedriver 二进制与一个 10 MB 的 zip 全扫进了索引。
+# 靠人当场看出来不是防：历史里的凭证删不掉，只能作废重发，而 push 一次就永久公开。
+# 名单与 access_guard / task_registry 里的 *_FILE_NAME 常量同源；硬门第 22 条拿 git 自己的
+# `check-ignore` 逐条验这几行真的挡得住（在 Python 里重抄一遍 gitignore 匹配就会和 git 分叉，
+# 那是最坏的一种假绿：你以为挡住了，add 那天才发现没有）。
+.acl_cache.json
+.acl_device.json
+.acl_claim.json
+_云展账号.json
+_采集任务索引.json
+mapping_history.json
+采集进度.json
+# Chrome / CDP 配置目录里的登录态：目录名到处不一样（ab_cdp_profile、chrome_b2bcollect_profile、
+# 持久位置那些），所以按 Chrome 自己的内部文件形状拦，不按我们的目录名猜。
+**/Default/Cookies
+**/Default/Login Data
+**/Default/History
+**/Default/Local Storage/
+# 驱动二进制与压缩包由 .github/scripts/fetch_chromedrivers.py 现取，入库只会让 clone 变大
+chromedriver
+chromedriver.exe
+chromedriver*.zip
+chromedriver-*/

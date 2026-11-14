@@ -294,6 +294,16 @@ _assert("def _write_cleaned" in _gsrc and "clean_records" in _gsrc[
     _gsrc.index("def _write_cleaned"):_gsrc.index("def _write_cleaned") + 700],
         "自动保存的《清洗后入库数据》经 session.clean_records（会话上那一份档位管得到它）")
 
+# ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
+# 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器
+# 自己拆 Qt 对象会撞上退出 SIGSEGV」（线上实测抓到过栈）。这里实测同样 6 次崩 1 次，且崩在
+# 打印汇总**之后**——批跑只看退出码，全绿也会被判成一次失败。
+# 走 hide() 而不是 close()：close 会进生产 closeEvent（等线程、弹确认框），本套件测的不是
+# 退出那条路；hide 之后把引用清掉，refcount 当场让 sip 删掉 C++ 对象，此时 app 仍在。
+w.hide()
+w = None
+app.processEvents()
+
 print("\n" + "=" * 60)
 total = _passed + _failed
 print((f"全部通过 ✅ ({_passed}/{total})") if _failed == 0

@@ -43,6 +43,15 @@ except ImportError:
 from cdp_base import clean_cell, CdpSiteCrawler, strict_keyword_filter
 # 官网回采联系方式的唯一口径实现（采集收尾与手动补采都走它，不在本文件重复写判据）。
 import website_contact as _site_wc
+# 命中层级/证据的列名单一来源 + 瀑布式多源补全（功能 A）。瀑布只在会话勾选上时接管
+# 收尾那一轮，判据本身（打分、归属、合并去重、预算）仍然全在 website_contact 里。
+import field_evidence as _fe
+import enrich_waterfall as _wf
+# 线索评分分层导出（功能 B+K）与通道健康账（功能 J）：两张**附加报表**的实现。
+# 它们都只读原始记录与会话账目，不回写任何采集判据——判据仍然只在
+# field_evidence / website_contact 两处，评分与体检只是把它们摊开给人看。
+import lead_scoring as _ls
+import channel_health as _ch
 from mic_crawler import MicCrawler
 from b2b168_crawler import B2b168Crawler
 from qihuo11467_crawler import Qihuo11467Crawler
@@ -96,9 +105,10 @@ for _slug in LIST_CHANNEL_SLUGS:
 # 状态行的排列顺序：关键词各站在前，三路名单补采殿后（与产出文件里的拼接顺序一致）
 STATUS_ORDER = tuple(SITE_ORDER) + LIST_CHANNEL_SLUGS
 
-RAW_HEADERS = ["序号", "关键词", "公司名称", "联系人", "岗位", "电话", "手机", "邮箱",
-               "地址", "主营产品", "经营模式", "所在区域", "公司网址", "详情URL", "memberId",
-               "数据来源", "采集时间", "状态", _site_wc.SITE_MARK]
+# 原始表列**直接引用爬虫层那一份实现**，不再手抄一遍：抄的那一份早晚和原件差一列，
+# 而差的那列恰好是最后加进来的留痕列（证据三列），表现是「原始表里有补全层级、
+# 会话导出的那份没有」——两处账对不上，用户只能靠肉眼比列名。
+RAW_HEADERS = CdpSiteCrawler.EXPORT_HEADERS
 
 if HAS_PYQT:
     class SessionSignals(QObject):
@@ -150,6 +160,33 @@ class ParallelSession:
         self.site_enrich_budget = 12 * 60
         self.site_enrich_workers = 6
         self.site_enrich_limit = 800
+        # ── 瀑布式多源补全（功能 A）：同一个缺口按「成本升序」逐级问，命中即停 ──
+        # 默认同样**关**，理由与 site_enrich 那条一模一样（离线套件的护栏），而且这两条
+        # 开关是叠加关系而不是替代关系：勾了回采没勾瀑布＝还是那一跳；勾了瀑布就接管
+        # 那一跳并往上加级别。判据仍然只在 website_contact 里，本模块只管排队与预算。
+        self.waterfall = False
+        # 线索分层导出（功能 B+K）与通道健康账（功能 J）：两张**附加报表**，
+        # 不改客户的入库模板列（那是接口契约），所以默认关不会少任何原有产出。
+        self.lead_export = False
+        # 字段级到期重验（功能 I）：按「这一列多久没被验过」决定要不要再问一次。
+        self.reverify = False
+        self.reverify_days = None       # None＝用 field_evidence.TTL_DAYS 各字段默认
+        self._site_enrich_stats = None   # 最近一轮账目（看板/日志/离线用例都读这一份）
+        self._waterfall_stats = None
+        self._lead_stats = None
+        self._health_stats = None
+        # 本轮是否已经落过分层报表。分层有两个入口（回采那一轮的汇合点、以及回采没跑成时
+        # 的独立支路），靠「调用顺序」去保证只出一张表太脆：瀑布那一支异常时
+        # ``enrich_websites`` 也会走到汇合点出表，收尾再无条件补一次就写成两遍。
+        # 与 ``_health_written`` 同一条纪律：**一轮只许推进一次**，由代码自己守住。
+        self._lead_written = False
+        self._change_rows = []
+        # 归并后的线索行（分层报表的数据源）：健康表算「每通道平均线索分」时复用它，
+        # 两处各算一遍就会有两张表的同一家分数不一样。
+        self._lead_rows = []
+        # 本轮是否已经往通道健康台账推进过一次连续轮次（一轮只许推进一次，见
+        # _report_channel_health）；每轮采集开始时复位。
+        self._health_written = False
         # 清洗档位（功能⑤）：正常档＝只按联系方式四项全空剔；严格档＝再要求每行
         # 「公司名+主营」正面命中关键词。判据与采集期同一份（cdp_base.relevance_hit），
         # 差别只在严格档不 fail-open——入库交付是最后一道闸门，判不出就当不相关。
@@ -374,7 +411,8 @@ class ParallelSession:
     # ── 配置下发 ───────────────────────────────────────────────
     def configure(self, delay_between=None, max_pages=None, relevance_guard=None,
                   incremental=None, max_records=None, province=None, site_enrich=None,
-                  clean_strict=None, clean_keywords=None):
+                  clean_strict=None, clean_keywords=None, waterfall=None,
+                  lead_export=None, reverify=None):
         for c in self._active_crawlers():
             if delay_between is not None:
                 d = float(delay_between)
@@ -424,6 +462,14 @@ class ParallelSession:
             # 回采开关是**会话级**的（它不属于任何一站，作用在合并后的结果集上），
             # 所以不下发给各爬虫，只记在这里。下发点见 GUI 的 configure 调用。
             self.site_enrich = bool(site_enrich)
+        # 瀑布/分层/重验三条都是会话级开关，理由与上面那条相同；写在这里而不是
+        # 各站身上，是因为它们管的都是「合并之后还缺什么」，不属于任何一路通道。
+        if waterfall is not None:
+            self.waterfall = bool(waterfall)
+        if lead_export is not None:
+            self.lead_export = bool(lead_export)
+        if reverify is not None:
+            self.reverify = bool(reverify)
         # 清洗档位与会话同寿（不是「本轮参数」）：采集结束后再点清洗、导出、同步数据池
         # 都要按同一档位走。界面勾选变化时也会即时写这里（单一写入口见 GUI _set_clean_strict）。
         if clean_strict is not None:
@@ -592,6 +638,8 @@ class ParallelSession:
         kws = [str(x).strip() for x in (keywords or []) if str(x).strip()]
         self._kw_count = len(kws)
         self._user_stop = False      # 新一轮开始：上一轮的「停止」不该扣住本轮收尾回采
+        self._health_written = False  # 新一轮开始：通道健康这轮只许推进一次连续计数
+        self._lead_written = False    # 新一轮开始：分层报表这轮只许落一张
         with self._lock:
             self._last_keywords = list(kws)
         actives = self._active_crawlers()
@@ -731,6 +779,21 @@ class ParallelSession:
         # 界面是在 crawl_finished 上触发导出与入库的，回采晚一步就等于这批补值永远进不了
         # 本轮交付文件；早一步则会在采集还没停稳时和野线程抢同一批记录。
         self.enrich_websites(reason="采集收尾")
+        # 回采那一轮没跑（没勾链路/手动停止/本轮无数据）时补一条独立支路：分层报表不该
+        # 被一个它并不需要的开关决定出不出（理由见 _export_lead_standalone）。
+        # 放在 enrich_websites 之后而不是让它自己判断返回值：这样两条支路互不知情，
+        # 「跑成了」那一支绝不会把报表出两遍。
+        self._export_lead_standalone(reason="采集收尾")
+        # 通道健康账（功能 J）：每一轮都记，**与两个补全开关无关**——红牌要抓的正是
+        # 「某一路悄悄不出货」，而那种事多数发生在用户没勾回采的日常轮次里。
+        # 放在收尾补全之后：这时填充率才是本轮真正交付出去的那份数。
+        # 手动停止的那一轮不推进连续轮次：半轮结果里多数通道本来就是 0，
+        # 把它们记成零产出会在两轮之后发出一批假红牌——假警报的代价是整张账没人信。
+        if self._user_stop:
+            self._log("ℹ 本轮被手动停止：通道健康台账不推进连续轮次"
+                      "（半轮不算这一路零产出，已采数据照常导出）")
+        else:
+            self._report_channel_health()
         self._emit("crawl_finished_signal")
 
     def _pending_keywords(self, crawler, keywords):
@@ -1442,7 +1505,6 @@ class ParallelSession:
         同意，不该被那条链路开关拦住。拦住之后界面只会说「没补」，用户完全无法理解——
         所以这里放行 force，但放行时把这件事写进日志，账上仍看得出是谁要求跑的。
         """
-        stats = None
         if not self.site_enrich and not force:
             self._log(f"🌐 {reason}：未勾选「采集后回采官网联系方式」，本轮不回采")
             return None
@@ -1455,6 +1517,49 @@ class ParallelSession:
         if not records:
             self._log(f"🌐 {reason}：本轮没有数据，无需回采")
             return None
+        if self.waterfall:
+            stats = self._run_waterfall(reason, records, workers=workers,
+                                        budget=budget, limit=limit,
+                                        only_missing=only_missing)
+        else:
+            stats = self._enrich_single_hop(reason, records, workers=workers,
+                                            budget=budget, limit=limit,
+                                            only_missing=only_missing)
+        # 分层报表（功能 B+K）挂在两条支路**汇合之后**、而不是写在瀑布支路里面：
+        # 只勾「回采」不勾「瀑布」也是一轮完整交付，那种跑法少一张表属于静默少功能，
+        # 而静默少功能正是本项目记过账的缺陷形态。
+        # force 往下传：界面上手动点「补采」是一次新的补全，报表跟着刷新；自动链路里
+        # 两个入口（这里 + 收尾的独立支路）共用「本轮已出」判据，不会写成两遍。
+        if self.lead_export:
+            self._export_lead_tiers(records, reason=reason, force=bool(force))
+        return stats
+
+    @staticmethod
+    def enrich_summary(stats):
+        """把两种形态的补全账目压成界面那一句摘要用的 ``(sites, ok, new_values)``。
+
+        为什么必须有这一份：单跳那一轮的账目是扁平的（``stats["sites"]``），瀑布把同一份
+        账目嵌进了 ``stats["network"]`` 里。界面直接读扁平键的话，勾上瀑布就会打出
+        「访问 0 个官网、0 行补到值、净新增 0 个」——明明补回了一批号却被报成零，
+        这是账目上最难解释的一种假话（而且只在勾了新功能时出现）。
+        读侧只认这一处，别让第二个地方各写一遍「两种形态怎么取」。
+        """
+        if not isinstance(stats, dict):
+            return {"sites": 0, "ok": 0, "new_values": 0}
+        net = stats.get("network")
+        part = net if isinstance(net, dict) else stats
+        return {"sites": int(part.get("sites") or 0),
+                "ok": int(part.get("ok") or 0),
+                "new_values": int(part.get("new_values") or part.get("added") or 0)}
+
+    def _enrich_single_hop(self, reason, records, workers=None, budget=None,
+                           limit=None, only_missing=False):
+        """老路子（未勾瀑布时的默认行为）：只认行自带的那一个官网字段。
+
+        保留这一条而不是让瀑布成为唯一路径，是为了「新功能不许伤旧交付」：
+        瀑布内部任何一级出错都只影响那一级，而这一条是完全未改的行为基线。
+        """
+        stats = None
         try:
             with_site = [r for r in records if _site_wc.pick_site(r)]
             missing = [r for r in with_site if not _site_wc._has_any(r)]
@@ -1479,7 +1584,7 @@ class ParallelSession:
             for why, n in sorted(stats["reasons"].items(), key=lambda x: -x[1])[:3]:
                 bits.append(f"{why} {n} 家")
             tail = f"｜没出值：{'、'.join(bits)}" + \
-                   (f" 等 {len(stats['reasons'])} 类" if len(stats["reasons"]) > 3 else "") \
+                   (f" 等 {len(stats['reasons'])} 类" if len(stats['reasons']) > 3 else "") \
                 if bits else ""
             self._log(f"🌐 {reason}完成：访问 {stats['sites']} 个官网、{stats['ok']} 行补到值，"
                       f"净新增 {stats['new_values']} 个联系方式（{stats['seconds']} 秒）{tail}"
@@ -1494,6 +1599,234 @@ class ParallelSession:
             self._log(f"⚠ {reason}异常（已跳过，不影响已采数据）：{type(e).__name__}: {e}")
         return stats
 
+    def _run_waterfall(self, reason, records, workers=None, budget=None,
+                       limit=None, only_missing=False):
+        """瀑布接管收尾那一轮（勾选「瀑布式多源补全」时才会走到这里）。
+
+        账目分三级报，而且**每一级都要说自己为什么没动**：这是采集账目从一开始的
+        纪律，接到补全上更要紧——瀑布最容易给人「跑了个空转」的错觉，因为第 1 级
+        根本不发请求，日志要是只写「补了 N 个号」，用户下次就不信这条链路了。
+        """
+        stats = None
+        try:
+            # 顺序那句话从 _wf.stage_chain() 取：五级名字就是「补全层级」列里落的值，
+            # 在这里手抄一份的话，改层级命名时日志会先跟数据分家（抄了 5 处、错了 5 处）。
+            self._log(f"🧵 {reason}：瀑布式补全开始（{len(records)} 行，顺序＝{_wf.stage_chain()}）")
+            stats = _wf.run_waterfall(
+                records, log=self._log,
+                workers=int(self.site_enrich_workers if workers is None else workers),
+                budget=float(self.site_enrich_budget if budget is None else budget),
+                stop=lambda: bool(self._user_stop),
+                limit=int(self.site_enrich_limit if limit is None else limit),
+                only_missing=bool(only_missing),
+                registry_queue=self._waterfall_queue,
+                reverify=bool(self.reverify),
+                reverify_days=self.reverify_days)
+            for line in _wf.stage_lines(stats):
+                self._log("  " + line)
+            net = stats.get("network") or {}
+            if net.get("retry"):
+                self._log(f"♻ 官网那一级里 {net['retry']} 行是暂时失败（停机/超时/证书），"
+                          f"已标「待重试」，下轮自动再试（最多 {_site_wc.MAX_ATTEMPTS} 次）")
+            self._change_rows = list(stats.get("changes") or [])
+            # 分层报表**不在这里落**：它由 enrich_websites 在两条支路汇合之后统一出一次。
+            # 早先是这里也调一次、汇合后又调一次，一轮采集写两遍同一张表——数字不会错
+            # （算的是同一份记录），但日志里会出现两条同名报表，读起来像跑了两个任务。
+            # 通道健康（功能 J）**不在这里落账**：一轮采集只该记一次连续轮次，
+            # 挂在瀑布里会让「勾了分层」和「没勾分层」两种跑法数出不同的轮次。
+            # 唯一落账点在 crawl() 末尾（见 _report_channel_health），手动补采不占轮次。
+        except Exception as e:
+            # 与单跳那一轮同一个兜底口径：抛出异常等于把已经采好的数据一起丢掉。
+            self._log(f"⚠ {reason}瀑布异常（已跳过，不影响已采数据）：{type(e).__name__}: {e}")
+        self._waterfall_stats = stats
+        self._site_enrich_stats = stats
+        return stats
+
+    def _waterfall_queue(self, names):
+        """瀑布第 3 级：把还是缺联系方式的家名投进工商补采名单（**复用现成通道**）。
+
+        刻意不自己查企知道/风鸟/爱企查：那三路已经有退避、限流、熔断、接管与属地关卡，
+        在补全模块里再写一遍查询等于把那些坑重新挖一次。这里只做一件事——投名单，
+        并如实回报投出去几家（任务文件夹没绑定时 `add_waste` 一个都不收，
+        那种情况下必须让「没投出去」在日志里看得见，而不是假装已经排队）。
+        """
+        if not names:
+            return 0
+        if not self.pending.is_bound:
+            self._log("🏛 瀑布第 3 级没投出去：本轮没绑定任务文件夹（待采名单落不了盘），"
+                      f"{len(names)} 家缺口留在此刻的表里，下次带文件夹跑还会再排")
+            return 0
+        try:
+            return int(self.pending.add_waste(list(names)) or 0)
+        except Exception as e:
+            self._log(f"⚠ 瀑布第 3 级投名单失败（{type(e).__name__}）：一家都不算投出去")
+            return 0
+
+    def _export_lead_standalone(self, reason="采集收尾"):
+        """回采那一轮没跑成，但分层报表仍要出一张（前提是勾了「线索分层报表」）。
+
+        2026-11-14 自查抓到的静默少功能：报表原先只在 ``enrich_websites`` 汇合点之后调用，
+        而那个函数有三种「原路返回 None」的走法——没勾回采链路、本轮被手动停止、本轮没数据。
+        前两种跟分层毫无关系：评分只读表里已有的数，一次网络请求都不发。用户在界面上勾了
+        「线索分层报表」（那条既没有前置校验、文案也没提过回采），结果只看到日志一句
+        「本轮不回采」，报表原地消失——这正是本项目反复记过账的缺陷形态，所以在这里补一条
+        独立支路，而不是给分层加一条「必须先勾回采」的假依赖。
+        """
+        if not self.lead_export:
+            return None
+        records = self._all_live_records()
+        if not records:
+            self._log(f"🎯 {reason}：本轮没有数据，分层报表不落盘（不是功能没生效，是没东西可排）")
+            return None
+        return self._export_lead_tiers(records, reason=reason)
+
+    # ── 线索分层导出（功能 B+K）与通道健康账（功能 J）──────────────────
+    # 两张表都是**附加报表**：客户入库模板（9 列接口契约）与既有两份产出文件一行未改，
+    # 不勾开关时这段代码一次都不执行。这样做的原因不是省事，是爆炸半径——
+    # 动模板列会直接把云展上传打坏，而分层这件事本身完全可以在旁边一张表里说完。
+    LEAD_REPORT_FILENAME = "线索分层与通道健康.xlsx"
+
+    def lead_report_path(self):
+        """报表落点：任务文件夹下那一份；没绑定文件夹时返回空串（不硬猜别的目录）。
+
+        写进用户找不到的地方比不写更容易被读成「工具乱出文件」，所以宁可不落盘，
+        也要在日志里说一句为什么没落盘。
+        """
+        if not self.task_folder:
+            return ""
+        return str(Path(self.task_folder) / self.LEAD_REPORT_FILENAME)
+
+    def health_ledger_path(self):
+        """台账落点：任务文件夹下的那份 JSON（**必须**与报表是两个文件）。
+
+        这一格是 2026-11-14 自查抓出来的：上一版直接把 `lead_report_path()` 传进
+        `update_ledger`，于是采集收尾写完报表之后，健康台账把 JSON 覆盖到同一个
+        .xlsx 路径上——用户拿到的是一个双击打不开的「线索分层与通道健康.xlsx」。
+        两个产物共用一个路径从来没有好结果，判据留在离线用例里（M/N 节）。
+        """
+        if not self.task_folder:
+            return ""
+        return str(Path(self.task_folder) / _ch.LEDGER_FILENAME)
+
+    def _stats_by_source(self):
+        """{该路 PLATFORM_NAME: stats()}。键**必须**用爬虫自己的名字而不是看板显示名：
+        显示名里名单通道带「补采」后缀，记录里的「数据来源」没有——两处不同源就会
+        把一家通道在健康表里数成两家（那是看板早就踩过的同类坑）。"""
+        out = {}
+        for c in self._all_result_crawlers():
+            name = str(getattr(c, "PLATFORM_NAME", "") or "").strip()
+            if not name:
+                continue
+            try:
+                out[name] = c.stats()
+            except Exception:
+                out[name] = {}     # 拿不到明细不等于这路没跑：仍要进账，只是没有分项
+        return out
+
+    def _score_by_source(self, rows=None):
+        """{通道: (平均分, 立即跟进家数)}——按**归并后的线索**算，一家只算一条。
+
+        一条线索被两个平台同时采到时两边各记一次（各自那一路确实出了货），所以
+        各通道平均分之和不等于全表平均分；这是口径，不是 bug，报表里写明了。
+        """
+        rows = self._lead_rows if rows is None else rows
+        got = {}
+        for r in rows or []:
+            for src in [x for x in str(r.get("数据来源") or "").split(",") if x]:
+                b = got.setdefault(src, [0, 0, 0])
+                b[0] += int(r.get("线索分") or 0)
+                b[1] += 1
+                if r.get("分层") == _ls.TIER_WORK:
+                    b[2] += 1
+        return {k: (round(v[0] / v[1]) if v[1] else 0, v[2]) for k, v in got.items()}
+
+    def _export_lead_tiers(self, records, reason="", force=False):
+        """算分层 + 落那张附加报表。返回账目 dict（界面/离线用例读这一份）。
+
+        ``force``＝本轮重出一张（只有界面上的手动补采用）：手动补采本身就是一次新的补全，
+        报表跟着刷新是对的；自动链路两个入口共用同一个「本轮已出」判据，见 __init__。
+        """
+        if self._lead_written and not force:
+            return self._lead_stats or {}
+        try:
+            rows = _ls.lead_rows(records, log=self._log)
+            self._lead_written = True
+            self._lead_rows = rows
+            counts = _ls.tier_counts(rows)
+            self._lead_stats = {"leads": len(rows), "by_tier": counts,
+                                "changes": len(self._change_rows or []),
+                                "path": "", "sheets": []}
+            self._log(f"🎯 {reason}：线索分层 {len(rows)} 家（按主体归并）→ "
+                      f"{_ls.TIER_WORK} {counts.get(_ls.TIER_WORK, 0)}、"
+                      f"{_ls.TIER_NURTURE} {counts.get(_ls.TIER_NURTURE, 0)}、"
+                      f"{_ls.TIER_IDLE} {counts.get(_ls.TIER_IDLE, 0)}"
+                      f"｜分数只读「补全层级」，本工具不在这里二次判断号码真假")
+            path = self.lead_report_path()
+            if not path:
+                self._log("⚠ 本轮没绑定任务文件夹，线索分层报表没落盘"
+                          "（原始表与清洗表照常导出，只是少这张附加报表）")
+                return self._lead_stats
+            health = (self._health_stats or {}).get("rows")
+            if health is None:
+                # 采集结束时才往台账记一次连续轮次；这里只借它的读数，不推进历史
+                health = self._report_channel_health(write_ledger=False).get("rows")
+            written = _ls.write_lead_report(path, rows, changes=self._change_rows,
+                                            health=health, log=self._log)
+            self._lead_stats.update({"path": path, "sheets": list(written or [])})
+            return self._lead_stats
+        except Exception as e:
+            # 附加报表失败绝不能连累主交付：这里只可能少一张表，不该少一条数据
+            self._log(f"⚠ 线索分层报表没出（{type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:80]}）：已采数据与两份既有产出不受影响")
+            return self._lead_stats
+
+    def _report_channel_health(self, write_ledger=True):
+        """通道健康账（功能 J）：各通道本轮出货/填充/连续零产出，够阈值就亮红牌。
+
+        落点在采集收尾那一次调用（crawl 末尾），**不在**任何一条补全支路里：
+        一轮采集只该往台账推进一次，否则「勾了分层」的跑法会把连续轮次数成两倍，
+        红牌比现实早到——那种假警报会让人整张账都不信。界面上手动点「补采」不占轮次
+        （走 ``write_ledger=False``：只读数、不改历史）。
+        """
+        try:
+            path = self.health_ledger_path()
+            metrics = _ch.metrics_from(self._all_live_records(), self._stats_by_source(),
+                                       self._score_by_source() if self._lead_rows else None)
+            result = {"alerts": [], "rounds": 0, "saved": False, "error": ""}
+            if write_ledger and self._health_written:
+                write_ledger = False      # 本轮已经记过账：不重复推进连续轮次
+            if write_ledger:
+                result = _ch.update_ledger(path, metrics, log=self._log,
+                                           round_label=time.strftime("%Y-%m-%d %H:%M"))
+                self._health_written = True
+            else:
+                data, _err = _ch.load_ledger(path) if path else ({}, "")
+                streak = data.get("zero_streak") or {}
+                for name, m in metrics.items():
+                    m["zero_streak"] = int(streak.get(name) or 0)
+                    m["red_card"] = m["zero_streak"] >= _ch.RED_CARD_ROUNDS
+            rows = _ch.health_rows(metrics)
+            self._health_stats = {"rows": rows, "metrics": metrics,
+                                  "alerts": list(result.get("alerts") or []),
+                                  "written": bool(result.get("saved")), "path": path}
+            if write_ledger:
+                for line in _ch.alert_lines(result, metrics):
+                    self._log(line)
+            # 每轮一行体检摘要：红牌之外，用户还想知道「今天这一轮谁在拖后腿」
+            dry = sorted(n for n, m in metrics.items()
+                         if m.get("ran") and int(m.get("companies") or 0) <= 0)
+            ran = sorted(n for n, m in metrics.items() if m.get("ran"))
+            if dry:
+                self._log(f"🩺 通道体检：本轮跑过 {len(ran)} 路，其中 {len(dry)} 路一家没出（"
+                          + "、".join(dry[:6]) + ("…" if len(dry) > 6 else "")
+                          + "）；连续零产出轮次见报表「通道健康」那张表")
+            elif ran:
+                self._log(f"🩺 通道体检：本轮跑过 {len(ran)} 路，每一路都有产出")
+            return self._health_stats
+        except Exception as e:
+            self._log(f"⚠ 通道健康账没记上（{type(e).__name__}）：不影响已采数据与导出")
+            return self._health_stats or {}
+
     def site_enrich_preview(self):
         """手动补采前的账：``(总行数, 带可回采官网的行数, 本来就缺联系方式的行数)``。
 
@@ -1505,6 +1838,13 @@ class ParallelSession:
         records = [r for r in self._all_live_records() if isinstance(r, dict)]
         with_site = [r for r in records if _site_wc.pick_site(r)]
         missing = [r for r in with_site if not _site_wc._has_any(r)]
+        if self.waterfall:
+            # 勾了瀑布就不能再只按「行自带可用官网」数：那样会把明明能补的一大截
+            # 报成 0 行，界面按钮据此拦住，用户看到的是「这功能没生效」。
+            # 口径与真跑那一轮同源（`workable_count` 用的就是那三个条件）。
+            workable = _wf.workable_count(records)
+            return len(records), workable, len(
+                [r for r in records if not _site_wc._has_any(r)])
         return len(records), len(with_site), len(missing)
 
     def per_site_results(self):

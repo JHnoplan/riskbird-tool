@@ -48,6 +48,12 @@ import threading
 import time
 from urllib.parse import urljoin, urlparse
 
+# 命中层级/证据的单一真源（field_evidence 只依赖标准库，反向不 import 本模块，无环）。
+# 为什么由本模块写证据而不是让上层回采器写完再补一列：值的可信度**只有在打分现场**
+# 才说得清（第几页、有没有过归属核验、是直取还是推导），出了这一层就只剩一串号码，
+# 上层再判一次就是第二份判据——那是本仓库记过账的缺陷形态。
+import field_evidence as _fe
+
 __all__ = [
     "norm_site", "is_platform_host", "is_public_host", "extract", "score_contacts",
     "plausible_phone", "plausible_email", "merge_values", "enrich_site",
@@ -755,7 +761,7 @@ def _has_any(rec, keys=("电话", "手机", "邮箱")):
 
 
 def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT,
-                   stop=None, limit=1500, only_missing=False):
+                   stop=None, limit=1500, only_missing=False, resolver=None):
     """就地补写 records 的电话/手机/邮箱（英文逗号去重合并），并写「官网回采」账。
 
     排队口径：**缺联系方式的先做**（收益最高），其次才是本来就有号码的做补充——
@@ -764,20 +770,57 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     预算用完/用户点停止后置 halt，**未落笔的结果一律不写**：绝不能出现
     「导出已经在跑了、还有野线程往记录里塞值」这种查无可查的数据污染。
     返回统计字典；任何单条失败都不影响其它记录，函数本身不抛异常。
+
+    ``resolver`` 是瀑布式补全（功能 A）接进来的**官网发现provider**：
+    `fn(record) -> (url, 层级slug)` 或假值。只在「行自带的官网字段不可用」时才问它，
+    也就是说它是 `pick_site` 的下一级而不是替代者——这一条顺序很重要：行里本来就有
+    正确官网时，任何推导都比不上直接访问那一家。层级由 provider 报下来，是因为
+    「这个网址是怎么来的」只有它自己知道（邮箱域名反查 / 品牌域名推导），
+    而这件事决定了后面那批值可信分是多少。provider 抛异常等同于没找到，
+    绝不能把已经跑了一半的回采轮带崩。
     """
     log = log or (lambda m: None)
     recs = [r for r in (records or []) if isinstance(r, dict)]
-    cand = [r for r in recs if pick_site(r)]
+
+    def _resolve(rec):
+        """问 provider 要一个官网（顺带把层级名定下来）；任何失败都当没找到。"""
+        if resolver is None:
+            return "", ""
+        try:
+            got = resolver(rec)
+        except Exception:
+            return "", ""
+        if not got:
+            return "", ""
+        if isinstance(got, str):
+            # 只回了一个网址、没说层级：按「邮箱域名反查」记。这一档是保守选择——
+            # provider 是「行自带官网字段不可用」时才问的，那来路不明的推导结果
+            # 不许享受直采的可信分。
+            return got, "mailsite"
+        url = str((got or [""])[0] or "").strip()
+        tier = str((got or ["", ""])[1] or "").strip() or "mailsite"
+        return url, (tier if tier in _fe.TIER_LABEL else "mailsite")
+
+    cand = []
+    for r in recs:
+        site = pick_site(r)
+        if site:
+            cand.append((r, site, "site"))
+            continue
+        url, tier = _resolve(r)
+        if url:
+            cand.append((r, url, tier))
     if only_missing:
-        cand = [r for r in cand if not _has_any(r)]
+        cand = [x for x in cand if not _has_any(x[0])]
     # 留痕已判定为终态的记录不再花第二次预算；待重试的（且未到次数上限）重新排队
-    todo = [r for r in cand if needs_retry(r.get(SITE_MARK))]
+    todo = [x for x in cand if needs_retry(x[0].get(SITE_MARK))]
     skip_done = len(cand) - len(todo)
-    todo.sort(key=lambda r: 0 if not _has_any(r) else 1)
+    todo.sort(key=lambda x: 0 if not _has_any(x[0]) else 1)
     targets = todo[:max(0, int(limit))]
     stats = {"total": len(recs), "eligible": len(targets), "cached": skip_done,
              "ok": 0, "added": 0, "no_site": len(recs) - len(cand),
-             "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0}
+             "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0,
+             "verified": 0, "tiers": {}, "discovered": 0}
     if not targets:
         return stats
 
@@ -799,19 +842,18 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
                 if i >= len(targets):
                     return
                 idx["n"] += 1
-                rec = targets[i]
+                rec, site, tier = targets[i]
             # 整段包起来：工作线程里任何一条异常若冒泡出去，线程池就少一路，剩下
             # 的家数由更少的线程去跑（表现为「越跑越慢」而日志一句不提）——本轮
             # 真实踩过一次 TypeError，正是这样被静默吞掉的。
             try:
-                one(rec)
+                one(rec, site, tier)
             except Exception as e:
                 with lock:
                     why = f"内部异常({type(e).__name__})"
                     stats["reasons"][why] = stats["reasons"].get(why, 0) + 1
 
-    def one(rec):
-        site = pick_site(rec)
+    def one(rec, site, tier):
         name = str(rec.get("公司名称") or rec.get("公司名") or "")
         res = enrich_site(site, name, timeout=timeout)
         if stopped():
@@ -840,10 +882,37 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
             fresh = [x for x in fresh if x not in added_keys]
             added_keys.update(fresh)
             gained = len(fresh)
+            touched = []
             for k in new:
                 if new[k] != old[k]:
                     rec[k] = new[k]
+                    # 命中层级只在**真的写进了值**时登记：值没变却记一层，
+                    # 就成了「邮箱:官网直采」而邮箱列还是空的那种自相矛盾的格子。
+                    _fe.set_field_evidence(
+                        rec, k, tier,
+                        f"{host_of(site)}({res.get('pages', 0)}页)")
+                    stats["tiers"][tier] = stats["tiers"].get(tier, 0) + 1
+                    touched.append(k)
+            # 「复核确认」= 这一行该字段原有的每一个值，这一轮又在页面上原样见到。
+            # 它和「补到新值」同等重要：到期重验（功能 I）重问一圈拿回**同一个号**，
+            # 若不刷新核验时间，这一行下一轮还会排在待办里——把预算花在原地打转上，
+            # 比不重验更糟。反过来，页面没再见到旧号时**不能**刷新时间戳：那等于把
+            # 「这家已经不换这个号了」这件事抹掉，而它正是下一轮该重验的唯一依据。
+            seen = {"电话": {_value_key(x) for x in tels},
+                    "手机": {_value_key(x) for x in mobs},
+                    "邮箱": {_value_key(x) for x in emails}}
+            confirmed = []
+            for k in _fe.CONTACT_FIELDS:
+                old_keys = {_value_key(x) for x in _SPLIT_RE.split(old.get(k, ""))
+                            if x and _value_key(x)}
+                if old_keys and old_keys <= seen.get(k, set()):
+                    confirmed.append(k)
+            if touched or confirmed:
+                _fe.stamp_verified(rec)
+                stats["verified"] = stats.get("verified", 0) + 1
             if phones or emails:
+                if tier != "site":
+                    stats["discovered"] += 1
                 stats["ok"] += 1
                 stats["added"] += gained
                 rec[SITE_MARK] = (f"官网回采({res.get('pages', 0)}页)："

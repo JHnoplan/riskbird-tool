@@ -4000,7 +4000,21 @@ def main():
         QMessageBox.critical(None, "启动失败", f"程序启动失败:\n{e}\n\n请重试或联系开发者。")
         sys.exit(1)
 
-    sys.exit(app.exec_())
+    # ── 有序收尾：窗口 → QApplication（与 b2bcollect_gui.main 同一条纪律）─────────
+    # 原来这里是直接 sys.exit(app.exec_())：app 在 window **之前**定义，解释器拆帧时按
+    # 定义顺序清局部变量，于是 QApplication 先析构、窗口 wrapper 后析构——PyQt 拆后者时
+    # 撞上的是一具已经随 app 一起没了的 C++ 对象，栈是退出 SIGSEGV（b2bcollect 线上实测
+    # 抓到过同一条栈，用户侧表现是「关掉工具弹一次系统崩溃报告」，顺带最后一次保存没落盘）。
+    # 所以趁 app 还活着先把窗口收掉。只在窗口还可见时补一次 close：用户自己关窗口那条路
+    # closeEvent 已经跑过（等自动保存落盘、刷进度台账），不再跑第二遍。
+    rc = app.exec_()
+    try:
+        if window.isVisible():
+            window.close()
+    except Exception:               # noqa: BLE001 - 收尾失败不该改退出码，也不该再弹框
+        pass
+    window = None
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

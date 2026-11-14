@@ -51,6 +51,7 @@ def _assert(condition, label):
 
 
 import website_contact as wc                                        # noqa: E402
+import field_evidence as fe                                          # noqa: E402
 import task_registry as _tasks                                      # noqa: E402
 from cdp_base import CdpSiteCrawler                                 # noqa: E402
 from parallel_session import RAW_HEADERS, ParallelSession            # noqa: E402
@@ -128,14 +129,25 @@ def _reset_net():
 # ── A. 口径同源 ─────────────────────────────────────────────
 print("A. 留痕列口径同源")
 _assert(wc.SITE_MARK == "官网回采", f"留痕列名固定（{wc.SITE_MARK}）")
-_assert(RAW_HEADERS[-1] == wc.SITE_MARK, "原始表最后一列就是官网回采列")
-_assert(CdpSiteCrawler.EXPORT_HEADERS[-1] == wc.SITE_MARK, "清洗导出表同列同名（两处不许各写一份）")
+# 瀑布补全（功能 A/I）在留痕列之后又接了三列证据，所以「官网回采是最后一列」这句
+# 旧判据已经过期。这里按**新的表尾契约**钉，钉得比原来更死：四列的顺序与名字全部
+# 从两个模块的常量派生（不写第二份字面量），任何一列被改名、被换序、被漏进某一张表，
+# 都当场红——原来那句只验最后一列，恰恰管不到「后面又加了三列而某张表只加了两列」。
+_evidence_tail = [wc.SITE_MARK] + list(fe.evidence_columns())
+_assert(RAW_HEADERS[-len(_evidence_tail):] == _evidence_tail,
+        f"原始表表尾四列＝留痕+证据三列且顺序固定（{('｜'.join(_evidence_tail))}）")
+_assert(CdpSiteCrawler.EXPORT_HEADERS[-len(_evidence_tail):] == _evidence_tail,
+        "清洗导出表表尾同序同名（两处不许各写一份）")
 _rec = CdpSiteCrawler.__new__(CdpSiteCrawler)
 CdpSiteCrawler.PLATFORM_NAME = "测试站"
 _base = _rec._base_rec({"公司名称": "测试公司", "公司网址": "www.mingliang-led.com"})
 _assert(wc.SITE_MARK in _base and _base[wc.SITE_MARK] == "",
         "_base_rec 建的每一行都带空的留痕列（空=本轮没对它跑过回采）")
+_assert(all(c in _base and str(_base[c]) == "" for c in fe.evidence_columns()),
+        "_base_rec 同样带齐三列证据且初始为空（空=这行还没被补全动过）")
 _assert(list(RAW_HEADERS).count(wc.SITE_MARK) == 1, "留痕列只出现一次（重复列会让导出错位）")
+_assert([c for c in fe.evidence_columns() if list(RAW_HEADERS).count(c) != 1] == [],
+        "证据三列各只出现一次（缺一列＝那一级写的值落进虚空，多一列＝导出错位）")
 
 # ── B. 什么算官网 / SSRF 边界 ───────────────────────────────
 print("B. norm_site / 平台页边界 / SSRF")
@@ -478,8 +490,21 @@ w.session._all_live_records = lambda: [_rec("某某食品公司", "")]
 boxes.clear()
 w.btn_site_now.click()
 app.processEvents()
-_assert(any("没有可回采的官网" in b for b in boxes), "有数据但一行官网都没有：单独一句话说明白")
-_assert(w._site_worker is None, "无官网时也不起线程")
+# 这一档默认开着瀑布，所以 0 行的解释必须是「五级途径都接不上」那一套；只讲
+# 「公司网址那列没有可用官网」是单跳时代的说法——勾了新功能却听旧解释，
+# 用户会以为是老问题，而真原因可能是邮箱列也空、同主体也没有值。
+_assert(any("没有可补采的行" in b for b in boxes),
+        "有数据但一行途径都没有：单独一句话说明白（标题按口径改名，不再只说官网）")
+_assert(any("五种途径都试过" in b for b in boxes),
+        "勾了瀑布时 0 行的解释跟着口径换：把五级途径点名，而不是只讲官网那一列")
+_assert(w._site_worker is None, "无途径可补时也不起线程")
+w.session.waterfall = False
+boxes.clear()
+w.btn_site_now.click()
+app.processEvents()
+_assert(any("平台页" in b and "五种途径" not in b for b in boxes),
+        "反向对照：没勾瀑布时只讲单跳口径（公司网址里的平台页那几条），不塞瀑布的话术")
+w.session.waterfall = True
 
 w.session._all_live_records = lambda: [_rec("上海明亮照明有限公司", "www.mingliang-led.com")]
 
@@ -602,6 +627,16 @@ if _requests is not None and _real_requests_get is not None:
 _assert(wc.fetch_html is not _fake_fetch and wc.socket.getaddrinfo is _real_getaddrinfo,
         "桩已还原（本套件跑完不影响后续套件的真实性）")
 _assert(_net_trips == [], "整轮从未发出真请求")
+
+# ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
+# 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器
+# 自己拆 Qt 对象会撞上退出 SIGSEGV」（线上实测抓到过栈）。这里实测同样 6 次崩 1 次，且崩在
+# 打印汇总**之后**——批跑只看退出码，全绿也会被判成一次失败。
+# 走 hide() 而不是 close()：close 会进生产 closeEvent（等线程、弹确认框），本套件测的不是
+# 退出那条路；hide 之后把引用清掉，refcount 当场让 sip 删掉 C++ 对象，此时 app 仍在。
+w.hide()
+w = None
+app.processEvents()
 
 print("\n" + "=" * 60)
 total_n = _passed + _failed

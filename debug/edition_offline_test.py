@@ -291,8 +291,21 @@ check("丐版「④ 采集参数」不留空行：每一行都得有真的可见
       bool(_lite_rows) and all(any(x.isVisibleTo(g_lite) for x in ws) for ws in _lite_rows),
       [(i, [f"{x.metaObject().className()}:{x.text()}" for x in ws])
        for i, ws in enumerate(_lite_rows)])
-check("内部版「④ 采集参数」仍是两行（扩词/历史任务没被挤到别处）",
-      len(_rows(g_pro)) == 2, len(_rows(g_pro)))
+# 原来这条钉的是「内部版恰好两行」。瀑布补全/线索分层/到期重验三个开关进来后是 3 行，
+# 于是红了——红得没有意义：行数是被功能数量推着走的代理量，钉死它的后果是每加一个合规
+# 开关都得回来改期望值，而这一格真正会坏的两件事（控件被挪出这个分区、整行空掉）它一次
+# 也没判住。改成按真性质判，与上面丐版那条同口径。
+_pro_rows = _rows(g_pro)
+check("内部版「④ 采集参数」每行都有真的可见控件（只藏控件不撤行 = 空一块，同丐版口径）",
+      bool(_pro_rows) and all(any(x.isVisibleTo(g_pro) for x in _row_widgets(r))
+                              for r in _pro_rows),
+      [(i, [f"{x.metaObject().className()}:{x.text()}" for x in _row_widgets(r)])
+       for i, r in enumerate(_pro_rows)])
+check("自动扩词勾选与历史任务入口仍在「④ 采集参数」分区里"
+      "（当年从操作行迁进来的那件事不许悄悄回退，也不许被塞到别的分组）",
+      any(x.text() == "自动扩词" for x in g_pro.findChildren(QCheckBox))
+      and any(x.text() == "历史任务" for x in g_pro.findChildren(QPushButton)),
+      [x.text() for x in g_pro.findChildren(QCheckBox)])
 check("丐版同样看得见「严格按关键词清洗」与「补采官网联系方式」：数据口径开关不是功能入口，"
       "藏掉它就会出现「界面上没这项、值却还在生效」那种最难解释的账",
       any(x.text() == "严格按关键词清洗" and x.isVisibleTo(w_lite)
@@ -301,6 +314,15 @@ check("丐版同样看得见「严格按关键词清洗」与「补采官网联�
               for x in g_lite.findChildren(QPushButton)),
       [x.text() for x in g_lite.findChildren(QCheckBox)]
       + [x.text() for x in g_lite.findChildren(QPushButton)])
+# 上面那条把两个开关点名判了一遍，但「点名」这件事本身有代价：以后每加一个口径开关都要
+# 回来补一句，忘了补就是安静地漏判。这条改成**按例外写**：先问「内部版这个分区的勾选框，
+# 丐版少了哪几个」，答案只许是那一类东西——功能入口（按档位可藏）。新加的口径开关自动落
+# 在「不许少」的那一侧，不需要有人记得回来改期望值（同 gui 里 hp3 恒定入布局那条纪律）。
+_QK_MAY_HIDE = {"自动扩词"}        # 唯一按档位可藏的勾选框：它是功能入口，不是数据口径
+_qk_pro = {x.text() for x in g_pro.findChildren(QCheckBox)}
+_qk_lite = {x.text() for x in g_lite.findChildren(QCheckBox) if x.isVisibleTo(g_lite)}
+check("丐版没丢掉任何「数据口径开关」：消失的只许是功能入口白名单里那几个",
+      _qk_pro - _qk_lite <= _QK_MAY_HIDE, sorted(_qk_pro - _qk_lite))
 _co_lite = _group(w_lite, "公司名单")
 check("丐版公司名单区仍然有内容（按钮 + 说明 + 一个勾选框），不是一块空板",
       len(_rows(_co_lite)) >= 3
@@ -862,13 +884,18 @@ check("风鸟/爱企查的通道注册与三平台台账代码原样保留（回
       "LIST_CHANNEL_SLUGS" in Path(gui.__file__).read_text(encoding="utf-8"))
 
 # ── 打包清单三方一致性：门禁能不能进包，取决于这三份文件有没有一起改
-#    两个 workflow（Win/Mac）+ 本地 .spec。漏任何一份，打出去的都是「安静地少一层
+#    两个 workflow（Win/Mac）+ 本机打包脚本。漏任何一份，打出去的都是「安静地少一层
 #    防护」的包：不会崩，不会报错，外面拿到的就是没有等级、没有单点登录的版本。
+# 第三份以前钉的是 b2bcollect_build/B2bCollectTool.spec——那是 **PyInstaller 每次构建
+# 自动生成的回显**（.gitignore 里 *.spec 就是为此），既不参与出包也不是人工维护的清单。
+# 后果本轮就撞上了：功能④⑤的四个新模块早就进了本机脚本与两份 workflow，这一条照样红，
+# 红的原因是「这台机器最近一次本地打包在那之前」。判据的输入取决于打过没打过包，得到的
+# 就不是清单对拍而是考古（同一条结论在 test_frozen_delivery_offline.py 的交付链一节已写在案）。
 _ROOT = Path(gui.__file__).resolve().parent.parent
 _MANIFESTS = {
     "Win workflow": _ROOT / ".github" / "workflows" / "build-b2bcollect.yml",
     "Mac workflow": _ROOT / ".github" / "workflows" / "build-b2bcollect-mac.yml",
-    "本地 spec": _ROOT / "b2bcollect_build" / "B2bCollectTool.spec",
+    "本机打包脚本": _ROOT / "debug" / "build_b2bcollect_mac_local.sh",
 }
 _FOUND = {k: v for k, v in _MANIFESTS.items() if v.is_file()}
 if len(_FOUND) == len(_MANIFESTS):
@@ -889,15 +916,15 @@ if len(_FOUND) == len(_MANIFESTS):
           _mf["Win workflow"] == _mf["Mac workflow"],
           [x for x in _mf["Win workflow"] if x not in _mf["Mac workflow"]]
           + [x for x in _mf["Mac workflow"] if x not in _mf["Win workflow"]])
-    check("本地 spec 覆盖 workflow 的全部模块（spec 多出来的 PIL 属显式兜底，允许）",
-          set(_mf["Win workflow"]) <= set(_mf["本地 spec"]),
-          [x for x in _mf["Win workflow"] if x not in set(_mf["本地 spec"])])
+    check("本机打包脚本覆盖 workflow 的全部模块（脚本里多出来的按架构项，允许）",
+          set(_mf["Win workflow"]) <= set(_mf["本机打包脚本"]),
+          [x for x in _mf["Win workflow"] if x not in set(_mf["本机打包脚本"])])
     # 本地模块只要存在就必须被收进包——这条把「今天新写一个 py、忘了登记」变成当场红
     _locals = {p.stem for p in (_ROOT / "b2bcollect_build").glob("*.py")
                if not p.stem.startswith(("test_", "b2bcollect_gui"))}
     _skip_local = {"gys_crawler", "solarbe_crawler", "unlock_no_contact"}   # 已下线/独立脚本
     _miss = sorted(x for x in _locals - _skip_local
-                   if x not in _mf["Win workflow"] or x not in _mf["本地 spec"])
+                   if x not in _mf["Win workflow"] or x not in _mf["本机打包脚本"])
     check("b2bcollect_build 下每个在用本地模块都在三份清单里（漏登记当场红，不等打包那天）",
           not _miss, _miss)
 else:

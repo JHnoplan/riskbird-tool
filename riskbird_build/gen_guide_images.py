@@ -89,4 +89,10 @@ if 1 in boxes:
     painter.drawRect(QRectF(b.x() - 4, b.y() - 4, boxes[1].width() + 8, boxes[1].height() + 8))
 painter.end()
 dpm.save(f"{OUT}/dialog_column.png")
+# 收尾：趁 QApplication 还活着把窗口交出去，不收尾退出码会随机 139（图已存好却被读成失败），
+# 同一条纪律与成因见硬门第 21 条。本脚本只离屏截图、不碰浏览器，用 hide() 即可，
+# 走 close() 反而会进生产 closeEvent（等自动保存、落盘进度台账），那不是这里要做的收尾。
+win.hide()
+win = None
+app.processEvents()
 print("done")

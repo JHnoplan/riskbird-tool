@@ -130,6 +130,14 @@ try:
     from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
                                   LIST_CHANNEL_SLUGS, STATS_LABELS, STATUS_ORDER, QZD_SLUG)
     from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
+    # 命中层级与保鲜期口径（功能 A/I 的单一真源）：界面上的天数、倍率、层级名都从
+    # 这里取。写成死数字的话，调 TTL 那一轮界面还在讲旧天数——话术与口径分家，
+    # 用户是按界面那句话来理解「多久会重问一次」的。
+    import field_evidence as _fe
+    # 瀑布五级（功能 A）：界面上那五级编号与名字必须和引擎、和「补全层级」列同源。
+    # 以前界面写「⑤ 转工商补采」、引擎日志写「第 3 级」、表里落「工商核验」——
+    # 同一件事三套写法，用户对着表找不到界面讲过的那一级。
+    import enrich_waterfall as _wf
     import customer_library_cleaner as _cleaner
     import keyword_expander as _kwexp
     import province_filter as _pfilter
@@ -2203,6 +2211,16 @@ class MainWindow(QMainWindow):
         # 读会话上那一份档位；「清洗数据」按钮洗的是外部表格，不走这条链路。
         # 默认正常清洗——严格档会剔数据，必须是用户明确表示的意思，不能是升级带来的默认。
         self._clean_strict = False
+        # 质量三开关的**生效值**（与上面两条同一纪律：值存在数据里，控件只是它的一个视图，
+        # 续采快照/会话下发/手动补采前置检查都读这一份，不各自再兜一遍默认）。
+        # 三个默认值与引擎层刻意不同：parallel_session 里它们都默认关（那是离线用例的护栏，
+        # 自称离线的测试绝不许真联网、真写报表），界面这边默认开——下发点漏传就等于功能
+        # 整体不生效，而且一行报错都没有（本轮记过账的老形状）。
+        # 「到期字段自动重验」默认**关**：它是三者里唯一会额外花网络请求去重问已经答过的
+        # 数据的档位，多烧的是防封预算，必须是用户明确表示的意思，不能是升级带来的默认。
+        self._waterfall_on = True
+        self._lead_report_on = True
+        self._reverify_on = False
         # 「补采官网联系方式」的在途线程：只允许一个在跑。记线程而不是记布尔，因为退出时
         # 要靠它 wait 住那一轮联网——丢掉这一轮就是「日志说补到了、表格里没有」那类对不上的账。
         self._site_worker = None
@@ -3003,6 +3021,85 @@ class MainWindow(QMainWindow):
         # 不是可选功能入口）。以前整行只在扩词/历史任务存在时才加入，对外档位会空一行。
         hp2.addStretch(1)
         vp.addLayout(hp2)
+        # 第三行：采完之后那三条链路（瀑布补全 / 线索分层 / 到期重验）。不塞进第二行是实测
+        # 判据：hp2 已排「扩词 + 严格清洗 + 历史任务 + 补采按钮」，再加三个长文案勾选框会把
+        # 配置内容最小宽顶过 1100——那正是上次「开始采集要左右滑才能点到」的成因（见
+        # _apply_width_floor 的说明）。单列一行还多送一层次序：前两行是「怎么采」，
+        # 这一行是「采完的东西怎么处理」。
+        # 三个都是**数据口径开关**，与清洗档位同一条纪律：恒定挂进布局，任何档位都不藏
+        # （藏掉控件而值还在生效，比多一行更难解释）。
+        hp3 = QHBoxLayout()
+        self.chk_waterfall = QCheckBox("多源瀑布补全")
+        self.chk_waterfall.setChecked(self._waterfall_on)
+        # 五级的**序号和名字**一律从 _wf 取（stage_mark → STAGES 的位置 + TIER_LABEL），
+        # 这里只写每级「具体怎么做」的注解。原来这五行把名字手抄在界面里，抄成了
+        # 「⑤ 转工商补采」，而「补全层级」那一列真正落库的值是「工商核验」——用户拿着
+        # 表找不到界面讲过的第五级，等于这一级没做过（话术与口径分家，最难发现的一类）。
+        _wfg = {"carry": "同名或同注册域名的另一行已经有这个值 → 直接复用，一次请求都不花",
+                "mailsite": "行里邮箱 @ 后面那串就是他的域名 → 去抓那个官网（qq/163 这类免费邮箱域不算）",
+                "site": "行自带「公司网址」本来就是可用企业域名 → 直接抓",
+                "brand": "由英文商号、店铺子域拼出候选域名 → 抓回来还得过归属核验才认",
+                # 最后一级**不点平台名**：这一档在丐版/受限账号上也可见（它是数据口径开关），
+                # 而 tooltip 里写出「风鸟/爱企查」就等于按钮藏住了、话没藏住——edition 的
+                # 「文案交底扫描」判的正是这一类。说的是同一件事，只是换成层级自己的名字。
+                "registry": "前面几级都接不上 → 把还缺的家数投进现成的工商核验待采名单，"
+                            "那一轮补采会顺路带上"}
+        _wfl = "\n".join(
+            f"{_wf.stage_mark(s)}：{_wfg[s]}" + ("。" if s == _wf.STAGES[-1] else "；")
+            for s in _wf.STAGES)
+        self.chk_waterfall.setToolTip(
+            "缺电话/邮箱的行，按「成本从低到高」逐级去问，问到就停（业界 waterfall 那套做法）：\n"
+            + _wfl + "\n"
+            "顺序按成本排、不按可信度排：同一批数据换个顺序账单能差四倍，免费的必须排在最前。\n"
+            "每一行都在「补全层级」「补全证据」两列写清楚这个号是哪一级给的；"
+            f"{_wf.stage_mark('brand')}拼出来的站只要认不出这家公司就整站不采信——"
+            "宁可少补，不补来路不明的号。\n"
+            f"取消勾选＝回到只做「{_wf.stage_mark('site')}」这一跳的老行为，"
+            "抓取与合并逻辑一个字都不变。")
+        self.chk_waterfall.toggled.connect(self._set_waterfall)
+        # 反向依赖同样要接线：取消「采集后回采」会让还勾着的瀑布整条链路原地停摆（它跑在
+        # 那一轮里面）。这一条**跟着一起收掉勾选**并在日志说清为什么（见
+        # _on_site_enrich_toggled）：留着勾就是一个「亮着但一行都不做」的开关，还会被
+        # _params_snapshot 原样记进任务快照；但绝不反向替用户打开任何东西。
+        self.chk_site.toggled.connect(self._on_site_enrich_toggled)
+        hp3.addWidget(self.chk_waterfall)
+        self.chk_lead = QCheckBox("线索分层报表")
+        self.chk_lead.setChecked(self._lead_report_on)
+        self.chk_lead.setToolTip(
+            "每轮采完在任务文件夹里多落一张《线索分层与通道健康.xlsx》（四张表）。\n"
+            "采集那两份表与《清洗后入库数据》模板一概不动：入库模板是接口契约，加一列就会破坏上传，\n"
+            "所以这三样全做成**附加报表**，不碰既有产出。\n"
+            "· 线索分层：一家一条（同主体多行先归并，逐字段取可信度最高的那一行并带它的出处），\n"
+            "  按可信度 45 / 完整度 35 / 新鲜度 20 打分，分成「立即跟进 / 先培育 / 本轮别碰」，\n"
+            "  分数怎么来的逐条写在「依据」列——只给分不给依据的分数没人敢用；\n"
+            "· 字段变更：这一轮哪个字段从什么变成什么、凭什么（旧值凭空消失属异常形状，会点名）；\n"
+            "· 通道健康：每一路来源各出多少家、平均分多少、哪一路连续几轮零产出（红牌告警）；\n"
+            "· 口径说明：这些分是怎么算出来的，免得看表的人自己猜一套。\n"
+            "可信度只读「补全层级」，不在这里第二次判号——两处各判一套，迟早对不上。\n"
+            "勾掉它只是少一张附加报表，采集数据与入库结果完全不受影响。")
+        self.chk_lead.toggled.connect(self._set_lead_report)
+        hp3.addWidget(self.chk_lead)
+        self.chk_reverify = QCheckBox("到期字段自动重验")
+        self.chk_reverify.setChecked(self._reverify_on)
+        self.chk_reverify.setToolTip(
+            "勾选之前要先知道的一件事：这一档会**额外花网络请求**去重问已经答过的数据。\n"
+            # 保鲜期与倍率**从 field_evidence 里取**再拼进文案：写成死数字，下一轮调 TTL
+            # 的时候界面还在讲旧天数（话术与口径分家，用户按界面上的天数去理解重验频率）。
+            f"判过期看「最后核验时间」那一列，不是看采集时间："
+            f"手机 {_fe.TTL_DAYS['手机']} 天、电话 {_fe.TTL_DAYS['电话']} 天、"
+            f"邮箱 {_fe.TTL_DAYS['邮箱']} 天；\n"
+            f"工商核验的号放宽到 {_fe.TTL_TIER_FACTOR['registry']} 倍（登记信息改得慢），"
+            f"平台自带的收紧到 {_fe.TTL_TIER_FACTOR['source']} 倍。\n"
+            "· 从没记过核验时间的老行一律算到期、本轮重问——读成「还新」等于这功能永远不生效；\n"
+            "· 重问到同一个号也会刷新时间戳：不刷新的话那一行每轮都被重问，是拿预算原地打转；\n"
+            "· 电话手机邮箱已经齐且达到官网直采以上可信度的行，命中即停，不重问。\n"
+            "什么时候该开：手里是一份要长期跟进的客户资产；一次性拉新名单不必开，白烧请求。")
+        self.chk_reverify.toggled.connect(self._set_reverify)
+        hp3.addWidget(self.chk_reverify)
+        hp3.addStretch(1)
+        vp.addLayout(hp3)
+        # 三个生效值当场推给会话一次：不能等「开始采集」才下发（理由见 _sync_quality_switches）
+        self._sync_quality_switches()
         cfg.addWidget(gb_p)
 
         hb = QHBoxLayout()
@@ -4154,7 +4251,14 @@ class MainWindow(QMainWindow):
                                # 《清洗后入库数据》，等用户点按钮再同步就晚了（第一份表已经
                                # 是按旧档位洗出来的）。
                                clean_strict=self.chk_strict.isChecked(),
-                               clean_keywords=self._strict_keyword_source())
+                               clean_keywords=self._strict_keyword_source(),
+                               # 质量三开关同样在这里下发（生效值走控件本身，与 site_enrich
+                               # 同一纪律）：引擎层三个默认都是关的，这一行漏传就等于功能
+                               # 整体不生效且无报错。会话构造时已推过一次 _sync_quality_switches，
+                               # 这里再按当前勾选覆盖一次（用户可能在界面上改过）。
+                               waterfall=self.chk_waterfall.isChecked(),
+                               lead_export=self.chk_lead.isChecked(),
+                               reverify=self.chk_reverify.isChecked())
         if self.selected_provinces:
             names = "、".join(self.selected_provinces)
             self._on_log(f"🗺 本次按 {len(self.selected_provinces)} 个省「{names}」精准采集："
@@ -5060,6 +5164,104 @@ class MainWindow(QMainWindow):
             pass
         return False
 
+    def _sync_quality_switches(self):
+        """把三个质量开关的生效值推给会话。三条链路（瀑布、分层报表、到期重验）都读会话上
+        这一份值，而读它的时机有两个：采集收尾那一轮，以及界面上的「补采官网联系方式」。
+
+        只在「开始采集」时下发一次是不够的：用户完全可能一轮都还没跑就点补采（上次任务
+        的数据还在表里）。那时会话上的值仍是引擎默认（三个全关），于是
+        ``site_enrich_preview`` 按单跳口径数出 0 行、界面据此把按钮拦住——用户看到的是
+        「这功能没生效」，真原因却是「界面勾了、会话没收到」。
+        """
+        self.session.waterfall = bool(self._waterfall_on)
+        self.session.lead_export = bool(self._lead_report_on)
+        self.session.reverify = bool(self._reverify_on)
+
+    def _set_waterfall(self, on):
+        """瀑布补全的唯一写入口（值、控件、会话三处都从这里过，同 _set_clean_strict）。
+
+        开之前有一道前置校验：瀑布整条链路跑在「采集后回采官网联系方式」那一轮里面
+        （``enrich_websites`` 的入口判据就是那条勾选）。勾了瀑布却没勾回采，结果是
+        界面上一排勾选框全亮、日志里一句「未勾选回采，本轮不回采」——新功能原地隐身，
+        这是最难被发现的一类缺陷。所以当场回弹并把缺的那一条说清楚，而不是替他偷偷勾上：
+        回采那条是独立的功能（只做一跳直采），顺手帮他勾等于改了他没要求过的开关。
+        """
+        want = bool(on)
+        if want and self.chk_site is not None and not self.chk_site.isChecked():
+            self._waterfall_on = False
+            self._sync_quality_switches()
+            if self.chk_waterfall is not None:
+                # 掐信号再回弹：否则 setChecked(False) 回调进来，日志会多出一句像是
+                # 用户自己关掉的话。
+                self.chk_waterfall.blockSignals(True)
+                self.chk_waterfall.setChecked(False)
+                self.chk_waterfall.blockSignals(False)
+            self._on_log("⚠ 瀑布补全开不了：它跑在「采集后回采官网联系方式」那一轮里，"
+                         "而那条没勾上；请先勾那条再来勾这条（只勾那条＝只做官网直采一跳的老行为）")
+            QMessageBox.information(
+                self, "暂时开不了瀑布补全",
+                "「多源瀑布补全」不是单独跑一轮，它是把「采集后回采官网联系方式」那一轮\n"
+                "从只问一次变成按成本逐级问最多五次，所以必须和那条一起开：\n\n"
+                "· 「采集后回采官网联系方式」——勾上它；\n"
+                "· 「多源瀑布补全」——再勾这条。\n\n"
+                "只勾第一条不勾第二条，就是以前的老行为：只认行里自带的那个官网，接不上就算了。")
+            return
+        self._waterfall_on = want
+        if self.chk_waterfall is not None and self.chk_waterfall.isChecked() != want:
+            self.chk_waterfall.setChecked(want)
+        self._sync_quality_switches()
+        self._on_log("🧮 多源瀑布补全：" + (
+            f"开（缺值按 {_wf.stage_chain()} 逐级问，"
+            "问到就停，每行留「补全层级」为账）" if want else
+            "关（只保留「行自带官网直接抓」这一跳，其余途径本轮不动）"))
+
+    def _set_lead_report(self, on):
+        """线索分层报表的唯一写入口。"""
+        self._lead_report_on = bool(on)
+        if self.chk_lead is not None and self.chk_lead.isChecked() != self._lead_report_on:
+            self.chk_lead.setChecked(self._lead_report_on)
+        self._sync_quality_switches()
+        self._on_log("🧮 线索分层报表：" + (
+            f"开（每轮落一张《{self.session.LEAD_REPORT_FILENAME}》到任务文件夹，采集表与入库模板不动）"
+            if self._lead_report_on else
+            # 这句原来写成「通道健康连续轮次台账也随之停更」——那是假话：健康台账
+            # 每轮照记（它挂在采集收尾，与这条勾选无关）。话术与实现不符的开关，
+            # 用户下一次看到红牌就会以为是自己上一轮关掉分层报表导致的。
+            "关（不落附加报表；通道健康台账每轮仍照记，红牌告警与这条无关）"))
+
+    def _set_reverify(self, on):
+        """到期重验的唯一写入口。这一档默认关，所以打开时把「要多花请求」讲在明面上。"""
+        self._reverify_on = bool(on)
+        if self.chk_reverify is not None and self.chk_reverify.isChecked() != self._reverify_on:
+            self.chk_reverify.setChecked(self._reverify_on)
+        self._sync_quality_switches()
+        self._on_log("🧮 到期字段自动重验：" + (
+            "开（按「最后核验时间」与各字段保鲜期判到期，到期的行本轮重问一次并刷新时间戳；"
+            "这一档会额外花网络请求）" if self._reverify_on else
+            "关（已经答过的号码本轮不再重问，只补还空着的字段）"))
+
+    def _on_site_enrich_toggled(self, on):
+        """「采集后回采」被关掉时，把还勾着的瀑布**一并收掉**并说清为什么。
+
+        为什么不是只提醒一句：瀑布整条链路跑在回采那一轮里面（``enrich_websites`` 的入口
+        判据就是那条勾选）。留着它勾着，界面上就是一个「亮着但一行都不做」的开关——这种
+        形状还会被 ``_params_snapshot`` 原样记进任务快照，下次接着采继续非法。
+        收掉的时候绝不替用户反向打开（勾回采不会自动勾瀑布）：他刚关的那一条是他自己的决定，
+        自动恢复就是在改他没要求过的开关。
+        """
+        if on or not self._waterfall_on:
+            return
+        self._waterfall_on = False
+        if self.chk_waterfall is not None:
+            # 掐信号：否则会回调 _set_waterfall(False)，日志里再多一句像是用户自己关的话
+            self.chk_waterfall.blockSignals(True)
+            self.chk_waterfall.setChecked(False)
+            self.chk_waterfall.blockSignals(False)
+        self._sync_quality_switches()
+        self._on_log("🧮 注：「采集后回采官网联系方式」已取消勾选，「多源瀑布补全」跟着一起关掉"
+                     "（瀑布五级都跑在回采那一轮里，留着勾也没有东西会跑）；"
+                     "只想停自动跑、别的不动——回采勾回来后再把这条勾上即可")
+
     def _sync_clean_strict(self):
         """把档位与关键词依据推给会话：四个出口都读会话上这一份值，漏推一处就是
         「同一批数据两种口径」。依据每次一并刷新——用户可能在采集后改关键词框再清洗。"""
@@ -5142,16 +5344,26 @@ class MainWindow(QMainWindow):
                 "先采一轮（或「开始新任务」后接着采），有了数据再点这个按钮。")
             return
         if not with_site:
+            # 文案必须跟着口径走：勾了瀑布时 0 行的含义是「五级途径一级都不接得上」，
+            # 只讲「公司网址那一列没有可用官网」是在说一半谎——那正是单跳时代的解释。
+            # 数几行的判据全在会话里（site_enrich_preview 按开关换口径），这里只换说法。
             QMessageBox.information(
-                self, "没有可回采的官网",
-                f"当前 {total} 行里，一行可用的企业官网都没有，这一次不会访问任何网站。\n\n"
-                "「公司网址」里这几类地址是不回采的：\n"
+                self, "没有可补采的行",
+                f"当前 {total} 行里，一行可用的补全途径都没有，这一次不会访问任何网站。\n\n"
+                + ("这一轮开了「多源瀑布补全」，五种途径都试过：行自带官网、行里邮箱的域名、"
+                   f"同主体另一行已有的值、由商号拼出来的域名、转{_wf.stage_name('registry')}的名单。\n"
+                   "全空通常说明：数据本身电话/邮箱已经齐了，或者「公司网址」「邮箱」两列都是平台页链接。\n\n"
+                   if bool(self.session.waterfall) else "")
+                + "「公司网址」里这几类地址是不回采的：\n"
                 "· 1688 / 马可波罗 / 企知道 / 顺企网这类**平台页**——那上面写的电话是平台客服号；\n"
                 "· 空值、只有公司名没网址、明显不是企业主页的链接。\n\n"
                 "想核对哪些值被当成官网，可以先点「导出 Excel」看《企业数据_原始》的「公司网址」列。")
             return
-        self._on_log(f"🌐 手动补采开始：{total} 行里 {with_site} 行带可回采官网"
-                     f"（其中 {missing} 行本来就缺联系方式，优先补它们）")
+        self._on_log(f"🌐 手动补采开始：{total} 行里 {with_site} 行"
+                     + ("这一轮按瀑布五级逐级问（" + _wf.stage_chain(" / ") + "）"
+                        if bool(self.session.waterfall)
+                        else "行带可回采官网（只认行自带的那一个官网）")
+                     + f"，其中 {missing} 行本来就缺联系方式，优先补它们")
         if not self.chk_site.isChecked():
             self._on_log("   注：「采集后回采官网联系方式」没勾上，这一轮只按你这次点击执行，"
                          "勾选状态不变")
@@ -5172,8 +5384,12 @@ class MainWindow(QMainWindow):
         if not isinstance(stats, dict):
             self._on_log("🌐 手动补采结束：这一轮没有实际访问官网，原因见上面那条日志")
             return
-        self._on_log(f"🌐 手动补采结束：访问 {stats.get('sites', 0)} 个官网、"
-                     f"{stats.get('ok', 0)} 行补到值、净新增 {stats.get('new_values', 0)} 个联系方式")
+        # 取数一律走会话那一份摘要口径：瀑布把官网级账目嵌在 stats["network"] 里，
+        # 界面自己读扁平键的话，勾了瀑布就会报「0 行补到值」这种当场可看见的假话。
+        _sm = self.session.enrich_summary(stats)
+        self._on_log(f"🌐 手动补采结束：访问 {_sm['sites']} 个官网、"
+                     f"{_sm['ok']} 行补到值、净新增 {_sm['new_values']} 个联系方式"
+                     + ("（瀑布各级的分档账目见上面几行 🧵）" if self.session.waterfall else ""))
         self.request_autosave()
 
     def _params_snapshot(self):
@@ -5183,6 +5399,11 @@ class MainWindow(QMainWindow):
                 "incremental": bool(self.chk_incr.isChecked()),
                 "site_enrich": bool(self.chk_site.isChecked()),
                 "clean_strict": bool(self._clean_strict),
+                # 质量三开关进快照：续采时照原样恢复，不然「接着采」会悄悄换成引擎默认
+                # 的口径（上次是瀑布补的，这次变成单跳），两份数据的可信度分布就对不上。
+                "waterfall": bool(self._waterfall_on),
+                "lead_report": bool(self._lead_report_on),
+                "reverify": bool(self._reverify_on),
                 "background": bool(self.chk_bg.isChecked()),
                 "auto_keyword_expand": bool(self._auto_expand),
                 "province": list(self.selected_provinces or [])}
@@ -5200,6 +5421,7 @@ class MainWindow(QMainWindow):
                                 ("background", self.chk_bg)):
                 if key in params:
                     widget.setChecked(bool(params[key]))
+            # 质量三开关单独一组、且不在这个 try 里面（见 _restore_quality_switches）
             # 扩词单独走 _set_auto_expand：控件在就顺带勾回界面，控件不在（对外档位）
             # 也要把生效值恢复出来——快照里记着什么就照用什么，不能让 None 控件吃掉它。
             if "auto_keyword_expand" in params:
@@ -5214,8 +5436,51 @@ class MainWindow(QMainWindow):
             else:
                 self.selected_provinces = []
             self._refresh_province_label()
-        except Exception:
-            pass
+        except Exception as e:
+            # 这里原来是 `except Exception: pass`：那是「静默少功能」的另一种写法——
+            # 快照里任何一个字段读坏（老版本格式、手工改过的状态文件）都会把**后面所有**
+            # 参数组一起跳过，界面上只看得见「参数好像没恢复」，查不到为什么没恢复。
+            # 现在如实点名（不改变「坏一个只少一个」的范围：质量三开关已被移出本 try）。
+            self._on_log(f"ℹ 续采参数快照有一部分没恢复（{type(e).__name__}: "
+                         f"{str(e).splitlines()[0][:60]}）：其余参数保持界面上的当前值")
+        # 质量三开关在大 try **之后**单独恢复：一是它必须在 site_enrich 恢复完之后才能做
+        # 依赖收敛，二是它不该被一个无关字段（比如老的 delay_between 写法）连累。
+        self._restore_quality_switches(params)
+
+    def _restore_quality_switches(self, params):
+        """从快照恢复三个质量口径开关（掐信号批量赋值 + 依赖收敛 + 生效值下发）。
+
+        为什么单独成一段、还自带 try/except：``setChecked`` 会触发 toggled → setter，
+        而 setter 里有前置校验会**弹模态框**。恢复参数时弹窗是最坏的形态（用户只是在
+        「接着采」上一轮任务，却被一个对话框按在原地），而且中间态本身就不合法
+        （site 已恢复成关、waterfall 还没恢复）。所以这里掐信号批量赋值，
+        再按「瀑布依赖回采」这一条把不合法的组合就地收敛，并在日志里说清收敛了什么。
+        """
+        try:
+            _q = (("waterfall", "_waterfall_on", self.chk_waterfall),
+                  ("lead_report", "_lead_report_on", self.chk_lead),
+                  ("reverify", "_reverify_on", self.chk_reverify))
+            for key, attr, widget in _q:
+                if key not in params or widget is None:
+                    continue
+                want = bool(params[key])
+                setattr(self, attr, want)
+                widget.blockSignals(True)
+                widget.setChecked(want)
+                widget.blockSignals(False)
+            if any(key in params for key, _a, _w in _q):
+                if self._waterfall_on and not bool(self.chk_site.isChecked()):
+                    self._waterfall_on = False
+                    self.chk_waterfall.blockSignals(True)
+                    self.chk_waterfall.setChecked(False)
+                    self.chk_waterfall.blockSignals(False)
+                    self._on_log("ℹ 上次任务的快照里「瀑布补全」开着但「回采官网」是关的"
+                                 "（那两个开关后来有了依赖关系）：本次按老行为只跑一跳直采，"
+                                 "要瀑布就把两条都勾上")
+                self._sync_quality_switches()
+        except Exception as e:
+            self._on_log(f"ℹ 质量口径开关没按上次任务恢复（{type(e).__name__}: "
+                         f"{str(e).splitlines()[0][:60]}）：当前勾的是什么就跑什么")
 
     def _auto_expand_on_start(self):
         """点「开始采集」前自动展开关键词。

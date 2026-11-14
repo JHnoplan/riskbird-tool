@@ -2953,6 +2953,266 @@ def check_python_stdin(texts=None) -> list:
     return problems
 
 
+# ── 第 21 条：Qt 工具的退出顺序（2026-11-14 本机自审抓到）─────────────────────
+# 现象：一份离线套件连跑 12 次崩 1 次（rc=139），且崩在**打印汇总之后**——批跑只看退出码，
+#       127/127 全绿照样被读成一次失败。生产侧同一条栈 b2bcollect 早就抓到过（main 的
+#       finally 里那段「窗口 → QApplication」就是那次留下的），另外四个工具的入口却仍是
+#       `sys.exit(app.exec_())`：那句后面一个字都放不进去。app 比窗口**先**定义，解释器拆帧
+#       按定义顺序清局部变量 → QApplication 先析构、窗口 wrapper 后析构，PyQt 拆剩下那些
+#       wrapper 时撞上的是一具已经随 app 没掉的 C++ 对象。用户侧表现是「关掉工具弹一次
+#       系统崩溃报告」，顺带 closeEvent 里那最后一次保存可能根本没跑。
+# 判据是结构、不是文案（第 19 条那条教训：注释里写了指路自己不构成判据）：
+#   ① `sys.exit(app.exec_())` 这种把返回值直接吞掉的写法一律红；
+#   ② 跑事件循环的入口必须先 `rc = app.exec_()`，再在 sys.exit 之前把主窗口交出去
+#      （close()/hide() + 置 None）；
+#   ③ 造过主窗口的离线套件同一条纪律——它们只调 processEvents、从不进 exec_，天然绕过
+#      生产那段收尾，不钉住就会一直在退出码上抖。
+# 扫描范围按目录发现（*_build 顶层 .py），不是一张登记表：以后再多一个工具，它自动在判据里。
+#
+# 三处口径细节（都是本条初版在本机跑出来的假阳性，写下来免得被「简化」回去）：
+#   · 只判**代码行**：我修 riskbird 时把旧写法 `sys.exit(app.exec_())` 原样抄进了注释里，
+#     结果门把自己的注释当成现场代码判红——门读注释就等于门在判文案。
+#   · 「谁跑事件循环」看**它自己建的那个 QApplication 变量**有没有被调 exec_()：套件里
+#     `dlg.exec_()` / `QMessageBox.exec_` 这类字样到处都是，拿子串 .exec_() 当判据会把
+#     每一份套件都拖进入口那一路。同一条绑定也用在这两行本身（`rc = app.exec_()` 与
+#     `sys.exit(app.exec_())`）：右侧变量不绑 appvar 的话，`n = dlg.exec_()` 会被当成入口循环，
+#     于是「主窗口取 exec_ 上方最近一次赋值」找的是弹窗那一行——判的是两段毫不相干的代码。
+#   · 主窗口取 exec_ **上方最近**的那次 `x = MainWindow(`：b2bcollect 的 ui_smoke 里也有一个
+#     `window = MainWindow()`，但它是函数内局部、返回时 app 还活着，那条路本来顺序就对。
+#   · QApplication 的两种创建句式都算（`QApplication(...)` 与 `QApplication.instance() or
+#     QApplication(...)`）：本仓库两种都在用——b2bcollect_gui.py 一份文件里就各有一处。只认后
+#     一种的话，那种写法的**入口**会掉进「套件」那一路：要求的是 hide/None 而不是「先接住返回值」，
+#     报的错与实际要改的行不符；更糟的是若文件里别处恰好有 hide，入口这一路就假绿了。
+_QT_APP_ASSIGN_RE = re.compile(
+    r"^\s*(\w+)\s*=\s*(?:QApplication\s*\.\s*instance\(\)\s*or\s*)?QApplication\s*\(", re.M)
+_QT_MAINWIN_RE = re.compile(r"^\s*(\w+)\s*=\s*(?:\w+\.)?MainWindow\(", re.M)
+
+
+def _qt_exec_res(appvar: str):
+    """把「谁在跑事件循环」绑到这个文件自己建的那个 QApplication 变量上。
+
+    通用写法（`x = y.exec_()` / `sys.exit(y.exec_())` 里不限变量名）会认错行：套件里
+    `n = dlg.exec_()`、`QMessageBox.exec_` 这类字样到处都是，拿它当入口循环，主窗口就按
+    exec_ 那一行的位置去找——找到的是弹窗那一行，判的是完全无关的两行之间有什么。
+    """
+    a = re.escape(appvar)
+    return (re.compile(rf"^\s*(\w+)\s*=\s*{a}\s*\.\s*exec_\(\)\s*$", re.M),
+            re.compile(rf"^\s*sys\.exit\(\s*{a}\s*\.\s*exec_\(\)\s*\)\s*(?:#.*)?$", re.M))
+
+
+def _qt_code_lines(text: str) -> str:
+    """去掉整行注释后的源码：判据只该看真会执行的那些行。"""
+    out = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            out.append("")
+        else:
+            out.append(line.split("  # ")[0].rstrip())     # 行尾注释也不算代码
+    return "\n".join(out)
+
+
+def _qt_build_py_files() -> dict:
+    out = {}
+    for d in sorted(ROOT.iterdir()):
+        if not (d.is_dir() and d.name.endswith("_build")):
+            continue
+        for p in sorted(d.glob("*.py")):
+            out[p] = p.read_text(encoding="utf-8", errors="replace")
+    return out
+
+
+def check_qt_shutdown_teardown(files=None) -> list:
+    """自己跑 Qt 事件循环 / 造过主窗口的文件，必须赶在解释器之前把窗口交出去（第 21 条）。"""
+    problems = []
+    files = _qt_build_py_files() if files is None else dict(files)
+    judged = 0
+    for path, text in files.items():
+        name = getattr(path, "name", str(path))
+        code = _qt_code_lines(text)
+        wins = list(_QT_MAINWIN_RE.finditer(code))
+        app_m = _QT_APP_ASSIGN_RE.search(code)
+        if not wins and app_m is None:
+            continue
+        appvar = app_m.group(1) if app_m else None
+        # 这条正则对 `rc = app.exec_()` 和 `sys.exit(app.exec_())` 两种写法都成立（后者也确实在跑
+        # 循环），所以「是不是入口循环」一次判掉，具体哪一种形态留给下面分别报。
+        loop = (re.search(rf"\b{re.escape(appvar)}\s*\.\s*exec_\(\)", code)
+                if appvar else None)
+        if appvar and not wins:
+            if loop:
+                judged += 1
+                problems.append(f"{name}：跑着 Qt 事件循环却认不出主窗口变量（判据要求 `x = MainWindow(`）"
+                                "——要么把窗口变量写清楚，要么连这条判据一起改，不许安静跳过")
+            continue
+        if not loop:
+            # 离线套件 / 一次性脚本那一路：不进 exec_，所以只要求「每个主窗口建出来之后
+            # 在文件收尾时被交出去」。
+            for win in wins:
+                judged += 1
+                var = win.group(1)
+                after = code[win.end():]
+                if not re.search(rf"^\s*{re.escape(var)}\s*\.\s*(?:close|hide)\s*\(", after, re.M) \
+                        or not re.search(rf"^\s*{re.escape(var)}\s*=\s*None\s*$", after, re.M):
+                    problems.append(
+                        f"{name}：造了主窗口（`{var} = MainWindow(`）却没在收尾时把它交出去"
+                        f"（要 `{var}.hide()`/`{var}.close()` 加 `{var} = None`）——套件只调 "
+                        "processEvents，绕过了生产 main 里那段有序收尾，退出码就会随机 139："
+                        "全绿的套件被批跑读成一次失败")
+            continue
+        _assign_re, _in_exit_re = _qt_exec_res(appvar)
+        if _in_exit_re.search(code):
+            judged += 1
+            problems.append(f"{name}：`sys.exit({appvar}.exec_())` 把返回值直接吞了，那句后面一个字都"
+                            "放不进去，主窗口只能等解释器去拆——而先析构的是先定义的 QApplication")
+            continue
+        m = _assign_re.search(code)
+        if m is None:
+            judged += 1
+            problems.append(f"{name}：没找到 `rc = {appvar}.exec_()` 这种「先接住返回值」的写法"
+                            "（不先接住，收尾就没有能落脚的地方）")
+            continue
+        win = [x for x in wins if x.start() < m.start()]
+        if not win:
+            judged += 1
+            problems.append(f"{name}：`{appvar}.exec_()` 上方找不到主窗口赋值（判据范围没覆盖到，请连判据一起改）")
+            continue
+        judged += 1
+        var = win[-1].group(1)
+        tail = code[m.end():]
+        ex = re.search(r"\bsys\.exit\(", tail)
+        if ex is None:
+            problems.append(f"{name}：exec_() 之后没有 sys.exit，这条判据的范围没覆盖到（请连判据一起改）")
+            continue
+        zone = tail[:ex.start()]
+        if not re.search(rf"^\s*{re.escape(var)}\s*\.\s*(?:close|hide)\s*\(", zone, re.M):
+            problems.append(f"{name}：sys.exit 之前没把 `{var}` close/hide 掉——窗口 wrapper 留到"
+                            "解释器收尾时才拆，那时 QApplication 已经先没了（退出 SIGSEGV）")
+        if not re.search(rf"^\s*{re.escape(var)}\s*=\s*None\s*$", zone, re.M):
+            problems.append(f"{name}：sys.exit 之前没把 `{var}` 置 None——引用还在，refcount 就不会"
+                            "当场拆掉 C++ 对象，上面那次 close 也不算收尾完成")
+    if judged == 0:
+        # 这一条本来写的是 `if files and judged == 0`：喂进来的源码是空的（扫描目录没读到东西）
+        # 就安静报绿。本轮反向对照当场抓到——一个文件都没读到比读到 191 个里全是无关文件更该响。
+        problems.append(f"第 21 条只读到 {len(files)} 份源码，一个 Qt 入口/主窗口都没判到：口径已经和交付链"
+                        "脱节（读 0 份＝扫描目录落空，读到的全不含 Qt＝判据追不上现实写法，"
+                        "两种都等于这条门从没跑过）")
+    return problems
+
+
+# ── 第 22 条：凭证与登录态不许进历史，也不许等着被下一次 add 扫进去 ─────────────
+# 由来（2026-11-14 本轮提交时自审抓到）：那一次是一句**常规**命令 `git add b2bcollect_build
+# riskbird_build`——不带 -A、不是危险命令、当时还专门为了"只加该加的文件"而列了目录名——
+# 索引里却当场多出 `_云展账号.json`（绑定手机号）、`acl/.acl_claim.json`（三个账号各自的
+# 32 位 session，键是手机号）、`acl/.acl_device.json`（设备指纹）、chromedriver 二进制和一个
+# 10 MB 的 zip。它们能被扫进来只因为一件事：**工具跑几天后会在包目录里自己写出这些文件**。
+# 靠人当场看出来不是防：历史里的凭证删不掉，只能作废重发，而 push 一次就永久公开。
+# 这条门判两件事，两件都不许安静通过：
+#  ①名单从代码里抽（`*_NAME = "xxx.json"` 那组常量），不在门里抄一遍文件名——抄一遍就会
+#    在某天改名时变成「门还在、名单已过期」那种假绿；改名后新写的名字自动进来，同时下面
+#    的 fail-closed 会因为抽不到任何东西而响。
+#  ②「被挡住」这件事问 git 自己的解析器（`check-ignore`），不在 Python 里重抄一遍 gitignore
+#    匹配。重抄就会分叉，而分叉的方向永远是「你以为挡住了」。
+STATE_NAME_RE = re.compile(r'^([A-Z][A-Z0-9_]*_NAME)\s*=\s*"([^"/\\]+\.json)"\s*$', re.M)
+# 名单从**被跟踪的源码**里抽，不维护一份文件清单：手写清单正是这条门要防的那种东西——
+# 今天新增一个模块、在里面声明一份新的状态文件，手写清单不会跟着长，门就安静地漏掉整类文件。
+STATE_SCAN_DIRS = ("b2bcollect_build/", "riskbird_build/", "ali1688_build/", ".github/scripts/")
+# 允许「是状态文件但不必被 ignore」的例外：必须写理由，且理由只能讲「这文件本来就应当入库」。
+# 空表是今天的实情；留这张表是为了让「这条门红得没道理」有一个正式出口，而不是逼人回去放宽
+# 正则或删判据（那样漏的就是整类文件）。
+STATE_NAME_EXEMPT = {}
+# 不来自常量、但同样会在开发机工作区里长出来的形状：Chrome/CDP 配置目录内部文件 + 驱动二进制。
+# 每一项 = (理由, 给 check-ignore 探的路径, 精确 basename, (basename 前缀, basename 后缀))
+DEFAULT_SHAPES = (
+    ("Chrome/CDP 配置目录里的登录态 Cookie 库", ("probe/Default/Cookies",),
+     ("Cookies",), ("", "")),
+    ("Chrome/CDP 配置目录里的账号登录数据", ("probe/Default/Login Data",),
+     ("Login Data",), ("", "")),
+    ("Chrome/CDP 配置目录里的浏览历史", ("probe/Default/History",),
+     ("History",), ("", "")),
+    ("内置 chromedriver 二进制（由 .github/scripts/fetch_chromedrivers.py 现取）",
+     ("probe/chromedriver", "chromedriver.exe"),
+     ("chromedriver", "chromedriver.exe"), ("", "")),
+    ("chromedriver 压缩包", ("probe/chromedriver.zip",), (), ("chromedriver", ".zip")),
+)
+
+
+def state_names_from_code(texts=None) -> dict:
+    """从代码常量里抽出「工具会写在目录里的 .json 状态文件名」：name -> 出处。"""
+    if texts is None:
+        index, _head = _tracked_sets()
+        texts = {}
+        for rel in sorted(index):
+            if not rel.endswith(".py") or not rel.startswith(STATE_SCAN_DIRS):
+                continue
+            p = ROOT / rel
+            if p.is_file():
+                texts[rel] = p.read_text(encoding="utf-8", errors="replace")
+    out = {}
+    for rel, text in texts.items():
+        for const, name in STATE_NAME_RE.findall(text):
+            out.setdefault(name, f"{rel}:{const}")
+    return out
+
+
+def _check_state_shape(problems, index, label, origin, probes, exact=(), pfx="", sfx=""):
+    """一个形状的两条判据：没被跟踪 + 被 git 挡住。两条各自报，不合并成一条。"""
+    hit = []
+    for path in index:
+        base = path.rsplit("/", 1)[-1]
+        if base in exact or (pfx and sfx and base.startswith(pfx) and base.endswith(sfx)):
+            hit.append(path)
+    if hit:
+        problems.append(f"{label} 已经被 git 跟踪（{', '.join(sorted(hit)[:3])}"
+                        f"{' 等' if len(hit) > 3 else ''}）：{origin}。历史里的凭证删不掉，"
+                        "只能 git rm --cached 之后重发；先确认这份内容的唯一归宿是 Secrets")
+    misses = []
+    for probe in probes:
+        rc, _out = _git("check-ignore", "--no-index", "-q", probe)
+        if rc == 0:
+            continue
+        if rc == 1:
+            misses.append(probe)
+        else:
+            problems.append(f"{label} 问不出结论：git check-ignore 对 {probe} 退出码 {rc}"
+                            f"（0=被忽略，1=没被忽略，其它=命令本身失败）：{origin}。"
+                            "读不到结论按不合格算，不按合格算")
+    if misses:
+        # 两个探法各报一条会刷成噪音（同一条规则漏了就是漏了），所以合起来说；报的
+        # 是**探的路径**而不是「建议加哪一行」：gitignore 能写对的形状有好几种，
+        # 门替人写死一行，遇到只想按目录拦的那一种就成了一条必须照抄的错误指示。
+        problems.append(f"{label} 没被 .gitignore 挡住（探的是 {'、'.join(misses)}）：{origin}。"
+                        "下一次 `git add <目录>` 就会把它扫进索引——工作区里已经有一份"
+                        "不等于挡住，判的是 add 那一刻 git 怎么说")
+
+
+def check_state_files_not_tracked(names=None, shapes=None) -> list:
+    """凭证/登录态/运行时状态那些文件：既不许已经在历史里，也不许等着被下一次 add 扫进去
+    （第 22 条）。"""
+    problems = []
+    if not in_work_tree():
+        return ["第 22 条读不到 git 工作区（不在 work tree 里）：这条门的两个判据都问的是 git，"
+                "问不到就不许报绿——「git 不在」和「文件没问题」在两句话里长得一样"]
+    names = state_names_from_code() if names is None else dict(names)
+    shapes = DEFAULT_SHAPES if shapes is None else tuple(shapes)
+    if not names:
+        problems.append("第 22 条一个状态文件名都没抽到：常量写法换了口径就会空转，"
+                        "空名单下的「全部合格」是假绿（见 STATE_NAME_RE 的说明）")
+    index, _head = _tracked_sets()
+    if not index:
+        problems.append(f"第 22 条从 git 只拿到 {len(index)} 个被跟踪文件：清单读空时下面两个"
+                        "判据全都「通过」，那种通过没有意义")
+    for name, origin in sorted(names.items()):
+        if name in STATE_NAME_EXEMPT:
+            continue
+        _check_state_shape(problems, index, name, origin, (name, f"a/b/{name}"),
+                           exact=(name,))
+    for why, probes, exact, (pfx, sfx) in shapes:
+        _check_state_shape(problems, index, probes[0].rsplit("/", 1)[-1], why,
+                           probes, exact, pfx, sfx)
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -3206,6 +3466,32 @@ def main(argv=None) -> int:
     else:
         print("✅ 解释器 stdin 独立：手写脚本里每一次独立起 python 都在管道右侧或自带 < /dev/null")
 
+    # 每个跑 Qt 事件循环的入口、每个造过主窗口的离线套件，都要赶在解释器之前把窗口交出去
+    # （第 21 条）：先定义的 QApplication 先析构，这条顺序不对就是退出 SIGSEGV。
+    qt_teardown = check_qt_shutdown_teardown()
+    if qt_teardown:
+        bad += 1
+        print("❌ Qt 退出顺序不合格（窗口没在 QApplication 之前交出去，关工具会弹系统崩溃报告；"
+              "离线套件的退出码还会随机 139，把全绿读成失败）：")
+        for p in qt_teardown:
+            print(f"   · {p}")
+            print(f"::error::Qt 退出顺序：{p}")
+    else:
+        print("✅ Qt 退出顺序：跑事件循环的入口都先接住返回值、再在 sys.exit 之前把主窗口交出去，"
+              "造过主窗口的离线套件也都带着同一条收尾")
+
+    # 凭证与登录态：既不许已经在历史里，也不许等着被下一次 `git add <目录>` 扫进来（第 22 条）。
+    state_gaps = check_state_files_not_tracked()
+    if state_gaps:
+        bad += 1
+        print("❌ 状态/凭证文件防护不合格（历史里的凭证删不掉，只能作废重发）：")
+        for p in state_gaps:
+            print(f"   · {p}")
+            print(f"::error::状态文件防护：{p}")
+    else:
+        print("✅ 状态文件防护：代码里声明的每份 .json 状态文件与 Chrome/驱动形状都没被跟踪，"
+              "且逐条问过 git「add 那一刻你会不会挡」")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -3235,6 +3521,8 @@ def main(argv=None) -> int:
           "入库路径在大小写不敏感文件系统上也不撞车、"
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
           "交付 zip 的门两侧都在链路上、"
+          "Qt 入口与离屏套件都按「窗口先于 QApplication」收尾、"
+          "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "注释里每一句指路节号都走得通")
     return 0
 

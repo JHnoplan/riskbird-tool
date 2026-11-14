@@ -715,6 +715,10 @@ def test_gui_defaults():
         assert label in html, f"看板缺「{label}」"
     ok("GUI 默认态：1688 不勾 / 企知道补采默认勾且风鸟爱企查默认不勾 / 三平台打开按钮与"
        "勾选框同源注册表 / 控件齐全 / 看板三路补采计数与 1688 一并渲染")
+    # 收尾趁 app 还活着把窗口交出去：不收尾的套件退出码会随机 139（全绿被批跑读成失败），
+    # 同一条纪律与成因见硬门第 21 条、test_site_enrich_offline.py 末尾那段。
+    w.hide()
+    w = None
 
 
 def main():

@@ -133,6 +133,24 @@
      三种放行，变量装的执行（`"$PY"`、`${PY}`）与隔了看门狗的（`timeout … "$PY"`）都要认，而
      引号文案、`command -v`/`which`、注释、赋值右值四种不许假红；workflow 的 bash 步刻意不判
      （Actions 自己关好 stdin），这一格边界用「单独喂就响」自证过滤本身在做事
+  AE. 关工具不许弹系统崩溃报告：Qt 退出顺序——硬门第 21 条。本机实测两件事同根：一路离线套件
+     打印完「全部通过」仍以 rc=139 收场（崩在汇总之后，批跑只看退出码，一条全绿就这样被读成失败），
+     以及四个生产工具入口的 `sys.exit(app.exec_())`——那句后面一个字都放不进去，主窗口只能留给
+     解释器拆，而 QApplication 比窗口先定义、按定义顺序清局部变量就是 app 先没。判的是销毁顺序，
+     跑起来才知道的事测不到，只能静态判；所以每一格都要证明「改真代码才响」：注释不算、弹窗的
+     `dlg.exec_()` 不算入口、`for` 循环收尾与 `w = w2 = None` 连赋不算、收尾写在 `sys.exit` 之后
+     不算；读 0 份源码与「一个入口都没判到」两种空转都必须响（反向对照当场抓到过一次 fail-open）。
+  AF. 凭证与登录态不许进历史：状态文件防护——硬门第 22 条。本轮提交前一句常规的
+     `git add b2bcollect_build riskbird_build`（不带 -A）就把 `_云展账号.json`（手机号）、
+     `acl/.acl_claim.json`（三个账号的 32 位 session）、`acl/.acl_device.json`（设备指纹）、
+     chromedriver 二进制与一个 10 MB 的 zip 全扫进了索引，靠人读一遍键名才拦下；而它们能被扫进来
+     只因为工具跑几天后会在包目录里自己写出这些文件。这类比「手滑提交密钥」更危险：触发条件是
+     日常操作，且历史里的凭证删不掉。两条判据各管一头：名单从 `*_NAME = "*.json"` 常量里抽
+     （手写清单会在改名那天变成「门还在、名单已过期」；注释里的声明不算，非 .json 的产出名不算，
+     免得把用户真正要保存的东西挡在提交外），「挡住没有」问 git 自己的 `check-ignore`（在 Python
+     里重抄一遍匹配就会分叉，而分叉的方向永远是「你以为挡住了」）。名单为空 / git 清单读空 /
+     不在 work tree / check-ignore 退出码既非 0 也非 1 四种都必须红；豁免要登记；最后一格在临时
+     目录里真 `git init` + 真 `git add` 复现当时的现场，没有 .gitignore 时三个名字各响两条
 
 为什么单独成套：本仓库其它离线测试都在**源码态**跑，而这一轮外部机器全员精简版
 的根因恰恰是「源码态通、打包态不通」——开发机恰好能从本机 iOS 工程读到密钥，
@@ -7580,6 +7598,376 @@ def test_curl_bounds_gate():
             "边界要能自证：workflow 侧不是「没有 python 调用」，而是被默认口径过滤掉了")
 
 
+def test_qt_shutdown_teardown_gate():
+    print("\n═══ AE. 关工具不许弹系统崩溃报告：Qt 退出顺序（第 21 条硬门）═══")
+    # 由来（2026-11-14 本机自审抓到，同一个根的两条形状）：
+    # ① test_site_enrich_offline.py 打印完「全部通过 ✅ (127/127)」仍以 rc=139 收场，12 次里崩 1 次，
+    #    而且崩在汇总**之后**。批跑只看退出码，一条全绿的套件就这样被读成一次失败；
+    # ② 同一形状写在四个生产工具的入口上：`sys.exit(app.exec_())`——那句后面一个字都放不进去，
+    #    主窗口只能留给解释器拆。app 比窗口**先**定义，解释器拆帧按定义顺序清局部变量，于是
+    #    QApplication 先析构、窗口 wrapper 后析构，PyQt 拆剩下那些 wrapper 撞上的是一具已经随
+    #    app 没掉的 C++ 对象。用户侧的表现是「关掉工具弹一次系统崩溃报告」，顺带 closeEvent 里
+    #    最后一次自动保存可能根本没跑。
+    # 这条门判的是**销毁顺序**，跑起来才知道的事测不到（崩不崩取决于 GC 时机），只能静态判；
+    # 而静态判据最容易红在文案上，所以下面每一格都要证明「改真代码才响」：注释不算、弹窗不算、
+    # 循环写法与连着赋不算、喂进来的源码读不到时不许安静报绿。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    def _src(*lines: str) -> str:
+        return "\n".join(lines) + "\n"
+
+    def _one(text: str, name: str = "ae_entry.py") -> list:
+        return gate.check_qt_shutdown_teardown({name: text})
+
+    # ── 1) 接线：判据在、被 main() 调用、结果进退出码、云端留下 annotation ──
+    for fn in ("check_qt_shutdown_teardown", "_qt_code_lines", "_qt_build_py_files", "_qt_exec_res"):
+        _assert(callable(getattr(gate, fn, None)),
+                f"硬门模块里有 {fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("qt_teardown = check_qt_shutdown_teardown()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 21 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::Qt 退出顺序" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「窗口没在 app 之前交出去」，不是「关工具会崩」")
+
+    # ── 2) 今天的真仓库：五个入口 + 所有造过主窗口的套件都在判据里，而且全绿 ──
+    _assert_eq(gate.check_qt_shutdown_teardown(), [],
+               "第 21 条：跑事件循环的入口都先接住返回值再收尾，造过主窗口的套件都带着同一条收尾")
+    _files = gate._qt_build_py_files()
+    _assert(len(_files) >= 100,
+            f"扫描范围按目录发现（*_build/*.py）：今天 {len(_files)} 份——以后多一个工具不必登记，"
+            f"它自动在判据里")
+
+    # ── 3) 入口那一路：形态只认「先接住返回值，再在 sys.exit 之前收尾」──
+    _HEAD = _src("import sys", "from PyQt5.QtWidgets import QApplication",
+                 "from tool_gui import MainWindow", "")
+    _ENTRY_OK = _HEAD + _src(
+        "app = QApplication(sys.argv)", "window = MainWindow()", "window.show()",
+        "rc = app.exec_()", "try:", "    if window.isVisible():", "        window.close()",
+        "except Exception:", "    pass", "window = None", "sys.exit(rc)")
+    _assert_eq(_one(_ENTRY_OK), [], "放行：先接住返回值，close 与置 None 都落在 sys.exit 之前")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                             "window.show()", "sys.exit(app.exec_())"))
+    _assert_eq(len(_got), 1, f"反向对照：`sys.exit(app.exec_())` 一律红（实际={_got}）")
+    _assert("把返回值直接吞了" in _got[0],
+            f"响的要是那一句本身，别的形态（没收尾）不该混在这一格（实际={_got[0]}）")
+    # 同一种坏写法换一种建 app 的句式也必须响，而且响在同一句结论上：b2bcollect_gui.py 一份文件里
+    # 两种句式都在用，只认 `QApplication(` 开头的会让它掉进「套件」那一路——报的错与实际要改的行不符。
+    _got = _one(_HEAD + _src("app = QApplication.instance() or QApplication(sys.argv)",
+                             "window = MainWindow()", "window.show()", "sys.exit(app.exec_())"))
+    _assert_eq(len(_got), 1, f"反向对照：`.instance() or` 那种建法同样是入口（实际={_got}）")
+    _assert("把返回值直接吞了" in _got[0],
+            f"结论必须是入口那一条，不是「补个 hide 就行」（实际={_got[0]}）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                             "app.exec_()", "sys.exit(0)"))
+    _assert_eq(len(_got), 1, f"反向对照：不先接住返回值，收尾就没有落脚的地方（实际={_got}）")
+    _assert("先接住返回值" in _got[0], f"要教的是那句写法本身（实际={_got[0]}）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                             "rc = app.exec_()", "sys.exit(rc)"))
+    _assert_eq(len(_got), 2, f"反向对照：close 与置 None 是两条各判各的（实际={_got}）")
+    _assert(any("close/hide" in x for x in _got) and any("置 None" in x for x in _got),
+            f"两条都要点名，缺一行人只会照着其中一条改（实际={_got}）")
+    _assert_eq(len(_one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                                     "rc = app.exec_()", "window.close()", "sys.exit(rc)"))), 1,
+               "只缺置 None 时只响一条：引用还在，refcount 不当场拆 C++ 对象，那次 close 不算收尾")
+    _assert_eq(len(_one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                                     "rc = app.exec_()", "window = None", "sys.exit(rc)"))), 1,
+               "只缺 close/hide 时也只响一条：对象还在树上，置 None 也拆不动它")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                             "rc = app.exec_()", "sys.exit(rc)", "window.close()", "window = None"))
+    _assert_eq(len(_got), 2,
+               f"反向对照：收尾写在 sys.exit **之后**等于没写——那句已经不会再执行了（实际={_got}）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "rc = app.exec_()",
+                             "window = None", "sys.exit(rc)"))
+    _assert_eq(len(_got), 1, f"反向对照：跑着循环却认不出主窗口变量也要响，不许安静跳过（实际={_got}）")
+    _assert("认不出主窗口变量" in _got[0],
+            f"结论要写清「要么写清楚，要么连判据一起改」，安静跳过才是这条门最坏的形状（实际={_got[0]}）")
+
+    # ── 4) 注释与文案不构成判据（这条门最容易红在自己写的说明上）──
+    _assert_eq(_one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                                 "rc = app.exec_()",
+                                 "# 以前这里是 sys.exit(app.exec_())，现在先接住返回值再收尾",
+                                 "window.close()", "window = None", "sys.exit(rc)")), [],
+               "放行：注释里那句旧写法不是现场代码（门读注释＝门在判文案，本轮第一版就红在这里）")
+    _assert_eq(_one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                                 "rc = app.exec_()", "window.close()  # 趁 app 还活着",
+                                 "window = None  # 交出去", "sys.exit(rc)")), [],
+               "放行：行尾注释不该把收尾读没（拆代码时要连着尾注释一起剥）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "window = MainWindow()",
+                             "rc = app.exec_()", "# window.close()", "# window = None",
+                             "sys.exit(rc)"))
+    _assert_eq(len(_got), 2, f"反向对照：只把两行注释掉不算收尾（实际={_got}）")
+
+    # ── 5) 弹窗不是入口循环：套件里 dlg.exec_() / QMessageBox.exec_ 到处都是 ──
+    _BOUND = _HEAD + _src(
+        "def _ask(text):", "    dlg = QMessageBox()", "    n = dlg.exec_()", "    return text",
+        "", "app = QApplication(sys.argv)", "window = MainWindow()", "window.show()",
+        '_ask("确认吗")', "rc = app.exec_()", "window.close()", "window = None", "sys.exit(rc)")
+    _assert_eq(_one(_BOUND), [],
+               "放行：`n = dlg.exec_()` 那行不是入口——旧口径按「任意 x = y.exec_()」取第一处，"
+               "于是主窗口去弹窗上方找，找不到就报「判据范围没覆盖到」，是一条彻头彻尾的假红")
+    _assert(len([x for x in _one(_BOUND) if "范围没覆盖" in x]) == 0,
+            "同上一条的直白版：这份夹具绝不能报「范围没覆盖到」")
+    _assert_eq(_one(_HEAD + _src("app = QApplication.instance() or QApplication(sys.argv)",
+                                 "w = MainWindow()", "n = QMessageBox.exec_", "w.hide()",
+                                 "w = None")), [],
+               "放行：套件里出现 exec_ 字样但**不是它自己那个 app**，仍按套件一路判收尾")
+
+    # ── 6) 套件那一路（不进 exec_）：hide/close + 单独置 None 才算交出窗口 ──
+    _SUITE_OK = _HEAD + _src(
+        "app = QApplication.instance() or QApplication(sys.argv)", "w = MainWindow()",
+        "check('窗口建得出', w is not None)", "w.hide()", "w = None", "app.processEvents()")
+    _assert_eq(_one(_SUITE_OK, "ae_suite.py"), [], "放行：套件按生产同一条口径收尾")
+    _got = _one(_HEAD + _src("app = QApplication.instance() or QApplication(sys.argv)",
+                             "w = MainWindow()", "check('窗口建得出', w is not None)"),
+                "ae_suite.py")
+    _assert_eq(len(_got), 1, f"反向对照：不收尾的套件退出码会随机 139（实际={_got}）")
+    _assert("`w = MainWindow(`" in _got[0], f"要报出是哪个变量（实际={_got[0]}）")
+    _assert_eq(len(_one(_HEAD + _src("app = QApplication(sys.argv)", "w = MainWindow()",
+                                     "w2 = MainWindow()", "w.hide()", "w = None"), "ae_suite.py")), 1,
+               "两个窗口只收一个：响的还是没收那一个，别把已收尾的也报进去")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "w = MainWindow()",
+                             "w2 = MainWindow()", "w.hide()", "w = None"), "ae_suite.py")
+    _assert("`w2 = MainWindow(`" in _got[0], f"点名的必须是 w2（实际={_got[0]}）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "w = MainWindow()", "w2 = MainWindow()",
+                             "for _x in (w, w2):", "    _x.hide()", "w = None", "w2 = None"),
+                "ae_suite.py")
+    _assert_eq(len(_got), 2,
+               f"反向对照：绕成 for 循环收尾，门认不出来（本轮实测撞上过）。这条口径**故意**严："
+               f"让门去猜循环目标，就要再猜元组、列表、生成器、别的函数；写两行比猜便宜（实际={_got}）")
+    _got = _one(_HEAD + _src("app = QApplication(sys.argv)", "w = MainWindow()", "w.hide()",
+                             "w = w2 = None"), "ae_suite.py")
+    _assert_eq(len(_got), 1,
+               f"反向对照：`w = w2 = None` 连着赋同样不算——判的是这个变量自己有没有被单独置 None"
+               f"（本轮实测也撞上过）（实际={_got}）")
+    _got = _one(_src("from m import MainWindow", "", "w = MainWindow()", "w.show()"),
+                "ae_nohelper.py")
+    _assert_eq(len(_got), 1,
+               f"没有 QApplication 也照判收尾：套件常从隔壁模块拿到 app，认不出 app 不等于窗口"
+               f"就交给了解释器（实际={_got}）")
+
+    # ── 7) 门自己不许 fail-open：读不到源码时不能报绿（本轮反向对照抓到的真缺陷）──
+    _got = gate.check_qt_shutdown_teardown({})
+    _assert_eq(len(_got), 1, f"反向对照：喂进来的源码是空的，必须响（实际={_got}）")
+    _assert("0 份源码" in _got[0], f"响的要还是「没读到」（实际={_got[0]}）")
+    _got = gate.check_qt_shutdown_teardown({"ae_plain.py": "print(1)\n"})
+    _assert_eq(len(_got), 1, f"反向对照：读到了源码但一个 Qt 形状都没判到，同样响（实际={_got}）")
+    _assert("一个 Qt 入口/主窗口都没判到" in _got[0], f"（实际={_got[0]}）")
+    _empty = Path(tempfile.mkdtemp(prefix="qt_gate_empty_root_"))
+    with _patch(gate, "ROOT", _empty):
+        _got = gate.check_qt_shutdown_teardown()
+    _assert_eq(len(_got), 1,
+               f"反向对照：扫描目录落空（默认口径全靠 *_build 那几个目录）时要响（实际={_got}）")
+
+    # ── 8) 逐份证明「真仓库里那几份确实在门里跑」：把两行各摘一次，当场要响 ──
+    # 钉调用点总数会在交付链加减时假红，量「这一份被摘掉关键行后响不响」才说明这一格真读到了它。
+    _by_name = {}
+    for _p, _t in _files.items():
+        _by_name.setdefault(_p.name, _t)
+    _none_re = re.compile(r"^\s*\w+\s*=\s*None\s*$", re.M)
+    _tear_re = re.compile(r"^\s*\w+\s*\.\s*(?:close|hide)\s*\(\)\s*$", re.M)
+    _watch = ("b2bcollect_gui.py", "riskbird_gui.py", "ali1688_gui.py", "phone_verifier_gui.py",
+              "wechat_helper_gui.py", "test_keyword_resume_offline.py",
+              "test_site_enrich_offline.py", "test_waterfall_leads_offline.py",
+              "test_integration_offline.py", "test_gui.py", "gen_guide_images.py",
+              "debug_dual_open_check.py")
+    for _n in _watch:
+        _assert(_n in _by_name, f"{_n} 在门视野里（按目录发现，挪目录或改名要在这里响，不许靠登记表）")
+        _t = _by_name[_n]
+        _assert(_tear_re.search(_t) is not None and _none_re.search(_t) is not None,
+                f"{_n} 今天就带着那两行——摘得到，才谈得上证明它真被读到")
+        _got = _one(_none_re.sub("", _t), _n)
+        _assert(len(_got) >= 1, f"摘掉「置 None」那行，{_n} 当场响（实际={_got[:1]}）")
+        _got = _one(_tear_re.sub("", _t), _n)
+        _assert(len(_got) >= 1, f"摘掉 close/hide 那行，{_n} 当场响（实际={_got[:1]}）")
+    # 反方向的自证：把某一份从输入里拿掉，别的影响不到它——说明报的每一条都归得到具体文件
+    _without = {p: t for p, t in _files.items() if p.name != "riskbird_gui.py"}
+    _assert_eq(gate.check_qt_shutdown_teardown(_without), [],
+               "摘掉一份真文件不会让别人变红：归属是干净的（一份一条，不是一锅糊结论）")
+    _withbad = dict(_without)
+    _withbad[_REPO / "riskbird_build" / "zz_bad_entry.py"] = _HEAD + _src(
+        "app = QApplication(sys.argv)", "window = MainWindow()", "sys.exit(app.exec_())")
+    _got = gate.check_qt_shutdown_teardown(_withbad)
+    _assert_eq(len(_got), 1, f"喂一份坏的进去，只响那一份（实际={_got}）")
+    _assert("zz_bad_entry.py" in _got[0], f"结论要带上文件名，否则批跑里没人知道改哪（实际={_got[0]}）")
+
+
+def test_state_file_protection_gate():
+    print("\n═══ AF. 凭证与登录态不许进历史：状态文件防护（第 22 条硬门）═══")
+    # 由来（2026-11-14 本轮提交时自审抓到）：一句**常规**命令 `git add b2bcollect_build
+    # riskbird_build`——不带 -A、不是危险命令、当时还专门为了「只加该加的文件」而列出目录名——
+    # 索引里当场多出 `_云展账号.json`（绑定手机号）、`acl/.acl_claim.json`（三个账号各自的
+    # 32 位 session，键就是手机号）、`acl/.acl_device.json`（设备指纹）、chromedriver 二进制
+    # 和一个 10 MB 的 zip。拦下它的不是我眼尖，是我在提交前把那几行读了一遍键名；而它们能被
+    # 扫进来只因为一件事：工具跑几天后会在包目录里**自己写出**这些文件。
+    # 这一类比「有人手滑提交了密钥」更危险，因为前者的触发条件是日常操作，后者需要人刻意犯错；
+    # 而且历史里的凭证删不掉——push 一次就永久公开，只能作废重发。
+    # 所以这条门的两个判据都不许安静通过：①名单从代码常量里抽（抄一份文件名就会在某天改名时
+    # 变成「门还在、名单已过期」）；②「挡住没有」问 git 自己的 check-ignore，不在 Python 里
+    # 重抄一遍 gitignore 匹配——重抄就分叉，而分叉的方向永远是「你以为挡住了」。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 0) 夹具用的合成口径：把「git 眼里被跟踪的文件」换成给定清单 ──
+    @contextlib.contextmanager
+    def _fake_index(paths):
+        """两条判据里只有这一条的输入能合成（另一条问的是 git 的 ignore 解析）。
+
+        真仓库那一格（下面第 8 节）验的是另一件事——把 .gitignore 拿走之后 git 怎么说。
+        """
+        _old = gate._tracked_sets
+        gate._tracked_sets = lambda: (set(paths), set(paths))
+        try:
+            yield
+        finally:
+            gate._tracked_sets = _old
+
+    # ── 1) 接线：函数在、main 真调、调了要进退出码、云端 annotation 能照做 ──
+    for _fn in ("state_names_from_code", "check_state_files_not_tracked", "_check_state_shape"):
+        _assert(callable(getattr(gate, _fn, None)), f"门模块里有 {_fn}（能被单独喂夹具）")
+    _at = gate_src.find("state_gaps = check_state_files_not_tracked()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 22 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "第 22 条报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::状态文件防护" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「状态文件没被挡住」而不是「git 报错」")
+
+    # ── 2) 真仓库全绿，而且绿得有内容：名单确实是从代码里抽出来的 ──
+    _names = gate.state_names_from_code()
+    _assert_eq(gate.check_state_files_not_tracked(), [],
+               "第 22 条：今天的仓库既没有凭证被跟踪，也没有凭证形状漏出 .gitignore")
+    _want = {"config.json", ".acl_cache.json", ".acl_device.json", ".acl_claim.json",
+             "_云展账号.json", "_采集任务索引.json", "采集进度.json", "mapping_history.json",
+             "deepseek_cache.json"}
+    _assert(_want <= set(_names),
+            f"凭证/登录态/状态文件一个都不许漏出名单（漏了就是那一类文件永远没人判）"
+            f"（实际缺 {sorted(_want - set(_names))}）")
+    _assert(all(v.rsplit(":", 1)[-1].endswith("_NAME") for v in _names.values()),
+            f"每条名单都要报得出是哪个常量给的（实际={_names}）")
+
+    # ── 3) 派生口径的正反：改名自动跟、注释不算、非 .json 不算（别把用户数据拦掉） ──
+    _got = gate.state_names_from_code({"m.py": 'NEW_STATE_NAME = "zz_af_new.json"\n'})
+    _assert_eq(_got, {"zz_af_new.json": "m.py:NEW_STATE_NAME"},
+               "反向对照：今天新声明一份状态文件，名单当场就带上它（手写清单才会漏）")
+    _assert("zz_af_new.json" not in gate.state_names_from_code(),
+            "合成常量不落到真名单里（夹具只喂那一份文本）")
+    _assert_eq(gate.state_names_from_code(
+                   {"m.py": '# OLD_STATE_NAME = "zz_af_comment.json"\n'
+                            '    # INDENT_STATE_NAME = "zz_af_indent.json"\n'}), {},
+               "放行：注释里的常量声明不算——门读代码不读文案（与第 21 条同一条口径）")
+    _assert_eq(gate.state_names_from_code(
+                   {"m.py": 'RAW_FILE_NAME = "企业数据_原始.xlsx"\n'
+                            'DIR_NAME = "zz_af_dir"\n'
+                            'NESTED_NAME = "sub/zz_af_nested.json"\n'}), {},
+               "放行：非 .json 的产出名（采集到的数据、目录名）不进名单——这条门不许把用户"
+               "真正要保存的东西挡在提交外面")
+
+    # ── 4) 「挡住没有」问的是 git：同一条形状的正反差分 ──
+    _assert_eq(gate.check_state_files_not_tracked({".acl_claim.json": "夹具"}), [],
+               "放行：真被 .gitignore 挡住的名字，喂进夹具也不该响（挡住是 git 说的，不是我们说的）")
+    _got = gate.check_state_files_not_tracked({"zz_af_not_ignored.json": "夹具"})
+    _assert_eq(len(_got), 1,
+               f"反向对照：没被挡住的名字必须响；两个探法（根目录与嵌套）合起来只报一条，"
+               f"同一条规则漏了报两遍是噪音（实际={_got}）")
+    _assert("没被 .gitignore 挡住" in _got[0] and "、" in _got[0],
+            f"要说清是「没挡住」并把两个探法都列出来（实际={_got[0]}）")
+    _assert("a/b/zz_af_not_ignored.json" in _got[0],
+            f"嵌套那一路也要探：只在根上写一条规则的 ignore 挡不住包目录里生成的文件"
+            f"（实际={_got[0]}）")
+
+    # ── 5) 已经在历史里的那种红：另一条判据，形状不同、处置也不同 ──
+    with _fake_index({"b2bcollect_build/acl/.acl_claim.json", "b2bcollect_build/_云展账号.json"}):
+        _got = gate.check_state_files_not_tracked({".acl_claim.json": "夹具",
+                                                    "_云展账号.json": "夹具"})
+    _assert_eq(len(_got), 2, f"反向对照：被跟踪的凭证逐条点名（实际={_got}）")
+    _assert(all("已经被 git 跟踪" in p for p in _got),
+            f"结论要是「已跟踪」而不是「没挡住」——两者处置完全不同：前者要 rm --cached 并重发"
+            f"凭证，后者只要补一行 ignore（实际={_got[0]}）")
+    _assert("acl/.acl_claim.json" in _got[0], f"要把真实路径写出来，人才知道删哪（实际={_got[0]}）")
+
+    # ── 6) fail-closed：三种「读不到」都不许被读成「没问题」 ──
+    _got = gate.check_state_files_not_tracked({})
+    _assert(any("一个状态文件名都没抽到" in p for p in _got),
+            f"反向对照：名单为空时不许报绿——常量写法一换，空名单下的「全部合格」就是假绿"
+            f"（实际={_got}）")
+    with _fake_index(set()):
+        _got = gate.check_state_files_not_tracked({".acl_claim.json": "夹具"})
+    _assert(any("只拿到 0 个被跟踪文件" in p for p in _got),
+            f"反向对照：git 清单读空时「没被跟踪」这条自动成立，那种绿没有意义（实际={_got}）")
+    with _patch(gate, "in_work_tree", lambda: False):
+        _got = gate.check_state_files_not_tracked()
+    _assert_eq(len(_got), 1, f"反向对照：不在 work tree 里就直接收，两个判据都问不到（实际={_got}）")
+    _real_git = gate._git
+
+    def _git_blind_checkignore(*args):
+        # 只把 check-ignore 问不出结论这一条模拟出来：整扇 _git 一起打回 128 的话，
+        # in_work_tree() 先失败，门会在上一格就直接收——那一格已经验过了，这一格验不到
+        # 「退出码既非 0 也非 1 时按红算」这句本身（本轮实测红在这一句上）。
+        return (128, "") if "check-ignore" in args else _real_git(*args)
+
+    with _patch(gate, "_git", _git_blind_checkignore):
+        _got = gate.check_state_files_not_tracked({".acl_claim.json": "夹具"})
+    _assert(any("问不出结论" in p and "按不合格算" in p for p in _got),
+            f"反向对照：check-ignore 退出码既不是 0 也不是 1 时按红算（实际={_got}）")
+    # 一个名字两个探法（根目录 + 嵌套），形状那些各自按 DEFAULT_SHAPES 里登记的探法数
+    _probe_count = sum(len(s[1]) for s in gate.DEFAULT_SHAPES) + 2
+    _assert(sum(1 for p in _got if "问不出结论" in p) == _probe_count,
+            f"每一个探法都要各自报一次「问不出」，不许合并成一句「git 有问题」"
+            f"（期望 {_probe_count} 条，实际 {len(_got)} 条：{_got}）")
+    _assert(gate._git is _real_git, "补丁收回：漏收会把后面所有用例的 git 都问成 128")
+
+    # ── 7) 豁免要登记：「我觉得这份不用判」不构成豁免 ──
+    with _patch(gate, "STATE_NAME_EXEMPT", {"zz_af_not_ignored.json": "夹具：本来就应当入库"}):
+        _assert_eq(gate.check_state_files_not_tracked({"zz_af_not_ignored.json": "夹具"}), [],
+                   "写进豁免表才算豁免")
+    _assert(bool(gate.STATE_NAME_EXEMPT) is False, "今天没有任何豁免：任何一条都是当场加上去的")
+
+    # ── 8) 摘掉 .gitignore 必须响：在临时目录里建一个**真** git 仓库复现当时的现场 ──
+    # 前七格问的都是函数逻辑；这一格问的是「把那份 .gitignore 从这台机器上拿走，门还判得
+    # 出来吗」。用真 `git init` + 真 `git add`，判据走的就是 git 自己的两条命令——也就是说，
+    # 这一格重演的正是 2026-11-14 那句差点被提交的 `git add b2bcollect_build`。
+    _bare = Path(tempfile.mkdtemp(prefix="state_gate_no_ignore_"))
+    _saved_index, _saved_head = dict(gate._INDEX), dict(gate._HEAD)
+    try:
+        with _patch(gate, "ROOT", _bare):
+            _assert(subprocess.run(["git", "init", "--quiet"], cwd=str(_bare),
+                                   capture_output=True).returncode == 0, "夹具仓库建得起来")
+            (_bare / "b2bcollect_build" / "acl").mkdir(parents=True)
+            for _f, _c in ((".acl_claim.json", '{"13800000000":{"session":"夹具不是真号"}}'),
+                           ("_云展账号.json", '{"phone":"13800000000"}'),
+                           ("acl/.acl_device.json", '{"device_id":"夹具"}')):
+                (_bare / "b2bcollect_build" / _f).write_text(_c, encoding="utf-8")
+            _assert(subprocess.run(["git", "add", "b2bcollect_build"], cwd=str(_bare),
+                                   capture_output=True).returncode == 0, "夹具 add 得动")
+            gate._INDEX.clear()
+            gate._HEAD.clear()
+            _three = {".acl_claim.json": "夹具", "_云展账号.json": "夹具",
+                      ".acl_device.json": "夹具"}
+            _got = gate.check_state_files_not_tracked(_three)
+        # 期望值从门自己登记的两组数据算出来，不写死数字：写死了就等于在钉「今天有几条
+        # 形状」，将来加一类（比如新的登录态文件）时这一格会假红，而假红的代价是回来把
+        # 期望值改大——那正好教会人跳过这一步。
+        _n_names, _n_shapes = len(_three), len(gate.DEFAULT_SHAPES)
+        _assert_eq(len(_got), _n_names + (_n_names + _n_shapes),
+                   f"反向对照：没有 .gitignore 时，三个名字各响两条（「已经被跟踪」+「没被挡住」），"
+                   f"另外 {_n_shapes} 类形状各响一条「没被挡住」——它们本来也是同一条 ignore "
+                   f"挡住的（实际 {len(_got)} 条）")
+        _assert(sum(1 for p in _got if "没被 .gitignore 挡住" in p) == _n_names + _n_shapes,
+                f"「没挡住」要一条不少：名字与形状两侧都归这条门管（实际={_got}）")
+        _assert(sum(1 for p in _got if "已经被 git 跟踪" in p) == _n_names,
+                f"「已跟踪」三条一条不许少：当时真就差一步进历史（实际={_got}）")
+        _assert(not any("只拿到 0 个" in p for p in _got),
+                f"夹具仓库里确实有被跟踪的文件，fail-closed 那条不该被触发（实际={_got}）")
+    finally:
+        gate._INDEX.clear()
+        gate._INDEX.update(_saved_index)
+        gate._HEAD.clear()
+        gate._HEAD.update(_saved_head)
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -7598,6 +7986,8 @@ SECTIONS = (
     test_pip_source_resilience_gate,
     test_section_pointer_gate,
     test_curl_bounds_gate,
+    test_qt_shutdown_teardown_gate,
+    test_state_file_protection_gate,
 )
 
 

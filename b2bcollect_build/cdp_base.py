@@ -41,6 +41,9 @@ import tool_config as _tc
 # 一个模块里）。这里引进来只是为了让 _base_rec 给出「官网回采」列的初始空值——列必须
 # 在记录诞生时就存在，否则回采写进去的行和没回采的行表结构不一致，导出会错列。
 import website_contact
+# 命中层级/证据的列名与口径单一来源（同样只依赖标准库，无环）：列名在记录骨架、
+# 原始表表头、清洗字段注册表三处都只许从这一份取。
+import field_evidence
 
 try:
     import websocket  # websocket-client
@@ -2528,6 +2531,13 @@ return '';})()"""
             # 「值写进正式列、来源另有账」是一条纪律——没有这一列，合并进来的号码就
             # 和站方给的号码长得一模一样，事后无法复核是哪来的。
             website_contact.SITE_MARK: "",
+            # 命中层级/证据：瀑布补全与线索评分都只读这两列，任何一处自己再判一遍
+            # 「这个号可信吗」就是第二份判据（列名同样取自单一来源，见 field_evidence）。
+            field_evidence.EVIDENCE_COL: "",
+            field_evidence.PROOF_COL: "",
+            # 最后核验时间：到期重验（功能 I）的唯一依据。它和「采集时间」必须分家——
+            # 重验到同一个号时只有这一列会刷新，采集时间却是「新采一行」才动的语义。
+            field_evidence.VERIFIED_COL: "",
         }
 
     # ── 控制 ───────────────────────────────────────────────────
@@ -2576,7 +2586,9 @@ return '';})()"""
     # 回采实现侧必须是同一个字符串常量，写三份迟早各叫各的（回采写进去的值就会掉出表外）。
     EXPORT_HEADERS = ["序号", "关键词", "公司名称", "联系人", "岗位", "电话", "手机", "邮箱",
                       "地址", "主营产品", "经营模式", "所在区域", "公司网址", "详情URL", "memberId",
-                      "数据来源", "采集时间", "状态", website_contact.SITE_MARK]
+                      "数据来源", "采集时间", "状态", website_contact.SITE_MARK,
+                      field_evidence.EVIDENCE_COL, field_evidence.PROOF_COL,
+                      field_evidence.VERIFIED_COL]
 
     def export_excel(self, output_path, rows=None):
         rows = self.snapshot_results() if rows is None else rows
@@ -2624,6 +2636,14 @@ return '';})()"""
             "数据来源": r.get("数据来源") or self.PLATFORM_NAME,
             "状态": "" if status == "成功" else status,
             "备注": remark,
+            # 层级与证据在这里**原样带过去**（独立键，不塞备注：历史教训是主营/区域塞进
+            # 「备注」被跨站首个非空整条盖掉）。要说清一句免得后人误会：清洗合并只认
+            # SOURCE_FIELDS 登记过的键，而这两列**刻意没登记**——线索分层报表与到期重验
+            # 读的都是原始记录（逐字段层级在那一层是精确的），合并后反而会说谎
+            # （电话取并集、层级却只有第一行的）。真要让清洗表也带层级，得先把
+            # merge_records 的层级语义改成逐字段合并，再同步三处 SOURCE_FIELDS。
+            field_evidence.EVIDENCE_COL: r.get(field_evidence.EVIDENCE_COL) or "",
+            field_evidence.PROOF_COL: r.get(field_evidence.PROOF_COL) or "",
         }
 
     @staticmethod

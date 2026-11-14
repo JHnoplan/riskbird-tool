@@ -534,4 +534,18 @@ w2.session.reset_results()
 check("「开始新任务」后不再有上一任务的跳过位",
       w2.session._kw_ledger == {} and w2.session.crawlers["b2b168"].resume is False)
 
+# ── 收尾：趁 QApplication 还活着把两个窗口都拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
+# 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器
+# 自己拆 Qt 对象会撞上退出 SIGSEGV」（线上实测抓到过栈）。不收尾时退出码会随机 139，且崩在
+# 打印汇总**之后**——批跑只看退出码，全绿也会被判成一次失败。
+# 走 hide() 而不是 close()：close 会进生产 closeEvent（等线程、弹确认框），本套件测的不是
+# 退出那条路；hide 之后把引用清掉，refcount 当场让 sip 删掉 C++ 对象，此时 app 仍在。
+# 两个窗口分开写、不用 for 循环收、也不用 `w = w2 = None` 连着赋：硬门第 21 条判的是「这个
+# 变量自己有没有被 hide/close 且单独置 None」，绕成循环或连赋它认不出来——写清楚比让门去猜可靠。
+w.hide()
+w2.hide()
+w = None
+w2 = None
+app.processEvents()
+
 print(f"\n全部通过：{ok} 项断言")
