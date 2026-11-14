@@ -721,6 +721,35 @@ def test_gui_defaults():
     w = None
 
 
+# ── 6.9 状态行读数保真：线程崩了不许永远报「推进中」 ────────────
+def test_site_status_truthful():
+    from parallel_session import ParallelSession
+
+    class FakeThread:
+        def __init__(self, alive): self._a = alive
+        def is_alive(self): return self._a
+
+    s = ParallelSession(enabled=["mic", "b2b168"])
+    st = s.site_status()
+    check = lambda c, m: (_ for _ in ()).throw(AssertionError(m)) if not c else None
+    # ① 空闲（从未起过线程）：维持 running 口径，纯名单轮不许把关键词站谎报成终态
+    check(st["mic"] == "running" and st["b2b168"] == "running", f"空闲应全 running: {st}")
+    # ② 线程活着：running
+    s._threads["mic"] = FakeThread(True)
+    check(s.site_status()["mic"] == "running", "活线程必须 running")
+    # ③ 线程已死且没发 finished（崩溃/异常终止）：不许永远假装在跑
+    s._threads["b2b168"] = FakeThread(False)
+    st3 = s.site_status()
+    check(st3["b2b168"] == "stopped", f"崩掉的线程应报 stopped: {st3}")
+    check(st3["mic"] == "running", f"活线程不受影响: {st3}")
+    # ④ 干净跑完（finished 落进 _done_sites）：仍是 done/stopped 老口径，回归不被扩大
+    s._done_sites.add("b2b168")
+    check(s.site_status()["b2b168"] == "done", "done 集合优先，正常收尾口径不变")
+    s.crawlers["b2b168"]._stop_requested = True
+    check(s.site_status()["b2b168"] == "stopped", "_done_sites+停止位 → stopped")
+    ok("状态行读数：崩溃线程改报 stopped（不再永远「推进中」），空闲/纯名单轮口径不变")
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="b2b_offline_") as tmp:
         test_site_topology()
@@ -738,6 +767,7 @@ def main():
         test_two_new_sites()
         test_pure_http_tab_gate()
         test_gongchang_site()
+        test_site_status_truthful()
         test_gui_defaults()
     print(f"\n全部通过：{len(PASS)} 组断言")
 

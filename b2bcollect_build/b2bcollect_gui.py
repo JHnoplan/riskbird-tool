@@ -531,6 +531,11 @@ def task_row_view(t, exists, done_n=0, current_id=""):
         badge, tone = "■ 上次暂停了", "pause"
     elif status == "已停止":
         badge, tone = "■ 上次手动停了", "pause"
+    elif status == "已中断":
+        badge, tone = "● 上次没跑完（进程被终止）", "run"
+        why = ("上次这条任务还在采，工具进程就先没了（被强杀、崩溃或关机），"
+               "所以来不及写结束状态。已采的数据都还在原来的文件夹里，"
+               "选中这条点「接着采这一条」会从断掉的关键词继续。")
     elif status == "采集中":
         badge, tone = "● 上次没跑完", "run"
     else:
@@ -2406,6 +2411,7 @@ class MainWindow(QMainWindow):
         self._refresh_yzd_status()
         # 自动保存双触发：①每满 AUTOSAVE_EVERY 条（见 _on_progress，采集驱动即时落盘）；
         # ②定时兜底（长时间单关键词深翻页也能按时间保存），另在开始/结束时各存一次。
+        # ②走 _autosave_tick：内容没变就跳过（空闲时不许每 3 分钟重写三份表，理由见那里）。
         self.AUTOSAVE_EVERY = 20
         self._last_autosave_bucket = 0
         # ①那条要再过一道**自适应限流**：一轮保存是「全表重洗 + 重写三份 Excel」，
@@ -2429,7 +2435,7 @@ class MainWindow(QMainWindow):
         self._board_timer.timeout.connect(self._flush_board)
         self._board_timer.start(400)
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self.request_autosave)
+        self._timer.timeout.connect(self._autosave_tick)
         self._timer.start(3 * 60 * 1000)
         # 采集计时（对齐企知道/1688 工具）：秒级刷新；验证等待/手动暂停时接管计时，
         # 避免人工等待把平均耗时算虚高。
@@ -4680,6 +4686,33 @@ class MainWindow(QMainWindow):
                 self._prompt_pool_sync(total)
 
     # ── 自动保存 / 导出 ────────────────────────────────────────
+    def _autosave_tick(self):
+        """3 分钟定时兜底：**内容没变就一个字都不写**。
+
+        实机取证（2026-11-14）：工具整晚空闲、一条数据都没新增时，这个定时器仍每 3 分钟
+        把三份 Excel 全量重写一遍（19:32 与 19:35 两次的文件内容、行数、指纹完全一致），
+        连带进度台账一起刷——磁盘、电量、网盘同步一直在 churn，而「采集中」的读数看着
+        像还在干活，排查时极易被带去查网络。跳过判据与 _final_save_sync 用的是同一把尺子
+        （指纹相同 + 三份文件都还在场），不另立一套。
+        为什么单开一个槽位而不是在 request_autosave 里判指纹：采集驱动的「每满 20 条」
+        那条路只在内容真的变了时才被叫到，给它加一次全表指纹扫描（本机 5000 条约几十毫秒）
+        是纯亏；空闲这一路才是问题所在，用一次便宜的比对换掉一次昂贵的整表重写。
+        """
+        if not self.session_dir:
+            return
+        if self.autosave and self.autosave.isRunning():
+            self._pending_save = True
+            return
+        try:
+            rows = self.session.snapshot_results()
+            if rows and rows_signature(rows) == self._last_saved_sig \
+                    and self._final_files_present(Path(self.session_dir)):
+                return
+        except Exception as e:
+            # 判据本身出错（极端脏数据等）时退回老行为：宁可多写一次，不许漏落盘
+            self._on_log(f"⚠ 自动保存跳过判据没能算出来，按原样写一次：{str(e).splitlines()[0][:80]}")
+        self.request_autosave()
+
     def request_autosave(self):
         if not self.session_dir:
             return
@@ -5934,10 +5967,31 @@ class MainWindow(QMainWindow):
             for _chk in self.site_checks.values():
                 _chk.blockSignals(False)
 
+    def _reconcile_stale_running(self):
+        """启动对账：把上一次进程遗留的「采集中」改记为「已中断」。
+
+        判据是「写下那条记录的 pid 此刻还在不在」（task_registry.reconcile_interrupted），
+        不是「文件夹多久没动」——等人工过验证一小时、IP 冷却半小时都是正当的长静默，
+        按时间猜会把正在跑的会话误判成中断。实机取证（2026-11-14）：一条 11-07 的任务
+        在索引里挂了 7 天仍写着「采集中」，而它的数据文件夹自那天起再没动过——那次进程
+        是被强杀/关机收掉的，没走结束写入。用户照这个读数会以为后台还在干活，从而不去
+        点「接着采」，这正是本轮体检顺手抓到的一项。
+        """
+        try:
+            changed = _tasks.reconcile_interrupted()
+            if changed:
+                self._on_log(f"🧹 {len(changed)} 条历史任务的「采集中」是上次进程留下的"
+                             f"（那个进程已不在），已改记为「已中断」：数据都还在，"
+                             f"在「历史任务」里选中它点「接着采这一条」即可继续")
+        except Exception as e:
+            # 对账失败绝不拖住启动：最坏就是界面还显示那条过期的「采集中」
+            self._on_log(f"⚠ 历史任务状态对账未完成：{str(e).splitlines()[0][:100]}")
+
     def _restore_last_task(self):
         """启动自动回填：取最近一条「能接着采」的任务，静默恢复关键词/参数/进度。"""
         if not HAS_YZD:
             return
+        self._reconcile_stale_running()
         try:
             tasks = [t for t in _tasks.load_tasks()
                      if t.get("status") in _tasks.RESUMABLE_STATUS

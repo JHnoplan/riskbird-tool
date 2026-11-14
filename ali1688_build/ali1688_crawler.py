@@ -53,6 +53,16 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent / "riskbird_build"))
     import runtime_paths as _paths
 
+# ChromeDriver 的查找与回退也只许有一份实现：riskbird_build/chrome_driver.py。
+# 名单通道（企知道/风鸟/爱企查）用的就是它，1688 与它们跑在同一台 Chrome 上，两套判据
+# 在同一台机器上会得出相反的结论（本轮 1688 恒 0 家就是这么来的，见 _attach 注释）。
+# 独立的 Ali1688Tool 包里没有这份模块，导入失败时 _attach 退回本文件自带的候选链——
+# 那条链也一并修掉了「大版本不等就立刻弃用本地驱动」这个实测错误的判据。
+try:
+    import chrome_driver as _chrome_driver
+except ImportError:
+    _chrome_driver = None
+
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
     HAS_PYQT = True
@@ -147,6 +157,9 @@ class Ali1688Crawler:
         self._block_times = []       # 近期被拦时间戳
         self._block_window = 900     # 统计窗口（秒）
         self._max_blocks = 5         # 窗口内达此次数 → 判持续限流，优雅结束本轮
+        # 本轮「为什么收的」：与 cdp_base 同一口径的耐久归因（拦停状态收轮前会被复位，
+        # 收尾那句读不到），只用于日志归因，不参与控制流。
+        self._run_abandon = ""
         self.max_pages = 10          # 每个关键词最多翻几页（1688 上限约 50）
         self.main_channel = True     # 主搜渠道（selloffer/offer_search，每页约50家，池子最深）
         self.company_channel = True  # 同时采集供应商(公司)渠道（实测产出为商品渠道数倍）
@@ -410,12 +423,13 @@ class Ali1688Crawler:
             return False
 
     def _driver_candidates(self):
-        """列出所有「本地已有」的 chromedriver 候选（按默认优先级排序）。
+        """列出所有「本地已有」的 chromedriver 候选（默认优先级序，排序交给 _driver_order）。
 
-        exe 里若只会命中一个固定版本驱动，一旦用户 Chrome 比它旧一个大版本
-        （Chrome for Testing 打包时是 156、用户自动更新还没到），156 驱动连 155
-        浏览器报的就是 'cannot connect to chrome'——重试/重启全都无效。
-        所以候选要全列出来，由 _driver_path 按浏览器实际版本挑配套的那一个。"""
+        为什么不能只打一个固定版本、也不能按版本号挑一个就完事：2026-11-14 实机测得
+        chromedriver 156 附加 Chrome 157 **可用**，而 135 附加同一台 Chrome **失败**
+        （失败文案是 'cannot connect to chrome'，看着像浏览器没响应，其实是驱动太旧）。
+        所以候选必须全列出来、按与浏览器版本的接近程度排序逐个实跑，让结果说话；
+        单挑「最配套的那一个」会在缺少同版本驱动时把本来能用的 156 也一并判死。"""
         exe_name = "chromedriver.exe" if sys.platform == "win32" else "chromedriver"
         cands = []
         if getattr(sys, "frozen", False):
@@ -476,21 +490,22 @@ class Ali1688Crawler:
         m = re.search(r"/(\d+)", self._devtools_browser())
         return int(m.group(1)) if m else 0
 
-    def _driver_path(self, want_major=0):
-        """挑一个能用的本地 chromedriver：优先与浏览器大版本(want_major)配套的；
-        没有匹配项才退回默认优先级第一个（_attach 会据版本差决定是否在线兜底）。
-        全部落空返回 None，由 _attach 回退 Selenium Manager（至多慢一次）。"""
+    def _driver_order(self, want_major=0, limit=3):
+        """本地驱动按「最可能一次成功」排好的前 limit 个（与 chrome_driver.candidates 同口径）：
+        大版本差在 DRIVER_MAJOR_SLACK 以内的最前，看不出版本的次之，明知差很远的垫底。
+        版本看不出来不等于不配套，所以只是往后排、绝不淘汰。"""
         cands = self._driver_candidates()
-        if not cands:
-            return None
-        if want_major:
-            for f in cands:
-                if self._cand_major(f) == want_major:
-                    return f
-            for f in cands:                       # 无名驱动实跑 --version 比对
-                if self._driver_major(f) == want_major:
-                    return f
-        return cands[0]
+        if not (want_major and cands):
+            return cands[:limit]
+
+        def _rank(f):
+            m = self._cand_major(f) or self._driver_major(f)
+            if not m:
+                return (1, 0)
+            d = abs(m - want_major)
+            return (0, d) if d <= self.DRIVER_MAJOR_SLACK else (2, d)
+
+        return sorted(cands, key=_rank)[:limit]
 
     def _debug_pages(self):
         """列出调试端口上的 page 标签；查询失败返回 None，空列表表示「0 标签」。"""
@@ -563,6 +578,10 @@ class Ali1688Crawler:
                                      "version mismatch",
                                      "unable to match browser version")
 
+    # 驱动与浏览器大版本差几个以内还值得一试：本机实测 156 驱动附加 Chrome 157 成功、
+    # 135 驱动附加同一台 Chrome 失败。判据与 chrome_driver 保持同一份常量，别两处各写一个数。
+    DRIVER_MAJOR_SLACK = getattr(_chrome_driver, "DRIVER_MAJOR_SLACK", 2)
+
     def _devtools_browser(self):
         """读调试端口 /json/version 的 Browser 字段（如 Chrome/142.0.x），用于诊断日志。"""
         try:
@@ -575,40 +594,48 @@ class Ali1688Crawler:
     def _attach(self):
         opts = Options()
         opts.debugger_address = f"127.0.0.1:{self.debug_port}"
-        browser = self._devtools_browser()
         want = self._browser_major()
-        drv = self._driver_path(want)
-        if drv is None:
+        if _chrome_driver is not None:
+            # 【2026-11-14 根修】这里以前有一条短路：本地驱动大版本 != 浏览器大版本就
+            # 立刻弃用它，交给 Selenium Manager 联网下载。实测把它推翻了——
+            #   chromedriver 156 附加 Chrome 157.0.8103.78 → 成功
+            #   chromedriver 135 附加同一台 Chrome      → 失败，报的是最容易被误读的
+            #       「session not created: cannot connect to chrome at 127.0.0.1:9255」
+            # 而 Selenium Manager 找驱动先看 PATH，本机 PATH 上躺着的正是那份 135（它自己
+            # 都打印了「这份可能不兼容，建议删掉」，却照用不误）。于是「明明有能用的驱动，
+            # 偏偏换成不能用的」，1688 从此恒 0 家；上层又把那句归成「稍后重试通常就好」，
+            # 就永远查不到根因。现在与企知道/风鸟/爱企查走同一个 create()：候选按与浏览器
+            # 版本的接近程度排序逐个实跑，全败才联网，联网前先绕过 PATH 上不配套的驱动目录。
+            return _chrome_driver.create(opts, self._log, ports=[self.debug_port])
+        browser = self._devtools_browser()
+        cands = self._driver_order(want)
+        if not cands:
             self._log("未检测到本地 chromedriver，改由 Selenium Manager 在线准备驱动"
                       "（首次可能较慢，请耐心等待）…")
             return webdriver.Chrome(options=opts)
-        # 本地找不到与浏览器大版本配套的驱动（如驱动 156、浏览器 155）：这种失配
-        # 报的是 'cannot connect to chrome'，重试/重启 Chrome 都无解，直接交
-        # Selenium Manager 在线拉配套版本；同时提示用户升级 Chrome 这条更快的路。
-        d_major = self._cand_major(drv) or self._driver_major(drv)
-        if want and d_major and d_major != want:
-            self._log(f"⚠ 本地驱动 {d_major} 与你的 Chrome {want} 不匹配，"
-                      f"Selenium Manager 在线获取配套驱动（可能较慢；把 Chrome 升级到"
-                      f"最新——设置→关于 Google Chrome→检查更新——是更快的解法）…")
-            return webdriver.Chrome(options=opts)
         last_exc = None
-        for i in range(3):
-            try:
-                return webdriver.Chrome(service=Service(executable_path=drv),
-                                        options=opts)
-            except Exception as e:
-                last_exc = e
-                msg = str(e).splitlines()[0][:140] if str(e) else e.__class__.__name__
-                low = msg.lower()
-                if any(k in low for k in self.DRIVER_VERSION_MISMATCH_MARKS):
-                    self._log(f"⚠ 内置驱动与你的 Chrome（{browser or '版本未知'}）不匹配，"
-                              f"改由 Selenium Manager 在线获取配套驱动（可能较慢，请等待）…")
-                    return webdriver.Chrome(options=opts)
-                time.sleep(1.5)          # 启动竞态：等 Chrome 完全就绪后重试
+        for attempt in range(3):
+            for drv in cands:
+                try:
+                    return webdriver.Chrome(service=Service(executable_path=drv),
+                                            options=opts)
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e).splitlines()[0][:140] if str(e) else e.__class__.__name__
+                    low = msg.lower()
+                    if any(k in low for k in self.DRIVER_VERSION_MISMATCH_MARKS):
+                        self._log(f"⚠ 内置驱动（{Path(drv).name}）与你的 Chrome（"
+                                  f"{browser or '版本未知'}）明确不匹配，改由 Selenium Manager "
+                                  f"在线获取配套驱动（可能较慢，请等待）…")
+                        return webdriver.Chrome(options=opts)
+            # 一整批本地驱动都失败：多半是 Chrome 刚起来还没就绪（2026-11-04 实测同一份
+            # 驱动 0.2 秒后附加就成功了），等一等把整批再走一遍，而不是在同一个驱动上死磕。
+            if attempt < 2:
+                time.sleep(1.5)
                 browser = self._devtools_browser() or browser
         # 反复连不上：多半 Chrome 半死或残留实例没起端口，联网回退同样连不上还易卡死。
         # 抛出交给 start_browser：清残留进程 → 重启 Chrome → 再附加。
-        self._log(f"⚠ 连续 3 次附加 Chrome 失败（端口 {self.debug_port}，"
+        self._log(f"⚠ 本地 {len(cands)} 个驱动都没能附加 Chrome（端口 {self.debug_port}，"
                   f"{browser or '无响应'}）：{last_exc.__class__.__name__}，"
                   f"将清理残留 Chrome 后重启重试…")
         raise last_exc
@@ -956,6 +983,8 @@ class Ali1688Crawler:
                           f"判定为持续限流。为保护账号，本轮到此为止（已采数据已保存），"
                           f"请稍后（建议 ≥30 分钟）或调大采集间隔后再跑。")
                 self._stop_requested = True
+                self._run_abandon = (f"持续限流（{self._block_window // 60} 分钟内第 {strikes} 次被拦）："
+                                     f"{str(reason or '')[:60]}")
                 return False
             self._log(f"🛑 {reason}")
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，通过后自动继续。")
@@ -989,6 +1018,8 @@ class Ali1688Crawler:
             if waited % 60 == 0:
                 self._log(f"   仍在等待{'登录' if login else '验证'}…已等 {waited} 秒")
         self._log("⚠ 等待超时，本轮结束（已采集数据不受影响）")
+        self._run_abandon = (f"等待{'登录' if login else '人工过验证'}超时"
+                             f"（{max_wait} 秒没人处理）")
         return False
 
     def _sleep(self):
@@ -1687,6 +1718,7 @@ class Ali1688Crawler:
         self._crawling = True
         self._stop_requested = False
         self._pause_requested = False
+        self._run_abandon = ""
         self._seen_members = set()
         self._filtered_count = 0
         self._early_skipped = 0
@@ -1843,7 +1875,19 @@ class Ali1688Crawler:
         pend = self._seen_store_pending() if self.incremental else 0
         pending = (f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
-        self._log(f"✅ 采集结束，共 {len(self.results)} 家公司{early}{incr}{pending}{tail}{saved}")
+        # 收尾标记与结论同源（口径与 cdp_base 的收尾一致）：被拦/被停止/零产出都各有
+        # 一句归因，绝不能因为「跑完了」就一律打 ✅——「1688 一直 0 家却查不出原因」
+        # 有一半责任在这句恒 ✅ 的日志上（另一半是驱动判据，见 _attach）。
+        if getattr(self, "_run_abandon", ""):
+            mark, why = "⛔", f"｜本轮因{self._run_abandon}提前收"
+        elif self._stop_requested:
+            mark, why = "⏹", "｜本轮被停止"
+        elif not self.results:
+            mark, why = "⚠", "｜本轮零产出（见上方逐词日志）"
+        else:
+            mark, why = "✅", ""
+        self._log(f"{mark} 采集结束，共 {len(self.results)} 家公司"
+                  f"{why}{early}{incr}{pending}{tail}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）

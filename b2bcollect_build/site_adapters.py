@@ -535,11 +535,17 @@ if HAS_1688:
 
         def close_browser(self):
             """只关自己的标签，共享 Chrome 留给其它通道（基类 driver.quit 虽不杀
-            attach 的浏览器，但会顺手关窗口，这里收敛成最小动作）。"""
+            attach 的浏览器，但会顺手关窗口，这里收敛成最小动作）。
+
+            最后一个标签不关：2026-11-14 实机查出，调试端口上 page target 归零后，
+            chromedriver 附加会报「session not created: cannot connect to chrome」
+            或直接挂住（浏览器本体活得好好的）。收尾把唯一一个标签也关掉，等于给
+            下一轮（以及企知道/风鸟/爱企查三路）留了一个必踩的坑。留着这一个标签
+            零副作用：不占域名、不动别人的标签，附加侧另有补开标签的兜底。"""
             try:
                 if self.driver is not None and getattr(self, "_tab", None):
                     handles = self.driver.window_handles
-                    if self._tab in handles:
+                    if self._tab in handles and len(handles) > 1:
                         if self.driver.current_window_handle != self._tab:
                             self.driver.switch_to.window(self._tab)
                         self.driver.close()
@@ -1053,11 +1059,14 @@ if HAS_RB:
                 return False
 
         def _close_own_tab(self):
-            """只关自己的标签，共享 Chrome 与别人的标签一个都不碰。"""
+            """只关自己的标签，共享 Chrome 与别人的标签一个都不碰。
+
+            手上只剩这一个标签时不关：调试端口上 page target 归零后 chromedriver
+            附加会失败或挂住（2026-11-14 实机），下一轮和另外两路名单通道都得踩。"""
             try:
                 if self.driver is not None and self._own_handle:
                     handles = self.driver.window_handles
-                    if self._own_handle in handles:
+                    if self._own_handle in handles and len(handles) > 1:
                         if self.driver.current_window_handle != self._own_handle:
                             self.driver.switch_to.window(self._own_handle)
                         self.driver.close()

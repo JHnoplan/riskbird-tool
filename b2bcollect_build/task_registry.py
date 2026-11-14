@@ -45,9 +45,14 @@ TASK_STATUS_RUNNING = "采集中"
 TASK_STATUS_DONE = "已完成"
 TASK_STATUS_STOPPED = "已停止"
 TASK_STATUS_PAUSED = "已暂停"
+# 上次进程被强杀/崩溃/关机时来不及写结束状态，「采集中」就永远挂在索引上（实机：
+# 一条任务挂了 7 天还在「采集中」，而它的数据文件夹三天没动过）。「已中断」是给
+# 这种历史补的一句实话：它没跑完，但也没人在跑，接着采完全可行。
+TASK_STATUS_INTERRUPTED = "已中断"
 # 能接着采的状态（界面「历史任务」列表里高亮提示用）：
 # 已完成的任务不鼓动用户重跑（要重采请开新任务），但也不禁止。
-RESUMABLE_STATUS = (TASK_STATUS_RUNNING, TASK_STATUS_STOPPED, TASK_STATUS_PAUSED)
+RESUMABLE_STATUS = (TASK_STATUS_RUNNING, TASK_STATUS_STOPPED, TASK_STATUS_PAUSED,
+                    TASK_STATUS_INTERRUPTED)
 PROGRESS_FILENAME = "采集进度.json"
 
 
@@ -406,6 +411,9 @@ def new_task(task_id: str, file_paths, folder: str, count: int = 0,
         "kw_raw": kw_raw or "",
         "sites": list(sites or []),
         "params": dict(params or {}),
+        # 谁写的这条「采集中」：启动对账要靠它判断是不是还有个进程在跑（见
+        # reconcile_interrupted）。多开两个实例时，这条字段是唯一的、不用猜的凭据。
+        "owner_pid": os.getpid(),
     }
 
 
@@ -465,6 +473,79 @@ def finish_task(task_id: str, status: str, count: int = 0, desktop_dir=None) -> 
     if hit:
         save_tasks(tasks, desktop_dir)
     return hit
+
+
+# ── 启动对账：把挂着「采集中」却没人跑的历史改记为「已中断」 ──────────────
+def _pid_alive(pid) -> bool:
+    """问某个进程此刻还在不在（判据只认「同一台机器上的这个 pid」）。
+
+    为什么不能靠时间猜：实机 2026-11-14 有一条 11-07 的任务在索引里挂了 7 天还写着
+    「采集中」，而它的数据文件夹自 11-07 起再没动过。看 mtime 判「多久没动就算死」
+    会被「等人工过验证一小时」「IP 冷却半小时」这些正当的长静默误杀；pid 是唯一
+    不用猜的凭据。问不到一律按「不在了」处理——多标一条「已中断」不丢任何数据，
+    漏标则让索引长期说谎。
+    """
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259                         # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True               # 进程在，只是不归当前用户问
+    except Exception:
+        return False
+
+
+def reconcile_interrupted(desktop_dir=None, my_pid=None) -> list:
+    """启动对账：凡是「采集中」但写它的进程已经不在了的任务，改记为「已中断」。
+
+    只动状态字段，不碰 started_at/count/进度——数据都在会话目录里，界面照样能
+    「接着采这一条」（已中断在 RESUMABLE_STATUS 里）。为什么不当成「已停止」：
+    「已停止」是用户亲手按的，「已中断」是进程没了，两者该说的话不一样、
+    该给的下一步提示也不一样。返回被改动的任务 id 列表，界面据此打一句账。
+    """
+    tasks = load_tasks(desktop_dir)
+    mine = int(my_pid or os.getpid())
+    changed = []
+    for t in tasks:
+        if str(t.get("status") or "") != TASK_STATUS_RUNNING:
+            continue
+        try:
+            pid = int(t.get("owner_pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid == mine:
+            continue                       # 本进程自己正在跑的那条（重启链路里会出现）
+        if pid and _pid_alive(pid):
+            continue                       # 另一个实例还在跑：不能替它下结论
+        t["status"] = TASK_STATUS_INTERRUPTED
+        t["interrupted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        changed.append(str(t.get("id") or ""))
+    if changed:
+        save_tasks(tasks, desktop_dir)
+    return changed
 
 
 # ── 原数据回读（导入时把历史任务的 Excel 读回成记录列表再清洗） ──

@@ -57,12 +57,40 @@ def tool_dir(desktop_dir=None) -> Path:
     return d
 
 
+# 与 b2bcollect_build/tool_config.py 里同一个开关（名字必须一致，判据只留一份）
+_STATE_DIR_ENV_VAR = "B2B_STATE_DIR"
+
+
+def _switched_state_dir():
+    """环境变量点名了状态落点就用它，返回 None 表示「没点名，按本模块默认走桌面」。
+
+    为什么风鸟这份也要认这个开关：同一份仓库里 task_registry 有**两处**
+    （b2bcollect_build 与 riskbird_build），哪一份被 import 取决于 sys.path 的顺序 ——
+    带 PYTHONPATH 跑批时命中的是这一份，而它过去只认桌面，于是离线套件里
+    `B2B_STATE_DIR=<临时目录>` 的隔离直接失效：假任务写进了开发机真实的
+    「桌面/企业数据自动采集工具/_采集任务索引.json」（2026-11-13 就攒出过 8 条脏任务）。
+    只读一个环境变量，默认落点一个字节都不动：打包出去的风鸟工具照旧把索引放在
+    用户看得见的桌面，不搬家、不丢历史。
+    """
+    raw = (os.environ.get(_STATE_DIR_ENV_VAR) or "").strip()
+    if not raw:
+        return None
+    d = Path(raw)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    return d
+
+
 def index_path(desktop_dir=None) -> Path:
-    return tool_dir(desktop_dir) / TASK_INDEX_NAME
+    d = _switched_state_dir()
+    return (d / TASK_INDEX_NAME) if d else tool_dir(desktop_dir) / TASK_INDEX_NAME
 
 
 def account_path(desktop_dir=None) -> Path:
-    return tool_dir(desktop_dir) / ACCOUNT_FILE_NAME
+    d = _switched_state_dir()
+    return (d / ACCOUNT_FILE_NAME) if d else tool_dir(desktop_dir) / ACCOUNT_FILE_NAME
 
 
 # ── 通用读写（写盘一律临时文件 + 原子替换，避免半个坏文件） ──

@@ -6,16 +6,18 @@
 Selenium Manager。它会先联网向 googlechromelabs、googleapis 查驱动版本再下载，国内网络
 这两个端点经常几十秒不通，界面上的表现就是：
     「Chrome 已经打开了，但企知道/风鸟的页面迟迟不出来，要等很久很久」
-（Ali1688Tool 早前就是同一个坑，见 ali1688_crawler._driver_path 的注释。）
+（Ali1688Tool 早前就是同一个坑；现在 1688 也直接调这里的 create()，两个工具一份判据。）
 
 这里的约束很硬：先把「手头已有的驱动」全试一遍，只有本地一个都不行时才允许退给
 Selenium Manager，并且明确打出这一次慢在哪一步、用的是哪个驱动、花了几秒。
 """
+import contextlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -46,11 +48,88 @@ def _cache_root() -> Path:
     return Path(home) / ".cache" / "selenium" / "chromedriver"
 
 
+# 驱动与浏览器大版本差多少还算「值得一试」：2026-11-14 实机用 chromedriver 156 附加
+# Chrome 157.0.8103.78 **成功**，用 135 附加同一台 Chrome **失败**（报的还是那句最容易被
+# 误读的 session not created: cannot connect to chrome）。旧代码因此写成了「大版本不等就
+# 立刻弃掉本地驱动、交给 Selenium Manager 联网下载」，结果 SM 按 PATH 挑中那份 135，
+# 1688 通道从此恒 0 家。留 2 个大版本的余量：差一点先试，真不行由建会话的结果说话。
+DRIVER_MAJOR_SLACK = 2
+
+
+def _path_major(path) -> int:
+    """从路径里读驱动大版本：文件名注版 chromedriver.156.exe（CI 随包那三个），
+    或缓存目录 <版本>/chromedriver。两处都读不出返回 0 —— 0 只表示「看不出来」，
+    不表示「不配套」，所以调用方要把它排到「已知配套」之后、而不是直接淘汰。"""
+    p = Path(str(path))
+    m = re.search(r"chromedriver[._](\d+)", p.name, re.I)
+    if m:
+        return int(m.group(1))
+    for part in reversed(p.parts[:-1]):
+        m = re.match(r"(\d+)\.", part)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _driver_dirs() -> list:
+    """放着「好几个注版驱动」的目录：Windows 随包三个大版本在 _MEIPASS/drivers，
+    源码态在 ali1688_build/drivers（CI 的 fetch_chromedrivers.py 就写在那儿）。
+
+    为什么 chrome_driver 也要认这个目录：打包命令把 drivers/ 打进包里是给 1688 用的，
+    但企知道/风鸟/爱企查与 1688 用的是同一台 Chrome。以前只有 ali1688 自己的候选链看
+    得到它，名单通道一个字没提 —— 于是 Windows 上「包里有配套驱动、这两个通道却偏要
+    联网下载」的怪事。判据只留一份，两个工具都从这一处挑驱动。"""
+    out = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            out.append(Path(meipass) / "drivers")
+        out.append(Path(sys.executable).resolve().parent / "drivers")
+    else:
+        here = Path(__file__).resolve().parent
+        out.append(here.parent / "ali1688_build" / "drivers")
+    return [d for d in out if d.is_dir()]
+
+
+def _local_session():
+    """问本机调试端口专用的连接：不吃系统代理、不吃 .netrc。
+
+    为什么专门写这一句：requests 默认照抄 HTTP_PROXY/ALL_PROXY，用户挂了代理时
+    「访问 127.0.0.1」也会被送到代理那儿去，回来的是 502 或超时 —— 于是本地判据
+    在代理机器上集体失明（问不到 Chrome 版本、误判端口没起，再把好端端的驱动
+    当不配套弃掉）。这些都是同机回环，没有任何理由经过代理。
+
+    必须走 Session 而不是给 requests.get(...) 塞参数：trust_env 是 Session 的属性，
+    当参数传进去直接 TypeError，而调用点那句 except 会把它吞成「端口问不到」——
+    判据全瞎，表现和「浏览器没起」一模一样，比不修更坏。离线用例第 ⑬ 节用真
+    requests 跑本机 HTTP 服务，就是为了钉住这一类「桩函数挡不住 API 用错」的坑。
+    """
+    s = requests.Session()
+    s.trust_env = False
+    s.proxies = {"http": None, "https": None}
+    return s
+
+
+def _local_get(url: str, timeout: float = 1.5):
+    with _local_session() as s:
+        return s.get(url, timeout=timeout)
+
+
+def _local_put(url: str, timeout: float = 1.5):
+    with _local_session() as s:
+        return s.put(url, timeout=timeout)
+
+
 def _port_chrome_major(port: int):
-    """从调试端口问 Chrome 主版本（共享浏览器已在跑时最准，也不用额外起进程）"""
+    """从调试端口问 Chrome 主版本（共享浏览器已在跑时最准，也不用额外起进程）
+
+    键名大小写踩过坑：/json/version 给的是 "Browser"，而 JSON 的键**区分大小写**
+    （HTTP 头才不分），旧写法取 "browser" 永远拿到空 → 这条快探路实际一直在走
+    后面的「问本地 Chrome 二进制版本」那条慢路。两个键名都认，取到哪个算哪个。
+    """
     try:
-        browser = str((requests.get(f"http://127.0.0.1:{port}/json/version",
-                                    timeout=1.5).json() or {}).get("browser") or "")
+        data = _local_get(f"http://127.0.0.1:{port}/json/version").json() or {}
+        browser = str(data.get("Browser") or data.get("browser") or "")
     except Exception:
         return None
     m = re.search(r"/(\d+)\.", browser)
@@ -96,10 +175,13 @@ def chrome_major(ports=None) -> str:
 
 
 def candidates(ports=None) -> list:
-    """本机能直接用的 chromedriver，按“最可能一次成功”排好序
+    """本机能直接用的 chromedriver，按「最可能一次建会话成功」排好序
 
-    排序原则：与当前 Chrome 主版本一致的缓存驱动排最前（版本不符 chromedriver 会直接拒绝启动，
-    白等一轮），其次才是随 exe 打包的、用户放在 exe 同目录的、PATH 上的、开发仓库里的。
+    排序原则：与当前 Chrome 主版本精确对上的排最前；其次随包/exe 旁那份没注版本的
+    （CI 打包时与 Stable 配对，Chrome 与打包通道同源时它就是配套的）；再后是大版本差
+    在 DRIVER_MAJOR_SLACK 以内的按新旧排（实测差 1 个大版本可用，见那里注释）；然后是
+    版本看不出来的散装驱动（PATH/手工放置，宁试勿垫底）；明知差出 SLACK 的排最后——
+    版本不符 chromedriver 会直接拒绝建会话，白等一轮。
     """
     exe = _exe_name()
     frozen = getattr(sys, "frozen", False)
@@ -110,6 +192,9 @@ def candidates(ports=None) -> list:
     if frozen:
         # 用户可以手动把一个匹配自己 Chrome 的驱动放在 exe 旁边，优先级高于打包里那份
         cands.append(Path(sys.executable).resolve().parent / exe)
+    for d in _driver_dirs():
+        # 注版驱动（chromedriver.156.exe）与不带版本的都收，交给下面的排序按浏览器版本挑
+        cands.extend(sorted(d.glob("chromedriver*"), reverse=True))
     root = _cache_root()
     if root.is_dir():
         cands.extend(sorted(root.glob("**/" + exe), key=_version_key, reverse=True))
@@ -134,9 +219,25 @@ def candidates(ports=None) -> list:
             uniq.append(c)
         except OSError:
             continue
-    if major:
-        # 主版本对得上的挪到最前面（缓存目录里往往躺着好几个历史版本）
-        uniq.sort(key=lambda c: 0 if re.search(r"(^|[\\/])" + re.escape(major) + r"\.", str(c)) else 1)
+    if major.isdigit():
+        want = int(major)
+        cache_root = str(_cache_root())
+
+        def _rank(c):
+            # (档位, 版本距离, 来源) —— 稳定排序，同键保持列出次序：
+            # 档位 0：大版本对得上或差在 SLACK 以内；其中随包/exe 旁那份虽然文件名
+            # 没注版本，却是 CI 打包时与当时 Stable 配对下载的（实测本机 Chrome 与
+            # 打包通道同源时它就是配套的），排在「精确命中」之后、其余相近版本之前；
+            # 档位 1：版本号看不出来的散装驱动（PATH/手工放置），宁试勿垫底；
+            # 档位 2：明知差出 SLACK 以上的，只给最后一线机会。
+            m = _path_major(c)
+            if not m:
+                in_cache = str(c).startswith(cache_root)
+                return (0, 0.5, 1 if in_cache else 0)
+            d = abs(m - want)
+            return (0, d, 1) if d <= DRIVER_MAJOR_SLACK else (2, d, 1)
+
+        uniq.sort(key=_rank)
     return [str(c) for c in uniq]
 
 
@@ -163,24 +264,44 @@ def driver_version(path) -> str:
     return ver
 
 
-def classify_driver_error(msg, drv_ver="", chrome_ver="") -> str:
+def classify_driver_error(msg, drv_ver="", chrome_ver="", pages=None) -> str:
     """建会话失败分两类，日志与上层重试判据都按这个分流：
 
-    version —— 驱动与 Chrome 主版本对不上，chromedriver 明确拒绝，只有换驱动才有用；
-    connect —— 端口在但浏览器那一刻不接驱动的连接，同一驱动稍后重试即可（2026-11-04
-               08:33 企知道通道撞的就是这一类，同一份驱动随后 0.2 秒附加成功）。
+    version —— 驱动与 Chrome 主版本差得够远，chromedriver 明确拒绝，只有换驱动才有用；
+    connect —— 端口在但浏览器那一刻不接驱动的连接（或浏览器压根没在跑），同一驱动
+               稍后重试即可（2026-11-04 08:33 企知道通道撞的就是这一类，同一份驱动
+               随后 0.2 秒附加成功）。
+
+    【判据顺序 2026-11-14 实测纠正】旧写法先看报错文案，于是「session not created:
+    cannot connect to chrome at …」这一句被无条件归成 connect。但它恰恰也是**驱动太旧**
+    时报的那句（本机实测：chromedriver 135 连 Chrome 157 就是这句，而 156 连 157 成功）。
+    归成 connect 的后果是「原地退避重试同一个旧驱动」——重试一百次也不会好，日志却写着
+    「稍后重试通常就好」，这就是 1688 恒 0 家还查不出原因的那条链。所以两个版本都问得到时
+    先按主版本判，问不到（返回空串）才退回文案判。
+
+    【判据范围 2026-11-14 第二次实测纠正】上一条写成「主版本不相等就算 version」，于是
+    156 驱动连 157 浏览器（实测 0.3 秒成功）也被记成版本不符。同一轮里真正的原因是
+    「调试端口上一个标签都没开」（见 ensure_attachable_pages），记错账的后果是日志
+    指着一份好驱动说「换下一个」，最后整条链退给 Selenium Manager 联网 —— 而本机联网
+    不通，任务就挂在那里。所以差在 DRIVER_MAJOR_SLACK 以内**不构成换驱动的理由**，
+    只有差出余量才算 version。端口证据排在版本推断前面：/json/list 都问不到时，
+    浏览器根本不在跑，这时候报「版本不符、换驱动」是让人往完全错的方向修。
     """
     s = (msg or "").lower()
     if "only supports chrome version" in s or "this version of chromedriver" in s:
         return "version"
+    if pages is not None and pages < 0:
+        return "connect"          # 调试端口 HTTP 都问不到：浏览器没在跑，换驱动无用
+    try:
+        if drv_ver and chrome_ver:
+            d = abs(int(str(drv_ver).split(".")[0]) - int(str(chrome_ver).split(".")[0]))
+            if d > DRIVER_MAJOR_SLACK:
+                return "version"
+    except Exception:
+        pass
     if ("cannot connect to chrome" in s or "session not created" in s
             or "websocket" in s or "failed to parse" in s):
         return "connect"
-    try:    # 老驱动有时只给一句含糊报错：主版本对不上仍按版本型处理
-        if drv_ver and chrome_ver and str(drv_ver).split(".")[0] != str(chrome_ver).split(".")[0]:
-            return "version"
-    except Exception:
-        pass
     return "connect"
 
 
@@ -188,6 +309,179 @@ def _short_err(e) -> str:
     """chromedriver 的报错动辄几十行堆栈，只留第一行给人看"""
     s = str(e) or e.__class__.__name__
     return s.splitlines()[0][:180]
+
+
+# Selenium Manager 是按父进程的 PATH 找现成驱动的，而改 PATH 是**进程级**动作：
+# 同一时刻只能有一路在改，所以补采三路与 1688 并行时要用这把锁排队。
+_sm_lock = threading.Lock()
+
+
+def stale_driver_path_dirs(want_major: str) -> list:
+    """PATH 上「装着 chromedriver、但大版本和浏览器不配套」的那些目录。
+
+    为什么专门找它们：Selenium Manager 的查找顺序是「PATH 上有没有现成驱动 → 有就用」，
+    它自己都会打一句「PATH 里那份 135 可能不兼容，建议删掉再试」，**却照样拿那份去连**
+    （2026-11-14 实机撞上的：135 连 Chrome 157 → session not created: cannot connect to
+    chrome，1688 因此恒 0 家）。删用户机器上的文件是越界，但只在本次子进程里把这些目录
+    藏起来，SM 找不到现成的就会自己去拉配套版本——这正是它设计上该走的那条路。
+    """
+    if not want_major:
+        return []
+    exe, bad, seen = _exe_name(), [], set()
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        # PATH 里同一个目录被重复挂几十上百次是常态（conda/venv 每次激活都插一遍，
+        # 本机实测 /usr/local/bin 出现 500+ 次）：去重后再查版本，既不让「绕过了 N 个
+        # 目录」的日志虚报成几百，也不白走几百次 is_file
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        try:
+            if not (Path(d) / exe).is_file():
+                continue
+            ver = driver_version(str(Path(d) / exe))
+        except OSError:
+            continue
+        if ver and ver.split(".")[0] != str(want_major):
+            bad.append(d)
+    return bad
+
+
+@contextlib.contextmanager
+def sm_clean_path(ports=None, log=None):
+    """临时把 PATH 里那些不配套的驱动目录摘掉，只管这一次调用，绝不落盘改用户环境。"""
+    log = log or (lambda m: None)
+    want = chrome_major(ports) or ""
+    bad = stale_driver_path_dirs(want)
+    if not bad:
+        yield
+        return
+    with _sm_lock:
+        old = os.environ.get("PATH", "")
+        kept = os.pathsep.join(x for x in old.split(os.pathsep) if x and x not in bad)
+        os.environ["PATH"] = kept
+        try:
+            log(f"   联网准备驱动时先绕过 PATH 上 {len(bad)} 个不配套的旧驱动目录"
+                f"（Chrome {want}，那些目录里的驱动大版本对不上；只绕本次调用，不改你的系统设置）")
+            yield
+        finally:
+            os.environ["PATH"] = old
+
+
+def _is_attach(options) -> bool:
+    """这次是「附加到已经在跑的 Chrome」还是「让驱动自己起一个浏览器」。
+
+    为什么要分清：附加模式下 Selenium Manager 联网换来的新驱动连的还是同一个
+    debuggerAddress。浏览器那一刻不接连接（端口在、进程半死、单实例锁没释放）时，
+    换驱动治不了，联网等几分钟更治不了 —— 该做的是把错误尽快抛给上层，由上层去清残留
+    Chrome、重启浏览器再附加。自己起浏览器的模式相反：SM 会连浏览器一起管，联网兜底
+    是真兜底，不能省。"""
+    try:
+        if getattr(options, "debugger_address", None):
+            return True
+        exp = getattr(options, "experimental_options", None) or {}
+        if exp.get("debuggerAddress"):
+            return True
+        return any(str(a).startswith("--remote-debugging-address")
+                   or str(a).startswith("--remote-debugging-port")
+                   for a in (getattr(options, "arguments", None) or []))
+    except Exception:
+        return False
+
+
+def _attach_addr(options, ports=None) -> str:
+    """这次要附加的调试地址（形如 127.0.0.1:9255）；不是附加模式返回空串。
+
+    三种写法都得认：Selenium 的 options.debugger_address、experimental_options
+    里的 debuggerAddress、以及命令行参数 --remote-debugging-port（1688 与企知道
+    用的就是不同的两种）。都没写时按调用方给的探测端口问一遍，问得到算数。
+    """
+    try:
+        a = str(getattr(options, "debugger_address", None) or "")
+        if not a:
+            exp = getattr(options, "experimental_options", None) or {}
+            a = str(exp.get("debuggerAddress") or "")
+        if not a:
+            for arg in (getattr(options, "arguments", None) or []):
+                s = str(arg)
+                if s.startswith("--remote-debugging-port"):
+                    p = s.split("=", 1)[1].strip() if "=" in s else ""
+                    if p.isdigit():
+                        a = f"127.0.0.1:{p}"
+                    break
+        if a:
+            return a
+        for p in (ports or []):
+            if cdp_pages(f"127.0.0.1:{p}", timeout=0.8) >= 0:
+                return f"127.0.0.1:{p}"
+    except Exception:
+        return ""
+    return ""
+
+
+def cdp_pages(addr, timeout: float = 1.5) -> int:
+    """调试端口上现在开着几个页面标签；−1 = 端口问不到（浏览器没起/没开调试端口）。
+
+    只走本机 HTTP，不联网，所以拿它当判据是零成本的。0 是个要命的数字，见
+    ensure_attachable_pages 的实测记录。
+    """
+    if not addr:
+        return -1
+    try:
+        data = _local_get(f"http://{addr}/json/list", timeout=timeout).json()
+    except Exception:
+        return -1
+    if not isinstance(data, list):
+        return -1
+    return sum(1 for t in data if str((t or {}).get("type") or "").lower() == "page")
+
+
+def ensure_attachable_pages(addr, log=None, timeout: float = 1.5) -> int:
+    """附加前保证至少开着一个标签；一个都没有就补一个 about:blank。返回补完的标签数。
+
+    【2026-11-14 实机定位的根因】同一份 chromedriver 156 附加同一个 Chrome 157：
+        · /json/list 里有 1 个 page → 0.3 秒建会话成功；
+        · page 数 = 0（用户手动关掉了那个 Chrome 窗口的最后一个标签，或上一轮收尾
+          把标签全 close 掉）→ 报「session not created: cannot connect to chrome」，
+          另一路干脆挂住 45 秒不返回。
+    报错文案把矛头指向驱动版本，实际浏览器活得好好的 —— 差别只在有没有标签。
+    补一个空白标签是本机操作：不动用户已开的标签、不联网、失败也只是回到原样。
+    """
+    log = log or (lambda m: None)
+    n = cdp_pages(addr, timeout)
+    if n != 0:
+        return n
+    log("   共享 Chrome 一个标签都没开（0 page target）：附加会失败或直接挂住，"
+        "先补开一个空白标签…")
+    try:
+        # 新版 Chrome 只认 PUT（GET 会被回一句 "Using unsafe HTTP verb GET"）
+        _local_put(f"http://{addr}/json/new?url=about:blank", timeout)
+    except Exception as e:
+        log(f"   补开标签没成功（{_short_err(e)}），继续按原样试一次")
+        return 0
+    for _ in range(3):
+        time.sleep(0.3)
+        n = cdp_pages(addr, timeout)
+        if n > 0:
+            log(f"   已补开标签（现在 {n} 个），继续附加")
+            return n
+    return 0
+
+
+def sm_source_reachable(timeout: float = 4.0) -> bool:
+    """驱动下载源此刻够不够得着（内网/被墙/拔线时这里就该说「够不着」）。
+
+    为什么要单独问一次：Selenium Manager 的联网过程是**阻塞**的，本机 googlechromelabs
+    不可达时它不是报错，而是一直等到自己的超时 —— 上层看到的就是「日志停在 21:17 之后
+    再不动，任务挂着 6 分钟还没结束」。先花 4 秒问一句，够不着就不去，换成一句人话。
+    """
+    for url in ("https://googlechromelabs.github.io/chrome-for-testing/",
+                "https://storage.googleapis.com/chrome-for-testing-public/"):
+        try:
+            requests.head(url, timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def create(options, log=None, ports=None, retries: int = 3):
@@ -199,6 +493,15 @@ def create(options, log=None, ports=None, retries: int = 3):
     from selenium.webdriver.chrome.service import Service
 
     log = log or (lambda m: None)
+    attach = _is_attach(options)
+    # 附加模式的第一个动作是看浏览器此刻有没有标签：没有就先补一个，
+    # 否则接下来每一次建会话都会撞那句误导人的 "cannot connect to chrome"
+    pages = None
+    if attach:
+        addr = _attach_addr(options, ports)
+        pages = cdp_pages(addr)
+        if pages == 0:
+            pages = ensure_attachable_pages(addr, log)
     tried = []
     kinds = []
     paths = candidates(ports)[:retries]
@@ -222,7 +525,7 @@ def create(options, log=None, ports=None, retries: int = 3):
             msg = _short_err(e)
             dver = driver_version(p)
             cver = chrome_major(ports)
-            kind = classify_driver_error(msg, dver, cver)
+            kind = classify_driver_error(msg, dver, cver, pages)
             tried.append(msg)
             kinds.append(kind)
             where = f"{Path(p).parent.name}/{Path(p).name}"
@@ -239,23 +542,53 @@ def create(options, log=None, ports=None, retries: int = 3):
         if driver is not None:
             return driver
 
+    # 浏览器压根问不到（端口没起）：附加不必再等，直接报给上层去重启 Chrome
+    if attach and pages is not None and pages < 0:
+        raise RuntimeError("附加到已运行的 Chrome 失败：调试端口没有响应"
+                           "（浏览器可能已退出或不是带调试端口启动的）")
+
     # 本地全败且全是「浏览器不接连接」：联网换驱动治不了这个，先原地退避再试一遍本地
     if paths and kinds and all(k == "connect" for k in kinds):
         for wait in (3, 6):
             log(f"   本地驱动都是「浏览器没接连接」这一类失败，{wait} 秒后原地重试一遍"
                 f"（不联网下载）…")
             time.sleep(wait)
+            if attach:
+                # 上一轮可能是「浏览器还没起来/没标签」，重试前按同样的顺序再核一遍
+                addr = _attach_addr(options, ports)
+                if cdp_pages(addr) == 0:
+                    ensure_attachable_pages(addr, log)
             for p in paths:
                 driver = _attempt(p)
                 if driver is not None:
                     return driver
+        if attach:
+            # 附加模式 + 全是连接类失败：交给上层走「清残留 Chrome → 重启 → 再附加」。
+            # 这里去联网只会让那次重试凭空慢几分钟，日志还看着像卡死。
+            head = tried[0] if tried else "无报错详情"
+            raise RuntimeError("附加到已运行的 Chrome 失败：浏览器端口在但没接受驱动的连接"
+                               f"（多为浏览器正忙/刚启动）。最近一次报错：{head}")
+    # 联网兜底前先问一句下载源够不够得着：够不着就别去 —— 那里的等待是阻塞的，
+    # 本机实测「不可达」不是报错而是一直挂着，界面上看就是任务卡死（2026-11-14 企知道）
+    if paths and not sm_source_reachable():
+        cver = chrome_major(ports) or "?"
+        mine = ", ".join(x for x in (driver_version(p) for p in paths) if x) or "?"
+        raise RuntimeError(
+            "创建浏览器会话失败：本机 ChromeDriver 都不配套，而驱动下载源此刻连不上"
+            f"（本机 Chrome {cver}，能用到的驱动 {mine}）。"
+            f"两条路：把 Chrome 升到最新；或放一份配套驱动进 {_cache_root()} "
+            "（下次开机就直接可用，不用联网）")
     if paths:
         log("⚠ 本机可用的 ChromeDriver 都没能建会话，回退 Selenium Manager（可能要联网查版本，会慢）")
     else:
-        log("⚠ 本机没有 ChromeDriver，交给 Selenium Manager 现场获取（首次要联网下载，可能等几十秒）")
+        log("⚠ 本机没有 ChromeDriver，交给 Selenium Manager 现场获取"
+            "（首次要联网下载配套驱动，本机实测约 6 分钟；下完进本地缓存，以后每次都是秒级）")
     t0 = time.monotonic()
     try:
-        driver = webdriver.Chrome(options=options)
+        # 联网这一路必须绕过 PATH 上那些不配套的旧驱动，否则 SM 会拿它们去连浏览器，
+        # 报的还是那句最容易被误读的「cannot connect to chrome」（见 stale_driver_path_dirs）
+        with sm_clean_path(ports, log):
+            driver = webdriver.Chrome(options=options)
         log(f"🔧 Selenium Manager 已备好驱动，耗时 {time.monotonic() - t0:.1f} 秒")
         return driver
     except Exception as e:
@@ -265,5 +598,8 @@ def create(options, log=None, ports=None, retries: int = 3):
         if kinds and all(k == "connect" for k in kinds):
             tail = "（浏览器端口在但没接受驱动的连接，多为浏览器正忙/刚启动，稍后重试即可）"
         elif "version" in kinds:
-            tail = "（驱动与 Chrome 版本不匹配，需要换成配套的 ChromeDriver）"
+            tail = (f"（驱动与 Chrome 版本不匹配：本机 Chrome {chrome_major(ports) or '?'}，"
+                    f"能找到的驱动是 {', '.join(x for x in (driver_version(p) for p in paths) if x) or '?'}；"
+                    "把 Chrome 升到最新，或放一份配套驱动进 "
+                    f"{_cache_root()} 就立刻可用）")
         raise RuntimeError(f"创建浏览器会话失败：{_short_err(e)}{tail}") from e

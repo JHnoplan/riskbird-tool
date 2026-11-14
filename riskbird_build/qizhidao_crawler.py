@@ -420,11 +420,15 @@ class QiZhiDaoCrawler:
         self._log("浏览器已重启")
 
     def _close_own_tab(self):
-        """只关闭本会话独占的窗口/标签（共享浏览器保持运行）"""
+        """只关闭本会话独占的窗口/标签（共享浏览器保持运行）
+
+        只剩这一个窗口时不关：调试端口上 page target 归零后，chromedriver 附加会
+        报「cannot connect to chrome」或直接挂住（2026-11-14 实机查出的根因），
+        下一轮任务与另外两路名单通道都必踩。留着它零副作用。"""
         try:
             if self.driver is not None and self._own_handle:
                 handles = self.driver.window_handles
-                if self._own_handle in handles:
+                if self._own_handle in handles and len(handles) > 1:
                     if self.driver.current_window_handle != self._own_handle:
                         self.driver.switch_to.window(self._own_handle)
                     self.driver.close()

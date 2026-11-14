@@ -352,7 +352,18 @@ class ParallelSession:
                 if s in self._done_sites:
                     out[s] = "stopped" if self.crawlers[s]._stop_requested else "done"
                 else:
-                    out[s] = "running"
+                    # 干净跑完的站一定会经 _on_site_finished 落进 _done_sites（走到
+                    # crawl 尾部必发 crawl_finished_signal，含 start_browser 失败早退那
+                    # 条 return）。所以「没进 _done_sites 且线程已死」只可能是崩溃/异常
+                    # 终止——以前恒报 running 会让状态行永远显示「推进中」误导排查
+                    # （2026-11-14 实机自查抓到）。报 stopped（线程退出·非正常收尾）而
+                    # 非 done，因为 done=已完成是谎报；t is None（空闲/纯名单轮/从未开跑）
+                    # 维持原口径 running，与名单通道「还没轮到开工=running」一致。
+                    t = self._threads.get(s)
+                    if t is not None and not t.is_alive():
+                        out[s] = "stopped"
+                    else:
+                        out[s] = "running"
             for slug, c in self.channels.items():
                 rt = self._rt(slug)
                 if not self.list_enabled.get(slug) and not self._list_active(slug):

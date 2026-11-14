@@ -730,6 +730,10 @@ return '';})()"""
         # 看门狗状态：当前是否处于「等人工过验证/等 IP 冷却」，以及本轮拦下的原因
         self._blocked = False
         self._block_reason = ""
+        # 本轮「为什么收的」耐久记账：_blocked/_block_reason 在收轮前就被复位了（熔断、
+        # 等验证超时都会清），收尾那句想复述原因时读到的永远是空。攒在这里到 crawl() 开头
+        # 才清，只用于归因日志与界面读数，不参与任何控制流。
+        self._run_abandon = ""
         self._block_kind = ""       # "ip"=IP 级限流（无页可点）/ "captcha"=可人工解除
         self._retry_after = 0       # 服务端 Retry-After 提示的秒数（有就听它的）
         self._block_probe_url = ""   # 探测用的代表页（就是刚被拦的那一页）
@@ -2011,6 +2015,10 @@ return '';})()"""
                           f"②等 ≥30 分钟再跑；③把「采集间隔」调大（建议 8~15 秒）。已采数据不丢，下次从断点续采。")
             self._stop_requested = True
             self._blocked = False
+            # 熔断收的轮：原因在这里就得写进耐久账，_after_block_cleared() 下一步就把
+            # _block_reason 清空了（收尾那句要靠它复述「为什么是 0 家」）。
+            self._run_abandon = (f"持续限流（{self._block_window // 60} 分钟内第 {strikes} 次被拦）："
+                                 f"{str(reason or self._block_reason or '')[:60]}")
             self._after_block_cleared()
             return False
         self._emit("blocked_signal", f"{tag}{self.PLATFORM_NAME}：{reason}")
@@ -2101,11 +2109,14 @@ return '';})()"""
             self._log(f"⚠ 本机网络仍未恢复（{limit} 秒内每次探测都是连接失败，"
                       f"不是站点在拦），本站本轮结束（已采数据不受影响）。"
                       f"网络恢复后重新开始任务会自动续采。")
+            self._run_abandon = f"本机网络未恢复（{limit} 秒内探测全连接失败，不是站点在拦）"
         elif ip_mode:
             self._log(f"⚠ 等 IP 冷却超时（{limit} 秒），本站本轮结束（已采数据不受影响）。"
                       f"想继续可重拨宽带换个出口 IP，或调大采集间隔后重跑。")
+            self._run_abandon = f"等站点放行超时（IP 冷却 {limit} 秒未解除）"
         else:
             self._log(f"⚠ 等待验证超时（{limit} 秒），本站本轮结束（已采数据不受影响）")
+            self._run_abandon = f"等待人工过验证超时（{limit} 秒没人处理）"
         self._blocked = False
         self._after_block_cleared()
         return False
@@ -2470,6 +2481,8 @@ return '';})()"""
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
+        # 本轮的拦停归因重新起账（上一轮为什么收的不该盖到这一轮的收尾句上）
+        self._run_abandon = ""
         # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
         self._incremental_skipped = 0
         self.stat_pages = self.stat_listed = 0
@@ -2599,8 +2612,24 @@ return '';})()"""
         pend = self._seen_store_pending() if self.incremental else 0
         pending = f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
-        self._log(f"✅ {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家"
-                  f"{early}{incr}{pending}{tail}{saved}")
+        # 【收尾归因 2026-11-14 实机体检修的归因陷阱】这一句以前恒打 ✅，于是本轮被
+        # 429 人工验证拦了 725 秒没人处理、最后 0 家收场，日志上写的仍是
+        # 「✅ 顺企网采集结束，共 0 家」——看的人只会去怀疑代码采不到，不会去想是被拦，
+        # 而这两者的处置完全相反（「某平台一直 0 家却查不出原因」就是这么来的）。
+        # 判据取本轮现成的状态：拦停账 _run_abandon（收轮前才被复位，故单记）、
+        # 用户停止 _stop_requested、零产出。标记与结论同源，不只看数量好看与否。
+        if getattr(self, "_run_abandon", ""):
+            mark, why = "⛔", f"｜本轮因{self._run_abandon}提前收"
+        elif self._blocked:
+            mark, why = "⛔", f"｜仍在等验证（{str(self._block_reason or '')[:40]}）"
+        elif self._stop_requested:
+            mark, why = "⏹", "｜本轮被停止"
+        elif not self.results:
+            mark, why = "⚠", "｜本轮零产出（见上方账目）"
+        else:
+            mark, why = "✅", ""
+        self._log(f"{mark} {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家"
+                  f"{why}{early}{incr}{pending}{tail}{saved}")
         s = self.stats()
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
@@ -2648,6 +2677,7 @@ return '';})()"""
         self._pause_requested = False
         self._blocked = False
         self._block_reason = ""
+        self._run_abandon = ""
         self._block_times = []
         self._seen_members = set()
         self._filtered_count = 0
