@@ -18,7 +18,7 @@
 #   9) 限流刹车：看门狗判定“持续限流”后一个请求都不再发（实测真跑时这里空转过
 #      4.5 请求/秒），且“整片拿不到页”不许被当成“这一片 0 家”写进台账（那样名下
 #      几百上千家会被补漏轮永久跳过、静默丢数据）。
-import sys, json, tempfile, pathlib, time
+import os, sys, json, tempfile, pathlib, time
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

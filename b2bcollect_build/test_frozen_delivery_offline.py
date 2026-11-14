@@ -8792,6 +8792,197 @@ def test_temp_dir_single_source_gate():
     finally:
         gate.ROOT = _saved_root
 
+def test_module_name_binding_gate():
+    print("\n═══ AK. 引导段不许用当场还没绑定的名字（第 27 条硬门 + 批跑理由渲染）═══")
+    # 由来（2026-11-15 本机自审抓到）：按第 25 条把批跑套件引导段里写死的 /Users/... 换成
+    # 按 __file__ 推时，五份套件的新代码用了当场还没绑定的名字——四份用了没导入的 Path、
+    # 一份用了从未定义的 _BUILD。同一批回归里五路一起崩，屏幕上给的是五条**没有任何理由**的
+    # FAIL：引导段一行判定都没打，而批跑入口的判定行只认「套件汇总的最后一行」。
+    # 所以本节判两半：①门禁第 27 条（缺陷本身）；②批跑入口的理由渲染（症状被吞掉这件事）。
+    # 少了②，下一次任何引导段崩溃仍然是一条无名 FAIL；少了①，同类写法还会再来一遍。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 1) 接线：判据在、被 main() 调用、结果进退出码、云端留下能照做的 annotation ──
+    for _fn in ("check_module_name_binding", "_module_level_uses",
+                "_import_first_line", "_any_binding_name"):
+        _assert(callable(getattr(gate, _fn, None)),
+                f"硬门模块里有 {_fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("name_binding = check_module_name_binding()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 27 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::名字取用早于绑定" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明是「取用早于绑定」并给出改法")
+    _assert("模块级没有取用早于绑定的名字" in gate_src,
+            "全绿的总结文案要把这一条也算进「过了一件事」（漏在文案里＝下次没人知道它存在）")
+
+    # ── 2) 今天的真仓库：全绿，而且视野不是空的 ──
+    _assert_eq(gate.check_module_name_binding(), [],
+               "第 27 条：交付链每份 .py 的模块级都只取用当场已绑定的名字"
+               "（本轮五处已修完，这一格把它们钉成回归判据）")
+    _scope = gate._dev_path_inputs()
+    _py_in_scope = [k for k in (_p if isinstance(_p, str) else _p.relative_to(_REPO).as_posix()
+                                for _p in _scope) if k.endswith(".py")]
+    _assert(len(_py_in_scope) >= 50,
+            f"第 27 条的视野里要有交付链的源码（今天 {len(_py_in_scope)} 份 .py）："
+            "范围断了，「没有取用早于绑定」就是一句空话")
+    # 疤痕判据：本轮真崩掉的那五份必须在视野里，而且带着当时缺的那一行
+    _ak_scars = {"debug/solarbe_fullslice_offline_test.py": "import os",
+                 "debug/block_guard_offline_test.py": "from pathlib import Path",
+                 "debug/local_scan_offline_test.py": "from pathlib import Path",
+                 "b2bcollect_build/test_block_triage_offline.py": "from pathlib import Path",
+                 "debug/gui_ux_offline_test.py": "_BUILD = "}
+    for _rel, _needle in sorted(_ak_scars.items()):
+        _assert(_rel in _py_in_scope,
+                f"{_rel} 在第 27 条的视野里（不在＝这一份从来没被这条门判过）")
+        _txt = Path(_REPO, _rel).read_text(encoding="utf-8", errors="replace")
+        _assert(_needle in _txt,
+                f"{_rel} 现在真的有 {_needle}（本轮就是缺它才崩在引导段）")
+        _ln_use = min([i + 1 for i, s in enumerate(_txt.splitlines())
+                       if ("Path(" in s or _needle.rstrip() + ")" in s) and not s.startswith("#")]
+                      or [1])
+        _assert(_ln_use >= 1, f"{_rel} 的使用点行号要算得出来（算不出来这一格就没在判东西）")
+
+    # ── 3) 反向对照：两种坏形状都要红，四种合法形状都不许红 ──
+    def _fed(_src, _name="debug/zz_ak_fixture.py"):
+        return gate.check_module_name_binding({_name: _src})
+
+    # (a) 取用早于 import：本轮四份套件的原件形状
+    _ak_a = ("import sys\n"
+             "sys.path.insert(0, str(Path(__file__).parent))\n"
+             "from pathlib import Path\n")
+    _got = _fed(_ak_a)
+    _assert_eq(len(_got), 1, f"(a) 取用早于 import 要红一条：{_got}")
+    _assert("第 2 行取用 Path" in _got[0] and "第 3 行才 import" in _got[0],
+            f"(a) 要说清是哪个名字、哪两行（只说「有问题」等于让人全文件翻）：{_got[0][:120]}")
+
+    # (b) 从未绑定：gui_ux 的 _BUILD 是这种
+    _ak_b = ("import os\nimport sys\n"
+             "sys.path.insert(0, _BUILD)\n"
+             "print(os.getcwd())\n")
+    _got = _fed(_ak_b)
+    _assert_eq(len(_got), 1, f"(b) 从未绑定的名字要红一条：{_got}")
+    _assert("没有任何地方绑定它" in _got[0],
+            f"(b) 要说清「挪 import 救不了」：{_got[0][:120]}")
+
+    # 合法形状一：函数体里的前向引用（晚于 import 才执行）
+    _ak_ok_fn = ("import sys\n"
+                 "def go():\n"
+                 "    return Path(sys.argv[0])\n"
+                 "from pathlib import Path\n")
+    _assert_eq(_fed(_ak_ok_fn), [],
+               "函数体里的取用不算：def 那一刻不执行函数体，判它就是把好代码逼坏")
+
+    # 合法形状二：lambda 体（被调用时才执行）
+    _ak_ok_lam = "f = lambda: LateName\nimport sys\nprint(sys.version)\n"
+    _assert_eq(_fed(_ak_ok_lam), [], "lambda 体里的取用不算（同上一条同一个理由）")
+
+    # 坏形状三：类体要算——建类那一刻类体真的执行
+    _ak_cls = ("import sys\n"
+               "class C:\n"
+               "    P = Path(sys.argv[0])\n"
+               "from pathlib import Path\n")
+    _got = _fed(_ak_cls)
+    _assert_eq(len(_got), 1, f"类体里的取用要算（类体在建类时执行）：{_got}")
+    _assert("第 3 行取用 Path" in _got[0], f"类体那一行要被点名：{_got[0][:120]}")
+
+    # 坏形状四：装饰器/默认值/返回值注解都在 def 语句执行时求值
+    _ak_dec = ("import sys\n"
+               "@staticmethod\n"
+               "def f(a=Path(sys.argv[0]), *, b=Path('.')) -> Path:\n"
+               "    return a\n"
+               "from pathlib import Path\n")
+    _got = _fed(_ak_dec)
+    _assert_eq(len(_got), 1, f"默认值与注解里的取用要算：{_got}")
+    _assert("第 3 行取用 Path" in _got[0],
+            f"要报在 def 那一行（不是函数体里那行）：{_got[0][:120]}")
+
+    # 合法形状三：带 ``from __future__ import annotations`` 的文件里注解不求值
+    _ak_fut = ("from __future__ import annotations\n"
+               "def f(a: LateName) -> LateName2:\n"
+               "    return a\n")
+    _assert_eq(_fed(_ak_fut), [],
+               "注解延迟求值的文件不许判注解（判了就是假红，而假红的代价是整条门被跳过）")
+
+    # 判得到的边界要在案：有 star import 的文件整份不判
+    _ak_star = ("from os import *\nimport sys\n"
+                "sys.path.insert(0, str(Path(__file__).parent))\n")
+    _assert_eq(_fed(_ak_star), [],
+               "有 ``from x import *`` 的文件整份不判（名字来源判不准，猜出来的多是假红）")
+    _assert_eq(len(_fed(_ak_star.replace("from os import *\n", ""))), 1,
+               "同一份代码去掉 star 就要红：证明上一格是「按在案的规则放行」，不是判漏了")
+
+    # 内置名与模块 dunder 不误报
+    _ak_bi = ("import sys\n"
+              "print(open, __file__, __name__, getattr(sys, 'argv', []))\n")
+    _assert_eq(_fed(_ak_bi), [], "内置名与 __file__/__name__ 不是缺陷（判它们＝满屏假红）")
+
+    # 一处红不许掩盖下一处：同一名字只报一次，不同名字各报一次
+    _ak_multi = ("import sys\n"
+                 "sys.path.insert(0, str(Path(__file__)))\n"
+                 "os.getcwd()\n"
+                 "from pathlib import Path\nimport os\n")
+    _got = _fed(_ak_multi)
+    _assert_eq(len(_got), 2, f"两个名字各红一条（Path 被用了两次也只报一次）：{_got}")
+
+    # fail-closed：坏源码、空视野、非 .py 三种「看不到」的处置必须不同
+    _got = _fed("def broken(:\n")
+    _assert_eq(len(_got), 1 and len(_got), "解析不过要报，不该安静当作没问题")
+    _assert("解析不过" in _got[0] and "按不合格算" in _got[0],
+            f"坏源码要按不合格算：{_got}")
+    _got = gate.check_module_name_binding({})
+    _assert_eq(len(_got), 1, f"视野为空不许报绿：{_got}")
+    _assert("没有任何含义" in _got[0], f"空视野要说清为什么这条结论没内容：{_got[0][:100]}")
+    _assert_eq(gate.check_module_name_binding({"debug/x.sh": "sys.path.insert(Path)\n"}), [],
+               "shell 与 workflow 不在这一条的视野里（那是另一种语言的名字规则）")
+
+    # ── 4) 批跑入口那一半：一条 FAIL 判定行必须自带理由（端到端，真起子进程）──────
+    # 只判门禁不够：本轮症状是「失败了但屏幕上什么都没有」，那是批跑入口的渲染问题。
+    # 这一格真跑一次批跑入口（只跑一份合成夹具），验的是**屏幕上那一行字**。
+    import shutil
+    import subprocess
+    import tempfile
+    _runner = _REPO / "debug" / "run_offline_regression.sh"
+    _rsrc = _runner.read_text(encoding="utf-8")
+    _assert("_pick_reason()" in _rsrc, "批跑入口要有「取理由」这一步")
+    _assert('reason=$(_pick_reason "$verdict" "$last" "$body" "$out")' in _rsrc,
+            "理由要按 汇总行 → 异常行 → 末行输出 的次序取，且四个输入都传进去")
+    _assert('printf \'FAIL  %-52s %s\\n\' "$f" "$reason"' in _rsrc,
+            "FAIL 判定行打印的是 reason（打印 $last 就是回到那条无名 FAIL）")
+    _assert("$EXC_RE" in _rsrc and "$RED_RE" in _rsrc,
+            "异常行与红判定行共用一份模式（计数用一份、打印用另一份就会各自漂移）")
+    if shutil.which("bash") and Path(sys.executable).exists():
+        _tmp = tempfile.mkdtemp(prefix="ak_runner_")
+        try:
+            _fx = Path(_tmp) / "fx_boot_nameerror.py"
+            # 夹具本身不用嵌套引号：上一层转义写错时，崩的是**夹具**而不是被测的渲染逻辑，
+            # 而报出来的理由会变成一条与本轮缺陷无关的 SyntaxError（本机第一跑就撞上了）。
+            _fx_src = ["# 崩在引导段：用了没导入的名字，且前面打过含「失败」的中文标题",
+                         "import sys",
+                         'print("[② 采集失败重试与断点续采]")',
+                         "sys.path.insert(0, str(Path(__file__).parent))",
+                         'print("===== 通过 1 / 失败 0 =====")']
+            _fx.write_text("\n".join(_fx_src) + "\n", encoding="utf-8")
+            _env = dict(os.environ, B2B_REGRESSION_ONLY=str(_fx), PER_TEST_TIMEOUT="60",
+                        B2B_REGRESSION_SANDBOX=tempfile.mkdtemp(prefix="ak_sandbox_"))
+            _cp = subprocess.run(["bash", str(_runner)], cwd=str(_REPO), env=_env,
+                                 capture_output=True, text=True, timeout=300)
+            _line = [x for x in _cp.stdout.splitlines() if x.startswith("FAIL ")]
+            _assert_eq(len(_line), 1, f"合成夹具应留下一条 FAIL（批跑输出见下）\n{_cp.stdout[-800:]}")
+            _assert("NameError" in _line[0],
+                    f"FAIL 行必须点名异常（本轮实况是这一行只有文件名，什么都没有）：{_line[0]}")
+            _assert("采集失败重试" not in _line[0],
+                    f"不许把栈里回显的中文标题当结论报（那是「走到过这里」，不是判定）：{_line[0]}")
+            _assert("一条判定都没打就异常退出" in _line[0],
+                    f"要说清「一条判定都没打」这层含义：{_line[0]}")
+        finally:
+            shutil.rmtree(_tmp, ignore_errors=True)
+    else:
+        _assert(False, "端到端这一格没法判：找不到 bash 或当前解释器（静默跳过＝这条格从没跑过）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -8816,6 +9007,7 @@ SECTIONS = (
     test_regression_suites_tracked_gate,
     test_no_dev_machine_paths_gate,
     test_temp_dir_single_source_gate,
+    test_module_name_binding_gate,
 )
 
 

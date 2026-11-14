@@ -15,6 +15,7 @@
 # 全程不联网、不启 Chrome：响应注入假会话，cdp_base 的 time 换成可推进的假时钟。
 import sys
 import inspect
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

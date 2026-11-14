@@ -308,6 +308,48 @@ PREV="$SNAP_A"
 CUR="$SNAP_B"
 cp "$STATE_BEFORE" "$PREV" 2>/dev/null || { echo "❌ 快照复制不到 ${PREV}：逐套件归属这一步不放行"; exit 2; }
 
+# ── 判定行的「理由」从哪来（汇总行 → 异常行 → 最后一行输出）──────────────
+# 未捕获异常行：行首是标识符、以 Error/Exception/Exit/Interrupt 结尾、紧跟冒号。
+# 判据不列具体异常类型清单，将来出现一种没见过的异常也照样报得出理由（本轮是 NameError，
+# 上一轮是 OSError；按类型枚举的写法每来一种就要改一次批跑入口）。
+EXC_RE='^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Exit|Interrupt):'
+# 红判定行：套件自己按约定缩进两格打的断言行 + 栈起始行 + 异常行。三处 grep 共用这一份
+# 模式，免得「计数用的」和「打印用的」各自漂移——本轮就是打印用的那份漏了 ^Traceback，
+# 才让一条崩在引导段的 FAIL 在屏幕上连一行线索都没留下。
+RED_RE="^  (FAIL|BAD|❌|✗)|^Traceback|^${EXC_RE%:}"
+
+_pick_reason() {
+  # $1 = 带计数的汇总行；$2 = 任何含判定字样的行（可能是小节标题）；$3 = 摘栈后的正文；
+  # $4 = 日志原文。
+  local summary="$1" loose="$2" body="$3" out="$4" exc tail
+  exc=$(printf '%s\n' "$out" | grep -E "$EXC_RE" | tail -1)
+  if [ -n "$exc" ] && [ -n "$summary" ]; then
+    # 两条事实都在场就两条都给：套件跑完了并打上「失败 N」，收尾又抛了一条没接住的异常，
+    # 只报其中一条都会让人往错的方向查（按位置猜谁是主因不如把两条都摊开）。
+    printf '%s（日志里另有一条未捕获异常：%s）' "$summary" "$exc"
+    return 0
+  fi
+  if [ -n "$exc" ]; then
+    printf '一条判定都没打就异常退出（栈见下方证据）：%s' "$exc"
+    return 0
+  fi
+  if [ -n "$summary" ]; then
+    printf '%s' "$summary"
+    return 0
+  fi
+  if [ -n "$loose" ]; then
+    # 明说它不是汇总行：否则读批跑的人会以为套件跑完了并数出了这个数，实际它半步没走。
+    printf '没有带计数的汇总行，最后一条含判定字样的输出是：%s' "$loose"
+    return 0
+  fi
+  tail=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1)
+  if [ -n "$tail" ]; then
+    printf '没有汇总行、也没有异常行；日志末尾那一行是：%s' "$tail"
+    return 0
+  fi
+  printf '没有汇总行、没有异常行、没有任何非空输出：这条判定只能靠日志文件本身'
+}
+
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
@@ -322,7 +364,24 @@ for f in $FILES; do
   fi
   code=$?
   out=$(cat "$log" 2>/dev/null)
-  last=$(printf '%s\n' "$out" | grep -E "PASS|FAIL|通过|失败|_OK" | tail -1)
+  # 找汇总行之前要先把**栈自身**按形状摘掉：Python 会把出错那行的源码原文缩进四格打出来，
+  # 套件的断言标题又满是中国字（含「失败」二字），拿它当汇总行就等于报一个假理由。
+  # 按形状摘而不是按区域摘：中途被 except 接住、print_exc 之后还会接着打判定，按「最后一处
+  # 栈起始行之后的全裁」会把那些真判定一起裁掉。摘到栈体结束为止（异常行本身要留着当理由）。
+  body=$(printf '%s\n' "$out" | awk '
+    /^(Traceback \(most recent call last\):|Fatal Python error: |Current thread )/ { tb = 1; next }
+    tb && (/^  File "/ || /^    / || /^[[:space:]]*$/) { next }
+    { tb = 0; print }
+  ')
+  last=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | tail -1)
+  # 「汇总行」还要再窄一档：真汇总一律带计数（通过 N / 失败 M、ALL PASS (41 checks)、
+  # 全部 122 项断言通过），而小节标题只有中国字没有数字。把两者混为一谈，套件死在
+  # 小节开头时判定行就会报成「[③ 采集失败重试]」——看着像结论，其实只说明它走到过这里。
+  verdict=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | grep -E '[0-9]' | tail -1)
+  # FAIL 判定行必须自带理由：本轮 5 份套件崩在引导段（用了没导入的名字），退出码 1、
+  # 日志里明明写着 NameError，屏幕上却是一条空的 FAIL——因为判定行只认「套件汇总的
+  # 最后一行」，而引导段一行汇总都没打。理由取不到汇总行时退到异常行，再退到末尾输出。
+  reason=$(_pick_reason "$verdict" "$last" "$body" "$out")
   # 证据必须先在场，判定才有意义。日志不见了（被并发的另一批删了）或压根没写一行
   # （套件静默 exit 0，一句断言都没报）都属于「看不到」，看不到的东西不许算绿。
   if [ ! -f "$log" ]; then
@@ -344,7 +403,7 @@ for f in $FILES; do
   if [ $code -eq 0 ] && [ -n "$nfail" ] && [ "$nfail" -gt 0 ]; then
     fail=$((fail+1)); failed="$failed $f"
     printf 'FAIL  %-52s 退出码 0，可套件自己数出了 %s 条失败（判定与退出码不一致，这种绿不算绿）\n' "$f" "$nfail"
-    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)" | head -20 | sed 's/^/        /'
+    printf '%s\n' "$out" | grep -nE "$RED_RE" | head -20 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   elif [ $code -eq 0 ] && printf '%s\n' "$out" | grep -q "SKIP-FIXTURE"; then
     skip=$((skip+1))
@@ -384,7 +443,7 @@ for f in $FILES; do
     # 「判定与退出码是否同源」用反证，同样不依赖措辞：日志里有没有任何一条红断言。一条红都没有
     # 却被信号打死 = 崩在收尾，套件必须自己 flush 后 os._exit，否则这种绿永远会被读成失败。
     sig=$((code-128))
-    redlines=$(printf '%s\n' "$out" | grep -cE "^  (FAIL|BAD|❌|✗)|^AssertionError|^OSError|^FileNotFoundError|^Traceback" || true)
+    redlines=$(printf '%s\n' "$out" | grep -cE "$RED_RE" || true)
     fail=$((fail+1)); failed="$failed $f"
     if [ "$redlines" -eq 0 ]; then
       printf 'CRASH %-52s 被信号 %s 打死（退出码 %s），日志里一条红断言都没有：崩在收尾阶段，与判定无关，' "$f" "$sig" "$code"
@@ -393,14 +452,15 @@ for f in $FILES; do
       printf 'CRASH %-52s 被信号 %s 打死（退出码 %s），日志里同时有 %s 处红：先按栈修判定，再谈收尾\n' "$f" "$sig" "$code" "$redlines"
     fi
     printf '%s\n' "$out" | sed -n '/^Fatal Python error: /,/^$/p' | head -14 | sed 's/^/        /'
-    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)|^AssertionError|^Traceback" | head -12 | sed 's/^/        /'
+    printf '%s\n' "$out" | grep -nE "$RED_RE" | head -12 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   else
-    fail=$((fail+1)); failed="$failed $f"; printf 'FAIL  %-52s %s\n' "$f" "$last"
-    # 只打红的那几条断言（含前后各一行上下文），完整日志见 LOG_DIR
+    fail=$((fail+1)); failed="$failed $f"
+    printf 'FAIL  %-52s %s\n' "$f" "$reason"
+    # 打红的那几条断言 + 异常行 + 栈起始行，完整日志见 LOG_DIR
     # BAD 也要打：check_gui_fit 这类几何体检报的是「BAD 某控件被压扁」，按 FAIL 找
     # 就等于失败了却看不到失败在哪——留档了却不去读，跟没留一样。
-    printf '%s\n' "$out" | grep -nE "^  (FAIL|BAD|❌|✗)|^AssertionError|^OSError|^FileNotFoundError" | head -20 | sed 's/^/        /'
+    printf '%s\n' "$out" | grep -nE "$RED_RE" | head -20 | sed 's/^/        /'
     printf '        （完整输出：%s）\n' "$log"
   fi
 

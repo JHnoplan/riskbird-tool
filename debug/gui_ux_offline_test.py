@@ -13,7 +13,12 @@ import re
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
+# 落点只算一遍并起个名字：下面读源码那一句要的也是同一个目录。上一版在那里直接引用
+# 了一个从没定义过的 _BUILD，于是这份套件在批跑里第一句断言之前就 NameError 崩掉
+# （2026-11-15 全量回归抓到）——崩在引导段的套件不会留下任何「测了什么」的痕迹，
+# 摘要行是空的，看批跑输出的人只看到一个没有理由的 FAIL。
+_BUILD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build")
+sys.path.insert(0, _BUILD)
 
 from PyQt5.QtWidgets import (QApplication, QGroupBox, QLabel, QPushButton,
                              QPlainTextEdit)  # noqa: E402

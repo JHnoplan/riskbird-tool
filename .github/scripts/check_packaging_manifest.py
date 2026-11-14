@@ -136,6 +136,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import hashlib
 import os
 import re
@@ -3728,6 +3729,200 @@ def check_temp_dir_single_source(files=None) -> list:
     return problems
 
 
+# ── 第 27 条：模块级不许取用「当场还没绑定的名字」（2026-11-15 本机自审抓到）──────
+# 由来：按第 25 条把批跑套件引导段里写死的 /Users/... 换成按 __file__ 推时，五份套件的**新代码**
+# 用了当场还没绑定的名字——四份用了没导入的 Path、一份用了从未定义的 _BUILD。这五处在同一批回归
+# 里一起崩，症状是五条**没有任何理由**的 FAIL：引导段一行判定都没打，而批跑入口的判定行只认
+# 「套件汇总的最后一行」，取不到就留空（那一半由 debug/run_offline_regression.sh 的 _pick_reason
+# 补上）。修完五份再把全仓扫了一遍（同一类缺陷要一次查全），还剩一处恒假死分支里的 io.open：
+# 它今天不炸，谁把那个条件翻回来就当场复现同一症状。
+# 判的形状两种，都限定在「顶层语句会被当场执行的部分」：
+#   (a) 名字在后面某行才 import —— 取用早于绑定；
+#   (b) 名字全文件没有任何绑定 —— gui_ux 的 _BUILD 是这种。
+# 函数体与 lambda 体不进视野：它们晚于 import 才执行，那种前向引用是合法的。类体要进：建类那一刻
+# 就执行。装饰器、参数默认值、注解也进：def 语句执行时就求值（``from __future__ import annotations``
+# 在的文件里注解不求值，就不判注解）。
+# 判不到的边界写在这里，免得这条门给人「名字全都被管住了」的错觉：有 ``from x import *`` 的文件
+# 整份不判（名字来源判不准，猜出来的多是假红）；``globals()[...]=``、``exec`` 造的绑定看不见——
+# 但 (a) 那一半不受影响，它只问「这行 import 之前有没有人用过这个名字」。
+# 视野取 _dev_path_inputs()：与第 25/26 条同一份，三条一起响应「扫描范围断了」这一件事。
+_NAME_EXEMPT = frozenset(dir(builtins)) | {
+    "__file__", "__name__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__debug__", "__class__",
+}
+
+
+def _import_first_line(tree) -> dict:
+    """import 绑定的名字 -> 它最早出现在第几行（同名字被 import 两次时取最早那处）。"""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            pairs = [((a.asname or a.name).split(".")[0], node.lineno) for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            pairs = [("*", 0) if a.name == "*" else (a.asname or a.name, node.lineno)
+                     for a in node.names]
+        else:
+            continue
+        for nm, ln in pairs:
+            out[nm] = min(out.get(nm, ln), ln)
+    return out
+
+
+def _any_binding_name(tree) -> set:
+    """文件里任何一处可能绑定名字的地方（含函数体内）：宁可放过也不误报。
+
+    为什么放过函数体内的赋值：这一格判的是「模块级取用时名字在不在」，而一个在函数里被当过
+    参数/目标的名字，仍可能在模块级是另一个含义（本轮五例里的 ``Path`` 若在全仓某处以同名参数
+    出现，按严格口径就会放掉真信号——所以这里反过来：**只用来排除遮蔽**，不用来要求绑定）。
+    """
+    out = set()
+
+    def add_target(node):
+        for x in ast.walk(node):
+            if isinstance(x, ast.Name):
+                out.add(x.id)
+
+    def add_args(a):
+        for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs):
+            out.add(arg.arg)
+        if a.vararg:
+            out.add(a.vararg.arg)
+        if a.kwarg:
+            out.add(a.kwarg.arg)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+            if not isinstance(node, ast.ClassDef):
+                add_args(node.args)
+        elif isinstance(node, ast.Lambda):
+            add_args(node.args)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for tg in targets:
+                add_target(tg)
+        elif isinstance(node, (ast.For, ast.comprehension)):
+            add_target(node.target)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            add_target(node.optional_vars)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            out.add(node.name)
+        elif isinstance(node, ast.Import):
+            out.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            out.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.Global):
+            out.update(node.names)
+    return out
+
+
+def _module_level_uses(tree, future_annotations: bool) -> list:
+    """顶层会被当场执行的部分里对裸名字的取用：[(名字, 行号)]。"""
+    hits = []
+
+    def rec(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                rec(dec)
+            a = node.args
+            for d in list(a.defaults) + [x for x in a.kw_defaults if x]:
+                rec(d)
+            if not future_annotations:
+                for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs):
+                    if arg.annotation:
+                        rec(arg.annotation)
+                if node.returns:
+                    rec(node.returns)
+            return                          # 函数体晚于 import 才执行：前向引用合法
+        if isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                rec(dec)
+            for base in node.bases:
+                rec(base)
+            for kw in node.keywords:
+                rec(kw.value)
+            for st in node.body:            # 类体在建类那一刻执行
+                rec(st)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in list(node.args.defaults) + [x for x in node.args.kw_defaults if x]:
+                rec(d)
+            return                          # lambda 体在被调用时才执行
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            hits.append((node.id, node.lineno))
+            return
+        if isinstance(node, ast.Attribute):
+            rec(node.value)                 # X.attr：只问 X 在不在
+            return
+        for child in ast.iter_child_nodes(node):
+            rec(child)
+
+    for st in tree.body:
+        rec(st)
+    return hits
+
+
+def _has_future_annotations(tree) -> bool:
+    return any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+               and any(a.name == "annotations" for a in n.names) for n in tree.body)
+
+
+def check_module_name_binding(files=None) -> list:
+    """交付链的 .py 里不许在模块级取用当场还没绑定的名字（第 27 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    if not files:
+        return ["第 27 条一份源码都没读到（交付目录、批跑清单、交付 shell 全落空）："
+                "扫描范围断了的时候，「没有取用早于绑定的名字」这句话没有任何含义"]
+
+    def _rel(path):
+        return path if isinstance(path, str) else (_rel_posix(path) or str(path))
+
+    judged = star_imports = 0
+    for path, text in sorted(files.items(), key=lambda kv: _rel(kv[0])):
+        rel = _rel(path)
+        if not rel.endswith(".py"):
+            continue                        # shell 与 workflow 是另一种语言、另一种名字规则
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as e:
+            problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：第 27 条读不到这一份的"
+                            "取用与绑定，按不合格算而不是按「这处没问题」算")
+            continue
+        judged += 1
+        imports = _import_first_line(tree)
+        if "*" in imports:
+            star_imports += 1
+            continue                        # 名字来源判不准：宁可不判，也不猜一条假红出来
+        binds = _any_binding_name(tree)
+        reported = set()
+        for nm, lineno in _module_level_uses(tree, _has_future_annotations(tree)):
+            if nm in _NAME_EXEMPT or nm in reported:
+                continue
+            first_import = imports.get(nm)
+            if first_import is not None and first_import > lineno:
+                line = text.splitlines()[lineno - 1].strip()[:90]
+                problems.append(
+                    f"{rel} 第 {lineno} 行取用 {nm}，而 {nm} 要到第 {first_import} 行才 import：{line}\n"
+                    f"   → 模块级语句是**导入这一刻**执行的，名字还没绑上就当场 NameError；"
+                    f"发生在批跑套件的引导段时，套件一条判定都没打就退出，屏幕上只剩一条没有理由的"
+                    f" FAIL。把 import 提到使用点之前（引导段整段照这个顺序写）")
+                reported.add(nm)
+            elif nm not in binds:
+                line = text.splitlines()[lineno - 1].strip()[:90]
+                problems.append(
+                    f"{rel} 第 {lineno} 行取用 {nm}，可这一份里没有任何地方绑定它：{line}\n"
+                    f"   → 同上一条一样的死法，只是连「往后挪一行 import」都救不了：这个名字压根"
+                    f"不存在（本轮实况是引导段引用了一个从未定义的 _BUILD）。要么补上定义，"
+                    f"要么改成这一行自己能算出来的值")
+                reported.add(nm)
+    if full_scan and judged - star_imports == 0:
+        problems.append(f"第 27 条一份都没判到（视野里 {judged} 份 .py 全是 ``from x import *``"
+                        " 或非 .py）：这一条门等于没跑，不许在空集合上报绿")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -4060,6 +4255,17 @@ def main(argv=None) -> int:
         print("✅ 临时目录口径：交付链里 TEMP 只在两侧同名的 legacy_temp_root() 里被读一次，"
               "两份实现结构一致")
 
+    name_binding = check_module_name_binding()
+    if name_binding:
+        bad += 1
+        print("❌ 模块级取用了当场还没绑定的名字（引导段一崩，整套回归就只剩一条没有理由的 FAIL）：")
+        for p in name_binding:
+            print(f"   · {p}")
+            print(f"::error::名字取用早于绑定：{p}")
+    else:
+        print("✅ 名字取用早于绑定：交付链每份 .py 的模块级都只取用当场已绑定的名字"
+              "（import 都在使用点之前，没有从未定义过的名字）")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -4091,7 +4297,7 @@ def main(argv=None) -> int:
           "交付 zip 的门两侧都在链路上、"
           "Qt 入口与离屏套件都按「窗口先于 QApplication」收尾、"
           "离线套件的判定与退出码同源、批跑清单里的套件都在提交里、交付链没有开发机绝对路径、"
-          "临时目录只在同口径的那一处被读、"
+          "临时目录只在同口径的那一处被读、模块级没有取用早于绑定的名字、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "注释里每一句指路节号都走得通")
     return 0

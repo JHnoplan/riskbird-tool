@@ -20,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 BASE = str(Path(__file__).resolve().parent.parent)
@@ -636,10 +637,10 @@ finally:
 
 # ── ⑧ GUI 入口与界面契约（源码级红线）──────────────────────────────────
 print("\n[⑧ GUI 入口与界面契约]")
-src = io.open(os.path.join(BASE, "b2bcollect_build", "b2bcollect_gui.py"),
-              encoding="utf-8").read() if False else open(
-    os.path.join(BASE, "b2bcollect_build", "b2bcollect_gui.py"),
-    encoding="utf-8").read()
+# 读源码只走 Path.read_text 一条路：原先写作 `io.open(...) if False else open(...)`，
+# 死分支里那个 io 全文件从没 import 过——今天不炸是因为条件恒假，谁把它翻回来，
+# 本节就当场 NameError 崩在引导段之后，而批跑只会留下一条没有理由的 FAIL。
+src = Path(BASE, "b2bcollect_build", "b2bcollect_gui.py").read_text(encoding="utf-8")
 check("⑧ 主界面新增「扫描本地表格」入口并连到扫描对话框",
       'QPushButton("扫描本地表格")' in src and "LocalScanDialog" in src
       and "btn_pool_scan.clicked.connect(self._on_pool_scan)" in src)
