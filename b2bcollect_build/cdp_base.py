@@ -753,6 +753,16 @@ return '';})()"""
         # 本轮「增量库已含所以跳过」计数：没有这一笔账，界面上就只剩「新增 0 家」，
         # 用户分不清「已经采全了」和「去重口径把活锁死了」（本轮 1688 出 0 家的形态）
         self._incremental_skipped = 0
+        # 本轮「一页都没取到」的账（2026-11-15 实机体检抓到）：请求层失败（连接超时/DNS/
+        # 被重置）和「这一页真的没有公司」在旧口径里长得一模一样——日志都写「无公司结果」、
+        # 统计都只给 0 家，于是 www.11467.com 整站 TCP 连不上被报成「顺企网采不到」。
+        # 两者的处置完全相反（前者查网络出口，后者改代码），所以必须分账、必须分文案。
+        self._page_fail = 0
+        self._last_page_error = ""
+        # 正在等人做点什么（登录／人工过验证）：体检器与界面靠它把「在等人」和「采不到」
+        # 分开。本轮 1688 等登录把 1500 秒预算烧光，却因为「0 家」被写成采不到——而它
+        # 既没被拦停（_blocked 在等放行循环里被复位），也没失败，只是在等人。
+        self._waiting_human = ""
 
         # 请求间隔统一记账（见 _sleep）：锚定「上一次真实请求完成」的时刻，
         # 同一条记录处理链路里连续多次 _sleep 不会重复支付整段等待。
@@ -796,6 +806,56 @@ return '';})()"""
                 getattr(self.signals, name).emit(*args)
             except Exception:
                 pass
+
+    def _note_request_error(self, err):
+        """把请求层最后一次失败的原因留在**机器可读**的地方（只留原因，不计数）。
+
+        各站 `_fetch` 的失败分支本来就打了这一句日志，但日志会被 tail 截掉、会被 ⚠ 淹没
+        上千行（GUI 里那段注释说得很清楚），而「本轮为什么 0 家」的归因必须能被界面和
+        体检器直接问出来，不能靠读文案。"""
+        self._last_page_error = str(err or "").strip()[:160] or "未知请求失败"
+
+    def _note_page_fail(self, err=""):
+        """记一笔「这一页列表根本没取到」——只在**翻页层**调用，一页最多一次。
+
+        原因与计数分家：原因由 `_note_request_error`（请求层）留，计数由这里加，因为
+        「详情页取页失败」也是 `_fetch` 失败，把它计进来会让「取页失败 N 页」随公司数
+        线性增长，而收尾的归因（⛔ 链路未通）讲的正是**列表这一页有没有取到**。
+        传了 err 就用它（翻页层自己知道的形状，如「导航失败」），没传就保留请求层留的。
+        """
+        if err:
+            self._note_request_error(err)
+        elif not self._last_page_error:
+            self._note_request_error("请求层未给出原因（见紧邻上一行）")
+        self._page_fail += 1
+        return self._page_fail
+
+    def _no_result_line(self, kw, page_label, html, noun="公司结果"):
+        """「这一页没有公司」与「这一页压根没取到」必须是两句话。
+
+        由来（2026-11-15 实机）：顺企网 80/443 全连接超时，`_fetch` 已经如实打了
+        「⚠ 顺企网请求失败（Max retries exceeded …）」，可它返回空串以后，翻页循环紧接着
+        又打「「泵」第 1 页无公司结果，停止翻页」——后一句把前一句否认了，读日志的人（和
+        体检器）看到的结论是「站点没有数据」，于是要查网络出口的缺陷被写成要改代码的缺陷。
+        同一族还有「频控薄壳伪装成 200 空页」那一格：只有确认**页面真取到了**而解析为空，
+        才允许说「无 X 结果」。
+        """
+        if isinstance(html, str):
+            got_page = bool(html.strip())
+        else:
+            # 爱采购那一类翻页走的是接口，取到的是解好的 dict／取不到是 None：
+            # 「页面」在这里本来就该读成「这一页拿到了没有」，不必为了套字符串先拼一遍
+            got_page = bool(html)
+        if not got_page:
+            # 空页有两种来路，而且给的下一步不一样：请求层报了错（查出口／域名／风控），
+            # 或者请求层没报错却回了一页空的（超末页的 404、频控空页）。合成一句「无数据」
+            # 就等于把前一种也归到「改代码」那一侧。
+            if self._last_page_error:
+                return (f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"
+                        f"不是本站没有{noun}；最后一次：{self._last_page_error[:70]}）")
+            return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
+                    f"404 或频控空页；是哪一种看紧邻上一行）")
+        return f"  「{kw}」{page_label}无{noun}"
 
     def snapshot_results(self):
         with self.results_lock:
@@ -2368,6 +2428,12 @@ return '';})()"""
             "filtered": self._filtered_count,
             "no_contact": self.stat_no_contact,
             "failed": self.stat_failed,
+            # 「一页都没取到」几页：0 家时到底是「站点没数据」还是「链路没通」，
+            # 界面与体检器都问这一个数，不许靠读日志文案猜（由来见 _no_result_line）
+            "page_fail": self._page_fail,
+            "last_page_error": self._last_page_error,
+            "waiting": self._waiting_human,
+            "incr_skip": self._incremental_skipped,
             "got": len(self.results),
             "pf_miss": self._pf_dropped,        # 省份把关：确认外省已排除
             "pf_unknown": self._pf_unknown,     # 省份把关：属地未标注已排除（已转名单补采反查）
@@ -2389,15 +2455,21 @@ return '';})()"""
             if not url:
                 return
             if not self._goto(url):
+                # 导航没成 → 这一页压根没取到，记的是「链路」的账（_goto 自己那几句
+                # 日志说的是什么错，这里不重复说，只把账记下来供收尾归因用）
+                self._note_page_fail("导航失败（具体原因见紧邻上一行）")
                 return
             html = self._html()
+            if not (html or "").strip():
+                self._note_page_fail("页面取回为空（会话断开或渲染未完成）")
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
             self.stat_listed += len(entries)
             if not entries:
                 empty_streak += 1
                 if empty_streak >= 2:
-                    self._log(f"  「{kw}」第 {page-1} 页起无结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page-1} 页起", html,
+                                                   noun="结果") + "，停止翻页")
                     return
                 continue
             empty_streak = 0
@@ -2485,6 +2557,10 @@ return '';})()"""
         self._run_abandon = ""
         # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
         self._incremental_skipped = 0
+        # 链路账与「在等人」账也是每轮重起：上一轮断网/等登录不该盖到这一轮的归因上
+        self._page_fail = 0
+        self._last_page_error = ""
+        self._waiting_human = ""
         self.stat_pages = self.stat_listed = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         if not self.resume:
@@ -2609,6 +2685,12 @@ return '';})()"""
         # ali1688_crawler 的收尾账目一致，对拍见 test_data_dir_offline.py 第 14 节）。
         incr = (f"，增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)"
                 if self._incremental_skipped else "")
+        # 链路那一笔单独记账（2026-11-15 实机体检）：顺企网整站 TCP 连不上时，上面每一笔
+        # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事
+        # 只有取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与
+        # ali1688_crawler 同构，对拍见 test_data_dir_offline.py 第 14 节）。
+        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"
+                    if self._page_fail else "")
         pend = self._seen_store_pending() if self.incremental else 0
         pending = f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
@@ -2618,22 +2700,42 @@ return '';})()"""
         # 而这两者的处置完全相反（「某平台一直 0 家却查不出原因」就是这么来的）。
         # 判据取本轮现成的状态：拦停账 _run_abandon（收轮前才被复位，故单记）、
         # 用户停止 _stop_requested、零产出。标记与结论同源，不只看数量好看与否。
+        # 2026-11-15 又把「零产出」拆成三种零：链路没通／增量库全跳过／真的没数据——
+        # 上一轮的实机体检里，9 站有 4 站被报成「采不到」，逐一定性后没有一站属于那三种里的
+        # 最后一种（3 站是全跳过、1 站是网络层不可达），而旧写法对这三者只有一句
+        # 「见上方账目」，上方账目在那两种形态下压根没有可看的一行。
         if getattr(self, "_run_abandon", ""):
             mark, why = "⛔", f"｜本轮因{self._run_abandon}提前收"
+        elif self._waiting_human:
+            mark, why = "⛔", (f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"
+                               "会自动续采，这一路的配额没烧）")
         elif self._blocked:
             mark, why = "⛔", f"｜仍在等验证（{str(self._block_reason or '')[:40]}）"
         elif self._stop_requested:
             mark, why = "⏹", "｜本轮被停止"
         elif not self.results:
-            mark, why = "⚠", "｜本轮零产出（见上方账目）"
+            if self._page_fail and not self.stat_listed:
+                mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到，"
+                                   "这不是本站没有数据（先查出口网络/域名可达，再谈代码）")
+            elif self._incremental_skipped:
+                mark, why = "⚠", (f"｜增量库全跳过 {self._incremental_skipped} 家"
+                                   f"（种子库 {len(self._seen_store)} 家已含，链路是通的；"
+                                   "要新数据得换关键词或放开省份）")
+            else:
+                mark, why = "⚠", "｜本轮零产出（见上方账目）"
         else:
             mark, why = "✅", ""
         self._log(f"{mark} {self.PLATFORM_NAME}采集结束，共 {len(self.results)} 家"
-                  f"{why}{early}{incr}{pending}{tail}{saved}")
+                  f"{why}{pagefail}{early}{incr}{pending}{tail}{saved}")
         s = self.stats()
+        # 链路/等人两笔记进账目行：只出现在「共 0 家」那一行的话，正常出货的轮次里
+        # 「有 3 页根本没取到」这笔坏账就永远看不见（少了几页同样是要紧的账）
+        lk = (f"｜取页失败 {s['page_fail']} 页（最后一次：{s['last_page_error'][:60]}）"
+              if s["page_fail"] else "")
+        wt = f"｜仍在等{s['waiting']}" if s["waiting"] else ""
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
-                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}"
+                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}{lk}{wt}"
                   + (f"｜省份把关：外省 {s['pf_miss']}、属地未标注 {s['pf_unknown']}"
                      if self.province else ""))
         self._emit("crawl_finished_signal")
@@ -2686,6 +2788,9 @@ return '';})()"""
         self._early_skipped = 0
         # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
         self._incremental_skipped = 0
+        self._page_fail = 0
+        self._last_page_error = ""
+        self._waiting_human = ""
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         self.kw_yield = {}

@@ -391,6 +391,7 @@ class GiCrawler(CdpSiteCrawler):
                 self._block_reason = ""
                 self._booted = False
                 return self._fetch(url, tries=tries, guarded=False)
+        self._note_request_error(last)
         self._log(f"  ⚠ 跨国采购网请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -497,7 +498,12 @@ class GiCrawler(CdpSiteCrawler):
             url = self.build_search_url(kw, page)
             html = self._fetch(url)
             if not html:
-                self._log(f"  「{kw}」第 {page} 页没取到页面（配额到底或仍在冷却），停止翻页")
+                if self._req_used >= self.REQ_BUDGET:
+                    # 主动收本轮（站方按 IP 计配额，_fetch 已经打过那句 ⛔）：这不是链路
+                    # 失败，记进「取页失败」会把「换出口 IP/改日再来」说成「代码采不到」
+                    return
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
@@ -505,7 +511,8 @@ class GiCrawler(CdpSiteCrawler):
             if not entries:
                 empty += 1
                 if empty >= 2:
-                    self._log(f"  「{kw}」第 {page-1} 页起无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page-1} 页起", html)
+                              + "，停止翻页")
                     return
                 continue
             empty = 0

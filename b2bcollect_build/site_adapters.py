@@ -21,6 +21,7 @@ import importlib.util
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict
 
@@ -279,6 +280,48 @@ LIST_BLOCK_WATCH_HEARTBEAT = 300
 # 「等待验证」、这一轮永远收不了尾）。60 分钟足够人吃个饭回来接着过验证；到点记一轮，
 # 轮次用尽（parallel_session._list_block_cycles）才如实结束本路。
 LIST_BLOCK_WATCH_ROUND_MAX = 3600
+
+# 「这一路正停在等人」的原因标签：与 cdp_base._waiting_human / ali1688_crawler 用同两个词
+# （登录／人工过验证）。界面看板、结束日志、实机体检读的是同一个键，措辞在一处分叉，
+# 另一处就会出现「在等登录」被读成「采不到」——2026-11-15 那轮体检正是这么绕的远路。
+_LOGIN_WAIT_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")
+
+
+def _human_wait_label(reason):
+    """拦截原因 → 要等人做什么（"登录" / "人工过验证"）。"""
+    return "登录" if any(w in str(reason or "") for w in _LOGIN_WAIT_WORDS) else "人工过验证"
+
+
+def _list_channel_extras(owner):
+    """名单通道的「链路/等人」四键：与关键词站的 stats() 同名，好让实机体检一套判据吃两路。
+
+    page_fail / last_page_error / incr_skip 在名单通道**结构上不存在**：这一路不按页取数据
+    （一家一次查询），也不靠种子库去重（防重复由待采名单的 tried 台账负责）。把没发生的
+    事编成计数，就是在给归因层造假证据；所以这里如实给 0，真正的链路失败落在 failed 格
+    （OUTCOME_RETRY＝根本没查成），等人工落在 waiting 格（见 _human_wait）。
+    """
+    return {"page_fail": 0, "last_page_error": "",
+            "waiting": str(getattr(owner, "_waiting_human", "") or ""),
+            "incr_skip": 0}
+
+
+@contextmanager
+def _human_wait(owner, reason):
+    """把「这一路正停在等人工」记成一格机器可读的账（同名键见 cdp_base.stats）。
+
+    名单通道不像关键词站那样有 `_blocked`，等验证期间在账目上完全隐身：体检器只看
+    「0 家」就会把「这一路停在验证页前」报成「这个平台采不到」，而正确的处置是
+    「人去把验证过完」。用 ctx 包住整段等待，解除／超时／用户停止三条出口共用
+    同一个 finally，绝不留下长亮的灯。
+    """
+    prev = str(getattr(owner, "_waiting_human", "") or "")
+    owner._waiting_human = _human_wait_label(reason)
+    try:
+        yield
+    finally:
+        # 恢复而不是清空：爱企查的 _wait_unblock_limited 会再回调 _wait_unblock（嵌套一
+        # 层），直接清空会让外层还在等验证时灯先灭掉（少报「在等人」同样是错账）
+        owner._waiting_human = prev
 
 
 def _shell_check(result):
@@ -592,7 +635,11 @@ if HAS_1688:
             return pairs
 
         def stats(self):
-            """与 cdp_base.stats() 同构的八键账目（GUI 看板/结束日志直接复用渲染）。"""
+            """与 cdp_base.stats() 同构的账目（GUI 看板/结束日志直接复用渲染）。
+
+            四个「链路/等人」键（page_fail / last_page_error / waiting / incr_skip）必须
+            一起给：实机体检靠这几格把「0 家」拆成「链路没通／在等人／增量库全跳过／真的
+            采不到」四种来路，缺一格就会把在等登录的一路报成采不到（2026-11-15 定性）。"""
             ok = no_contact = failed = 0
             for r in self.snapshot_results():
                 st = r.get("状态", "") or ""
@@ -605,6 +652,10 @@ if HAS_1688:
             return {"pages": self.stat_pages, "listed": self.stat_listed, "ok": ok,
                     "early": self._early_skipped, "filtered": self._filtered_count,
                     "no_contact": no_contact, "failed": failed, "got": len(self.results),
+                    "page_fail": self._page_fail,
+                    "last_page_error": self._last_page_error,
+                    "waiting": self._waiting_human,
+                    "incr_skip": self._incremental_skipped,
                     "pf_miss": self._pf_dropped,      # 省份把关：确认外省已排除
                     "pf_unknown": self._pf_unknown}   # 省份把关：属地未标注已排除（宁可少不可污）
 
@@ -617,6 +668,12 @@ if HAS_1688:
             self._pf_unknown = 0
             self._filtered_count = 0
             self._early_skipped = 0
+            # 链路账与等人账同 cdp_base.reset_run_state 口径：跨轮不清会让上一轮的网络
+            # 故障冒充本轮的归因，界面在本轮早已正常时继续喊「等你登录」
+            self._page_fail = 0
+            self._last_page_error = ""
+            self._waiting_human = ""
+            self._incremental_skipped = 0
             self._seen_members = set()
             self._stop_requested = False
             self._pause_requested = False
@@ -659,9 +716,10 @@ if HAS_QZD:
             # 系列开关，同窗后台标签不会被节流，故无需再各占独立窗口。
             self._own_window_type = "tab"
             self._seen_store = {}     # session.seen_store_counts 会读（企知道无种子库）
-            self._stat_queried = 0    # 名单通道账目（stats() 由通道侧回填八键）
+            self._stat_queried = 0    # 名单通道账目（stats() 由通道侧回填同一套键）
             self._stat_found = 0
             self._stat_missing = 0
+            self._waiting_human = ""  # 这一路是否正停在等人工（登录／过验证），见 stats()
             # 省份精准采集：企知道是名单驱动通道（拿不到搜索参数），但它的查回结果是
             # 工商登记地址——全体系最硬的属地证据，所以必须在这里补上数据层关卡：
             # 本轮它就放进过 1 条浙江公司（嘉兴市桐乡），属于补采通道无监管的漏洞。
@@ -738,7 +796,8 @@ if HAS_QZD:
             """三通道并行后，等人工过码必须有上限：一路死等 30 分钟只会把整份名单
             卡在这一家上（其余两路不受影响，但这一路当晚就废了）。"""
             cap = int(getattr(self, "block_wait_limit", 600) or 600)
-            return super()._wait_unblock(reason, min(int(max_wait or cap), cap))
+            with _human_wait(self, reason):
+                return super()._wait_unblock(reason, min(int(max_wait or cap), cap))
 
         # ── 清洗契约 ───────────────────────────────────────────
         def _to_cleaner_record(self, r):
@@ -787,10 +846,12 @@ if HAS_QZD:
                 self._stat_missing += 1
 
         def stats(self):
+            """企知道通道账目（与关键词站同一套键名，实机体检一套判据吃两路）。"""
             return {"pages": 0, "listed": self._stat_queried, "ok": self._stat_found,
                     "early": 0, "filtered": 0, "no_contact": self._stat_missing,
                     "failed": max(0, self._stat_queried - self._stat_found - self._stat_missing),
                     "got": len(self.results),
+                    **_list_channel_extras(self),
                     "pf_miss": self._pf_dropped, "pf_unknown": self._pf_unknown}
 
         def reset_run_state(self):
@@ -804,6 +865,7 @@ if HAS_QZD:
             self._stop_requested = False
             self._pause_requested = False
             self._crawling = False
+            self._waiting_human = ""    # 上一轮的「在等人」不许活到本轮的账目里
             self._shell_streak = 0
             self._shell_gate_passed = False
             return True
@@ -831,7 +893,8 @@ class _ListChannelBase:
 
     三平台能并行的前提是对编排层说同一种话，这里只补四件平台无关的事：
       ① 属地关卡：查回的结果进表前过模块级 _pf_admit（与企知道同一个函数，口径不可能分叉）；
-      ② 账目：bump_stat / stats 十键 + reset_run_state，看板与结束日志三平台一套；
+      ② 账目：bump_stat / stats（与关键词站同名的一套键，含 waiting 等「链路/等人」四键）
+         + reset_run_state，看板与结束日志三平台一套；
       ③ classify：把各平台五花八门的状态词翻译成中性 OUTCOME_*（词表由子类声明）；
       ④ 清洗契约：_to_cleaner_record 产出 cdp_base 十字键，跨平台合并在清洗层完成。
     浏览器接入方式差得太远（风鸟 Selenium、爱企查裸 CDP），attach 与独占标签各自实现。
@@ -844,6 +907,9 @@ class _ListChannelBase:
     # 名单逐家查询的采集间隔安全下限：风鸟两次列表页导航最小 2 秒（min_interval），
     # 低于它就是自己撞「操作过于频繁」；爱企查每家要过联想＋详情页两次导航，同理。
     MIN_DELAY = 2.0
+    # 「这一路正停在等人工」的账（与关键词站 stats()["waiting"] 同名）：放在类级默认值上，
+    # 保证 __init__ 之前或导入降级路径上调 stats() 也不会 KeyError
+    _waiting_human = ""
 
     # ── 状态词表（子类按平台实际词表覆写；判定顺序见 classify）──
     OK_STATUS_WORDS = ("成功",)                                  # 明确的成功标记，不是异常
@@ -942,10 +1008,12 @@ class _ListChannelBase:
             self._stat_missing += 1
 
     def stats(self):
+        """通道账目（与关键词站同一套键名，实机体检一套判据吃两路）。"""
         return {"pages": 0, "listed": self._stat_queried, "ok": self._stat_found,
                 "early": 0, "filtered": 0, "no_contact": self._stat_missing,
                 "failed": max(0, self._stat_queried - self._stat_found - self._stat_missing),
                 "got": len(self.results),
+                **_list_channel_extras(self),
                 "pf_miss": self._pf_dropped, "pf_unknown": self._pf_unknown}
 
     def reset_run_state(self):
@@ -959,6 +1027,7 @@ class _ListChannelBase:
         self._stop_requested = False
         self._pause_requested = False
         self._crawling = False
+        self._waiting_human = ""      # 上一轮的「在等人」不许活到本轮的账目里
         self._shell_streak = 0
         self._shell_gate_passed = False
         return True
@@ -1190,6 +1259,7 @@ if HAS_RB:
         def _wait_unblock(self, reason, max_wait=None):
             cap = int(getattr(self, "block_wait_limit", 600) or 600)
             wait = min(int(max_wait or cap), cap)
+            self._waiting_human = _human_wait_label(reason)   # 等人工期间账目要看得见
             try:
                 import block_guard
                 # heal 只做不打断人工的动作（把焦点认领回自己的标签，不导航不刷新）；
@@ -1205,6 +1275,9 @@ if HAS_RB:
                     revive=self._goto_homepage_verified)
             except Exception:
                 return False
+            finally:
+                # 解除、超时、用户停止、异常四条出口共用这一句：灯不许长亮
+                self._waiting_human = ""
             if ok:
                 self._emit_cleared(reason)
             return bool(ok)
@@ -1416,7 +1489,8 @@ if HAS_AQC:
             内部撞墙（带 block_wait_limit 与名单移交语义），与这里是两条独立入口。
             """
             cap = int(getattr(self, "block_wait_limit", 600) or 600)
-            return bool(super()._wait_unblock(reason, min(int(max_wait or cap), cap)))
+            with _human_wait(self, reason):
+                return bool(super()._wait_unblock(reason, min(int(max_wait or cap), cap)))
 
         def close_tab(self):
             try:

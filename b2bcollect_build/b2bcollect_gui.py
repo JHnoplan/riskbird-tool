@@ -3799,6 +3799,15 @@ class MainWindow(QMainWindow):
         tot = {k: sum(s.get(k, 0) for s in stats.values()) for k in keys}
         pf = (f"｜省份把关 外省 {tot['pf_miss']}·待核实 {tot['pf_unknown']}"
               if (tot['pf_miss'] or tot['pf_unknown']) else "")
+        # 链路和「在等人」两笔只在出事时上板（0 是常态，常驻只会稀释真正要紧的账）：
+        # 这一路 0 家到底是网络没通、还是停在验证页前等人，用户必须在看板上就看得到，
+        # 而不是等采集跑完去翻上千行日志（2026-11-15 实机：1688 整轮烧在等登录上，
+        # 看板上只写着「成功 0」，看起来和「这个站采不到」一模一样）。
+        pfail = sum(int(s.get("page_fail") or 0) for s in stats.values())
+        link = (f"｜取页失败 {pfail} 页" if pfail else "")
+        waiting = sorted({str(s.get("waiting") or "").strip() for s in stats.values()} - {""})
+        if waiting:
+            link += f"｜仍在等{'、'.join(waiting)}"
         # 并发档位只在回采真的在跑时挂上来（判据与文案见 build_perf_board_suffix）。
         # 治理层读不出来时这一栏就是不出现——账目行照常显示，绝不因为它让看板空白。
         perf_gs, perf_tip = [], ""
@@ -3811,12 +3820,14 @@ class MainWindow(QMainWindow):
         perf = build_perf_board_suffix(perf_gs)
         self.lbl_board.setText(
             f"明细：成功 {tot['ok']}｜无联系方式 {tot['no_contact']}｜失败可重采 {tot['failed']}｜"
-            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条{pf}{perf}")
+            f"早过滤 {tot['early']}｜详情不相关 {tot['filtered']}｜翻 {tot['pages']} 页见 {tot['listed']} 条{pf}{link}{perf}")
         _site_tip = "\n".join(
             f"{name}：采到 {s.get('got', 0)} 家（成功 {s.get('ok', 0)}）｜翻 {s.get('pages', 0)} 页见 "
             f"{s.get('listed', 0)} 条｜无联系方式 {s.get('no_contact', 0)}｜失败/可重采 "
             f"{s.get('failed', 0)}｜早过滤 {s.get('early', 0)}｜详情不相关 {s.get('filtered', 0)}｜"
             f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转名单补采 {s.get('pf_unknown', 0)}"
+            + (f"｜取页失败 {s['page_fail']} 页" if s.get('page_fail') else "")
+            + (f"｜仍在等{s['waiting']}" if str(s.get('waiting') or '').strip() else "")
             for name, s in stats.items())
         self.lbl_board.setToolTip(_site_tip + (f"\n\n【本机并发】\n{perf_tip}" if perf else ""))
         self.lbl_board.setVisible(True)

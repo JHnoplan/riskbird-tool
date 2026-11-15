@@ -162,6 +162,7 @@ class B2b168Crawler(CdpSiteCrawler):
             if self.handle_http_block(url):
                 self._block_reason = ""
                 return self._fetch(method, url, tries=tries, guarded=False, **kw)
+        self._note_request_error(last)
         self._log(f"  ⚠ b2b168 请求失败（{last}）：{url[:70]}")
         return ""
 
@@ -217,13 +218,20 @@ class B2b168Crawler(CdpSiteCrawler):
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
             html = self._search_page(kw, page)
+            if not html:
+                # 一次 POST 没换回页面（502 限流／连接被重置／插页到底）：记的是**链路**的账。
+                # 这里原来不判空就往下走，于是这种页照样进 stat_pages（「翻到第 N 页」）、
+                # 日志还写成「本页无公司结果」——网络问题被记成了站点没数据（见 _no_result_line）
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
+                return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
             self.stat_listed += len(entries)
             if not entries:
                 empty += 1
                 if empty >= 1:
-                    self._log(f"  「{kw}」第 {page} 页无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                     return
             else:
                 empty = 0

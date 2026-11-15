@@ -206,6 +206,7 @@ class Qihuo11467Crawler(CdpSiteCrawler):
                 self._fallback_pages = 0
                 self._log("  ⚠ 顺企网 HTTP 仍被拦，本轮临时改走浏览器标签续采")
                 return self._fetch_via_tab(url)
+        self._note_request_error(last)
         self._log(f"  ⚠ 顺企网请求失败（{last}）：{url[:70]}")
         return "", url
 
@@ -275,13 +276,20 @@ class Qihuo11467Crawler(CdpSiteCrawler):
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
             html = self._search_page(kw, page, base_cache)
+            if not html:
+                # 这一页压根没取回来（连接超时／被拦到底）：记链路的账，并且**不能**进
+                # stat_pages——旧写法不判空就往下走，「翻 N 页共见 M 条」里混进了根本没
+                # 发生的页，日志还写成「本页无公司结果」，于是整站 TCP 连不上被报成采不到
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
+                return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
             self.stat_listed += len(entries)
             if not entries:
                 empty += 1
                 if empty >= 1:
-                    self._log(f"  「{kw}」第 {page} 页无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                     return
             else:
                 empty = 0

@@ -230,6 +230,7 @@ class SolarbeCrawler(CdpSiteCrawler):
                 self._block_reason = ""
                 self._empty_streak = 0
                 return self._fetch(url, tries=tries, ua=ua, guarded=False)
+        self._note_request_error(last)
         self._log(f"  ⚠ 索比光伏网请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -311,11 +312,23 @@ class SolarbeCrawler(CdpSiteCrawler):
                     time.sleep(0.5)
                 budget -= 1
                 html = self._fetch(self.build_search_url(kw, page, catid, areaid))
+                if not html:
+                    # 这一页压根没取回来：记**链路**的账，并且不能冒充「本片翻到底了」——
+                    # 旧写法直接走下面的 `not sig` 分支 break 掉，请求失败与「这个切片真没公司」
+                    # 在日志里长得一模一样（2026-11-15 实机体检抓到的那一族）
+                    self._note_page_fail()
+                    self._log(self._no_result_line(
+                        kw, f"行业{catid or '不限'}/地区{areaid or '不限'} 第 {page} 页", html))
+                    break
                 entries = self.parse_list(html, kw)
                 self.stat_pages += 1
                 self.stat_listed += len(entries)
                 sig = tuple(e["公司ID"] for e in entries)
                 if not sig or sig == prev_sig:    # 空切片 / 内容与上一页逐字相同＝已到顶
+                    if not sig and page == 1:
+                        # 切片第 1 页就一页真数据都没有：这才是「本站没有这家公司」
+                        self._log(self._no_result_line(
+                            kw, f"行业{catid or '不限'}/地区{areaid or '不限'} 第 {page} 页", html))
                     break
                 prev_sig = sig
                 total = max(total, self.slice_total(html))

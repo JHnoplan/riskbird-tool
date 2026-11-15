@@ -121,6 +121,14 @@ def note_from_stats(metric):
             bits.append(f"{label} {s[key]}")
     if s.get("pf_unknown"):
         bits.append(f"属地未标注转名单 {s['pf_unknown']}")
+    # 链路/等人两笔只在出事时念出来：红牌看到的「本轮 0 家」必须自带来路，否则
+    # 读的人只能瞎猜是站点没数据、网络没通还是有人在等登录（2026-11-15 的教训）
+    if s.get("page_fail"):
+        bits.append(f"取页失败 {s['page_fail']} 页"
+                    + (f"（最后一次：{str(s.get('last_page_error') or '')[:40]}）"
+                       if s.get("last_page_error") else ""))
+    if str(s.get("waiting") or "").strip():
+        bits.append(f"仍在等{s['waiting']}")
     return "｜".join(bits) if bits else f"本轮 {metric.get('companies', 0)} 家"
 
 

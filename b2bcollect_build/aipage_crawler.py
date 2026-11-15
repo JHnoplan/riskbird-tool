@@ -126,6 +126,7 @@ class AipageCrawler(CdpSiteCrawler):
             if self.handle_http_block(url):
                 self._block_reason = ""
                 return self._fetch(url, tries=tries, headers=headers, guarded=False)
+        self._note_request_error(last)
         self._log(f"  ⚠ 爱采购请求失败（{last}）：{url[:80]}")
         return "", url
 
@@ -221,13 +222,18 @@ class AipageCrawler(CdpSiteCrawler):
                     self._session = self._new_session()
                     data = self._api_page(kw, 1, ctx)
                 if data is None:
-                    self._log(f"  「{kw}」第 {page} 页接口无数据，停止翻页")
+                    # 接口一次都没回数据：记的是**链路**的账（请求失败／csrf 失效／风控插页），
+                    # 不是「爱采购对这个词没有公司」——两者处置完全相反。文案不在此处另写
+                    # 一份：data 为 None 时 _no_result_line 的第一支讲的就是这一件事，
+                    # 自己拼一句只会和基类分叉（分叉过一次，代价是两处说法不一致）。
+                    self._note_page_fail("接口未回数据（请求失败、csrf 失效或风控插页）")
+                    self._log(self._no_result_line(kw, f"第 {page} 页", data))
                     return
             entries = self.parse_list(data, kw)
             self.stat_pages += 1
             self.stat_listed += len(entries)
             if not entries:
-                self._log(f"  「{kw}」第 {page} 页无公司结果，停止翻页")
+                self._log(self._no_result_line(kw, f"第 {page} 页", data) + "，停止翻页")
                 return
             new = skipped = seen = 0
             for e in entries:

@@ -192,10 +192,15 @@ class FakeChannel:
             self._stat_missing += 1
 
     def stats(self):
+        # 与 _ListChannelBase.stats() 同一套键：会话层的账目/看板/实机体检读的就是这几格，
+        # 夹具少给就等于绕过了「在等人 ≠ 采不到」那条归因判据
         return {"pages": 0, "listed": self._stat_queried, "ok": self._stat_found,
                 "early": 0, "filtered": 0, "no_contact": self._stat_missing,
                 "failed": max(0, self._stat_queried - self._stat_found - self._stat_missing),
                 "got": len(self.results), "pf_miss": self._pf_dropped,
+                "page_fail": 0, "last_page_error": "",
+                "waiting": str(getattr(self, "_waiting_human", "") or ""),
+                "incr_skip": 0,
                 "pf_unknown": self._pf_unknown}
 
     def snapshot_results(self):

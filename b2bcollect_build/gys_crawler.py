@@ -252,13 +252,18 @@ class GysCrawler(CdpSiteCrawler):
                                   expect_domain="gys.cn"):
                     return
                 html = self._html()
+            if not (html or "").strip():
+                # 标签里是空的（会话断开／渲染没完成）：记**链路**的账，不许冒充「本页无公司」
+                self._note_page_fail("页面取回为空（会话断开或渲染未完成）")
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止")
+                return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
             self.stat_listed += len(entries)
             if not entries:
                 empty += 1
                 if empty >= 1:
-                    self._log(f"  「{kw}」第 {page} 页无公司结果，停止")
+                    self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止")
                     return
             else:
                 empty = 0

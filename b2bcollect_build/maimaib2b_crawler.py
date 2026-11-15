@@ -382,6 +382,7 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 self._block_reason = ""
                 self._log("  ↪ HTTP 仍拿不到页、浏览器已放行：改用标签取这一页（降级模式）")
                 return page
+        self._note_request_error(last)
         self._log(f"  ⚠ 麦麦B2B 请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -462,8 +463,11 @@ class Maimaib2bCrawler(CdpSiteCrawler):
             url = self.build_search_url(kw, page)
             html = self._fetch(url)
             if not html:
-                # 拿不到页＝这一页没翻到（超末页 404）或被防采/限流拦到底了，两种都不该再往下翻
-                self._log(f"  「{kw}」第 {page} 页没取到页面（到底了或仍在防采），停止翻页")
+                # 拿不到页＝这一页没翻到：超末页的 404 与被防采/限流拦到底都会回空串。
+                # 旧文案写成「到底了或仍在防采」这种二选一猜测，读的人无从分辨；现在由
+                # _no_result_line 按「请求层刚刚有没有报过错」给出确定的那一支。
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
@@ -471,7 +475,8 @@ class Maimaib2bCrawler(CdpSiteCrawler):
             if not entries:
                 empty += 1
                 if empty >= 2:
-                    self._log(f"  「{kw}」第 {page-1} 页起无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page-1} 页起", html)
+                              + "，停止翻页")
                     return
                 continue
             empty = 0

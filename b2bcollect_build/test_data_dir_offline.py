@@ -1408,10 +1408,23 @@ check("14h 反向对照：旧口径（进过种子库就永不重采）在这张
       _cdp_cls._entry_locked({"ct": 0, "rt": 0}) is False,
       "ct=0/rt=0 也被锁住——那正是「以前能采、现在一直是 0」的那一步")
 
-# 14i 收尾那两句账目：两边都必须说「跳过多少家」和「还欠多少家补联系人」，逐字同一段话。
-# 只比函数指纹比不到这里：这两句分散在各自的收尾方法里，长在不同上下文中。
+# 14i 收尾那几句账目与归因：两边都必须逐字同一段话。
+# 只比函数指纹比不到这里：这些句子分散在各自的收尾方法里，长在不同上下文中。
+# 2026-11-15 实机体检后补进来的四类归因（链路没通／在等人／增量库全跳过／真的零产出）
+# 是同一套话术的两个副本——分叉一次就会出现「1688 说在等登录、其它站说采不到」这种
+# 同一件事两套结论的账，用户按哪一句处置都是错的。
 _FRAG14 = ("增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)",
-           "另有 {pend} 家欠补联系人，下轮自动重采")
+           "另有 {pend} 家欠补联系人，下轮自动重采",
+           # 收尾「取页失败」片段（挂在结束行的那一笔链路账）
+           'f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"',
+           # 「本页一页都没取到」两支出文案：请求层报过错 / 请求层没报错（超末页 404、频控空页）
+           'f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"',
+           'f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "',
+           # 零产出三分支 + 在等人一支（处置各不相同，缺一条就等于把一类问题说成另一类）
+           'f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"',
+           'f"｜链路未通：{self._page_fail} 页一页都没取到，"',
+           'f"｜增量库全跳过 {self._incremental_skipped} 家"',
+           '"｜本轮零产出（见上方账目）"')
 _src_cdp14 = (HERE / "cdp_base.py").read_text(encoding="utf-8")
 _src_a1614 = (HERE.parent / "ali1688_build" / "ali1688_crawler.py").read_text(encoding="utf-8")
 for _frag in _FRAG14:
@@ -1424,6 +1437,51 @@ check("14j 欠账计数真的能数出来（台账里一半待补采就不能报
           type("_S", (), {"_seen_store": {"k1": {"ct": 1}, "k2": {"ct": 0, "rt": 0}},
                           "_entry_locked": staticmethod(_a16_cls._entry_locked)})()) == 1,
       "数不出「还欠几家」的账目只是把 0 家说成两句好听的话")
+
+# 14k 「0 家」的四类归因（链路没通／在等人／增量库全跳过／真零产出）读的是 stats() 里
+# 同名的四格，不是日志文案。少一路给键，那一队在实机体检里就只剩「采不到」这一个结论
+# ——2026-11-15 那轮 4 站「采不到」逐一定性后没一站是代码问题，缺的就是这几格。
+# 结构判据扫源码，新增通道忘了给键会在门禁里红，而不是等线上出假红。
+_ATTR_KEYS = ("page_fail", "last_page_error", "waiting", "incr_skip")
+
+
+def _stats_blocks(src):
+    """切出一个源文件里所有 ``def stats(self):`` 的函数体（按缩进找边界）。"""
+    out, lines = [], src.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() != "def stats(self):":
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        body = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                break
+            body.append(nxt)
+        out.append("\n".join(body))
+    return out
+
+
+def _stats_missing(body):
+    """这一份 stats() 少给哪几个归因键（走 _list_channel_extras 统一补齐的算给全）。"""
+    if "_list_channel_extras" in body:
+        return []
+    return [k for k in _ATTR_KEYS if f'"{k}"' not in body]
+
+
+_bad_stats14 = []
+for _f14 in (HERE / "cdp_base.py", HERE / "site_adapters.py"):
+    _blocks14 = _stats_blocks(_f14.read_text(encoding="utf-8"))
+    check(f"14k- {_f14.name} 里找得到 stats()", bool(_blocks14), "一份都没有=判据空转")
+    for _b in _blocks14:
+        _m14 = _stats_missing(_b)
+        if _m14:
+            _bad_stats14.append(f"{_f14.name}: 缺 {'、'.join(_m14)}")
+check("14k 每一路 stats() 都给全「链路/等人」四键（缺一路=那一路的在等人被报成采不到）",
+      not _bad_stats14, str(_bad_stats14))
+check("14l 反向对照：少给键的 stats() 确实会被 14k 抓住（这条判据不是摆设）",
+      _stats_missing('return {"pages": 0, "ok": 0}') == list(_ATTR_KEYS)
+      and not _stats_missing('return {"got": 0, **_list_channel_extras(self)}'),
+      "恒绿的判据比没有判据更糟")
 
 # ── 15. results_live：五路采集器同一个「就地补字段的实时视图」 ──────────────
 # 官网回采联系方式那一轮（功能④）必须写回真身：整体替换 results 会把并发的 append 盖掉，

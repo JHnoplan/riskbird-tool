@@ -184,6 +184,7 @@ class GongchangCrawler(CdpSiteCrawler):
                 last = str(e).splitlines()[0][:80]
             if i < tries - 1:
                 time.sleep(1.5 * (i + 1))
+        self._note_request_error(last)
         self._log(f"  ⚠ 世界工厂网请求失败（{last}）：{url[:70]}")
         return "", self._thin_shell_streak > 0
 
@@ -308,10 +309,13 @@ class GongchangCrawler(CdpSiteCrawler):
             url = self.build_search_url(kw, page)
             html, is_thin = self._fetch(url)
             if is_thin:
+                # 频控薄壳＝拿到了 200 却是一页假列表：既不是「本站没公司」，也不该进
+                # stat_pages（它压根没被解析过），更不该计进「取页失败」——那是限流的账
                 self._log(f"  「{kw}」第 {page} 页触发频控薄壳，停止翻页（已采数据不丢）")
                 return
             if not html:
-                self._log(f"  「{kw}」第 {page} 页没取到页面，停止翻页")
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
@@ -319,7 +323,8 @@ class GongchangCrawler(CdpSiteCrawler):
             if not entries:
                 empty += 1
                 if empty >= 2:
-                    self._log(f"  「{kw}」第 {page-1} 页起无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page-1} 页起", html)
+                              + "，停止翻页")
                     return
                 continue
             empty = 0

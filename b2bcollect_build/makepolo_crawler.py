@@ -409,6 +409,7 @@ class MakepoloCrawler(CdpSiteCrawler):
             if self.handle_http_block(url):
                 self._block_reason = ""
                 return self._fetch(url, enc=enc, tries=tries, guarded=False, referer=referer)
+        self._note_request_error(last)
         self._log(f"  ⚠ 马可波罗请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -511,7 +512,8 @@ class MakepoloCrawler(CdpSiteCrawler):
             url = self.build_search_url(kw, page)
             html = self._fetch(url, enc="gb18030", referer=HOME_URL)
             if not html:
-                self._log(f"  「{kw}」第 {page} 页没取到页面（仍在限流里或会话失效），停止翻页")
+                self._note_page_fail()
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
@@ -519,7 +521,8 @@ class MakepoloCrawler(CdpSiteCrawler):
             if not entries:
                 empty += 1
                 if empty >= 2:
-                    self._log(f"  「{kw}」第 {page - 1} 页起无公司结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"第 {page - 1} 页起", html)
+                              + "，停止翻页")
                     return
                 continue
             empty = 0

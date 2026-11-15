@@ -251,6 +251,15 @@ class Ali1688Crawler:
         # 本轮「增量库已含所以跳过」计数：没有这一笔账，界面上就只剩「新增公司 0 家」，
         # 用户分不清「已经采全了」和「去重口径把活锁死了」——后者恰恰是本轮 1688 出 0 的形态
         self._incremental_skipped = 0
+        # 本轮「一页都没取到」的账（2026-11-15 实机体检抓到，口径与 cdp_base 一致）：
+        # 请求层失败（导航没成/会话断开）和「这一页真的没有公司」在旧口径里长得一模一样，
+        # 而两者的处置完全相反——前者查出口和登录态，后者改代码，所以必须分账分文案。
+        self._page_fail = 0
+        self._last_page_error = ""
+        # 本轮结束那一刻是不是还在等人（登录／人工过验证）：1688 上一轮把 1500 秒体检
+        # 预算全烧在等登录上，最后 0 家被报成「采不到」。它既没被拦停熔断，也没失败，
+        # 只是在等人——这一格就是为了让界面与体检器能问出这一句。
+        self._waiting_human = ""
         self._guard_kw = ""          # 类目过滤：当前关键词
         self._guard_pred = None      # 类目过滤：关键词级 PRECISE 预测类目集（id+名）
 
@@ -270,6 +279,40 @@ class Ali1688Crawler:
                 getattr(self.signals, name).emit(*args)
             except Exception:
                 pass
+
+    def _note_request_error(self, err):
+        """把请求层最后一次失败的原因留在**机器可读**的地方（只留原因，不计数）。
+
+        口径与 cdp_base 的同名方法一致：日志会被 tail 截掉、会被 ⚠ 淹没上千行，而
+        「本轮为什么 0 家」的归因必须能被界面和体检器直接问出来，不能靠读文案。"""
+        self._last_page_error = str(err or "").strip()[:160] or "未知请求失败"
+
+    def _note_page_fail(self, err=""):
+        """记一笔「这一页列表根本没取到」——只在翻页层调用，一页最多一次。
+
+        原因与计数分家（同 cdp_base）：详情页的失败不该混进「取页失败 N 页」，否则这个
+        数随公司数线性增长，收尾的归因（⛔ 链路未通）就没法用它讲话了。"""
+        if err:
+            self._note_request_error(err)
+        elif not self._last_page_error:
+            self._note_request_error("请求层未给出原因（见紧邻上一行）")
+        self._page_fail += 1
+        return self._page_fail
+
+    def _no_result_line(self, kw, page_label, html, noun="公司数据"):
+        """「这一页没有公司」与「这一页压根没取到」必须是两句话（同 cdp_base）。
+
+        由来：1688 这一路把「等登录/被风控空页/真的没数据」三种 0 家都说成「无数据」，
+        实机体检因此把「没人登录」报成「1688 采不到」。判空页时还要看请求层留没留过原因，
+        留了就是链路，没留才是「翻到底/空切片」。"""
+        got_page = bool(html.strip()) if isinstance(html, str) else bool(html)
+        if not got_page:
+            if self._last_page_error:
+                return (f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"
+                        f"不是本站没有{noun}；最后一次：{self._last_page_error[:70]}）")
+            return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
+                    f"404 或频控空页；是哪一种看紧邻上一行）")
+        return f"  「{kw}」{page_label}无{noun}"
 
     def snapshot_results(self):
         with self.results_lock:
@@ -1069,6 +1112,10 @@ class Ali1688Crawler:
         每次都强制递增冷却（拿不到冷却窗口会把软限流熬成硬封号），
         达到阈值则直接优雅结束本轮，绝不死磕。"""
         login = (reason == "__LOGIN__")
+        # 「在等人」必须是一格机器可读的账，不是日志里的一句话（2026-11-15 实机：1688 把
+        # 整轮体检预算烧在等登录上，最后 0 家被报成「采不到」——它既没熔断也没失败，只是
+        # 在等人）。只在等待期间为真，解除或放弃时当场清掉，绝不留给下一句看起来正常的日志。
+        self._waiting_human = "登录" if login else "人工过验证"
         if login:
             self._emit("login_required_signal", "1688 需要登录，请在弹出的 Chrome 里完成登录")
             self._log("🔑 检测到未登录，请在 Chrome 窗口里登录 1688（登录后自动继续）")
@@ -1081,6 +1128,7 @@ class Ali1688Crawler:
                           f"判定为持续限流。为保护账号，本轮到此为止（已采数据已保存），"
                           f"请稍后（建议 ≥30 分钟）或调大采集间隔后再跑。")
                 self._stop_requested = True
+                self._waiting_human = ""      # 已经放弃等待并收轮，不再算「在等人」
                 self._run_abandon = (f"持续限流（{self._block_window // 60} 分钟内第 {strikes} 次被拦）："
                                      f"{str(reason or '')[:60]}")
                 return False
@@ -1104,6 +1152,7 @@ class Ali1688Crawler:
             waited += 3
             state = self._detect_block()
             if state == "" or (login and state != "__LOGIN__") or (not login and state != "__LOGIN__" and not state):
+                self._waiting_human = ""      # 人已经处理完了，这一格必须当场收掉
                 if login:
                     self._log("✅ 检测到已登录，继续采集")
                 else:
@@ -1122,6 +1171,8 @@ class Ali1688Crawler:
             if waited % 60 == 0:
                 self._log(f"   仍在等待{'登录' if login else '验证'}…已等 {waited} 秒")
         self._log("⚠ 等待超时，本轮结束（已采集数据不受影响）")
+        # 超时＝放弃了，「等人」这一格就此收账；真正留下的归因是下面那句 _run_abandon
+        self._waiting_human = ""
         self._run_abandon = (f"等待{'登录' if login else '人工过验证'}超时"
                              f"（{max_wait} 秒没人处理）")
         return False
@@ -1223,11 +1274,12 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
+                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
                 return
             html = self.driver.page_source
             offers = self._parse_list_page(html)
             if not offers:
-                self._log(f"  「{kw}」第 {page} 页无数据，停止翻页")
+                self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             new = skipped = seen = 0
             for o in offers:
@@ -1308,15 +1360,21 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
+                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
                 return
             entries = self._parse_company_page(self.driver.page_source)
             if not entries:
                 empty_streak += 1
                 if empty_streak >= 2:
                     if page == 2:
-                        self._log(f"  「{kw}」供应商渠道无公司卡片（1688 已改道/暂无该词公司），跳过该渠道")
+                        # 走到这里说明 _goto 成功、页面真取回来了（导航失败在上面已经记账并
+                        # 收轮），所以这一句可以如实说「无公司卡片」；两种来路不能共用一句
+                        self._log(f"  「{kw}」供应商渠道无公司卡片"
+                                  f"（1688 已改道／暂无该词公司），跳过该渠道")
                     else:
-                        self._log(f"  「{kw}」供应商渠道第 {page - 1} 页起无数据，停止翻页")
+                        self._log(self._no_result_line(kw, f"供应商渠道第 {page - 1} 页起",
+                                                       self.driver.page_source)
+                                  + "，停止翻页")
                     return
                 continue
             empty_streak = 0
@@ -1531,6 +1589,7 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
+                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
                 return
             src = self.driver.page_source
             pairs = self._parse_main_search_page(src)
@@ -1540,7 +1599,8 @@ class Ali1688Crawler:
             if not pairs:
                 empty_streak += 1
                 if empty_streak >= 2:
-                    self._log(f"  「{kw}」主搜渠道第 {page - 1} 页起无结果，停止翻页")
+                    self._log(self._no_result_line(kw, f"主搜渠道第 {page - 1} 页起", src,
+                                                   noun="结果") + "，停止翻页")
                     return
                 continue
             empty_streak = 0
@@ -1828,6 +1888,12 @@ class Ali1688Crawler:
         self._early_skipped = 0
         # 每轮重新起账：这个数跨轮累加会把「上一轮的跳过」算进本轮，界面读数就废了
         self._incremental_skipped = 0
+        # 链路账与「等人」账同理（口径与 cdp_base.crawl 一致）：跨轮累加的「取页失败」
+        # 会让上一轮的网络故障冒充本轮的归因，而「仍在等登录」留着不清更会让界面在
+        # 本轮早就正常跑完之后继续喊「等你登录」。
+        self._page_fail = 0
+        self._last_page_error = ""
+        self._waiting_human = ""
         self._guard_debug = []
         self._block_times = []
         self._current_delay = self.delay_between
@@ -1978,6 +2044,12 @@ class Ali1688Crawler:
         # 只有「种子库累计 N 家」这一句是不够的——它说的是库有多大，不是这轮为什么没活。
         incr = (f"，增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)"
                 if self._incremental_skipped else "")
+        # 链路那一笔单独记账（2026-11-15 实机体检）：整轮都卡在导航/等登录时，上面每一笔
+        # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事只有
+        # 取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与 cdp_base 同构，
+        # 对拍见 b2bcollect_build/test_data_dir_offline.py 第 14 节）。
+        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"
+                    if self._page_fail else "")
         pend = self._seen_store_pending() if self.incremental else 0
         pending = (f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
@@ -1986,14 +2058,29 @@ class Ali1688Crawler:
         # 有一半责任在这句恒 ✅ 的日志上（另一半是驱动判据，见 _attach）。
         if getattr(self, "_run_abandon", ""):
             mark, why = "⛔", f"｜本轮因{self._run_abandon}提前收"
+        elif self._waiting_human:
+            mark, why = "⛔", (f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"
+                               "会自动续采，这一路的配额没烧）")
         elif self._stop_requested:
             mark, why = "⏹", "｜本轮被停止"
         elif not self.results:
-            mark, why = "⚠", "｜本轮零产出（见上方逐词日志）"
+            # 「零产出」有两种零，处置完全相反：链路根本没通（查出口/登录态/域名可达）
+            # 和增量库把这一轮全跳过了（种子库已含，链路是通的，要新数据得换词）。
+            # 合成一句「见上方账目」时，上一轮就是这么把 3 站全跳过、1 站网络不可达
+            # 都报成「采不到」的（判据片段与 cdp_base 逐字对拍，见第 14 节）。
+            if self._page_fail and not getattr(self, "stat_listed", 0):
+                mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到，"
+                                   "这不是本站没有数据（先查出口网络/域名可达，再谈代码）")
+            elif self._incremental_skipped:
+                mark, why = "⚠", (f"｜增量库全跳过 {self._incremental_skipped} 家"
+                                   f"（种子库 {len(self._seen_store)} 家已含，链路是通的；"
+                                   "要新数据得换关键词或放开省份）")
+            else:
+                mark, why = "⚠", "｜本轮零产出（见上方账目）"
         else:
             mark, why = "✅", ""
         self._log(f"{mark} 采集结束，共 {len(self.results)} 家公司"
-                  f"{why}{early}{incr}{pending}{tail}{saved}")
+                  f"{why}{pagefail}{early}{incr}{pending}{tail}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）

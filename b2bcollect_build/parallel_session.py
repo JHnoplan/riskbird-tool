@@ -877,9 +877,15 @@ class ParallelSession:
             pf = (f"｜省份把关：外省 {s.get('pf_miss', 0)}、"
                   f"属地未标注转名单补采 {s.get('pf_unknown', 0)}"
                   if (s.get('pf_miss') or s.get('pf_unknown')) else "")
+            # 链路/等人两笔跟着汇总账目走：某一路「0 家」的来路要在总账里就说清楚，
+            # 不能只写在它自己那一站的结束行里——用户看的是这份汇总（同名口径见 cdp_base）
+            lk = (f"｜取页失败 {s['page_fail']} 页"
+                  f"（最后一次：{str(s.get('last_page_error') or '')[:60]}）"
+                  if s.get('page_fail') else "")
+            wt = f"｜仍在等{s['waiting']}" if str(s.get('waiting') or '').strip() else ""
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
                       f"无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
-                      f"早过滤 {s['early']}｜详情不相关 {s['filtered']}{pf}")
+                      f"早过滤 {s['early']}｜详情不相关 {s['filtered']}{lk}{wt}{pf}")
         # 收尾回采官网联系方式（功能④）：放在**全部账目之后、crawl_finished 之前**——
         # 界面是在 crawl_finished 上触发导出与入库的，回采晚一步就等于这批补值永远进不了
         # 本轮交付文件；早一步则会在采集还没停稳时和野线程抢同一批记录。
