@@ -177,11 +177,11 @@ class GongchangCrawler(CdpSiteCrawler):
                             time.sleep(2.0 * (i + 1))
                         continue
             except requests.exceptions.ConnectionError as e:
-                last = str(e).splitlines()[0][:80] or "连接被重置"
+                last = self._shape_request_error(e)
                 self._session.close()
                 self._session = self._new_session()
             except Exception as e:
-                last = str(e).splitlines()[0][:80]
+                last = self._shape_request_error(e)
             if i < tries - 1:
                 time.sleep(1.5 * (i + 1))
         self._note_request_error(last)

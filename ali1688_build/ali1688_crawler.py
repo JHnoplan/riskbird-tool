@@ -182,6 +182,130 @@ def reap_driver_service(driver) -> bool:
         return False
 
 
+# ── 请求层失败分型：类别必须写在最前面，才活得过后面每一档截断 ──────────────────
+# 由来（2026-11-15 实机体检：顺企网被报成「采不到」）：一份 requests 异常的形状是固定的
+# 三段——池头 `HTTPSConnectionPool(host=…, port=…)`、`Max retries exceeded with url: …`、
+# `(Caused by XxxError(…))`。**决定处置方向的字全在第三段**：连不上＝查出口/域名可达，
+# 端口拒绝/无应答＝站点侧，MissingSchema＝代码把 URL 拼错，HTTP 429/403＝限流风控。
+# 而旧写法 `str(e).splitlines()[0][:80]` 恰好截在第三段之前，再叠加记账的 [:160]、渲染的
+# [:60]/[:70]/[:40]，界面与体检器最终拿到的是
+# `HTTPSConnectionPool(host='b2b.11467.com', port=443): Max ret`——一句既没有类别也没有
+# 方向的话，逼着人再 curl 一遍才能定性。分型器把**类别放在最前**、尾部挂实测到的关键证据，
+# 于是任何一档截断之后剩下的都还是一句能照着处置的话。
+# 下面每一档判据都对着本机抓到的真实异常文本（七档各自取过一份 str(e)，夹具见
+# test_block_triage_offline 第 ⑪ 节），不是照 urllib3 文档猜的。
+# 1688 这一路没有 requests（Selenium 取页），但它的失败原因同样是 `Message: unknown error:
+# net::ERR_…` 这种带类别的形状，所以这张表两边共用、**两份实现必须同字节**：分叉一次就会
+# 出现「同一件网络故障，1688 说一类、其它站说另一类」那种两套结论的账（第 ⑭ 节 14i 对拍钉的
+# 就是这个形状）。
+_ERR_POOL_RE = re.compile(r"(?:https?)ConnectionPool\(host='([^']*)'\s*,\s*port=(\d+)\)",
+                          re.IGNORECASE)
+_ERR_CAUSED_RE = re.compile(r"Caused by\s+", re.IGNORECASE)
+# `<HTTPSConnection(host='x', port=443) at 0x108e3b750>`：整段是噪声，里面有嵌套括号但没有
+# 尖括号，所以 [^<>]* 足够（真要写递归括号匹配就是过度设计）。
+_ERR_OBJ_RE = re.compile(r"<[^<>]*0x[0-9a-f]+>")
+# `XxxError(` / `XxxError(54, `：异常类名与它的 errno 参数都是包装，留下后面的消息。
+# 要求紧跟左括号，是为了不误删 `ConnectionError: (…)` 这种我们自己拼上去的前缀。
+_ERR_CLS_RE = re.compile(r"\b[A-Za-z_]*(?:Error|Exception)\(\s*(?:\d+\s*,\s*)?")
+# 池头有两种写法（异常里 `HTTPConnection(host=…, port=…):`、外层 `HTTPConnectionPool(...):`），
+# 都是定位信息（host/port 已经进头了），留在证据里就是把同一句话抄两遍。
+_ERR_POOL_HEAD_RE = re.compile(r"(?:https?)Connection(?:Pool)?\(host='[^']*'\s*,\s*port=\d+\)\s*:\s*",
+                               re.IGNORECASE)
+_ERR_HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(\d{3})\b", re.IGNORECASE)
+# 匹配顺序＝优先级：越具体越靠前。拒绝／重置／无应答三档共用一句
+# `Failed to establish a new connection: …`，只有 errno 与措辞能把它们分开，
+# 所以「只有它才有」的那两档必须排在「大家都有」的那一档之前——顺序错了就把
+# 「端口没人监听」说成「网络不通」，而这两件事的处方完全不同。
+_REQUEST_ERROR_KINDS = (
+    ("代理不通", ("proxyerror", "unable to connect to proxy", "proxy url")),
+    # 本机断网与「域名解析不了」是两件事：前者整站都出不去（对照组也会红），后者只有这一
+    # 个域名没了（对照组正常）。混成一档会让人去改 hosts／换域名，而该做的是接网线。
+    ("本机断网", ("net::err_internet_disconnected", "network is unreachable", "no route to host",
+                 "[errno 51]", "[errno 65]", "[errno 101]")),
+    ("DNS解析不了", ("nameresolutionerror", "failed to resolve", "getaddrinfo",
+                    "nodename nor servname", "name or service not known",
+                    "net::err_name_not_resolved")),
+    ("URL不合法(代码)", ("missingschema", "invalidurl", "no scheme supplied", "invalid url")),
+    ("连不上·端口被拒", ("connection refused", "[errno 61]", "[errno 111]",
+                      "net::err_connection_refused")),
+    ("连不上·被重置", ("connection reset", "connection aborted", "[errno 54]", "[errno 104]",
+                     "broken pipe", "remotedisconnected", "net::err_connection_reset",
+                     "net::err_socket", "net::err_network_changed")),
+    ("TLS握手失败", ("sslerror", "ssl:", "certificate", "handshake", "sslv3", "tlsv1",
+                   "net::err_ssl", "net::err_cert")),
+    ("连不上·无应答", ("connecttimeout", "connect timeout", "timed out. (connect",
+                     "operation timed out", "[errno 60]", "failed to establish a new connection",
+                     "net::err_connection_timed_out", "net::err_timed_out",
+                     "net::err_empty_response")),
+    ("读响应超时", ("readtimeout", "read timed out", "read timeout", "incompleteread",
+                   "timed out")),
+    ("返回不可解析(代码)", ("expecting value", "jsondecoder", "char 0", "no json could be",
+                         "failed to decode")),
+)
+# HTTP 状态码单独成一档：各站 `_fetch` 里失败原因本来就是 `f"HTTP {r.status_code}"` 这一句
+# 裸话，它没有异常链可读，但 429/403/5xx 的方向性最强（限流／风控／站点故障），
+# 而这几档恰恰是「等一等就好」与「改代码」的分界线。
+_HTTP_STATUS_KINDS = ((429, "HTTP 429·限流"), (403, "HTTP 403·风控/需验证"),
+                      (407, "HTTP 407·要代理口令"), (404, "HTTP 404·这一页没了"))
+
+
+def _request_error_detail(text, cap):
+    """把异常文本里「人能照着处置」的那一段剥出来：Caused by 之后优先，池头之后其次。"""
+    seg = _ERR_CAUSED_RE.split(text, 1)[-1] if _ERR_CAUSED_RE.search(text) else text
+    seg = _ERR_OBJ_RE.sub("", seg)
+    seg = _ERR_POOL_HEAD_RE.sub("", seg)
+    seg = _ERR_CLS_RE.sub("", seg)
+    seg = seg.replace("'", "").replace('"', "")
+    seg = re.sub(r",\s*,", ", ", seg)
+    seg = re.sub(r"^[\s(),]+|[\s(),]+$", "", seg)
+    seg = re.sub(r"\s+", " ", seg).strip()
+    # 上面把包装括号一路剥掉以后，消息自带的括号可能只剩左半边，这里补回去——
+    # `(connect timeout=8)` 被写成 `(connect timeout=8` 会让下一个人在日志里找不著头脑
+    opens = seg.count("(") - seg.count(")")
+    if opens > 0:
+        seg = seg + ")" * opens
+    return seg[:cap]
+
+
+def request_error_shape(err, cap=160):
+    """请求层失败原因 → `【类别】host:port｜关键证据`（类别在最前，截不丢）。
+
+    幂等：已经带类别的原文直接按 cap 收口，不再二次分型——各站 except 分支先调它一次
+    （为了打日志），翻页层随后还会把它交给 `_note_request_error` 记账，两次必须同一句。
+    认不出形状时返回 `【未分型】<清洗过的原文>`，**绝不返回空串、也绝不说「采不到」**：
+    这一格将来还要长出新档，先让「没分上型」这件事本身可见。"""
+    if err is None:
+        return "未知请求失败"
+    text = str(err) if isinstance(err, str) else f"{type(err).__name__}: {err}"
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        return "未知请求失败"
+    if text.startswith("【"):
+        return text[:cap]
+    low = text.lower()
+    kind = ""
+    for name, needles in _REQUEST_ERROR_KINDS:
+        if any(n in low for n in needles):
+            kind = name
+            break
+    rest = text
+    if not kind:
+        m = _ERR_HTTP_STATUS_RE.search(text)
+        if m:
+            code = int(m.group(1))
+            kind = dict(_HTTP_STATUS_KINDS).get(code) or (
+                f"HTTP {code}·站点故障" if code >= 500 else f"HTTP {code}·请求被拒")
+            rest = (text[:m.start()] + " " + text[m.end():]).strip("（）() ,:；;")
+    if not kind:
+        kind = "未分型"
+        rest = text
+    head = f"【{kind}】"
+    pool = _ERR_POOL_RE.search(text)
+    if pool and pool.group(1):
+        head = f"{head}{pool.group(1)}:{pool.group(2)}"
+    detail = _request_error_detail(rest, max(0, cap - len(head) - 1))
+    return f"{head}｜{detail}" if detail else head
+
 class Ali1688Crawler:
     PLATFORM_NAME = "1688"
     PLATFORM_SLUG = "1688"
@@ -256,6 +380,10 @@ class Ali1688Crawler:
         # 而两者的处置完全相反——前者查出口和登录态，后者改代码，所以必须分账分文案。
         self._page_fail = 0
         self._last_page_error = ""
+        # `_goto` 当场那一次导航失败的分型原因（每次调用开头清空，只对本次调用有效）：
+        # 列表页那句「导航失败」以前只能说「具体原因见紧邻上一行」，界面与体检器问不出类别，
+        # 而**只走浏览器**的那几站失败恰恰全在这一层。取用见 _goto_fail_reason。
+        self._last_goto_error = ""
         # 本轮结束那一刻是不是还在等人（登录／人工过验证）：1688 上一轮把 1500 秒体检
         # 预算全烧在等登录上，最后 0 家被报成「采不到」。它既没被拦停熔断，也没失败，
         # 只是在等人——这一格就是为了让界面与体检器能问出这一句。
@@ -280,12 +408,23 @@ class Ali1688Crawler:
             except Exception:
                 pass
 
+    def _shape_request_error(self, err):
+        """站点采集器在 except 分支里把异常整成一句带类别的话（**只整形、不记账**）。
+
+        为什么不顺手调 `_note_request_error`：重试循环里每一次失败都会经过这里，而记账那一格
+        讲的必须是「这一轮翻列表最终败在什么上」。中间某次超时、下一次就成功的情形很常见，
+        把中间态记进去会让一页正常取回的关键词在收尾时挂着一条旧故障——那种假红比不说更难查。
+        """
+        return request_error_shape(err)
+
     def _note_request_error(self, err):
         """把请求层最后一次失败的原因留在**机器可读**的地方（只留原因，不计数）。
 
         口径与 cdp_base 的同名方法一致：日志会被 tail 截掉、会被 ⚠ 淹没上千行，而
         「本轮为什么 0 家」的归因必须能被界面和体检器直接问出来，不能靠读文案。"""
-        self._last_page_error = str(err or "").strip()[:160] or "未知请求失败"
+        # 走分型器而不是 str(err)[:160]：截断从头部砍，砍掉的恰好是唯一决定方向的
+        # `(Caused by …)` 那一段（详见 request_error_shape 上方的由来）。
+        self._last_page_error = request_error_shape(err, cap=160)
 
     def _note_page_fail(self, err=""):
         """记一笔「这一页列表根本没取到」——只在翻页层调用，一页最多一次。
@@ -901,6 +1040,7 @@ class Ali1688Crawler:
             self._timeout_set = True
         backoff = (2, 5, 10, 15)
         waited_for_captcha = False  # 标记是否已经等人机验证通过（防重复刷新验证码）
+        self._last_goto_error = ""   # 只对本次调用有效（见 __init__ 处注释与 _goto_fail_reason）
         for i in range(tries):
             try:
                 # _ensure_tab 也放进 try：浏览器被关/崩溃时它访问 window_handles 会抛
@@ -936,8 +1076,15 @@ class Ali1688Crawler:
                     self.driver.get(url)
             except Exception as e:
                 # 只记录首行，避免 chromedriver 巨长堆栈刷屏；含超时/断网等
-                msg = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
-                if self._session_dead(msg):
+                raw = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                # 分型后的一句才交给日志与归因：类别在最前面，后面每一档 [:60] 截断都截不掉它
+                # （旧写法从头部截，砍掉的恰好是 chromedriver 那句 `Message: unknown error:
+                # net::ERR_…` 里唯一决定方向的字样）。`_session_dead` 仍**先按原文判**：它的标记
+                # 表是照着 Selenium 原文调出来的（见 SESSION_DEAD_MARKS 上方那段「不能用裸
+                # disconnected」的教训），只喂整形后的字符串会让这条自愈路径悄悄失效。
+                msg = request_error_shape(e, cap=160)
+                self._last_goto_error = msg   # 只对本次 _goto 有效：翻页层据此说清败在哪一类
+                if self._session_dead(raw) or self._session_dead(msg):
                     # 会话/浏览器已死：原地重试同一个 driver 永远救不回来，必须重启并
                     # 重新附加 Chrome（独立 profile 登录态保留），从卡住处续采而非崩线程。
                     self._log(f"⚠ 浏览器会话已断开（{msg[:60]}），正在重启 Chrome 续采…（第{i + 1}/{tries}次）")
@@ -957,12 +1104,25 @@ class Ali1688Crawler:
             if block:
                 waited_for_captcha = True  # 标记：已进入人工过码流程
                 if not self._wait_unblock(block):
+                    self._last_goto_error = "【被拦停】防采页没等到放行（等人过验证或等 IP 冷却）"
                     return False
                 # 【关键修复】过码成功后不再 continue 重试导航（那会触发新验证码），
                 # 而是进入下一轮循环，由上方 waited_for_captcha 分支处理
                 continue
             return True
         return False
+
+    def _goto_fail_reason(self, label="导航失败"):
+        """翻页层「这一页根本没取到」的原因句：`_goto` 当场抓到了就写清楚，抓不到才指日志。
+
+        为什么不让 `_goto` 自己记账：同一句「导航失败」既可能来自列表页也可能来自详情页，
+        而 `_last_page_error` 讲的是**整轮最终**败在什么上。重试循环里的中间态（第 1 次超时、
+        第 2 次就成功）很常见，把它记进整轮那一格，下一页明明正常取回时收尾还挂着一条旧故障，
+        `_no_result_line` 就会把「真的没公司」说成「链路没通」——那种假红比不说更难查。
+        所以 `_goto` 只留当场的 `_last_goto_error`，由**真的据此下结论的那一层**取用。
+        """
+        why = str(self._last_goto_error or "").strip()
+        return f"{label}（{why}）" if why else f"{label}（具体原因见紧邻上一行）"
 
     # 浏览器/会话已死的特征（Selenium WebDriverError 文案）：命中即重启续采，绝不崩线程。
     # 注意不能用裸 "disconnected"——断网 ERR_INTERNET_DISCONNECTED 也含该子串，
@@ -1274,7 +1434,7 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
-                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
+                self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
             html = self.driver.page_source
             offers = self._parse_list_page(html)
@@ -1360,7 +1520,7 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
-                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
+                self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
             entries = self._parse_company_page(self.driver.page_source)
             if not entries:
@@ -1589,7 +1749,7 @@ class Ali1688Crawler:
                 time.sleep(0.5)
             url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
             if not self._goto(url):
-                self._note_page_fail("列表页导航失败（原因见紧邻上一行）")
+                self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
             src = self.driver.page_source
             pairs = self._parse_main_search_page(src)
@@ -2017,8 +2177,9 @@ class Ali1688Crawler:
             except Exception as e:
                 # 兜底：迭代器内直接读 driver.page_source/current_url 等极端时序下仍可能
                 # 抛会话失效。会话失效→重启续采；其它异常→跳过该关键词继续，绝不让线程崩。
-                msg = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
-                if self._session_dead(msg):
+                raw = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                msg = request_error_shape(e, cap=160)
+                if self._session_dead(raw) or self._session_dead(msg):
                     self._log(f"⚠ 「{kw}」处理中浏览器会话断开（{msg[:60]}），重启后续采…")
                     if not self.try_restore_session():
                         self._log("❌ 无法恢复浏览器会话，本轮结束（已采数据已保存，可稍后继续）")

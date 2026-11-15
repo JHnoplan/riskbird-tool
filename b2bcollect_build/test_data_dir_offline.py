@@ -1424,7 +1424,15 @@ _FRAG14 = ("增量库跳过 {self._incremental_skipped} 家(已采过或重试�
            'f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"',
            'f"｜链路未通：{self._page_fail} 页一页都没取到，"',
            'f"｜增量库全跳过 {self._incremental_skipped} 家"',
-           '"｜本轮零产出（见上方账目）"')
+           '"｜本轮零产出（见上方账目）"',
+           # 请求层失败分型三件套（类别写在头部，[:40]/[:60]/[:70] 截不掉方向）。
+           # 为什么单列进这一格而不是只靠 11 节的同字节比对：这三行各自只有一行长，
+           # 只在其中一份里改的话，函数指纹与两份的行为断言都不一定响，而后果是
+           # 「有一个平台永远报【未分型】」——顺企网那轮被说成「采不到」就是这条链。
+           'def request_error_shape(err, cap=160):',
+           '        return request_error_shape(err)',
+           '        self._last_page_error = request_error_shape(err, cap=160)',
+           '        return f"{label}（{why}）" if why else f"{label}（具体原因见紧邻上一行）"')
 _src_cdp14 = (HERE / "cdp_base.py").read_text(encoding="utf-8")
 _src_a1614 = (HERE.parent / "ali1688_build" / "ali1688_crawler.py").read_text(encoding="utf-8")
 for _frag in _FRAG14:

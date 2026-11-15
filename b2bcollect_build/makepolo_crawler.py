@@ -398,11 +398,11 @@ class MakepoloCrawler(CdpSiteCrawler):
                     # 所以不设拦截原因、不白重试，由详情逻辑落到 contact_us 兜底。
                     return ""
             except requests.exceptions.ConnectionError as e:
-                last = str(e).splitlines()[0][:80] or "连接被重置"
+                last = self._shape_request_error(e)
                 self._session.close()
                 self._session = self._new_session()
             except Exception as e:
-                last = str(e).splitlines()[0][:80]
+                last = self._shape_request_error(e)
             if i < tries - 1:
                 time.sleep(1.2 * (i + 1))
         if guarded and self._block_reason:

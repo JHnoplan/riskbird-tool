@@ -352,11 +352,11 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 if r.status_code == 404:
                     return ""
             except requests.exceptions.ConnectionError as e:
-                last = str(e).splitlines()[0][:80] or "连接被重置"
+                last = self._shape_request_error(e)
                 self._session.close()
                 self._session = self._new_session()
             except Exception as e:
-                last = str(e).splitlines()[0][:80]
+                last = self._shape_request_error(e)
             if i < tries - 1:
                 time.sleep(1.2 * (i + 1))
         if guarded and self._block_reason:

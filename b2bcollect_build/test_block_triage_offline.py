@@ -793,4 +793,194 @@ check("reap 吞异常：停不掉也只是少收一次，绝不把收工路径�
       and _a1688.reap_driver_service(_Drv10(_s3)) is False)
 
 print("⑩ 独立 1688 包收尾：quit() 之外补收 chromedriver 子进程，幂等且吞异常 ✓")
+
+# ── ⑪ 请求层失败分型：类别写在最前面，才活得过渲染层每一档截断 ─────────────────
+# 由来（2026-11-15 实机体检）：顺企网 www.11467.com 三个 IP、80/443 端口 TCP 全连不上
+# （对照组同机 b2b168／世界工厂网／中国制造网全 200，另一条独立网络路径打同一域名也超时），
+# 结论是**站点侧不可达**。可工具当时说的是「顺企网采不到」，因为界面与体检器拿到的最后一次
+# 失败原因长这样：`HTTPSConnectionPool(host='b2b.11467.com', port=443): Max ret`——
+# 决定方向的 `Caused by ConnectTimeoutError(… timed out. (connect timeout=8))` 被请求层那句
+# `str(e).splitlines()[0][:80]` 从头部截掉了，再叠加记账 [:160] 与渲染 [:60]/[:70]/[:40]，
+# 一句话里既没有类别也没有方向。这一节钉的就是「分型器分得对」+「旧写法确实分不出来」。
+# 下面每一段文本都是本机 requests 真抛出来的 str(e)（现场抓的，不是照 urllib3 文档编的）：
+# 编的形状只能证明判据自洽，证不了它认得现实。
+_shape = cdp_base.request_error_shape
+# (期望类别, 真实异常类名, 真实消息, 必须留下的关键证据)
+_ERR_SAMPLES = (
+    ("连不上·无应答", "ConnectTimeout",
+     "HTTPSConnectionPool(host='b2b.11467.com', port=443): Max retries exceeded with url: / "
+     "(Caused by ConnectTimeoutError(<HTTPSConnection(host='b2b.11467.com', port=443) "
+     "at 0x108e3b750>, 'Connection to b2b.11467.com timed out. (connect timeout=8)'))",
+     "connect timeout=8"),
+    ("DNS解析不了", "ConnectionError",
+     "HTTPConnectionPool(host='no-such-host-zzqq.invalid', port=80): Max retries exceeded with url: / "
+     "(Caused by NameResolutionError(\"HTTPConnection(host='no-such-host-zzqq.invalid', port=80): "
+     "Failed to resolve 'no-such-host-zzqq.invalid' ([Errno 8] nodename nor servname provided, "
+     "or not known)\"))",
+     "Errno 8"),
+    ("连不上·端口被拒", "ConnectionError",
+     "HTTPConnectionPool(host='127.0.0.1', port=1): Max retries exceeded with url: / "
+     "(Caused by NewConnectionError(\"HTTPConnection(host='127.0.0.1', port=1): Failed to establish "
+     "a new connection: [Errno 61] Connection refused\"))",
+     "Connection refused"),
+    ("读响应超时", "ReadTimeout",
+     "HTTPConnectionPool(host='127.0.0.1', port=49923): Read timed out. (read timeout=2)",
+     "Read timed out"),
+    ("代理不通", "ProxyError",
+     "HTTPConnectionPool(host='127.0.0.1', port=1): Max retries exceeded with url: http://example.com/ "
+     "(Caused by ProxyError('Unable to connect to proxy', NewConnectionError(\"HTTPConnection"
+     "(host='127.0.0.1', port=1): Failed to establish a new connection: [Errno 61] Connection refused\")))",
+     "Unable to connect to proxy"),
+    ("TLS握手失败", "SSLError",
+     "HTTPSConnectionPool(host='self-signed.badssl.com', port=443): Max retries exceeded with url: / "
+     "(Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate "
+     "verify failed: self-signed certificate (_ssl.c:1032)')))",
+     "CERTIFICATE_VERIFY_FAILED"),
+    ("连不上·被重置", "ConnectionError",
+     "('Connection aborted.', ConnectionResetError(54, 'Connection reset by peer'))",
+     "Connection reset by peer"),
+    ("URL不合法(代码)", "MissingSchema",
+     "Invalid URL 'example.com/': No scheme supplied. Perhaps you meant https://example.com/?",
+     "No scheme supplied"),
+    ("返回不可解析(代码)", "JSONDecodeError", "Expecting value: line 1 column 1 (char 0)",
+     "Expecting value"),
+)
+
+
+def _as_err(cls_name, text):
+    """造一个「类名与真异常一致、消息与真异常一致」的异常（不必 import 那九个 requests 类）。"""
+    return type(cls_name, (Exception,), {})(text)
+
+
+_shaped = {}
+for _kind, _cls, _text, _proof in _ERR_SAMPLES:
+    _shaped[_kind] = _shape(_as_err(_cls, _text))
+    check(f"11a 分型正确：{_cls} → 【{_kind}】",
+          _shaped[_kind].startswith(f"【{_kind}】"), _shaped[_kind])
+    # 光有类别等于把「为什么」又丢了：现场证据必须在句子里（这一条挡的是过度清洗）
+    check(f"11b 关键证据留在句子里：{_kind}", _proof in _shaped[_kind], _shaped[_kind])
+
+# 11c 反向对照：旧写法在同一批真实文本上**一个类别都给不出**。不验这一条，上面 18 项断言
+#     可能只是装饰——判据只有在「坏了会响」时才算存在。
+_old_blind = [k for k, _c, _t, _p in _ERR_SAMPLES
+              if "【" not in str(_as_err(_c, _t)).splitlines()[0][:80]]
+check("11c 反向对照：旧写法 str(e).splitlines()[0][:80] 在这九份真文本上全blind",
+      len(_old_blind) == len(_ERR_SAMPLES),
+      f"只有 {len(_old_blind)}/{len(_ERR_SAMPLES)} 份认不出类别")
+
+# 11d 性质判据：渲染层用的是**截断之后**的字符串（channel_health [:40]、收尾 [:60]、
+#     体检器与 GUI [:70]），所以「类别在头部」要按这些真实数字逐档验，而不是只验返回值。
+#     以后有人把类别挪到句中或把 host 挪到最前，这一条会先响。
+_caps = (40, 60, 70)
+_too_far = [f"{k}@{n}→{v[:n]!r}" for k, v in _shaped.items() for n in _caps
+            if "】" not in v[:n]]
+check(f"11d 每一档截断（{'、'.join(str(n) for n in _caps)}）之后都还读得出类别",
+      not _too_far, "；".join(_too_far[:3]))
+_no_host = [f"{k}→{_shaped[k][:44]!r}" for k, _c, _t, _p in _ERR_SAMPLES
+            if "host='" in _t and ":" not in _shaped[k].split("｜")[0]]
+check("11e 原文带池头时 host:port 紧跟在类别后面（截断后仍知道是哪个域名败的）",
+      not _no_host, "；".join(_no_host))
+
+# 11f 表序＝优先级：被拒／无应答／代理三档共用一句 `Failed to establish a new connection`，
+#     只有 errno 与措辞分得开。顺序写错就把「端口没人监听」说成「网络不通」，处方完全不同。
+_shared = [_t for _k, _c, _t, _p in _ERR_SAMPLES if "Failed to establish a new connection" in _t]
+check("11f 共用同一句话的三档各自归位（这一条钉住判据表的顺序）",
+      len(_shared) >= 2
+      and _shaped["连不上·端口被拒"] != _shaped["连不上·无应答"]
+      and _shape(_as_err("ConnectionError", _shared[0])).startswith("【连不上·端口被拒】")
+      and _shape(_as_err("ProxyError", _shared[-1])).startswith("【代理不通】"),
+      f"共用句 {len(_shared)} 份｜被拒={_shaped['连不上·端口被拒'][:26]}"
+      f"｜无应答={_shaped['连不上·无应答'][:26]}")
+
+# 11g 幂等：各站 except 分支先整形一次（为了打日志），翻页层随后把**同一句**交给
+#     `_note_request_error` 记账；两次必须同一句话，否则日志与界面会各说一种。
+_once = _shape(_as_err("ConnectTimeout", _ERR_SAMPLES[0][2]))
+check("11g 幂等：整过形的句子再过一次分型器不变样",
+      _shape(_once) == _once and _shape(_once[:160]) == _once[:160], _shape(_once))
+
+# 11h 空手而归不许冒充产出结论：None/空串也必须有一句可念的话，而任何一档都**不许**出现
+#     「采不到」三个字——那是产出结论，本轮假红恰恰红在这三个字被链路故障借用。
+check("11h 空输入也有话可说，且十分型里没有任何一句说「采不到」",
+      _shape("") == "未知请求失败" and _shape(None) == "未知请求失败"
+      and _shape("   ") == "未知请求失败"
+      and all("采不到" not in v for v in _shaped.values()),
+      repr(_shape("")) + " / " + repr(_shape(None)))
+
+# 11i HTTP 状态档：各站 `_fetch` 的失败原因本来就是 `f"HTTP {code}"` 这一句裸话，而
+#     429/403/5xx 恰恰是「等一等就好」与「改代码」的分界线。附带验「（防采插页）」这种
+#     站点自己补的说明不会被状态码档吃掉。
+check("11i HTTP 状态自带方向（429 限流／403 风控／5xx 站点故障／404 这一页没了）",
+      _shape("HTTP 429（防采插页）").startswith("【HTTP 429·限流】")
+      and "防采插页" in _shape("HTTP 429（防采插页）")
+      and _shape("HTTP 403").startswith("【HTTP 403·风控/需验证】")
+      and _shape("HTTP 502").startswith("【HTTP 502·站点故障】")
+      and _shape("HTTP 404").startswith("【HTTP 404·这一页没了】"),
+      _shape("HTTP 429（防采插页）") + "｜" + _shape("HTTP 502"))
+
+# 11j Chrome/Selenium 那一侧的 net::ERR_*：1688 与各名单通道取页失败都是这个形状，共用同
+#     一张表才不会「同一件网络故障，两个平台说两种话」。断网与解析失败必须分档（对照组红不
+#     红是两回事），混成一档会让人去改 hosts 而该做的是接网线。
+check("11j Chrome net::ERR_* 归同一张表，且「本机断网」不与「DNS解析不了」混档",
+      _shape("Message: unknown error: net::ERR_NAME_NOT_RESOLVED").startswith("【DNS解析不了】")
+      and _shape("net::ERR_CONNECTION_TIMED_OUT").startswith("【连不上·无应答】")
+      and _shape("net::ERR_CONNECTION_REFUSED").startswith("【连不上·端口被拒】")
+      and _shape("net::ERR_INTERNET_DISCONNECTED").startswith("【本机断网】"),
+      _shape("net::ERR_INTERNET_DISCONNECTED"))
+
+# 11k 认不出形状时**必须留下痕迹**：【未分型】是这张表的缺口清单（本轮就有三档是这样长出来的），
+#     静默返回空串或返回原文都会让缺口谁也看不见。
+check("11k 没分上型的带【未分型】并保留原文（缺口可见才补得上）",
+      _shape("某种没见过的新错误").startswith("【未分型】")
+      and "某种没见过的新错误" in _shape("某种没见过的新错误"),
+      _shape("某种没见过的新错误"))
+
+# 11l 两份镜像同答：1688 独立包自己实现了一份，同一条异常两边必须给同一句话
+_a16_shape = _a1688.request_error_shape
+_diff = [(k, _shaped[k], _a16_shape(_as_err(c, t))) for k, c, t, _p in _ERR_SAMPLES
+         if _a16_shape(_as_err(c, t)) != _shaped[k]]
+check("11l 1688 那份镜像逐字同答（分叉＝同一件事两套结论）", not _diff, str(_diff[:1]))
+_src_cdp11 = (Path(__file__).resolve().parent / "cdp_base.py").read_text(encoding="utf-8")
+_src_a1611 = (Path(__file__).resolve().parents[1] / "ali1688_build" / "ali1688_crawler.py"
+              ).read_text(encoding="utf-8")
+
+
+def _between(src, start, end):
+    """源文件里 [起始标记, 结束标记] 这一段（含结束标记本身）；任一边缺标记就返回哨兵让它响。"""
+    if start not in src or end not in src:
+        return f"（缺标记：start={start in src} end={end in src}）"
+    i = src.index(start)
+    j = src.index(end, i) + len(end)
+    return src[i:j]
+
+
+_SHAPE_TAIL = '    return f"{head}｜{detail}" if detail else head\n'
+check("11m 分型器两份**源码同字节**（只比答案比不出注释里的由来，也拦不住悄悄改一边）",
+      _between(_src_cdp11, "def request_error_shape(err, cap=160):", _SHAPE_TAIL)
+      == _between(_src_a1611, "def request_error_shape(err, cap=160):", _SHAPE_TAIL),
+      "两份 request_error_shape 函数体有差异")
+check("11n 判据表两份同字节（新加一档只加一边，就会有一个平台一直【未分型】）",
+      _between(_src_cdp11, "_REQUEST_ERROR_KINDS = (", "_HTTP_STATUS_KINDS")
+      == _between(_src_a1611, "_REQUEST_ERROR_KINDS = (", "_HTTP_STATUS_KINDS"),
+      "_REQUEST_ERROR_KINDS 两份不一致")
+check("11o _goto_fail_reason 两份同字节（翻页层那句「导航失败」的取用口径两边共用）",
+      _between(_src_cdp11, '    def _goto_fail_reason(self, label="导航失败"):',
+               '        return f"{label}（{why}）" if why else f"{label}（具体原因见紧邻上一行）"')
+      == _between(_src_a1611, '    def _goto_fail_reason(self, label="导航失败"):',
+                  '        return f"{label}（{why}）" if why else f"{label}（具体原因见紧邻上一行）"'),
+      "_goto_fail_reason 两份不一致")
+
+# 11p 结构判据（同类查全）：**请求层不许再自己从头部截断**。只测函数挡不住下一个新站点照抄
+#     一句 `str(e).splitlines()[0][:80]`——本轮九站就是各抄一份才凑齐这个缺陷的。
+_head_cut = sorted(p.name for p in Path(__file__).resolve().parent.glob("*_crawler.py")
+                   if "str(e).splitlines()[0][" in p.read_text(encoding="utf-8"))
+check("11p 没有一份站点采集器还在自己 str(e).splitlines()[0][:N]（截断只交给分型器）",
+      not _head_cut, "、".join(_head_cut))
+# 整形了却不记账 = 界面照样问不到（本轮 gys 就是这样：日志说得出、账上是空的）
+_unrecorded = sorted(p.name for p in Path(__file__).resolve().parent.glob("*_crawler.py")
+                     if "_shape_request_error(" in p.read_text(encoding="utf-8")
+                     and "_note_request_error(" not in p.read_text(encoding="utf-8"))
+check("11q 整形过的站点一定也记了账（只打日志的失败在界面上等于没发生）",
+      not _unrecorded, "、".join(_unrecorded))
+print("⑪ 请求层失败分型：类别在头部， [:40]/[:60]/[:70] 三档截断之后仍读得出方向 ✓")
+
 print(f"\n全部 {ok} 项断言通过 ✅")

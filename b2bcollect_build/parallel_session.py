@@ -40,7 +40,8 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     import customer_library_cleaner as _cleaner
 
-from cdp_base import clean_cell, CdpSiteCrawler, strict_keyword_filter
+from cdp_base import (clean_cell, CdpSiteCrawler, strict_keyword_filter,
+                         request_error_shape)
 # 官网回采联系方式的唯一口径实现（采集收尾与手动补采都走它，不在本文件重复写判据）。
 import website_contact as _site_wc
 # 命中层级/证据的列名单一来源 + 瀑布式多源补全（功能 A）。瀑布只在会话勾选上时接管
@@ -2206,7 +2207,11 @@ class ParallelSession:
                 try:
                     c._goto(c.BASE_URL, expect_domain=c.HOME_DOMAIN or None, tries=2)
                 except Exception as e:
-                    self._log(f"⚠ {c.PLATFORM_NAME} 首页导航失败：{str(e).splitlines()[0][:80]}")
+                    # 整形而不是 str(e)[:80]：这一句是「这个站今天通不通」的第一现场，
+                    # 从头部截 80 字恰好把决定方向的 `(Caused by …)`／`net::ERR_…` 截掉，
+                    # 于是界面只能说「首页导航失败」，人分不清是站点停了还是本机断了网。
+                    self._log(f"⚠ {c.PLATFORM_NAME} 首页导航失败："
+                              f"{request_error_shape(e, cap=120)}")
         return ok
 
     def close_browser(self):
@@ -2259,7 +2264,8 @@ class ParallelSession:
                 c._ensure_tab()
                 c._goto(c.BASE_URL, tries=2)
             except Exception as e:
-                return True, f"1688 已打开（首页导航异常：{str(e).splitlines()[0][:80]}）"
+                return True, (f"1688 已打开（首页导航异常："
+                              f"{request_error_shape(e, cap=120)}）")
             self.set_browser_background(False)   # 还原/前置窗口，把登录页递到眼前
             return True, "1688 已在浏览器打开，请确认登录状态"
         c = self.channels.get(slug)
@@ -2284,7 +2290,10 @@ class ParallelSession:
         try:
             return c.login_state()
         except Exception as e:
-            return "unknown", str(e).splitlines()[0][:80]
+            # 登录态问不出来时也要说清「为什么问不出来」：连接断了／会话没了／脚本抛错，
+            # 三种情况的下一步完全不同（接浏览器、重开标签、改代码），一句 [:80] 的原文
+            # 经常三种都长成一个头。
+            return "unknown", request_error_shape(e, cap=80)
 
     def _pick_site(self, name=""):
         """按站名找采集器；没给名字就找「当前正在等放行的站」，再退而找

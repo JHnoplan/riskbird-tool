@@ -335,13 +335,16 @@ class GysCrawler(CdpSiteCrawler):
                     return r.text
                 last = f"HTTP {r.status_code}"
             except Exception as e:
-                last = str(e).splitlines()[0][:80]
+                last = self._shape_request_error(e)
             if i < tries - 1:
                 time.sleep(1.5 * (i + 1))
         self._http_fails += 1
         if self._http_fails >= 3 and not self._http_disabled:
             self._http_disabled = True
             self._log("  ⚠ gys 连续取页失败，本轮改走浏览器渲染（不再走纯 HTTP）")
+        # 这一路以前只打日志、不记账：日志会被 tail 截掉，而界面与体检器问的是 stats()。
+        # 不记这一笔，gys 整轮 0 家时「链路没通」与「真的没有公司」在账上长得一模一样。
+        self._note_request_error(last)
         self._log(f"  ⚠ gys HTTP 取页失败（{last}）：{url[:70]}")
         return ""
 

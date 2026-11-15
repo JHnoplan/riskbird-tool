@@ -775,7 +775,9 @@ if HAS_QZD:
             try:
                 return self.check_login()
             except Exception as e:
-                return "unknown", str(e).splitlines()[0][:80]
+                # 同 parallel_session.login_status_of：问不出登录态时那句话要带类别，
+                # 「接不上浏览器」与「脚本自己抛错」在界面上是完全不同的两种处置。
+                return "unknown", cdp_base.request_error_shape(e, cap=80)
 
         # ── 产出分类（三平台共用台账的翻译层）──────────────────
         def classify(self, result):
@@ -993,7 +995,7 @@ class _ListChannelBase:
         try:
             state, detail = self.check_login()
         except Exception as e:
-            return "unknown", str(e).splitlines()[0][:80]
+            return "unknown", cdp_base.request_error_shape(e, cap=80)
         # 三个平台的 check_login 都走 block_guard.login_state，返回 missing 表示
         # 「读到了 Cookie 但没有登录标识」＝需要登录；unknown 交给空壳门兜底。
         return ("need_login", detail) if state == "missing" else (state, detail)
