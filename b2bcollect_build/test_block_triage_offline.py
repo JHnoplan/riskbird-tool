@@ -12,6 +12,10 @@
 # 未登录会话在联系方式页反复吃验证，老提示只说「过验证」，用户照着反复过码白等）。
 # 第 10 节钉 1688 的收尾：Selenium 4.51 的 quit() 只删会话、不收 chromedriver 子进程，
 # 独立的 Ali1688Tool 包里又没有 chrome_driver 那套口径，必须就地补收（幂等、吞异常）。
+# 第 12 节钉「连不上」这一族账（2026-11-14 实机：顺企网 80/443 全部连接超时，界面却按「仍在
+# 防采/限流状态」说话，用户照着等两小时 IP 冷却）：连接/读数两个数分开、连接类连续两次拉黑主机、
+# 恢复探测与对照实测这两条支路也不许把失败原因吞掉（12m 不许裸截断异常文本、12n 不许静默 except、
+# NET_FAIL_TAG 只准基类那几把把手拼一次）。
 # 全程不联网、不启 Chrome：响应注入假会话，cdp_base 的 time 换成可推进的假时钟。
 import sys
 import inspect
@@ -844,6 +848,14 @@ _ERR_SAMPLES = (
      "No scheme supplied"),
     ("返回不可解析(代码)", "JSONDecodeError", "Expecting value: line 1 column 1 (char 0)",
      "Expecting value"),
+    # 类名兜底那一档（2026-11-14 实机跨国采购网引导失败就是这一形状：只剩池头与
+    # `Max retries exceeded`，`Caused by` 那半句是空的）。按消息关键词认不出来，可 requests 的
+    # ConnectionError 类名本身就写着「连接阶段断了」——让它掉进【未分型】，这一台既不进熔断账、
+    # 探测也不挂网络前缀，界面就会说成「站点在拦」。
+    ("连不上·链路中断", "ConnectionError",
+     "HTTPSConnectionPool(host='www.globalimporter.net', port=443): Max retries exceeded "
+     "with url: /",
+     "Max retries exceeded"),
 )
 
 
@@ -982,5 +994,750 @@ _unrecorded = sorted(p.name for p in Path(__file__).resolve().parent.glob("*_cra
 check("11q 整形过的站点一定也记了账（只打日志的失败在界面上等于没发生）",
       not _unrecorded, "、".join(_unrecorded))
 print("⑪ 请求层失败分型：类别在头部， [:40]/[:60]/[:70] 三档截断之后仍读得出方向 ✓")
+
+# ══════════════════════════════════════════════════════════
+# ⑫ 主机级熔断 + 连接/读数超时拆分：连不上的主机不该再吃整轮预算
+# ══════════════════════════════════════════════════════════
+# 由来（本轮实机体检抓到两条同族缺陷，都不在解析代码里）：
+#   1) 裸 HTTP 把 `timeout=25` 同时当**连接**超时和**读数**超时。同机实测：
+#      b2b.11467.com(59.36.210.149) 与 www.11467.com(58.61.157.108) 的 80/443 全部
+#      TCP 连接超时、ICMP 100% 丢包，而对照组（同机 b2b168／世界工厂网／中国制造网／
+#      爱采购）全 200 —— 站点侧不可达。旧写法下顺企网每个关键词的第一页要付
+#      4×25s+退避≈107s，两个关键词 3 分钟全喂给超时，能出货的路子反而被饿死。
+#   2) 更糟的是**每一页都重新付一遍**：连不上是主机的属性，不是这一页的属性，
+#      重试、换关键词、借浏览器标签都改变不了它。大厂口径是主机级隔离（dead-host
+#      quarantine）＋冷却后再给一次机会，而不是「本轮无限重试」。
+# 连接档取 10s 的实测依据：正常站 0.03~0.4s，偶发 SYN 重传 1~7s（爱采购抽到过一次
+# 「第一次 5s 没连上、第二次 0.03s」），10s 既容得下重传又能在真连不上时快速失败。
+import ast as _ast
+import re
+import tempfile as _tf
+import importlib.util as _ilu
+from pathlib import Path as _P12
+
+HERE = _P12(__file__).resolve().parent
+import website_contact                                        # noqa: E402
+
+
+def _load_live_check():
+    """把实机体检器当普通模块载进来（只取它的判据函数，绝不跑 main）。
+
+    为什么要跨目录载：熔断这笔账最终是在体检报告里给人看的，账记对了、报告不读，
+    用户看到的还是一句「采不到」。载成模块就能让 ⑫ 节同时钉住两端。
+    """
+    path = _REPO / "debug" / "platform_live_check.py"
+    if not path.exists():
+        raise AssertionError(f"FAIL: 体检器不在预期位置（判据失去对拍对象）：{path}")
+    spec = _ilu.spec_from_file_location("_live_check_for_test", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_LIVE_SRC = (_REPO / "debug" / "platform_live_check.py").read_text(encoding="utf-8")
+
+
+def _def_src(src, name, cls_name=None):
+    """某个函数/方法的源码段（可按类限定）。找不到就返回哨兵，让「判据没落地」自己响。"""
+    tree = _ast.parse(src)
+    scopes = ([n for n in _ast.walk(tree)
+               if isinstance(n, _ast.ClassDef) and n.name == cls_name]
+              if cls_name else [tree])
+    for sc in scopes:
+        for fn in (n for n in _ast.walk(sc)
+                   if isinstance(n, _ast.FunctionDef) and n.name == name):
+            seg = _ast.get_source_segment(src, fn)
+            if seg:
+                return seg
+    return f"（找不到 {cls_name or '<模块>'}.{name}）"
+
+
+# 12a 取值形状：拆成二元组，读数沿用调用方给的数（不许把慢页面等不到的那一份削掉）
+check("12a http_timeout(N) → (10, N)：连接与读数是两个数",
+      cdp_base.http_timeout(25) == (10, 25) and cdp_base.http_timeout(20) == (10, 20)
+      and cdp_base.http_timeout() == (10, 25) and cdp_base.http_timeout(0) == (10, 25),
+      repr(cdp_base.http_timeout(25)))
+check("12a- 连接档两处必须同一个数（cdp_base 与官网回采各定各的＝又一套口径）",
+      cdp_base.HTTP_CONNECT_TIMEOUT == website_contact.CONNECT_TIMEOUT == 10,
+      f"cdp_base={cdp_base.HTTP_CONNECT_TIMEOUT} website_contact={website_contact.CONNECT_TIMEOUT}")
+
+
+_HTTP_RECV_RE = re.compile(r"session|requests|\bjar\b")
+# 本机回路（CDP 控制面）不参与这两笔账：那是秒级预算的 127.0.0.1，熔断/超时口径都不适用
+_LOCAL_EXEMPT_RE = re.compile(r"local_session|local_url|/json/|127\.0\.0\.1|localhost")
+# 变量名绑的是 HTTP 客户端（`s = self._session`、`s = requests.Session()`、
+# `s = self._ensure_http()`）才算取页接收者；会话工厂在各站有不同名字，这里逐个列出来，
+# 新增工厂名却没登记的话，判据会安静地把那一处当成字典取值放过
+_HTTP_BIND_RE = re.compile(r"[Ss]ession|_ensure_http|_http_client|\bjar\b")
+# 反面：绑的是**响应**而不是客户端（`ver = requests.get(...).json()` 之后那句
+# `ver.get("webSocketDebuggerUrl")` 是字典取值），按上面那条会被认成客户端——必须排除，
+# 否则门开始在编事故（本轮 site_adapters 的爱企查标签那一处就是这个形状）
+_HTTP_RESPONSE_RE = re.compile(r"\.(?:get|post|request|head)\s*\(")
+
+
+def _http_client_names(src, root):
+    """这棵子树里被**赋值为 HTTP 客户端**的局部变量名。
+
+    为什么不能只看接收者的名字：`s.get(url, timeout=…)`（mic 的重定向探测）是真的取页，
+    `s.get("dead_hosts")`（cdp_base.stats 里的字典取值）是账本读数——两处写法只差参数。
+    收进名单就两头都对，按名字排除就一头瞎、一头吵，所以按「这个名字在本函数里被什么赋值」判。
+    """
+    names = set()
+    for node in _ast.walk(root):
+        if not isinstance(node, _ast.Assign):
+            continue
+        val = _ast.get_source_segment(src, node.value) or ""
+        if not _HTTP_BIND_RE.search(val) or _HTTP_RESPONSE_RE.search(val):
+            continue
+        for t in node.targets:
+            if isinstance(t, _ast.Name):
+                names.add(t.id)
+    return names
+
+
+def _http_calls_in(src, root):
+    """root 这棵子树里**真发 HTTP 请求**的调用节点。
+
+    两条排除都是必需的，缺一条判据就变成噪音，噪音会被下一个人整条关掉：
+      ① 接收者得是 requests/session 那一族（含上面按赋值认出来的局部名）——
+         `queue.get(timeout=5)`、`s.get("dead_hosts")` 这种同名方法不算；
+      ② 本机 CDP 控制面不算（见 _LOCAL_EXEMPT_RE）。
+    """
+    bound = _http_client_names(src, root)
+    out = []
+    for node in _ast.walk(root):
+        if not isinstance(node, _ast.Call) or not isinstance(node.func, _ast.Attribute):
+            continue
+        if node.func.attr not in ("get", "post", "request", "head"):
+            continue
+        recv = _ast.get_source_segment(src, node.func.value) or ""
+        whole = _ast.get_source_segment(src, node) or ""
+        is_http = bool(_HTTP_RECV_RE.search(recv)) or (
+            isinstance(node.func.value, _ast.Name) and node.func.value.id in bound)
+        if not is_http or _LOCAL_EXEMPT_RE.search(whole):
+            continue
+        out.append(node)
+    return out
+
+
+def _bare_timeout_problems(src):
+    """AST 判据：真·HTTP 取页的 timeout 必须走 http_timeout()（回采那一处必须带 CONNECT_TIMEOUT）。
+
+    为什么按 AST 而不是按行：本轮就有两份是**跨行调用**（跨国采购网质询页那一跳），
+    按行扫会漏；而 `queue.get(timeout=5)`、`s.get("dead_hosts")` 这些同名方法按行扫
+    会误响。行扫描的门在自己身上造新缺陷，就失去修它的意义了。
+    """
+    out = []
+    tree = _ast.parse(src)
+    for node in _http_calls_in(src, tree):
+        kwargs = {k.arg: k.value for k in node.keywords if k.arg}
+        if "timeout" not in kwargs:
+            continue                       # 没写 timeout＝用的是 requests 默认值，另说
+        val = kwargs["timeout"]
+        if isinstance(val, _ast.Call) and getattr(val.func, "id", "") == "http_timeout":
+            continue
+        if (isinstance(val, _ast.Tuple) and val.elts
+                and isinstance(val.elts[0], _ast.Name) and "CONNECT" in val.elts[0].id):
+            continue
+        out.append(f"第 {node.lineno} 行 {node.func.attr}(timeout=…) 没拆连接/读数")
+    return out
+
+
+_HTTP_SRC = {p.name: p.read_text(encoding="utf-8")
+             for p in [HERE / "cdp_base.py", HERE / "website_contact.py", HERE / "site_adapters.py"]
+             + sorted(HERE.glob("*_crawler.py"))}
+_found_bare = {n: r for n, s in _HTTP_SRC.items() if (r := _bare_timeout_problems(s))}
+check(f"12b 交付链没有一处裸 HTTP 还把一个数当连接+读数用（扫了 {len(_HTTP_SRC)} 份）",
+      not _found_bare, str({k: v[:2] for k, v in _found_bare.items()}))
+check("12b- 反向对照：把这一行退回 `timeout=25`，判据当场响并且点出第几行",
+      _bare_timeout_problems('r = self._session.get(url, timeout=25, headers=headers)\n')
+      and _bare_timeout_problems('r = _http_session().get(url, timeout=timeout)\n')
+      and not _bare_timeout_problems('r = self._session.get(url, timeout=http_timeout(25))\n')
+      and not _bare_timeout_problems('r = _http_session().get(url, timeout=(CONNECT_TIMEOUT, t))\n'),
+      "退回旧写法的夹具没被抓住＝这条门是摆设")
+check("12b-- 反向对照：CDP 控制面与队列的同名 .get 不误响（门不能靠禁掉判据来保持安静）",
+      not _bare_timeout_problems('return local_session().get(local_url(port, "/json/version"),'
+                                 ' timeout=3).status_code == 200\n')
+      and not _bare_timeout_problems('item = self._queue.get(timeout=5)\n')
+      and not _bare_timeout_problems('v = self._cache.get("k")\n'),
+      "误响的门会被下一个人在注释里关掉")
+
+
+def _own_flag_false(cls, name):
+    """类**自己这一层**有没有写 `NAME = False`（不含继承、不含注释——搜字符串两者都骗得过）。"""
+    return any(isinstance(st, _ast.Assign)
+               and any(isinstance(t, _ast.Name) and t.id == name for t in st.targets)
+               and _ast.unparse(st.value) == "False"
+               for st in cls.body)
+
+
+def _pure_http_classes(src):
+    """这份源码里自己声明 NEEDS_BROWSER = False 的类名：主机熔断判据的作用范围。"""
+    return [cls.name for cls in (n for n in _ast.walk(_ast.parse(src))
+                                 if isinstance(n, _ast.ClassDef))
+            if _own_flag_false(cls, "NEEDS_BROWSER")]
+
+
+def _fuse_names(src):
+    """基类里**真的会去问主机熔断**的方法名：_skip_dead_host 本体 + 任何调用它的封装。
+
+    名单从源码现推，不写死两个名字：以后再加一层封装（探测账、批量账）不用改判据；
+    而各站自造一个「听起来像熔断」的私有方法，因为没人问那本账，就一定不会被认出来——
+    这正是这条判据要挡的东西。
+    """
+    names = {"_skip_dead_host"}
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        attrs = {c.func.attr for c in _ast.walk(fn)
+                 if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)}
+        if "_skip_dead_host" in attrs:
+            names.add(fn.name)
+    return names
+
+
+_FUSE = _fuse_names(_HTTP_SRC["cdp_base.py"])
+
+
+def _fetch_hook_problems(src):
+    """AST 判据：**任何真的发出 HTTP 请求的函数**，都必须先问一句「这台熔断了吗」。
+
+    为什么不按 NEEDS_BROWSER 划范围：那个旗标说的是「要不要占浏览器标签」，不是「有没有
+    裸 HTTP 取页」。gys 是混合站（HTTP 快路 + 浏览器回退），类上压根没写 NEEDS_BROWSER=False，
+    靠旗标筛就会整份漏掉它——删掉它的钩子判据照样绿。按「谁真的在发请求」划才封得住。
+    反向夹具（12d-/12d--）就是本轮回填真实踩到的坑：钩子插进多行 docstring 中间，语法、
+    编译、真跑都不报错，那段代码成了字符串的一部分——只有 AST 读得出它在不在函数体里。
+    """
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        reqs = _http_calls_in(src, fn)
+        if not reqs:
+            continue                                   # 不发请求的函数不归这笔账管
+        first_req = min(r.lineno for r in reqs)
+        hooks = [n for n in _ast.walk(fn)
+                 if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)
+                 and n.func.attr in _FUSE]
+        if not hooks:
+            out.append(f"{fn.name}(第 {fn.lineno} 行) 真发 HTTP 请求却没先问主机熔断")
+        elif min(h.lineno for h in hooks) > first_req:
+            out.append(f"{fn.name}(第 {fn.lineno} 行) 熔断问在请求之后"
+                       f"（第 {first_req} 行已经付过整轮超时了）")
+    return out
+
+
+# 扫描集＝整条交付链，不只 *_crawler.py：上一版只 glob 采集器，**基类自己**那句
+# `except: pass`（谎报「站点仍在限流」）正好落在盲区里——各站的写法是照基类抄的，
+# 基类破了这一族就是十份跟着破，而门却是绿的。website_contact 有自己那本主机账
+# （_HOST_CACHE.dead_why + CONNECT_TIMEOUT），豁免理由写在 12n= 那条检查里。
+_hook_srcs = dict(_HTTP_SRC)
+_hook_srcs.pop("website_contact.py", None)
+_hook_bad = {n: r for n, r in ((n, _fetch_hook_problems(s)) for n, s in _hook_srcs.items()) if r}
+_pure = sorted(n for n, s in _hook_srcs.items() if _pure_http_classes(s))
+_http_fns = sum(len(_http_calls_in(s, n))
+                for s in _hook_srcs.values()
+                for n in (m for m in _ast.walk(_ast.parse(s)) if isinstance(m, _ast.FunctionDef)))
+check(f"12d 每一处真发 HTTP 请求的取页函数都先问了主机熔断（{len(_hook_srcs)} 份采集器、"
+      f"{_http_fns} 个发请求的函数）",
+      not _hook_bad and _http_fns >= 20 and len(_pure) >= 8,
+      f"{_hook_bad}｜纯 HTTP 站={_pure}")
+check("12d--- 熔断名单是从基类现推的：本体与探测那层封装都在内（写死名单＝加一层就判不到）",
+      "_skip_dead_host" in _FUSE and "_skip_dead_host_probe" in _FUSE,
+      f"现推名单={sorted(_FUSE)}")
+check("12d- 反向对照：把钩子写在 docstring 里（今天真实踩到过的写法）必须被判定为没挂",
+      bool(_fetch_hook_problems(
+          'class A:\n'
+          '    NEEDS_BROWSER = False\n'
+          '    def _fetch(self, url, tries=3):\n'
+          '        """取页。\n'
+          '        # 主机级熔断\n'
+          '        if self._skip_dead_host(url):\n'
+          '            return ""\n'
+          '        """\n'
+          '        return requests.get(url, timeout=http_timeout(25)).text\n')),
+      "插进 docstring 的钩子＝静默失效，这种夹具不响就说明判据在读注释")
+check("12d-- 反向对照：正常挂法的夹具放行、摘掉钩子或挂晚了的夹具要响（两头都试才叫判据）",
+      not _fetch_hook_problems(
+          'class A:\n    NEEDS_BROWSER = False\n'
+          '    def _fetch(self, url):\n        """取页。"""\n'
+          '        if self._skip_dead_host(url):\n            return ""\n'
+          '        return requests.get(url, timeout=http_timeout(25)).text\n')
+      and bool(_fetch_hook_problems(
+          'class A:\n    NEEDS_BROWSER = False\n'
+          '    def _fetch(self, url):\n'
+          '        return requests.get(url, timeout=http_timeout(25)).text\n'))
+      and bool(_fetch_hook_problems(
+          'class A:\n    NEEDS_BROWSER = False\n'
+          '    def _fetch(self, url):\n'
+          '        r = requests.get(url, timeout=http_timeout(25))\n'
+          '        if self._skip_dead_host(url):\n            return ""\n'
+          '        return r.text\n')),
+      "恒响或恒不响的门都等于没有门")
+
+
+class DeadHostCrawler(CdpSiteCrawler):
+    """最小纯 HTTP 站：只为验证基类那本熔断账，站点解析逻辑一概不碰（也不许碰数据目录）。"""
+
+    PLATFORM_SLUG = "zz_deadhost"
+    PLATFORM_NAME = "熔断夹具站"
+    HOME_DOMAIN = "dead.example.com"
+    NEEDS_BROWSER = False
+
+    _TMP = _tf.mkdtemp(prefix="dead_host_")
+
+    @staticmethod
+    def _stable_data_dir():
+        return Path(DeadHostCrawler._TMP)     # 夹具的 seen_store 绝不落进真数据目录
+
+    def __init__(self):
+        super().__init__()
+        self.calls = self.skips = 0
+        self.script = []                      # 每页一种死法：callable 抛异常或正常回页
+
+    def _fetch(self, url, tries=2):
+        if self._skip_dead_host(url):
+            self.skips += 1
+            return ""
+        self.calls += 1
+        act = self.script.pop(0) if self.script else (lambda: "<html>正常页</html>")
+        try:
+            html = act()
+        except Exception as e:
+            self._note_request_error(self._shape_request_error(e))
+            return ""
+        if html:                       # 与交付链各站同一口径：真的取到一页就销一次账
+            self._mark_activity()
+        return html
+
+    def build_search_url(self, kw, page):
+        return f"{self.BASE_URL}s?q={kw}&p={page}"
+
+    def parse_list(self, html, kw):
+        return []
+
+    def crawl_detail(self, stub):
+        return {}
+
+
+def _raise(text, cls="ConnectTimeout"):
+    """造一个「调用就抛」的动作：夹具用它把每一页的死法安排明白。"""
+    return lambda: (_ for _ in ()).throw(_as_err(cls, text))
+
+
+_CONNECT_TEXT = _ERR_SAMPLES[0][2]          # 顺企网那一页的真异常（本机抓的，不是编的）
+_HOST = "b2b.11467.com"                     # 池头里那个 host：分型器与熔断账都从这里取
+_LIST_URL = "https://b2b.11467.com/search.php?q=泵"
+_NEXT_URL = "https://b2b.11467.com/search/-abc.htm"
+_d = DeadHostCrawler()
+_e, _logs = equip(_d)
+
+_d.script = [_raise(_CONNECT_TEXT)]
+check("12e 第 1 次连不上：不拉黑（偶发一次就掐活路＝自己把能出货的路断了）",
+      _d._fetch(_LIST_URL) == "" and not _d._dead_hosts
+      and _d._dead_strikes.get("b2b.11467.com") == 1,
+      f"strikes={_d._dead_strikes} dead={_d._dead_hosts}")
+_d.script = [_raise(_CONNECT_TEXT)]
+check("12e- 第 2 次连不上：按主机拉黑，并且存的就是分型好那一句（类别在头部）",
+      _d._fetch(_NEXT_URL) == "" and "b2b.11467.com" in _d._dead_hosts
+      and _d._dead_hosts["b2b.11467.com"][1].startswith("【连不上·无应答】b2b.11467.com:443"),
+      str(_d._dead_hosts))
+_before = (_d.calls, _d.skips)
+for _ in range(4):
+    _d._fetch(_NEXT_URL)
+check("12e-- 拉黑之后一次网络都不发（省下来的就是本轮别人的预算）",
+      _d.calls == _before[0] and _d.skips == _before[1] + 4,
+      f"calls={_d.calls} skips={_d.skips}")
+check("12e--- 「本轮不再请求」那句只打一次，且说清这不是采不到（刷屏与误导都算缺陷）",
+      sum(1 for x in _logs if "本轮不再请求" in x) == 1
+      and any("这不是采不到" in x and "改解析代码没有用" in x for x in _logs),
+      str([x[:80] for x in _logs if "不再请求" in x]))
+check("12e---- stats() 给得出这笔（界面与体检器问的是账，不是日志文案）",
+      list(_d.stats()["dead_hosts"]) == ["b2b.11467.com"]
+      and _d.stats()["dead_hosts"]["b2b.11467.com"].startswith("【连不上·无应答】"),
+      str(_d.stats()["dead_hosts"]))
+check("12e----- 收尾两处渲染都接了这笔：0 家那行与账目行（少一处＝某一轮看不见熔断）",
+      "已按主机熔断，本轮不再重试" in _HTTP_SRC["cdp_base.py"]
+      and 'lk += f"｜主机熔断 ' in _HTTP_SRC["cdp_base.py"],
+      "cdp_base 收尾没把 dead_hosts 并进渲染")
+
+# 探测账（12k）：看门狗每几十秒探一次，比取页更烧预算；更要紧的是**说对来路**——
+# 熔断＝这一次探测根本没发出去，把它报成「仍在限流/仍在等验证」就是让人干等。
+_fuse_word = _d._skip_dead_host_probe(_LIST_URL)      # _d 此刻已拉黑 _HOST
+check("12k 探测门给的是带 NET_FAIL_TAG 前缀的一句话（看门狗按前缀分网络账与站点账）",
+      _fuse_word is not None and _fuse_word.startswith(cdp_base.NET_FAIL_TAG)
+      and _HOST in _fuse_word, repr(_fuse_word))
+check("12k- 反向对照：没熔断的主机必须回 None（真能探的时候不许谎说网络不通）",
+      _d._skip_dead_host_probe("https://www.makepolo.com/spc_new.php?q=泵") is None,
+      repr(_d._skip_dead_host_probe("https://www.makepolo.com/spc_new.php?q=泵")))
+check("12k-- 问探测门不算一次新死法：黑名单还是那一台，取页失败账一页都没多记",
+      list(_d._dead_hosts) == [_HOST] and _d.stats()["page_fail"] == 0,
+      f"dead={list(_d._dead_hosts)} page_fail={_d.stats()['page_fail']}")
+
+
+def _probe_fuse_problems(src):
+    """AST 判据：`probe_block` 这类**回报文**的探测，只准用 `_skip_dead_host_probe`。
+
+    直接问 `_skip_dead_host` 拿到的是布尔，探测函数十有八九会顺手回「仍在限流」或「已解除」——
+    前者让人干等两小时，后者更糟：以为通了，回头取页还是一台都连不上。封装那句子里带了
+    NET_FAIL_TAG 前缀，看门狗才分得清这是网络账（见 cdp_base._skip_dead_host_probe）。
+    """
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "probe_block"):
+        if not _http_calls_in(src, fn):
+            continue
+        used = {c.func.attr for c in _ast.walk(fn)
+                if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)}
+        if "_skip_dead_host_probe" not in used:
+            out.append(f"probe_block(第 {fn.lineno} 行) 没用探测门（回报文必须带网络归因）")
+    return out
+
+
+_probe_bad = {n: r for n, r in ((n, _probe_fuse_problems(s)) for n, s in _hook_srcs.items()) if r}
+_probe_srcs = sorted(n for n, s in _hook_srcs.items() if "def probe_block" in s)
+check(f"12k--- 每一站的恢复探测（{len(_probe_srcs)} 份）都走探测门，不带网络归因的写法判不过",
+      not _probe_bad and len(_probe_srcs) >= 5, f"{_probe_bad}｜探测站={_probe_srcs}")
+check("12k---- 反向对照：探测里用裸布尔门（回「仍在限流」那种写法）必须被判定为不合格",
+      bool(_probe_fuse_problems(
+          'class A:\n'
+          '    def probe_block(self):\n'
+          '        if self._skip_dead_host(self.url):\n            return "仍在限流"\n'
+          '        return requests.get(self.url, timeout=http_timeout(20)).text\n'))
+      and not _probe_fuse_problems(
+          'class A:\n'
+          '    def probe_block(self):\n'
+          '        f = self._skip_dead_host_probe(self.url)\n'
+          '        if f:\n            return f\n'
+          '        return requests.get(self.url, timeout=http_timeout(20)).text\n'),
+      "探测账的归因分叉没有反夹具＝下一次「顺手写成限流」没人拦")
+
+
+def _mark_clear_problems(src):
+    """AST 判据：问过熔断门、又真发了请求的函数，成功那一路必须给这笔账销一次。
+
+    少了这一步，探测/对照就变成「只记账不销账」：站点明明回了话，连击照挂，下一次抖动就把
+    一台活着的主机拉黑——比不设熔断更糟（用户看到的是「偶发一次好，之后再也不来」）。
+    本轮补完 9 处熔断门之后，正是这条判据把 5 个只探测不销账的函数点出来的。
+    """
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        attrs = {c.func.attr for c in _ast.walk(fn)
+                 if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)}
+        if not (attrs & _FUSE) or not _http_calls_in(src, fn):
+            continue
+        if "_mark_activity" not in attrs:
+            out.append(f"{fn.name}(第 {fn.lineno} 行) 真发了请求却没给熔断账销账")
+    return out
+
+
+_clear_bad = {n: r for n, r in ((n, _mark_clear_problems(s)) for n, s in _hook_srcs.items()) if r}
+_clear_fns = sum(1 for s in _hook_srcs.values()
+                 for fn in _ast.walk(_ast.parse(s))
+                 if isinstance(fn, _ast.FunctionDef)
+                 and ({c.func.attr for c in _ast.walk(fn)
+                       if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)} & _FUSE)
+                 and _http_calls_in(s, fn))
+check(f"12l 挂了熔断门的函数一定也销账（{len(_hook_srcs)} 份采集器、{_clear_fns} 个挂了门的函数）",
+      not _clear_bad, str(_clear_bad))
+check("12l- 反向对照：只挂门不销账的夹具必须响（这条门就是本轮抓那 5 处用的）",
+      bool(_mark_clear_problems(
+          'class A:\n'
+          '    def _fetch(self, url):\n'
+          '        if self._skip_dead_host(url):\n            return ""\n'
+          '        return requests.get(url, timeout=http_timeout(20)).text\n'))
+      and not _mark_clear_problems(
+          'class A:\n'
+          '    def _fetch(self, url):\n'
+          '        if self._skip_dead_host(url):\n            return ""\n'
+          '        r = requests.get(url, timeout=http_timeout(20))\n'
+          '        self._mark_activity()\n        return r.text\n'),
+      "只验一条腿的门＝下一次漏销账照样看不见")
+
+# 一次成功的往来必须把账清掉：否则站点抖动两次就永久拉黑（这是「连续」二字的分量）
+_c = DeadHostCrawler()
+_e2, _l2 = equip(_c)
+_c.script = [_raise(_CONNECT_TEXT), lambda: "<html>正常一页</html>", _raise(_CONNECT_TEXT)]
+for _ in range(3):
+    _c._fetch(_LIST_URL)
+check("12f 拉黑看的是「连续」：失败·成功·失败 之后仍不拉黑（抖动不是死刑）",
+      not _c._dead_hosts and _c._dead_strikes.get(_HOST) == 1,
+      f"strikes={_c._dead_strikes} dead={_c._dead_hosts}")
+_c.script = [_raise(_CONNECT_TEXT)]
+_c._fetch(_LIST_URL)                    # 这次是紧接着的第二次失败 → 真的拉黑
+check("12f- 前提成立：这一次确实进了黑名单（下面那条销账才有对照组）",
+      _HOST in _c._dead_hosts, f"strikes={_c._dead_strikes} dead={_c._dead_hosts}")
+_c._skip_dead_host(_LIST_URL)           # 只为本轮把「当前主机」记进这笔账
+_c._mark_activity()                     # 同一主机在**没挂钩的那条路**上取到页（详情/官网回采）
+check("12f-- 一次真实往来就销账：连击与黑名单同时清空（不清＝抖动两次再也回不来）",
+      not _c._dead_hosts and not _c._dead_strikes,
+      f"strikes={_c._dead_strikes} dead={_c._dead_hosts}")
+
+# 冷却：拉黑不等于本轮之后再也不试（用户可能中途换网络，站点也可能自己回来）
+_g = DeadHostCrawler()
+_e3, _l3 = equip(_g)
+_g.script = [_raise(_CONNECT_TEXT)] * cdp_base.DEAD_HOST_STRIKES
+while _g.script:
+    _g._fetch(_LIST_URL)
+check("12g 冷却未到：仍然跳过（不是一到时间就猛试）",
+      _g._skip_dead_host(_LIST_URL) and not any("冷却已满" in x for x in _l3),
+      str(_g._dead_hosts))
+FT.now += cdp_base.DEAD_HOST_COOLDOWN + 1
+check("12g- 冷却期满：放一次真实机会，并清掉两本账（拉黑是有期限的隔离，不是死刑）",
+      not _g._skip_dead_host(_LIST_URL) and not _g._dead_hosts and not _g._dead_strikes
+      and any("冷却已满" in x for x in _l3), f"dead={_g._dead_hosts}｜logs={[x[:40] for x in _l3]}")
+
+# 反面：说明「连接是通的」那些档，一律不许进熔断账
+_h = DeadHostCrawler()
+_e4, _l4 = equip(_h)
+for _txt, _cls in ((_ERR_SAMPLES[3][2], "ReadTimeout"),        # 读响应超时：站慢，不是连不上
+                   (_ERR_SAMPLES[5][2], "SSLError"),           # TLS：连上了才谈得上证书
+                   # 这一格**必须按字符串**喂：各站 `_fetch` 拿到响应后就是这么记的（`f"HTTP {code}"`），
+                   # 类名兜底那一档只在「拿不到响应」的异常上生效——真响应永远不会是 ConnectionError，
+                   # 所以两者不会同时出现（要是哪天出现了，说明那一档得让状态码先行，改这里就是提醒）。
+                   ("HTTP 429（防采插页）", "ConnectionError"),  # 限流：链路明明通着
+                   ("某种没见过的新错误", "Exception")):        # 未分型：缺口清单，不是死刑
+    _h._note_request_error(_txt)
+check("12h 只有「连接阶段」那七档能拉黑：读超时/TLS/429/未分型一律不进账",
+      not _h._dead_hosts and not _h._dead_strikes, f"{_h._dead_strikes}｜{_h._dead_hosts}")
+_j = DeadHostCrawler()
+_e6, _l6 = equip(_j)
+for _ in range(cdp_base.DEAD_HOST_STRIKES):
+    _j._note_request_error(cdp_base.request_error_shape(
+        _as_err("ConnectionError", _ERR_SAMPLES[-1][2])))     # 消息里没细节的 ConnectionError
+check("12h---- 类名兜底那一档同样能拉黑：池头说得出主机就轮得到熔断账（否则这类死法整轮白付超时）",
+      list(_j._dead_hosts) == ["www.globalimporter.net"]
+      and _j._skip_dead_host("https://www.globalimporter.net/"),
+      f"dead={list(_j._dead_hosts)}｜shape={_j._dead_hosts and list(_j._dead_hosts.values())[0][:60]}")
+_i = DeadHostCrawler()
+_e5, _l5 = equip(_i)
+for _ in range(cdp_base.DEAD_HOST_STRIKES):        # 同一台主机连续两次连不上
+    _i._note_request_error(cdp_base.request_error_shape(
+        _as_err("ConnectTimeout", _CONNECT_TEXT)))
+check("12h- 拉黑按主机而不是按站：商铺子域与列表域各记一本账（列表连不上≠子域也不能试）",
+      list(_i._dead_hosts) == [_HOST]
+      and not _i._skip_dead_host("https://sz12345.11467.com/contact.asp")
+      and _i._skip_dead_host("https://B2B.11467.COM/search/-abc.htm"),
+      f"dead={list(_i._dead_hosts)}")
+check("12h-- _host_of 认得大小写/端口/userinfo/IPv6/无 scheme（认不出主机＝这笔账永远记不上）",
+      CdpSiteCrawler._host_of("https://B2B.11467.COM:443/x") == "b2b.11467.com"
+      and CdpSiteCrawler._host_of("http://u:p@sz1.11467.com/a") == "sz1.11467.com"
+      and CdpSiteCrawler._host_of("https://[::1]:8080/x") == "::1"
+      and CdpSiteCrawler._host_of("b2b.11467.com/search") == ""
+      and CdpSiteCrawler._host_of("") == "", str([
+          CdpSiteCrawler._host_of("https://[::1]:8080/x"),
+          CdpSiteCrawler._host_of("b2b.11467.com/search")]))
+
+# 名单通道（1688/企知道那一族走浏览器）没有「跳过取页」这一步：故意不给这一格，
+# 给了恒空的键就会让体检器把「没这件事」读成「查过了，一台都没拉黑」。
+_1688_stats_src = _def_src(_HTTP_SRC["site_adapters.py"], "stats", "Ali1688Site")
+_lchan_stats = _def_src(_HTTP_SRC["site_adapters.py"], "stats", "QizhidaoSite")
+_lchan_extras = _def_src(_HTTP_SRC["site_adapters.py"], "_list_channel_extras")
+check("12i 走浏览器的通道 stats() 里没有 dead_hosts（文档里写明了为什么故意不给）",
+      '"dead_hosts"' not in _1688_stats_src and '"dead_hosts"' not in _lchan_stats
+      and '"dead_hosts"' not in _lchan_extras and "故意不给" in _1688_stats_src,
+      _1688_stats_src[:120])
+
+# 实机体检器读的是同一本账：报告里那一路要能说「已按主机熔断」，而不是「采不到」
+_live = _load_live_check()
+_mark, _verdict = _live._attrib({"page_fail": 3, "listed": 0, "last_page_error": "【连不上·无应答】x:443｜…",
+                                 "waiting": "", "incr_skip": 0,
+                                 "dead_hosts": {"b2b.11467.com": "【连不上·无应答】b2b.11467.com:443｜…"}},
+                                0, False, "")
+check("12j 体检器把「链路未通」与「熔断主机」一起报出来（读数只问 stats，不猜文案）",
+      _mark == "❌" and "已按主机熔断" in _verdict and "b2b.11467.com" in _verdict,
+      _verdict)
+_mark2, _verdict2 = _live._attrib({"page_fail": 3, "listed": 0, "last_page_error": "",
+                                   "waiting": "", "incr_skip": 0}, 0, False, "")
+check("12j- 反向对照：没熔断账时不许凭空写「已熔断」（假安心比假红更难查）",
+      _mark2 == "❌" and "已按主机熔断" not in _verdict2, _verdict2)
+# 12m 同类查全：分型器修好了 9 个取页点，**同样决定方向的其它 except 分支**不许还在原地截断。
+# 本轮实机跨国采购网就是这一族——日志里那句「首页会话引导失败（HTTPSConnectionPool(host=…」
+#  [:60] 砍掉的正好是 `(Caused by …)`，而引导失败的主语通常是「这台主机连不上」：既不说类别，
+#  也不给熔断账记连击，于是整轮每个关键词都重新付一遍跳转链的超时（已改成走 _note_request_error）。
+def _raw_exc_slice_problems(src):
+    """AST 判据：except 分支里不许出现 `str(那个异常名)[a:b]`。
+
+    只认「绑定了 except 名字的那一层」里的切片，所以 `str(rec["备注"])[:80]` 这类与异常无关的
+    普通截断不误伤；也不管没截断的 `str(e)`（信息是全的，只是长）。
+    适用边界：这一条只管**裸 HTTP 那条链**（cdp_base 一族 + 1688 那份镜像）。riskbird 那棵树
+    走 Selenium、没有主机熔断这本账，它的导航异常文案不归这笔管（口径不同的两份实现各判各的，
+    比硬套一个判据然后把另一侧整条注释掉要好）。
+    """
+    out = []
+    for h in (n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.ExceptHandler) and n.name):
+        for sub in (n for n in _ast.walk(h) if isinstance(n, _ast.Subscript)):
+            v = sub.value
+            if (isinstance(v, _ast.Call) and isinstance(v.func, _ast.Name) and v.func.id == "str"
+                    and len(v.args) == 1 and isinstance(v.args[0], _ast.Name)
+                    and v.args[0].id == h.name):
+                out.append(f"第 {sub.lineno} 行 str({h.name})[…] 直接截断异常文本"
+                           f"（该走 request_error_shape / _note_request_error）")
+    return out
+
+
+_raw_srcs = dict(_HTTP_SRC)
+_raw_srcs["ali1688_crawler.py"] = (_REPO / "ali1688_build" / "ali1688_crawler.py").read_text(encoding="utf-8")
+_raw_bad = {n: r for n, r in ((n, _raw_exc_slice_problems(s)) for n, s in _raw_srcs.items()) if r}
+check(f"12m 交付链没有任何一处还在拿 str(异常)[:N] 当失败归因（扫了 {len(_raw_srcs)} 份）",
+      not _raw_bad and len(_raw_srcs) >= 13, str(_raw_bad))
+check("12m- 反向对照：gi 引导那一处的原样写法做成夹具必须响（不响就是判据抓不到这一族）",
+      bool(_raw_exc_slice_problems(
+          'try:\n    r = s.get(url, timeout=http_timeout(25))\n'
+          'except Exception as e:\n'
+          '    self._log(f"  ⚠ 首页会话引导失败（{str(e)[:60]}）")\n'))
+      and not _raw_exc_slice_problems(
+          'try:\n    r = s.get(url, timeout=http_timeout(25))\n'
+          'except Exception as e:\n'
+          '    self._note_request_error(e)\n'
+          '    self._log(f"  ⚠ 首页会话引导失败（{self._last_page_error[:70]}）")\n')
+      and not _raw_exc_slice_problems(
+          'x = str(rec["备注"])[:80]\nnote = str(cfg)[:40]\n'),
+      "抓不到旧写法、或对与异常无关的截断误响，都会让这条门下一个人整个关掉")
+
+# 12n 探测这一族的账：取页函数吞了异常至少还会打一行日志，探测函数吞掉的这一笔**直接决定**
+# 看门狗接下来那句是「仍在限流」「已解除」还是「本机网络不通」。2026-11-14 实机顺企网 80/443
+# 全部连接超时，界面却说「顺企网仍在防采/限流状态」——处方因此从「换出口网络」变成「干等两小时」。
+_PROBE_FAMILY_RE = re.compile(r"probe|_control_ok")
+
+
+def _account_handles(base_src):
+    """基类里**会把失败原因记进请求层账**的把手名（现推，不写死名单）。
+
+    判「有没有交账」要认的就是这一组：`_note_request_error` 本体，加上任何调它或调分型器的封装
+    （`_probe_net_fail`、`_note_page_fail`、`_shape_request_error`…）。以后新加一把把手，只要它
+    在基类里走了这两条路，各站用它收口就自动被认——写死名单的话，下一个封装出来就得改判据，
+    而人大概率会改成「先注释掉这条门」。
+    """
+    names = {"_note_request_error"}
+    for fn in (n for n in _ast.walk(_ast.parse(base_src)) if isinstance(n, _ast.FunctionDef)):
+        body = _ast.get_source_segment(base_src, fn) or ""
+        if "_note_request_error" in body or "request_error_shape" in body:
+            names.add(fn.name)
+    return names
+
+
+_ACCOUNT_HANDLES = _account_handles(_HTTP_SRC["cdp_base.py"])
+
+
+def _probe_family_fns(src):
+    """探测/对照这一族的函数节点：名字命中的，以及定义在它们**里面**的闭包。
+
+    闭包这一层不能省：跨国采购网的 `once()` 就写在 probe_block 肚子里，真发请求的是它，
+    只看外层名字等于把那一处整个放行。
+    """
+    fns = [n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)]
+    picked = {}
+    for n in fns:
+        if not _PROBE_FAMILY_RE.search(n.name):
+            continue
+        picked[id(n)] = n
+        for m in fns:
+            if m is not n and n.lineno <= m.lineno and (m.end_lineno or 0) <= (n.end_lineno or 0):
+                picked.setdefault(id(m), m)
+    return list(picked.values())
+
+
+def _probe_account_problems(src):
+    """AST 判据：**包着真实 HTTP 请求**的 try，在探测/对照函数里就不许把失败原因吞掉。
+
+    三种历史写法都判不过（都是本轮从真站上摘下来的）：
+      · `except: pass` → 落到「站点仍在限流」；
+      · `except: return ""` → 谎报「已解除」，刚放行就撞第二次死链；
+      · `except: return False`（对照探测）→ 布尔没错，但那笔原因谁也没记，熔断账少一次连击。
+    只按 try 里真发了请求来划范围：gys/maimaib2b 各有一个包着浏览器取页的 except，那是 CDP
+    那本账的事，硬套这条判据只会逼着人给控制面也记一笔网络账。
+    另一半：helper 记了账，`probe_block` 收尾就得把那本账**读出来**，否则原因躺在
+    `_last_page_error` 里、界面照旧说「仍在限流」（麦麦B2B 修前正是这一格）。
+    """
+    out = []
+    for fn in _probe_family_fns(src):
+        for t in (x for x in _ast.walk(fn) if isinstance(x, _ast.Try)):
+            if not _http_calls_in(src, t):
+                continue
+            for h in t.handlers:
+                called = {c.func.attr for c in _ast.walk(h)
+                          if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)}
+                if called & _ACCOUNT_HANDLES or any(isinstance(x, _ast.Raise) for x in _ast.walk(h)):
+                    continue
+                out.append(f"{fn.name}(第 {fn.lineno} 行) 第 {h.lineno} 行的 except 把探测失败"
+                           f"的原因吞了（没记账也没交出话，看门狗只能猜）")
+    tree = _ast.parse(src)
+    fns = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+    head = next((n for n in fns if n.name == "probe_block"), None)
+    if head is not None:
+        head_src = _ast.get_source_segment(src, head) or ""
+        helpers = sorted({n.name for n in fns
+                          if n.name != "probe_block" and _PROBE_FAMILY_RE.search(n.name)
+                          and "_note_request_error" in (_ast.get_source_segment(src, n) or "")})
+        # 记账的那一把只要被 probe_block 叫到（自己收口＝`_probe_net_fail`，或收尾读账＝
+        # `_probe_net_word`）就算交出；两把都没出现，说明原因记在字段里却没人说给看门狗
+        if helpers and not any(h in head_src for h in ("_probe_net_word", "_probe_net_fail")):
+            out.append(f"probe_block 没读 helper（{helpers}）记下的那笔账（原因记了但没人说，等于没记）")
+    return out
+
+
+_probe_acc_bad = {n: r for n, r in ((n, _probe_account_problems(s)) for n, s in _hook_srcs.items()) if r}
+_probe_fns = sum(len(_probe_family_fns(s)) for s in _hook_srcs.values())
+check(f"12n 探测/对照这一族（{_probe_fns} 个函数、{len(_hook_srcs)} 份源码）的 except 一律交出原因",
+      not _probe_acc_bad and _probe_fns >= 12, str(_probe_acc_bad))
+check("12n- 反向对照：三种真实旧写法（pass 谎报限流 / return \"\" 谎报解除 / return False 不记账）"
+      "都必须响，改后的写法必须放行",
+      bool(_probe_account_problems(
+          'class A:\n    def probe_block(self):\n        try:\n'
+          '            r = self._session.get(u, timeout=http_timeout(20))\n'
+          '            return "" if r.status_code == 200 else "仍在限流"\n'
+          '        except Exception:\n            pass\n'
+          '        return "站点仍在限流"\n'))
+      and bool(_probe_account_problems(
+          'class A:\n    def probe_block(self):\n        try:\n'
+          '            return "" if self._session.get(u, timeout=http_timeout(20)).status_code == 200 else "x"\n'
+          '        except Exception:\n            return ""\n'))
+      and bool(_probe_account_problems(
+          'class A:\n    def _control_ok(self):\n        try:\n'
+          '            return self._session.get(u, timeout=http_timeout(20)).status_code == 200\n'
+          '        except Exception:\n            return False\n'))
+      and not _probe_account_problems(
+          'class A:\n    def probe_block(self):\n        try:\n'
+          '            r = self._session.get(u, timeout=http_timeout(20))\n'
+          '            self._mark_activity()\n            return ""\n'
+          '        except Exception as e:\n            return self._probe_net_fail(e)\n')
+      and not _probe_account_problems(
+          'class A:\n    def _control_ok(self):\n        try:\n'
+          '            return self._session.get(u, timeout=http_timeout(20)).status_code == 200\n'
+          '        except Exception as e:\n'
+          '            self._note_request_error(e)\n            return False\n'
+          '    def probe_block(self):\n'
+          '        return self._probe_net_word() or "仍在限流"\n'),
+      "三种旧写法里任何一条不被抓到，这一族就会在下一次重构里长回来")
+check("12n-- 反向对照：包着浏览器/CDP 的 except（没发 HTTP）不许误响，helper 记账而 probe 不读要响",
+      not _probe_account_problems(
+          'class A:\n    def probe_block(self):\n        try:\n'
+          '            hit = self._eval("document.title")\n'
+          '        except Exception:\n            hit = ""\n        return "仍在限流"\n')
+      and bool(_probe_account_problems(
+          'class A:\n    def _http_probe_ok(self):\n'
+          '        try:\n            return bool(self._session.get(u, timeout=http_timeout(20)))\n'
+          '        except Exception as e:\n'
+          '            self._note_request_error(e)\n            return False\n'
+          '    def probe_block(self):\n'
+          '        if self._http_probe_ok():\n            return ""\n'
+          '        return "仍在限流"\n')))
+check("12n--- 认账把手是从基类现推的：探测那两把（记原因的与给看门狗那句话的）都在名单里"
+      "（写死名单＝加一把就判不到）",
+      "_note_request_error" in _ACCOUNT_HANDLES and "_probe_net_fail" in _ACCOUNT_HANDLES
+      and "_note_page_fail" in _ACCOUNT_HANDLES, f"现推名单={sorted(_ACCOUNT_HANDLES)}")
+_tag_srcs = {n: s for n, s in _hook_srcs.items() if n != "cdp_base.py"}
+_tag_bad = {n: [x.lineno for x in _ast.walk(_ast.parse(s))
+                if isinstance(x, _ast.Name) and x.id == "NET_FAIL_TAG"] for n, s in _tag_srcs.items()}
+_tag_bad = {n: v for n, v in _tag_bad.items() if v}
+check("12n= NET_FAIL_TAG 只在基类那几把把手里拼一次（各站自己挂前缀＝把代码异常也说成断网，"
+      "而且不给熔断账记连击）",
+      not _tag_bad and len(_tag_srcs) >= 11, str(_tag_bad))
+check("12n=- 反向对照：gi 探测里那句 `f\"{NET_FAIL_TAG}{type(e).__name__}\"` 的原样写法必须响",
+      bool([1 for x in _ast.walk(_ast.parse(
+          'def once():\n    try:\n        r = s.get(u)\n'
+          '    except Exception as e:\n'
+          '        return False, f"{NET_FAIL_TAG}{type(e).__name__}", False\n'))
+          if isinstance(x, _ast.Name) and x.id == "NET_FAIL_TAG"]))
+print("⑫ 主机级熔断 + 连接/读数超时拆分：连不上的主机不再吃整轮预算 ✓")
+
 
 print(f"\n全部 {ok} 项断言通过 ✅")

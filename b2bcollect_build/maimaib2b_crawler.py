@@ -32,6 +32,8 @@ import requests
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, dept_only, compose_position,
                       strip_name_marketing_tail, strip_country_code, HONORIFIC_ONLY_RE)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 HOME_URL = "https://www.maimaib2b.com/"
 SEARCH_URL = "https://www.maimaib2b.com/search/Company/{kw}/"
@@ -173,7 +175,15 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         探测自己绝不走 _fetch：_fetch 开头会按降级状态反过来叫 probe_block，互相递归。
         通路判死（_http_dead）后跳过①②只做③：那时候再发裸 HTTP 就是拿注定 403 的请求
         给站方风控计数加码，把用户刚点出来的进度顶回去（实测「人工点了还是回到这一页」）。"""
-        if not self._http_dead:
+        _probe_url = self._block_probe_url or self.build_search_url("公司", 1)
+        # ①②的失败原因由 _http_probe_ok 留在请求层账上，先清一次：否则上一轮取页留下的
+        # 连接类旧账会被这次探测认领（口径见 cdp_base._probe_net_word）
+        self._last_page_error = ""
+        # 主机熔断＝①②这两次裸 HTTP 探测根本没发出去（省下来的是整轮连接超时）。但③标签
+        # 探测照做：CF 通行证本来就在浏览器手里，一条网络账不能把浏览器那条路也判死
+        # （前缀口径见 cdp_base._skip_dead_host_probe）。
+        fuse = self._skip_dead_host_probe(_probe_url, "恢复探测")
+        if not self._http_dead and not fuse:
             if self._http_probe_ok():
                 self._block_reason = ""
                 return ""
@@ -191,26 +201,34 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                     self._log(f"   ⛔ 浏览器通行证已抄进会话、裸 HTTP 仍连吃 "
                               f"{self._http_probe_fails} 次拦截：本机这条路是死的，"
                               f"本轮全部改走标签取页（再发只会给站方挑战计数加码）")
-        if self._tab_page_ok(self._block_probe_url or self.build_search_url("公司", 1)):
+        if self._tab_page_ok(_probe_url):
             self._browser_fallback = True
             self._fallback_pages = 0
             self._block_reason = ""
             return ""
-        return self._block_reason or "麦麦B2B 仍在 Cloudflare 质询状态"
+        return (fuse or self._probe_net_word() or self._block_reason
+                or "麦麦B2B 仍在 Cloudflare 质询状态")
 
     def _http_probe_ok(self):
         """拿被拦那一页（没有则用一个通用关键词的首页）真试一次：能解析出公司条目才算通。"""
         if self._http_dead:
             return False
         url = self._block_probe_url or self.build_search_url("公司", 1)
+        if self._skip_dead_host(url):
+            return False        # 这台已经确认连不上，没发出去的探测不许报成「盾还没过」
         try:
-            r = self._session.get(url, timeout=20)
+            r = self._session.get(url, timeout=http_timeout(20))
+            # 有回应＝这台主机活着（哪怕是 403 质询页）：清掉熔断连击，别让探测白做一轮
+            self._mark_activity()
             if r.status_code == 200:
                 if "charset" not in (r.headers.get("Content-Type") or "").lower():
                     r.encoding = "utf-8"
                 return bool(self.parse_list(r.text or "", "公司"))
-        except Exception:
-            pass
+        except Exception as e:
+            # 回 False 是对的（这一路确实没通），但**为什么**没通要留在请求层账上：
+            # probe_block 收尾那句靠它区分「CF 盾还没过」和「这台连不上」（口径见
+            # cdp_base._probe_net_word），否则连接类死法会被说成质询状态、让用户干等
+            self._note_request_error(e)
         return False
 
     def _tab_page_ok(self, url=""):
@@ -318,6 +336,10 @@ class Maimaib2bCrawler(CdpSiteCrawler):
 
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
     def _fetch(self, url, tries=3, guarded=True, referer=""):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         if self._browser_fallback:
             # 降级模式下隔 20 个请求真探一次 HTTP（只认「会话里已有通行证且能拉到公司条目」，
             # 不能拿 probe_block 当恢复判据——它看到标签能用也会报“已解除”，会把降级模式误切回）；
@@ -334,7 +356,7 @@ class Maimaib2bCrawler(CdpSiteCrawler):
             try:
                 self._pace_before_request()
                 headers = {"Referer": referer} if referer else None
-                r = self._session.get(url, timeout=25, headers=headers)
+                r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url, r.headers)
                 if block:

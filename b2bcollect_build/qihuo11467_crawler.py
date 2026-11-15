@@ -27,6 +27,8 @@ import requests
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, compose_position,
                       extract_legal_rep)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 SEARCH_URL = "https://b2b.11467.com/search.php?q="
 HOME_URL = "https://www.11467.com/"
@@ -119,18 +121,28 @@ class Qihuo11467Crawler(CdpSiteCrawler):
     def probe_block(self):
         """看门狗恢复探测：必须是「真拿得到正常页」才算解除（只看状态码会把
         挑战页当已通）。HTTP 探一次首页；标签能正常打开本站也算解除（转降级模式）。"""
-        try:
-            r = self._session.get(HOME_URL, timeout=20)
-            if r.status_code == 200 and len(r.text or "") >= 2000 \
-                    and not self.http_block_reason(r.status_code, r.text):
-                self._block_reason = ""
-                return ""
-        except Exception:
-            pass
+        # 熔断＝这次 HTTP 探测没发出去（省掉整轮连接超时），但标签那条路照探：
+        # 用户可能正在浏览器里操作，网络账不能替它做决定（前缀口径见基类）
+        fuse = self._skip_dead_host_probe(HOME_URL, "恢复探测")
+        net = ""              # 探测自己撞上的连接类死法（网络账，不能说成「站点还在拦」）
+        if not fuse:
+            try:
+                r = self._session.get(HOME_URL, timeout=http_timeout(20))
+                # 有回应＝这台主机活着（哪怕正文太薄或仍是挑战页）：给熔断账销一次连击
+                self._mark_activity()
+                if r.status_code == 200 and len(r.text or "") >= 2000 \
+                        and not self.http_block_reason(r.status_code, r.text):
+                    self._block_reason = ""
+                    return ""
+            except Exception as e:
+                net = self._probe_net_fail(e)
         if self._tab_page_ok():
             self._block_reason = ""
             return ""
-        return self._block_reason or "顺企网仍在防采/限流状态"
+        # 本轮实机（2026-11-14）红的就是这一格：b2b.11467.com 整站连接超时，这里旧写法
+        # `except: pass` 之后落到「顺企网仍在防采/限流状态」，用户照着等 IP 冷却，而真实
+        # 处方是换出口网络（口径见 cdp_base._probe_net_fail）。
+        return fuse or net or self._block_reason or "顺企网仍在防采/限流状态"
 
     def _tab_page_ok(self):
         """标签当前是否已能正常打开本站（用户在浏览器里过完验证的直观表现）。"""
@@ -160,6 +172,10 @@ class Qihuo11467Crawler(CdpSiteCrawler):
 
     # ── 裸 HTTP 取页：站点偶发 connection reset（非封禁），退避重建连接池重试 ──
     def _fetch(self, url, tries=4, allow_redirects=True, guarded=True):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return "", url
         if self._browser_fallback:
             # 降级模式下隔 20 页探一次 HTTP 是否已恢复，恢复就切回不占标签的快路
             self._fallback_pages += 1
@@ -173,7 +189,7 @@ class Qihuo11467Crawler(CdpSiteCrawler):
         last = ""
         for i in range(max(1, tries)):
             try:
-                r = self._session.get(url, timeout=25, allow_redirects=allow_redirects)
+                r = self._session.get(url, timeout=http_timeout(25), allow_redirects=allow_redirects)
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url)
                 if block:

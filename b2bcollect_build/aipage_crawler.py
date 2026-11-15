@@ -28,6 +28,8 @@ import requests
 
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, dept_only)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 HOME_URL = "https://b2b.aipage.com/"
 SEARCH_URL = "https://b2b.aipage.com/s?q="
@@ -87,20 +89,27 @@ class AipageCrawler(CdpSiteCrawler):
     # ── 裸 HTTP：偶发连接重置/瞬时非 200 → 退避重建 Session 重试 ──
     def probe_block(self):
         """能力探测：重发一次真实搜索页，能拿到注水的 window.data 才算解除。"""
+        # 只认这次探测的失败：_fetch 自己吞异常并记原因，不清的话上一轮的连接类旧账
+        # 会被这一次认领，界面就把「站点在拦」和「这台连不上」说反（口径见基类 _probe_net_word）
+        self._last_page_error = ""
         try:
             html, _ = self._fetch(SEARCH_URL + quote("公司"), tries=1, guarded=False)
             if self._window_data(html) is not None:
                 self._block_reason = ""
                 return ""
-        except Exception:
-            pass
-        return self._block_reason or "爱采购仍在限流状态"
+        except Exception as e:
+            return self._probe_net_fail(e)
+        return self._probe_net_word() or self._block_reason or "爱采购仍在限流状态"
 
     def _fetch(self, url, tries=4, headers=None, guarded=True):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return "", url
         last = ""
         for i in range(max(1, tries)):
             try:
-                r = self._session.get(url, timeout=25, headers=headers)
+                r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url)
                 if block:

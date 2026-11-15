@@ -33,6 +33,8 @@ import province_filter as _pf
 
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, dept_only)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 # 中文公司搜索（word 需 GBK 百分号编码；page 分页；须用浏览器过验证码）
 COMPANY_SEARCH_URL = (
@@ -292,8 +294,12 @@ class MicCrawler(CdpSiteCrawler):
         if s is None:
             return False
         url = CONTACT_URL.format(user=user)
+        # 主机级熔断：这台已经连不上两次了，裸 HTTP 这步直接判「没走通」交回浏览器那条路，
+        # 不再为每家重复付连接超时（口径与由来见 cdp_base._skip_dead_host）
+        if self._skip_dead_host(url):
+            return False
         try:
-            r = s.get(url, timeout=20, allow_redirects=False)
+            r = s.get(url, timeout=http_timeout(20), allow_redirects=False)
             self._mark_activity()
             if r.status_code in (301, 302, 303, 307):
                 loc = (r.headers.get("Location") or "").lower()

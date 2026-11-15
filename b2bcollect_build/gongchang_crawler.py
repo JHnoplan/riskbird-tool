@@ -31,7 +31,9 @@ import requests
 
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, compose_position,
-                      strip_name_marketing_tail, NET_FAIL_TAG)
+                      strip_name_marketing_tail)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 HOME_URL = "https://qiye.gongchang.com/"
 SEARCH_URL = "https://qiye.gongchang.com/search.php?kw={kw}&page={page}"
@@ -143,10 +145,14 @@ class GongchangCrawler(CdpSiteCrawler):
     def _fetch(self, url, tries=4):
         """取页：检测薄壳/挑战页，触发频控时重建 session 退避重试。
         返回 (html, is_thin_shell)。is_thin_shell=True 时调用方应停止翻页。"""
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return "", self._thin_shell_streak > 0
         last = ""
         for i in range(max(1, tries)):
             try:
-                r = self._session.get(url, timeout=20)
+                r = self._session.get(url, timeout=http_timeout(20))
                 self._mark_activity()
                 if r.status_code == 200 and r.text:
                     text = r.text

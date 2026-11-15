@@ -116,6 +116,8 @@ import requests
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, dept_only, compose_position,
                       strip_country_code, HONORIFIC_ONLY_RE, is_valid_landline)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 from mk_phone_ocr import load_default_font, expected_chars, TOKEN_LEN_OFFSET
 import province_filter as _pf
 
@@ -354,14 +356,23 @@ class MakepoloCrawler(CdpSiteCrawler):
     def probe_block(self):
         """恢复探测：真取一页搜索并解析得出公司卡才算解除（限流薄壳也是 200）。"""
         url = self._block_probe_url or self.build_search_url("公司", 1)
+        # 熔断＝这次探测没发出去，说成「仍在限流」就是把网络账记到站点头上
+        # （前缀口径见 cdp_base._skip_dead_host_probe）
+        fuse = self._skip_dead_host_probe(url, "恢复探测")
+        if fuse:
+            return fuse
         try:
-            r = self._session.get(url, timeout=25, headers={"Referer": HOME_URL})
+            r = self._session.get(url, timeout=http_timeout(25), headers={"Referer": HOME_URL})
+            # 站点有回应＝这台主机还活着，顺手给熔断账销一次（口径见 cdp_base._mark_activity）
+            self._mark_activity()
             if r.status_code == 200 and not self.http_block_reason(r.status_code, r.text):
                 if self.parse_list(self._decode(r, "gb18030"), "公司"):
                     self._block_reason = ""
                     return ""
-        except Exception:
-            pass
+        except Exception as e:
+            # 旧写法 `except: pass` 会把「连不上」说成「马可波罗仍在限流状态」：那条处方是
+            # 等冷却／换 IP，而这里要的是换出口网络（口径见 cdp_base._probe_net_fail）
+            return self._probe_net_fail(e)
         return self._block_reason or "马可波罗仍在限流状态"
 
     @staticmethod
@@ -373,12 +384,16 @@ class MakepoloCrawler(CdpSiteCrawler):
             return r.text or ""
 
     def _fetch(self, url, enc="utf-8", tries=3, guarded=True, referer=""):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         last = ""
         self._last_status = 0
         for i in range(max(1, tries)):
             try:
                 self._pace_before_request()
-                r = self._session.get(url, timeout=25,
+                r = self._session.get(url, timeout=http_timeout(25),
                                       headers={"Referer": referer} if referer else None)
                 self._mark_activity()
                 self._last_status = r.status_code
@@ -641,9 +656,13 @@ class MakepoloCrawler(CdpSiteCrawler):
         def grab(style, token):
             """返回 None＝这一张没拿到 PNG；返回空串＝拿到了图但读不出可信号码。"""
             url = IMG_URL.format(slug=slug, style=style, token=token)
+            # 图片码是按店的子域取的，熔断账也就按这一台店记（口径见 cdp_base._skip_dead_host）：
+            # 连不上与「这家没开图」是两件事，但两者的处置一样——别再为这一家付连接超时
+            if self._skip_dead_host(url):
+                return None
             body = b""
             try:
-                r = self._session.get(url, timeout=20, headers={"Referer": shop_url})
+                r = self._session.get(url, timeout=http_timeout(20), headers={"Referer": shop_url})
                 self._mark_activity()
                 body = r.content or b""
             except Exception:

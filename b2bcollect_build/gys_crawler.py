@@ -25,6 +25,8 @@ from bs4 import BeautifulSoup
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, normalize_spaces,
                       strip_name_marketing_tail, compose_position, extract_legal_rep)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 SEARCH_HOME = "https://www.gys.cn/"
 # 结果页里的公司自有子域锚点：href 指向 <sub>.gys.cn，锚文本即公司名
@@ -139,21 +141,30 @@ class GysCrawler(CdpSiteCrawler):
         任一路已正常就算解除（滑过验证码只清浏览器侧、IP 冷却则两条一起通）。
         探测绝不主动导航：不能把用户正拖到一半的滑块刷掉。"""
         url = self._block_probe_url or self.BASE_URL
-        if url:
+        # 主机熔断＝这一次探测根本没发出去：不能把它读成「仍在限流/验证」，那条处方是等两小时
+        # 或换 IP，而这里要说的是网络（前缀口径见 cdp_base._skip_dead_host_probe）
+        fuse = self._skip_dead_host_probe(url, "恢复探测") if url else None
+        net = ""              # 探测自己撞上的连接类死法（网络账，不能说成「站点还在拦」）
+        if url and not fuse:
             try:
-                r = requests.get(url, headers=GYS_HTTP_HEADERS, timeout=20)
+                r = requests.get(url, headers=GYS_HTTP_HEADERS, timeout=http_timeout(20))
+                # 站方回了话（哪怕 520）＝这台活着：给熔断账销一次，别让探测成功的记录
+                # 白过、下一次抖动又从头攒连击（口径见 cdp_base._mark_activity）
+                self._mark_activity()
                 if r.status_code == 200 and r.text and not self._html_abnormal(r.text):
                     self._http_fails = 0
                     self._http_disabled = False
                     return ""
-            except Exception:
-                pass
+            except Exception as e:
+                net = self._probe_net_fail(e)
         try:
             if not self._gys_blocked():
                 return ""
         except Exception:
-            return ""
-        return self._block_reason or "供应商网仍在限流/验证状态"
+            # 标签那条路查不成时保持旧的失败即放行口径（本站的滑过验证只在浏览器侧），
+            # 但 HTTP 探测已经拿到网络账就不许再谎报「已解除」——否则刚放行就撞第二次死链
+            return net or ""
+        return fuse or net or self._block_reason or "供应商网仍在限流/验证状态"
 
     # ── 搜索：驱动真实 UI（结果页 code 无法由关键词构造）──────────
     def build_search_url(self, kw, page):
@@ -317,12 +328,16 @@ class GysCrawler(CdpSiteCrawler):
         比浏览器快且不占标签）。只识浏览器 UA + 低频，失败返回空串由调用方回退浏览器，
         绝不把网络抖动当「无数据」；连续失败则放弃快路（见 _http_disabled）。
         防采/限流插页（520 等）单独记账：不重试、不当普通失败，交看门狗。"""
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         if self._http_disabled:
             return ""
         last = ""
         for i in range(max(1, tries)):
             try:
-                r = requests.get(url, headers=GYS_HTTP_HEADERS, timeout=25)
+                r = requests.get(url, headers=GYS_HTTP_HEADERS, timeout=http_timeout(25))
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url)
                 if block:

@@ -35,6 +35,8 @@ import requests
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, dept_only, compose_position,
                       strip_name_marketing_tail, strip_country_code, HONORIFIC_ONLY_RE)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 HOME_URL = "https://company.solarbe.com/"
 SEARCH_URL = "https://company.solarbe.com/search.php"
@@ -143,15 +145,20 @@ class SolarbeCrawler(CdpSiteCrawler):
     def probe_block(self):
         """能力探测：重发一次真实搜索页，能解析出公司卡片才算解除。
         只看状态码会把空白页当已通（本站的异常正是 200 + 空正文）。"""
+        # _fetch 自己吞异常并留账，先清一次：否则上一轮的连接类旧账会被这次探测认领
+        self._last_page_error = ""
         try:
             html = self._fetch(f"{SEARCH_URL}?kw={quote('光伏')}&catid=0&areaid=0&page=1",
                                tries=1, guarded=False)
             if html and self.parse_list(html, "光伏"):
                 self._block_reason = ""
                 return ""
-        except Exception:
-            pass
-        return self._block_reason or "索比光伏网仍在限流状态"
+        except Exception as e:
+            return self._probe_net_fail(e)
+        # 连不上时说成「仍在限流状态」＝把网络账记到站点头上（处方会从「换出口」变成
+        # 「等两小时」）；非连接类仍走下面那句，见 cdp_base._probe_net_word
+        return (self._probe_net_word() or self._block_reason
+                or "索比光伏网仍在限流状态")
 
     def _control_ok(self):
         """对照实测：拿一个已知正常时稳定返回 ~75KB 的页（空关键词搜索首页）探一刀，
@@ -159,11 +166,22 @@ class SolarbeCrawler(CdpSiteCrawler):
         不花这一个请求做对照，就会把已注销商铺的空页误判成限流：全量脚本因此每轮
         都在同样三家身上撞熔断、每轮只推进 1 片（2026-11-04 实测 bj1103、
         hfgkjg3235、grandglow24 三家恒返回 200+0 字节，而同时刻别家 5.6KB 正常）。"""
+        url = f"{SEARCH_URL}?kw=&catid=0&areaid=0&page=1"
+        # 走到这里说明上一页刚拿到过 200（会话刚被 _mark_activity 销过账），熔断账本应是空的；
+        # 这一问是兜底：真被熔断时宁可回「对照没做成」，也不为它付一次连接超时
+        if self._skip_dead_host(url):
+            return False
         try:
             self._pace_before_request()
-            r = self._session.get(f"{SEARCH_URL}?kw=&catid=0&areaid=0&page=1", timeout=20)
+            r = self._session.get(url, timeout=http_timeout(20))
+            # 对照页有回应＝这台主机活着，顺手销掉熔断连击（这一问本来就是「页面本身是空的」
+            # 还是「整台被限流」的定性依据，它自己成功却没账，下一轮又要重攒两次）
+            self._mark_activity()
             return r.status_code == 200 and len(r.text or "") >= self.MIN_PAGE_CHARS
-        except Exception:
+        except Exception as e:
+            # 回 False 是保守方向（宁可当成限流也别把这一页判成「终态空页」永久跳过），
+            # 但账必须留下：连接类死法在这里不记账，就要等 probe_block 再撞一次才攒得到连击
+            self._note_request_error(e)
             return False
 
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
@@ -179,6 +197,10 @@ class SolarbeCrawler(CdpSiteCrawler):
         现在改成：一条 URL 只记一笔，并用 _control_ok() 实测定性——对照页正常就把这一页
         记进 _blank_urls（以后零请求直接跳过），对照页也不行才交看门狗等冷却。
         两种情况都不静默把「拿不到页」当成「这一家没数据」。"""
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         last = ""
         self._last_blank_page = False
         if url in self._blank_urls:
@@ -189,7 +211,7 @@ class SolarbeCrawler(CdpSiteCrawler):
             try:
                 self._pace_before_request()
                 headers = {"User-Agent": ua} if ua else None
-                r = self._session.get(url, timeout=25, headers=headers)
+                r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url, r.headers)
                 if block:

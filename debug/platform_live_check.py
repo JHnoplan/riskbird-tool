@@ -64,9 +64,13 @@ def _attrib(st, n, blocked, reason):
                      "先登录/过验证再谈这一路）")
     if not n:
         if page_fail and not listed:
+            dead = "、".join((st.get("dead_hosts") or {}).keys())
             return "❌", (f"链路未通：{page_fail} 页一页都没取到"
                           f"（最后一次：{last_err[:70] or '未记录'}）——先查出口网络/域名可达，"
-                          "这与解析代码无关，别照着它改爬虫")
+                          f"这与解析代码无关，别照着它改爬虫"
+                          # 熔断账是这一路「我们已经不再试了」的凭据：没有它，读报告的人
+                          # 会以为再等等就有数据（由来见 cdp_base._skip_dead_host）
+                          + (f"；已按主机熔断：{dead}" if dead else ""))
         if incr_skip:
             return "⚠", (f"0 家但增量库全跳过 {incr_skip} 家（链路是通的，种子库已含这些公司；"
                           "要新数据得换关键词或放开省份）")
@@ -103,9 +107,11 @@ def _fmt_site(slug, crawler, kws):
                  f"无联系方式 {st.get('no_contact', '-')}｜详情失败 {st.get('failed', '-')}｜"
                  f"早过滤 {st.get('early', '-')}｜详情不相关 {st.get('filtered', '-')}")
     # 链路这一笔平时全是 0，出了事却是唯一能定性的数：单独占一行，别混进产出那长句里
+    _dead = "、".join((st.get("dead_hosts") or {}).keys()) or "（无）"
     lines.append(f"  链路: 取页失败 {st.get('page_fail', 0) or 0} 页｜"
                  f"最后一次={str(st.get('last_page_error') or '')[:70] or '（无）'}｜"
                  f"增量跳过 {st.get('incr_skip', 0) or 0} 家｜"
+                 f"熔断主机 {_dead}｜"
                  f"等人={str(st.get('waiting') or '') or '（无）'}")
     lines.append(f"  逐词净新增: {st.get('kw_yield', {})}")
     a, b = (kws + ["", ""])[:2]

@@ -25,6 +25,8 @@ from bs4 import BeautifulSoup
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE, EMAIL_RE, clean_address,
                       parse_contact_field, is_placeholder_number, normalize_spaces,
                       compose_position, dept_only)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 SEARCH_POST_URL = "https://www.b2b168.com/Index.aspx"
 HOME_URL = "https://www.b2b168.com/"
@@ -121,18 +123,27 @@ class B2b168Crawler(CdpSiteCrawler):
         """能力探测：按真实搜索形状（POST Index.aspx）发一次，能解析出公司条目才算解除。
         只看状态码会把挑战页当已通（谎报恢复后立刻又被拦，实测就是这样反复摆荡）。
         频率已由看门狗的指数退避控制（IP 冷却下首次 ≥45s），不再拿 15s 去打断冷却。"""
+        # _fetch 自己吞异常并留账，先清一次：否则上一轮的连接类旧账会被这次探测认领
+        self._last_page_error = ""
         try:
             html = self._fetch("POST", SEARCH_POST_URL, tries=1, guarded=False,
                                data={"q": "公司", "act": "ComSearch", "page": ""})
             if html and self.parse_list(html, "公司"):
                 self._block_reason = ""
                 return ""
-        except Exception:
-            pass
-        return self._block_reason or "八方资源网仍在限流状态"
+        except Exception as e:
+            return self._probe_net_fail(e)
+        # 取页失败时 _fetch 只回空串，旧写法一律说成「仍在限流状态」；连接类死法要改口成
+        # 网络账（非连接类仍走下面那句，因为「限流」才是那一档的处方，见 _probe_net_word）
+        return (self._probe_net_word() or self._block_reason
+                or "八方资源网仍在限流状态")
 
     # ── 裸 HTTP 取页（带重试，网络抖动不伪装成空页）────────────
     def _fetch(self, method, url, tries=3, guarded=True, **kw):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         last = ""
         for i in range(max(1, tries)):
             try:
@@ -140,7 +151,7 @@ class B2b168Crawler(CdpSiteCrawler):
                 # 睡一次，记录内部背靠背发——实际速率是设定间隔的 3~5 倍，200 多家
                 # 就把出口 IP 压到 502。现在每个请求前都对齐一次节奏。
                 self._pace_before_request()
-                r = self._session.request(method, url, timeout=25, **kw)
+                r = self._session.request(method, url, timeout=http_timeout(25), **kw)
                 self._mark_activity()
                 block = self.http_block_reason(r.status_code, r.text, url, r.headers)
                 if block:

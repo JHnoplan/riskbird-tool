@@ -241,6 +241,13 @@ _REQUEST_ERROR_KINDS = (
                    "timed out")),
     ("返回不可解析(代码)", ("expecting value", "jsondecoder", "char 0", "no json could be",
                          "failed to decode")),
+    # 兜底档：requests 的 ConnectionError **类名本身**就是「连接阶段断了」（urllib3 的
+    # NewConnectionError / ConnectTimeoutError 都包装成它），可它带的消息偶尔只剩
+    # `HTTPSConnectionPool(host=…, port=443): Max retries exceeded with url: /…` 而后半句
+    # `Caused by …` 是空的（本机与 gi_pace 夹具都抓到过）——按关键词就掉进【未分型】，那一档
+    # 不进熔断账、探测也不挂网络前缀，于是「这台连不上」被说成「站点在拦」，正是这一族事故。
+    # 排在最后：上面每一档都按更具体的消息先命中，这一档只兜「类名说是连接问题、消息没细节」。
+    ("连不上·链路中断", ("connectionerror", "max retries exceeded")),
 )
 # HTTP 状态码单独成一档：各站 `_fetch` 里失败原因本来就是 `f"HTTP {r.status_code}"` 这一句
 # 裸话，它没有异常链可读，但 429/403/5xx 的方向性最强（限流／风控／站点故障），

@@ -28,6 +28,7 @@ import random
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -165,12 +166,61 @@ _REQUEST_ERROR_KINDS = (
                    "timed out")),
     ("返回不可解析(代码)", ("expecting value", "jsondecoder", "char 0", "no json could be",
                          "failed to decode")),
+    # 兜底档：requests 的 ConnectionError **类名本身**就是「连接阶段断了」（urllib3 的
+    # NewConnectionError / ConnectTimeoutError 都包装成它），可它带的消息偶尔只剩
+    # `HTTPSConnectionPool(host=…, port=443): Max retries exceeded with url: /…` 而后半句
+    # `Caused by …` 是空的（本机与 gi_pace 夹具都抓到过）——按关键词就掉进【未分型】，那一档
+    # 不进熔断账、探测也不挂网络前缀，于是「这台连不上」被说成「站点在拦」，正是这一族事故。
+    # 排在最后：上面每一档都按更具体的消息先命中，这一档只兜「类名说是连接问题、消息没细节」。
+    ("连不上·链路中断", ("connectionerror", "max retries exceeded")),
 )
 # HTTP 状态码单独成一档：各站 `_fetch` 里失败原因本来就是 `f"HTTP {r.status_code}"` 这一句
 # 裸话，它没有异常链可读，但 429/403/5xx 的方向性最强（限流／风控／站点故障），
 # 而这几档恰恰是「等一等就好」与「改代码」的分界线。
 _HTTP_STATUS_KINDS = ((429, "HTTP 429·限流"), (403, "HTTP 403·风控/需验证"),
                       (407, "HTTP 407·要代理口令"), (404, "HTTP 404·这一页没了"))
+
+# ── 裸 HTTP 超时拆成「连接／读数」两个数 ─────────────────────────────────────────
+# 一个数当两个用的代价是本机实测出来的：顺企网整站无应答时 `timeout=25` 让每次重试都付满
+# 25 秒**连接**超时，`tries=4` 加退避＝一页约 107 秒，两个关键词就吃掉 3 分钟预算——而这一路
+# 本轮根本不可能出数据，能出货的路子反而被饿死。拆开以后连接阶段固定 10 秒（同机抽样：正常站
+# 0.03~0.4s，偶发 SYN 重传 1~7s；10s 既容得下重传，又能在真的连不上时快速失败），
+# 读数阶段沿用各站原来的数值——慢页面多等一会儿本来就该等。
+# 与 oss_pool_client._CONNECT_TIMEOUT_S 同一口径：别让两套「多久算连不上」并存。
+HTTP_CONNECT_TIMEOUT = 10
+
+
+def http_timeout(read=25):
+    """requests 的 timeout 统一取值：(连接 HTTP_CONNECT_TIMEOUT, 读数 read)。"""
+    return (HTTP_CONNECT_TIMEOUT, max(1, int(read or 25)))
+
+
+# ── 主机级熔断：连接阶段连续失败＝这一路本轮不必再试 ────────────────────────────
+# 判据只看**类别**（上面那张分型表的第一格），不看文案：这七档「连接阶段」失败的主语是
+# 主机/出口网络，处置是换出口、等站点恢复；读响应超时、TLS、HTTP 状态、不可解析这四档
+# 恰恰说明「连接是通的」，一律不算进来——把它们算进来就会在站点慢的时候把好主机拉黑。
+# 由来（实机体检抓到）：b2b.11467.com(59.36.210.149) 与 www.11467.com(58.61.157.108) 的
+# 80/443 全部 TCP 连接超时、ICMP 100% 丢包（同机对照组 b2b168／世界工厂网／中国制造网全
+# 200），工具却按「采不到」处理，每一页重新付一遍超时。
+DEAD_HOST_KINDS = ("连不上·无应答", "连不上·端口被拒", "连不上·被重置", "连不上·链路中断",
+                   "DNS解析不了", "本机断网", "代理不通")
+# 两次而不是三次：一次可能是偶发重置（本机 aipage 抽样就有「第一次 5s 没连上、第二次 0.03s」），
+# 而第二次仍然连不上时，同一出口对同一主机的路由已经重复给出同一答案。
+DEAD_HOST_STRIKES = 2
+# 拉黑不是永久：冷却后放一次机会（用户中途换网络、站点自己回来），否则「一次故障」会被
+# 记成「整轮放弃」，而长跑任务动辄几十分钟。
+DEAD_HOST_COOLDOWN = 900
+_DEAD_HOST_RE = re.compile(r"^(?:.{0,12}?[（(])?【([^】]+)】([^｜）]*)")
+
+
+def request_error_is_connect(shape):
+    """这句**分型好的**失败原因，主语是不是「连接阶段」（该记网络账还是站点账）。
+
+    与 _note_dead_host 共用同一张 DEAD_HOST_KINDS 表：拉黑算一套、看门狗归因算另一套，
+    迟早长成「这台已经被熔断了，界面却说在等站点放行」那种自相矛盾的账。
+    """
+    m = _DEAD_HOST_RE.match(str(shape or ""))
+    return bool(m and m.group(1) in DEAD_HOST_KINDS)
 
 
 def _request_error_detail(text, cap):
@@ -891,6 +941,15 @@ return '';})()"""
         # 分开。本轮 1688 等登录把 1500 秒预算烧光，却因为「0 家」被写成采不到——而它
         # 既没被拦停（_blocked 在等放行循环里被复位），也没失败，只是在等人。
         self._waiting_human = ""
+        # 主机级熔断的四本账（由来见 DEAD_HOST_KINDS 上方）：
+        #   _dead_strikes —— 每个主机**连续**的连接阶段失败次数，一次成功往来就清零
+        #   _dead_hosts   —— 已拉黑的主机 → (拉黑时刻, 最后一次分型原因)
+        #   _dead_logged  —— 已经打过「不再请求」那一行的主机（避免每个关键词刷一遍屏）
+        #   _cur_fetch_host —— 本次取页的主机，供 _mark_activity 知道该给谁销账
+        self._dead_strikes = {}
+        self._dead_hosts = {}
+        self._dead_logged = set()
+        self._cur_fetch_host = ""
 
         # 请求间隔统一记账（见 _sleep）：锚定「上一次真实请求完成」的时刻，
         # 同一条记录处理链路里连续多次 _sleep 不会重复支付整段等待。
@@ -953,6 +1012,136 @@ return '';})()"""
         # 走分型器而不是 str(err)[:160]：截断从头部砍，砍掉的恰好是唯一决定方向的
         # `(Caused by …)` 那一段（详见 request_error_shape 上方的由来）。
         self._last_page_error = request_error_shape(err, cap=160)
+        # 记完原因顺手按主机计一笔「连接阶段」连击：攒够就拉黑（见 _note_dead_host）。
+        self._note_dead_host(self._last_page_error)
+
+    @staticmethod
+    def _host_of(url):
+        """URL → 主机名（小写、去端口、去 userinfo）；认不出来就回空串，空串不进熔断账。"""
+        try:
+            net = urlparse(str(url or "").strip()).netloc
+        except Exception:
+            return ""
+        net = net.rsplit("@", 1)[-1]
+        if net.startswith("["):                      # IPv6 字面量：[::1]:8080
+            return net.split("]")[0].lstrip("[").lower()
+        return net.split(":")[0].strip().lower()
+
+    def _note_dead_host(self, shape):
+        """连接阶段失败按主机累计；连续攒够 DEAD_HOST_STRIKES 次就把这个主机拉黑一轮。
+
+        为什么以**主机**为单位、为什么只认分型类别：整站无应答时，重试、换关键词、借浏览器
+        标签都不改变结果，改变的只有预算（本机实测一页约 107 秒全喂给了超时）。而「读超时」
+        「HTTP 429」这些恰恰说明链路是通的，算进拉黑就会在站点慢的时候自己把活路掐了。
+        计量的**单位是「一页的最终失败」**：各站 _fetch 的重试循环只在收口那一次调
+        _note_request_error（页内重试不计数），所以两次连击＝连着两页都没取到，而不是一页里
+        重试了两次。按页而不是按次是有实测依据的——本轮实机顺企网第 1 页付了 4×10s+退避≈47s
+        才判死，第 2 页同样，之后整轮零请求；若把页内重试也计进来，一次偶发 connection reset
+        （11467 历史上就偶发）就会把一台活着的主机拉黑 15 分钟，那是自己断自己的活路。
+        返回命中的主机名（没命中任何一档时返回空串），供调用方与测试读。
+        """
+        m = _DEAD_HOST_RE.match(str(shape or ""))
+        if not request_error_is_connect(shape):
+            return ""
+        seg = m.group(2).strip()
+        # 池头给的是 `host:port`；没有池头（如 Chrome 的 net::ERR_*）就退回本次取页的主机
+        host = (seg.rsplit(":", 1)[0].strip().lower()
+                if re.match(r"^[a-z0-9._-]+:\d+$", seg, re.I) else seg.lower())
+        host = host or self._cur_fetch_host or ""
+        if not host:
+            return ""
+        self._dead_strikes[host] = self._dead_strikes.get(host, 0) + 1
+        if self._dead_strikes[host] >= DEAD_HOST_STRIKES and host not in self._dead_hosts:
+            self._dead_hosts[host] = (time.time(), str(shape)[:120])
+        return host
+
+    def _skip_dead_host(self, url):
+        """取页入口先问一句：这个主机本轮是不是已经确认连不上了。是→直接回「没取到」，
+        不再付那一整轮连接超时（拉黑不等于放弃：冷却期到了照旧给一次机会）。"""
+        host = self._host_of(url)
+        self._cur_fetch_host = host           # 成功往来时由 _mark_activity 给这一格销账
+        if not host or host not in self._dead_hosts:
+            return False
+        since, why = self._dead_hosts[host]
+        waited = time.time() - since
+        if waited >= DEAD_HOST_COOLDOWN:
+            self._dead_hosts.pop(host, None)
+            self._dead_strikes.pop(host, None)
+            self._dead_logged.discard(host)
+            self._log(f"  ♻️ {host} 冷却已满 {int(waited)}s，再给一次机会（上次：{why[:60]}）")
+            return False
+        if host not in self._dead_logged:
+            self._dead_logged.add(host)
+            self._log(f"  ⛔ {host} 连续 {self._dead_strikes.get(host, DEAD_HOST_STRIKES)} 次"
+                      f"连不上，本轮不再请求它（{why[:70]}）——这不是采不到：要换出口网络或等"
+                      f"站点恢复，改解析代码没有用；冷却 {DEAD_HOST_COOLDOWN}s 后会再试一次")
+        return True
+
+    def _skip_dead_host_probe(self, url, label="恢复探测"):
+        """探测/对照类调用共用的同一道门（口径见 _skip_dead_host，只是话说的是探测账）。
+
+        返回 None＝可以真探；返回一句话＝这台已熔断，**这一次探测根本没发出去**。
+        那句话必须带 NET_FAIL_TAG 前缀：看门狗按前缀把「本机/站点不可达」和「站点在拦」
+        分成两本账（见 _wait_manual_unblock 里的 net_hits 与 _run_abandon）。少了这个前缀，
+        一次连接失败就会被写成「仍在等站点放行/仍在限流状态」，用户照着等满两小时——
+        2026-11-04 断网实机红过的正是这个形状，而探测比取页更烧预算（它是循环发的）。
+        配对要求：探测真的发出去了并且站点回了话，就要调一次 _mark_activity() 给这笔账销账；
+        只问门不销账会让一台活着的主机被误拉黑（离线判据 test_block_triage_offline 12l 钉这条）。
+        """
+        if not url or not self._skip_dead_host(url):
+            return None
+        return (f"{NET_FAIL_TAG}{self._host_of(url)} 已按主机熔断"
+                f"（连续 {DEAD_HOST_STRIKES} 次连不上，{label}不再为它付连接超时）")
+
+    def _probe_net_fail(self, err, label="恢复探测"):
+        """探测函数**自己**撞上异常时给看门狗的那句话（连接类＝网络账，带 NET_FAIL_TAG 前缀）。
+
+        为什么要有这一份：各站 probe_block 的 except 分支原本有三种写法，三种都把**网络账**
+        记到了站点头上，只是方向不同——
+          · `except: pass` 后落到 `return self._block_reason or "站点仍在限流"`：用户照着等
+            两小时 IP 冷却，而真实原因是这台主机连不上（本轮实机顺企网正是这一档）；
+          · `except: return ""`：谎报「已解除」，看门狗刚放行就又一头撞在死链上；
+          · `except: return str(e)[:60]`：信息全被截断，且不带前缀，看门狗仍按站点账处理。
+        这里顺手把这笔记进请求层账（连接类死法要累计连击），并交出前缀，让 _wait_manual_unblock
+        的 net_hits 与「本机网络未恢复」那句归因真的能成立。离线判据 12n 钉这一族。
+        """
+        self._note_request_error(err)
+        return self._probe_net_word(label)
+
+    @staticmethod
+    def _probe_connect_word(shape, label="恢复探测"):
+        """**只有连接类**才代看门狗说这一句（带 NET_FAIL_TAG 前缀），否则回空串不代言。
+
+        为什么宁可不说话：探测「没抛异常、但这一页拿不出东西」也有第二种成因——站点回了
+        200 却是一张空列表（限流薄壳）。这时候请求层账本里根本没有连接类死法，若还硬挤出
+        一句「探测没做成」，就把「限流」这条唯一有处方的归因顶掉了（正确说法是等冷却）。
+        只有 DEAD_HOST_KINDS 那七档值得改口，因为它们把处方从「等站点放行」换成「换出口网络」。
+        """
+        if not request_error_is_connect(shape):
+            return ""
+        return f"{NET_FAIL_TAG}{label}没做成（不是站点在拦）：{str(shape)[:70]}"
+
+    def _probe_net_fail(self, err, label="恢复探测"):
+        """上面那三种 except 分支的统一收口：**绝不回空串**。
+
+        回空串＝告诉看门狗「已解除」，而此刻什么都没探明；刚返回连接类死法又说成代码异常，
+        都会让看门狗按错的处方走（前者立刻又一头撞死链，后者让真 bug 永远没人看栈）。
+        所以：连接类 → 带前缀的网络账；其余 → Plain 一句「探测没做成：<分型>」。
+        顺手记进请求层账是为了让连接类死法累计连击（探测也是页面级失败，攒够照样拉黑）。
+        """
+        self._note_request_error(err)
+        shape = str(self._last_page_error or "")
+        return (self._probe_connect_word(shape, label)
+                or f"{label}没做成：{shape[:70] or '未分型（原因见紧邻上一行日志）'}")
+
+    def _probe_net_word(self, label="恢复探测"):
+        """探测没抛异常、只是「这一页没东西」时补的那一句：只对网络账开口。
+
+        走 `self._fetch(...)` 的站点用它（_fetch 自己吞了异常并记了账，probe 这层看不到）。
+        调用前请把 `_last_page_error` 清一次——否则上一轮留下的连接类旧账会被这次探测认领。
+        非连接类返回空串，让各站原来的 `_block_reason`／「仍在限流状态」说法照常生效。
+        """
+        return self._probe_connect_word(self._last_page_error, label)
 
     def _note_page_fail(self, err=""):
         """记一笔「这一页列表根本没取到」——只在**翻页层**调用，一页最多一次。
@@ -1810,17 +1999,25 @@ return '';})()"""
         url = self._block_probe_url or self.BASE_URL
         if not url:
             return self._block_reason or "站点仍在防采/限流状态"
+        # 熔断＝这一次探测根本没发出去：说成「仍在限流」就是让人干等（口径见 _skip_dead_host_probe）
+        fuse = self._skip_dead_host_probe(url)
+        if fuse:
+            return fuse
+        net = ""
         try:
             jar = getattr(self, "_session", None)
             headers = getattr(self, "PROBE_HEADERS", None) or None
-            r = (jar or requests).get(url, timeout=20, headers=headers)
+            r = (jar or requests).get(url, timeout=http_timeout(20), headers=headers)
+            # 站方回了话（哪怕仍是挑战页）＝这台活着：给熔断账销一次连击，别让探测白问
+            self._mark_activity()
             if r.status_code == 200 and len(r.text or "") >= self.HTTP_BLOCK_MAX_BYTES \
                     and not self.http_block_reason(r.status_code, r.text):
                 self._block_reason = ""
                 return ""
-        except Exception:
-            pass
-        return self._block_reason or "站点仍在防采/限流状态"
+        except Exception as e:
+            # 探测自己撞上连接层死法：既不是「已解除」也不是「站点在拦」，是网络账
+            net = self._probe_net_fail(e)
+        return net or self._block_reason or "站点仍在防采/限流状态"
 
     def open_verify_page(self, url=""):
         """把需要人工过的验证页递到共享 Chrome 眼前：
@@ -2305,7 +2502,14 @@ return '';})()"""
             try:
                 still = probe()
             except Exception as e:
-                still = f"探测异常：{str(e).splitlines()[0][:60]}"
+                # 探测函数自己抛了：先过一次分型器再决定记哪本账。连接类死法必须带上
+                # NET_FAIL_TAG 前缀，否则下面 net_hits 永远是 0、收工写成「等 IP 冷却超时」，
+                # 用户以为站点封了他这台电脑（2026-11-04 断网实机红过的正是这一条）；
+                # 而代码异常（AttributeError 之类）绝不能冒充网络账——那样真 bug 会被
+                # 说成「等网络恢复」，谁都不会去看栈。
+                shape = request_error_shape(e)
+                still = (f"{NET_FAIL_TAG}探测异常：{shape[:60]}"
+                         if request_error_is_connect(shape) else f"探测异常：{shape[:60]}")
             # 探针带 NET_FAIL_TAG 前缀＝本机网络层就没通（断网/DNS/连接被重置），
             # 与「站点在拦」是两本账：文案、超时归因都按这个分叉走。
             if str(still).startswith(NET_FAIL_TAG):
@@ -2374,6 +2578,13 @@ return '';})()"""
     def _mark_activity(self):
         """记账「一次真实网络请求/导航刚完成」：裸 HTTP 子类取页后也要调。"""
         self._last_activity = time.time()
+        # 主机级熔断的销账：一次真的往来就说明这个主机活着，连击与拉黑都要清掉。
+        # 不清的话，站点偶发两次抖动就会把它永久拉黑——那是自己把能出货的路掐了。
+        # 拿不到本次主机（浏览器路径没走 _skip_dead_host）时什么都不清，宁保守。
+        _h = self._cur_fetch_host
+        if _h:
+            self._dead_strikes.pop(_h, None)
+            self._dead_hosts.pop(_h, None)
 
     def _sleep(self, mult=1.0):
         """请求间隔统一记账：只补齐「距上一次请求完成时刻」到间隔目标的差额。
@@ -2598,6 +2809,9 @@ return '';})()"""
             # 界面与体检器都问这一个数，不许靠读日志文案猜（由来见 _no_result_line）
             "page_fail": self._page_fail,
             "last_page_error": self._last_page_error,
+            # 本轮被主机级熔断拉黑的主机：界面/体检器靠它说「这一路本轮不再重试了」，
+            # 而不是让下一个读红话的人以为还要再等等看（读数只在这张账上，不靠文案）
+            "dead_hosts": {h: v[1] for h, v in sorted(self._dead_hosts.items())},
             "waiting": self._waiting_human,
             "incr_skip": self._incremental_skipped,
             "got": len(self.results),
@@ -2729,6 +2943,10 @@ return '';})()"""
         self._page_fail = 0
         self._last_page_error = ""
         self._waiting_human = ""
+        # 主机熔断同样按轮起账：上一轮连不上的主机，这一轮（可能已经换了出口）必须重新试
+        self._dead_strikes = {}
+        self._dead_hosts = {}
+        self._dead_logged = set()
         self.stat_pages = self.stat_listed = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         if not self.resume:
@@ -2895,8 +3113,10 @@ return '';})()"""
             mark, why = "⏹", "｜本轮被停止"
         elif not self.results:
             if self._page_fail and not self.stat_listed:
-                mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到，"
-                                   "这不是本站没有数据（先查出口网络/域名可达，再谈代码）")
+                mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到"
+                                   + (f"（{'、'.join(self._dead_hosts)} 已按主机熔断，本轮不再重试）"
+                                      if self._dead_hosts else "")
+                                   + "，这不是本站没有数据（先查出口网络/域名可达，再谈代码）")
             elif self._incremental_skipped:
                 mark, why = "⚠", (f"｜增量库全跳过 {self._incremental_skipped} 家"
                                    f"（种子库 {len(self._seen_store)} 家已含，链路是通的；"
@@ -2912,6 +3132,10 @@ return '';})()"""
         # 「有 3 页根本没取到」这笔坏账就永远看不见（少了几页同样是要紧的账）
         lk = (f"｜取页失败 {s['page_fail']} 页（最后一次：{s['last_page_error'][:60]}）"
               if s["page_fail"] else "")
+        # 熔断那一笔在正常出货的轮次里也要露出来：某台主机被跳过 5 页，账上只写「翻 5 页」
+        # 就是「少了几页没人说」——与上面「链路账不许只在 0 家时才可见」同一口径。
+        if s.get("dead_hosts"):
+            lk += f"｜主机熔断 {'、'.join(s['dead_hosts'])}（本轮不再请求，冷却后自动再试）"
         wt = f"｜仍在等{s['waiting']}" if s["waiting"] else ""
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
@@ -2971,6 +3195,10 @@ return '';})()"""
         self._page_fail = 0
         self._last_page_error = ""
         self._waiting_human = ""
+        # 主机熔断账同样要清：「开始新任务」意味着重新给每台主机一次机会
+        self._dead_strikes = {}
+        self._dead_hosts = {}
+        self._dead_logged = set()
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         self.kw_yield = {}

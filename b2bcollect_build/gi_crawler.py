@@ -63,8 +63,9 @@ import requests
 
 from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE,
                       parse_contact_field, is_placeholder_number, dept_only, compose_position,
-                      strip_name_marketing_tail, strip_country_code, HONORIFIC_ONLY_RE,
-                      NET_FAIL_TAG)
+                      strip_name_marketing_tail, strip_country_code, HONORIFIC_ONLY_RE)
+# 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
+from cdp_base import http_timeout
 
 HOME_URL = "https://www.globalimporter.net/"
 SEARCH_URL = "https://www.globalimporter.net/search_company.asp?keyword={kw}&curpage={page}"
@@ -231,8 +232,13 @@ class GiCrawler(CdpSiteCrawler):
         所以引导的正确形状是：首页 →（有 token 就跟，最多 3 跳）→ 回补一次首页，
         用回补那次的体积当放行判据（浏览器跟完质询页本来就要回到首页）。
         跟完仍不给内容，才轮到安全狗那句 IP 冷却处置（那是另一层，见模块 docstring）。"""
+        # 主机级熔断：这台已经确认连不上了，跳转链（首页→质询→首页）三个请求全是白付
+        # （口径与由来见 cdp_base._skip_dead_host）
+        if self._skip_dead_host(HOME_URL):
+            self._booted = False
+            return False
         try:
-            r = self._session.get(HOME_URL, timeout=25)
+            r = self._session.get(HOME_URL, timeout=http_timeout(25))
             self._mark_activity()
             text = self._decode(r)
             hops = 0
@@ -242,14 +248,14 @@ class GiCrawler(CdpSiteCrawler):
                     break
                 time.sleep(0.8 + 0.4 * hops)          # 薄壳里 JS 等的是 700ms，按它的节奏来
                 r = self._session.get(f"{HOME_URL}?WebShieldSessionVerify={m.group(1)}",
-                                      headers={"Referer": HOME_URL}, timeout=25)
+                                      headers={"Referer": HOME_URL}, timeout=http_timeout(25))
                 self._mark_activity()
                 text = self._decode(r)
                 hops += 1
             if hops:
                 # 跟完质询页回补首页：这一步才是「拿到真内容 + 下发 ASP Cookie」
                 time.sleep(0.8)
-                r = self._session.get(HOME_URL, headers={"Referer": HOME_URL}, timeout=25)
+                r = self._session.get(HOME_URL, headers={"Referer": HOME_URL}, timeout=http_timeout(25))
                 self._mark_activity()
                 text = self._decode(r)
             self._boot_hops = hops
@@ -262,7 +268,12 @@ class GiCrawler(CdpSiteCrawler):
                           f"（{self._boot_len} 字）——这不是缺跳转，是站方在拦这个出口")
             return self._booted
         except Exception as e:
-            self._log(f"  ⚠ 跨国采购网首页会话引导失败（{str(e)[:60]}）")
+            # 走分型器并记进请求层那本账，而不是 str(e)[:60]：引导这一步败了的时候，
+            # 主语多半是**这台主机连不上**（本轮实机就是 www.globalimporter.net:443 连接超时），
+            # 原样截断既砍掉了决定方向的 `(Caused by …)`，也让主机熔断拿不到这次连击——
+            # 于是整轮每个关键词都重新付一遍 3 个请求的连接超时（口径见 cdp_base._note_request_error）。
+            self._note_request_error(e)
+            self._log(f"  ⚠ 跨国采购网首页会话引导失败（{self._last_page_error[:70]}）")
             self._booted = False
             return False
 
@@ -284,14 +295,22 @@ class GiCrawler(CdpSiteCrawler):
 
         def once():
             """发一个请求判定。返回 (是否解除, 未解除说明, 是否 WAF 会话质询薄壳)。"""
+            fuse = self._skip_dead_host_probe(url, "恢复探测")
+            if fuse:
+                # 熔断＝这一次探测根本没发出去，说成「仍在配额/限流」就是假等待（见基类前缀口径）
+                return False, fuse, False
             try:
-                r = self._session.get(url, timeout=25, headers={"Referer": HOME_URL})
+                r = self._session.get(url, timeout=http_timeout(25), headers={"Referer": HOME_URL})
                 self._mark_activity()
             except Exception as e:
                 self._session.close()
                 self._session = self._new_session()
                 self._booted = False
-                return False, f"{NET_FAIL_TAG}{type(e).__name__}", False
+                # 交给分型器而不是 `NET_FAIL_TAG + type(e).__name__`：①那样任何异常（包括
+                # 代码里的 AttributeError）都冒充「本机断网」，看门狗会一直等网络恢复而没人
+                # 去看栈；②Requests 的 ConnectionError 还可能是「连接被重置/DNS 挂了」，
+                # 只留类名就丢了主机与证据；③不记账就永远攒不到熔断连击（口径见基类）
+                return False, self._probe_net_fail(e), False
             text = self._decode(r)
             block = self.http_block_reason(r.status_code, text, url)
             if r.status_code == 200 and not block:
@@ -326,6 +345,10 @@ class GiCrawler(CdpSiteCrawler):
 
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
     def _fetch(self, url, tries=3, guarded=True):
+        # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
+        # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
+        if self._skip_dead_host(url):
+            return ""
         if self._req_used >= self.REQ_BUDGET:
             self._log(f"  ⛔ 跨国采购网本轮已用到 {self._req_used} 个页面（站方规定同一个网络地址"
                       f"最多看约 50 个页面，主动收本轮比被它拦下快），"
@@ -337,7 +360,7 @@ class GiCrawler(CdpSiteCrawler):
         for i in range(max(1, tries)):
             try:
                 self._pace_before_request()
-                r = self._session.get(url, timeout=25, headers={"Referer": HOME_URL})
+                r = self._session.get(url, timeout=http_timeout(25), headers={"Referer": HOME_URL})
                 self._mark_activity()
                 text = self._decode(r)
                 block = self.http_block_reason(r.status_code, text, url, r.headers)

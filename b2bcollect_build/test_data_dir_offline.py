@@ -35,7 +35,9 @@
 14/15 钉用户报「以前能采到、现在一直是 0」那条链上的两句口径：页尾「早过滤 N 家/增量库
 已含 N 家」与收尾「还欠多少家补联系人」在 cdp_base 与 ali1688 两边逐字同构、同表同答，
 种子库解锁判据 ct/rt 两边一致（旧口径「进过库就永不重采」在这张表上确实锁死待补采的公
-司）；results_live 五路同构且真跑一次——官网回采联系方式必须写回真身，写成副本的话那句
+司）；收尾「零产出」那四档归因按**渲染结果**对拍（把两边的分支源码抠出来真跑一遍），因
+为基类那句里插了一段主机熔断、1688 那一路根本没有这本账——按文本钉只会逼出假账或删真话；
+results_live 五路同构且真跑一次——官网回采联系方式必须写回真身，写成副本的话那句
 「已补采」就是空话。
 运行：python test_data_dir_offline.py
 """
@@ -1422,7 +1424,6 @@ _FRAG14 = ("增量库跳过 {self._incremental_skipped} 家(已采过或重试�
            'f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "',
            # 零产出三分支 + 在等人一支（处置各不相同，缺一条就等于把一类问题说成另一类）
            'f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"',
-           'f"｜链路未通：{self._page_fail} 页一页都没取到，"',
            'f"｜增量库全跳过 {self._incremental_skipped} 家"',
            '"｜本轮零产出（见上方账目）"',
            # 请求层失败分型三件套（类别写在头部，[:40]/[:60]/[:70] 截不掉方向）。
@@ -1439,6 +1440,110 @@ for _frag in _FRAG14:
     check(f"14i 收尾账目片段两边逐字同在：「{_frag[:16]}…」",
           _frag in _src_cdp14 and _frag in _src_a1614,
           f"基类有={_frag in _src_cdp14} 1688 有={_frag in _src_a1614}")
+
+
+# 14m 「链路未通」那一支：两边**不逐字同**是刻意的，所以不能按片段比。
+# 基类那句在中间插了一段主机熔断（`{'、'.join(self._dead_hosts)} 已按主机熔断…`），
+# 1688 那一路是浏览器驱动、根本没有这本账（见 ⑫ 节 12i：Ali1688Site.stats 故意不给
+# dead_hosts）。按片段钉死只会逼出两种坏修法：要么给 1688 硬造一本假账，要么把基类
+# 那句拆掉。所以这里比的是**渲染结果**——同一组事实喂给两边的零产出分支，除了那段
+# 熔断插入语，说出来的话必须一字不差。
+def _zero_body(src, tag):
+    """抠出收尾里 `elif not self.results:` 那一段的**函数体**（零产出三分支本体）。
+
+    只认一处：出现两处就说明判据抓的对象已经不唯一，宁可比错之前先响。
+    取 body 而不是取整个 If 节点：两边的这一段都挂在 elif 链上，连 `elif` 一起取出来
+    就没法独立 exec；而外层那几支（被拦/在等人/被停止）各有本站的取页口径，不归这格比。
+    """
+    import textwrap
+    found = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.If) and ast.unparse(n.test) == "not self.results"]
+    if len(found) != 1:
+        check(f"14m- {tag} 零产出分支取得唯一", False, f"找到 {len(found)} 处，判据已失去对拍对象")
+        return ""
+    node = found[0]
+    lines = src.splitlines()
+    body = textwrap.dedent("\n".join(lines[node.body[0].lineno - 1:node.body[-1].end_lineno]))
+    check(f"14m- {tag} 零产出分支抠得出可独立执行的函数体", "mark" in body and "why" in body,
+          repr(body[:80]))
+    return body
+
+
+_ZERO_CDP = _zero_body(_src_cdp14, "cdp_base")
+_ZERO_A16 = _zero_body(_src_a1614, "ali1688")
+
+
+class _Stub14:
+    """零产出分支只读这几格，用桩喂进去就能比「同一组事实的两份说法」。"""
+
+    results = []
+    _page_fail = 0
+    stat_listed = 0
+    _dead_hosts = {}
+    _incremental_skipped = 0
+    _seen_store = {}
+
+
+def _render_zero(body, **facts):
+    """把一段收尾分支源码真的跑一遍，拿它给出的 (标记, 那句话)。
+
+    exec 的对象只有本仓库自己的两段源码和下面手写的夹具常量，没有任何外部输入。
+    """
+    st = type("_S14", (), dict(vars(_Stub14), **facts))()
+    ns = {"self": st}
+    exec(compile(body, "<zero-branch>", "exec"), ns)     # noqa: S102
+    return ns.get("mark"), ns.get("why")
+
+
+_ZERO_CASES = [
+    ("链路没通（一页都没取到、列表也没见过头）", {"_page_fail": 3, "stat_listed": 0}),
+    ("链路没通但列表见过条目（是详情全失败，不是取不到页）",
+     {"_page_fail": 2, "stat_listed": 5}),
+    ("增量库全跳过（链路是通的，要新数据得换词）",
+     {"_incremental_skipped": 7, "_seen_store": {1: {}, 2: {}, 3: {}}}),
+    ("真的零产出（哪一笔账都没有）", {}),
+]
+_bad14m = []
+for _lbl, _facts in _ZERO_CASES:
+    _x = _render_zero(_ZERO_CDP, **_facts)
+    _y = _render_zero(_ZERO_A16, **_facts)
+    if _x != _y:
+        _bad14m.append(f"{_lbl}: 基类={_x} 1688={_y}")
+check(f"14m 同一组事实喂两边零产出分支，{len(_ZERO_CASES)} 档说法逐字同答",
+      not _bad14m and len(_ZERO_CASES) >= 4, str(_bad14m))
+check("14m- 这四档落在三种不同的说法上（第二档刻意与第四档同句：取到过列表就不算链路未通）",
+      len({_render_zero(_ZERO_CDP, **_f)[1] for _, _f in _ZERO_CASES}) == 3
+      and _render_zero(_ZERO_CDP, **_ZERO_CASES[1][1]) == _render_zero(_ZERO_CDP),
+      str([_render_zero(_ZERO_CDP, **_f) for _, _f in _ZERO_CASES]))
+_fused = _render_zero(_ZERO_CDP, _page_fail=3, stat_listed=0,
+                      _dead_hosts={"b2b.11467.com": "【连不上·无应答】…"})
+check("14m-- 基类那一段插入语只在有熔断账时出现，且说清「本轮不再重试」（与账目行同一口径）",
+      _fused[0] == "⛔" and _fused[1].startswith("｜链路未通：3 页一页都没取到")
+      and "b2b.11467.com 已按主机熔断，本轮不再重试" in _fused[1]
+      and _fused[1].endswith("再谈代码）"),
+      repr(_fused))
+check("14m--- 1688 那一路没有主机熔断这本账（浏览器驱动，没有裸 HTTP 池），这句话不许凭空冒出来",
+      "_dead_hosts" not in _ZERO_A16
+      and "熔断" not in _render_zero(_ZERO_A16, _page_fail=3, stat_listed=0,
+                                     _dead_hosts={"b2b.11467.com": "…"})[1],
+      repr(_ZERO_A16[:120]))
+_OLD_ZERO = 'mark, why = "⚠", "｜本轮零产出（见上方账目）"'
+_old14 = [_render_zero(_OLD_ZERO, **_f) for _, _f in _ZERO_CASES]
+check("14n 反向对照：旧写法（2026-11-15 之前）这四档全塌成同一句——上一轮把网络不可达报成"
+      "「采不到」的就是这一句；它必须与基类不同答",
+      len(set(_old14)) == 1
+      and sum(1 for _, _fx in _ZERO_CASES
+              if _old14[0] != _render_zero(_ZERO_CDP, **_fx)) >= 2,
+      str(_old14))
+check("14n- 反向对照：把熔断插入语拆掉（退回上一版写法）渲染出来就没有「熔断」字样"
+      "（14m-- 比的确实是代码，不是注释）",
+      "熔断" not in _render_zero(
+          'if self._page_fail and not self.stat_listed:\n'
+          '    mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到，"\n'
+          '                       "这不是本站没有数据（先查出口网络/域名可达，再谈代码）")\n'
+          'else:\n    mark, why = "⚠", "｜本轮零产出（见上方账目）"\n',
+          _page_fail=3, stat_listed=0, _dead_hosts={"b2b.11467.com": "…"})[1],
+      "拆掉插入语还能渲染出「熔断」=判据在比注释而不是比代码")
 check("14j 欠账计数真的能数出来（台账里一半待补采就不能报「已经采全」）",
       _cdp_cls._seen_store_pending.__name__ == _a16_cls._seen_store_pending.__name__
       and _a16_cls._seen_store_pending(

@@ -90,7 +90,12 @@ __all__ = [
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 HEADERS = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
-TIMEOUT = 12                 # 单页硬超时：企业站慢，但慢到 12s 以上不如算失败
+TIMEOUT = 12                 # 单页**读数**硬超时：企业站慢，但慢到 12s 以上不如算失败
+# 连接阶段单独给数（与 cdp_base.HTTP_CONNECT_TIMEOUT 同一口径，两份常量的等式由离线套件
+# 对拍钉住——「同一件事两个数」正是这一族缺陷的来源）。为什么必须拆：企业官网整站连不上时
+# 一个数当两个用，每次抓取都付满 12s 才回一句「不可达」，而每家站点的预算只有 45s——
+# 连不上付 10s 就够了，慢页面该等的仍然等。
+CONNECT_TIMEOUT = 10
 MAX_BYTES = 1_200_000        # 响应体封顶：页面再大也用不到后面的内容，别让带宽拖死预算
 SITE_MARK = "官网回采"       # 写进记录「官网回采」列的来源标记（可复核，不静默回填）
 
@@ -581,7 +586,7 @@ def fetch_html(url, timeout=TIMEOUT):
     """
     import requests
     try:
-        r = _http_session().get(url, timeout=timeout, allow_redirects=True)
+        r = _http_session().get(url, timeout=(CONNECT_TIMEOUT, timeout), allow_redirects=True)
         try:
             final = r.url or url
             code = int(r.status_code)
