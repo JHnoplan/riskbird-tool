@@ -9,6 +9,13 @@
 # 紧跟在 { } 块后面的 RC=$?，而块里最后一句是 echo，于是 PROBE_RC 恒等于 0，
 # 「门自己绿了」这件事根本没被判据看过（同一类缺陷在交付链硬门里记过账）。
 set -u
+# errexit／pipefail 显式关掉——**这份脚本的生死不许由调用方的 shell 选项决定**。
+# Actions 的 bash 步是 `bash --noprofile --norc -e -o pipefail`，它拉起的 python 再拉起
+# 子 bash 时，新版 bash 会把这套选项交给孩子；本轮 Windows 云端就是这么把批跑入口
+# 一声不响杀掉的（退出码 1、stdout 0 字节、stderr 0 字节）。完整故事与复现见
+# debug/run_offline_regression.sh 开头那段，判据是硬门第 15 条的「立场」那半。
+set +e
+set +o pipefail
 cd "$(dirname "$0")/.." || exit 2
 OUT="${1:-/tmp/perf_probe_$(date +%m%d_%H%M%S).txt}"
 HEAD="${GIT_HEAD:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"

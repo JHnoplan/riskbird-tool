@@ -6377,11 +6377,15 @@ def test_errexit_silent_death_gate():
     _assert_eq(_haz('# BEFORE_PIDS=$(pgrep -x Foo)\n'), [],
                "反向对照：注释行不算（否则每句解释都要改写成转义，门禁立刻沦为噪音）")
     _got = _haz('set +e\nX=$(pgrep -x Foo)\n')
-    _assert_eq(len(_got), 1,
-               "反向对照：set +e 之后那段不适用 15a（口径跟着脚本自己走），但整段关保护"
-               "这件事由 15c 自己判红——两头都不能放过")
-    _assert("整段的 errexit" in _got[0],
-            f"15c 报的要指明是哪一行关的保护（实际={_got[0][:90]}）")
+    _assert_eq(_got, [],
+               "口径（2026-11-14 改的）：**第一句**就 `set +e` 是第 28 条要求的立场表态，"
+               "这段里裸赋值不会静默死，15a 不适用、15c 也不该把它当「关保护」报红——否则这条门"
+               "会逼下一个人在批跑入口里补一句 `set -e`，那才是真把一百多条裸赋值交到 errexit 手上")
+    _assert_eq(len(_haz('X=$(pgrep -x Foo)\n')), 1,
+               "表态的另一半：同样的裸赋值放在**没表态**的脚本里必须红（默认按调用方给了 -e 判）。"
+               "上面那条放行是靠这一条兜住的，两条一起才成立")
+    _assert("pgrep" in _haz('X=$(pgrep -x Foo)\n')[0],
+            "没表态那一红要能照做（点名命令）")
     for _cmd in ("grep -c ok f", "ls /nope", "diff a b", "command -v nope"):
         _assert_eq(len(_haz(f"V=$({_cmd})\n")), 1,
                    f"覆盖面不止 pgrep：`{_cmd}` 正常情形也返回非零，裸赋值同样要报")
@@ -6397,9 +6401,13 @@ def test_errexit_silent_death_gate():
                    f"反向对照：`{_s}` 都算开了 errexit，裸赋值那一句必须报"
                    f"（认不出来=这条门在那种写法下从没跑过）")
     _got = _haz("set +o errexit\n" + _RAW)
+    _assert_eq(_got, [],
+               "反向对照：长写法的第一句表态和短写法同口径（`set +o errexit` 也算表态），"
+               "只认 `set +e` 的字面会逼出一份「为了过门而写的假表态」")
+    _got = _haz("set -Eeuo pipefail\nfoo\nset +o errexit\n" + _RAW)
     _assert_eq(len(_got), 1,
-               "反向对照：长写法关掉 errexit 时 15a 不报那句裸赋值（口径跟着 set 走），"
-               "但关保护这件事由 15c 报——两种写法都不能漏")
+               "反向对照：先把保护开起来、中段再用长写法关掉——15c 必须认得 "
+               "`set +o errexit` 这种拼法并报红（实际=%s）" % (_got[:1],))
     _assert("整段的 errexit" in _got[0],
             f"报的要说是哪一行关的保护（实际={_got[0][:80]}）")
 
@@ -6431,23 +6439,35 @@ def test_errexit_silent_death_gate():
     _assert(any("-E" in p for p in _haz("set -euo pipefail\ntrap 'echo boom' ERR\n")),
             "报的话要能直接照做：点名补 -E")
 
-    # 3d) 「整份脚本没开 -e 却装了陷阱」只有本地脚本口径（默认不带 -e）才判得出来，
-    #     texts 走的是 Actions 默认 -e 的口径，所以这一条必须落到真文件上跑一遍登记表。
-    #     夹具名不许只差大小写（noe/noE 那种）：macOS 与 Windows 的默认文件系统大小写不
-    #     敏感，两个名字是**同一个文件**，后写的把先写的盖掉——本轮实测于是把「没开 -e」
-    #     那条判成「缺 -E」，红得莫名其妙，而 Linux CI 上永远不会出现这个症状。
+    # 3d) 「装了陷阱却永远不会响」与「装了陷阱但只盖住脚本主体那一层」是两种坏样子，
+    #     分别由**明确 `set +e`** 和**从头到尾没表态**引出来。后半句是本轮重立默认口径之后
+    #     改的：调用方的 `-e` 会被 bash 交给子脚本（第 28 条整条就是这一件事），所以「脚本
+    #     自己没写 set」不能再推出「这一段没有 errexit」——没表态的那份按 -e 生效判，报的
+    #     是「缺 -E」而不是「没有一段在 -e 下跑」。两条都留在夹具里跑真文件，是为了让
+    #     「默认口径变了」这件事必须在判据上留下痕迹，而不是只改一句注释。
+    #     这一格必须落到真文件上跑一遍登记表（texts 那侧只喂得出一种默认）。夹具名不许只差
+    #     大小写（noe/noE 那种）：macOS 与 Windows 的默认文件系统大小写不敏感，两个名字是
+    #     **同一个文件**，后写的把先写的盖掉——本轮实测于是把「没开 -e」那条判成「缺 -E」，
+    #     红得莫名其妙，而 Linux CI 上永远不会出现这个症状。
     _shfx = {
-        "debug/zz_errtrap_noerrexit.sh": "trap 'echo boom' ERR\npgrep -x Foo\n",
+        "debug/zz_errtrap_setplus.sh": "set +e\ntrap 'echo boom' ERR\npgrep -x Foo\n",
+        "debug/zz_errtrap_noset.sh": "trap 'echo boom' ERR\npgrep -x Foo\n",
         "debug/zz_errtrap_noerrtrace.sh": "set -euo pipefail\ntrap 'echo boom' ERR\n",
         "debug/zz_errtrap_ok.sh": "set -Eeuo pipefail\ntrap 'echo boom' ERR\n",
     }
     for _rel, _src in _shfx.items():
         (_REPO / _rel).write_text(_src, encoding="utf-8")
     try:
-        _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_noerrexit.sh",),
+        _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_setplus.sh",),
                                                 workflows=())
         _assert(any("没有任何一段在 -e 下跑" in p for p in _got),
-                f"反向对照：没开 -e 的脚本装了 ERR 陷阱要判红（实际={_got}）")
+                f"反向对照：明确 set +e 的脚本装了 ERR 陷阱要判红（实际={_got}）")
+        _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_noset.sh",),
+                                                workflows=())
+        _assert(any("-E" in p for p in _got)
+                and not any("没有任何一段在 -e 下跑" in p for p in _got),
+                f"默认口径：全程没表态的脚本按 -e 生效判，报「缺 -E」而不是「陷阱不会响」"
+                f"（实际={_got}）")
         _got = gate.check_shell_errexit_hazards(sources=("debug/zz_errtrap_noerrtrace.sh",),
                                                 workflows=())
         _assert(any("-E" in p for p in _got),
@@ -8237,8 +8257,9 @@ def test_suite_exit_code_guard_gate():
             "云端 annotation 要能直接照做：写明是「判定与退出码不同源」，不是「套件失败」")
 
     # ── 2) 范围与批跑同源，而且真仓库今天全绿 ──
-    _rc, _files, _err = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _rc, _files, _err, _out = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
+                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
     _assert(len(_files) >= 50,
             f"--list 展开出 {len(_files)} 项：少于 50 说明发现逻辑或 --list 的 stdout 契约坏了")
     _assert(all(x.endswith(".py") and not x.startswith("/") and (_REPO / x).is_file()
@@ -8372,8 +8393,9 @@ def test_regression_suites_tracked_gate():
             "云端 annotation 要能直接照做：写明是「本机有、提交里没有」")
 
     # ── 2) 真仓库：清单里每一路都已在提交里；当年漏掉的那 5 份单独钉一次 ──
-    _rc, _files, _err = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _rc, _files, _err, _out = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
+                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
     _assert_eq(gate.check_regression_suites_tracked(), [],
                "第 24 条：清单展开出来的每一路套件都已在提交里（红了就照每条前面的 git 命令做）")
     _scar = ("debug/verify_gys_offline.py", "debug/gi_mp_offline_check.py",
@@ -8551,8 +8573,9 @@ def test_no_dev_machine_paths_gate():
     # ── 7) 范围：交付目录 + 批跑清单 + 交付 shell + workflow + 门禁自己，一个都不许漏 ──
     _inputs = gate._dev_path_inputs()
     _rels = {gate._rel_posix(p) for p in _inputs}
-    _rc, _files, _err = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（stderr={_err[:150]}）")
+    _rc, _files, _err, _out = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
+                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
     _assert(set(_files) <= _rels,
             f"清单里每一份套件都在第 25 条的视野内（缺 {sorted(set(_files) - _rels)[:4]}）"
             f"——门与批跑分叉的方向永远是「少判一侧」")
@@ -8983,6 +9006,164 @@ def test_module_name_binding_gate():
         _assert(False, "端到端这一格没法判：找不到 bash 或当前解释器（静默跳过＝这条格从没跑过）")
 
 
+def test_shell_errexit_posture_gate():
+    print("\n═══ AL. 手写 shell 必须自己对 errexit 表态：第 28 条硬门要有牙 ═══")
+    # 由来（2026-11-14 Windows 云端实发，本机逐字节复现过）：打包前硬门那一步红，红话是
+    # 「批跑清单取不到（bash debug/run_offline_regression.sh --list 退出码 1）」，而同一条命令
+    # 在本机怎么跑都是绿的。把云端那次 job 的日志读到底才看见真正的签名：**退出码 1、stdout
+    # 0 字节、stderr 0 字节**——连批跑入口第一句走 stderr 的诊断都没来得及打。本机照着 Actions
+    # 给 bash 步的那对选项起它（`bash -e -o pipefail debug/run_offline_regression.sh --list`）
+    # 当场复现，`bash -x` 停在 ``hits=$(ls "$d"/test_*_offline.py 2>/dev/null)``：ali1688_build
+    # 按登记就是没有 *_offline.py，ls 无匹配返回非零、报错又被自己的 2>/dev/null 吃掉，裸赋值
+    # 把这个非零原样交给**从调用方继承来的** errexit，脚本一声不响地结束。
+    #
+    # 为什么只有 Windows 红：两步都是 `shell: bash`，但 mac 上那一位是 /bin/bash 3.2，实测不
+    # 把 -e 交给子 bash；Git Bash 5.2 会交。**同一份脚本、一个平台绿一个平台红，差的不是代码，
+    # 是拉起它的人带了什么选项。** 所以第 15 条原来那句「脚本里没写 set -e 就一路不设」的口径
+    # 被这件事正面证伪了：一份不表态的 shell 有两种生死，而这两种生死都不会在日志里留下第二句
+    # 话。本节要钉的就是「生死必须由脚本自己宣布」，以及宣布的时机必须早于第一句可能失败的命令。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    runner_rel = "debug/run_offline_regression.sh"
+    runner = _REPO / runner_rel
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    _assert(callable(getattr(gate, "check_shell_errexit_posture", None)),
+            "硬门模块里有第 28 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("posture = check_shell_errexit_posture()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 28 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 28 条报出来的问题要并进不合格计数（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::shell errexit 立场" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：写明要补的是表态，不是「重跑一次」")
+    _assert(runner_rel in gate.SHELL_SOURCES,
+            "死在云端的那份批跑入口在这条门的登记表里（不在表里的判据等于没判）")
+
+    # ── 2) 真仓库全绿，而且绿得有内容：视野不是空的 ──
+    _assert_eq(gate.check_shell_errexit_posture(), [],
+               "第 28 条：交付链每一份手写 shell 都在第一条真命令之前对 errexit 表了态")
+    _absent = [rel for rel in gate.SHELL_SOURCES if not (_REPO / rel).is_file()]
+    _assert_eq(_absent, [],
+               f"登记表里每一份都在磁盘上——不在位的那份会被这条门 continue 掉，"
+               f"视野悄悄缺一格而结论照绿：{_absent}")
+
+    # ── 3) 逐份承重：把某一份真脚本的表态那一行删掉，门必须当场响在这一份上 ──
+    # 只看「今天返回 []」是不够的：登记表现在有 7 份，判据也可能对其中几份压根没生效。
+    for rel in gate.SHELL_SOURCES:
+        text = (_REPO / rel).read_text(encoding="utf-8", errors="replace")
+        _ok, _on, _ln, _fr = gate._errexit_posture(text)
+        _assert(_ok, f"{rel}：现状就该有表态（_errexit_posture 读不到＝上面那条 [] 是空转）")
+        if not _ln:
+            continue
+        _stripped = "\n".join(ln for i, ln in enumerate(text.splitlines(), 1) if i != _ln)
+        _got = gate.check_shell_errexit_posture(sources=(), texts=((rel, _stripped),))
+        _assert_eq(len(_got), 1,
+                   f"承重判据：删掉 {rel} 第 {_ln} 行那句表态后，门必须当场响在这一份上"
+                   f"（不响=这条门对真仓库的这一格没有覆盖）")
+        _assert(rel in _got[0] and "第一条真命令" in _got[0],
+                f"响的那句要点名是哪一份、以及为什么（实际={_got[0][:110]}）")
+
+    # ── 4) 反向对照：表态与不表态、表态早与表态晚，八种形状各判一次 ──
+    def _post(script: str) -> list:
+        return gate.check_shell_errexit_posture(sources=(), texts=(("夹具", script),))
+
+    for _txt, _want, _why in (
+        ("X=$(ls /nope)\necho hi\n", 1, "完全没表态：生死交给调用方"),
+        ("set +e\nX=$(ls /nope)\necho hi\n", 0, "第一句就把继承来的 errexit 关掉并写明走显式分支"),
+        ("set -Eeuo pipefail\nX=$(ls /nope) || true\n", 0, "开起来并逐条接管非零，同样算表态"),
+        ("set +o errexit\necho hi\n", 0, "长写法算表态（只认 `set +e` 的字面会逼人写假表态）"),
+        ("set -u\nset -x\nX=$(ls /nope)\n", 1, "路过的 set 里没提 errexit 不算表态"),
+        ("#!/bin/bash\n# set -e\nX=$(ls /nope)\n", 1, "注释里的表态不算（否则解释都能过门）"),
+        ("X=$(ls /nope)\nset +e\necho hi\n", 1, "表态来晚了：它之前那句已经有机会把脚本带走"),
+        ("#!/bin/bash\n# 只有说明\n", 1, "既没表态也没真命令＝这份被清空了，不该留在登记表里"),
+    ):
+        _got = _post(_txt)
+        _assert_eq(len(_got), _want,
+                   f"反向对照：{_why}（夹具={_txt.splitlines()[:2]}，实际={_got[:1]}）")
+
+    # ── 5) 与第 15 条联动：默认口径不许跟着表态走（那是本轮证伪出来的假绿口子）──
+    # 表态**之后**的段落由 _errexit_segments 逐行跟着脚本自己的 set 切换；表态**之前**那几行
+    # 仍然交在调用方手里，所以那一段必须按 -e 生效判。这一格分开测两条边：早于表态的裸赋值
+    # 必须红，晚于表态的裸赋值必须放行；而且两条门要一起响、一起放行。
+    _tmp = tempfile.mkdtemp(prefix="al_prologue_")
+    try:
+        _early = Path(_tmp) / "fx_prologue_early.sh"
+        _early.write_text("#!/bin/bash\nV=$(ls /nope 2>/dev/null)\nset +e\necho hi\n",
+                          encoding="utf-8")
+        _late = Path(_tmp) / "fx_prologue_late.sh"
+        _late.write_text("#!/bin/bash\nset +e\nV=$(ls /nope 2>/dev/null)\necho hi\n",
+                         encoding="utf-8")
+        for _fx, _want, _why in (
+            (_early, 1, "表态之前的裸赋值——那一段的生死不归脚本自己定，按最坏情形判"),
+            (_late, 0, "作者第一句就明确关掉 errexit 之后的裸赋值——这一段本来不会静默死"),
+        ):
+            _got = gate.check_shell_errexit_hazards(sources=(_fx.as_posix(),), workflows=())
+            _assert_eq(len(_got), _want,
+                       f"第 15 条默认口径：{_why}（实际={_got[:1]}）")
+            _p28 = gate.check_shell_errexit_posture(sources=(_fx.as_posix(),))
+            _assert_eq(len(_p28), 1 if _fx is _early else 0,
+                       f"两条门要一起响/一起放行，不许出现「立场绿了而静默死没人管」的中间态"
+                       f"（{_fx.name} 实际={_p28[:1]}）")
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+    # ── 6) 端到端：真按 Actions 那对选项起批跑入口的 --list（本机不带选项永远是绿的）──
+    # 这一格是整节的核心：前面五格判的都是「读源码的门」，而本轮的事故只有在**把脚本用调用方
+    # 那两种方式各起一次**时才现形。少了这一格，第 28 条就只是一句注释。
+    _bash = shutil.which("bash")
+    if _bash and runner.is_file():
+        _plain = subprocess.run([_bash, str(runner), "--list"], cwd=str(_REPO),
+                                capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        _strict = subprocess.run([_bash, "-e", "-o", "pipefail", str(runner), "--list"],
+                                 cwd=str(_REPO), capture_output=True,
+                                 stdin=subprocess.DEVNULL, timeout=300)
+        _assert_eq(_plain.returncode, 0,
+                   f"不带选项这一路必须绿（批跑入口自己的退出码）：\n{_plain.stderr[-600:]}")
+        _assert_eq(_strict.returncode, 0,
+                   f"带上 Actions 给 bash 步的那对选项也必须绿——本轮云端的签名是「退出码 1、"
+                   f"stdout 0 字节、stderr 0 字节」，现在是（退出码 {_strict.returncode}｜"
+                   f"stdout {len(_strict.stdout)} 字节｜stderr {len(_strict.stderr)} 字节）："
+                   f"\n{_strict.stderr[-600:]}")
+        _assert_eq(_strict.stdout, _plain.stdout,
+                   "两种调用方式的 stdout 必须**逐字节一致**：批跑清单的内容不许取决于谁把它"
+                   "拉起来（少了这条，上一格可能只是在比两份同样被截断的输出）")
+        _lines = [x for x in _strict.stdout.decode("utf-8", errors="replace").splitlines()
+                  if x.strip()]
+        _assert(len(_lines) >= 50,
+                f"-e 下也要展开出完整清单（实际 {len(_lines)} 行；少于 50 说明发现逻辑半路就断了）")
+        _assert(all(x.endswith(".py") for x in _lines),
+                "--list 的 stdout 契约：只有套件路径，进度与诊断一律走 stderr")
+
+        # 6b) 这一格的判据自己得能红：同一条裸赋值在 -e 下必须当场静默死。不放这条反向对照，
+        # 上面那句「_strict.returncode == 0」有可能是在测一件根本测不出来的事（这台机器的 bash
+        # 恰好不把 -e 交给子进程，而脚本里也已经没有任何会非零的取值）。
+        _tmp2 = tempfile.mkdtemp(prefix="al_sig_")
+        try:
+            _fx = Path(_tmp2) / "fx_silent_death.sh"
+            _fx.write_text("#!/bin/bash\nV=$(ls /definitely-not-here-xyz 2>/dev/null)\n"
+                           "echo SHOULD-NOT-PRINT\n", encoding="utf-8")
+            _p = subprocess.run([_bash, str(_fx)], capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=60)
+            _s = subprocess.run([_bash, "-e", "-o", "pipefail", str(_fx)], capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=60)
+            _assert_eq(_p.returncode, 0, "不带选项：这份夹具正常跑完（echo 都打出来了）")
+            if _s.returncode == 0:
+                # macOS 的 /bin/bash 3.2 就是这一侧（实测不把 -e 交给子 bash）。这不是缺陷，而
+                # 是本轮「同一份脚本两个平台两种生死」的另一半，所以如实打出来但不判红——判红
+                # 会让 mac 上的回归永远红着一句与代码无关的话。
+                print("   ℹ 本机 bash 不把调用方的 -e 交给子脚本（/bin/bash 3.2 的实测行为），"
+                      "6b 在这一侧只能验到「不带选项」；Git Bash/云端会验到静默死")
+            else:
+                _assert_eq(_s.stdout, b"",
+                           f"静默死的签名要复现得出来：非零退出且一个字都不打"
+                           f"（实际 stdout={_s.stdout[:80]!r}）")
+        finally:
+            shutil.rmtree(_tmp2, ignore_errors=True)
+    else:
+        _assert(False, "端到端这一格没法判：找不到 bash 或批跑入口不在位（静默跳过＝这条格从没跑过）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -9008,6 +9189,7 @@ SECTIONS = (
     test_no_dev_machine_paths_gate,
     test_temp_dir_single_source_gate,
     test_module_name_binding_gate,
+    test_shell_errexit_posture_gate,
 )
 
 

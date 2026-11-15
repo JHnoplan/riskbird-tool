@@ -1321,7 +1321,7 @@ def _errtrap_problems(label: str, base: int, segments: list) -> list:
 
 
 def _setplus_problems(label: str, base: int, segments: list) -> list:
-    """第 15 条的第三半：`set +e` 把**一整段**的保护关掉。
+    """第 15 条的第三半：`set +e` 把**一整段**的保护关掉（开头的表态除外）。
 
     上面两半管的是「一句非零把脚本带走」与「陷阱响了却没开 -E」，这一半管的是反向的那
     种侥幸：`set +e … set -e` 之间每一条命令都失去了拦路资格，后来人在中间插一句（换
@@ -1330,10 +1330,26 @@ def _setplus_problems(label: str, base: int, segments: list) -> list:
     `cmd | tee log || rc=${PIPESTATUS[0]}`，实测 bash 3.2 与 5.x 都成立）。
     """
     out = []
+    # 例外只开给**第一条 errexit 表态**、且它把 -e 关掉的情形：那是第 28 条要求的「自己声明
+    # 立场」，不是从别人手里抢走一段保护。2026-11-14 Windows 云端实发之后才有这一格——调用方
+    # 的 `-e -o pipefail` 会被 bash 交给子脚本，一份从没用过 errexit 的脚本唯一的自保方式就是
+    # 在第一句把它关掉；把这种写法也判红，等于逼下一个人在批跑入口里补一句 `set -e`（那才是
+    # 真把一百多条裸赋值交到 errexit 手上）。关掉**已经打开的**保护，仍旧逐条报。
+    declared = None
+    for lineno, line, _active in segments:
+        if line.strip().startswith("#"):
+            continue
+        st = _set_state(line)[0]
+        if st is None:
+            continue
+        declared = (lineno, st)
+        break
     for lineno, line, _active in segments:
         if line.strip().startswith("#"):
             continue
         if _set_state(line)[0] is not False:
+            continue
+        if declared == (lineno, False):
             continue
         out.append(
             f"{label} 第 {base + lineno} 行用 `set +e` 关掉了整段的 errexit：这一句到"
@@ -1386,8 +1402,13 @@ def check_shell_errexit_hazards(sources: tuple = None, workflows: tuple = None,
         if not path.is_file():
             continue                    # 不在位由第 11 条点名，这里不重复报
         text = path.read_text(encoding="utf-8", errors="replace")
-        # 本地脚本：只有显式 `set -e` 之后才算（脚本里没写过就一路不设，本条不适用）。
-        corpus.append((rel, 0, _errexit_segments(text, default=False)))
+        # 第一段（到脚本自己第一条 errexit 表态为止）一律按 **-e 生效** 判，不再按「脚本里没写
+        # 就是没开」：调用方的 `-e` 会被 bash 交给子脚本（第 28 条整条就是这一件事，2026-11-14
+        # Windows 云端实发），所以「脚本自己没提」恰恰不能推出「这一段没有 errexit」。
+        # 一份后面写了 `set +e` 的脚本，它**表态之前**那几行同样交在别人手里——把默认值跟着
+        # 表态走，等于在最需要保守的那一侧开了一个假绿的口子。表态之后的段落仍由
+        # _errexit_segments 逐行跟着脚本自己的 `set` 切换，不会把作者明确关掉的段判红。
+        corpus.append((rel, 0, _errexit_segments(text, default=True)))
     for rel in workflows:
         path = ROOT / rel
         if not path.is_file():
@@ -1433,6 +1454,94 @@ def check_shell_errexit_hazards(sources: tuple = None, workflows: tuple = None,
                 f" set -e，脚本从这里起**静默结束**，后面的门一道也不会跑。"
                 f"要么 `|| true`（取不到就算了），要么 `|| {{ echo \"为什么停\"; exit 1; }}`"
                 f"（取不到就不能往下走）：{s[:120]}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# 第 28 条：每一份手写 shell 都要在**第一条真命令之前**对 errexit 表态（2026-11-14 云端实发）。
+#
+# 现场：Windows 云端「Packaging manifest gate」这一步红，红话说的是
+#   批跑清单取不到（`bash debug/run_offline_regression.sh --list` 退出码 1）
+# 而那条命令在本机一模一样是绿的。把云端那次 job 的日志逐行读完才看清签名：**退出码 1、
+# stdout 0 字节、stderr 0 字节**——批跑入口连它的第一句诊断（`清单完整性：…`，走 stderr）
+# 都没来得及打，等于死在第 78 行之前。本机拿同一条命令喂上 Actions 给 bash 步的那对选项
+# （`bash -e -o pipefail debug/run_offline_regression.sh --list`）当场复现出逐字节一致的签名，
+# `bash -x` 停在 ``hits=$(ls "$d"/test_*_offline.py 2>/dev/null)``：ali1688_build 按登记就是
+# 没有 *_offline.py，ls 找不到匹配返回非零，报错又被自己的 2>/dev/null 吃掉，裸赋值把这个
+# 非零交给 errexit，脚本一声不响地结束。
+#
+# 为什么只有 Windows 红：Actions 两步都是 `shell: bash`，但 macOS 上那一位是 /bin/bash 3.2，
+# 实测不把 -e 交给子 bash；Windows 上的 Git Bash 会交。**同一份脚本、一个平台绿一个平台红，
+# 差的不是代码，是谁带着什么选项把它拉起来的。**
+#
+# 这一族今天一共 14 处（第 15 条按「-e 生效」重判全仓的结果）：批跑入口 8 处、取制品 6 处，
+# 全部已改。而真正被本轮证伪的是第 15 条原来那句口径——「脚本里没写过 set -e 就一路不设」：
+# 选项可以从调用方来，脚本自己没写不等于没生效。所以这里补一条**立场**判据，并把第 15 条的
+# 默认值改成跟着脚本自己的表态走（没表态就按最坏的 -e 生效判，同时第 28 条先为「没表态」响）。
+# ---------------------------------------------------------------------------
+SET_POSTURE = re.compile(r"^\s*set\b")
+
+
+def _errexit_posture(text: str) -> tuple:
+    """脚本开头有没有对 errexit 表态：(表没表态, 表成什么, 表态行号, 第一条真命令行号)。
+
+    只认「第一条真命令之前那一串 `set`」：`set -u` / `set -x` 这类没提到 errexit 的开关算
+    路过（继续往后找），赋值与其它命令算真命令（当场停）。为什么卡这么紧：表态发生在第一句
+    可能失败的命令**之后**，那句就已经有机会静默把脚本带走了，这一格要的正是「先定规矩再动手」。
+    """
+    first_real = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        er, _et = _set_state(line)
+        if er is not None:
+            return True, er, lineno, 0
+        if SET_POSTURE.match(line):
+            continue
+        first_real = lineno
+        break
+    return False, None, 0, first_real
+
+
+def check_shell_errexit_posture(sources: tuple = None, texts: tuple = ()) -> list:
+    """第 28 条：手写 shell 必须自己声明 errexit 立场，不许由调用方决定。
+
+    sources/texts 与第 15 条同口径：登记表可整体替换，texts 是内存里的 [(标签, 脚本)]——
+    离线对拍要能拿「同一句裸赋值，开头表态 / 不表态」这一对喂进来，要求不表态的那份必须
+    响、表态的那份干净。判据验不出「坏了会响」就等于没有判据。
+    """
+    sources = SHELL_SOURCES if sources is None else sources
+    corpus = []
+    for rel in sources:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                    # 不在位由第 11 条点名，这里不重复报
+        corpus.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+    for label, script in texts:
+        if label in set(sources):
+            continue                    # 登记表里那份已经按磁盘读过了，不重复判
+        corpus.append((label, script))
+    if not corpus:
+        return ["第 28 条一份手写 shell 都没读到（登记表里那些路径在磁盘上都不在位，喂进来的"
+                "夹具也是空的）：这时「都表态了」这句话没有任何含义，不许报绿"]
+    problems = []
+    for label, text in corpus:
+        ok, _on, _at, first_real = _errexit_posture(text)
+        if ok:
+            continue
+        if first_real:
+            problems.append(
+                f"{label}：第 {first_real} 行已经是第一条真命令，可它之前没有任何一句 `set` 提到"
+                " errexit——**这份脚本有两种生死**：调用方带 `-e` 起来（Actions 的 bash 步默认就是 "
+                "`-e -o pipefail`，新版 bash 会把它交给子脚本）它就在那一句失败处静默结束，调用方"
+                "没带就是另一副样子。本轮云端就是这么把 `run_offline_regression.sh --list` 读成"
+                "「退出码 1、stdout 0 字节、stderr 0 字节」的。要么在开头写 `set -Eeuo pipefail`"
+                "（并把每一条正常也会非零的取值都 `|| rc=$?` 接管），要么写 `set +e` 明说这份脚本"
+                "的错误处理走显式分支，不靠 errexit")
+        else:
+            problems.append(f"{label}：整份脚本没有任何一句 `set` 提到 errexit，也没有一条真命令"
+                            "——一份空脚本不该出现在交付链登记表里，请核对它是不是被清空了")
     return problems
 
 
@@ -3361,7 +3470,12 @@ _EXIT_FLUSH_WINDOW = 4
 
 
 def regression_suites() -> tuple:
-    """(退出码, 套件相对路径清单, stderr 摘要)。
+    """(退出码, 套件相对路径清单, stderr 摘要, stdout 原文)。
+
+    第四格是本轮（2026-11-14 云端实发）加的：红话只报「退出码 1」不够——同一句
+    `--list` 在「清单不完整」「解释器不在位」「被 errexit 静默带走」三种死法下退出码都
+    可能是 1，能区分它们的是**两条流各有几个字节**。取清单的人必须把证据一起交出来，
+    否则下一个读 CI 日志的人只能再跑一轮。
 
     stdout 的格式依据就地写明，不留给下一个人在这里凭想象：那批字节由
     `run_offline_regression.sh` 里唯一一句 `printf '%s\\n' $FILES` 打印，约定是
@@ -3372,19 +3486,30 @@ def regression_suites() -> tuple:
         proc = subprocess.run(list(REGRESSION_LIST_CMD), cwd=str(ROOT), capture_output=True,
                               stdin=subprocess.DEVNULL, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return -1, [], f"起不来：{type(exc).__name__}: {exc}"
-    files = [ln.strip() for ln in proc.stdout.decode("utf-8", errors="replace").splitlines()
-             if ln.strip()]
+        return -1, [], f"起不来：{type(exc).__name__}: {exc}", ""
+    out = proc.stdout.decode("utf-8", errors="replace")
+    files = [ln.strip() for ln in out.splitlines() if ln.strip()]
     err = proc.stderr.decode("utf-8", errors="replace").strip().replace("\n", " | ")
-    return proc.returncode, files, err
+    return proc.returncode, files, err, out
 
 
-def _regression_scope_problem(rc: int, files: list, err: str) -> list:
-    """清单读不到＝这三条门一条都没跑。这时候必须响，不能按「没问题」返回空表。"""
+def _regression_scope_problem(rc: int, files: list, err: str, out: str = "") -> list:
+    """清单读不到＝这三条门一条都没跑。这时候必须响，不能按「没问题」返回空表。
+
+    证据要把**两条流各拿到了多少字节**原样摊开（2026-11-14 云端实发）：这一句原来只在
+    stderr 非空时附上 stderr，于是「退出码 1、stdout 空、stderr 空」这种签名在日志里读起来
+    像「门自己取不到清单」，而它真正的意思是「脚本一个字都没说就死了」——差一条静默死因的
+    线索，人就得多跑一轮 CI 才看得懂。取不到清单要说的从来不只是「取不到」。
+    """
     if rc != 0:
-        return [f"批跑清单取不到（`{' '.join(REGRESSION_LIST_CMD)}` 退出码 {rc}"
-                + (f"，stderr：{err[:200]}" if err else "") + "）：第 23/24/25 条的范围全长在"
-                "这一份清单上，读不到就一条都没判，不能报绿"]
+        ev = (f"，stderr：{err[:200]}" if err
+              else "（stderr 空）")
+        return [f"批跑清单取不到（`{' '.join(REGRESSION_LIST_CMD)}` 退出码 {rc}｜"
+                f"stdout {len(out.encode('utf-8'))} 字节 / {len(files)} 行{ev}｜"
+                f"stderr {len(err.encode('utf-8'))} 字节）：第 23/24/25 条的范围全长在"
+                "这一份清单上，读不到就一条都没判，不能报绿。两条流都是空的就说明脚本是被"
+                "静默结束的（继承来的 errexit 撞上一条正常也会非零的命令是最常见的一种），"
+                "先照第 15/28 条的口径查那一份 shell，别改本门的判据"]
     if not files:
         return ["批跑清单是空的（退出码 0，可一行路径都没打出来）：三条门会在空集合上各自"
                 "「通过」，那种通过等于这三条门从没跑过"]
@@ -3395,8 +3520,8 @@ def check_suite_exit_code_guard(suites=None) -> list:
     """跑过 Qt 的离线套件必须自己在收尾把退出码交给操作系统（第 23 条）。"""
     problems = []
     if suites is None:
-        rc, files, err = regression_suites()
-        problems += _regression_scope_problem(rc, files, err)
+        rc, files, err, out = regression_suites()
+        problems += _regression_scope_problem(rc, files, err, out)
         suites = files if rc == 0 else []
     judged = 0
     for rel in suites:
@@ -3442,8 +3567,8 @@ def check_regression_suites_tracked(suites=None) -> list:
                 "这一份」，问不到不许按合格返回"]
     problems = []
     if suites is None:
-        rc, files, err = regression_suites()
-        problems += _regression_scope_problem(rc, files, err)
+        rc, files, err, out = regression_suites()
+        problems += _regression_scope_problem(rc, files, err, out)
         suites = files if rc == 0 else []
     judged = 0
     for rel in suites:
@@ -3508,7 +3633,7 @@ def _dev_path_inputs() -> dict:
         if d.is_dir() and d.name.endswith("_build"):
             for p in sorted(d.glob("*.py")):
                 add(p)
-    rc, files, _err = regression_suites()
+    rc, files, _err, _out = regression_suites()
     if rc == 0:
         for rel in files:
             add(ROOT / rel)
@@ -4021,6 +4146,23 @@ def main(argv=None) -> int:
               "装了的 ERR 陷阱也都带着 -E 生效，整段关保护的那种侥幸一处也没有"
               f"（{len(SHELL_SOURCES)} 份脚本 + {len(WORKFLOWS)} 份 workflow 的 bash 步）")
 
+    # errexit 立场（第 28 条）：第 15 条管「这一段在 -e 下有没有会静默死的取值」，
+    # 这一条管「这一段到底归谁决定活法」。2026-11-14 Windows 云端红的那一步，本机怎么跑都是
+    # 绿的——差的不是代码，是拉起脚本的人带了 `-e -o pipefail`。一份不表态的 shell 有两种生死，
+    # 而第 15 条原来那句「脚本里没写 set -e 就一路不设」的假设正是被这件事证伪的。
+    posture = check_shell_errexit_posture()
+    if posture:
+        bad += 1
+        print("❌ 手写 shell 没在第一条真命令之前对 errexit 表态（生死交给调用方的选项，"
+              "同一份脚本会在一个平台静默死、另一个平台正常跑）：")
+        for p in posture:
+            print(f"   · {p}")
+            print(f"::error::shell errexit 立场：{p}")
+    else:
+        print("✅ shell errexit 立场："
+              f"{len(SHELL_SOURCES)} 份手写 shell 都在第一条真命令之前自己声明了 errexit 的活法"
+              "（要么 `set -Eeuo pipefail` 并且逐条接管非零，要么 `set +e` 明说走显式分支）")
+
     # 大小写·变体不敏感文件系统上的同名路径（第 16 条）：这一条管的是「同一份仓库在不同
     # 平台上不是同一棵树」。云端 Linux 检得出两份、开发机 mac 只有一份，且留哪一份取决于
     # 写入顺序——这类差异不会让 CI 变红，只会让「我这边是好的」变成一句真话加一个坏包。
@@ -4292,6 +4434,7 @@ def main(argv=None) -> int:
     print("\n✅ 打包清单硬门：三处入口与 site_adapters 的清单一致，"
           "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
           "shell 里没有被 set -e 静默带走的裸赋值、装了的 ERR 陷阱也都带着 -E、"
+          "每一份手写 shell 都在第一条真命令之前对 errexit 表了态、"
           "入库路径在大小写不敏感文件系统上也不撞车、"
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
           "交付 zip 的门两侧都在链路上、"

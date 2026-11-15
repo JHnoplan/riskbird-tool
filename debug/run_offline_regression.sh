@@ -18,6 +18,18 @@
 # 只有改布局那天才会想起来跑一次的私人脚本。
 # 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，
 # 而这几个脚本正是「交付链可复现」唯一的机器口径。
+# 调用方的 shell 选项不许决定本脚本的生死（2026-11-14 Windows 云端实发，本机已复现同签名）：
+# Actions 的 bash 步是 `bash --noprofile --norc -e -o pipefail` 起 python，python 再拉一个
+# bash 跑这一份——继承下来的 errexit 让脚本在第 78 行 ``hits=$(ls "$d"/test_*_offline.py
+# 2>/dev/null)`` 那一句**一声不响地退出**（ali1688_build 天生没有 *_offline.py，ls 返回非零，
+# 而它的报错被 2>/dev/null 吃掉了）：退出码 1、stdout 0 字节、stderr 0 字节。本机
+# ``bash -e -o pipefail debug/run_offline_regression.sh --list`` 复现出的签名与云端逐字节一致，
+# 而 mac CI 同一条命令是绿的（/bin/bash 3.2 不把 -e 传给子 bash，Git Bash 会）——**同一份脚本、
+# 一个平台红一个平台绿**，差的不是代码，是拉起它的那个人带了什么选项。
+# 这份脚本的契约是「拒绝开跑必须说清为什么」，静默退出正好把契约反着写，所以第一句先把继承来
+# 的选项关掉；下面的失败处理一律走显式 `|| { echo 为什么; exit N; }`，不拿 errexit 当错误处理。
+set +e
+set +o pipefail
 cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 export QT_QPA_PLATFORM=offscreen
 PY=${PY:-.venv/bin/python}
@@ -75,7 +87,16 @@ for d in $DELIVERY_DIRS; do
     echo "❌ 交付目录 $d/ 不在了：它的离线套件将整体从批跑里消失（静默少一档回归）" >&2
     exit 1
   fi
-  hits=$(ls "$d"/test_*_offline.py 2>/dev/null)
+  # 用 bash 自己的 glob 发现套件，不 `ls`：①ls 在「没有匹配」时返回非零，把整份脚本的生死
+  # 交给一条外部命令的退出码（本轮云端就死在这上面）；②解析 ls 的输出是反模式——真有个文件名
+  # 带空格，这里就会把它劈成两项，报成「清单里有套件在磁盘上不存在」。
+  # 不开 nullglob：没匹配时 bash 会留下字面量本身，下面用 [ -f ] 当场判掉，改完全局 shopt
+  # 会跟着影响同一进程里后面的每一段（脚本被 source 时尤其脏）。
+  hits=""
+  for p in "$d"/test_*_offline.py; do
+    [ -f "$p" ] || continue
+    hits="$hits $p"
+  done
   if [ -z "$hits" ]; then
     case "$DIR_WITHOUT_SUITES" in
       *"$d"*) echo "   ℹ ${d}：没有 *_offline.py 套件（已登记理由）" >&2;;
@@ -90,7 +111,7 @@ done
 
 # 手写清单里若有 *_offline.py 约定命名的项，与自动发现会撞车（同一套跑两遍，
 # 断言数翻倍看着像「更严了」，其实只是慢）。这里去重，并让约定命名的项以自动发现为准。
-_hand_count=$(printf '%s\n' $FILES | grep -c .)
+_hand_count=$(printf '%s\n' $FILES | grep -c . || true)
 FILES=$(printf '%s\n' $FILES $discovered | awk 'NF && !seen[$0]++')
 
 # debug/ 那侧仍靠手写，所以补一道完整性判据：磁盘上有、清单里没有 → 不开跑
@@ -116,16 +137,19 @@ for p in $FILES; do
   [ -f "$p" ] || absent="$absent $p"
 done
 if [ -n "$absent" ]; then
-  echo "❌ 批跑清单里有 $(printf '%s\n' $absent | grep -c .) 份套件在磁盘上不存在：" >&2
+  _absent_n=$(printf '%s\n' $absent | grep -c . || true)
+  echo "❌ 批跑清单里有 ${_absent_n} 份套件在磁盘上不存在：" >&2
   for p in $absent; do echo "   · $p" >&2; done
   echo "   要么文件被删/改名了，要么这一路本来就登记错了。缺失的那一路永远不会红，" >&2
   echo "   只会让这一类缺陷从此没有守卫，所以这里拒绝开跑，不当它不存在。" >&2
   exit 1
 fi
 
-echo >&2 "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .) 个（${DELIVERY_DIRS}）" \
-     "+ 手写 ${_hand_count} 项 = 合计 $(printf '%s\n' $FILES | grep -c .) 项，" \
-     "另有 $(printf '%s\n' "$EXCLUSIONS" | grep -c .) 项按登记排除（都带理由）" >&2
+# 三处 grep -c 都带 `|| true`：`discovered` 在「三个交付目录一个套件都没有」时是空的，
+# 那种情形这一行正是唯一能说清「范围为什么空了」的一句话，不能被 grep 的退出码提前带走。
+echo >&2 "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c . || true) 个（${DELIVERY_DIRS}）" \
+     "+ 手写 ${_hand_count} 项 = 合计 $(printf '%s\n' $FILES | grep -c . || true) 项，" \
+     "另有 $(printf '%s\n' "$EXCLUSIONS" | grep -c . || true) 项按登记排除（都带理由）" >&2
 
 # 单跑几套（排查时不必等全批）：给了 B2B_REGRESSION_ONLY 就以它为准，其余判据
 # （清单完整性、计数自洽、总判定进退出码）一条都不少。为什么要开这个口子：批跑入口
@@ -133,7 +157,7 @@ echo >&2 "清单完整性：约定发现 $(printf '%s\n' $discovered | grep -c .
 # 验活——不能验的判据和没有判据只差一句注释。
 if [ -n "${B2B_REGRESSION_ONLY:-}" ]; then
   FILES=$(printf '%s\n' $B2B_REGRESSION_ONLY)
-  echo "   ℹ 本轮只跑指定的 $(printf '%s\n' $B2B_REGRESSION_ONLY | grep -c .) 项（B2B_REGRESSION_ONLY）" >&2
+  echo "   ℹ 本轮只跑指定的 $(printf '%s\n' $B2B_REGRESSION_ONLY | grep -c . || true) 项（B2B_REGRESSION_ONLY）" >&2
 fi
 
 # --list：只把解析完的批跑清单打出来（给回归入口自己的离线断言用：判据写在脚本里，
@@ -165,7 +189,10 @@ fi
 pass=0; fail=0; skip=0; failed=""; hung=""; total=0
 # 有 timeout/gtimeout 就上真实看门狗（SIGABRT + faulthandler 能把挂死点栈打出来），
 # 没有也别裸跑：宁可用例慢，也不要一个模态弹窗把整批回归拖死。
-TMO=$(command -v timeout || command -v gtimeout)
+# `|| true`：这台机器上两个名字都没有时，这一行的状态就是 1——而本脚本随时可能被一个带着
+# errexit 的调用方拉起来（本轮 Windows 云端就是这么死的）。取不到看门狗下面有明确的降级路，
+# 不该由这一句的退出码决定整批跑不跑。
+TMO=$(command -v timeout || command -v gtimeout || true)
 # 每套件的完整输出都落盘：失败时「tail -N」只能看到最后几行，而断言失败的那一行
 # （`  FAIL xxx`）通常埋在中间——上次 gui_store 批跑红 2 条、单跑全绿，就是因为
 # 看不到具体哪两条，只能靠猜。留档 + 只打 FAIL 行，才能定位抖动。
@@ -322,7 +349,9 @@ _pick_reason() {
   # $1 = 带计数的汇总行；$2 = 任何含判定字样的行（可能是小节标题）；$3 = 摘栈后的正文；
   # $4 = 日志原文。
   local summary="$1" loose="$2" body="$3" out="$4" exc tail
-  exc=$(printf '%s\n' "$out" | grep -E "$EXC_RE" | tail -1)
+  # `|| true`：grep 没匹配返回 1。这一句在 _pick_reason 里，也就是**正在给一条 FAIL 找理由**
+  # 的路上——找理由的路上自己静默退出，屏幕上就又是那条没有理由的 FAIL（本轮修的就是它）。
+  exc=$(printf '%s\n' "$out" | grep -E "$EXC_RE" | tail -1 || true)
   if [ -n "$exc" ] && [ -n "$summary" ]; then
     # 两条事实都在场就两条都给：套件跑完了并打上「失败 N」，收尾又抛了一条没接住的异常，
     # 只报其中一条都会让人往错的方向查（按位置猜谁是主因不如把两条都摊开）。
@@ -342,7 +371,7 @@ _pick_reason() {
     printf '没有带计数的汇总行，最后一条含判定字样的输出是：%s' "$loose"
     return 0
   fi
-  tail=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1)
+  tail=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1 || true)
   if [ -n "$tail" ]; then
     printf '没有汇总行、也没有异常行；日志末尾那一行是：%s' "$tail"
     return 0
@@ -353,17 +382,24 @@ _pick_reason() {
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
+  code=0
   if [ -n "$TMO" ]; then
     # < /dev/null：解释器必须自己带 fd 0。批跑常在后台起、起它的终端随后被回收，那时
     # fd 0 是个已关闭的描述符，python 在初始化阶段就崩（init_sys_streams / Bad file
     # descriptor），日志里只剩上一行标题——硬门第 20 条 20f，夹具见
     # b2bcollect_build/test_frozen_delivery_offline.py 的 AD 节。
-    "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null
+    #
+    # `|| code=$?`（第 15 条给的写法）：退出码必须在**接管它的那一句里**取。两种坏写法都实测过：
+    # ①`cmd` 单独一行、下一行 `code=$?`——在继承来的 errexit 下走不到第二行，套件一红脚本先没；
+    # ②中间夹一句 `if [ $? -eq 0 ]` 再在 else 里取 `$?`——那时 `$?` 已经是 `[` 自己的 1，
+    #   139（SIGSEGV）会被读成普通断言红，按信号分类那一整支就此失效。
+    "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
   else
-    $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null
+    $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
   fi
-  code=$?
-  out=$(cat "$log" 2>/dev/null)
+  # `|| true` 且把 2>/dev/null 留着：日志不见了的处置就在下面 `if [ ! -f "$log" ]` 那一支，
+  # 让 cat 的非零先把脚本带走，就等于「有证据说它为什么没跑成」的那一支永远不会被执行。
+  out=$(cat "$log" 2>/dev/null || true)
   # 找汇总行之前要先把**栈自身**按形状摘掉：Python 会把出错那行的源码原文缩进四格打出来，
   # 套件的断言标题又满是中国字（含「失败」二字），拿它当汇总行就等于报一个假理由。
   # 按形状摘而不是按区域摘：中途被 except 接住、print_exc 之后还会接着打判定，按「最后一处
@@ -372,12 +408,12 @@ for f in $FILES; do
     /^(Traceback \(most recent call last\):|Fatal Python error: |Current thread )/ { tb = 1; next }
     tb && (/^  File "/ || /^    / || /^[[:space:]]*$/) { next }
     { tb = 0; print }
-  ')
-  last=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | tail -1)
+  ' || true)
+  last=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | tail -1 || true)
   # 「汇总行」还要再窄一档：真汇总一律带计数（通过 N / 失败 M、ALL PASS (41 checks)、
   # 全部 122 项断言通过），而小节标题只有中国字没有数字。把两者混为一谈，套件死在
   # 小节开头时判定行就会报成「[③ 采集失败重试]」——看着像结论，其实只说明它走到过这里。
-  verdict=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | grep -E '[0-9]' | tail -1)
+  verdict=$(printf '%s\n' "$body" | grep -E "PASS|FAIL|通过|失败|_OK" | grep -E '[0-9]' | tail -1 || true)
   # FAIL 判定行必须自带理由：本轮 5 份套件崩在引导段（用了没导入的名字），退出码 1、
   # 日志里明明写着 NameError，屏幕上却是一条空的 FAIL——因为判定行只认「套件汇总的
   # 最后一行」，而引导段一行汇总都没打。理由取不到汇总行时退到异常行，再退到末尾输出。
@@ -399,7 +435,7 @@ for f in $FILES; do
   # 机器可判的口径，只有人眼盯着屏幕那一刻算数——而同一套逻辑的坑在同一个套件里已经
   # 抓过一次（poll 脚本静默空跑）。这里只认能明确解析出「N 失败 / 失败 N」的那种汇总，
   # 认不出来的仍按退出码判（宁可少判也不误判：误判的红会让人去改判据，而不是改代码）。
-  nfail=$(printf '%s\n' "$out" | grep -oE "[0-9]+ 失败|失败[：: ]*[0-9]+" | tail -1 | grep -oE "[0-9]+" | tail -1)
+  nfail=$(printf '%s\n' "$out" | grep -oE "[0-9]+ 失败|失败[：: ]*[0-9]+" | tail -1 | grep -oE "[0-9]+" | tail -1 || true)
   if [ $code -eq 0 ] && [ -n "$nfail" ] && [ "$nfail" -gt 0 ]; then
     fail=$((fail+1)); failed="$failed $f"
     printf 'FAIL  %-52s 退出码 0，可套件自己数出了 %s 条失败（判定与退出码不一致，这种绿不算绿）\n' "$f" "$nfail"
@@ -479,7 +515,8 @@ for f in $FILES; do
     fi
     # 不论有没有改动都要推进「上一张」：不推进的话第一处污染之后的每一路都拿它比对，
     # 同一个元凶会被点名几十次，真正的新增污染反而埋没在重复里。
-    cp "$CUR" "$PREV" 2>/dev/null
+    cp "$CUR" "$PREV" 2>/dev/null || echo "   ⚠ 快照没推进成功：下一路套件会拿**上一张**快照比对，" \
+                                       "归属可能指到隔壁那一路（污染本身仍由收工对拍兜住）"
   fi
 done
 echo "----------------------------------------------------------------"
@@ -511,9 +548,10 @@ fi
 if [ $fail -eq 0 ] && [ $leak -eq 0 ]; then
   echo "ALL SUITES PASS"
 else
-  [ -n "$failed" ] && echo "FAILED:$failed"
+  if [ -n "$failed" ]; then echo "FAILED:$failed"; fi
 fi
-[ -n "$hung" ] && echo "HANG:$hung"
+# 同上：`[ -n "$hung" ] && echo` 在没有挂死时整行返回 1（本轮全批就是没有挂死）。
+if [ -n "$hung" ]; then echo "HANG:$hung"; fi
 # 总判定必须进退出码：这一句之前，「跑绿」只有人眼盯屏幕那一次算数，CI 与任何脚本
 # 拿到的都是 0——红着 6 条也一样绿。SKIP 不算失败（缺的是实机夹具，不是代码）。
 [ $fail -eq 0 ] || exit 1

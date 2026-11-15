@@ -1,7 +1,15 @@
 #!/bin/bash
 # 触发 b2bcollect 云端打包（Windows exe + Mac arm64），并轮询本次 run 状态。
 set -u
-# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+# errexit／pipefail 显式关掉——**这份脚本的生死不许由调用方的 shell 选项决定**。
+# Actions 的 bash 步是 `bash --noprofile --norc -e -o pipefail`，它拉起的 python 再拉起
+# 子 bash 时，新版 bash 会把这套选项交给孩子；本轮 Windows 云端就是这么把批跑入口
+# 一声不响杀掉的（退出码 1、stdout 0 字节、stderr 0 字节）。完整故事与复现见
+# debug/run_offline_regression.sh 开头那段，判据是硬门第 15 条的「立场」那半。
+set +e
+set +o pipefail
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，
+# 而这几个脚本正是「交付链可复现」唯一的机器口径。
 cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 # GIT_TERMINAL_PROMPT=0：helper 里没凭证时 `git credential fill` 会去开 /dev/tty 问密码，
 # 那一刻它既不读 stdin 也不看超时——整趟派发就这么挂住，而屏幕上一句原因都没有。口径与

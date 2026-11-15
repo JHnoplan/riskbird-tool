@@ -19,6 +19,13 @@
 #        那正是 GitHub 正在为交付做的事。被顶掉不当失败、也不当成功：换到新提交接着看，
 #        若顶掉它的新提交一直没起来，就点名报错（静默等 40 轮不是答案）。
 set -u
+# errexit／pipefail 显式关掉——**这份脚本的生死不许由调用方的 shell 选项决定**。
+# Actions 的 bash 步是 `bash --noprofile --norc -e -o pipefail`，它拉起的 python 再拉起
+# 子 bash 时，新版 bash 会把这套选项交给孩子；本轮 Windows 云端就是这么把批跑入口
+# 一声不响杀掉的（退出码 1、stdout 0 字节、stderr 0 字节）。完整故事与复现见
+# debug/run_offline_regression.sh 开头那段，判据是硬门第 15 条的「立场」那半。
+set +e
+set +o pipefail
 cd "$(dirname "$0")/.."
 PY=".venv/bin/python"          # 上一行已经 cd 到仓库根，这里一律相对仓库根，不写机器路径
 [ -x "$PY" ] || PY="python3"

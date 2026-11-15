@@ -10,7 +10,17 @@
 # 再验一次——万一哪天有人改了 workflow 的 --add-data，本机就能立刻看出来，而不是等
 # 客户反馈。
 set -u
-# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，# 而这几个脚本正是「交付链可复现」唯一的机器口径。
+# errexit／pipefail 显式关掉——**这份脚本的生死不许由调用方的 shell 选项决定**。
+# Actions 的 bash 步是 `bash --noprofile --norc -e -o pipefail`，它拉起的 python 再拉起
+# 子 bash 时，新版 bash 会把这套选项交给孩子；本轮 Windows 云端就是这么把批跑入口
+# 一声不响杀掉的（退出码 1、stdout 0 字节、stderr 0 字节）。完整故事与复现见
+# debug/run_offline_regression.sh 开头那段，判据是硬门第 15 条的「立场」那半。
+set +e
+set +o pipefail
+# 因此下面每一处「取不到就是空」的取值（find|head -1、cat 一个可能不存在的 pid 文件）
+# 都自带 `|| true`：那些位置的空值由各自的 if 分支负责说清，不该由退出码接管整脚本。
+# 仓库根从脚本自己的位置推：写死某台机器的绝对路径，换一台（含 CI 打包机）第一行就 exit，
+# 而这几个脚本正是「交付链可复现」唯一的机器口径。
 cd "$(dirname "$0")/.." || { echo "❌ 进不去仓库根（$(dirname "$0")/..）：下面每一步都按仓库根的相对路径找 .venv 和 debug/"; exit 2; }
 REPO_DIR=$(pwd)
 # GIT_TERMINAL_PROMPT=0 不是装饰：helper 里没有 github.com 凭证时，`git credential fill`
@@ -328,7 +338,7 @@ unzip_probe() {  # 差分探针：$1=zip $2=标签 $3=口径解出来的参照�
   local p="$WORK/probe_$2" lg="$WORK/probe_$2.log" rc mine ref=
   rm -rf "$p"; mkdir -p "$p" || return 0
   unzip -q "$1" -d "$p" < /dev/null > "$lg" 2>&1; rc=$?
-  mine=$(find "$p" -type f 2>/dev/null | wc -l | tr -d ' ')
+    mine=$(find "$p" -type f 2>/dev/null | wc -l | tr -d ' ' || true)
   if [ -n "${3:-}" ] && [ -d "$3" ]; then
     ref="，口径同一份解出 $(find "$3" -type f 2>/dev/null | wc -l | tr -d ' ') 个文件"
   elif [ -n "${3:-}" ]; then
@@ -494,7 +504,7 @@ print(a[0].get("id", "") if a else "")')
   # 当年「崩一次留一份 883MB 垃圾」一样，让这个脚本每次失败后都更难跑成功一次。
   if ! mkdir "$lock" 2>/dev/null; then
     local holder
-    holder=$(cat "$lock/pid" 2>/dev/null | tr -dc 0-9)
+        holder=$(cat "$lock/pid" 2>/dev/null | tr -dc 0-9 || true)
     if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
       echo "[$key] ❌ 另一个取制品进程（pid ${holder}）正在写同一份字节；不并发写同一批 zip。"
       return 1
@@ -596,14 +606,14 @@ for kv in "${IDS[@]}"; do
   # 解不开必须当场停：静默跳过校验等于把「随包凭证」这道门拆了，而它正是外部机器全员
   # 精简版那次事故的守门人。
   if [ "$key" = "mac" ]; then
-    INNER=$(find "$WORK/$key" -maxdepth 2 -name "*.zip" -type f | head -1)
+        INNER=$(find "$WORK/$key" -maxdepth 2 -name "*.zip" -type f | head -1 || true)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有内层产物 zip（workflow 的上传步骤变了？先修校验器再谈交付）"; exit 6; }
     extract_zip "$INNER" "$WORK/$key/unpacked" \
       || { echo "[$key] ❌ 内层产物 zip 解不开：$INNER"; unzip_probe "$INNER" "$key.inner" "$WORK/$key/unpacked"; exit 6; }
     unzip_probe "$INNER" "$key.inner" "$WORK/$key/unpacked"
     echo "[$key] 已解开内层：$(basename "$INNER") → $(find "$WORK/$key/unpacked" -maxdepth 1 -name "*.app" -type d | head -1)"
   else
-    INNER=$(find "$WORK/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1)
+        INNER=$(find "$WORK/$key" -maxdepth 2 -name "B2bCollectTool_Win_portable.zip" -type f | head -1 || true)
     [ -n "$INNER" ] || { echo "[$key] ❌ 制品里没有 B2bCollectTool_Win_portable.zip（onedir 交付的两个产物少了一个，先修 workflow 再谈交付）"; exit 6; }
     if ! extract_zip "$INNER" "$WORK/$key/root/dist"; then
       NOW_KB=$(df -kP "$WORK" 2>/dev/null | awk 'NR==2 {print $4}')
@@ -738,8 +748,8 @@ PYEOF
 
 FAIL=0
 WIN_ROOT="$WORK/win/root"
-WIN_SETUP=$(find "$WORK/win" -maxdepth 2 -name "B2bCollectToolSetup.exe" -type f | head -1)
-MAC_APP=$(find "$WORK/mac" -maxdepth 4 -name "B2bCollectTool.app" -type d | head -1)
+WIN_SETUP=$(find "$WORK/win" -maxdepth 2 -name "B2bCollectToolSetup.exe" -type f | head -1 || true)
+MAC_APP=$(find "$WORK/mac" -maxdepth 4 -name "B2bCollectTool.app" -type d | head -1 || true)
 check_win "$WIN_ROOT" "$WIN_SETUP" || FAIL=1
 check_mac "$MAC_APP" || FAIL=1
 [ "$FAIL" = 0 ] || { echo "❌ 产物校验未通过，本地 dist 保持原样（不覆盖成坏包）"; exit 5; }
