@@ -128,6 +128,13 @@
      后者，续传在那儿反而是错的（每轮换镜像重下并核哈希）。同一趟还在派发脚本上抓到两条裸
      curl：派发失败长得和成功一模一样，人就开始等一个从没起来过的 run。
 
+ 21 之后（21 Qt 退出顺序 / 22 状态文件与 Chrome 配置目录防护 / 23 套件判定与退出码同源 /
+     24 离线套件必须被 git 跟踪 / 25 交付链不许写死开发机路径 / 26 TEMP 只许一处口径 /
+     27 模块级不许取用未绑定的名字 / 28 shell 必须自己表态 errexit / 29 交付链必须有写在
+     仓库里的行尾立场）：这九条各自的由来与口径写在**它们函数上方**的注释块里——那九条都是
+     一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
+     提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
+
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
   python .github/scripts/check_packaging_manifest.py --list  # 只打印当前清单
@@ -143,6 +150,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from pathlib import Path, PurePosixPath
 
@@ -1542,6 +1550,130 @@ def check_shell_errexit_posture(sources: tuple = None, texts: tuple = ()) -> lis
         else:
             problems.append(f"{label}：整份脚本没有任何一句 `set` 提到 errexit，也没有一条真命令"
                             "——一份空脚本不该出现在交付链登记表里，请核对它是不是被清空了")
+    return problems
+
+
+# ── 第 29 条：交付链必须对「检出出来是什么行尾」有一份**写在仓库里**的立场 ──────────
+# 由来（2026-11-15 Windows 云端实发）：Windows 的 GitHub runner 镜像把 git 全局
+# `core.autocrlf` 设成 true，`actions/checkout@v4` 不覆盖它；本仓库此前没有 .gitattributes，
+# 也就是**对行尾一个字都没说**。同一份提交在两台机器上检出成两种字节，而 shell 只在 LF 上
+# 能跑——本机把 debug/run_offline_regression.sh 整份转成 CRLF 实测过后果（macOS bash 3.2）：
+#   退出码 2｜stdout 0 字节｜stderr 360 字节
+#   `line 31: set: +: invalid option`、`line 85: syntax error near unexpected token 'do'`
+# 最要紧的一格是：**`bash -n` 对同一份 CRLF 文件是过的**（第 12 条那道语法门只解析不执行），
+# 所以行尾差异骗得过语法检查，只在真跑那一刻炸。这条门补的就是「解析得过、跑不起来」这一段
+# 空白，与第 15/28 条（errexit 由谁决定）同族：判的都是**换一台机器之后这行命令还成不成立**。
+LINE_ENDING_STANCE_FILE = ".gitattributes"
+# 问哪两格：text 决定「这份文件要不要做行尾转换」，eol 决定「检出成哪一种」。
+# 值的形状来自 `git check-attr`：属性被定义时是 set/unset/auto/lf/crlf，**没定义时是空串**。
+# 用 `--stdin -z` 而不是解析普通输出：普通输出会把非 ASCII 路径八进制转义再套引号
+# （``"riskbird_build/\345\220\257\345\212\250….bat"``），那一格就不是路径了——同 _path_set。
+_STANCE_ATTRS = ("text", "eol")
+# 一个字节的名字叫 CR：写成 `b"\r"` 的字面量放进 f-string 表达式里，在 3.11（Windows 构建机
+# 用的就是它）是 SyntaxError，而在 3.13 上能过——这种「本机过得去、构建机过不去」的差别本身
+# 就是这条门要拦的形状，所以这里给它一个名字，谁都用变量。
+CR = b"\r"
+
+
+def _line_ending_scope(sources: tuple = None) -> list:
+    """第 29 条的视野：交付 shell（登记表）+ 门禁脚本 + workflow + 那几份 shell 的语法夹具。
+
+    范围以登记表为准，不写死数字：新增一份 shell 会先进第 11 条的登记表，登记了却不进这一条
+    就等于「它在别的机器上行尾没人管」，而那正是这条门要拦的事。
+    """
+    sources = SHELL_SOURCES if sources is None else tuple(sources)
+    out = list(sources) + list(WORKFLOWS)
+    for path in sorted((ROOT / ".github" / "scripts").glob("*.py")):
+        rel = _rel_posix(path)
+        if rel not in out:
+            out.append(rel)
+    return out
+
+
+def _line_ending_stances(paths: list) -> dict:
+    """问 git：这些路径按本仓库的立场检出时 text/eol 各是什么（{路径: {属性: 值}}）。
+
+    取不到就返回空表，由调用方判红——**不许按「没定义也没事」返回**：这一条问的是立场在不在
+    仓库里，问不到问题本身就是结论。
+    """
+    if not paths:
+        return {}
+    payload = "\0".join(paths) + "\0"
+    try:
+        proc = subprocess.run(["git", "check-attr", "--stdin", "-z", *_STANCE_ATTRS],
+                              cwd=str(ROOT), input=payload.encode("utf-8", "surrogateescape"),
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    rows = proc.stdout.decode("utf-8", "surrogateescape").split("\0")
+    out = {}
+    # 三元组逐格读：属性未定义时**值那一格是空串**，所以不能靠「跳过空串」对齐，只能按 3 步长
+    # 走（末尾多出的那一个空串是最后一个 NUL 留下的，用 len-2 收边）。
+    for i in range(0, len(rows) - 2, 3):
+        rel, attr, value = rows[i], rows[i + 1], rows[i + 2]
+        if rel and attr:
+            out.setdefault(rel, {})[attr] = value
+    return out
+
+
+def check_line_ending_stance(sources: tuple = None, texts: tuple = ()) -> list:
+    """第 29 条：交付文本不许带着 CR，且 eol 必须由仓库里的 .gitattributes 定成 lf。
+
+    sources/texts 与第 28 条同口径（登记表可整体替换，texts 是内存里的 [(标签, 内容)]）：
+    离线对拍要能拿「同一份 shell，LF / CRLF」这一对喂进来，要求 CRLF 那份必须响。判据验不出
+    「坏了会响」就等于没有判据。
+    """
+    scope = _line_ending_scope(sources)
+    problems = []
+    # 判一：字节层面不许有 CR。磁盘上那一份与喂进来的夹具走同一条判据，不分轻重。
+    checked = 0
+    for rel in scope:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                        # 不在位由第 11 条点名，这里不重复报
+        checked += 1
+        raw = path.read_bytes()
+        crs = raw.count(CR)
+        if crs:
+            problems.append(
+                f"{rel}：工作区这一份里有 {crs} 处 CR。shell 带着 CRLF 会被 bash 死在"
+                "第一句真命令上（本机实测签名：退出码 2、`syntax error near unexpected token 'do'`），"
+                "而 `bash -n` 查不出来——构建语法门全绿、真跑才崩，正是最难查的那一类")
+    for label, script in texts:
+        checked += 1
+        blob = script.encode("utf-8", "surrogateescape") if isinstance(script, str) else bytes(script)
+        crs = blob.count(CR)
+        if crs:
+            problems.append(f"{label}：喂进来的这一份里有 {crs} 处 CR（同上：bash 死在"
+                            "第一句，而 bash -n 查不出来）")
+    if not checked:
+        return ["第 29 条一份交付文本都没读到（登记表里的路径在磁盘上都不在位，夹具也是空的）："
+                "这时「行尾合格」这句话没有任何含义，不许报绿"]
+    # 判二：立场必须写在仓库里。只在这一条真跑过 git 时才判，且判不到问题一律算红。
+    real = [rel for rel in scope if (ROOT / rel).is_file()]
+    stances = _line_ending_stances(real)
+    if not stances:
+        problems.append("第 29 条问不到 git 的行尾立场（git 不可用，或 `check-attr` 一句没回）："
+                        "这一条判的就是「检出出来长什么样」，问不到就不许按合格返回")
+    else:
+        bad = sorted(rel for rel in real if (stances.get(rel) or {}).get("eol") != "lf")
+        if bad:
+            got = "、".join(f"{rel}→{(stances.get(rel) or {}).get('eol') or '未定义'}"
+                            for rel in bad[:4])
+            problems.append(
+                f"{len(bad)} 份交付文本的 eol 不是 lf（{got}"
+                f"{' 等' if len(bad) > 4 else ''}）：Windows 构建机与 Windows 用户克隆出来就是 "
+                "CRLF，shell 当场死。修法是在 "
+                f"{LINE_ENDING_STANCE_FILE} 里对这一类显式写 `text eol=lf`，而不是去改某台机器的"
+                "全局 git 配置——写在机器上的立场换一台机器就没了，那正是本轮踩到的形状")
+    stance_path = ROOT / LINE_ENDING_STANCE_FILE
+    state = tracked_state(stance_path)
+    if state != "ok":
+        problems.append(f"{LINE_ENDING_STANCE_FILE}：{_state_hint(LINE_ENDING_STANCE_FILE, state)}"
+                        "——行尾立场必须跟着提交走，否则 CI 检出的仓库里没有任何东西管着 eol，"
+                        "本机绿与云端红可以同时成立很久")
     return problems
 
 
@@ -3447,11 +3579,19 @@ def check_state_files_not_tracked(names=None, shapes=None, profile_dirs=None) ->
 #     5/54 路覆盖，而批跑照跑、计数照对，没有任何一句会说「你少跑了」。
 #   ③开发机绝对路径（25）：批跑入口曾经第 20 行写死某个绝对路径再 `|| exit 1`——换一台机器
 #     （含 CI 打包机）第一步就退；同族的写法散在 19 份套件与 5 份 shell 里。
-# 三条的范围都取自同一个来源：**批跑清单**（`run_offline_regression.sh --list` 的 stdout）。
+# 三条的范围都取自同一个来源：**批跑清单**（`run_offline_regression.sh --list`），现在有两条
+# 通道读它：脚本写进 B2B_REGRESSION_LIST_FILE 的那份文件，和它的 stdout（见下面 regression_suites）。
 # 不在门里重实现一遍发现逻辑（DELIVERY_DIRS + FILES + EXCLUSIONS）——重实现就会和批跑分叉，
 # 而分叉的方向永远是「门比批跑宽或窄」：窄了漏判，宽了红在门自己的口径上，人第一件事是把
 # 这一步跳过。第 24 条尤其依赖这条纪律：它要问的正是「批跑要跑的那些文件在不在提交里」。
 REGRESSION_LIST_CMD = ("bash", "debug/run_offline_regression.sh", "--list")
+REGRESSION_LIST_FILE_ENV = "B2B_REGRESSION_LIST_FILE"
+REGRESSION_LIST_SCRIPT = "debug/run_offline_regression.sh"
+# 红话里一条流最多带出这么多字节原文。要原文是因为本轮吃过只报字节数的亏：云端那句
+# 「stdout 504 字节 / 11 行」把「那 11 行到底是什么」丢掉了，人只能靠算术反推清单在哪一步
+# 断的，反推不出来；而全量贴又有几 KB，会把真线索挤出屏幕。300 字节足够认出「这是不是路径、
+# 有没有 CR、有没有 ANSI 转义、是不是整份清单」。
+_SCOPE_EVIDENCE_CAP = 300
 # 「碰过 Qt」的口径：源码里出现 QApplication / QtWidgets 字样才判。为什么不是「造过主窗口」：
 # 本轮点过一遍批跑清单，29 份不提 Qt 的套件里只有 3 份出现 MainWindow 字样，而那 3 份都是
 # `W = gui.MainWindow`（取类引用）或 `MainWindow.__new__`（不建 C++ 对象），既没进事件循环也
@@ -3469,50 +3609,162 @@ _FLUSH_RE = re.compile(r"^\s*sys\.stdout\.flush\(\)\s*$")
 _EXIT_FLUSH_WINDOW = 4
 
 
-def regression_suites() -> tuple:
-    """(退出码, 套件相对路径清单, stderr 摘要, stdout 原文)。
+def _silent_unlink(path: str) -> None:
+    """删一份本次即弃的证据文件，删不掉也不影响判定。
 
-    第四格是本轮（2026-11-14 云端实发）加的：红话只报「退出码 1」不够——同一句
-    `--list` 在「清单不完整」「解释器不在位」「被 errexit 静默带走」三种死法下退出码都
-    可能是 1，能区分它们的是**两条流各有几个字节**。取清单的人必须把证据一起交出来，
-    否则下一个读 CI 日志的人只能再跑一轮。
-
-    stdout 的格式依据就地写明，不留给下一个人在这里凭想象：那批字节由
-    `run_offline_regression.sh` 里唯一一句 `printf '%s\\n' $FILES` 打印，约定是
-    「每行一个仓库相对的 .py 路径，进度与诊断一律走 stderr」。这句约定被离线对拍与
-    下面三条门共同依赖，改那句 printf 的人必须同时改这里。
+    这份文件是**证据**而不是产物：判定已经把它读完，留着只是在这台机器上多一份没人认领的
+    临时文件（离线回归那侧「批跑不许把假数据写进开发机」盯的就是这类遗留物）。而它删失败
+    绝不能变成一条红——那会让人以为清单取不到是文件系统的问题。
     """
     try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _stream_evidence(raw: str) -> str:
+    """一条流的取证：多少字节 / 多少非空行 + 原文片段。
+
+    原文必须以 repr 交出，不能直接贴：\\r、ANSI 转义这类字节一旦原样写进日志，终端会拿
+    后写的字**覆盖**先写的字，人看到的就不是那批字节了——本轮读云端那份日志恰好吃过这一
+    手（看到「stderr 0 字节」和「stdout 504 字节 / 11 行」这两句时无法判断它们是渲染结果
+    还是真实形状）。取证要交给下一个人的是可核对的形状，不是视觉效果。
+    """
+    data = raw.encode("utf-8", errors="replace")
+    lines = len([ln for ln in raw.splitlines() if ln.strip()])
+    body = repr(data[:_SCOPE_EVIDENCE_CAP].decode("utf-8", errors="replace"))
+    return f"{len(data)} 字节 / {lines} 行｜原文 {body}" + ("…" if len(data) > _SCOPE_EVIDENCE_CAP else "")
+
+
+def _list_channel_facts() -> str:
+    """解释这份签名需要的现场事实：哪个 bash、什么版本、那份脚本在磁盘上是 LF 还是 CRLF。
+
+    行尾这一格为什么必须由门来说：Windows runner 镜像的 git 全局 `core.autocrlf=true`，
+    `actions/checkout` 不覆盖它，所以**同一份提交在 Windows 工作区里可能是 CRLF**，而
+    `bash` 读到 CRLF 的 shell 会死在第一句（本机实测整份脚本转 CRLF：rc=2、stdout 0 字节、
+    stderr 360 字节，签名是 `set: +: invalid option` 与 `syntax error near 'do'`）。门里其它
+    shell 判据走的是 Python 读字节 + `bash -n`，`-n` 只解析不执行，恰好看不见这一类差别。
+    """
+    facts = [f"平台 {sys.platform}"]
+    bash = shutil.which("bash")
+    if not bash:
+        facts.append("PATH 里没有 bash")
+    else:
+        facts.append(f"bash={Path(bash).name}")
+        try:
+            proc = subprocess.run([bash, "--version"], capture_output=True, timeout=20,
+                                  stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                  errors="replace")
+            first = (proc.stdout or "").splitlines()
+            facts.append(f"版本 {first[0][:60] if proc.returncode == 0 and first else f'取不到（退出码 {proc.returncode}）'}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            facts.append(f"版本取不到（{type(exc).__name__}）")
+    try:
+        raw = (ROOT / REGRESSION_LIST_SCRIPT).read_bytes()
+        facts.append(f"{REGRESSION_LIST_SCRIPT} 在磁盘上是"
+                     + ("**CRLF**" if b"\r\n" in raw else ("含孤立 CR" if b"\r" in raw else "纯 LF")))
+    except OSError as exc:
+        facts.append(f"{REGRESSION_LIST_SCRIPT} 读不到（{type(exc).__name__}）")
+    return "｜".join(facts)
+
+
+def regression_suites() -> tuple:
+    """(退出码, 套件相对路径清单, stderr 摘要, stdout 原文, 清单出自哪条通道)。
+
+    第 4、5 格是本轮（2026-11-15 Windows 云端实发）加的，加的原因是**这两格互相矛盾**：
+    云端报回来的签名是「退出码 1｜stdout 504 字节 / 11 行｜stderr 0 字节」，而这一份脚本
+    在 `--list` 之前一个字都不往 stdout 写、每一条 `exit 1` 都必写 stderr。要么脚本没走
+    它声称的那些分支，要么**取证据的那条管道自己在换平台后不可信**。光靠一条管道没法把
+    这两种情形分开，所以：
+
+      · 清单同时经文件通道取回（脚本侧契约就写在 --list 旁边），文件不经受 stdout/stderr
+        的句柄归属、伪终端、参数转换这些平台差异；两条通道都读到并且对得上，范围才算有据；
+      · 红话里带出两条流的**原文**和平台事实，让下一个读日志的人拿到的是字节而不是猜测。
+
+    stdout 的格式依据就地写明，不留给下一个人在这里凭想象：那批字节由
+    `run_offline_regression.sh` 里 `printf '%s\\n' $FILES` 打印（同一份展开结果也会写进
+    B2B_REGRESSION_LIST_FILE），约定是「每行一个仓库相对的 .py 路径，进度与诊断一律走
+    stderr」。这句约定被离线对拍与下面三条门共同依赖，改那一句的人必须同时改这里。
+    """
+    env = dict(os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    list_file = ""
+    facts = _list_channel_facts()
+    try:
+        fd, list_file = tempfile.mkstemp(prefix="b2b_regression_list_", suffix=".txt")
+        os.close(fd)
+        env[REGRESSION_LIST_FILE_ENV] = list_file
+    except OSError as exc:
+        list_file = ""
+        facts += f"｜文件通道建不起来（{type(exc).__name__}），本轮只有管道一条证据"
+    try:
         proc = subprocess.run(list(REGRESSION_LIST_CMD), cwd=str(ROOT), capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=120)
+                              stdin=subprocess.DEVNULL, timeout=120, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return -1, [], f"起不来：{type(exc).__name__}: {exc}", ""
+        if list_file:
+            _silent_unlink(list_file)
+        return -1, [], f"起不来：{type(exc).__name__}: {exc}", "", facts
     out = proc.stdout.decode("utf-8", errors="replace")
     files = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    err = proc.stderr.decode("utf-8", errors="replace").strip().replace("\n", " | ")
-    return proc.returncode, files, err, out
+    # err_raw 留着**没被 strip** 的那一份：strip 会把首尾的 CR/LF 一起吃掉，而本轮要判的
+    # 恰恰是「这批字节里有没有行尾差异」。摘要给人读，原文给判据读，两者不能是同一份。
+    err_raw = proc.stderr.decode("utf-8", errors="replace")
+    err = err_raw.strip().replace("\n", " | ")
+    chan = (f"{facts}｜管道通道：{_stream_evidence(out)}"
+            f"｜stderr 通道：{_stream_evidence(err_raw)}")
+    if list_file:
+        try:
+            raw = Path(list_file).read_text(encoding="utf-8", errors="replace")
+            file_files = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            chan += f"｜文件通道：{_stream_evidence(raw)}"
+        except OSError as exc:
+            file_files = []
+            chan += f"｜文件通道读不到（{type(exc).__name__}）"
+        _silent_unlink(list_file)
+        if file_files and file_files != files:
+            # 两条通道不一致时按文件通道为准，但把差分说出去：差分本身就是那条平台缺陷的
+            # 形状（管道少读了哪几行、多读了什么），藏起来就等于把证据又丢回给人猜。
+            only_pipe = [p for p in files if p not in file_files][:3]
+            only_file = [p for p in file_files if p not in files][:3]
+            chan += (f"｜**两条通道不一致**：管道 {len(files)} 项、文件 {len(file_files)} 项，"
+                     f"管道独有 {only_pipe}、文件独有 {only_file}（判定按文件通道）")
+            files = file_files
+        elif file_files:
+            chan += f"｜两条通道一致（各 {len(file_files)} 项）"
+            files = file_files
+        else:
+            chan += "｜文件通道空（清单仍按管道，两条证据一起交给判据）"
+    return proc.returncode, files, err, out, chan
 
 
-def _regression_scope_problem(rc: int, files: list, err: str, out: str = "") -> list:
+def _regression_scope_problem(rc: int, files: list, err: str, out: str = "",
+                              chan: str = "") -> list:
     """清单读不到＝这三条门一条都没跑。这时候必须响，不能按「没问题」返回空表。
 
-    证据要把**两条流各拿到了多少字节**原样摊开（2026-11-14 云端实发）：这一句原来只在
-    stderr 非空时附上 stderr，于是「退出码 1、stdout 空、stderr 空」这种签名在日志里读起来
-    像「门自己取不到清单」，而它真正的意思是「脚本一个字都没说就死了」——差一条静默死因的
-    线索，人就得多跑一轮 CI 才看得懂。取不到清单要说的从来不只是「取不到」。
+    证据要把**两条通道的原文、退出码和平台事实**一起摊开（2026-11-15 云端实发）：上一版只
+    报「stdout 几个字节、stderr 几个字节」，并在文案里断言「两条流都是空的就说明脚本是被静默
+    结束的」。可云端那一次 stdout 有 504 字节 11 行——**文案说的和证据给的不是同一件事**，
+    人照着那句去查 errexit，而真方向在通道上。所以现在的红话按实际签名分支措辞：空就说不空，
+    非空就把原文交出来。
     """
     if rc != 0:
-        ev = (f"，stderr：{err[:200]}" if err
-              else "（stderr 空）")
+        shape = []
+        if out.strip() and not err:
+            shape.append("stdout 有原文而 stderr 一个字都没有：这一份脚本每一条 exit 1 都必写 "
+                         "stderr，所以这个组合不该出现——先怀疑取证据的通道，而不是脚本在撒谎")
+        elif not out.strip() and not err:
+            shape.append("两条流都是空的：脚本被静默结束（继承来的 errexit 撞上一条正常也会非零"
+                         "的命令是最常见的一种），先照第 15/28 条的口径查那一份 shell")
+        if err:
+            shape.append(f"stderr 原文：{err[:200]}")
         return [f"批跑清单取不到（`{' '.join(REGRESSION_LIST_CMD)}` 退出码 {rc}｜"
-                f"stdout {len(out.encode('utf-8'))} 字节 / {len(files)} 行{ev}｜"
-                f"stderr {len(err.encode('utf-8'))} 字节）：第 23/24/25 条的范围全长在"
-                "这一份清单上，读不到就一条都没判，不能报绿。两条流都是空的就说明脚本是被"
-                "静默结束的（继承来的 errexit 撞上一条正常也会非零的命令是最常见的一种），"
-                "先照第 15/28 条的口径查那一份 shell，别改本门的判据"]
+                f"{_stream_evidence(out)}）：第 23/24/25 条的范围全长在这一份清单上，读不到就一条"
+                f"都没判，不能报绿。{('；'.join(shape)) if shape else ''}"
+                + (f"｜现场：{chan}" if chan else "")]
     if not files:
-        return ["批跑清单是空的（退出码 0，可一行路径都没打出来）：三条门会在空集合上各自"
-                "「通过」，那种通过等于这三条门从没跑过"]
+        return ["批跑清单是空的（退出码 0，可两条通道都没读出一行路径）：三条门会在空集合上各自"
+                "「通过」，那种通过等于这三条门从没跑过"
+                + (f"｜现场：{chan}" if chan else "")]
     return []
 
 
@@ -3520,8 +3772,8 @@ def check_suite_exit_code_guard(suites=None) -> list:
     """跑过 Qt 的离线套件必须自己在收尾把退出码交给操作系统（第 23 条）。"""
     problems = []
     if suites is None:
-        rc, files, err, out = regression_suites()
-        problems += _regression_scope_problem(rc, files, err, out)
+        rc, files, err, out, chan = regression_suites()
+        problems += _regression_scope_problem(rc, files, err, out, chan)
         suites = files if rc == 0 else []
     judged = 0
     for rel in suites:
@@ -3567,8 +3819,8 @@ def check_regression_suites_tracked(suites=None) -> list:
                 "这一份」，问不到不许按合格返回"]
     problems = []
     if suites is None:
-        rc, files, err, out = regression_suites()
-        problems += _regression_scope_problem(rc, files, err, out)
+        rc, files, err, out, chan = regression_suites()
+        problems += _regression_scope_problem(rc, files, err, out, chan)
         suites = files if rc == 0 else []
     judged = 0
     for rel in suites:
@@ -3633,7 +3885,7 @@ def _dev_path_inputs() -> dict:
         if d.is_dir() and d.name.endswith("_build"):
             for p in sorted(d.glob("*.py")):
                 add(p)
-    rc, files, _err, _out = regression_suites()
+    rc, files = regression_suites()[:2]
     if rc == 0:
         for rel in files:
             add(ROOT / rel)
@@ -4163,6 +4415,20 @@ def main(argv=None) -> int:
               f"{len(SHELL_SOURCES)} 份手写 shell 都在第一条真命令之前自己声明了 errexit 的活法"
               "（要么 `set -Eeuo pipefail` 并且逐条接管非零，要么 `set +e` 明说走显式分支）")
 
+    # 行尾立场（第 29 条）：交付链的 shell/脚本/workflow 不许带 CR，且检出时必须是 LF，
+    # 而这个「必须是 LF」要由仓库里的一份 .gitattributes 来说，不能由某台机器的全局配置来说。
+    line_ending = check_line_ending_stance()
+    if line_ending:
+        bad += 1
+        print("❌ 交付链的行尾不合格，或行尾立场没写在仓库里（Windows 检出成 CRLF 之后 shell"
+              "当场死在第一句，而 bash -n 查不出来）：")
+        for p in line_ending:
+            print(f"   · {p}")
+            print(f"::error::行尾立场：{p}")
+    else:
+        print("✅ 行尾立场：交付链的 shell、脚本、workflow 都不带 CR，且 eol=lf 由仓库里的 "
+              ".gitattributes 定死（换一台 autocrlf=true 的机器也一样检出成 LF）")
+
     # 大小写·变体不敏感文件系统上的同名路径（第 16 条）：这一条管的是「同一份仓库在不同
     # 平台上不是同一棵树」。云端 Linux 检得出两份、开发机 mac 只有一份，且留哪一份取决于
     # 写入顺序——这类差异不会让 CI 变红，只会让「我这边是好的」变成一句真话加一个坏包。
@@ -4435,6 +4701,7 @@ def main(argv=None) -> int:
           "依赖链闭合、进包源码都已在提交里、同名拷贝分叉都在案、交付链 shell 都过了解析器、"
           "shell 里没有被 set -e 静默带走的裸赋值、装了的 ERR 陷阱也都带着 -E、"
           "每一份手写 shell 都在第一条真命令之前对 errexit 表了态、"
+          "交付链对行尾有写在仓库里的立场（检出必是 LF，不靠任何一台机器的全局配置）、"
           "入库路径在大小写不敏感文件系统上也不撞车、"
           "交付链脚本的编码都写死在脚本里、Windows 装配清单与构建命令互相钉死、"
           "交付 zip 的门两侧都在链路上、"

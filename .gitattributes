@@ -1,0 +1,94 @@
+# 行尾立场（2026-11-15 加，起因是 Windows 云打包的一次红）
+#
+# 为什么要专门写这份文件：Windows 的 GitHub runner 镜像把 git 全局 `core.autocrlf` 设成
+# true，`actions/checkout` 不覆盖它；本仓库此前**对行尾一个字都没说**，于是同一份提交在
+# Windows 工作区里会被检出成 CRLF，在 macOS/Linux 里是 LF。本机实测过这一类的代价：把
+# debug/run_offline_regression.sh 整份转成 CRLF 后，bash 死在第一句真命令上——
+#   rc=2｜stdout 0 字节｜stderr 360 字节
+#   `line 31: set: +: invalid option`、`line 85: syntax error near unexpected token 'do'`
+# 而 `bash -n` 对同一份文件是**过的**（只解析不执行），所以行尾差异骗得过语法检查，只在
+# 真跑的那一刻炸——这正是最难查的那类平台差异缺陷：一份代码、两个平台、一个绿一个红。
+#
+# 口径：文本一律以 LF 入库、LF 检出。被跟踪的交付文件今天就已经是 LF，所以这份声明不改写
+# 任何现有字节，它管的是「下一台机器检出出来长什么样」。二进制必须显式排除：Git 的自动文本
+# 探测会对含少量控制字节的文件误判，一旦误判就会往图片、字体、制品里插 CR。
+* text=auto eol=lf
+
+# 交付链里会被 shell 直接执行的类型单独点出来：这几类检出成 CRLF 就当场死（签名见上）。
+# 默认那行已经管住了它们，重复声明是为了让「谁在被保护」一眼能看见，也为了将来有人改默认
+# 值时这一类不会跟着翻。
+*.sh text eol=lf
+*.bash text eol=lf
+
+# 构建前门禁与被 workflow 调用的脚本：在 Windows 构建机上由 bash/python 执行
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# NSIS 脚本与批处理：仓库里一直是 LF，构建与安装也一直是通的，所以这里**跟着默认走 LF**。
+# 不写 eol=crlf 是有意的——那会在修「行尾没有立场」的同一步里，顺手改动一份现在能用的构建
+# 输入，两件事的风险不对等，要改也该带着一次真机构建验证单独改。
+*.nsi text eol=lf
+*.bat text eol=lf
+*.cmd text eol=lf
+
+# 二进制：不做行尾转换，也不做文本探测（图片/字体/归档/可执行/Office/音视频/编译产物）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.bmp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.bz2 binary
+*.xz binary
+*.zst binary
+*.7z binary
+*.rar binary
+*.exe binary
+*.dll binary
+*.dylib binary
+*.so binary
+*.a binary
+*.lib binary
+*.obj binary
+*.o binary
+*.msi binary
+*.pkg binary
+*.dmg binary
+*.apk binary
+*.aab binary
+*.ipa binary
+*.jar binary
+*.class binary
+*.pyc binary
+*.pyo binary
+*.pyd binary
+*.pdb binary
+*.xlsx binary
+*.xls binary
+*.xlsm binary
+*.docx binary
+*.doc binary
+*.pptx binary
+*.ppt binary
+*.mp4 binary
+*.mov binary
+*.avi binary
+*.mkv binary
+*.webm binary
+*.mp3 binary
+*.wav binary
+*.ogg binary
+*.flac binary
+*.psd binary
+*.ai binary

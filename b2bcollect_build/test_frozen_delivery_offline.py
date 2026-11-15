@@ -8257,9 +8257,8 @@ def test_suite_exit_code_guard_gate():
             "云端 annotation 要能直接照做：写明是「判定与退出码不同源」，不是「套件失败」")
 
     # ── 2) 范围与批跑同源，而且真仓库今天全绿 ──
-    _rc, _files, _err, _out = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
-                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
+    _rc, _files, _err, _out, _chan = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜{len(_files)} 行｜{_chan}）")
     _assert(len(_files) >= 50,
             f"--list 展开出 {len(_files)} 项：少于 50 说明发现逻辑或 --list 的 stdout 契约坏了")
     _assert(all(x.endswith(".py") and not x.startswith("/") and (_REPO / x).is_file()
@@ -8393,9 +8392,8 @@ def test_regression_suites_tracked_gate():
             "云端 annotation 要能直接照做：写明是「本机有、提交里没有」")
 
     # ── 2) 真仓库：清单里每一路都已在提交里；当年漏掉的那 5 份单独钉一次 ──
-    _rc, _files, _err, _out = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
-                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
+    _rc, _files, _err, _out, _chan = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜{len(_files)} 行｜{_chan}）")
     _assert_eq(gate.check_regression_suites_tracked(), [],
                "第 24 条：清单展开出来的每一路套件都已在提交里（红了就照每条前面的 git 命令做）")
     _scar = ("debug/verify_gys_offline.py", "debug/gi_mp_offline_check.py",
@@ -8573,9 +8571,8 @@ def test_no_dev_machine_paths_gate():
     # ── 7) 范围：交付目录 + 批跑清单 + 交付 shell + workflow + 门禁自己，一个都不许漏 ──
     _inputs = gate._dev_path_inputs()
     _rels = {gate._rel_posix(p) for p in _inputs}
-    _rc, _files, _err, _out = gate.regression_suites()
-    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜stdout {len(_out.encode('utf-8'))} 字节"
-                       f" / {len(_files)} 行｜stderr={_err[:120]}）")
+    _rc, _files, _err, _out, _chan = gate.regression_suites()
+    _assert_eq(_rc, 0, f"批跑清单取得到（退出码｜{len(_files)} 行｜{_chan}）")
     _assert(set(_files) <= _rels,
             f"清单里每一份套件都在第 25 条的视野内（缺 {sorted(set(_files) - _rels)[:4]}）"
             f"——门与批跑分叉的方向永远是「少判一侧」")
@@ -9164,6 +9161,228 @@ def test_shell_errexit_posture_gate():
         _assert(False, "端到端这一格没法判：找不到 bash 或批跑入口不在位（静默跳过＝这条格从没跑过）")
 
 
+def test_line_ending_stance_gate():
+    print("\n═══ AM. 行尾立场必须写在仓库里：第 29 条硬门要有牙 ═══")
+    # 由来（Windows 云端实发）：GitHub 的 Windows runner 镜像把 git 全局 core.autocrlf 设成
+    # true，actions/checkout@v4 不覆盖它，而本仓库此前对行尾一个字都没说——同一份提交在
+    # Windows 工作区里被检出成 CRLF，在 mac/Linux 里是 LF。本机把批跑入口整份转成 CRLF 实测
+    # 过后果：rc=2｜stdout 0 字节｜stderr 360 字节，`line 31: set: +: invalid option`、
+    # `line 85: syntax error near unexpected token 'do'`。
+    # 最要紧的一格是：**`bash -n` 对同一份 CRLF 文件是过的**（第 12 条只解析不执行），所以
+    # 行尾差异骗得过语法门，只在真跑那一刻炸——云端红、构建全绿、本机永远绿。这一节钉的就是
+    # 「解析得过、跑不起来」那一段空白，外加「立场必须写在仓库里」：写在某台机器的全局配置上
+    # 的 autocrlf 换一台机器就没了，那正是本轮踩到的形状。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    _assert(callable(getattr(gate, "check_line_ending_stance", None)),
+            "硬门模块里有第 29 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("line_ending = check_line_ending_stance()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 29 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 29 条报出来的问题要并进不合格计数（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::行尾立场" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：写明缺的是行尾立场，不是「重跑一次」")
+    _assert_eq(gate.LINE_ENDING_STANCE_FILE, ".gitattributes",
+               "立场文件的名字要说死：换一个名字等于换一台机器再重新找一遍是谁在管行尾")
+
+    # ── 2) 视野：交付 shell 每一份都得在这条门的范围内（登记了却不被看＝Windows 上没人管）──
+    _scope = gate._line_ending_scope()
+    for rel in gate.SHELL_SOURCES:
+        _assert(rel in _scope,
+                f"{rel} 在第 29 条的视野里（它在第 11/20e 条登记了，这一条不看它，"
+                f"检出的行尾就归某台机器的 git 配置管）")
+    for rel in gate.WORKFLOWS:
+        _assert(rel in _scope, f"{rel} 在第 29 条的视野里（workflow 里的 shell 步同样只在 LF 上能跑）")
+
+    # ── 3) 判一（CR）承重：把每一份真脚本换成 CRLF 喂进去，必须当场响在这一份上 ──
+    def _cr_of(label: str, text: str) -> list:
+        # 标签用真路径：门对内存夹具报的是「喂进来的那一份叫什么」，叫错了下一个读红话的人
+        # 就照着错的名字去找文件（第 11 条同一道理：归因错了比不归因更费时间）。
+        return [p for p in gate.check_line_ending_stance(sources=(), texts=((label, text),))
+                if "处 CR" in p]
+
+    for rel in gate.SHELL_SOURCES:
+        _lf = (_REPO / rel).read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+        _crlf = _lf.replace("\n", "\r\n")
+        _got = _cr_of(rel, _crlf)
+        _assert_eq(len(_got), 1,
+                   f"{rel} 整份转成 CRLF 必须响（不响＝真仓库那条 ✅ 只是在判一个空集合）")
+        if _got:
+            _assert(rel in _got[0] and str(_lf.count("\n")) in _got[0],
+                    f"响的那句要点名是哪一份、有几处 CR（实际={_got[0][:130]}）")
+        _assert_eq(_cr_of(rel, _lf), [],
+                   f"{rel} 同一份内容按 LF 喂进去不许响（红了说明判的是文件名而不是字节）")
+        # 只改一行行尾才是真难查的那种：本机照样跑得起来，换台机器检出后未必。
+        _half = _lf.replace("echo hi\n", "echo hi\r\n", 1) if "echo hi\n" in _lf \
+            else _lf.replace("\n", "\r\n", 1)
+        _assert_eq(len(_cr_of(rel, _half)), 1,
+                   f"{rel} 只有**一处**行尾是 CRLF 也要响（按「整份是不是 CRLF」判会放过这种）")
+
+    # ── 4) 判二：git 问不到 / 答非 lf / 立场文件没进仓库，三格各响一次 ──
+    with _patch(gate, "_line_ending_stances", lambda paths: {}):
+        _got = gate.check_line_ending_stance()
+        _assert(any("问不到 git 的行尾立场" in p for p in _got),
+                "问不到 git 的回答时不许按合格返回（这一条判的就是检出长什么样）")
+    _crlf_map = {rel: {"text": "set", "eol": "crlf"} for rel in gate.SHELL_SOURCES}
+    with _patch(gate, "_line_ending_stances", lambda paths: dict(_crlf_map)):
+        _got = gate.check_line_ending_stance()
+        _assert(any("eol 不是 lf" in p and gate.LINE_ENDING_STANCE_FILE in p for p in _got),
+                f"git 答 crlf 时必须响，并且把修法说成改仓库立场而不是某台机器的配置"
+                f"（实际={_got[:1]}）")
+    with _patch(gate, "tracked_state", lambda p: "missing"):
+        _got = gate.check_line_ending_stance()
+        _assert(any(gate.LINE_ENDING_STANCE_FILE in p and "git add" in p for p in _got),
+                "立场文件没进仓库时必须响：写在某台机器上的全局配置换一台就没了，那正是本轮事故")
+    # 空视野不许绿：登记表里的路径都不在位、夹具也是空的，这时候「行尾合格」没有任何含义。
+    _tmpE = Path(tempfile.mkdtemp(prefix="am_empty_scope_"))
+    try:
+        with _patch(gate, "ROOT", _tmpE), \
+                _patch(gate, "_line_ending_stances", lambda paths: {}):
+            _got = gate.check_line_ending_stance(sources=("zz_不在位.sh",))
+        _assert(any("一份交付文本都没读到" in p for p in _got),
+                f"视野是空的却不许报绿（实际={_got[:1]}）")
+    finally:
+        shutil.rmtree(_tmpE, ignore_errors=True)
+
+    # ── 5) 真仓库今天：CR 一格都不许有，eol 一格都不许有；立场文件那一格如实说 ──
+    _today = gate.check_line_ending_stance()
+    _assert_eq([p for p in _today if "处 CR" in p], [],
+               "第 29 条判一：交付链里没有一份文本带着 CR（红了就照那句改文件，不是改 git 配置）")
+    _assert_eq([p for p in _today if "eol 不是 lf" in p], [],
+               "第 29 条判二：git 对每一份交付文本都答 eol=lf（立场真的在仓库里生效了）")
+    _stance = [p for p in _today if gate.LINE_ENDING_STANCE_FILE in p]
+    _assert(len(_stance) <= 1,
+            f"今天剩下的行尾问题只能是立场文件在 git 里的那一格（实际={_stance}）")
+    if _stance:
+        # 这一格不掩盖也不重复判红：门禁自己会一直响到那次提交为止，本节只保证它响的是这句话。
+        print("   ℹ 此刻 .gitattributes 还没进提交（只 add 没 commit）——门禁第 29 条会一直红到"
+              "提交那一刻，本节的夹具不把它读成绿")
+
+    # ── 6) 端到端：真起一个临时 git 仓库，把 .gitattributes 装上/摘下，门的答案必须跟着变 ──
+    # 前五格判的都是「读字节的门」和「喂进内存的字典」。本轮的事故只在**换一台机器之后**才
+    # 现形，所以这一格必须让 git 真的回答：同一份仓库、同一批文件，多的只有那份被提交的
+    # .gitattributes——判二从红转绿，才证明门读的是仓库的立场，而不是自己写的字典。
+    _tmpR = Path(tempfile.mkdtemp(prefix="am_real_repo_"))
+    try:
+        _gi = subprocess.run(["git", "init", "-q", str(_tmpR)],
+                             capture_output=True, text=True, check=False)
+        if _gi.returncode != 0:
+            _assert(False, f"端到端这一格没法判：git init 起不来（{(_gi.stderr or '')[:120]}）")
+        else:
+            (_tmpR / "fx_lean.sh").write_text("#!/bin/bash\nset +e\necho hi\n", encoding="utf-8")
+
+            def _commit():
+                subprocess.run(["git", "add", "-A"], cwd=str(_tmpR), capture_output=True,
+                               text=True, check=False)
+                subprocess.run(["git", "-c", "user.email=fx@example.invalid",
+                                "-c", "user.name=fx", "commit", "-q", "-m", "fx"],
+                               cwd=str(_tmpR), capture_output=True, text=True, check=False)
+
+            with _patch(gate, "ROOT", _tmpR):
+                _commit()
+                gate.reset_git_cache()
+                _before = gate.check_line_ending_stance(sources=("fx_lean.sh",))
+                (_tmpR / gate.LINE_ENDING_STANCE_FILE).write_text(
+                    "* text=auto eol=lf\n*.sh text eol=lf\n", encoding="utf-8")
+                _commit()
+                gate.reset_git_cache()
+                _after = gate.check_line_ending_stance(sources=("fx_lean.sh",))
+            _assert(any("eol 不是 lf" in p for p in _before),
+                    f"仓库里没有 .gitattributes 时判二必须响（这正是本轮云端的现场；实际={_before[:2]}）")
+            _assert_eq([p for p in _after if "eol 不是 lf" in p
+                        or gate.LINE_ENDING_STANCE_FILE in p], [],
+                       f"只多了那份被提交的立场文件，判二就要转绿（实际={_after[:2]}）")
+    finally:
+        gate.reset_git_cache()
+        shutil.rmtree(_tmpR, ignore_errors=True)
+
+
+def test_forensic_job_log_channel_gate():
+    print("\n═══ AN. 取证脚本判「日志拿到没有」必须按 HTTP 状态，不许按魔法字节 ═══")
+    # 由来（本轮本机实发）：debug/fetch_run_log.sh 用 `[ "$(head -c 2 落点)" = "PK" ]`
+    # 判「这是不是日志」，不是就当错误响应 continue 掉。本机对着 run 43664465393 的 job
+    # 132660669361 实测取了一次：HTTP 200｜Content-Type: text/plain｜53545 字节｜开头 EF BB BF。
+    # GitHub 的 /actions/jobs/{id}/logs 返回的**本来就是纯文本**，zip 只属于
+    # /actions/runs/{id}/logs 那个归档接口。于是这份取证脚本每一次正常取证都在自己的判据上
+    # 被丢掉，而它下面读日志的 python 早就写了纯文本分支——永远跑不到。
+    # 症状不是报错，是一句「命中 0 行错误线索」：人拿着它去找一个不存在的 bug。同一天
+    # Windows 门禁那条红（硬门 23/24/25 的范围全长在那份清单上）就是这么被绕过去的。
+    #
+    # 为什么这条写在离线套件而不是编号硬门里：它判的是一份**只在本机跑的取证脚本**的内部
+    # 形状，不参与打包与检出；编号硬门的每一条都要在构建机上成立才有意义。这里要的是「下一
+    # 次有人把 PK 判据写回来就当场响」，交付前本机必跑这一份，就够了。
+    rel = "debug/fetch_run_log.sh"
+    sh = (_REPO / rel).read_text(encoding="utf-8")
+
+    def _problems(text: str) -> list:
+        """这份取证脚本对「拿到的是不是一份可用的日志」表了哪几种态（缺一种就算一条）。"""
+        out = []
+        if "curl" not in text:
+            return out                        # 没有下载这一回事：这一节对它没有结论
+        if "%{http_code}" not in text:
+            out.append("没问过 HTTP 状态码：curl 的退出码只能发现「连都没连上」，"
+                       "发现不了连上了却回 401/404/限流——那种响应体是一段 JSON，"
+                       "最容易被读成「云端没报错」")
+        if not re.search(r"^\s*2\?\?\)", text, re.M):
+            out.append("没有「2xx 才算拿到」这一分档：状态码问到了却按别的字节决定丢弃，等于没问")
+        # PK 只能用来决定「要不要真解一遍」，不许用来决定「这是不是日志」。判的是语句形状：
+        # 「比头两字节的 if」带一个 else 分支、那个分支当场丢弃这个 job——这正是上一版的原话，
+        # 而现在的 `is_zip "$dst"` 只在 then 分支里决定要不要 unzip -t，没有 else 丢弃。
+        for m in re.finditer(r'\[\s*"\$\(head -c 2[^\n]*"PK"\s*\][^\n]*then(.{0,600}?)\belse\b'
+                             r'\s*\n\s*(continue|return|exit|rm -f)', text, re.M | re.S):
+            out.append(f"第 {text[:m.start()].count(chr(10)) + 1} 行拿头两字节是不是 PK 决定要不要"
+                       "丢掉日志（else 分支当场丢弃这个 job）：这个端点返回的是 text/plain，"
+                       "纯文本日志会被当成错误响应扔掉")
+        if not re.search(r"wc -c|wc_bytes|size_download", text):
+            out.append("没有「状态码 2xx 但响应体 0 字节」这一格：那同样是什么都没取到，"
+                       "交给分析段去猜就会得到「没有错误行」")
+        if re.search(r"\.read\(\)\.decode\(|raw\.decode\(", text) and "utf-8-sig" not in text:
+            out.append("整份日志体按 utf-8 解：实测这份日志以 EF BB BF 开头，BOM 会留在第一行"
+                       "第一个字符上，行首特征（::error::、##[group]）从此永远匹配不到")
+        return out
+
+    _now = _problems(sh)
+    _assert_eq(_now, [],
+               f"{rel} 现状要对「拿到日志没有」五格全表态（实际={_now[:1]}）")
+
+    # ── 反向对照：把上一版（真在本机错过的取证形状）与各缺格的写回一次，门必须各响一次 ──
+    _OLD = ('  curl -sSL -m 180 -o "$L" "$U"\n'
+            '  if [ "$(head -c 2 "$L")" = "PK" ]; then\n'
+            '    unzip -tqq "$L" >/dev/null 2>&1 || continue\n'
+            '  else\n'
+            '    continue\n'
+            '  fi\n'
+            '  /usr/bin/python3 -c \'print(open("$L","rb").read().decode("utf-8"))\'\n')
+    _got = _problems(_OLD)
+    _assert_eq(len(_got), 5, f"上一版那一份要五格全响（实际={_got}）")
+    for _needle, _why in (("HTTP 状态码", "没问状态码"), ("2xx 才算拿到", "没有 2xx 分档"),
+                          ("决定要不要丢掉日志", "PK 当门禁——本轮实际错过取证的就是那一句"),
+                          ("0 字节", "没有空响应体那一格"), ("EF BB BF", "按 utf-8 解带 BOM 的日志")):
+        _assert(any(_needle in p for p in _got), f"{_why}的那一版要响（实际={_got[:1]}）")
+    # 说明文字加回去、缺陷留着，仍然要五格全响：这一格把上面五条从「数关键词」里摘出来。
+    _assert_eq(len(_problems("# 这里本来会核对方返回的错误响应与编码\n" + _OLD)), 5,
+               "判的是代码形状，不是文案里出现没有这些词（能靠注释过关的门等于没有门）")
+    # 只修一半不算修好：一格一格补上去，每补一格少一条，且不是一上来就全绿。
+    _CODE = '  code=$(curl -sSL -m 180 -o "$L" -w \'%{http_code}\' "$U")\n'
+    _CASE = '  case "$code" in\n    2??) ;;\n    *) return 2 ;;\n  esac\n'
+    _SIZE = '  [ "$(wc -c < "$L")" = "0" ] && { echo "响应体是空的"; continue; }\n'
+    _SIG = _OLD.replace('decode("utf-8")', 'decode("utf-8-sig", "replace")')
+    _ladder = [len(_problems(_p + _OLD)) for _p in
+               ("", _CODE, _CODE + _CASE, _CODE + _CASE + _SIZE)]
+    _assert_eq(_ladder, [5, 4, 3, 2],
+               f"每补一格少一条：{_ladder}（一次补满或原地不动，都说明判据没在逐格承重）")
+    _assert_eq(len(_problems(_CODE + _CASE + _SIZE + _SIG)), 1,
+               "编码那一格要真能靠 utf-8-sig 消掉，剩下的 1 条必须是 PK 那一格"
+               f"（实际={_problems(_CODE + _CASE + _SIZE + _SIG)[:1]}）")
+    # 取证脚本自己也在第 20/28 条的视野里（登记表、curl 有界、errexit 立场），这里别重复判。
+    gate = _manifest_gate()
+    _assert(rel in gate.SHELL_SOURCES, f"{rel} 在交付链 shell 登记表里（不在表里的取证脚本，"
+                                       "其余四道门在它身上全是空的）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -9190,6 +9409,8 @@ SECTIONS = (
     test_temp_dir_single_source_gate,
     test_module_name_binding_gate,
     test_shell_errexit_posture_gate,
+    test_line_ending_stance_gate,
+    test_forensic_job_log_channel_gate,
 )
 
 
