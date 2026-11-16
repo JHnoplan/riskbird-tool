@@ -134,8 +134,11 @@
      仓库里的行尾立场 / 30 失败原因只准一个把手收口 / 31 标签交出的正文必须过页面身份门、
      且「这一跳根本没加载出来」必须按 Chrome 原话归因（31g 还要证明那枚启动参数真的带上了，
      而且三条路径上的浏览器带的是同一份）/ 32 「无联系方式」与关标签的账必须能被逐档念出来 /
-     33 列表条目账只住在一个把手里 / 34 交付链每份 .py 都必须被打包机那个解释器读得懂）：
-     这十四条各自的由来与口径写在**它们函数上方**的注释块里——那十四条都是
+     33 列表条目账只住在一个把手里 / 34 交付链每份 .py 都必须被打包机那个解释器读得懂 /
+     35 取 bash 只许一个把手（执行前得换成解析出的绝对路径，身份靠版本横幅＋横幅里的三元组
+        问它自己——Linux 那份 bash 在 Windows 打包机上看不见工作目录）/
+     36 报告用的相对路径必须与 git 写法同源（自己裁一遍在 Windows 上永远裁不掉））：
+     这十六条各自的由来与口径写在**它们函数上方**的注释块里——那十六条都是
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
 
@@ -159,7 +162,7 @@ import tempfile
 import textwrap
 import tokenize
 import unicodedata
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 
 for _s in (sys.stdout, sys.stderr):
@@ -513,7 +516,7 @@ def _tracked_sets() -> tuple:
     return _INDEX["files"], _HEAD["files"]
 
 
-def _rel_posix(path: Path):
+def _rel_posix(path: Path, root=None):
     """仓库相对路径的 **git 写法**：分隔符永远是 `/`。仓库外返回 None。
 
     这一行归一不是洁癖，是 2026-11-12 Windows 构建实机踩出来的：`git ls-files` 与
@@ -521,11 +524,21 @@ def _rel_posix(path: Path):
     两边直接比对的结果是**每一个进包文件都被判成「从未被 git 跟踪」**——门禁在 Mac 上
     全绿、在 Windows 上把整条清单刷成红，那是门禁自己坏了，比没有门禁更糟（人会直接把
     这一步跳过）。判据跨平台可比，前提是先把说法统一到 git 那一边。
+
+    多出的是一个 `root` 参数，默认口径一点没动（不给就是 ROOT）。加它的原因很具体：第 36 条
+    要在 Mac 上拿 **Windows 形状的路径**真跑一遍这一刀——`PureWindowsPath` 在任何平台上都能
+    造，而两种 flavour 之间 `relative_to` 抛的是 **TypeError**（不是 ValueError），所以下面
+    两种都兜，并再走一次「按字符串裁前缀」的兜底；那一条兜底同时也是打包机上跨盘符、
+    或 ROOT 与路径拼写不完全一致时唯一还能给出相对名的路。
     """
+    base = ROOT if root is None else root
     try:
-        return path.relative_to(ROOT).as_posix()
-    except ValueError:
+        return path.relative_to(base).as_posix()
+    except (ValueError, TypeError):
         text = str(path).replace("\\", "/")
+        head = str(base).replace("\\", "/").rstrip("/")
+        if head and text.startswith(head + "/"):
+            return text[len(head) + 1:]
         return None if text.startswith("/") else text
 
 
@@ -988,6 +1001,204 @@ def run_blocks_in_workflow(text: str) -> list:
     return out
 
 
+# 取 bash 的那一个把手需要的五件常量。它们只住在把手这里，**不许在调用方重建**（第 35 条判的
+# 就是这件事）。`BASH_TOKEN` 是命令表里允许出现的唯一写法：裸名字必须由 `resolve_shell_cmd`
+# 换成绝对路径后才送去执行。
+BASH_TOKEN = "bash"
+_BASH_ID_RE = re.compile(r"GNU bash, version (\d+)\.(\d+)")
+# 系统目录只用来把**淘汰理由**说得能读（身份判据不靠它），大小写与两种分隔符都要认。
+_SYSTEM_DIR_RE = re.compile(r"[\\/](?:windows[\\/](?:system32|syswow64)|winnt)[\\/]", re.I)
+# PATH 里没配 Git 的机器（Windows 开发机上常见）兼容一下。这里只有系统级安装位，没有
+# 任何具体某人的目录——第 25 条禁止的是开发机路径，不是「Windows 上 Program Files 在哪」。
+GIT_BASH_HINTS = (
+    os.path.join("%ProgramFiles%", "Git", "bin", "bash.exe"),
+    os.path.join("%ProgramFiles%", "Git", "usr", "bin", "bash.exe"),
+    os.path.join("%ProgramFiles(x86)%", "Git", "bin", "bash.exe"),
+    os.path.join("%LocalAppData%", "Programs", "Git", "bin", "bash.exe"),
+)
+# 探身份那一步的超时：装了发行版的 WSL 里 `bash --version` 能跑，但冷启动可能几秒；
+# 把它当成「没答话」淘汰掉，不许把整道门禁卡在一枚程序上（卡死比响难查得多）。
+_BASH_PROBE_TIMEOUT = 20
+_BASH_CACHE: dict = {}
+
+
+# ── 「要一个能跑 shell 脚本的 bash」在交付链里只有一个把手（第 35 条）─────────────────
+# 由来：2026-11-16 云端 Windows run 43860712318，同一个提交 Mac 绿、Windows 红。红话里同时
+# 写着两句**互相矛盾**的现场：
+#   「`bash debug/run_offline_regression.sh --list` 退出码 1｜504 字节｜原文 "W\x00i\x00n\x00d…"」
+#   「bash=bash.EXE｜版本 GNU bash, version 5.3.15(2)-release (x86_64-pc-cygwin)」
+# 两句说的是两个不同的程序，而这**不是编码玄学**：Python 用裸名字 `bash` 起子进程时走的是
+# Windows `CreateProcess` 的目录搜索顺序（程序目录→当前目录→**SystemRoot\System32**→
+# Windows→PATH），Windows 在 System32 里放了一枚 `bash.exe` **WSL 存根**，它排在 PATH 里
+# Git 那份之前；存根在没装发行版的机器上打印那句 UTF-16LE 提示并以 rc=1 退出，`--list` 从头
+# 到尾**没被执行过**。而取证那句用的是 `shutil.which("bash")`——它只按 PATH 找，于是拿到了
+# Git 的 cygwin。两种取法给出两个程序，门把自己的现场说成了两句互相打脸的话；更坏的是后果
+# 不落在「谁取错了」那一格，而是第 23/24/25 条的范围全长在一份读不到的清单上，三条门一条都
+# 没判，红成一片「套件不合格」，人照着红去改真源就改错了方向。
+#
+# 认身份只许问它自己是谁（`--version` 的横幅＋横幅里的三元组），不许凭路径猜：存根可以被改名、
+# 可以住在别的目录，装了发行版的 WSL 里 `bash --version` 答的也是真横幅；反过来 Git 装在非常规
+# 位置的正规 bash 也不该因为路径陌生就被淘汰。路径线索只用来在**淘汰理由**里把话说清楚。
+# 三元组是横幅的一部分，不是第二条刀：它专门堵「横幅为真、但住在 Linux 内核里」那一枚，因为
+# 那种 bash 在 Windows 打包机上看不见工作目录——本轮事故换了个伪装就会从这一格钻回来。
+def _bash_candidates() -> list:
+    """PATH 上**每一个**叫 bash 的程序（不是第一个），外加 Git Bash 的常见安装位。
+
+    只取第一个正是上一版犯错的地方：`shutil.which` 天生返回 PATH 上第一个命中，而「第一个」
+    恰好是被系统存根抢占的那一位。这里逐目录查，让把手看得见全部候选——被淘汰的候选也要
+    进现场说明，否则下一个人还是只能靠算术反推清单断在哪。
+    """
+    dirs = [d for d in os.environ.get("PATH", os.defpath).split(os.pathsep) if d]
+    out = []
+    for one in dirs:
+        found = shutil.which("bash", path=one)
+        if found and found not in out:
+            out.append(found)
+    for hint in GIT_BASH_HINTS:
+        full = os.path.expandvars(hint)
+        if os.path.isfile(full) and full not in out:
+            out.append(full)
+    return out
+
+
+def _decode_maybe_utf16(raw: bytes) -> str:
+    """子进程输流的解码：**带 NUL 就当 UTF-16 试一遍**，解不出来才 utf-8 + replace。
+
+    Python 自己给 `text=True` 用的是控制台代码页，那是第 11 条已经踩过一次的坑（见
+    `check_shell_parse`）；而本轮那 504 字节是 UTF-16LE，按 utf-8 解出来是一串 `W\x00i\x00n\x00d`，
+    判据读到的形状会一直「看着像坏字节」。解码口径也收在一处，别再分叉第三次。
+
+    不成对的那一个字节不能拖整段后退（AV 第 4 档实测抓出来的）：真存根就是这种形状——
+    前半句是 UTF-16LE，尾巴上换行是一个裸 `\n`。奇数长度下 strict 与 `errors="replace"` 都会
+    报 truncated data，三种编码全军覆没就退到 utf-8，NUL 于是留在取证里：人看到的仍是
+    `W\x00i\x00n\x00d`，而本轮要治的恰好是「这句人读不懂」。所以试完 strict 再把最后那一
+    个不成对的字节剔掉解一次，只剔那一字节，不猜别的。
+    """
+    if b"\x00" in raw[:700]:
+        for enc in ("utf-16", "utf-16le", "utf-16be"):
+            try:
+                return raw.decode(enc, errors="strict")
+            except (UnicodeError, ValueError):
+                pass
+            if len(raw) > 1:
+                try:
+                    return raw[:len(raw) - 1].decode(enc, errors="replace")
+                except (UnicodeError, ValueError):
+                    continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _is_linux_flavoured_bash(banner: str) -> bool:
+    """版本横幅里那位「提供者」是不是 Linux 内核上的 bash（WSL / Linux 兼容层）。
+
+    判据是横幅括号里的三元组，不是路径：`(1)-release (x86_64-pc-linux-gnu)` 属于 Linux 那份
+    GNU bash，Git for Windows 给的是 `(x86_64-pc-cygwin)`、MSYS 给的是 `-pc-msys`。为什么非要
+    在这一格较真：认「GNU bash, version」横幅是上一版留下的**最后一个**洞——Windows 上装了
+    WSL 发行版的机器里，`System32\bash.exe --version` 答得出一句真横幅且 rc=0，横幅一路畅通
+    无阻，可那个 bash 活在 Linux 内核里，**看不见打包机的工作目录**（`D:\a\riskbird-tool\...`），
+    脚本会从第一个 `cd` 就坏。这仍是本轮那句「同一个名字解析成两个程序」，只是换了伪装。
+    """
+    text = (banner or "").lower()
+    return "pc-linux-gnu" in text or "linux-gnu" in text or "wsl" in text
+
+
+def _bash_identity(prog: str, on_windows=None):
+    """问一次 `--version`：答得上「GNU bash, version X.Y」且**不是 Linux 那份**才算 bash。
+
+    返回 (版本元组或 None, 给人看的一句)。`on_windows` 是给离线夹具留的注入口：默认按
+    `sys.platform` 判断，而夹具在 Mac 上要能仿真 Windows 那一半——不仿真就等于把最要紧的一档
+    写进永远执行不到的分支。
+    """
+    if on_windows is None:
+        on_windows = sys.platform == "win32"
+    try:
+        proc = subprocess.run([prog, "--version"], capture_output=True, timeout=_BASH_PROBE_TIMEOUT,
+                              stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        return None, f"起不来（{type(exc).__name__}: {exc}）"
+    except subprocess.TimeoutExpired:
+        return None, f"{int(_BASH_PROBE_TIMEOUT)} 秒内没答话"
+    text = _decode_maybe_utf16(proc.stdout or b"")
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    m = _BASH_ID_RE.search(first) or _BASH_ID_RE.search(text)
+    if proc.returncode != 0 or m is None:
+        return None, (f"没有 GNU bash 版本横幅（退出码 {proc.returncode}，第一行 "
+                      f"{first[:60]!r}）" + _stub_hint(prog, text))
+    if on_windows and _is_linux_flavoured_bash(first):
+        return None, (f"横幅是 Linux 内核那份 bash（{first[:60]}）：Windows 上它来自 WSL，"
+                      "看不见以 Windows 路径写出的工作目录，脚本会从第一个 cd 就坏；"
+                      "要的是 Git 自带的 (x86_64-pc-cygwin)")
+    return (int(m.group(1)), int(m.group(2))), first[:80]
+
+
+def _stub_hint(prog: str, text: str) -> str:
+    """把「它其实不是 bash」说成具体的一句，而不是留给人查资料。
+
+    本轮那 504 字节的原文里带着 Subsystem for Linux 的字样，Windows 目录里那枚存根也住在
+    System32：两条线索任中一条就点名，人不必重新发现一次。
+    """
+    low = text.lower()
+    if "subsystem for linux" in low or "wsl" in low:
+        return "｜这不是 Git 的 bash，是 Windows 的 WSL 入口：它把参数转给 Linux 子系统，"
+    if _SYSTEM_DIR_RE.search(prog):
+        return "｜它在 Windows 系统目录里，`CreateProcess` 的搜索顺序会优先命中它"
+    return ""
+
+
+def bash_executable(windows=None) -> tuple:
+    """(能跑 shell 脚本的 bash 绝对路径，现场说明)。取不到时返回 (空串, 为什么取不到)。
+
+    进程内按 PATH 取值做一次性记忆：一轮门禁里第 11/23/24/25 条都要用 bash，每次都重探一遍
+    会把几十毫秒乘以候选数再乘以判据数（本轮给 frozen 计时就是栽在类似量级上）；PATH 变了则
+    重新解析，记忆不许变成「第一次的结论永远算数」。
+
+    `windows` 只给离线夹具用（在 Mac 上把 Windows 那一半真跑一遍，含淘汰与选路），默认 None
+    就是按本机平台判断；它跟着进缓存键，否则仿真结论会污染同一进程里后面的真判据。
+    """
+    if windows is None:
+        windows = sys.platform == "win32"
+    key = (os.environ.get("PATH", ""), bool(windows))
+    if _BASH_CACHE.get("key") == key:
+        return _BASH_CACHE["value"]
+    rejected = []
+    candidates = _bash_candidates()
+    for prog in candidates:
+        ver, why = _bash_identity(prog, on_windows=windows)
+        if ver is None:
+            rejected.append(f"{prog}：{why}")
+            continue
+        note = f"bash={prog}｜版本 {why}"
+        if rejected:
+            note += "｜已淘汰 " + "；".join(rejected)
+        value = (prog, note)
+        break
+    else:
+        value = ("", ("PATH 与常见安装位里没有一个「能在本平台跑仓库脚本的 GNU bash」"
+                      f"（探了 {len(candidates)} 个候选）" + ("：" + "；".join(rejected)
+                                                            if rejected else "，一个候选都没有")))
+    _BASH_CACHE["key"], _BASH_CACHE["value"] = key, value
+    return value
+
+
+def resolve_shell_cmd(cmd) -> tuple:
+    """把命令表第 0 位那枚**裸名字** `bash` 换成 `bash_executable()` 解析出的绝对路径。
+
+    只认字面量 `"bash"` 且只换第 0 位：离线夹具用 `("bash", "-c", "…")` 造的形状要能被同样
+    改写（否则夹具验的是另一条通路），而用假命令名造「起不来」的形状必须**不被**改写——
+    第 23 条那条反向对照靠的就是它，改写了就等于把夹具自己的证据拆了。
+    返回 (argv, 现场说明)；解析不出来时 argv 第 0 位仍是裸名字，调用方**必须响**，不许退回
+    裸名字碰运气（碰运气就是本轮的形状：在 Mac 上永远好，在 Windows 上永远坏）。
+    """
+    argv = list(cmd)
+    if not argv or str(argv[0]) != BASH_TOKEN:
+        return argv, ""
+    prog, note = bash_executable()
+    if not prog:
+        return argv, note
+    argv[0] = prog
+    return argv, note
+
+
 def check_shell_parse(script: str, bash: str) -> list:
     """把一段 bash 脚本原样交给 `bash -n`：只解析、不执行，所以不会有副作用。
 
@@ -1015,12 +1226,14 @@ def check_shell_syntax(workflows: tuple = None, sources: tuple = None) -> list:
     """
     workflows = WORKFLOWS if workflows is None else workflows
     sources = SHELL_SOURCES if sources is None else sources
-    bash = shutil.which("bash")
+    bash, _bash_note = bash_executable()
     if not bash:
         # 这条判据的存在意义是「拦在开建之前」。这台机器上没有 bash 就静默放行，
         # 等于在最需要它的环境（Windows 开发机直构）里把门拆了——必须响。
-        return [f"找不到 bash，第 11 条没法执行（{len(workflows)} 份 workflow + "
-                f"{len(sources)} 份脚本全部未判）：装 Git Bash 后重跑这一步"]
+        # 响的话要带上把手探到的现场（哪一个候选为什么被淘汰），只说「找不到」与
+        # 「System32 那枚存根答不上版本横幅」在两句话里是不同的修法。
+        return [f"第 11 条用不上 bash，{len(workflows)} 份 workflow + "
+                f"{len(sources)} 份脚本全部未判：{_bash_note}。装 Git Bash 后重跑这一步"]
     problems = []
     for rel in sources:
         path = ROOT / rel
@@ -3702,19 +3915,10 @@ def _list_channel_facts() -> str:
     shell 判据走的是 Python 读字节 + `bash -n`，`-n` 只解析不执行，恰好看不见这一类差别。
     """
     facts = [f"平台 {sys.platform}"]
-    bash = shutil.which("bash")
-    if not bash:
-        facts.append("PATH 里没有 bash")
-    else:
-        facts.append(f"bash={Path(bash).name}")
-        try:
-            proc = subprocess.run([bash, "--version"], capture_output=True, timeout=20,
-                                  stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                                  errors="replace")
-            first = (proc.stdout or "").splitlines()
-            facts.append(f"版本 {first[0][:60] if proc.returncode == 0 and first else f'取不到（退出码 {proc.returncode}）'}")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            facts.append(f"版本取不到（{type(exc).__name__}）")
+    # 取证与执行必须用**同一个把手**：上一版这里用 `shutil.which("bash")`、那边用裸名字起子
+    # 进程，于是同一句红话里能同时出现两个不同的 bash（那正是本轮把人带偏的那一步）。
+    bash, note = bash_executable()
+    facts.append(note if bash else f"没有可用的 bash（{note}）")
     try:
         raw = (ROOT / REGRESSION_LIST_SCRIPT).read_bytes()
         facts.append(f"{REGRESSION_LIST_SCRIPT} 在磁盘上是"
@@ -3741,11 +3945,21 @@ def regression_suites() -> tuple:
     `run_offline_regression.sh` 里 `printf '%s\\n' $FILES` 打印（同一份展开结果也会写进
     B2B_REGRESSION_LIST_FILE），约定是「每行一个仓库相对的 .py 路径，进度与诊断一律走
     stderr」。这句约定被离线对拍与下面三条门共同依赖，改那一句的人必须同时改这里。
+
+    那一段命令不是直接送去执行的：它先过 `resolve_shell_cmd`（第 35 条）。上一版就是这里
+    拿裸名字直接 `subprocess.run`，Windows 上 CreateProcess 先命中 System32 的 WSL 存根，
+    `--list` 一句都没跑，而红话里另一句取证却写着 cygwin 的版本号——两句都在说真话，合在
+    一起却把方向带偏。解析不出 bash 时**不许退回裸名字**，当场把「没执行」说成没执行。
     """
     env = dict(os.environ)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     list_file = ""
     facts = _list_channel_facts()
+    argv, bash_note = resolve_shell_cmd(REGRESSION_LIST_CMD)
+    if argv and str(argv[0]) == BASH_TOKEN:
+        # 到这里还没换成绝对路径，就是这台机器上根本没有什么能跑脚本的 bash。这一步不能
+        # 本身去猜一个名字交给系统解析：那恰好是被判的那个做法。证据文件还没建，不必收尾。
+        return -1, [], f"没执行：{bash_note}", "", f"{facts}｜命令未发出（bash 没解析出来）"
     try:
         fd, list_file = tempfile.mkstemp(prefix="b2b_regression_list_", suffix=".txt")
         os.close(fd)
@@ -3754,20 +3968,30 @@ def regression_suites() -> tuple:
         list_file = ""
         facts += f"｜文件通道建不起来（{type(exc).__name__}），本轮只有管道一条证据"
     try:
-        proc = subprocess.run(list(REGRESSION_LIST_CMD), cwd=str(ROOT), capture_output=True,
+        proc = subprocess.run(argv, cwd=str(ROOT), capture_output=True,
                               stdin=subprocess.DEVNULL, timeout=120, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         if list_file:
             _silent_unlink(list_file)
         return -1, [], f"起不来：{type(exc).__name__}: {exc}", "", facts
-    out = proc.stdout.decode("utf-8", errors="replace")
+    # 两条流都按**字节**先看过形状再解：NUL 在列就是 UTF-16 那一类签名（本轮云端那 504
+    # 字节正是），把它说成一句人读得懂的话，而不是留一串 \x00 给下个人对着猜。
+    nul_out = b"\x00" in (proc.stdout or b"")[:700]
+    nul_err = b"\x00" in (proc.stderr or b"")[:700]
+    out = _decode_maybe_utf16(proc.stdout or b"")
     files = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # err_raw 留着**没被 strip** 的那一份：strip 会把首尾的 CR/LF 一起吃掉，而本轮要判的
     # 恰恰是「这批字节里有没有行尾差异」。摘要给人读，原文给判据读，两者不能是同一份。
-    err_raw = proc.stderr.decode("utf-8", errors="replace")
+    err_raw = _decode_maybe_utf16(proc.stderr or b"")
     err = err_raw.strip().replace("\n", " | ")
-    chan = (f"{facts}｜管道通道：{_stream_evidence(out)}"
+    chan = (f"{facts}｜实发命令 argv[0]={Path(str(argv[0])).name}"
+            f"｜管道通道：{_stream_evidence(out)}"
             f"｜stderr 通道：{_stream_evidence(err_raw)}")
+    if nul_out or nul_err:
+        chan += ("｜**含 NUL 字节（UTF-16 形状）：{}**——那不像一份仓库相对路径清单，"
+                 "Windows 在 System32 里那枚 WSL 入口就是这么说话的，它不是 Git 的 bash"
+                 .format("、".join([n for n, k in (("stdout", nul_out), ("stderr", nul_err))
+                                    if k])))
     if list_file:
         try:
             raw = Path(list_file).read_text(encoding="utf-8", errors="replace")
@@ -3813,7 +4037,7 @@ def _regression_scope_problem(rc: int, files: list, err: str, out: str = "",
                          "的命令是最常见的一种），先照第 15/28 条的口径查那一份 shell")
         if err:
             shape.append(f"stderr 原文：{err[:200]}")
-        return [f"批跑清单取不到（`{' '.join(REGRESSION_LIST_CMD)}` 退出码 {rc}｜"
+        return [f"批跑清单取不到（模板 `{' '.join(REGRESSION_LIST_CMD)}`，实发命令取第 35 条把手解析出的 bash 绝对路径，见下面现场；退出码 {rc}｜"
                 f"{_stream_evidence(out)}）：第 23/24/25 条的范围全长在这一份清单上，读不到就一条"
                 f"都没判，不能报绿。{('；'.join(shape)) if shape else ''}"
                 + (f"｜现场：{chan}" if chan else "")]
@@ -4483,15 +4707,25 @@ def _is_zero_index(node) -> bool:
 
 
 def _rel_label(path) -> str:
-    """给报告用的相对路径：夹具喂进来的**仓外/相对**路径也要能印出来。
+    """给报告用的相对路径：**写法必须与 _rel_posix 完全一致**，这里不再自己裁一遍。
 
-    原来这句写的是 `path.relative_to(ROOT) if hasattr(path, "relative_to") else path`——
-    `hasattr` 永远为真（Path 一直都有这个方法），所以离线夹具一喂相对路径就当场 ValueError，
-    「判据可被反向对照」这句话在第一次真去喂的时候自己崩了。护栏要挡的是**语义**上的不在仓内。
+    为什么这不是冗余而是补锅（2026-11-16 云端 Windows run，同提交 Mac 绿）：上一版这里写的是
+    `text[len(root) + 1:] if text.startswith(root + "/") else text`——Windows 上 `str(ROOT)` 是
+    `D:\a\riskbird-tool\riskbird-tool`（反斜杠），与 `root + "/"` 永远对不上，于是返回的是
+    **整条绝对路径**。它不只影响打印：第 30 条的豁免表、第 31 条的 TAB_BODY_EXITS、第 32/33 条的
+    登记表，键都是仓库相对正斜杠——lookup 拿着一把查不到的键去问，已登记豁免的两处与四处在案的
+    标签出口全被报成「没登记」。门禁在 Windows 上把自己变成了假红发生器，而这句假红里一个字节
+    都没提「是分隔符的事」——比没有更坏，因为人会先去改真源。
+
+    _rel_posix 本来就把 `str(Path)` 归到 git 那一边（2026-11-12 立的），只是这里当时没接它。
+    仓外路径（离线夹具喂进来的 `a.py`、临时目录里的绝对路径）保持原样返回，语义与旧版一致。
     """
     text = str(path)
-    root = str(ROOT)
-    return text[len(root) + 1:] if text.startswith(root + "/") else text
+    try:
+        rel = _rel_posix(Path(text))
+    except (OSError, ValueError):        # 包名里有 NUL 等 Path 不收的字：当作仓外处理
+        rel = None
+    return rel if rel is not None else text.replace("\\", "/")
 
 
 def _slice_of_first_line(tree) -> list:
@@ -7394,7 +7628,318 @@ def check_python_floor(files=None) -> list:
                 problems.append(f"{rel} 里出现了内联 python（本条款只看 .py，这一处它看不到）："
                                 + "；".join(hits[:3])
                                 + "｜要么把它提成 .github/scripts 里的一份文件（那就能进本条视野），"
-                                  "要么把它接入本条款的扫描集并补上夹具")
+                                "要么把它接入本条款的扫描集并补上夹具")
+    return problems
+
+
+# ── 第 35 条：交付链里「要一个 bash」只许一个把手────────────────────────
+# 由来写在 `bash_executable` 上方那块注释里（2026-11-16 云端 Windows run 43860712318）。
+# 这一条款要拦的不是「本机跑不跑得动」——本机永远跑得动；它拦的是**同一个名字在两个平台
+# 解析成两个程序**这件事还能不能再写出来。三种形状各自一条判据：
+#   ① 执行位点：`subprocess.*` 的第一个参数如果是「以字面量 bash 开头的表/元组」，或是一个
+#      在同一个函数里被赋成那种字面量、且本函数从没调用 `resolve_shell_cmd` 的名字——就是违规。
+#      只把字面量算上会漏后一种（本轮 frozen 里四处有一处就是这种形状），所以要把变量那一跳接上。
+#   ② 取名位点：`shutil.which("bash")` 不带 `path=` 就是「只取 PATH 上第一个」，那正是上一版
+#      拿到 cygwin、执行拿到存根的那把第二刀。把手自己逐目录查（带 path=），所以不被这一判拦住。
+#   ③ 把手存在性：`bash_executable` / `resolve_shell_cmd` 在视野里必须各自**只有一份定义**，
+#      否则两份实现早晚分叉（第 10/30/32 条同一课：同名拷贝靠 import 顺序决定哪份生效）。
+# 边界（说不清边界会被当成全能）：① 不看嵌套函数里的赋值，也不看 `os.system("bash …")` 这种
+# 把命令拼成整串字符串的写法（那一写法另有第 15/28 条管）；名字要绕过一个以上中间变量才能
+# 查到源头时戒掉——宁漏不误报，这条门的信用比覆盖面重要（第 11 条已经付过一次假红的钱）。
+_SUBPROCESS_EXEC_FUNCS = frozenset({"run", "Popen", "call", "check_call", "check_output",
+                                    "getoutput", "getstatusoutput"})
+# 允许以字面量裸名字开头的**模板常量**：它们不是被直接执行的，而是在执行前由
+# `resolve_shell_cmd` 换成绝对路径。登记表只登记「当下这一处」，名字对不上就算违规；
+# 而登记表自己也要被反查（判据 ④）：登记的姓名不在视野里，说明那个把手已经被删了，
+# 表格就成了拖在判据上的一块旧布（与 DIVERGENT_VENDORED / DEV_PATH_EXEMPT 同一套做法）。
+_SHELL_TEMPLATE_NAMES = frozenset({"REGRESSION_LIST_CMD"})
+# 把手自己那几个函数：它们是唯一允许「直接面对候选」的地方，判定里要给它们留出识别位。
+_BASH_HELPER_FNS = frozenset({"_bash_candidates", "bash_executable", "_bash_identity",
+                             "resolve_shell_cmd", "_stub_hint", "_decode_maybe_utf16"})
+
+
+def _bash_leading(node) -> bool:
+    """一个表/元组字面量的**首元素**是不是裸名字 bash。
+
+    `cmd = ["bash", "-e"] + (["-o", "pipefail"] if x else []) + ["-c", script]` 这种拼接形状
+    也要认（本轮 frozen 里就有一处）：它的外层是 BinOp，只看 List 会让它「看起来合规」。
+    """
+    while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        node = node.left
+    return (isinstance(node, (ast.List, ast.Tuple)) and node.elts
+            and isinstance(node.elts[0], ast.Constant)
+            and isinstance(node.elts[0].value, str)
+            and Path(node.elts[0].value).name == BASH_TOKEN)
+
+
+def _enclosing_func(tree, lineno: int):
+    """包住这一行的**最里层**函数；模块级返回 None。"""
+    best = None
+    for n in _walk(tree):
+        if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.lineno <= lineno <= (n.end_lineno or n.lineno)):
+            if best is None or n.lineno > best.lineno:
+                best = n
+    return best
+
+
+def _callee_attr_name(node) -> str:
+    """`subprocess.run(...)` / `shutil.which(...)` 里的属性名（run / which）。"""
+    return node.func.attr if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) else ""
+
+
+def _callee_module(node) -> str:
+    """`subprocess.run(...)` 里的模块名。"""
+    return node.func.value.id if (isinstance(node, ast.Call)
+                                  and isinstance(node.func, ast.Attribute)
+                                  and isinstance(node.func.value, ast.Name)) else ""
+
+
+def check_bash_single_lookup(files: dict = None) -> list:
+    """交付链里取 bash 只许走那一个把手（第 35 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    py = {p: t for p, t in files.items() if p.suffix == ".py"}
+    if not py:
+        return ["第 35 条一份 .py 都没读到（交付目录、批跑清单、门禁自身全落空）："
+                "视野断了的时候，「取 bash 只一把刀」这句话没有任何含义"]
+    defined = {"bash_executable": [], "resolve_shell_cmd": []}
+    templates = set()
+    judged = 0
+    for path, text in sorted(py.items()):
+        rel = _rel_posix(path) or str(path)
+        try:
+            tree = _file_tree(f"35:{rel}", text)
+        except SyntaxError:
+            continue                     # 读不懂由第 34 条负责，这里不抢它的案子
+        judged += 1
+        for fn in [n for n in _walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for name in defined:
+                if fn.name == name:
+                    defined[name].append(rel)
+        # 把手本身（`bash_executable` 那一块）里出现 `shutil.which("bash", path=…)` 是定义地的
+        # 正当写法，但执行位点一律不许在那儿——因此两条判据各自只认自己那一形状。
+        # 「在不在把手里」按**行号区间**认，不靠遍历顺序：`_walk` 是广度优先，拿「最后一次看到的
+        # 函数名」当上下文会被兄弟节点覆盖，那样这条判据绿的是一条不存在的口径。
+        spans = [(n.name, n.lineno, n.end_lineno or n.lineno) for n in _walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+        def _in_helper(lineno: int) -> bool:
+            return any(name in _BASH_HELPER_FNS and start <= lineno <= end
+                       for name, start, end in spans)
+
+        for node in _walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            mod, attr = _callee_module(node), _callee_attr_name(node)
+            in_helper = _in_helper(node.lineno)
+            if mod == "subprocess" and attr in _SUBPROCESS_EXEC_FUNCS:
+                args = node.args
+                if not args:
+                    continue
+                if _bash_leading(args[0]):
+                    problems.append(f"{rel} 第 {node.lineno} 行：拿裸名字 `{BASH_TOKEN}` 直接起子进程"
+                                    f"（`{mod}.{attr}`）。Windows 上 CreateProcess 会先命中 "
+                                    "System32 里的 WSL 存根，而不是 Git 的 bash；要跑 shell 脚本"
+                                    "必须先过 resolve_shell_cmd（第 35 条）")
+                elif (isinstance(args[0], ast.Name) and not in_helper
+                      and _name_from_bash_literal(args[0].id,
+                                                  _enclosing_func(tree, node.lineno) or tree)):
+                    problems.append(f"{rel} 第 {node.lineno} 行：`{mod}.{attr}` 用的 "
+                                    f"`{args[0].id}` 在同一层作域里被赋成以裸名字 bash 开头的表，"
+                                    "而这一层一次都没调用 resolve_shell_cmd（同一类只换个写法"
+                                    "不算修好了，第 35 条）")
+            if mod == "shutil" and attr == "which" and node.args:
+                first = node.args[0]
+                if (isinstance(first, ast.Constant) and first.value == BASH_TOKEN
+                        and not any(k.arg == "path" for k in node.keywords or [])):
+                    problems.append(f"{rel} 第 {node.lineno} 行：`shutil.which(\"{BASH_TOKEN}\")` 只取 "
+                                    "PATH 上第一个命中——把手逐目录查全部候选，这里只拿到「第一个」，"
+                                    "而本轮云端那一句取证就错在这一刀上（第 35 条：取名只许走 "
+                                    "bash_executable）")
+        # ④ 模块级那张「允许以裸名字开头的模板」登记表：双向都要对得上。
+        # 视野里没登记过的模板名 = 新长出一处「直接拿名字交给系统解析」的入口；
+        # 登记了却找不到 = 表格在拖旧布（与 DEV_PATH_EXEMPT 同一套“只管当下”的做法）。
+        for node in tree.body:
+            names = ([t.id for t in node.targets if isinstance(t, ast.Name)]
+                     if isinstance(node, ast.Assign) else
+                     ([node.target.id] if isinstance(node, ast.AnnAssign)
+                      and isinstance(node.target, ast.Name) else []))
+            if any(nm in _SHELL_TEMPLATE_NAMES for nm in names):
+                templates.update(nm for nm in names if nm in _SHELL_TEMPLATE_NAMES)
+            for nm in names:
+                if _bash_leading(getattr(node, "value", None)) and nm not in _SHELL_TEMPLATE_NAMES:
+                    problems.append(f"{rel} 第 {node.lineno} 行：模块级常量 {nm} 以裸名字 "
+                                    f"`{BASH_TOKEN}` 开头却没登记在 _SHELL_TEMPLATE_NAMES："
+                                    "新模板要么接入 resolve_shell_cmd，要么把为什么它能当模板写清楚")
+    if judged == 0:
+        problems.append(f"第 35 条读了 {len(py)} 份 .py 却一份都没展开成语法树："
+                        "这一条在空集合上报绿等于没判")
+    for name, where in defined.items():
+        if len(where) > 1:
+            problems.append(f"把手 {name}() 在视野里有 {len(where)} 份定义（{'、'.join(where)}）："
+                            "两份实现早晚分叉，哪一份生效交给 import 顺序（第 35 条要求只一份）")
+        if not where and full_scan:
+            problems.append(f"视野里没有 {name}() 的定义：取 bash 的那个把手被删了或被改名了，"
+                            "上面三条判据就都没了参照物（第 35 条）")
+    if full_scan:
+        missing = sorted(_SHELL_TEMPLATE_NAMES - templates)
+        if missing:
+            problems.append(f"_SHELL_TEMPLATE_NAMES 登记的模板在视野里找不到（{missing}）："
+                            "表格比现场旧就等于这条判据少判一处")
+    # 行为侧：静态那三条只证明「写法对」，不证明「把手真能解析出一个存在的 bash」。
+    # 拿两个真调用对拍：模板必须被换成存在且绝对的路径；假命令名必须**不被**改写。
+    prog, note = bash_executable()
+    if not prog:
+        problems.append(f"第 35 条的把手在本机解析不出 bash：{note}——"
+                        "这一格不许静默放行，不然第 11/23/24/25 条全在问一个不存在的程序")
+    else:
+        if not Path(prog).is_absolute() or not Path(prog).is_file():
+            problems.append(f"把手返回的 {prog!r} 不是存在的绝对路径：执行位点拿它去起子进程"
+                            "等于拿裸名字去赌（第 35 条）")
+        argv, _ = resolve_shell_cmd((BASH_TOKEN, "--version"))
+        if str(argv[0]) != prog:
+            problems.append(f"resolve_shell_cmd 没把裸名字换成把手解析出的 {prog!r}"
+                            f"（实得 {argv[0]!r}）：两条口径又分叉了")
+        keep, _ = resolve_shell_cmd(("zz_第35条反向对照_不存在", "-c", "true"))
+        if str(keep[0]) != "zz_第35条反向对照_不存在":
+            problems.append("第 35 条的反向对照失灵：假命令名被改写了，那第 23 条那条"
+                            "「起不来」夹具验的已经不是生产现场同一条通路")
+    return problems
+
+
+def _name_from_bash_literal(name: str, scope) -> bool:
+    """在**给定的那一层作域**（包住调用点的那个函数，模块级则整份顶层）里找
+    `name = ["bash", …]`；找不到返回 False。
+
+    只在那一层里找，不跳层、不跨函数：这条判据要能说出「哪一行赋的」，拿全树当一个作域
+    会把不相干的函数算成同一家（假红会把人逼成跳过这一步，第 11 条已经付过一次钱）。
+    在赋值那一侧宁可宽：`x = [...]`、`x: list = [...]`、`x = [...] + [...]` 都算。
+    """
+    for node in _walk(scope):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name
+                for t in node.targets):
+            return _bash_leading(node.value)
+        if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                and node.target.id == name and node.value is not None):
+            return _bash_leading(node.value)
+    return False
+
+
+# ── 第 36 条：给报告用的路径写法只许一把刀────────────────────────
+# 由来（2026-11-16 云端 Windows run 43860712318，同提交 Mac 绿）：`_rel_label` 上一版自己按
+# `str(ROOT) + "/"` 裁前缀。Windows 上 `str(ROOT)` 是反斜杠，与 `root + "/"` 永远对不上，
+# 于是报出来的是整条绝对路径；真正致命的是那一句被拿去当**查表的键**：第 30 条的豁免表、
+# 第 31 条的 TAB_BODY_EXITS、第 32/33 条的登记表，键都是仓库相对正斜杠——lookup 拿查不到的键
+# 去问，已登记的两处豁免与四处在案的标签出口全被报成「没登记」。Windows 那一路红得满屏都
+# 是「未登记」，而登记表一个字都没错——这种形状里人会先去改真源。
+# 判的三件事：
+#   ① `_rel_label` 必须**委托** `_rel_posix`，自己一次都不许提 ROOT（提了就是又裁一遍）；
+#   ② 视野里除 `_rel_posix` 那一处以外，任何拿 `str(ROOT)` / `ROOT` 去做 replace／startswith／
+#      removeprefix 之类「自己裁前缀」的都算第二把刀；
+#   ③ 真差分：拿两张**真登记表**的键（它们就是因 Windows 那一刀查不到的那批），在两种分隔
+#      符形状上都要求 `_rel_posix` 能原样给出这个键——不是看起来像，而是真去查表。
+#   外加一条防空转：旧写法必须在至少一档输入上与新写法给出不同结果，否则③是在空集合上报绿。
+# 边界：② 只看名字字面量 `ROOT`（变量另取一个名字就查不到），它拦的是「在门禁里再造一把
+# 尺子」这一族，不是拦所有路径字符串操作。
+CI_WIN_ROOT = r"D:\a\riskbird-tool\riskbird-tool"   # 抄自那一 run 的红话现场（不是某人的开发机）
+
+
+def _self_cutting_with_root(node) -> bool:
+    """这一段里有没有「拿 ROOT 自己裁前缀」的形状（与 `_rel_posix` 同口径的第二把刀）。"""
+    for n in _walk(node):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+            continue
+        if n.func.attr not in {"replace", "startswith", "endswith", "removeprefix",
+                               "removesuffix", "lstrip", "rstrip", "strip"}:
+            continue
+        for a in list(n.args) + [k.value for k in n.keywords]:
+            if any(isinstance(m, ast.Name) and m.id == "ROOT" for m in _walk(a)):
+                return True
+            if any(isinstance(m, ast.Call) and isinstance(m.func, ast.Name)
+                   and m.func.id == "str" and m.args
+                   and isinstance(m.args[0], ast.Name) and m.args[0].id == "ROOT"
+                   for m in _walk(a)):
+                return True
+    return False
+
+
+def check_report_path_label(files: dict = None) -> list:
+    """报告用相对路径的写法与 git 写法必须同源（第 36 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    py = {p: t for p, t in files.items() if p.suffix == ".py"}
+    if not py:
+        return ["第 36 条一份 .py 都没读到（交付目录、批跑清单、门禁自身全落空）："
+                "视野断了的时候，「路径写法只一把刀」这句话没有任何含义"]
+    labeled = []
+    for path, text in sorted(py.items()):
+        rel = _rel_posix(path) or str(path)
+        try:
+            tree = _file_tree(f"36:{rel}", text)
+        except SyntaxError:
+            continue
+        fns = {n.name: n for n in _walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if "_rel_label" in fns:
+            labeled.append(rel)
+            fn = fns["_rel_label"]
+            # ① 必须委托，且自己不许提 ROOT
+            called = {n.func.id for n in _walk(fn)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            if "_rel_posix" not in called:
+                problems.append(f"{rel} 第 {fn.lineno} 行：_rel_label() 没把归一交给 _rel_posix，"
+                                "而是自己切了一份——Windows 上 `str(ROOT)` 是反斜杠，那把尺子"
+                                "永远裁不掉，登记表里的键会被整批查不到（第 36 条）")
+            if any(isinstance(n, ast.Name) and n.id == "ROOT" for n in _walk(fn)):
+                problems.append(f"{rel} 第 {fn.lineno} 行：_rel_label() 里直接提了 ROOT："
+                                "只要它自己碰根目录，就是在 _rel_posix 之外再造一把刀")
+        # ② 全局：除 _rel_posix 那一处，别处不许拿 ROOT 自己裁
+        for n in _walk(tree):
+            if isinstance(n, (ast.Assign, ast.Return, ast.Expr, ast.If, ast.AnnAssign)):
+                if _self_cutting_with_root(n):
+                    owner = _enclosing_func(tree, n.lineno)
+                    if owner is not None and owner.name == "_rel_posix":
+                        continue
+                    if owner is None and any(isinstance(m, ast.FunctionDef)
+                                             and m.name == "_rel_posix" for m in _walk(n)):
+                        continue
+                    problems.append(f"{rel} 第 {n.lineno} 行：这里拿 ROOT 自己裁了一遍前缀，"
+                                    "与 _rel_posix 同口径的第二把刀（第 36 条：归一只一处）")
+    if full_scan and len(labeled) != 1:
+        problems.append(f"_rel_label() 在视野里有 {len(labeled)} 份定义（{labeled}）："
+                        "没有它就没人能担保那一刀只裁一次，多份就会分叉")
+    # ③ 拿真登记表的键做真 lookup：键在表里长什么样，两种分隔符下都必须能算出那个样子。
+    tables = {"DEV_PATH_EXEMPT": sorted(DEV_PATH_EXEMPT),
+              "TAB_BODY_EXITS": sorted(TAB_BODY_EXITS)}
+    for tname, keys in tables.items():
+        if not keys:
+            problems.append(f"第 36 条的参照表 {tname} 是空的：拿空表做对拍等于这一格没判")
+            continue
+        for key in keys:
+            posix_out = _rel_posix(ROOT / key)
+            if posix_out != key:
+                problems.append(f"{tname} 的键 {key!r} 在 POSIX 形状上算不回来（实得 {posix_out!r}）："
+                                "这张表里它那一行永远不会被命中，登记就成了拖在判据上的旧布")
+            win_path = PureWindowsPath(CI_WIN_ROOT + "\\" + key.replace("/", "\\"))
+            win_out = _rel_posix(win_path, root=PureWindowsPath(CI_WIN_ROOT))
+            if win_out != key:
+                problems.append(f"{tname} 的键 {key!r} 在 Windows 形状（{CI_WIN_ROOT}）上算不回来"
+                                f"（实得 {win_out!r}）：那正是 2026-11-16 云端那一路假红的形状")
+    # 防空转：旧写法（拿 str(ROOT) 裁）必须在至少一档输入上与新写法不同，否则上面那一判在
+    # 本机上恒真，看起来绿、实际判不到分隔符这件事。
+    _old = lambda p, root: str(p).replace(str(root) + "/", "")
+    _differ = 0
+    for key in tables["DEV_PATH_EXEMPT"][:1] or ["b2bcollect_build/local_scan.py"]:
+        win_path = PureWindowsPath(CI_WIN_ROOT + "\\" + key.replace("/", "\\"))
+        if _old(win_path, CI_WIN_ROOT) != _rel_posix(win_path, root=PureWindowsPath(CI_WIN_ROOT)):
+            _differ += 1
+    if not _differ:
+        problems.append("第 36 条的差分在本机上不能分辨新旧写法（旧写法算出来也一样）："
+                        "这一格已经空转，拿它报绿没有任何担保")
     return problems
 
 
@@ -7847,6 +8392,33 @@ def main(argv=None) -> int:
               f"f-string 家用法 {len(FLOOR_FSTRING_CASES)} 档、新语法节点 {len(FLOOR_CONSTRUCTS)} 档在表上；"
               f"f-string 那一路的口径：{_FLOOR_FACTS['fstring_mode']}）")
 
+    bash_lookup = check_bash_single_lookup()
+    if bash_lookup:
+        bad += 1
+        print("❌ 交付链里取 bash 不止一把刀（同一个名字在两个平台解析成两个程序，于是一句红话里"
+              "能同时写着存根的输出与 cygwin 的版本号，而第 23/24/25 条一条都没判）：")
+        for p in bash_lookup:
+            print(f"   · {p}")
+            print(f"::error::bash 取值把手：{p}")
+    else:
+        print("✅ bash 取值把手：执行位点都先过 resolve_shell_cmd，取名只有一处逐目录查全部候选"
+              f"并靠版本横幅认身份（{len(_BASH_HELPER_FNS)} 个把手函数、"
+              f"{len(_SHELL_TEMPLATE_NAMES)} 份登记在案的模板命令；本机现场："
+              f"{bash_executable()[1] or '没有可用 bash'}）")
+
+    label_gate = check_report_path_label()
+    if label_gate:
+        bad += 1
+        print("❌ 给报告用的路径写法与 git 写法不同源（Windows 上那把自己裁的尺子永远裁不掉，"
+              "登记表里的键会被整批查不到，已登记的东西会被报成未登记）：")
+        for p in label_gate:
+            print(f"   · {p}")
+            print(f"::error::路径写法归一：{p}")
+    else:
+        print("✅ 路径写法归一：报告用的相对路径全部委托 _rel_posix，拿两张真登记表"
+              f"（DEV_PATH_EXEMPT / TAB_BODY_EXITS 共 {len(DEV_PATH_EXEMPT) + len(TAB_BODY_EXITS)} 个键）"
+              "在 POSIX 与 Windows 两种分隔符形状上都对拍过，旧写法不能分辨新旧这一格也响了")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -7886,6 +8458,8 @@ def main(argv=None) -> int:
           "从浏览器标签交出去的正文都先过了页面身份门（串页假数据算不合格）、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "交付链每份 .py 都不用到只有打包机那个解释器之后才成立的写法（本机比 CI 新不算绿）、"
+          "取 bash 只走一个把手（执行前换成解析出的绝对路径、靠版本横幅认它是不是 bash）、"
+          "报告用的相对路径与 git 写法同源（两种分隔符形状都拿真登记表对拍过）、"
           "注释里每一句指路节号都走得通")
     return 0
 

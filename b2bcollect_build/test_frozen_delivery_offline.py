@@ -1071,6 +1071,31 @@ def _manifest_gate():
     return _GATE_MOD
 
 
+def _bash_argv(*rest):
+    """拼一条「交给 bash 跑」的命令：**bash 那一位只从门禁的把手取**。
+
+    由来（2026-11-16 云端 Windows run 43860712318）：这一份用例原本有 5 处各自取 bash——4 处
+    把裸名字 `"bash"` 直接交给 `subprocess.run`，1 处 `shutil.which("bash")`。在 Mac 与 Linux 上
+    两种取法拿到的是同一个程序，所以这条分叉从来没被看见过；Windows 上裸名字走 `CreateProcess`
+    的目录搜索顺序，先命中 `System32\bash.exe`（WSL 存根：它不跑我们的脚本，只答一句 UTF-16 的话
+    并以 rc=1 退掉），而 `shutil.which` 按 PATH 拿到的是 Git 的 cygwin——同一轮日志里两句「现场」
+    互相打脸，人照着其中一句去查就查不到真原因。第 35 条就是为这一件事立的。
+    取不到时返回 (None, 为什么取不到)，调用方要么把它写成一句响的，要么明说跳过，
+    不许拿「没跑」当「跑过了」。
+    """
+    prog, note = _manifest_gate().bash_executable()
+    return ([prog, *rest], note) if prog else (None, note)
+
+
+def _bash_or_die(*rest):
+    """`_bash_argv` 的硬版本：解析不出 bash 就把它报成一次带理由的失败，不静默往下跑。"""
+    argv, note = _bash_argv(*rest)
+    if argv is None:
+        raise RuntimeError(f"第 35 条的 bash 把手在本机解析不出可用 bash（{note}）："
+                           "依赖它的夹具一格都没跑，不许按通过算")
+    return argv
+
+
 def _cli_values(text: str, pattern: str) -> set:
     # 注释必须先剔掉再匹配：workflow/脚本的注释里写着「--add-data/--hidden-import 与
     # site_adapters 的清单」这种话，不剔就会凭空多出一个叫「与」的幽灵清单项，
@@ -3234,7 +3259,7 @@ def test_workflow_shell_syntax():
     # 5c) 批跑清单的完整性：交付目录里靠命名约定**自动发现**，这条判据核对「磁盘上有、
     # 清单里没有」。riskbird_build 那 13 个套件就是这么整目录消失了两年的——写完当天
     # 跑绿，此后随包代码怎么改都不红（本轮手工补跑才发现一条真实上传缺陷）。
-    proc = subprocess.run(["bash", str(_REPO / "debug" / "run_offline_regression.sh"), "--list"],
+    proc = subprocess.run(_bash_or_die(str(_REPO / "debug" / "run_offline_regression.sh"), "--list"),
                           capture_output=True, text=True, cwd=str(_REPO))
     _assert_eq(proc.returncode, 0, f"回归入口能解析清单（stderr={proc.stderr[-200:]}）")
     listed = {ln.strip() for ln in proc.stdout.splitlines() if ln.strip().endswith(".py")}
@@ -3279,7 +3304,7 @@ def test_workflow_shell_syntax():
             env.update(extra_env or {})
             env["B2B_REGRESSION_ONLY"] = "debug/zz_regression_probe.py"
             env["B2B_REGRESSION_SANDBOX"] = str(sandbox)
-            return subprocess.run(["bash", str(runner)], capture_output=True, text=True,
+            return subprocess.run(_bash_or_die(str(runner)), capture_output=True, text=True,
                                   cwd=str(_REPO), env=env)
         finally:
             fixture.unlink(missing_ok=True)
@@ -3413,7 +3438,7 @@ def test_workflow_shell_syntax():
     shutil.rmtree(sandbox, ignore_errors=True)
 
     sandbox2 = Path(tempfile.mkdtemp(prefix="b2b_reg_empty_"))
-    proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True, cwd=str(_REPO),
+    proc = subprocess.run(_bash_or_die(str(runner)), capture_output=True, text=True, cwd=str(_REPO),
                           env=dict(os.environ, B2B_REGRESSION_ONLY=" ",
                                    B2B_REGRESSION_SANDBOX=str(sandbox2)))
     shutil.rmtree(sandbox2, ignore_errors=True)
@@ -3574,7 +3599,7 @@ def test_workflow_shell_syntax():
             env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
                        RUNNER_TEMP=(str(root / "nope") if bad_temp else str(root)),
                        APP_VERSION=app_version, WIN_ROOT=str(root))
-            cmd = ["bash", "-e"] + (["-o", "pipefail"] if pipefail else []) + \
+            cmd = _bash_or_die("-e") + (["-o", "pipefail"] if pipefail else []) + \
                   ["-c", script or gate_script]
             # errors="replace"：binary=True 时子进程的输出里就是非法 UTF-8 字节，
             # 严格解码会让取证本身炸掉（观测手段不能污染被测对象，这条在这轮已经付过学费）
@@ -6499,10 +6524,14 @@ def test_errexit_silent_death_gate():
     # 4) 行为侧：上面那些都是「我认为 bash 会怎么走」。判据依赖的这一条推断本身也要有证据
     #    ——真起 bash 跑一遍：旧写法必须 rc≠0 且**第二句 echo 不出现**（这才是「门安静消失」
     #    的现实），修好的写法必须 rc=0 且两句都在。
-    bash = shutil.which("bash")
+    #    取法走第 35 条那个把手：上一版这里是 `shutil.which("bash")`，而上面四处是裸名字，
+    #    同一份用例里两种取法在 Windows 上会拿到两个不同的程序（那正是本轮云端红话自相
+    #    矛盾的来源），行为侧测的就不是要被判的那一个 bash 了。
+    _argv, _bash_note = _bash_argv()
+    bash = _argv[0] if _argv else ""
     if not bash:
-        print("   ⏭ 这台机器上没有 bash，行为侧跳过（静态那几条照跑）；"
-              "第 11 条会因缺 bash 判红，所以交付链上不会出现「静默跳过的验窗」")
+        print(f"   ⏭ 这台机器上没有 bash（{_bash_note}），行为侧跳过（静态那几条照跑）；"
+              "第 11/35 条会因缺 bash 判红，所以交付链上不会出现「静默跳过的验窗」")
     else:
         _tmp = Path(tempfile.mkdtemp(prefix="errexit_fixture_"))
         try:
@@ -8990,7 +9019,11 @@ def test_module_name_binding_gate():
             "FAIL 判定行打印的是 reason（打印 $last 就是回到那条无名 FAIL）")
     _assert("$EXC_RE" in _rsrc and "$RED_RE" in _rsrc,
             "异常行与红判定行共用一份模式（计数用一份、打印用另一份就会各自漂移）")
-    if shutil.which("bash") and Path(sys.executable).exists():
+    # 取 bash 只走第 35 条那个把手：上一版这里用 `shutil.which("bash")` 做守卫、里面却拿
+    # 裸名字起子进程，两句话在 Windows 上说的是两个程序（那一行守卫于是放行了一个跑不成
+    # 的存根，而报回来的理由会变成「没有 NameError」这种与真缺陷无关的话）。
+    _ak_argv, _ak_note = _bash_argv()
+    if _ak_argv and Path(sys.executable).exists():
         _tmp = tempfile.mkdtemp(prefix="ak_runner_")
         try:
             _fx = Path(_tmp) / "fx_boot_nameerror.py"
@@ -9004,7 +9037,7 @@ def test_module_name_binding_gate():
             _fx.write_text("\n".join(_fx_src) + "\n", encoding="utf-8")
             _env = dict(os.environ, B2B_REGRESSION_ONLY=str(_fx), PER_TEST_TIMEOUT="60",
                         B2B_REGRESSION_SANDBOX=tempfile.mkdtemp(prefix="ak_sandbox_"))
-            _cp = subprocess.run(["bash", str(_runner)], cwd=str(_REPO), env=_env,
+            _cp = subprocess.run(_bash_or_die(str(_runner)), cwd=str(_REPO), env=_env,
                                  capture_output=True, text=True, timeout=300)
             _line = [x for x in _cp.stdout.splitlines() if x.startswith("FAIL ")]
             _assert_eq(len(_line), 1, f"合成夹具应留下一条 FAIL（批跑输出见下）\n{_cp.stdout[-800:]}")
@@ -9125,8 +9158,12 @@ def test_shell_errexit_posture_gate():
     # ── 6) 端到端：真按 Actions 那对选项起批跑入口的 --list（本机不带选项永远是绿的）──
     # 这一格是整节的核心：前面五格判的都是「读源码的门」，而本轮的事故只有在**把脚本用调用方
     # 那两种方式各起一次**时才现形。少了这一格，第 28 条就只是一句注释。
-    _bash = shutil.which("bash")
-    if _bash and runner.is_file():
+    _argv28, _note28 = _bash_argv()
+    _bash = _argv28[0] if _argv28 else ""
+    if not _bash:
+        print(f"   ⏭ 本机没有可用的 bash（{_note28}）：这一格要真起脚本，判不了就明说判不了，"
+              "不许拿「静态那几格过了」当这格过了")
+    elif runner.is_file():
         _plain = subprocess.run([_bash, str(runner), "--list"], cwd=str(_REPO),
                                 capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
         _strict = subprocess.run([_bash, "-e", "-o", "pipefail", str(runner), "--list"],
@@ -10765,6 +10802,234 @@ def test_python_floor_gate():
     shutil.rmtree(_tmp, ignore_errors=True)
 
 
+def test_bash_lookup_gate():
+    """AV. 取 bash 只一把刀（第 35 条硬门）。"""
+    print("\n═══ AV. 同一个名字在两个平台不能解析成两个程序：bash 取值把手（第 35 条硬门）═══")
+    gate = _manifest_gate()
+
+    def _fx(name: str, body: str) -> dict:
+        return {Path(f"b2bcollect_build/{name}"): body}
+
+    # 1) 反向：四种「自己取 bash」的形状必须各自响。只验「现在绿」不验「坏了会响」的
+    #    判据等于没有判据（这一条在 11/23/25/30 条上都付过钱）。
+    _bad = (
+        ("字面量直接起子进程", 'import subprocess\nsubprocess.run(["bash", "x.sh"])\n',
+         ("裸名字", "resolve_shell_cmd")),
+        ("换个写法：先赋变量再起", 'import subprocess\n\n\ndef f():\n'
+         '    cmd = ["bash", "-e"] + ["-c", "x"]\n    subprocess.run(cmd)\n',
+         ("同一层作域", "resolve_shell_cmd")),
+        ("拼接只接到右边也算", 'import subprocess\n\n\ndef f(x):\n'
+         '    cmd = ["bash"] + x\n    subprocess.run(cmd)\n', ("同一层作域",)),
+        ("which 只取第一个", 'import shutil\nshutil.which("bash")\n',
+         ("PATH 上第一个", "bash_executable")),
+        ("新模板没登记", 'REGRESSION_LIST_CMD9 = ("bash", "x.sh")\n',
+         ("_SHELL_TEMPLATE_NAMES",)),
+    )
+    for why, src, wants in _bad:
+        hits = gate.check_bash_single_lookup(_fx("zz_av_bad.py", src))
+        _assert(hits, f"反向对照「{why}」必须响（实得 {hits}）")
+        for w in wants:
+            _assert(any(w in h for h in hits), f"「{why}」的响话里要能读出 {w}（实得 {hits[:2]}）")
+
+    # 2) 正向：接到把手上的写法不许响。这一半是必要的——只有反向的门会把人也拦在门外。
+    _good = (
+        ("执行前过 resolve_shell_cmd", 'import subprocess\n\n\ndef f(gate):\n'
+         '    argv, _ = gate.resolve_shell_cmd(("bash", "x.sh"))\n'
+         '    subprocess.run(argv)\n'),
+        ("which 逐目录查（带 path=）", 'import shutil\nshutil.which("bash", path="/bin")\n'),
+        ("relative_to 不是裁前缀", 'from pathlib import Path\n'
+         'Path("x").relative_to(ROOT)\n'),
+    )
+    for why, src in _good:
+        _assert_eq(gate.check_bash_single_lookup(_fx("zz_av_good.py", src)), [],
+                   f"合规写法「{why}」不该被第 35 条拦住")
+
+    # 3) 两份把手 / 空视野：两条防空转。
+    _two = "def bash_executable():\n    return \"\", \"\"\n"
+    _hits = gate.check_bash_single_lookup({Path("b2bcollect_build/zz_a.py"): _two,
+                                           Path("b2bcollect_build/zz_b.py"): _two})
+    _assert(any("2 份定义" in h for h in _hits),
+           f"同名把手有两份定义时必须点名（哪份生效交给 import 顺序）：{_hits[:2]}")
+    _hits = gate.check_bash_single_lookup({Path("b2bcollect_build/zz_av.txt"): "bash"})
+    _assert(any("一份 .py 都没读到" in h for h in _hits),
+            f"视野里没有 .py 时不许报绿（空集合上的「合格」等于没判）：{_hits[:2]}")
+
+    # 4) 行为侧真验：在 Mac 上**造一枚 WSL 存根**——它不是「我以为 Windows 长什么样」，
+    #    而是字节形状与云端那 504 字节同类的一份真产物：输出 UTF-16LE、rc=1、名字就叫 bash。
+    _tmp = Path(tempfile.mkdtemp(prefix="av_wsl_stub_"))
+    _old_path = os.environ.get("PATH", "")
+    try:
+        _stub = _tmp / "bash"
+        _stub.write_text("#!/bin/sh\n"
+                         "printf 'Windows Subsystem for Linux has no installed distributions'"
+                         " | iconv -f UTF-8 -t UTF-16LE\n"
+                         "echo\nexit 1\n", encoding="utf-8")
+        _stub.chmod(0o755)
+        _real, _ = _bash_argv()
+        if not _real or not shutil.which("iconv"):
+            print(f"   ⏭ 本机造不出这一族（bash 把手：{_real and '有'}｜iconv："
+                  f"{bool(shutil.which('iconv'))}），存根与 Windows 仿真那四档一并跳过；"
+                  "静态那几格照跑")
+            return
+        _prog = _real[0]
+        # 4a) 存根排在 PATH 最前：把手必须跨过它拿到真 bash，并在现场里把被淘汰的那枚说出来
+        os.environ["PATH"] = f"{_tmp}{os.pathsep}{_old_path}"
+        gate._BASH_CACHE.clear()
+        _got, _note = gate.bash_executable()
+        _assert(_got == _prog, f"把手不能让存根赢（实得 {_got!r}，真的应是 {_prog!r}）："
+                               "那正是本轮云端把 --list 交给一个不会跑它的程序的那一步")
+        _assert(str(_stub) in _note and "淘汰" in _note,
+                f"现场要指名被淘汰的那枚存根（实得 {_note!r}）：只说「找到了」不说明「跳过了谁」，"
+                "下一个人还是只能靠算术反推")
+        _assert("Subsystem for Linux" in _note or "WSL" in _note,
+                f"淘汰理由要说「它为什么不是 bash」（实得 {_note!r}）")
+        _argv, _ = gate.resolve_shell_cmd(("bash", "x.sh"))
+        _assert(_argv[0] == _prog, f"执行位点拿到的必须是同一个程序（实得 {_argv[0]!r}）："
+                                   "取证与执行分叉就是本轮事故本身")
+        # 4b) 只留存根：把手必须说「没有」，而且红话要把它说成存根而不是默默递回裸名字
+        os.environ["PATH"] = str(_tmp)
+        gate._BASH_CACHE.clear()
+        _got2, _note2 = gate.bash_executable()
+        _assert(not _got2, f"只剩存根时不许报出一个程序（实得 {_got2!r}）")
+        _assert("Subsystem for Linux" in _note2 or "WSL" in _note2 or "版本横幅" in _note2,
+                f"取不到的理由要说清它不是 bash（实得 {_note2!r}）")
+        _kept, _ = gate.resolve_shell_cmd(("bash", "--version"))
+        _assert(_kept[0] == "bash",
+                f"解析不出时不许偷换成存根去跑（实得 {_kept[0]!r}）：调用方必须能看出来没执行")
+        # 4c) NUL 签名必须被读成 UTF-16：同一批字节交给 _decode_maybe_utf16 要能拼回人话
+        _raw = ("Windows Subsystem for Linux has no installed distributions"
+                .encode("utf-16le"))
+        _dec = gate._decode_maybe_utf16(_raw)
+        _assert("Subsystem for Linux" in _dec and "\x00" not in _dec,
+                f"UTF-16LE 要解回人话（实得 {_dec[:60]!r}）：带着 NUL 去拼红话就是第二轮猜谜")
+        # 4d) 装了发行版的 WSL：横幅是**真**的 GNU bash、rc=0，只有括号里的三元组露出它住在
+        #     Linux 内核。在 Mac 上把 Windows 那一半仿真出来真跑选路——不仿真就等于把最要紧的
+        #     一档写进永远执行不到的分支。
+        _wsl_dir = _tmp / "wsl_distro"
+        _wsl_dir.mkdir()
+        _fake = _wsl_dir / "bash"
+        _fake.write_text("#!/bin/sh\n"
+                         "echo 'GNU bash, version 5.2.15(1)-release (x86_64-pc-linux-gnu)'\n"
+                         "exit 0\n", encoding="utf-8")
+        _fake.chmod(0o755)
+        _host_ver, _host_why = gate._bash_identity(_prog, on_windows=True)
+        if _host_ver is None and "Linux 内核" in _host_why:
+            print("   ⏭ 本机真 bash 自己就是 linux-gnu 那份（在 WSL/Linux 上跑这一轮），"
+                  "Windows 仿真那一档的「不误杀」无从对照，跳过 4d；存根三档照跑")
+        else:
+            os.environ["PATH"] = f"{_wsl_dir}{os.pathsep}{_old_path}"
+            gate._BASH_CACHE.clear()
+            _got3, _note3 = gate.bash_executable(windows=True)
+            _assert(_got3 == _prog,
+                    f"真横幅不能替 Linux 那份 bash 开路（实得 {_got3!r}，应是 {_prog!r}）："
+                    "它进了 WSL，看不见 Windows 形状的工作目录，脚本会从第一个 cd 就坏")
+            _assert(str(_fake) in _note3 and "淘汰" in _note3,
+                    f"现场要指名被淘汰的那枚 WSL bash（实得 {_note3!r}）")
+            _assert("Linux" in _note3,
+                    f"淘汰理由要点名它是 Linux 内核那份（实得 {_note3!r}）："
+                    "只说「不合适」人就又要重新发现一次")
+            # 同一枚程序、同一个 PATH，在 Linux 立场上必须**不被**淘汰：否则这一刀是把两条腿
+            # 都砍了（真在 Linux 上跑门禁时会一个 bash 都找不到）。顺带证明缓存键带了平台。
+            _got4, _ = gate.bash_executable(windows=False)
+            _assert(_got4 == str(_fake),
+                    f"同一枚 linux-gnu bash 在非 Windows 立场下应被选中（实得 {_got4!r}）："
+                    f"这条判据只属于 Windows；且与 windows=True 的结论必须不同（{_got3!r}）")
+            # Windows 立场 + 只有真 bash：不许误杀（Git 装在非常规位置也该活）
+            os.environ["PATH"] = str(Path(_prog).parent)
+            gate._BASH_CACHE.clear()
+            _got5, _note5 = gate.bash_executable(windows=True)
+            _assert(_got5 == _prog,
+                    f"Windows 立场不许把平台的真 bash 也抖掉（实得 {_got5!r}，理由 {_note5!r}）")
+            # Windows 立场 + 只有 WSL 那枚：必须说「没有」，不许递一个能过横幅就交出去的程序
+            os.environ["PATH"] = str(_wsl_dir)
+            gate._BASH_CACHE.clear()
+            _got6, _note6 = gate.bash_executable(windows=True)
+            _assert(not _got6, f"只剩 WSL bash 时不许报出一个程序（实得 {_got6!r}）："
+                              "报出去就等于把 --list 交给看不见工作目录的那一位")
+            _assert("Linux" in _note6, f"取不到的理由要说破三元组（实得 {_note6!r}）")
+    finally:
+        os.environ["PATH"] = _old_path
+        gate._BASH_CACHE.clear()
+        shutil.rmtree(_tmp, ignore_errors=True)
+
+    # 5) 生产现场：真模板命令的 argv[0] 必须是把手那一个，而且红话里不能再出现两个 bash
+    _argv, _note = gate.resolve_shell_cmd(gate.REGRESSION_LIST_CMD)
+    _assert(_argv[0] != "bash", f"模板递到执行位点前必须被换成绝对路径（实得 {_argv[0]!r}）")
+    _assert(gate.BASH_TOKEN not in str(_argv[0]) or Path(_argv[0]).is_file(),
+            f"实发的必须是一个存在的程序（{_argv[0]!r}）")
+    _facts = gate._list_channel_facts()
+    # 取证那句里的 bash 必须与实发那一个**逐字相同**：本轮云端就是同一句红话里写着
+    # System32 存根的输出、又写着 cygwin 的版本号，两句各自是真话、合起来把方向带偏。
+    _m = re.search(r"bash=(.+?)｜", _facts + "｜")
+    _assert(_m is not None and _m.group(1) == _argv[0],
+            f"取证与执行必须是同一个程序（现场读到 {_m.group(1) if _m else '无 bash='!r}，"
+            f"实发 {_argv[0]!r}）")
+
+
+def test_path_label_gate():
+    """AW. 报告用的路径写法只一把刀（第 36 条硬门）。"""
+    print("\n═══ AW. 同一把尺子只裁一次：报告路径与 git 写法同源（第 36 条硬门）═══")
+    gate = _manifest_gate()
+    from pathlib import PureWindowsPath as _PWP
+
+    # 1) 真登记表的键：两种分隔符形状都必须能算回那个键。这不是「看起来像」，而是
+    #    真拿它们去查表——本轮云端那一路假红就是因为表里每条登记都正确、键却查不到。
+    _keys = sorted(set(gate.DEV_PATH_EXEMPT) | set(gate.TAB_BODY_EXITS))
+    _assert(len(_keys) >= 5, f"参照表共 {len(_keys)} 个键太少了，这一格可能在空转")
+    for _k in _keys:
+        _assert_eq(gate._rel_posix(gate.ROOT / _k), _k, f"POSIX 形状上 {_k} 必须能算回登记的键")
+        _w = _PWP(gate.CI_WIN_ROOT + "\\" + _k.replace("/", "\\"))
+        _assert_eq(gate._rel_posix(_w, root=_PWP(gate.CI_WIN_ROOT)), _k,
+                   f"Windows 形状（反斜杠、带盘符）上 {_k} 也必须能算回登记的键："
+                   "那一档算不回来就是 2026-11-16 云端那一路假红")
+        # 旧写法（自己按 str(ROOT)+"/" 裁）在同一输入上必须给出**不同**的结果：否则
+        # 上面那一判在本机上恒真，看上去绿、实际判不到分隔符这件事。
+        _assert(str(_w).replace(gate.CI_WIN_ROOT + "/", "") != _k,
+                f"旧写法在 {_k} 上必须算错（算对了就说明这一格空转）")
+
+    # 2) 反向对照：把 `_rel_label` 改回旧写法，第 36 条必须两头都响（没委托 + 自己提 ROOT）
+    _old = ("ROOT = 1\n\n\ndef _rel_label(path):\n    text = str(path)\n"
+            "    root = str(ROOT) + \"/\"\n    return text.replace(root, \"\")\n")
+    _hits = gate.check_report_path_label({Path("b2bcollect_build/zz_aw_old.py"): _old})
+    _assert(any("没把归一交给 _rel_posix" in h for h in _hits),
+            f"旧写法必须被读出「没委托」：{_hits[:2]}")
+    _assert(any("直接提了 ROOT" in h for h in _hits),
+            f"旧写法必须被读出「自己碰了 ROOT」：{_hits[:2]}")
+
+    # 3) 第二把刀的形状：不在 _rel_label 里、但在另一个函数里拿 ROOT 自己裁，也要响
+    _knife = ("ROOT = 1\n\n\ndef other_label(p):\n"
+              "    return str(p).replace(str(ROOT) + \"/\", \"\")\n")
+    _hits = gate.check_report_path_label({Path("b2bcollect_build/zz_aw_knife.py"): _knife})
+    _assert(any("自己裁了一遍前缀" in h for h in _hits),
+            f"别的函数里再造一把尺子也要点名：{_hits[:2]}")
+    # 反向的反向：同样的活交给 _rel_posix 干，就不该响（否则这条门会把修法本身拦在门外）
+    _ok = ("ROOT = 1\n\n\ndef other_label(p):\n    return _rel_posix(p)\n")
+    _assert_eq(gate.check_report_path_label({Path("b2bcollect_build/zz_aw_ok.py"): _ok}), [],
+               "把归一交给 _rel_posix 的写法不该被拦住")
+
+    # 4) 性质判据：`_rel_label` 的输出必须与 `_rel_posix` 逐项同值（真源只一处就不许分叉）
+    _cases = [str(gate.ROOT / "b2bcollect_build/local_scan.py"),
+              str(gate.ROOT / "b2bcollect_build/cdp_base.py"),
+              gate.CI_WIN_ROOT + "\\b2bcollect_build\\gys_crawler.py",
+              "a.py", "", "/etc/hosts"]
+    for _c in _cases:
+        _a = gate._rel_label(_c)
+        _b = gate._rel_posix(Path(_c))
+        _assert(_a == (_b if _b is not None else _c.replace("\\", "/")),
+                f"输入 {_c!r}：_rel_label 与 _rel_posix 必须同值（前者 {_a!r}，"
+                f"后者 {_b!r}；仓外时按反斜杠归一比对）")
+    _assert_eq(gate._rel_label(str(gate.ROOT / "b2bcollect_build/local_scan.py")),
+               "b2bcollect_build/local_scan.py", "仓内路径要给出登记表的键那种写法")
+    _assert_eq(gate._rel_label("a.py"), "a.py", "仓外路径保持原样（语义与旧版一致这一句要真）")
+
+    # 5) 空转保险：参照表空 / 视野里一份 .py 都没有，都必须响而不是报绿
+    _empty = gate._rel_posix(Path("a.py"))
+    _assert_eq(_empty, "a.py", "仓外相对路径归一后仍是它本身（上面那一判的参照）")
+    _hits = gate.check_report_path_label({Path("b2bcollect_build/zz_aw.txt"): "ROOT"})
+    _assert(any("一份 .py 都没读到" in h for h in _hits),
+            f"第 36 条不许在空视野上报绿：{_hits[:2]}")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -10778,6 +11043,8 @@ SECTIONS = (
     test_launch_ledger_gate,
     test_protected_dir_never_blocks_startup,
     test_batch_state_watch_gate,
+    test_bash_lookup_gate,
+    test_path_label_gate,
     test_errexit_silent_death_gate,
     test_case_insensitive_filesystem_gate,
     test_pip_source_resilience_gate,
