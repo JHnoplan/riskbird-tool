@@ -2321,11 +2321,15 @@ check("14f2==== 结构判据：收尾那两笔主机账只许由把手念出来�
       not _acct_off_helper(_crawl_src13), str(_acct_off_helper(_crawl_src13)))
 _old14f2 = ('if s.get("deep_block"):\n    lk += "｜深链被拒 " + "、".join(\n'
              '        f"{h} {v[0]} 次" for h, v in sorted(s["deep_block"].items()))\n')
+# 「把手改名」那一档的输入单独提成变量：它内部全是双引号，塞进 f-string 的花括号里就得写 \"，
+# 而**花括号里带反斜杠是 Python 3.12 才放开的写法**——CI 打包机按 workflow 声明的 3.11 装解释器，
+# 上一版就是这一句让第 26/27 条「读不到这一份」而整条流水线停在构建前硬门。判据见第 34 条。
+_renamed14f2 = 'lk += self._acct(s.get("deep_block"), "深链被拒")\n'
 check("14f2===== 判据不是空跑：修复前那三行与「把手改名」两种形状喂给同一条判据都必须响并点出行号"
       "（永真式反向对照比没有更坏：下一次真分叉会混在噪音里）",
       _acct_off_helper(_old14f2) == [(2, "｜深链被拒 ")]
-      and _acct_off_helper('lk += self._acct(s.get("deep_block"), "深链被拒")\n') == [(1, "深链被拒")],
-      f"{_acct_off_helper(_old14f2)} ↔ {_acct_off_helper('lk += self._acct(s.get(\"deep_block\"), \"深链被拒\")\n')}")
+      and _acct_off_helper(_renamed14f2) == [(1, "深链被拒")],
+      f"{_acct_off_helper(_old14f2)} ↔ {_acct_off_helper(_renamed14f2)}")
 
 # 14g 同族类目桥：这一词被砍光的根因修复（实机取证写进表注释，泛词一律不收）
 import keyword_expander as _ke14                                    # noqa: E402

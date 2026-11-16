@@ -133,7 +133,9 @@
      27 模块级不许取用未绑定的名字 / 28 shell 必须自己表态 errexit / 29 交付链必须有写在
      仓库里的行尾立场 / 30 失败原因只准一个把手收口 / 31 标签交出的正文必须过页面身份门、
      且「这一跳根本没加载出来」必须按 Chrome 原话归因（31g 还要证明那枚启动参数真的带上了，
-     而且三条路径上的浏览器带的是同一份）：这十一条各自的由来与口径写在**它们函数上方**的注释块里——那十一条都是
+     而且三条路径上的浏览器带的是同一份）/ 32 「无联系方式」与关标签的账必须能被逐档念出来 /
+     33 列表条目账只住在一个把手里 / 34 交付链每份 .py 都必须被打包机那个解释器读得懂）：
+     这十四条各自的由来与口径写在**它们函数上方**的注释块里——那十四条都是
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
 
@@ -147,6 +149,7 @@ import argparse
 import ast
 import builtins
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -154,6 +157,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tokenize
 import unicodedata
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -7101,6 +7105,299 @@ def check_listing_accountability(files=None) -> list:
 
 
 
+# ---------------------------------------------------------------------------
+# 第 34 条：语法地板——交付链上每份 .py 都得被「打包机那个解释器」读得懂。
+#
+# 由来（2026-11-16，Windows 与 Mac 两个 run 同时停在构建前硬门）：离线套件里写了一句
+# `f"{helper('lk += …(s.get(\"deep_block\")…)')}"`——花括号里带反斜杠。那是 **PEP 701
+# （Python 3.12）才放开的写法**，而四份 workflow 都写着 `python-version: '3.11'`。本机 3.13
+# 解析它毫无障碍，于是全量离线回归 53/53 绿、frozen 2718 绿、门禁前三十三条绿，push 上去两个
+# 平台一起红在第 26、27 条：那两条各自 `ast.parse` 这一份，读到 SyntaxError 就按不合格算——
+# 这一层是对的，也是本次唯一起了作用的防线。真正缺的是上一层：**门禁的语法视野等于跑它的那台
+# 机器的解释器能力**，本机越新，门就越钝；「本机全绿」这句话对交付没有任何担保（与第 7 条同族：
+# 量的是不会被交付的内容）。所以地板要从 workflow 里取出来显式判，写法超出地板当场就响。
+#
+# 判据里每一条「哪个写法需要哪个版本」都是**实测**出来的（3.9.6 与 3.13.7 对拍，见 frozen AU 节
+# 夹具），不是凭印象：`f"{'#ff' if a else '#cc'}"` 这种「嵌串里的井号」两个版本都合法，而
+# `f"{v:#08x}"` 的井号住在格式域里也合法——拿整段替换域去问「有没有井号」会直接冤枉一片配色代码。
+#
+# 边界（说不清边界的判据会被当成全能的）：这一条只看 `_dev_path_inputs()` 里的 .py。workflow
+# 今天没有内联 python（实测：`python -c` 与 heredoc 在四份 yml 里 0 命中），长出来就必须进这一条
+# 的视野，否则它又是一处「门照不到的角落」——所以这里主动把它报成不合格。debug/*.sh 里那些
+# `python3 -c` 是本机取证脚本（多数显式走 /usr/bin/python3），不进打包链。
+
+_PY_FLOOR_PAT = re.compile(r"python-version:\s*[\"']?(\d+)\.(\d+)")
+# workflow 里的内联 python：`python -c …` / `python - <<'PY'` / `python <<PY`。
+_INLINE_PY_PAT = re.compile(r"python3?\s+(?:-c\b|-\s*<<|<<)")
+# AST 节点类型名 → （需要的最低版本，处方）。按名字比而不按 `ast.Match` 比：判据自己也得能在
+# 3.11 上跑——那个版本的 ast 模块里压根没有 MatchStar 之外的某些类，按属性取会先把自己弄爆。
+FLOOR_CONSTRUCTS = {
+    "Match": ((3, 10), "`match`/`case` 语句（PEP 634）：改成 if/elif 链"),
+    "TryStar": ((3, 11), "`except*`（PEP 654）：改成普通 except 分组"),
+    "TypeAlias": ((3, 12), "`type X = …`（PEP 695）：改用 `X = …` 别名赋值"),
+    "TypeVar": ((3, 12), "新式类型参数 `[T]`（PEP 695）：改用 typing.TypeVar 旧写法"),
+    "TypeVarTuple": ((3, 12), "新式类型参数 `*Ts`（PEP 695）：改用 typing 旧写法"),
+    "ParamSpec": ((3, 12), "新式类型参数 `**P`（PEP 695）：改用 typing 旧写法"),
+}
+# f-string 替换域里的家用写法：**档数以这张表为准**（✅ 那行与留痕里都念 len()，注释不另抄数字，
+# 因为抄的那一份会过期）。每条规则都只问分词器真供给了的东西，见 _fstring_floor_problems 的注释。
+FLOOR_FSTRING_CASES = {
+    "反斜杠": ((3, 12), "花括号里不许出现反斜杠：把这一段提成变量或改字符串拼接"),
+    "同种引号": ((3, 12), "单引号 f-string 的花括号里不许复用外层那个引号：换一种引号或提成变量"),
+    "域内换行": ((3, 12), "单引号 f-string 的花括号里不许有物理换行：提成变量"),
+    "域内注释": ((3, 12), "花括号里不许写注释（`#`）：把注释挪到字符串外面"),
+    # 这一档不是 PEP 701 正文里写的，是差分对拍时自己跑出来的（3.9 原话：f-string:
+    # expressions nested too deeply）：地板之前格式域里只许再嵌**一层**替换域。
+    "嵌套域超一层": ((3, 12), "格式域里只许再嵌一层替换域（`f\"{a:{b}}\"` 可以，"
+                              "`f\"{a:{b:{c}}}\"` 不行）：把最里面那一层提成变量"),
+}
+# 本条款上一轮看到了多少东西：只在全量扫描时写，给 ✅ 那行念，也给 frozen 当「判据不是空转」的证据。
+_FLOOR_FACTS = {"files": 0, "fstrings": 0, "fields": 0, "fstring_mode": ""}
+
+
+def python_floor() -> tuple:
+    """地板版本从 workflow 的 `python-version` 派生（那里才是「用哪个解释器打包」的真源）。
+
+    返回 `(floor, problems)`。两个都不许留空：一份都没读到就是「地板悬空」（这一条等于
+    没判，不许报绿）；四份各说一种就是要报的事——那意味着同一个包在两台打包机上语法能力
+    不同。不一致时取**最低**那个当地板（最严的那个说话，判据继续工作而不是眼盲）。"""
+    seen = {}
+    for rel in WORKFLOWS:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for m in _PY_FLOOR_PAT.finditer(path.read_text(encoding="utf-8", errors="replace")):
+            seen.setdefault((int(m.group(1)), int(m.group(2))), []).append(rel)
+    if not seen:
+        return (0, 0), ["第 34 条从任何一份 workflow 里都没读到 `python-version`：地板悬空，"
+                        "「没有超地板的写法」这句话没有任何含义（四份："
+                        + "、".join(WORKFLOWS) + "）"]
+    floor = min(seen)
+    problems = []
+    if len(seen) > 1:
+        problems.append("四份 workflow 声明了不止一种解释器版本："
+                        + "；".join(f"{a}.{b}←{'/'.join(v)}" for (a, b), v in sorted(seen.items()))
+                        + f"——按最低的那档判，但请把它们对齐（打包机语法能力不一致，"
+                        "「本机绿」与「云端绿」就又不是同一件事了）")
+    return floor, problems
+
+
+def _fstring_floor_problems(text):
+    """f-string 里「只在地板之上才成立」的几种家用写法，按 **Python 自己的分词器**判。
+
+    返回 ``None``：本机解释器的分词器没有 ``FSTRING_START``（即 ≤ 3.11），这一档在它上面
+    压根解析不出来（由上面「连本机都读不懂」那一档接住）。这不是漏判，但必须把「本机判不了
+    这一档」说出来并让 ✅ 那行念出来——沉默报绿会让下一个人以为这一档有人管着。
+    否则返回 ``(问题列表, 字面量份数, 替换域个数, 走不通的原因)``：中间两个数用来证明这一路
+    真接触过现场，而不是在空集合上报绿。
+
+    为什么走分词器而不是自己扫字符。本条款第一版就是手扫的，一次实跑就错了两处：
+      · AST 把 `{d:.1f}` 的格式域也存成一个 JoinedStr，手扫那一版拿 `:.1f` 当字面量去找
+        开头的引号，把 wechat_helper_build/wechat_flow.py 里一句正常的
+        `f"随机间隔 {d:.1f}s 后处理下一条…"` 报成「取不到源码片段」；
+      · `f"a{x}" f"b{y}"` 这种相邻隐式拼接（一个 JoinedStr 横跨多份字面量）只要正文里有个
+        孤引号（`f"don't {x}"`），手扫的字符串状态就会错位——既能漏判，也能把正文里的引号
+        当成「域内复用了外层引号」而误判。
+    第 11 条对 shell 早就立过同一条规矩：**判据要用语言自己的解析器**，不用「我猜到了哪几种
+    写法会坏」。分词器直接供给了表上每条规则各自要问的东西：每份字面量的外层引号与是否三引号
+    （FSTRING_START 的原文）、替换域边界（真 OP `{`/`}`；转义那两对住在 FSTRING_MIDDLE 里，
+    实测不会伪装成域）、格式域分隔符（深度 0 且不在容器里的 OP `:`/`!`）、注释（COMMENT）
+    与嵌套字符串（STRING）。
+    """
+    start_tok = getattr(tokenize, "FSTRING_START", None)
+    end_tok = getattr(tokenize, "FSTRING_END", None)
+    if start_tok is None or end_tok is None:
+        return None
+    lines = text.splitlines(keepends=True)
+
+    def _region(a, b):
+        (l1, c1), (l2, c2) = a, b
+        if l1 == l2:
+            return lines[l1 - 1][c1:c2] if l1 - 1 < len(lines) else ""
+        if l2 - 1 >= len(lines):
+            return ""
+        return "".join([lines[l1 - 1][c1:]] + lines[l1:l2 - 1] + [lines[l2 - 1][:c2]])
+
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except Exception as exc:                      # 分词走不通＝判不了，判不了不许报绿
+        return [], 0, 0, f"{type(exc).__name__}: {exc}"
+
+    out, literals, fields_seen = [], 0, 0
+    stack = []                                    # 每份 f-string 字面量自己的域栈（嵌字面量各一层）
+    for t in toks:
+        name = tokenize.tok_name[t.type]
+        if t.type == start_tok:
+            raw = t.string
+            idxs = [i for i in (raw.find('"'), raw.find("'")) if i >= 0]
+            qch = raw[min(idxs)] if idxs else ""
+            stack.append({"q": qch,
+                          "triple": bool(qch) and raw.startswith(qch * 3, raw.index(qch)),
+                          "open": []})
+            literals += 1
+            continue
+        if t.type == end_tok:
+            if stack:
+                stack.pop()
+            continue
+        if not stack:
+            continue
+        opens = stack[-1]["open"]
+        if name == "OP" and t.string == "{":
+            # 只有「外面没域」或「最外层域已切进格式域」时才是真替换域；表达式位置上的 `{`
+            # 是 dict/set 字面量，记一笔但不按域判它（实测它确实是个真 OP token）。
+            top = opens[-1] if opens else None
+            real = top is None or (top["real"] and top["cut"] is not None)
+            # 真域的层级：已经开着两层再开第三层，就是地板之上才成立的写法（实测：
+            # `f"{a:{b:{c}}}"` 在 3.9 上报 expressions nested too deeply，3.12+ 才接受）。
+            deep = real and sum(1 for r in opens if r["real"]) >= 2
+            opens.append({"start": t.end, "line": t.start[0], "cut": None, "cont": 0,
+                          "real": real, "deep": deep,
+                          "hash": False, "reuse": False})
+            continue
+        if name == "OP" and t.string == "}":
+            if not opens:
+                continue
+            rec = opens.pop()
+            if not rec["real"]:
+                continue
+            fields_seen += 1
+            expr = _region(rec["start"], rec["cut"] or t.start)
+            why = []
+            if "\\" in expr:
+                why.append("反斜杠")
+            if not stack[-1]["triple"] and rec["reuse"]:
+                why.append("同种引号")
+            if not stack[-1]["triple"] and t.start[0] != rec["line"]:
+                why.append("域内换行")
+            if rec["hash"]:
+                why.append("域内注释")
+            if rec["deep"]:
+                why.append("嵌套域超一层")
+            for w in why:
+                out.append((rec["line"], w, expr))
+            continue
+        if not opens:
+            continue
+        top = opens[-1]
+        if name == "OP" and top["real"] and top["cut"] is None and top["cont"] == 0 \
+                and t.string in (":", "!"):
+            top["cut"] = t.start
+        elif name == "OP" and t.string in ("(", "["):
+            top["cont"] += 1
+        elif name == "OP" and t.string in (")", "]"):
+            top["cont"] = max(0, top["cont"] - 1)
+        elif name == "COMMENT":
+            for rec in reversed(opens):
+                if rec["real"]:
+                    rec["hash"] = True
+                    break
+        elif name == "STRING" and stack[-1]["q"]:
+            for rec in reversed(opens):
+                if rec["real"]:
+                    if t.string[:1] == stack[-1]["q"]:
+                        rec["reuse"] = True
+                    break
+    return out, literals, fields_seen, ""
+
+
+def check_python_floor(files=None) -> list:
+    """交付链每份 .py 里都不许出现「只在地板之上才成立」的写法（第 34 条）。"""
+    floor, problems = python_floor()
+    full_scan = files is None
+    files = _dev_path_inputs() if full_scan else dict(files)
+    if not files:
+        return problems + ["第 34 条一份源码都没读到（交付目录、批跑清单、门禁自身全落空）："
+                           "扫描范围断了的时候，「都读得懂」这句话没有任何含义"]
+
+    def _rel(path):
+        return path if isinstance(path, str) else (_rel_posix(path) or str(path))
+
+    seen_f = seen_fields = 0
+    counted = 0
+    fstring_mode = ""
+    for path, text in sorted(files.items(), key=lambda kv: _rel(kv[0])):
+        rel = _rel(path)
+        if not rel.endswith(".py"):
+            continue
+        counted += 1
+        try:
+            tree = _file_tree(rel, text)
+        except SyntaxError as exc:
+            # 跑门禁的这一台连解析都过不去：地板就是本机版本，写法超了地板（这一档在 CI 上才会
+            # 被看到，本机因为解释器更新所以看到的是上面那条按原文判的路）。
+            problems.append(f"{rel} 第 {exc.lineno} 行连跑门禁的解释器（"
+                            f"{sys.version_info[0]}.{sys.version_info[1]}）都读不懂：{exc.msg}｜"
+                            f"本条款按 {floor[0]}.{floor[1]} 地板判，请把它降到地板以下")
+            continue
+        for node in _walk(tree):
+            kind = type(node).__name__
+            if kind not in FLOOR_CONSTRUCTS:
+                continue
+            need, advice = FLOOR_CONSTRUCTS[kind]
+            if need > floor:
+                line = text.splitlines()[max(node.lineno, 1) - 1].strip()
+                problems.append(f"{rel} 第 {node.lineno} 行用了 {advice}：{line[:100]}｜"
+                                f"打包机只有 {floor[0]}.{floor[1]}（读自 workflow 的 python-version）")
+
+        got = _fstring_floor_problems(text)
+        if got is None:
+            # 本机解释器的分词器没有 FSTRING_START（≤ 3.11）：表上这些写法在这一台机器上根本
+            # 解析不出来，由上面「连本机都读不懂」那一档接住。但这件事必须记进事实并被 ✅ 那行
+            # 念出来：拿「本机判不了」当「扫过且没问题」，就是这条门本来要治的那个病。
+            fstring_mode = (f"本机（{sys.version_info[0]}.{sys.version_info[1]}）分词器没有 "
+                            "FSTRING_START，PEP 701 那 "
+                            + str(len(FLOOR_FSTRING_CASES)) + " 档写法在这台机器上解析不出来")
+            continue
+        hits, lits, flds, broken = got
+        if lits:
+            fstring_mode = "tokenize"
+        seen_f += lits
+        seen_fields += flds
+        if broken:
+            problems.append(f"{rel} 的分词在这一份上走不通（{broken}）：第 34 条读不到它的"
+                            "f-string，按不合格算而不是按「这处没问题」算")
+            continue
+        for lineno, why, expr in hits:
+            need, advice = FLOOR_FSTRING_CASES[why]
+            if need > floor:
+                problems.append(
+                    f"{rel} 第 {lineno} 行 f-string 的花括号里有{why}："
+                    f"{{{expr.strip()[:80]}}}｜{advice}（地板 {floor[0]}.{floor[1]}，"
+                    "读自 workflow 的 python-version）")
+
+    # 空视野保险放在 full_scan 外面：判据的合同不许随输入来源变。写在 `if full_scan` 里就等于
+    # 「只对生产现场负责」，而离线夹具喂进来一份非 .py 时它会默默报绿——下一档夹具就会把这条当成
+    # 真判据拿去对拍别的东西（25/26/27 条同一课：能报绿的空集合比不报绿更危险）。
+    if counted == 0:
+        problems.append("第 34 条视野里一份 .py 都没有"
+                        + ("（*_build 与 .github/scripts 全落空）" if full_scan
+                           else "（喂进来的 %d 项没有一项是 .py）" % len(files))
+                        + "：这一条在空集合上报绿等于没判")
+    if full_scan:
+        _FLOOR_FACTS.update(files=counted, fstrings=seen_f, fields=seen_fields,
+                            fstring_mode=fstring_mode or "未扫到任何 f-string")
+        # 空转保险：真源里一份 f-string 都没看到，要么交付链被清空了，要么这一条的视野断了——
+        # 两种都不能让它在空集合上报绿（与第 25/26/28 条同一课）。只有「本机分词器判不了这一档」
+        # 这一种是结构性的，不算缺陷，但它会被 ✅ 那行原样念出来。
+        if seen_f == 0 and not fstring_mode.startswith("本机"):
+            problems.append(f"第 34 条扫了 {counted} 份 .py 却一个 f-string 字面量都没看到："
+                            "判据的 f-string 那一路已经断了（不接触现场的门会把真违规哄绿）")
+        for rel in WORKFLOWS:
+            path = ROOT / rel
+            if not path.is_file():
+                continue          # 在不在位由第 6/9 条管，这一条只管内联 python
+            hits = [ln.strip()[:90] for ln in
+                    path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if _INLINE_PY_PAT.search(ln)]
+            if hits:
+                problems.append(f"{rel} 里出现了内联 python（本条款只看 .py，这一处它看不到）："
+                                + "；".join(hits[:3])
+                                + "｜要么把它提成 .github/scripts 里的一份文件（那就能进本条视野），"
+                                  "要么把它接入本条款的扫描集并补上夹具")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -7534,6 +7831,22 @@ def main(argv=None) -> int:
               "都在砍单账被清的那几处一起起账、且交付链里至少被读一次；归因句按四档分叉"
               "（解析漏／账没记上／个位数货源（上限住在 KW_THIN_SUPPLY_ITEMS）／全被砍）")
 
+    floor_gaps = check_python_floor()
+    if floor_gaps:
+        bad += 1
+        print("❌ 交付链里有打包机读不懂的写法（本机解释器比 CI 新，就会把「只在 3.12+ 成立的写法」"
+              "判成绿：本机全绿、两个平台一起停在构建前硬门，就是这么来的）：")
+        for p in floor_gaps:
+            print(f"   · {p}")
+            print(f"::error::语法地板：{p}")
+    else:
+        _fl, _ = python_floor()
+        print(f"✅ 语法地板：按 {_fl[0]}.{_fl[1]}（读自四份 workflow 的 python-version，不一致就不许绿）"
+              f"扫了 {_FLOOR_FACTS['files']} 份 .py：没用到超出地板的写法（{_FLOOR_FACTS['fstrings']} 个"
+              f" f-string 字面量、{_FLOOR_FACTS['fields']} 个替换域逐条走过 Python 自己的分词器；"
+              f"f-string 家用法 {len(FLOOR_FSTRING_CASES)} 档、新语法节点 {len(FLOOR_CONSTRUCTS)} 档在表上；"
+              f"f-string 那一路的口径：{_FLOOR_FACTS['fstring_mode']}）")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -7572,6 +7885,7 @@ def main(argv=None) -> int:
           "列表条目账只住在一个把手里且被归因句读到（「站方回了几条」说不出就算不合格）、"
           "从浏览器标签交出去的正文都先过了页面身份门（串页假数据算不合格）、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
+          "交付链每份 .py 都不用到只有打包机那个解释器之后才成立的写法（本机比 CI 新不算绿）、"
           "注释里每一句指路节号都走得通")
     return 0
 

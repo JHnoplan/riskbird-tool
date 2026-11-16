@@ -10500,6 +10500,271 @@ def test_tree_cache_gate():
     print("AT 取树只一个把手：绕过必响／登记空转必响／四条性质有行为夹具 ✓")
 
 
+def test_python_floor_gate():
+    print("\n═══ AU. 本机比打包机新不算绿：语法地板一处口径（第 34 条硬门）═══")
+    # 由来（2026-11-16 云端：Windows 与 Mac 两个 run 同时停在构建前硬门）：离线套件里
+    # 写了一句 `f"{helper('… \"…\" …')}"`——花括号里带反斜杠，那是 PEP 701（3.12）才放开的
+    # 写法，而四份 workflow 都声明 `python-version: '3.11'`。本机 3.13 解析它毫无障碍：全量
+    # 回归 53/53 绿、frozen 两千多项绿、门禁前三十三条绿，push 上去两个平台一起红在第 26/27 条
+    # （那两条各自 ast.parse 这一份，读到 SyntaxError 就按不合格算）。
+    # 真正的结构性盲区是：**门禁的语法视野等于跑它的那台机器的解释器能力**，本机越新、门越钝。
+    # 所以地板要从 workflow 里取出来显式判，并且每张「哪个写法要哪个版本」的表都要有出处：
+    # 下面这份对照表是拿一个真更老的解释器（3.9.6）当裁判逐档跑出来的——3.9 拒绝的必须被点名，
+    # 3.9 接受的必须放行；两边不一致就是判据错了（本轮就是这样抓到「格式域只能嵌一层」这一档，
+    # 它不在 PEP 701 正文里，靠猜是猜不到的）。
+    gate = _manifest_gate()
+    # 上一版「域内换行」那一档写的是 `f"{a⏎b}"`：它同时带了两个变量（换行 **加上** 两个名字并列），
+    # 3.13 光因「并列」这一个就先在 `ast.parse` 那一档把整份文件判死了，根本走不到 f-string 分词，
+    # 于是夹具报成「判据没点名」——错的不是判据，是夹具自己把两个缺陷叠在一起。
+    # 本节的每一档都只许含**被考察的那一个变量**（换行那三档就是为这一条立的：单引号里两种摆法都该响，
+    # 三引号里同样的换行 3.9 也接受，必须不许响）。
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    BS, NL, Q3 = chr(92), chr(10), chr(34) * 3
+
+    # ── 1) 接线：判据在、被 main() 调用、结果进退出码、云端留下能照做的 annotation ──
+    for _fn in ("check_python_floor", "python_floor", "_fstring_floor_problems"):
+        _assert(callable(getattr(gate, _fn, None)),
+                f"硬门模块里有 {_fn}（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("floor_gaps = check_python_floor()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 34 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1400],
+            "报出来的问题要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::语法地板" in gate_src[_at:_at + 1400],
+            "云端 annotation 要能直接照做：写明是「用了打包机读不懂的写法」并点名地板")
+    # 不是只搜一句新文案：上一版就是这么写的，把自己拼错的「第 34 条…」当成了期望，结果
+    # 报了一条假红（表里真写的是「34 交付链每份 .py 都必须被打包机那个解释器读得懂」）。
+    # 改成两边都按模式提号数：凡是某个 check_* 函数的 docstring 里写了「第 N 条」，
+    # 文件头那张索引表里就必须有 N——漏的不只今天这一条，而是以后每一条新门。
+    # 边界取「模块文档字符串」而不是取某个句子当错位针：上一版就是拿“口径（谁是真源）”
+    # 切头，而那句话在编号表**前面**，于是提出来永远是空集——空集减任何数都是空，门当场假绿。
+    _head = ast.get_docstring(ast.parse(gate_src)) or ""
+    _listed = {int(n) for n in re.findall(r"^\s*(\d{1,2})\s", _head, re.M)}
+    _listed |= {int(n) for n in re.findall(r"[/／]\s*(\d{1,2})\s", _head)}
+    _claimed = set()
+    for _nd in ast.walk(ast.parse(gate_src)):
+        if isinstance(_nd, ast.FunctionDef) and _nd.name.startswith("check"):
+            _dc = ast.get_docstring(_nd) or ""
+            _claimed |= {int(x) for x in re.findall(r"第 (\d{1,2}) 条", _dc)}
+    _assert(_claimed and not (_claimed - _listed),
+            "文件头那张编号表与真源里的条款号对齐（只看到 20 的人会以为后面没有了）："
+            "实得表上 " + str(sorted(_listed)[-6:]) + " 缺登记：" + str(sorted(_claimed - _listed)))
+    # 上面那条在「两个集合都是空」时会假绿，而今天提不出号数完全可能是因为提法写错。
+    # 所以把两个集合自身的量与形状也钉住：紧凑那一段（「21 之后（21 … / 22 … / 34 …）」）
+    # 只能靠分隔符提到，只认行号开头的提法会整段漏掉——那就是我刚踩过的坑。
+    _assert(len(_listed) >= 34 and {1, 21, 22, 33, 34} <= _listed,
+            "编号表确实被提到了 34 条且含紧凑段里的号数（实得 " + str(sorted(_listed)) + "）："
+            "只认行号开头的提法会把「21 之后（… / 22 … / 34 …）」整段漏成空集")
+    _assert(len(_claimed) >= 20,
+            "真源里确实有 " + str(len(_claimed)) + " 个 check_* 函数在 docstring 里点了条款号"
+            "（声称集合为空时上面那条减法永远为空，等于没判）")
+    _assert("这张编号表不是全集" in gate_src,
+            "表末尾那句「这张编号表不是全集」要在（漏的那一句正是这一条要防的事）")
+
+    # ── 2) 地板只有一个来源：四份 workflow 必须说同一种版本 ──
+    _fl, _fp = gate.python_floor()
+    _assert_eq(_fp, [], "今天的四份 workflow 对解释器版本口径一致")
+    _assert(_fl >= (3, 10), f"地板读出来是个真版本（实际 {_fl}）")
+    _assert("python-version" in gate_src and "_PY_FLOOR_PAT" in gate_src,
+            "地板是**从 workflow 派生**的，不是在本条款里又抄了一遍数字（抄的那一份会过期）")
+
+    # ── 3) 地板口径的两个反向对照：不一致必响、取不到必响（都不许默默拿默认值跑）──
+    _tmp = Path(tempfile.mkdtemp(prefix="frozen34_"))
+    _saved_root, _saved_wk = gate.ROOT, gate.WORKFLOWS
+    try:
+        gate.ROOT = _tmp
+        wdir = _tmp / ".github" / "workflows"
+        wdir.mkdir(parents=True, exist_ok=True)
+
+        def _write_wf(pairs):
+            for name, ver in pairs:
+                body = ("- uses: actions/setup-python@v5\n"
+                        "  with:\n    python-version: '" + ver + "'\n") if ver else \
+                    "- uses: actions/setup-python@v5\n  with:\n    python-version: 3\n"
+                (wdir / name).write_text(body, encoding="utf-8")
+
+        _write_wf([("a.yml", "3.11"), ("b.yml", "3.12"), ("c.yml", "3.11"), ("d.yml", "3.11")])
+        gate.WORKFLOWS = tuple(".github/workflows/" + n for n in ("a.yml", "b.yml", "c.yml", "d.yml"))
+        _f2, _p2 = gate.python_floor()
+        _assert(_p2 and "不止一种" in "".join(_p2),
+                "两份 workflow 各说一种版本：必响（打包机语法能力不一致时，「本机绿」与「云端绿」"
+                "又不是同一件事）")
+        _assert_eq(_f2, (3, 11), "不一致时按**最低**那档当地板（最严的说话，判据不许眼盲）")
+
+        for f in wdir.iterdir():
+            f.unlink()
+        _f3, _p3 = gate.python_floor()
+        _assert(_p3 and "地板悬空" in "".join(_p3),
+                "workflow 里一份 python-version 都读不到：必响，不许拿一个默认版本当作实测结论")
+        _assert_eq(_f3, (0, 0), "悬空时不编地板（报的是「读不到」而不是「读到了某个值」）")
+    finally:
+        gate.ROOT, gate.WORKFLOWS = _saved_root, _saved_wk
+
+    # ── 4) 21 档差分对照表：3.9 拒绝的必须被点名，3.9 接受的必须放行 ──
+    _T34 = [
+        ("表达式里嵌套串带反斜杠", ("反斜杠",), 'x = f"{d[' + chr(39) + 'a' + BS + 'nb' + chr(39) + ']}"' + NL),
+        ("join 分隔符带反斜杠", ("反斜杠",), "x = f\"{'}" + BS + "n'.join(a)}\"" + NL),
+        ("单引号域里复用外层双引号", ("同种引号",), 'x = f"{d[' + chr(34) + 'k' + chr(34) + ']}"' + NL),
+        ("单引号域里物理换行（只含这一个变量）", ("域内换行",),
+         'x = f"{1' + NL + '+ 2}"' + NL),
+        ("单引号域两侧各一个换行", ("域内换行",), 'x = f"{' + NL + '1' + NL + '}"' + NL),
+        ("三引号域里的换行（3.9 也接受）", (),
+         "x = f" + Q3 + "{1" + NL + "+ 2}" + Q3 + NL),
+        ("三引号域里写真注释", ("域内注释",),
+         "x = f" + Q3 + "{a  # 注释" + NL + "}" + Q3 + NL),
+        ("带格式域但反斜杠在表达式里", ("反斜杠",),
+         'x = f"{d[' + chr(39) + 'x' + BS + 'ty' + chr(39) + ']:>3}"' + NL),
+        ("三引号域里带反斜杠", ("反斜杠",),
+         "x = f" + Q3 + "{d['a" + BS + "nb']}" + Q3 + NL),
+        ("格式域嵌两层（3.9：nested too deeply）", ("嵌套域超一层",), 'x = f"{a:{b:{c}}}"' + NL),
+        ("三引号里格式域嵌两层", ("嵌套域超一层",), "x = f" + Q3 + "{a:{b:{c}}}" + Q3 + NL),
+        ("嵌串里的井号（配色那类写法）", (),
+         'x = f"{' + chr(39) + '#ff6b6b' + chr(39) + ' if a else ' + chr(39) + '#c62828' + chr(39) + '}"' + NL),
+        ("格式域里的井号（十六进制）", (), 'x = f"{v:#08x}"' + NL),
+        ("反斜杠住在格式域里", (), 'x = f"{a:' + BS + 'n}"' + NL),
+        ("格式域嵌一层（上一档的对照）", (), 'x = f"{a:{b}}"' + NL),
+        ("域里的 dict 字面量", (), 'x = f"{ {' + chr(39) + 'k' + chr(39) + ': 1} }"' + NL),
+        ("相邻隐式拼接 + 正文孤引号", (),
+         'x = f"don' + chr(39) + 't {a}" f"y {b}"' + NL),
+        ("转换符加宽度", (), 'x = f"{a!r:>10}"' + NL),
+        ("转义大括号", (), 'x = f"{{1:2}} {a}"' + NL),
+        ("切片下标", (), 'x = f"{a[1:2]}"' + NL),
+        ("域里裸可迭代解包", (), 'x = f"{*a,}"' + NL),
+        ("域里带括号的 lambda", (), 'x = f"{(lambda q: q)}"' + NL),
+        ("域里未加括号的元组", (), 'x = f"{1, 2}"' + NL),
+    ]
+    _why34 = tuple(gate.FLOOR_FSTRING_CASES)
+    _got_none = gate._fstring_floor_problems("x = f\"{a}\"" + NL) is None
+    if _got_none:
+        _assert(True,
+                "本机分词器没有 FSTRING_START（≤ 3.11）：这一档在本机根本解析不出超地板的写法，"
+                "由「连本机都读不懂」那一档接住——**明确跳过**而不是把跳过念成扫过且全绿")
+    else:
+        for _name, _exp, _src in _T34:
+            _probs = gate.check_python_floor(files={"f34.py": _src})
+            _txt = "".join(_probs)
+            _hit = tuple(w for w in _why34 if ("花括号里有" + w + "：") in _txt)
+            _assert_eq(sorted(_hit), sorted(_exp),
+                       f"34 档对照「{_name}」：判据点名要与 3.9.6 的真实裁决一致")
+        _named = set()
+        for _row in _T34:
+            _named |= set(_row[1])
+        _assert_eq(_named, set(_why34),
+                   "表上每一档 f-string 家用法都至少被一档夹具真点名（只在纸上的类目＝空转）")
+        _silent = [r for r in _T34 if not r[1]]
+        _assert(len(_silent) >= 10,
+                f"对照表里「3.9 也接受、判据不许响」的那一半必须成规模（实得 {len(_silent)} 档）："
+                "只有正例的表会把过度判据也念成绿——上一版就是靠这种表冤枉了配色代码")
+        _assert(any("f34.py" in p for p in gate.check_python_floor(
+                      files={"f34.py": 'x = f"{d[' + chr(39) + 'a' + BS + 'nb' + chr(39) + ']}"' + NL})),
+                "报出来要点名是哪一份（不点名的话，下一个人只能自己全仓找）")
+
+    # ── 5) 新语法节点那一半：地板降下去就要响，地板够新就不许响 ──
+    _m34 = "match a:" + NL + "    case 1:" + NL + "        pass" + NL
+    _saved_root2 = gate.ROOT
+    try:
+        gate.ROOT = _tmp
+        (wdir / "a.yml").write_text("python-version: '3.9'\n", encoding="utf-8")
+        gate.WORKFLOWS = (".github/workflows/a.yml",)
+        _low = gate.check_python_floor(files={"m34.py": _m34})
+        _assert(any("match" in p for p in _low),
+                "地板降到 3.9 时，match 语句必被点名（PEP 634 是 3.10 才有的）")
+        gate.WORKFLOWS = _saved_wk
+        gate.ROOT = _saved_root2
+        _high = gate.check_python_floor(files={"m34.py": _m34})
+        _assert_eq(_high, [], "按真地板（workflow 里那份）判，match 是合法写法——不许误报")
+    finally:
+        gate.ROOT, gate.WORKFLOWS = _saved_root2, _saved_wk
+
+    # ── 6) 空转与断链：三种「看不到东西」都不许报绿 ──
+    _assert(any("一份源码都没读到" in p for p in gate.check_python_floor(files={})),
+            "喂进来的视野是空的：必响（在空集合上报绿等于没判）")
+    _assert(any("一份 .py 都没有" in p for p in gate.check_python_floor(files={"a.txt": "x\n"})),
+            "视野里只有非 .py：必响，不许当成「都读得懂」")
+    _assert(any("解析" in p or "读不懂" in p for p in gate.check_python_floor(
+                  files={"b34.py": "def broken(:\n"})),
+            "本机都解析不过的那一份：按不合格算而不是按「这处没问题」算")
+    _first = gate.check_python_floor()               # 第一次全量
+    _ff = dict(gate._FLOOR_FACTS)                    # 必须**复制**读数：拿引用比＝自己跟自己比，永真
+    _second = gate.check_python_floor()              # 第二次全量
+    _assert(_ff["files"] > 100 and _ff["fstrings"] > 100,
+            "全量跑一遍后事实表里真有量（实得 " + str(_ff["files"]) + " 份 .py / "
+            + str(_ff["fstrings"]) + " 个 f-string 字面量）："
+            "这一路真的接触过现场，不是在空转")
+    _assert(_ff["fstring_mode"],
+            "f-string 那一路的口径要留痕（是 tokenize 扫的还是本机判不了，✅ 那行会原样念出来）")
+    _assert_eq(_ff, dict(gate._FLOOR_FACTS),
+               "同一份真源喂两次得到同一张读数（这一路的视野不随机漂移）")
+    _assert_eq(_first, _second,
+               "同一份真源喂两次得到同一个判定（不稳定的判据会把真违规看成偶发噪音）")
+    _assert_eq(_first, [],
+               "今天交付链里真的没有超地板的写法——这一条把「本机绿≠云端绿」那层盲区也一并钉住："
+               "夹具自己写的每一行都得先过自己的门")
+
+    # ── 7) 终极对照：让**地板那一档解释器自己**把交付链读一遍 ──
+    # 前六块测的都是「判据怎么判」，这一块测的是「判据与打包机是否一致」：拿一个真按
+    # workflow 那个版本号建出来的解释器把每份 .py  compile 一次。本仓扫过的那两条 CI 红
+    # 就是这句话没人做过——本机 3.13 读得懂，打包机 3.11 读不懂，而「本机绿」被当成了结论。
+    # 只走 PATH 与 sys.executable 发现解释器（写死开发机绝对路径是第 25 条管的）。
+    _want = "%d.%d" % _fl
+    _exe, _how = "", ""
+    if "%d.%d" % sys.version_info[:2] == _want:
+        _exe, _how = sys.executable, "本机解释器就是地板版本"
+    else:
+        _cand = shutil.which("python" + _want)
+        if _cand:
+            _v = subprocess.run([_cand, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                                capture_output=True, text=True)
+            if _v.stdout.strip() == _want:
+                _exe, _how = _cand, "PATH 上的 python" + _want
+    if not _exe:
+        _assert(True,
+                "本机找不到 python" + _want + "（地板那一档）：这一档只能由 tokenize 判据代判。"
+                "**没实测不等于实测通过**，所以这里明说没实测；打包机上这一块会自动跑起来")
+    else:
+        _probe = (
+            "import sys, json\n"
+            "items = json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "bad = []\n"
+            "for name, src in items:\n"
+            "    try:\n"
+            "        compile(src, name, 'exec')\n"
+            "    except SyntaxError as exc:\n"
+            "        bad.append([name, exc.lineno, exc.msg])\n"
+            "print(json.dumps({'total': len(items), 'bad': bad}, ensure_ascii=False))\n"
+        )
+        _pd = Path(tempfile.mkdtemp(prefix="frozen34_floor_"))
+        try:
+            _jl = _pd / "chain.json"
+            _chain = {}
+            for _k, _t in gate._dev_path_inputs().items():
+                _nm = gate._rel_posix(_k) or str(_k)
+                if _nm.endswith(".py"):
+                    _chain[_nm] = _t
+            _jl.write_text(json.dumps([[n, s] for n, s in sorted(_chain.items())],
+                                       ensure_ascii=False), encoding="utf-8")
+            (_pd / "probe.py").write_text(_probe, encoding="utf-8")
+            _pr = subprocess.run([_exe, str(_pd / "probe.py"), str(_jl)],
+                                 capture_output=True, text=True, encoding="utf-8")
+            _rep = json.loads(_pr.stdout) if _pr.stdout.lstrip().startswith("{") else {}
+            _assert(_rep.get("total", 0) > 100,
+                    "地板解释器（" + _how + "，" + _want + "）真读了 " + str(_rep.get("total")) +
+                    " 份交付链 .py（不是只抽了一份看）")
+            _oldbad = [b for b in _rep.get("bad", [])]
+            _assert_eq(_oldbad, [],
+                       "按打包机那一档解释器实测：交付链里没有一份读不懂（实际："
+                       + str(_oldbad[:3]) + "）")
+            _judge = {m.group(1) for m in
+                      (re.match(r"(\S+\.py) 第 (\d+) 行", p) for p in gate.check_python_floor()) if m}
+            for _b in _oldbad:
+                _assert(_b[0] in _judge,
+                        "地板解释器拒了 " + _b[0] + "，第 34 条却得同样点名它"
+                        "（两边不一致＝判据比打包机还瞎，那正是本条款要治的病）")
+        finally:
+            shutil.rmtree(_pd, ignore_errors=True)
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -10534,6 +10799,7 @@ SECTIONS = (
     test_no_contact_accountability_gate,
     test_listing_accountability_gate,
     test_tree_cache_gate,
+    test_python_floor_gate,
 )
 
 
