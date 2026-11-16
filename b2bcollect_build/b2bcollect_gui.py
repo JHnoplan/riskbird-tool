@@ -3805,7 +3805,17 @@ class MainWindow(QMainWindow):
         # 而不是等采集跑完去翻上千行日志（2026-11-15 实机：1688 整轮烧在等登录上，
         # 看板上只写着「成功 0」，看起来和「这个站采不到」一模一样）。
         pfail = sum(int(s.get("page_fail") or 0) for s in stats.values())
+        # 计数为 0 不等于「没有取页失败」：详情那条腿整条不通时列表页照常，那一格就是 0
+        # （顺企网 2026-11-16：详情腿 14 次 TLS 失败、账上「取页失败 0 页」）。看板这一行
+        # 是总数、原因分站才能说准，所以总数照念，另点出「有几路带着失败原因却没计入页数」；
+        # 每一路到底是哪一句只取采集器渲染好的 page_ledger（见下方分站 tooltip）
+        _unpaged = sum(1 for s in stats.values()
+                       if str(s.get("page_ledger") or "").strip()
+                       and not int(s.get("page_fail") or 0))
         link = (f"｜取页失败 {pfail} 页" if pfail else "")
+        if _unpaged:
+            link += (f"｜{_unpaged} 路最后一次取页失败但未计入页数"
+                     "（是哪一路、为什么：鼠标悬停看板看分站明细）")
         waiting = sorted({str(s.get("waiting") or "").strip() for s in stats.values()} - {""})
         if waiting:
             link += f"｜仍在等{'、'.join(waiting)}"
@@ -3827,7 +3837,7 @@ class MainWindow(QMainWindow):
             f"{s.get('listed', 0)} 条｜无联系方式 {s.get('no_contact', 0)}｜失败/可重采 "
             f"{s.get('failed', 0)}｜早过滤 {s.get('early', 0)}｜详情不相关 {s.get('filtered', 0)}｜"
             f"省份把关：外省 {s.get('pf_miss', 0)}·属地未标注转名单补采 {s.get('pf_unknown', 0)}"
-            + (f"｜取页失败 {s['page_fail']} 页" if s.get('page_fail') else "")
+            + (f"｜{s['page_ledger']}" if str(s.get('page_ledger') or '').strip() else "")
             + (f"｜仍在等{s['waiting']}" if str(s.get('waiting') or '').strip() else "")
             for name, s in stats.items())
         self.lbl_board.setToolTip(_site_tip + (f"\n\n【本机并发】\n{perf_tip}" if perf else ""))

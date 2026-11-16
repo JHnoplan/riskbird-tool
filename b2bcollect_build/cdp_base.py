@@ -232,6 +232,15 @@ def http_timeout(read=25):
 # 200），工具却按「采不到」处理，每一页重新付一遍超时。
 DEAD_HOST_KINDS = ("连不上·无应答", "连不上·端口被拒", "连不上·被重置", "连不上·链路中断",
                    "DNS解析不了", "本机断网", "代理不通")
+# 「该不该进通道账」比「该不该拉黑这台主机」宽一档，两者**不许共用一个判据**：
+# 由来（2026-11-16 实机第十三轮）：顺企网 7 家详情全部 TLS 握手失败（站方把商铺子域的通配
+# 记录指到了 8.8.8.8，证书自然名不符），日志里明晃晃打了 14 次原因，收尾账却写「取页失败 0 页
+# ｜最后一次=（无）」——而汇总行的处方恰好写着「去看取页失败那一格非零」，等于把人指向一个 0。
+# 根因不是表里少一项：`_note_fetch_fail` 借 `request_error_is_connect` 决定记不记账，于是
+# 「不想因为一次证书抖动把好主机拉黑」这条**正确的拉黑纪律**，顺带把账也拦在门外了。
+# TLS 名不符按主机名记账是无用的（每个公司一个子域，一台只撞一次），但按**通道**记账是必要的：
+# 这一条腿整条不可用，正是「链路通不通」要回答的问题。
+PAGE_FAIL_KINDS = DEAD_HOST_KINDS + ("TLS握手失败",)
 # 两次而不是三次：一次可能是偶发重置（本机 aipage 抽样就有「第一次 5s 没连上、第二次 0.03s」），
 # 而第二次仍然连不上时，同一出口对同一主机的路由已经重复给出同一答案。
 DEAD_HOST_STRIKES = 2
@@ -251,6 +260,17 @@ def request_error_is_connect(shape):
     return bool(m and m.group(1) in DEAD_HOST_KINDS)
 
 
+def request_error_takes_page_ledger(shape):
+    """这句失败该不该进**通道账**（`page_fail`/`last_page_error`）——比拉黑口径宽一档。
+
+    与 `request_error_is_connect` 共用同一个解析器 `_DEAD_HOST_RE`，只差在那张表上：
+    证书名不符不证明主机死了（TCP 都连上了），不该拉黑；但它证明**这一条腿走不通**，
+    必须让归因层读得到。判据见 PAGE_FAIL_KINDS 上方那段实机由来。
+    """
+    m = _DEAD_HOST_RE.match(str(shape or ""))
+    return bool(m and m.group(1) in PAGE_FAIL_KINDS)
+
+
 def request_error_kind(shape):
     """从**已分型**的失败原因里取回那个类别词（`【连不上·无应答】host:443｜…` → `连不上·无应答`）。
 
@@ -262,6 +282,84 @@ def request_error_kind(shape):
     """
     m = _DEAD_HOST_RE.match(str(shape or ""))
     return m.group(1) if m else ""
+
+
+def page_ledger_line(page_fail, last_page_error, cap=60):
+    """通道账那一格怎么念：计数与原因**分家**，所以两半都得念，不许用前者压掉后者。
+
+    `page_fail` 只数「列表那一页整页没取到」（为什么只数列表页见 `_note_page_fail`），
+    `_last_page_error` 讲的是「整轮最终败在什么上」，深链的连接类失败只进后者。
+    由来（2026-11-16 实机第十三轮 顺企网）：详情腿 14 次 TLS 握手失败全在日志里，
+    而收尾与体检都按 `if page_fail` 决定开不开口，账上就成了「取页失败 0 页｜最后一次
+    =（无）」——而汇总行的处方恰好写着「去看取页失败那一格非零」，等于把人指向一个 0。
+    旧写法只错在「用计数决定原因说不说」：计数为 0 依然要念，因为那一格本来就不归它管。
+    两处渲染（采集器收尾账目、实机体检报告）与 1688 镜像那一份共用本把手。
+    """
+    pf = int(page_fail or 0)
+    err = short_reason(last_page_error, cap)
+    if not pf and not err:
+        return ""
+    return f"取页失败 {pf} 页（最后一次：{err or '未记录'}）"
+
+
+# ── [WAIT-BLOCK-BEGIN]
+# 「这一路正停在等人」的措辞只这一处定义（名单通道 site_adapters 直接 import 本函数，
+# 1688 镜像那份逐字节相同、由门禁按标记对拍）。由来：看板、结束日志、实机体检读的是
+# 同一个 `waiting` 键，措辞在一处分叉，另一处就会出现「在等登录」被读成「采不到」。
+# 2026-11-16 又补一行：site_adapters 里那句注释一直写着「与 cdp_base._waiting_human 用同两
+# 个词」，而 cdp_base 这一半**从来没把这格赋过值**——关键词站等人工过验证等到超时，体检
+# 报告仍写「等人=（无）」。注释声称同源而代码并不同源，比两处分叉更坏：它让下一个查这个
+# 问题的人直接跳过这一格。
+# 「在等登录」有两种输入形状：1688 一路是 `_detect_block()` 交回的那枚哨兵（值恒定、
+# 不含任何中文词），其余各路交回的是一句人话。两种形状都只在这里认一次：调用方
+# 各自 `== "__LOGIN__"` 或各自 `"登录" in reason`，就又长成两把尺子。
+# 调用方**已经确凿知道**是哪一种时（1688 那一路按哨兵判，不按文案猜）显式传进来：
+# 措辞层再猜一次就会与流程自己的判定分叉——账上写「在等登录」、循环却在等验证码。
+LOGIN_WAIT_SENTINEL = "__LOGIN__"
+HUMAN_WAIT_LOGIN_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")
+HUMAN_WAIT_LOGIN_LABEL = "登录"
+HUMAN_WAIT_MANUAL_LABEL = "人工过验证"
+
+
+def human_wait_is_login(reason):
+    """这句拦截原因的主语是不是「要人登录/会话已失效」（而不是要人过验证码）。"""
+    text = str(reason or "")
+    return text == LOGIN_WAIT_SENTINEL or any(w in text for w in HUMAN_WAIT_LOGIN_WORDS)
+
+
+def human_wait_label(reason, login=None):
+    """拦截原因 → 要等人做什么（HUMAN_WAIT_LOGIN_LABEL / HUMAN_WAIT_MANUAL_LABEL）。
+
+    login=None 时才按词认；认不出就算后者：「人工过验证」是这盏灯里更保守的那一档
+    ——它不会把「等你登录」说成「你去过个码」，而说错方向的代价是人白过一遍验证。
+    """
+    if login is None:
+        login = human_wait_is_login(reason)
+    return HUMAN_WAIT_LOGIN_LABEL if login else HUMAN_WAIT_MANUAL_LABEL
+
+
+def human_wait_hold(owner, reason, login=None):
+    """点亮这盏灯，并交回改之前的那一格（配对见 `human_wait_release`）。
+
+    为什么「点灯」本身也要一枚把手而不只是措辞：名单通道等验证是会嵌套的（爱企查的
+    `_wait_unblock_limited` 会再回调一次 `_wait_unblock`），内层收尾必须**原样归还**外层那一格，
+    而不是清成空串——清空会让外层还在等人时灯先灭，那是把「在等验证」报成「采不到」。
+    「归还上一个值」这件事在通道层写出来就是一个 `owner._waiting_human = prev` 的旁路赋值，
+    而形状判据只能认把手：所以这里把整套灯的状态机接走，通道层一个词也不碰。
+    """
+    prev = str(getattr(owner, "_waiting_human", "") or "")
+    owner._waiting_human = human_wait_label(reason, login)
+    return prev
+
+
+def human_wait_release(owner, prev=""):
+    """把灯交还给 `human_wait_hold` 之前那一格（传空串就是普通灭灯）。
+
+    只接 hold 交回的那个值，不接受调用方自己现造的字符串——否则「恢复」与「点亮」
+    又分不开，措辞层就白立了。
+    """
+    owner._waiting_human = str(prev or "")
+# ── [WAIT-BLOCK-END]
 
 
 # Chrome 自己的错误页只有这一个地址形状：`chrome-error://chromewebdata/`（错误正文由
@@ -2659,9 +2757,16 @@ return '';})()"""
 
         但「连不上」是**主机**的属性，跟请求哪一页无关：深链的连接类失败照旧要进账，
         该累计连击、该拉黑就拉黑（见 _note_dead_host），否则一条只在大站深链上暴露的
-        网络断路会被永久漏记。判定共用 DEAD_HOST_KINDS 那张表，不与拉黑口径分叉。
+        网络断路会被永久漏记。
+
+        但「该不该记账」与「该不该拉黑」不是一个问题，两者**不许共用一张名单**：
+        拉黑用 DEAD_HOST_KINDS（一次证书抖动不该把好主机拉黑），记账用 PAGE_FAIL_KINDS
+        （同一条腿整条不可用必须看得见）。共用的是同一把解析尺子 `_DEAD_HOST_RE`，
+        不是同一张表。由来（2026-11-16 实机第十三轮 顺企网）：旧写法借了
+        `request_error_is_connect`，7 家详情全部 TLS 名不符仍写「最后一次=（无）」，
+        而拉黑那一半的纪律是对的——错的是把两件事当成了一件事。
         """
-        if deep and not request_error_is_connect(last):
+        if deep and not request_error_takes_page_ledger(last):
             return False
         self._note_request_error(last)
         return True
@@ -3279,6 +3384,9 @@ return '';})()"""
         self._harvest_browser_cookies()
         self._block_reason = ""
         self._block_needs_js = False
+        # 「在等人」这盏灯只能在同一个收口里灭：等待循环的四条出口（用户停止／熔断收轮／
+        # 探测到已解除／等到超时）全走这里，写在任何一条出口上都会有遗漏。
+        self._waiting_human = ""
         self._release_verify_tab()
 
     def _register_block(self):
@@ -3370,6 +3478,12 @@ return '';})()"""
         else:
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，"
                       "看门狗探测到验证已解除后会自动续采。")
+            # 下面这段等待是**真的在等人**：必须当场记成一格机器可读的账，而不是只存在
+            # 于日志里的一句话（麦麦B2B 2026-11-16 实机：等了十分钟没人过验证，收尾写
+            # 「等人=（无）」，体检器只能把这一路报成「链路未通」）。ip_mode 那一支不记：
+            # 等 IP 冷却没有人可等，把它算成「在等人」就是给归因层假证据。灭灯由
+            # _after_block_cleared() 统一收口，四条出口都不会漏。
+            self._waiting_human = human_wait_label(reason)
         self._current_delay = min(30.0, max(6.0, self._current_delay * 1.6))
         self._log(f"   自动降速：采集间隔上调为约 {self._current_delay:.1f}s")
         # max_wait 要显式判 None：写成 `max_wait or 默认` 时，调用方传 0
@@ -3926,6 +4040,10 @@ return '';})()"""
             # 界面与体检器都问这一个数，不许靠读日志文案猜（由来见 _no_result_line）
             "page_fail": self._page_fail,
             "last_page_error": self._last_page_error,
+            # 这一本账**渲染好**的那一句：计数与原因分家，读的人各自决定开不开口就会
+            # 长出「取页失败 0 页｜最后一次=（无）」那种自相矛盾的账（拼法与由来见
+            # page_ledger_line；红牌/看板/总账都只念这一格，不自己再拼一遍）
+            "page_ledger": page_ledger_line(self._page_fail, self._last_page_error),
             # 本轮被主机级熔断拉黑的主机：界面/体检器靠它说「这一路本轮不再重试了」，
             # 而不是让下一个读红话的人以为还要再等等看（读数只在这张账上，不靠文案）
             "dead_hosts": {h: v[1] for h, v in sorted(self._dead_hosts.items())},
@@ -4263,8 +4381,10 @@ return '';})()"""
         # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事
         # 只有取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与
         # ali1688_crawler 同构，对拍见 test_data_dir_offline.py 第 14 节）。
-        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"
-                    if self._page_fail else "")
+        # 2026-11-16 改准：这一句以前拿 `if self._page_fail` 决定开不开口，于是详情腿
+        # 全挂、列表页正常的轮次依旧什么都不说（拼法与共用的把手见 page_ledger_line）。
+        _pf_line = page_ledger_line(self._page_fail, self._last_page_error)
+        pagefail = f"，{_pf_line}" if _pf_line else ""
         pend = self._seen_store_pending() if self.incremental else 0
         pending = f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else ""
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""
@@ -4306,8 +4426,9 @@ return '';})()"""
         s = self.stats()
         # 链路/等人两笔记进账目行：只出现在「共 0 家」那一行的话，正常出货的轮次里
         # 「有 3 页根本没取到」这笔坏账就永远看不见（少了几页同样是要紧的账）
-        lk = (f"｜取页失败 {s['page_fail']} 页（最后一次：{short_reason(s['last_page_error'], 60)}）"
-              if s["page_fail"] else "")
+        # 计数与原因分家：只拿计数决定开不开口，详情腿整条不通就没人念（把手见 page_ledger_line）
+        _lk0 = page_ledger_line(s["page_fail"], s["last_page_error"])
+        lk = f"｜{_lk0}" if _lk0 else ""
         # 熔断那一笔在正常出货的轮次里也要露出来：某台主机被跳过 5 页，账上只写「翻 5 页」
         # 就是「少了几页没人说」——与上面「链路账不许只在 0 家时才可见」同一口径。
         if s.get("dead_hosts"):

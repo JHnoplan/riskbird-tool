@@ -485,6 +485,84 @@ def nc_kinds_text(kinds, evidence=None):
 # ── [NC-BLOCK-END]
 
 
+# ── [WAIT-BLOCK-BEGIN]
+# 「这一路正停在等人」的措辞只这一处定义（名单通道 site_adapters 直接 import 本函数，
+# 1688 镜像那份逐字节相同、由门禁按标记对拍）。由来：看板、结束日志、实机体检读的是
+# 同一个 `waiting` 键，措辞在一处分叉，另一处就会出现「在等登录」被读成「采不到」。
+# 2026-11-16 又补一行：site_adapters 里那句注释一直写着「与 cdp_base._waiting_human 用同两
+# 个词」，而 cdp_base 这一半**从来没把这格赋过值**——关键词站等人工过验证等到超时，体检
+# 报告仍写「等人=（无）」。注释声称同源而代码并不同源，比两处分叉更坏：它让下一个查这个
+# 问题的人直接跳过这一格。
+# 「在等登录」有两种输入形状：1688 一路是 `_detect_block()` 交回的那枚哨兵（值恒定、
+# 不含任何中文词），其余各路交回的是一句人话。两种形状都只在这里认一次：调用方
+# 各自 `== "__LOGIN__"` 或各自 `"登录" in reason`，就又长成两把尺子。
+# 调用方**已经确凿知道**是哪一种时（1688 那一路按哨兵判，不按文案猜）显式传进来：
+# 措辞层再猜一次就会与流程自己的判定分叉——账上写「在等登录」、循环却在等验证码。
+LOGIN_WAIT_SENTINEL = "__LOGIN__"
+HUMAN_WAIT_LOGIN_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")
+HUMAN_WAIT_LOGIN_LABEL = "登录"
+HUMAN_WAIT_MANUAL_LABEL = "人工过验证"
+
+
+def human_wait_is_login(reason):
+    """这句拦截原因的主语是不是「要人登录/会话已失效」（而不是要人过验证码）。"""
+    text = str(reason or "")
+    return text == LOGIN_WAIT_SENTINEL or any(w in text for w in HUMAN_WAIT_LOGIN_WORDS)
+
+
+def human_wait_label(reason, login=None):
+    """拦截原因 → 要等人做什么（HUMAN_WAIT_LOGIN_LABEL / HUMAN_WAIT_MANUAL_LABEL）。
+
+    login=None 时才按词认；认不出就算后者：「人工过验证」是这盏灯里更保守的那一档
+    ——它不会把「等你登录」说成「你去过个码」，而说错方向的代价是人白过一遍验证。
+    """
+    if login is None:
+        login = human_wait_is_login(reason)
+    return HUMAN_WAIT_LOGIN_LABEL if login else HUMAN_WAIT_MANUAL_LABEL
+
+
+def human_wait_hold(owner, reason, login=None):
+    """点亮这盏灯，并交回改之前的那一格（配对见 `human_wait_release`）。
+
+    为什么「点灯」本身也要一枚把手而不只是措辞：名单通道等验证是会嵌套的（爱企查的
+    `_wait_unblock_limited` 会再回调一次 `_wait_unblock`），内层收尾必须**原样归还**外层那一格，
+    而不是清成空串——清空会让外层还在等人时灯先灭，那是把「在等验证」报成「采不到」。
+    「归还上一个值」这件事在通道层写出来就是一个 `owner._waiting_human = prev` 的旁路赋值，
+    而形状判据只能认把手：所以这里把整套灯的状态机接走，通道层一个词也不碰。
+    """
+    prev = str(getattr(owner, "_waiting_human", "") or "")
+    owner._waiting_human = human_wait_label(reason, login)
+    return prev
+
+
+def human_wait_release(owner, prev=""):
+    """把灯交还给 `human_wait_hold` 之前那一格（传空串就是普通灭灯）。
+
+    只接 hold 交回的那个值，不接受调用方自己现造的字符串——否则「恢复」与「点亮」
+    又分不开，措辞层就白立了。
+    """
+    owner._waiting_human = str(prev or "")
+# ── [WAIT-BLOCK-END]
+
+
+def page_ledger_line(page_fail, last_page_error, cap=60):
+    """通道账那一格怎么念：计数与原因**分家**，所以两半都得念，不许用前者压掉后者。
+
+    `page_fail` 只数「列表那一页整页没取到」（为什么只数列表页见 `_note_page_fail`），
+    `_last_page_error` 讲的是「整轮最终败在什么上」，深链的连接类失败只进后者。
+    由来（2026-11-16 实机第十三轮 顺企网）：详情腿 14 次 TLS 握手失败全在日志里，
+    而收尾与体检都按 `if page_fail` 决定开不开口，账上就成了「取页失败 0 页｜最后一次
+    =（无）」——而汇总行的处方恰好写着「去看取页失败那一格非零」，等于把人指向一个 0。
+    旧写法只错在「用计数决定原因说不说」：计数为 0 依然要念，因为那一格本来就不归它管。
+    两处渲染（采集器收尾账目、实机体检报告）与 1688 镜像那一份共用本把手。
+    """
+    pf = int(page_fail or 0)
+    err = short_reason(last_page_error, cap)
+    if not pf and not err:
+        return ""
+    return f"取页失败 {pf} 页（最后一次：{err or '未记录'}）"
+
+
 def _request_error_detail(text, cap):
     """把异常文本里「人能照着处置」的那一段剥出来：Caused by 之后优先，池头之后其次。"""
     seg = _ERR_CAUSED_RE.split(text, 1)[-1] if _ERR_CAUSED_RE.search(text) else text
@@ -1649,7 +1727,7 @@ class Ali1688Crawler:
         except Exception:
             return ""
         if any(m in url for m in LOGIN_URL_MARKERS):
-            return "__LOGIN__"
+            return LOGIN_WAIT_SENTINEL
         if any(m in url for m in BLOCK_URL_MARKERS):
             return "页面被跳转到 1688 安全验证/风控页"
         if any(m in title for m in BLOCK_TITLE_MARKERS) and not any(h in title for h in SAFE_TITLE_HINTS):
@@ -1726,11 +1804,11 @@ class Ali1688Crawler:
         非登录类拦截额外走熔断：短窗口内反复被拦＝已进限流区，
         每次都强制递增冷却（拿不到冷却窗口会把软限流熬成硬封号），
         达到阈值则直接优雅结束本轮，绝不死磕。"""
-        login = (reason == "__LOGIN__")
+        login = (reason == LOGIN_WAIT_SENTINEL)
         # 「在等人」必须是一格机器可读的账，不是日志里的一句话（2026-11-15 实机：1688 把
         # 整轮体检预算烧在等登录上，最后 0 家被报成「采不到」——它既没熔断也没失败，只是
         # 在等人）。只在等待期间为真，解除或放弃时当场清掉，绝不留给下一句看起来正常的日志。
-        self._waiting_human = "登录" if login else "人工过验证"
+        self._waiting_human = human_wait_label(reason, login)
         if login:
             self._emit("login_required_signal", "1688 需要登录，请在弹出的 Chrome 里完成登录")
             self._log("🔑 检测到未登录，请在 Chrome 窗口里登录 1688（登录后自动继续）")
@@ -1766,7 +1844,8 @@ class Ali1688Crawler:
             time.sleep(3)
             waited += 3
             state = self._detect_block()
-            if state == "" or (login and state != "__LOGIN__") or (not login and state != "__LOGIN__" and not state):
+            if state == "" or (login and state != LOGIN_WAIT_SENTINEL) or (
+                    not login and state != LOGIN_WAIT_SENTINEL and not state):
                 self._waiting_human = ""      # 人已经处理完了，这一格必须当场收掉
                 if login:
                     self._log("✅ 检测到已登录，继续采集")
@@ -1788,7 +1867,7 @@ class Ali1688Crawler:
         self._log("⚠ 等待超时，本轮结束（已采集数据不受影响）")
         # 超时＝放弃了，「等人」这一格就此收账；真正留下的归因是下面那句 _run_abandon
         self._waiting_human = ""
-        self._run_abandon = (f"等待{'登录' if login else '人工过验证'}超时"
+        self._run_abandon = (f"等待{human_wait_label(reason, login)}超时"
                              f"（{max_wait} 秒没人处理）")
         return False
 
@@ -2441,7 +2520,7 @@ class Ali1688Crawler:
             rec["状态"] = "联系方式页拦截未解除"
             return rec
         # 联系方式页可能仍需登录：跳登录则记录状态、不写空壳
-        if self._detect_block() == "__LOGIN__":
+        if self._detect_block() == LOGIN_WAIT_SENTINEL:
             rec["状态"] = "未登录-联系方式不可见"
             return rec
         chtml = self.driver.page_source
@@ -2455,7 +2534,7 @@ class Ali1688Crawler:
                 else winport.rstrip("/") + "/page/contactinfo.html"
             if alt and alt != contact:
                 self._sleep()
-                if self._goto(alt) and self._detect_block() != "__LOGIN__":
+                if self._goto(alt) and self._detect_block() != LOGIN_WAIT_SENTINEL:
                     self._keep_detail(self.driver.page_source)
                     r2 = self._parse_contact(self.driver.page_source)
                     rec.update({k: v for k, v in r2.items() if v})
@@ -2484,7 +2563,7 @@ class Ali1688Crawler:
         if not self._goto(contact):
             rec["状态"] = "联系方式页导航失败"
             return rec
-        if self._detect_block() == "__LOGIN__":
+        if self._detect_block() == LOGIN_WAIT_SENTINEL:
             rec["状态"] = "未登录-联系方式不可见"
             return rec
         self._keep_detail(self.driver.page_source)
@@ -2493,7 +2572,7 @@ class Ali1688Crawler:
             # 两套模板回退：.html 取不到就试 .htm
             alt = winport + "/page/contactinfo.htm"
             self._sleep()
-            if self._goto(alt) and self._detect_block() != "__LOGIN__":
+            if self._goto(alt) and self._detect_block() != LOGIN_WAIT_SENTINEL:
                 rec["联系方式URL"] = alt
                 self._keep_detail(self.driver.page_source)
                 rec.update({k: v for k, v in self._parse_contact(self.driver.page_source).items() if v})
@@ -2569,8 +2648,8 @@ class Ali1688Crawler:
 
         # 先打开首页建立会话并检测登录
         self._goto(self.BASE_URL)
-        if self._detect_block() == "__LOGIN__":
-            if not self._wait_unblock("__LOGIN__"):
+        if self._detect_block() == LOGIN_WAIT_SENTINEL:
+            if not self._wait_unblock(LOGIN_WAIT_SENTINEL):
                 self._crawling = False
                 self._emit("crawl_finished_signal")
                 return
@@ -2720,8 +2799,10 @@ class Ali1688Crawler:
         # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事只有
         # 取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与 cdp_base 同构，
         # 对拍见 b2bcollect_build/test_data_dir_offline.py 第 14 节）。
-        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"
-                    if self._page_fail else "")
+        # 计数与原因分家：只拿计数决定开不开口，详情腿整条不通就没人念（拼法与 cdp_base 同构，
+        # 共用同一个把手名 page_ledger_line，对拍见 test_data_dir_offline.py 第 14 节）
+        _pf_line = page_ledger_line(self._page_fail, self._last_page_error)
+        pagefail = f"，{_pf_line}" if _pf_line else ""
         pend = self._seen_store_pending() if self.incremental else 0
         pending = (f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else "")
         saved = f"，种子库累计 {len(self._seen_store)} 家" if self.incremental else ""

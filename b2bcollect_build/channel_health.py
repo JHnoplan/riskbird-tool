@@ -29,7 +29,9 @@ from pathlib import Path
 
 # 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
 # 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
-from text_shape import first_line, short_reason
+# （以前这里还 import 了 short_reason，只为了自己拼那一句取页失败账；现在那一句
+# 改读采集器渲染好的 page_ledger，本模块就不再切第二刀了）
+from text_shape import first_line
 
 import field_evidence as _fe
 
@@ -126,11 +128,12 @@ def note_from_stats(metric):
     if s.get("pf_unknown"):
         bits.append(f"属地未标注转名单 {s['pf_unknown']}")
     # 链路/等人两笔只在出事时念出来：红牌看到的「本轮 0 家」必须自带来路，否则
-    # 读的人只能瞎猜是站点没数据、网络没通还是有人在等登录（2026-11-15 的教训）
-    if s.get("page_fail"):
-        bits.append(f"取页失败 {s['page_fail']} 页"
-                    + (f"（最后一次：{short_reason(s.get('last_page_error'), 40)}）"
-                       if s.get("last_page_error") else ""))
+    # 读的人只能瞎猜是站点没数据、网络没通还是有人在等登录（2026-11-15 的教训）。
+    # 这一句直接取采集器渲染好的 `page_ledger`（与 nc_note 同一个口径）：本模块刻意不
+    # import cdp_base（它要在采集器全坏时还能说话），而计数为 0 那一档能不能开口
+    # 也只该由记账的主人定一次（由来见 cdp_base.page_ledger_line）
+    if str(s.get("page_ledger") or "").strip():
+        bits.append(str(s["page_ledger"]))
     if str(s.get("waiting") or "").strip():
         bits.append(f"仍在等{s['waiting']}")
     # 「无联系方式 N」这一格必须自带是谁的责任：红牌这一行是用户在界面上唯一会读的地方，

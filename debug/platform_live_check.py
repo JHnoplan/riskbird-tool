@@ -64,6 +64,9 @@ from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES, STATS_LABE
 from cdp_base import short_reason, CdpSiteCrawler               # noqa: E402
 # 分档的说词只许取采集器那一个把手（nc_kinds_text）：探针自己写一份就会出现同一笔账两种处方
 from cdp_base import nc_kinds_text              # noqa: E402
+# 通道账那一格只许念采集器渲染好的那一句（不自己再拼一遍）；而「这句原因是不是
+# 链路那一侧的死因」也必须走采集器那把判据（口径由来见 cdp_base.PAGE_FAIL_KINDS）
+from cdp_base import request_error_kind, request_error_takes_page_ledger   # noqa: E402
 
 # 「任一联系方式」的**宽口径**：只出现在报表那一行对比数字里，不参与判定。
 # 判定一律用生产入库那把尺子（见 _importable：make_row + filter_import_rows，
@@ -208,6 +211,24 @@ def _nc_line(st):
     return nc_kinds_text(st.get("nc_kinds") or {}, st.get("nc_evidence") or {})
 
 
+def _pf_line(st):
+    """通道账那一行（计数 + 最后一次原因）：只念采集器渲染好的 `page_ledger`。
+
+    为什么要拿现成的那一格而不是这里再拼一次：顺企网 2026-11-16 那轮探针就是自己写了
+    「取页失败 {page_fail} 页」，而原因那一半只在计数非零时才开口——详情腿 14 次 TLS
+    失败全在日志里，报告这一行仍写「0 页｜最后一次=（无）」。同一个口径只允许有一处写法。
+    """
+    return str(st.get("page_ledger") or "").strip()
+
+
+def _pf_link_kind(st):
+    """通道账里那句原因属于「链路那一侧」的那一档（连不上/DNS/断网/代理/TLS）；不是就回空串。
+
+    判据不自己拼：只认 `request_error_takes_page_ledger` 那一张表，与记账处同一把尺。"""
+    err = str(st.get("last_page_error") or "")
+    return request_error_kind(err) if request_error_takes_page_ledger(err) else ""
+
+
 def _nc_advice(st):
     """分档账 → 一句能执行的处方。只许 miss 那一档说「修代码」，其余几档要说清不是我们的锅。
 
@@ -218,6 +239,13 @@ def _nc_advice(st):
     """
     k = st.get("nc_kinds") or {}
     ev = st.get("nc_evidence") or {}
+    # 先问「这一批到底有没有页面回来」：详情腿整条不通时，分账里那一档说得再都对也没用
+    # ——页面根本不存在，不存在「栏位里本有号码」的证据（由来见 cdp_base.PAGE_FAIL_KINDS）
+    _kind = _pf_link_kind(st)
+    if _kind:
+        return (f"——详情那条腿整条不通（【{_kind}】{short_reason(st.get('last_page_error'), 60)}）："
+                "这一批四项全空是因为页面没取回来，先查出口网络/证书可达，"
+                "照着分档改解析只会引入假数据")
     if k.get("miss"):
         return (f"——四项全空里有 {k['miss']} 家**栏位里本有号码**：先修我们的解析"
                 f"（证据：{short_reason(ev.get('miss', ''), 46)}）")
@@ -368,6 +396,13 @@ def _attrib(st, n, blocked, reason, diff="ok", peer=0, killed="", zero=(), imp=N
                           "要新数据得换关键词或放开省份）")
         failed = int(st.get("failed") or 0)
         missing = int(st.get("no_contact") or 0)
+        # 详情那条腿整条不通时，上面两句（「这一路必须修」/「平台确实查不到」）都不成立：
+        # 页面压根没取回来，站方连一次机会都没给（顺企网 2026-11-16：7 家全 TLS 名不符）。
+        # 只拿计数判这一档的旧写法会把它退给「改解析」，而正确的处方是查出口。
+        _lk = _pf_link_kind(st)
+        if _lk:
+            return "❌", (f"0 家且详情那条腿整条不通（【{_lk}】{short_reason(last_err, 60)}）："
+                          "先查出口网络/证书可达，这不是平台没数据；列表页能回就说明只断了这一条腿")
         if listed and failed:
             # 「链路上明明回了 M 条、一条都没落地」≠「这个站没有你要的公司」：
             # 前者必须修（详情取不到/解析失效），后者该换词换站，改了代码反而引入假数据
@@ -411,8 +446,10 @@ def _attrib(st, n, blocked, reason, diff="ok", peer=0, killed="", zero=(), imp=N
             ev.append("深链被拒 " + "、".join(f"{h}({v[0]} 次)" for h, v in deep.items()))
         if killed:
             ev.append(f"相关性砍单 {killed}")
-        if st.get("page_fail"):
-            ev.append(f"取页失败 {st.get('page_fail')} 页")
+        _pfl = _pf_line(st)
+        if _pfl:
+            # 只按计数决定开不开口，详情腿整条不通就谁都说不上（把手见 _pf_line）
+            ev.append(_pfl)
         if st.get("failed"):
             ev.append(f"详情失败 {st.get('failed')} 次")
         # 增量库已含多少家要念出来：它直接决定了本轮「最多能出多少家新的」，
@@ -436,7 +473,7 @@ def _attrib(st, n, blocked, reason, diff="ok", peer=0, killed="", zero=(), imp=N
             ev.append("落点不符 " + "、".join(
                 f"{h}({v[0]} 次)" for h, v in sorted(_land.items(), key=lambda kv: -int(kv[1][0]))))
         broken = bool(deep or killed or st.get("failed") or st.get("page_fail")
-                      or (imp is not None and imp * 2 < n))
+                      or _pf_link_kind(st) or (imp is not None and imp * 2 < n))
         # 有证据＝这一路确实坏了（该修）；没证据只是词/站薄（该换词换站），
         # 两者都给红会把「平台本来货少」也判成缺陷，下一轮就没人信这份报告了
         # 结论里的「可入库」只念真的测出来的那个数：复算不成时拿抓到的家数顶上去，
@@ -510,8 +547,10 @@ def _fmt_site(slug, crawler, kws):
                  f"早过滤 {st.get('early', '-')}｜详情不相关 {st.get('filtered', '-')}")
     # 链路这一笔平时全是 0，出了事却是唯一能定性的数：单独占一行，别混进产出那长句里
     _dead = "、".join((st.get("dead_hosts") or {}).keys()) or "（无）"
-    lines.append(f"  链路: 取页失败 {st.get('page_fail', 0) or 0} 页｜"
-                 f"最后一次={short_reason(st.get('last_page_error'), 70) or '（无）'}｜"
+    # 这里不许出现第二种拼法：把手交回空串的唯一条件是「计数为 0 且手里没原因」，
+    # 那种时候如实说「没有」；曾经在这里补过一句 `取页失败 0 页（最后一次：未记录）`，
+    # 等于把把手的措辞又抄了一份——把手哪天改口，这一行就跟账目其他四处不一致。
+    lines.append(f"  链路: {_pf_line(st) or '本轮没有取页失败记录'}｜"
                  f"增量跳过 {st.get('incr_skip', 0) or 0} 家｜"
                  f"熔断主机 {_dead}｜"
                  f"等人={str(st.get('waiting') or '') or '（无）'}")

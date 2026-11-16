@@ -137,8 +137,12 @@
      33 列表条目账只住在一个把手里 / 34 交付链每份 .py 都必须被打包机那个解释器读得懂 /
      35 取 bash 只许一个把手（执行前得换成解析出的绝对路径，身份靠版本横幅＋横幅里的三元组
         问它自己——Linux 那份 bash 在 Windows 打包机上看不见工作目录）/
-     36 报告用的相对路径必须与 git 写法同源（自己裁一遍在 Windows 上永远裁不掉））：
-     这十六条各自的由来与口径写在**它们函数上方**的注释块里——那十六条都是
+     36 报告用的相对路径必须与 git 写法同源（自己裁一遍在 Windows 上永远裁不掉）/
+     37 「取页失败」那一格的口径表与念法都只许一处（拉黑一台主机与进不进通道账是两张表：
+        借拉黑表判记账，详情腿整条不通也会写成「0 页｜最后一次=（无）」）/
+     38 「这一路在等谁」那盏灯只许由把手点亮与归还（旁路赋一个字符串，下一轮就没人
+        知道它是不是也在词表上；只被 init/清/读却从没点过，就是把等到超时说成采不到））：
+     这十八条各自的由来与口径写在**它们函数上方**的注释块里——那十八条都是
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
 
@@ -151,6 +155,7 @@ from __future__ import annotations
 import argparse
 import ast
 import builtins
+import codecs
 import hashlib
 import io
 import os
@@ -162,6 +167,7 @@ import tempfile
 import textwrap
 import tokenize
 import unicodedata
+import warnings
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 
@@ -1065,13 +1071,13 @@ def _decode_maybe_utf16(raw: bytes) -> str:
     """子进程输流的解码：**带 NUL 就当 UTF-16 试一遍**，解不出来才 utf-8 + replace。
 
     Python 自己给 `text=True` 用的是控制台代码页，那是第 11 条已经踩过一次的坑（见
-    `check_shell_parse`）；而本轮那 504 字节是 UTF-16LE，按 utf-8 解出来是一串 `W\x00i\x00n\x00d`，
+    `check_shell_parse`）；而本轮那 504 字节是 UTF-16LE，按 utf-8 解出来是一串 `W\\x00i\\x00n\\x00d`，
     判据读到的形状会一直「看着像坏字节」。解码口径也收在一处，别再分叉第三次。
 
     不成对的那一个字节不能拖整段后退（AV 第 4 档实测抓出来的）：真存根就是这种形状——
-    前半句是 UTF-16LE，尾巴上换行是一个裸 `\n`。奇数长度下 strict 与 `errors="replace"` 都会
+    前半句是 UTF-16LE，尾巴上换行是一个裸 `\\n`。奇数长度下 strict 与 `errors="replace"` 都会
     报 truncated data，三种编码全军覆没就退到 utf-8，NUL 于是留在取证里：人看到的仍是
-    `W\x00i\x00n\x00d`，而本轮要治的恰好是「这句人读不懂」。所以试完 strict 再把最后那一
+    `W\\x00i\\x00n\\x00d`，而本轮要治的恰好是「这句人读不懂」。所以试完 strict 再把最后那一
     个不成对的字节剔掉解一次，只剔那一字节，不猜别的。
     """
     if b"\x00" in raw[:700]:
@@ -1094,8 +1100,8 @@ def _is_linux_flavoured_bash(banner: str) -> bool:
     判据是横幅括号里的三元组，不是路径：`(1)-release (x86_64-pc-linux-gnu)` 属于 Linux 那份
     GNU bash，Git for Windows 给的是 `(x86_64-pc-cygwin)`、MSYS 给的是 `-pc-msys`。为什么非要
     在这一格较真：认「GNU bash, version」横幅是上一版留下的**最后一个**洞——Windows 上装了
-    WSL 发行版的机器里，`System32\bash.exe --version` 答得出一句真横幅且 rc=0，横幅一路畅通
-    无阻，可那个 bash 活在 Linux 内核里，**看不见打包机的工作目录**（`D:\a\riskbird-tool\...`），
+    WSL 发行版的机器里，`System32\\bash.exe --version` 答得出一句真横幅且 rc=0，横幅一路畅通
+    无阻，可那个 bash 活在 Linux 内核里，**看不见打包机的工作目录**（`D:\\a\\riskbird-tool\\...`），
     脚本会从第一个 `cd` 就坏。这仍是本轮那句「同一个名字解析成两个程序」，只是换了伪装。
     """
     text = (banner or "").lower()
@@ -4711,7 +4717,7 @@ def _rel_label(path) -> str:
 
     为什么这不是冗余而是补锅（2026-11-16 云端 Windows run，同提交 Mac 绿）：上一版这里写的是
     `text[len(root) + 1:] if text.startswith(root + "/") else text`——Windows 上 `str(ROOT)` 是
-    `D:\a\riskbird-tool\riskbird-tool`（反斜杠），与 `root + "/"` 永远对不上，于是返回的是
+    `D:\\a\\riskbird-tool\\riskbird-tool`（反斜杠），与 `root + "/"` 永远对不上，于是返回的是
     **整条绝对路径**。它不只影响打印：第 30 条的豁免表、第 31 条的 TAB_BODY_EXITS、第 32/33 条的
     登记表，键都是仓库相对正斜杠——lookup 拿着一把查不到的键去问，已登记豁免的两处与四处在案的
     标签出口全被报成「没登记」。门禁在 Windows 上把自己变成了假红发生器，而这句假红里一个字节
@@ -6327,13 +6333,22 @@ TAB_ACTION_CALLS = ("close_tab", "release_tabs", "release_tab", "_close_tab",
                     "_close_own_tab", "_release_verify_tab", "quit_browser")
 
 
-def _nc_block_of(text: str) -> str:
-    """按标记取镜像段本体（从判据第一行到 [NC-BLOCK-END]）。取不到就交回标记串，让调用方响。"""
-    i = text.find(NC_BLOCK_MARKS[0])
-    j = text.find(NC_BLOCK_MARKS[1])
+def _marked_block(text: str, marks) -> str:
+    """按 (起始标记, 结束标记) 取镜像段本体。取不到就交回标记串，让调用方响。
+
+    第 32 条（NC 判据段）与第 38 条（WAIT 措辞段）共用这一把刀：两段镜像各写一套「找标记、
+    切片、缺标记时返回什么」，早晚会长成「一段缺标记返回标记串、另一段返回空串」这种
+    只在反向对照里才暴露的分叉——而返回空串那一套会让「逐字节相同」在两份都缺标记时成立。
+    """
+    i = text.find(marks[0])
+    j = text.find(marks[1])
     if i < 0 or j < 0:
         return "（缺标记）"
     return text[i:j]
+
+
+def _nc_block_of(text: str) -> str:
+    return _marked_block(text, NC_BLOCK_MARKS)
 
 
 def _is_abstract_stub(fn) -> bool:
@@ -7386,7 +7401,134 @@ FLOOR_FSTRING_CASES = {
                               "`f\"{a:{b:{c}}}\"` 不行）：把最里面那一层提成变量"),
 }
 # 本条款上一轮看到了多少东西：只在全量扫描时写，给 ✅ 那行念，也给 frozen 当「判据不是空转」的证据。
-_FLOOR_FACTS = {"files": 0, "fstrings": 0, "fields": 0, "fstring_mode": ""}
+_FLOOR_FACTS = {"files": 0, "fstrings": 0, "fields": 0, "fstring_mode": "",
+                "escape_files": 0, "escape_ctrl": 0}
+
+# ── 转义立场（第 34 条的 34e/34f/34g，2026-11-16 一次抓到三条）─────────────────
+# 由来：本轮写第 35/36 条的注释时，在同一份门禁里写下了 `System32\bash.exe`、
+# `D:\a\riskbird-tool`，在另一份说明里写下了 `W\0i\0n\0d` 那种「引用一个转义符」的句子。
+# 它们都不是 raw 串，于是 Python 当场把 `\b` 解成退格、`\a` 解成响铃、`\0` 解成 NUL：
+# 「正在解释一个路径问题的那句注释，自己已经把那个路径写坏了」。这一族难的是没人会撞它——
+# 注释不进执行路径，看源文件的人读到的是原文，而读 `__doc__` 的人（IDE 悬停、`help()`、
+# 以后被打进报告的句子）读到的是控制字符。另一半更贵：`\.` 那种不成转义的反斜杠现在只是
+# SyntaxWarning，CPython 已宣布后续版本升成 SyntaxError——到那天第一个红的是门禁自己，
+# 而打包机上跑的正是那个新版本（第 34 条立的就是这件事）。
+# 白名单只有 TAB/LF/CR：这三位在正文里本来就常见，而 0x00-0x08、0x0b、0x0c、0x0e-0x1f
+# 在任何一句给人读的话里都不该出现（真要用它们的代码，写的是 `"\0"` 这种**整个常量就是
+# 那一枚**的形状，长度 1，由下面的 `len(v) > 1` 如实放过）。
+# 报出来要念得出名字，不然 `U+0009` 这种写法读到的人还得自己去查是哪一枚。TAB/LF/CR 不在上面
+# 那条禁令里（它们是白名单），但 34f 会拿它们报「反引号里写的是一个转义、解出来是一个真字符」，
+# 所以这三枚的人名也要给全——**这只是念法表，不是禁令表**，改它不改动下面的 `FLOOR_CTRL_BANNED`。
+FLOOR_CTRL_NAMES = {0x00: "NUL", 0x07: "响铃 BEL", 0x08: "退格 BS", 0x09: "制表符 TAB",
+                    0x0a: "真空行 LF", 0x0b: "纵表 VT", 0x0c: "换页 FF",
+                    0x0d: "回车 CR", 0x1b: "逃逸 ESC"}
+FLOOR_CTRL_BANNED = frozenset(c for c in range(0x20) if c not in (0x09, 0x0a, 0x0d))
+# 反引号包住的那一段就是在引用「字面上长这样的几个字符」：它里面出现控制字符，
+# 就是说写下的与解出的不是同一句（`` `\n` `` 解成一个真空行，正是这一档）。
+FLOOR_DOC_TICK_PAT = re.compile(r"`([^`]*)`")
+# 这一格只许从**源码原文**算起，不许拿解码后的值再配一个「这段有多长」的闸门：
+# 长度是巧合的区分器而不是理由。真源里现成就有 6 处合法写法——docstring 用反引号引用一段
+# 跨行代码示例，那里的换行是源码里就摆着的真换行；而 `C:\temp`、`C:\new` 解出来的是制表符
+# 和一个凭空多出来的空行。要判的事说清楚只有一句：「解码这一步造出了一枚原文里没有的控制
+# 字符」。它与长短无关，所以既不用给那 6 处开后门，也不放过「很长的路径里藏着 \n」那一种
+# （旧口径按长度放过的那一档，正是 Windows 路径最常写错的那一档）。
+
+
+def _escape_stance_problems(rel, tree, text="") -> list:
+    r"""34e/34f：源码里写着反斜杠、解出来却是控制字符的那一整族。
+
+    两问各管一种形状，少一种都会漏：
+      34e 长度大于 1 的字符串常量里出现禁用控制字符（Windows 路径、`W\x00i\x00n\x00d` 那一类）；
+      34f docstring 里被反引号包住的片段里，藏着一条**解出来在原文里并不存在**的控制字符转义
+          ——这一格专门接住 `` `\n` ``、`` `C:\temp` ``：换行/制表在 34e 的白名单里，拿它当
+          「没出错」正好放过本轮那第三处。
+
+    34f 要拿 `text` 去取那一段的**源码原文**：一个控制字符是不是「转义解出来的」，只能在原文
+    上问。拿解码后的值问就分不清「作者真在反引号里写了一段跨行代码」与「作者写了一个 \n」，
+    于是只能拿长度当区分器——而长度不是理由（上面那段注释里记的就是它怎样放过了一类、
+    又误伤了另一类）。`text` 给不上时退回按值判的保守口径（只报换行以外的那些），而不是整格闭嘴。
+    """
+    out = []
+    for node in _walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            if len(v) > 1:
+                for c in v:
+                    if ord(c) in FLOOR_CTRL_BANNED:
+                        out.append(f"{rel} 第 {node.lineno} 行的字符串里真的有一个"
+                                   f"{FLOOR_CTRL_NAMES.get(ord(c), 'U+%04X' % ord(c))}："
+                                   "那一处多半是在**引用**一段带反斜杠的字面文字（Windows 路径、"
+                                   "转义符本身），而它已经被解掉了一个字符——要么写成 raw 串，"
+                                   "要么把反斜杠打成两条")
+                        break
+    for node in _walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if not node.body or not isinstance(node.body[0], ast.Expr):
+            continue
+        cst = node.body[0].value        # body[0] 是个字符串常量就是 docstring（与 CPython 同一判定）
+        if not (isinstance(cst, ast.Constant) and isinstance(cst.value, str)):
+            continue
+        seg = ast.get_source_segment(text, cst) if text else None
+        if seg is None:
+            ghost = [ch for ch in sorted(set(cst.value)) if ord(ch) < 32 and ch != "\n"]
+            if not ghost:
+                continue
+            out.append(f"{rel} 第 {cst.lineno} 行那段 docstring 里，反引号引用的片段里解出了"
+                       f"{ghost[0]!r}：本条款要拿源码原文分辨「这是作者真的换行」还是「这是 \\n "
+                       f"被解开的」，而这一份读不到原文（{len(text or '')} 字节）——按值判的"
+                       "保守口径先报上来，不要当成「已逐字对过」")
+            for m in FLOOR_DOC_TICK_PAT.finditer(cst.value):
+                if any(ord(ch) < 32 and ch != "\n" for ch in m.group(1)):
+                    out[-1] += f"（在反引号里：{m.group(1)[:40]!r}）"
+                    break
+            continue
+        quote_at = min((i for i, ch in enumerate(seg) if ch in "\"'"), default=-1)
+        if quote_at < 0 or "r" in seg[:quote_at].lower():
+            continue          # raw 串里 `\n` 就是「反斜杠加 n」那两个字，正是作者要给人看的东西
+        for m in FLOOR_DOC_TICK_PAT.finditer(seg):
+            body = m.group(1)
+            try:
+                dec = codecs.decode(body, "unicode_escape")
+            except Exception:
+                continue      # 解不动的是「不成转义」那一档，由 34g 编译那一路立案，不重复记账
+            ghost = [ch for ch in sorted(set(dec)) if ord(ch) < 32 and ch not in body]
+            if ghost:
+                names = "、".join(FLOOR_CTRL_NAMES.get(ord(c), "U+%04X" % ord(c)) for c in ghost)
+                out.append(f"{rel} 第 {cst.lineno} 行那段 docstring 里，反引号引用的 "
+                           f"{body[:44]!r} 被解出了**原文里并没有的**{names}：反引号里写的就是"
+                           "「字面上长这样」，读源码的人看见那几个字符、读 __doc__ 的人看见"
+                           "控制字符——写成 raw 串或把反斜杠打成两条")
+                break
+    return out
+
+
+def _invalid_escape_problems(files) -> tuple:
+    r"""34g：把每份 .py 原文交给解释器编译一遍，只取它关于转义的那句警告。
+
+    为什么 `ast.parse` 过了不算过：`\.` 这种不成转义的反斜杠解析器照收，只在**编译**那一刻
+    给一句 SyntaxWarning（本轮实测就是门禁自己报的）。返回 `(problems, 扫过的份数)`：
+    份数要被 ✅ 那行念出来，否则「视野断了」与「真没有警告」在输出上完全同形。
+    """
+    out, checked = [], 0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for path, text in files.items():
+            rel = path if isinstance(path, str) else (_rel_posix(path) or str(path))
+            if not rel.endswith(".py"):
+                continue
+            checked += 1
+            try:
+                compile(text, rel, "exec")
+            except Exception:
+                pass        # 解析不过由「连本机都读不懂」那一档报，这里不重复立案
+        for w in caught:
+            if issubclass(w.category, (SyntaxWarning, DeprecationWarning)) \
+                    and "escape" in str(w.message):
+                out.append(f"{w.filename} 第 {w.lineno} 行{w.message}：反斜杠后面跟了个"
+                           "不成转义的字——现在它是警告，CPython 已宣布以后升成 SyntaxError，"
+                           "而打包机那个解释器就是「以后」（把这一处改成 raw 串或双反斜杠）")
+    return out, checked
 
 
 def python_floor() -> tuple:
@@ -7548,6 +7690,7 @@ def check_python_floor(files=None) -> list:
         return path if isinstance(path, str) else (_rel_posix(path) or str(path))
 
     seen_f = seen_fields = 0
+    seen_ctrl = 0
     counted = 0
     fstring_mode = ""
     for path, text in sorted(files.items(), key=lambda kv: _rel(kv[0])):
@@ -7573,6 +7716,13 @@ def check_python_floor(files=None) -> list:
                 line = text.splitlines()[max(node.lineno, 1) - 1].strip()
                 problems.append(f"{rel} 第 {node.lineno} 行用了 {advice}：{line[:100]}｜"
                                 f"打包机只有 {floor[0]}.{floor[1]}（读自 workflow 的 python-version）")
+
+        # 34e/34f 转义立场：这一族不需要超地板的语法，也不需要跑起来，它是「写下的
+        # 与解出的不是同一句」。所以它必须接在本条款已经拿到树的那一圈里（而不是另开一圈：
+        # 两份读法、两个视野，就是本条款本来要治的那个病）。
+        esc_hits = _escape_stance_problems(rel, tree, text)
+        problems.extend(esc_hits)
+        seen_ctrl += len(esc_hits)
 
         got = _fstring_floor_problems(text)
         if got is None:
@@ -7603,6 +7753,13 @@ def check_python_floor(files=None) -> list:
     # 空视野保险放在 full_scan 外面：判据的合同不许随输入来源变。写在 `if full_scan` 里就等于
     # 「只对生产现场负责」，而离线夹具喂进来一份非 .py 时它会默默报绿——下一档夹具就会把这条当成
     # 真判据拿去对拍别的东西（25/26/27 条同一课：能报绿的空集合比不报绿更危险）。
+    # 转义立场那一族（34g）也要同一份视野：写在自己那一圈循环里就会跟着 `continue` 跳过
+    # 解析不过的那一份——而「这一份根本没被看到」恰恰是最要报的事（编译它才能报出警告）。
+    esc, esc_checked = _invalid_escape_problems(files)
+    problems.extend(esc)
+    if counted and esc_checked < counted:
+        problems.append(f"第 34 条扫了 {counted} 份 .py，转义那一路只编译了 {esc_checked} 份："
+                        "两个计数分叉就是有一类文件在某一问里隐身（同一份视野只许一份读法）")
     if counted == 0:
         problems.append("第 34 条视野里一份 .py 都没有"
                         + ("（*_build 与 .github/scripts 全落空）" if full_scan
@@ -7610,7 +7767,8 @@ def check_python_floor(files=None) -> list:
                         + "：这一条在空集合上报绿等于没判")
     if full_scan:
         _FLOOR_FACTS.update(files=counted, fstrings=seen_f, fields=seen_fields,
-                            fstring_mode=fstring_mode or "未扫到任何 f-string")
+                            fstring_mode=fstring_mode or "未扫到任何 f-string",
+                            escape_files=esc_checked, escape_ctrl=seen_ctrl)
         # 空转保险：真源里一份 f-string 都没看到，要么交付链被清空了，要么这一条的视野断了——
         # 两种都不能让它在空集合上报绿（与第 25/26/28 条同一课）。只有「本机分词器判不了这一档」
         # 这一种是结构性的，不算缺陷，但它会被 ✅ 那行原样念出来。
@@ -7940,6 +8098,547 @@ def check_report_path_label(files: dict = None) -> list:
     if not _differ:
         problems.append("第 36 条的差分在本机上不能分辨新旧写法（旧写法算出来也一样）："
                         "这一格已经空转，拿它报绿没有任何担保")
+    return problems
+
+
+# ── 第 37 条：通道账（取页失败）的口径表与念法各只许一把刀 ────────────────────
+# 由来（2026-11-16 实机第十三轮 顺企网）：详情腿 14 次 TLS 握手失败全在日志里，收尾与
+# 实机体检却一起念「取页失败 0 页｜最后一次=（无）」，而汇总行的处方恰好写着「去看取页
+# 失败那一格非零」——等于把人指向一个 0。两层原因叠在一起，都属于「账没错、话说错」，
+# 而下游处方完全相反（改解析 vs 查出口网络）：
+#   ① 记账口径借了拉黑口径：`_note_fetch_fail(deep=True)` 问的是 `request_error_is_connect`，
+#      而那张表刻意不含 TLS（一次证书抖动不该把好主机拉黑，这条纪律本身是对的），于是它
+#      顺带把「这一条腿整条不通」拦在了账本外。
+#   ② 渲染口径拿计数决定原因说不说：`page_fail` 只数列表页（为什么只数见 `_note_page_fail`），
+#      计数为 0 时各处渲染各自 `if page_fail` 闭嘴，那一格就从报告里消失了。
+# 所以这一条钉的四件事：两张口径表必须同源而分列、深链那一支必须只问通道账那一张、
+# 念法只许住在把手里、每一路 stats() 必须把念好的那一句交出去（读家有五处：GUI 看板/
+# 分站 tooltip/健康红牌/会话总账/实机体检，各拼一次就长五种说法）。
+PAGE_LEDGER_SOURCE = "b2bcollect_build/cdp_base.py"
+PAGE_LEDGER_HANDLE = "page_ledger_line"
+# 把手输出模板的两段指纹：只有**合起来**才是「在念那一格」。拿单个词组当抓手会误伤：
+# 第一版就是拿「取页失败」四个字去抓，立刻响四处——gys 的「连续取页失败，改走浏览器渲染」
+# （降级公告）、maimai/期货的「这一页按取页失败记账」（动作说明）、看板的聚合总数（本来就没有
+# 「最后一次」可说）。它们都不是第 37 条要立的那一刀，而误伤一次，下一个真漏接的人就会被
+# 当成噪音放过去（同一族教训见 31f 注释）。所以这里要的是「计数 + 原因」两个槽位同时出现。
+PAGE_LEDGER_WORDS = "取页失败"
+PAGE_LEDGER_SHAPE = "页（最后一次"
+PAGE_LEDGER_STATS_KEY = "page_ledger"                 # 由 stats() 预渲染好的那一格
+PAGE_LEDGER_CONNECT_GATE = "request_error_is_connect"                 # 拉黑口径
+PAGE_LEDGER_ACCOUNT_GATE = "request_error_takes_page_ledger"          # 通道账口径
+PAGE_LEDGER_TABLES = ("DEAD_HOST_KINDS", "PAGE_FAIL_KINDS")
+PAGE_LEDGER_PARSER = "_DEAD_HOST_RE"                  # 两张表共用同一个解释器
+PAGE_LEDGER_DEEP_CALLER = "_note_fetch_fail"          # 深链那一支：只许问第二把门
+PAGE_LEDGER_CASES = (                                 # 把手的行为对拍（带标签，不按下标取）
+    ("列表页整页取不到", 3, "【连不上·无应答】b2b.11467.com:443｜timed out"),
+    ("详情腿整条不通、列表页正常（本轮那一档）", 0,
+     "【TLS握手失败】shop.11467.com｜Hostname mismatch, certificate is not valid"),
+    ("一笔账都没有", 0, ""),
+    ("有原因但没分过型", 0, "HTTP 403 防采插页"),
+    ("套着壳的分型原因", 0, "列表页导航失败（【被拦停】429 需人工验证）"),
+)
+
+
+def _module_assign_node(tree, name):
+    """模块级 ``name = ...`` 右边那个**语法树节点**（不是文本）。没有就交回 None。
+
+    只看 tree.body 不下钻：表住在类里、住在函数里都是分叉的开始（每一路自己造一张表）。
+    为什么这一层要交回节点而不是 unparse 的原文：拿文本再解一次等于把同一件事交给
+    第二把尺（unparse 会按自己的口味丢括号、选引号），而取树只一个把手那条纪律
+    （第 33 条同族，对拍在 frozen AT 节）也不允许门禁里多出一种 `ast.parse(`。
+    """
+    for st in tree.body:
+        if isinstance(st, ast.Assign):
+            for t in st.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    return st.value
+    return None
+
+
+def _module_assign_src(tree, name) -> str:
+    """模块级 ``name = ...`` 右边的原文（unparse）。没有就交回空串。
+
+    只给「要把写法念给人看」的报告用；要按结构判的东西一律走 `_module_assign_node`。
+    """
+    node = _module_assign_node(tree, name)
+    return ast.unparse(node) if node is not None else ""
+
+
+def _table_added_kinds(tree, name, base):
+    """这张表比那张表多出的档位名；结构不是 ``base + (若干档,)`` 时交回 None（由调用方响）。
+
+    为什么不拿 unparse 后的文本比「等于不等于」：`PAGE_FAIL_KINDS = DEAD_HOST_KINDS` 这一刀
+    （把两张表合回一张）在文本上根本不等于 DEAD_HOST_KINDS 的字面值，上一版判据就是这么漏的
+    （离线夹具一跑就诚实地报了 []）。这里按结构认：必须是「那个名字 + 一个非空元组/列表」。
+    """
+    src = _module_assign_node(tree, name)
+    if not (isinstance(src, ast.BinOp) and isinstance(src.op, ast.Add)
+            and isinstance(src.left, ast.Name) and src.left.id == base):
+        return None
+    if not isinstance(src.right, (ast.Tuple, ast.List)):
+        return None
+    return [ast.unparse(e) for e in src.right.elts]
+
+
+def _fn_defs(tree, name):
+    """这份语法树里所有叫这个名的函数节点（含方法）：数量本身就是判据的一部分。"""
+    return [n for n in _walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+
+
+def _page_ledger_behaviour(blocks) -> list:
+    """同一组事实喂两份真把手，必须逐字同答（第 37 条）。
+
+    为什么逐字节比过还要跑这一遍：逐字节只保证「此刻抄得一样」，而这一格的要害是分支——
+    `if page_fail` 包在把手里还是包在调用处，两段字节可以完全一样、说法完全不同（第十三轮
+    那一句正是包在调用处的三处渲染里）。跑一遍才钉得住「计数为 0 也照念原因」。
+    断句口径从 {REASON_HANDLE} 取真源 exec，不在这里手抄一份（同第 30 条纪律）。
+    """
+    if len(blocks) != 2:
+        return []              # 缺镜像由逐字节那一格报，这里不重复立案
+    try:
+        reason_src = (ROOT / REASON_HANDLE).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return [f"读不到 {REASON_HANDLE}（{e}）：断句口径没有真源，行为对拍只能拿手抄的代替"
+                "——那正是第 30 条禁的事"]
+    out, ran = [], {}
+    for rel, src in blocks:
+        ns: dict = {"re": re}
+        try:
+            exec(compile(reason_src, f"<{REASON_HANDLE}>", "exec"), ns)       # noqa: S102
+            exec(compile(src, rel, "exec"), ns)                               # noqa: S102
+            ran[rel] = ns[PAGE_LEDGER_HANDLE]
+        except Exception as e:
+            out.append(f"{rel} 里那份把手 exec 不起来（{type(e).__name__}: {e}）："
+                       "它在 import 时也会带着整条通道一起崩")
+    if len(ran) != 2:
+        return out + [f"第 37 条的行为对拍只跑起来 {len(ran)}/2 份：一份跑不动时"
+                      "「两边同答」是句空话，不许当成通过"]
+    answers = {rel: {lbl: fn(p, e) for lbl, p, e in PAGE_LEDGER_CASES}
+               for rel, fn in ran.items()}
+    (rel_a, _), (rel_b, _) = blocks
+    diff = [f"{lbl}: {rel_a}={answers[rel_a][lbl]!r} {rel_b}={answers[rel_b][lbl]!r}"
+            for lbl, _p, _e in PAGE_LEDGER_CASES
+            if answers[rel_a][lbl] != answers[rel_b][lbl]]
+    if diff:
+        out.append(f"同一组事实喂两份 {PAGE_LEDGER_HANDLE}，{len(diff)} 档不同答：{'；'.join(diff)}："
+                   "→ 通道账这一格在 1688 那条路上与关键词站上念成两句话，"
+                   "用户按哪一句处置都有一半是错的")
+    # 本轮那一档单独钉死：计数为 0、原因在手，塌成空串就是那个谎原地复活
+    if not answers[rel_a]["详情腿整条不通、列表页正常（本轮那一档）"].startswith(
+            f"{PAGE_LEDGER_WORDS} 0 页（最后一次：【TLS握手失败】"):
+        out.append(f"{rel_a} 的把手在「详情腿整条不通」那一档交出 "
+                   f"{answers[rel_a]['详情腿整条不通、列表页正常（本轮那一档）']!r}："
+                   "计数只数列表页，这一档为 0 是设计如此；拿它决定原因说不说，"
+                   "就是第十三轮把 14 次 TLS 失败说成「没有取页失败」的那一刀")
+    if answers[rel_a]["一笔账都没有"] != "":
+        out.append(f"{rel_a} 的把手在「一笔账都没有」那一档交出 "
+                   f"{answers[rel_a]['一笔账都没有']!r}：没发生的事不编一句"
+                   "「取页失败 0 页」给人当证据（名单通道那一格就是如实交空串）")
+    return out
+
+
+def check_page_ledger_gate(files=None) -> list:
+    """通道账：口径表两张同源、深链只问第二把门、念法一处、每一路都透出（第 37 条）。
+
+    `files` 是给反向对照留的注入口（与第 32/33 条同口径）：把真源改回修复前的写法
+    （深链问拉黑表、渲染处再包一层 `if page_fail`、stats 少给那一格）都要响。
+    """
+    problems = []
+    files = _runtime_reason_sources() if files is None else dict(files)
+    if not files:
+        return ["第 37 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「取页失败那一格只有一种念法」这句话没有任何含义"]
+    trees = {}
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        label = _rel_label(path)
+        try:
+            trees[label] = (text, _file_tree(f"37:{label}", text))
+        except SyntaxError as e:
+            problems.append(f"{label} 解析不过（第 {e.lineno} 行 {e.msg}）：第 37 条读不到"
+                            "这一份的写法，按不合格算而不是按「这处没问题」算")
+    if not trees:
+        return problems + [f"第 37 条扫了 0 份源码（视野里 {len(files)} 项全解析失败）：这一条等于没跑"]
+    if PAGE_LEDGER_SOURCE not in trees:
+        return problems + [f"真源不在位：{PAGE_LEDGER_SOURCE} 读不到——通道账这一族又退回各站自己拼"]
+    _src_cdp, tree_cdp = trees[PAGE_LEDGER_SOURCE]
+
+    # 37a 两把门 + 那一句念法 + 两张表，都得住在真源里
+    for name in (PAGE_LEDGER_CONNECT_GATE, PAGE_LEDGER_ACCOUNT_GATE, PAGE_LEDGER_HANDLE):
+        if not _fn_defs(tree_cdp, name):
+            problems.append(f"{PAGE_LEDGER_SOURCE} 里没有 {name}()："
+                            + ("通道账没有比拉黑更宽的那一档口径，TLS/读超时那一类失败又会掉在账外"
+                               if name == PAGE_LEDGER_ACCOUNT_GATE else
+                               "「这一格怎么念」就没有唯一出处，只能退回各处自己拼"))
+    for tab in PAGE_LEDGER_TABLES:
+        if not _module_assign_src(tree_cdp, tab):
+            problems.append(f"{PAGE_LEDGER_SOURCE} 模块级取不到 {tab} 的赋值："
+                            "口径表不在模块顶层，就意味着每一路可以自己再养一张")
+
+    # 37b 两张表必须同源而**分列**（合回一张就是把本轮的修复倒回去）
+    _pfk, _dhk = _module_assign_src(tree_cdp, "PAGE_FAIL_KINDS"), _module_assign_src(
+        tree_cdp, "DEAD_HOST_KINDS")
+    if _pfk and not _dhk:
+        problems.append("PAGE_FAIL_KINDS 引用了 DEAD_HOST_KINDS，但后者在真源里取不到模块级赋值："
+                        "派生关系断了，两张表其实是两份手抄")
+    elif _pfk:
+        _extra = _table_added_kinds(tree_cdp, "PAGE_FAIL_KINDS", "DEAD_HOST_KINDS")
+        if _extra is None:
+            problems.append(f"PAGE_FAIL_KINDS = {_pfk} 不是「DEAD_HOST_KINDS + 若干档」那个形状："
+                            "两张表不再同源，将来给拉黑加一类而忘了给通道账加，表现是"
+                            "「这台已经被熔断了、报告却说不出为什么取不到页」")
+        elif not _extra:
+            problems.append("PAGE_FAIL_KINDS 比 DEAD_HOST_KINDS 多出 0 档（两张表其实是一张）："
+                            "「不想因一次证书抖动拉黑好主机」这条纪律会再次顺带把账拦在门外")
+
+    # 37c 两把门必须用同一个解析器解释那一句原因
+    for name in (PAGE_LEDGER_CONNECT_GATE, PAGE_LEDGER_ACCOUNT_GATE):
+        for node in _fn_defs(tree_cdp, name):
+            if PAGE_LEDGER_PARSER not in ast.unparse(node):
+                problems.append(f"{name}() 没用 {PAGE_LEDGER_PARSER}：换一把正则解释同一句原因，"
+                                "两张表就会对同一句话给出「一个认、一个不认」")
+
+    # 37d 深链那一支只许问通道账那把门（本轮那个谎的正身）
+    deep = _fn_defs(tree_cdp, PAGE_LEDGER_DEEP_CALLER)
+    if not deep:
+        problems.append(f"{PAGE_LEDGER_SOURCE} 里没有 {PAGE_LEDGER_DEEP_CALLER}()："
+                        "「深链失败进不进通道账」这件事没人判，第 37 条的 ① 无对照面")
+    else:
+        dsrc = ast.unparse(deep[0])
+        if f"{PAGE_LEDGER_ACCOUNT_GATE}(" not in dsrc:
+            problems.append(f"{PAGE_LEDGER_DEEP_CALLER}() 里没问 {PAGE_LEDGER_ACCOUNT_GATE}："
+                            "深链失败进账的判据又回到「拿拉黑表当通道表」，TLS 名不符那一档会掉出报告")
+        if f"{PAGE_LEDGER_CONNECT_GATE}(" in dsrc:
+            problems.append(f"{PAGE_LEDGER_DEEP_CALLER}() 里拿 {PAGE_LEDGER_CONNECT_GATE} 判进不进账："
+                            "证书抖动不该拉黑好主机是对的，但把这条纪律顺手用到「这一格要不要说话」上，"
+                            "就是第十三轮那个谎——详情腿 14 次 TLS 失败全掉在账外")
+
+    # 37e 念法只住把手里：视野内任何一份再拼一句「计数+原因」那个形状就响
+    for label, (_t, tree) in sorted(trees.items()):
+        spans = [(n.lineno, n.end_lineno or n.lineno) for n in _fn_defs(tree, PAGE_LEDGER_HANDLE)]
+        for node in _walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            # 字面片段要从**整棵子树**收，不能只收 `node.values` 顶层那几段：
+            # 2026-11-16 写这一条时只看了顶层，于是 `f"…{x or '取页失败 0 页（最后一次：未记录）'}…"`
+            # 这种把整句拼法藏在**占位符里**的写法直接逃掉了（而它恰好就是最像把手的那一句）。
+            # 两个指纹同时出现才响的口径不变，所以中文撞车那四处（降级公告/单页日志/聚合行）仍不误伤。
+            joined = "".join(v.value for v in _walk(node)
+                             if isinstance(v, ast.Constant) and isinstance(v.value, str))
+            if PAGE_LEDGER_WORDS not in joined or PAGE_LEDGER_SHAPE not in joined:
+                continue
+            if any(a <= node.lineno <= b for a, b in spans):
+                continue
+            problems.append(f"{label} 第 {node.lineno} 行自己拼了一句「{PAGE_LEDGER_WORDS}…"
+                            f"{PAGE_LEDGER_SHAPE}…」（计数与原因两个槽位齐全）："
+                            f"通道账那一格只许由 {PAGE_LEDGER_HANDLE} 念出来。"
+                            "多一处拼法就多一种说法，而两种说法里必有一种在计数为 0 时闭嘴")
+
+    # 37f 每一路 stats()：给了计数就必须把念好的那一句一起给出
+    # （按语法里的字符串常量/名字认，不拿 unparse 的文本比：unparse 会按自己的口味选引号，
+    #   拿 '"page_fail"' 去比就只能判到双引号写法——上一版判据靠这个差异漏了一次）
+    for label, (_t, tree) in sorted(trees.items()):
+        for node in _fn_defs(tree, "stats"):
+            lits = {n.value for n in _walk(node)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            names = {n.id for n in _walk(node) if isinstance(n, ast.Name)}
+            if (PAGE_LEDGER_STATS_KEY in lits or PAGE_LEDGER_STATS_KEY in names
+                    or "_list_channel_extras" in names):
+                continue
+            if "page_fail" in lits:
+                problems.append(f"{label} 的 stats() 透出了 page_fail 却没透出 {PAGE_LEDGER_STATS_KEY}："
+                                "读家拿不到念好的一句就会各自拼一遍（看板/tooltip/红牌/总账/体检 五处），"
+                                "而循环依赖纪律不许红牌去 import 把手")
+
+    # 37g 两份镜像把手逐字节相同，再按真源跑一遍行为对拍
+    blocks = []
+    for rel in NC_MIRROR_FILES:
+        if rel not in trees:
+            problems.append(f"镜像 {rel} 不在第 37 条视野里：逐字节对拍没有对照面，这一格等于没判")
+            continue
+        nodes = _fn_defs(trees[rel][1], PAGE_LEDGER_HANDLE)
+        if len(nodes) != 1:
+            problems.append(f"{rel} 里 {PAGE_LEDGER_HANDLE} 取到 {len(nodes)} 处："
+                            "两处=拼法又分叉，零处=把手被改名或删掉，逐字节对拍已无对象")
+            continue
+        blocks.append((rel, ast.get_source_segment(trees[rel][0], nodes[0]) or ""))
+    if len(blocks) == 2 and blocks[0][1] != blocks[1][1]:
+        where = ""
+        for n, (x, y) in enumerate(zip(blocks[0][1].splitlines(), blocks[1][1].splitlines())):
+            if x != y:
+                where = f"（第一段差异：第 {n + 1} 行 {x.strip()[:40]!r} ↔ {y.strip()[:40]!r}）"
+                break
+        problems.append(f"{blocks[1][0]} 里那份内联把手与 {blocks[0][0]} **不是逐字节相同**{where}：\n"
+                        f"   → 同一条网络故障在 1688 那条路上念得完整、其它站念半截，"
+                        "而这种分叉只有换一种异常文本才会暴露（第 30 条同一族教训）")
+    problems += _page_ledger_behaviour(blocks)
+    return problems
+
+
+# ── 第 38 条：「这一路正停在等人」那盏灯只能由把手点亮 ──────────────────────
+# 由来（2026-11-16 第十三轮实机之后自查）：site_adapters 自己养过一张措辞表与一枚
+# `_human_wait_label`，注释写着「与 cdp_base._waiting_human 用同两个词」——而 cdp_base
+# 这一侧从头到尾**没有一处给 `_waiting_human` 赋过值**（只有 init、清空、读取三处）。结果是
+# 关键词站等到超时，实机体检仍写「等人=（无）」，把「人去把验证过完」误诊成「这个平台采不到」。
+# 注释声称同源而代码不同源，比两处分叉更坏：它让下一个来查这问题的人直接跳过这一格。
+# 所以这一条钉五件事：赋值只许来自把手（或交出灭灯值）、措辞表只许住在 WAIT-BLOCK 里、
+# 两份镜像逐字节相同、四条出口共用一个灭灯收口、**这盏灯在全链路里真的被点亮过**
+# （前面几条全绿而没人点灯，恰是本轮那个谎的形状）。
+WAIT_SOURCE = "b2bcollect_build/cdp_base.py"
+WAIT_BLOCK_MARKS = ("# ── [WAIT-BLOCK-BEGIN]", "# ── [WAIT-BLOCK-END]")
+WAIT_HANDLE = "human_wait_label"
+WAIT_LOGIN_HANDLE = "human_wait_is_login"
+WAIT_HOLD = "human_wait_hold"            # 点灯并交回改之前那一格
+WAIT_RELEASE = "human_wait_release"      # 原样归还（传空就是普通灭灯）
+WAIT_LAMP = "_waiting_human"
+WAIT_TABLES = ("LOGIN_WAIT_SENTINEL", "HUMAN_WAIT_LOGIN_WORDS",
+               "HUMAN_WAIT_LOGIN_LABEL", "HUMAN_WAIT_MANUAL_LABEL")
+WAIT_CLEARR = "_after_block_cleared"      # 灭灯收口（四条出口共用的那个 finally）
+WAIT_CASES = (                            # 措辞行为对拍（带标签，不按下标取）
+    ("哨兵值", {}, {"reason": "__LOGIN__"}),
+    ("词表命中：登录", {}, {"reason": "页面要求登录"}),
+    ("词表命中：扫码", {}, {"reason": "等待扫码超时"}),
+    ("词表命中：会话失效", {}, {"reason": "会话失效，取到的是空壳页"}),
+    ("要人过码", {}, {"reason": "429 需人工验证"}),
+    ("调用方已确凿知道在等登录", {"login": True}, {"reason": "看起来不像登录的词"}),
+    ("调用方已确凿知道不是登录", {"login": False}, {"reason": "页面要求登录"}),
+    ("没有任何原因但已在等人", {"login": True}, {"reason": ""}),
+)
+
+
+def _lamp_assigns(tree):
+    """这棵树里所有对 WAIT_LAMP 的赋值 (节点, 右端)。
+
+    AugAssign 也收进来：一盏灯能被 `+=` 就不可能被把手接管，那一形状本身就是分叉，
+    照报而不是当它不存在。"""
+    out = []
+    for node in _walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Attribute) and t.attr == WAIT_LAMP for t in node.targets):
+                out.append((node, node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node.target, ast.Attribute) and node.target.attr == WAIT_LAMP \
+                    and node.value is not None:
+                out.append((node, node.value))
+    return out
+
+
+def _lamp_value_shape(value) -> str:
+    """这盏灯的右端是什么形状：`handle`（把手调用）/ `off`（灭灯）/ 其余交原文。"""
+    if isinstance(value, ast.Constant) and value.value == "":
+        return "off"
+    if isinstance(value, ast.Call):
+        fn = value.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+        if name == WAIT_HANDLE:
+            return "handle"
+    return ast.unparse(value)[:48]
+
+
+def _wait_block_span(text):
+    """WAIT-BLOCK 在这份源码里的行号区间；取不到标记交 None（由调用方响）。"""
+    i, j = text.find(WAIT_BLOCK_MARKS[0]), text.find(WAIT_BLOCK_MARKS[1])
+    if i < 0 or j < 0:
+        return None
+    return (text.count("\n", 0, i) + 1, text.count("\n", 0, j) + 1)
+
+
+def _wait_block_behaviour(blocks) -> list:
+    """同一组拦截原因喂两份真措辞段，必须逐字同答（第 38 条）。
+
+    逐字节相同只保证「抄得一样」；这里跑一遍钉的是三条契约：
+    · 认不出「等的是登录」时走更保守那一档（人工过验证）——说错方向让人白过一遍验证；
+    · 调用方已确凿知道时（显式传 login）措辞层**不许再猜**——否则 1688 的控制流按哨兵值
+      判到了「等登录」，措辞层却可以根据原因里没词而说成「人工过验证」，同一轮里两套话；
+    · 嵌套等待时内层收尾必须**归还外层那一格**而不是清空（爱企查的限额等待会再回调一次
+      过验证；清空就是「人还在验证页前，报告已说这一路没等人」）。
+    """
+    if len(blocks) != 2:
+        return []              # 缺镜像由逐字节那一格报，这里不重复立案
+    out, ran, nss = [], {}, {}
+    for rel, src in blocks:
+        ns: dict = {}
+        try:
+            exec(compile(src, rel, "exec"), ns)                             # noqa: S102
+            ran[rel] = ns[WAIT_HANDLE]
+            nss[rel] = ns
+        except Exception as e:
+            out.append(f"{rel} 里那段 WAIT-BLOCK exec 不起来（{type(e).__name__}: {e}）："
+                       "它在 import 时也会带着整条通道一起崩")
+    if len(ran) != 2:
+        return out + [f"第 38 条的行为对拍只跑起来 {len(ran)}/2 份：一份跑不动时"
+                      "「两边同答」是句空话，不许当成通过"]
+    answers = {rel: {lbl: fn(**kw, **extra) for lbl, extra, kw in WAIT_CASES}
+               for rel, fn in ran.items()}
+    (rel_a, _), (rel_b, _) = blocks
+    diff = [f"{lbl}: {rel_a}={answers[rel_a][lbl]!r} {rel_b}={answers[rel_b][lbl]!r}"
+            for lbl, _e, _k in WAIT_CASES if answers[rel_a][lbl] != answers[rel_b][lbl]]
+    if diff:
+        out.append(f"同一组拦截原因喂两份 {WAIT_HANDLE}，{len(diff)} 档不同答：{'；'.join(diff)}："
+                   "→ 「这一路在等谁」在 1688 与关键词站上念成两句话（本轮那个谎的形状）")
+    a = answers[rel_a]
+    if a["要人过码"] == a["词表命中：登录"]:
+        out.append(f"{rel_a} 里「过验证」与「等登录」念成同一句：处置相反的两件事（"
+                   "去点一下 vs 去扫一下码）合成一个标签，体检报告就开不出方")
+    if a["调用方已确凿知道不是登录"] != a["要人过码"]:
+        out.append(f"{rel_a} 里显式传 login=False 时交出 {a['调用方已确凿知道不是登录']!r}："
+                   "措辞层又在调用方已确凿知道之后自己猜了一次，同一轮里就能长出两套话")
+    if a["调用方已确凿知道在等登录"] != a["词表命中：登录"]:
+        out.append(f"{rel_a} 里显式传 login=True 时交出 {a['调用方已确凿知道在等登录']!r}："
+                   "1688 那一路的控制流就是按这个开关判的，措辞跟不上它就是账上说谎")
+
+    # 灯的状态机：hold 交回的是「改之前」那一格，release 原样归还（不是清成空串）
+    stacks = {}
+    for rel, ns in sorted(nss.items()):
+        if WAIT_HOLD not in ns or WAIT_RELEASE not in ns:
+            out.append(f"{rel} 那段 WAIT-BLOCK 里没有 {WAIT_HOLD}/{WAIT_RELEASE}："
+                       "通道层只能走措辞把手的话，「恢复上一个值」就只能写成旁路赋值")
+            continue
+
+        owner = type("_Owner38", (), {})()
+        first = ns[WAIT_HOLD](owner, "页面要求登录")        # 交出改之前的（空）
+        outer = getattr(owner, WAIT_LAMP, "（那一格不在）")
+        second = ns[WAIT_HOLD](owner, "429 需人工验证")     # 交出改之前的（登录）
+        inner = getattr(owner, WAIT_LAMP, "（那一格不在）")
+        ns[WAIT_RELEASE](owner, second)                     # 内层收尾：归还外层那一格
+        back = getattr(owner, WAIT_LAMP, "（那一格不在）")
+        ns[WAIT_RELEASE](owner, first)
+        ns[WAIT_RELEASE](owner)                             # 不传参就是普通灭灯
+        stacks[rel] = (first, outer, second, inner, back,
+                       getattr(owner, WAIT_LAMP, "（那一格不在）"))
+    if len(stacks) == 2 and stacks[rel_a] != stacks[rel_b]:
+        out.append(f"两份灯的状态机走位不同：{rel_a}={stacks[rel_a]} {rel_b}={stacks[rel_b]}")
+    got = stacks.get(rel_a)
+    if got is not None and got != ("", "登录", "登录", "人工过验证", "登录", ""):
+        out.append(f"{rel_a} 的 {WAIT_HOLD}/{WAIT_RELEASE} 走出 {got}：期望 "
+                   "('', '登录', '登录', '人工过验证', '登录', '')——"
+                   "内层收尾把灯清成空串，外层还在等验证而报告已经不说「在等人」了；"
+                   "把恢复写成重新猜测，同一轮里就能长出两种措辞")
+    if got is not None and "（那一格不在）" in got:
+        out.append(f"{rel_a} 走过一轮 {WAIT_HOLD} 之后身上没有 {WAIT_LAMP} 这一格："
+                   "灯被改名/搬走了，形状判据与所有读家都会瞎（这不是「灯没亮」那种可解释的缺）")
+    return out
+
+
+def check_human_wait_lamp_gate(files=None) -> list:
+    """等人那盏灯：只能由把手点亮、只在收口处灭、措辞只住 WAIT-BLOCK（第 38 条）。
+
+    `files` 是给反向对照留的注入口（与第 32/33/37 条同口径）：把真源改回修复前的写法
+    （灯从不赋值、旁路自己养词表、`_after_block_cleared` 不关灯）都要响。
+    """
+    problems = []
+    files = _runtime_reason_sources() if files is None else dict(files)
+    if not files:
+        return ["第 38 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「等人那盏灯只由把手点亮」这句话没有任何含义"]
+    trees = {}
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        label = _rel_label(path)
+        try:
+            trees[label] = (text, _file_tree(f"38:{label}", text))
+        except SyntaxError as e:
+            problems.append(f"{label} 解析不过（第 {e.lineno} 行 {e.msg}）：第 38 条读不到"
+                            "这一份的写法，按不合格算而不是按「这处没问题」算")
+    if not trees:
+        return problems + [f"第 38 条扫了 0 份源码（视野里 {len(files)} 项全解析失败）：这一条等于没跑"]
+    if WAIT_SOURCE not in trees:
+        return problems + [f"真源不在位：{WAIT_SOURCE} 读不到——措辞段与灯都没有对照面"]
+
+    # 38a 赋值形状：灯只许由把手点亮、由收口处置空，或在真源本体（WAIT-BLOCK）里被接手机
+    lit_anywhere = 0
+    for label, (text, tree) in sorted(trees.items()):
+        span = _wait_block_span(text)
+        for node, value in _lamp_assigns(tree):
+            shape = _lamp_value_shape(value)
+            if shape == "handle":
+                lit_anywhere += 1
+                continue
+            if span and span[0] <= node.lineno <= span[1]:
+                continue      # 块内是灯的状态机本体（hold/release），逐字节+行为两道对拍罩着它
+            if shape == "off":
+                continue
+            problems.append(f"{label} 第 {node.lineno} 行把「这一路在等谁」赋成了 {shape!r}："
+                            f"那一格只许由 {WAIT_HANDLE}() 给出（或由收口处置空）。"
+                            "旁路赋一个字符串（哪怕是把上一个值「恢复」回去），下一轮就没人"
+                            "知道它是不是也在词表上——那件事只能由真源担保")
+    # 38b 这盏灯在全链路里真的被点亮过（形状全绿而没人点灯，就是本轮那个谎）
+    if not lit_anywhere:
+        problems.append(f"交付链里没有一处 `{WAIT_LAMP} = {WAIT_HANDLE}(...)`："
+                        "灯只被 init/清空/读取而从没亮过——形状判据全绿，而报告里永远写"
+                        "「等人=（无）」，把等到超时说成采不到（本轮就是这个形状）")
+
+    # 38c 措辞表/把手只许住在 WAIT-BLOCK 里，且只有镜像那两份许有
+    for rel in NC_MIRROR_FILES:
+        if rel not in trees:
+            problems.append(f"镜像 {rel} 不在第 38 条视野里：逐字节对拍没有对照面，这一格等于没判")
+            continue
+        text, tree = trees[rel]
+        span = _wait_block_span(text)
+        if span is None:
+            problems.append(f"{rel} 里没有 {WAIT_BLOCK_MARKS[0]} 这一段：镜像对拍与「词表只住块内」"
+                            "两条判据都失去边界，改措辞的人无从知道要同步两处")
+            continue
+        for fn in (_fn_defs(tree, WAIT_HANDLE) + _fn_defs(tree, WAIT_LOGIN_HANDLE)
+                   + _fn_defs(tree, WAIT_HOLD) + _fn_defs(tree, WAIT_RELEASE)):
+            if not (span[0] <= fn.lineno <= span[1]):
+                problems.append(f"{rel} 第 {fn.lineno} 行在 WAIT-BLOCK 之外又定义了一枚 "
+                                f"{fn.name}：块外那一份不在逐字节对拍的罩子里，就是第二把刀")
+        for name in (WAIT_HANDLE, WAIT_LOGIN_HANDLE, WAIT_HOLD, WAIT_RELEASE):
+            if not _fn_defs(tree, name):
+                problems.append(f"{rel} 的 WAIT-BLOCK 里没有 {name}()："
+                                + ("通道层「恢复上一个值」就没有合法去处，只能写旁路赋值"
+                                   if name in (WAIT_HOLD, WAIT_RELEASE) else
+                                   "措辞或它的判据被拆掉了，同一件事在两条路上能念成两样"))
+        for name in WAIT_TABLES:
+            for st in tree.body:
+                if isinstance(st, ast.Assign) \
+                        and any(isinstance(t, ast.Name) and t.id == name for t in st.targets) \
+                        and not (span[0] <= st.lineno <= span[1]):
+                    problems.append(f"{rel} 第 {st.lineno} 行在 WAIT-BLOCK 之外定义了 {name}："
+                                    "措辞表分叉一次，同一条拦截在两条路上就念成两件事")
+    for label, (_t, tree) in sorted(trees.items()):
+        if label in NC_MIRROR_FILES:
+            continue
+        stray = [(st.lineno, name) for name in WAIT_TABLES for st in tree.body
+                 if isinstance(st, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == name for t in st.targets)]
+        stray += [(fn.lineno, fn.name) for name in (WAIT_HANDLE, WAIT_LOGIN_HANDLE)
+                  for fn in _fn_defs(tree, name)]
+        for lineno, name in sorted(stray):
+            problems.append(f"{label} 第 {lineno} 行又养了一枚 {name}：措辞只住一处——"
+                            f"镜像那两份逐字节相同，其余各路（含名单通道）一律 import "
+                            f"{WAIT_SOURCE} 里那一份。注释声称同源而代码不同源，比两处分叉更坏："
+                            "它让下一个来查这问题的人直接跳过这一格")
+
+    # 38d 灭灯收口：四条出口（解除/超时/停止/异常）共用一个 finally
+    _t, tree_cdp = trees[WAIT_SOURCE]
+    clear = _fn_defs(tree_cdp, WAIT_CLEARR)
+    if not clear:
+        problems.append(f"{WAIT_SOURCE} 里没有 {WAIT_CLEARR}()：等待的四条出口没有共用的"
+                        "灭灯收口，长亮的灯（人早走了、界面还挂着「等待验证」）与"
+                        "长不亮的灯一样是错账")
+    elif not any(_lamp_value_shape(v) == "off" for _n, v in _lamp_assigns(clear[0])):
+        problems.append(f"{WAIT_CLEARR}() 里没把 {WAIT_LAMP} 置空：这一路已经继续跑了，"
+                        "体检报告还在说「仍在等人工」——那是把好人报成病人")
+
+    # 38e 两份镜像措辞段逐字节相同，再按真源跑一遍行为对拍
+    blocks = []
+    for rel in NC_MIRROR_FILES:
+        if rel not in trees:
+            continue
+        block = _marked_block(trees[rel][0], WAIT_BLOCK_MARKS)
+        if block == "（缺标记）":
+            continue                       # 缺标记由 38c 报，这里不重复立案
+        blocks.append((rel, block))
+    if len(blocks) == 2 and blocks[0][1] != blocks[1][1]:
+        where = ""
+        for n, (x, y) in enumerate(zip(blocks[0][1].splitlines(), blocks[1][1].splitlines())):
+            if x != y:
+                where = f"（第一段差异：第 {n + 1} 行 {x.strip()[:40]!r} ↔ {y.strip()[:40]!r}）"
+                break
+        problems.append(f"{blocks[1][0]} 里那段 WAIT-BLOCK 与 {blocks[0][0]} **不是逐字节相同**{where}：\n"
+                        f"   → 等人措辞又分叉成两套，同一轮拦停能在两条路上念出不同的处置")
+    problems += _wait_block_behaviour(blocks)
     return problems
 
 
@@ -8379,7 +9078,8 @@ def main(argv=None) -> int:
     floor_gaps = check_python_floor()
     if floor_gaps:
         bad += 1
-        print("❌ 交付链里有打包机读不懂的写法（本机解释器比 CI 新，就会把「只在 3.12+ 成立的写法」"
+        print("❌ 交付链里有打包机读不懂的写法，或有一句注释里的反斜杠已经被解成了控制字符"
+              "（本机解释器比 CI 新，就会把「只在 3.12+ 成立的写法」"
               "判成绿：本机全绿、两个平台一起停在构建前硬门，就是这么来的）：")
         for p in floor_gaps:
             print(f"   · {p}")
@@ -8390,7 +9090,9 @@ def main(argv=None) -> int:
               f"扫了 {_FLOOR_FACTS['files']} 份 .py：没用到超出地板的写法（{_FLOOR_FACTS['fstrings']} 个"
               f" f-string 字面量、{_FLOOR_FACTS['fields']} 个替换域逐条走过 Python 自己的分词器；"
               f"f-string 家用法 {len(FLOOR_FSTRING_CASES)} 档、新语法节点 {len(FLOOR_CONSTRUCTS)} 档在表上；"
-              f"f-string 那一路的口径：{_FLOOR_FACTS['fstring_mode']}）")
+              f"f-string 那一路的口径：{_FLOOR_FACTS['fstring_mode']}），而且这"
+              f"{_FLOOR_FACTS['escape_files']} 份原文都真编译过一遍：没一句反斜杠被解成了控制字符、"
+              "也没一句带上不成转义的警告（那句警告在以后的版本里就是 SyntaxError）")
 
     bash_lookup = check_bash_single_lookup()
     if bash_lookup:
@@ -8418,6 +9120,33 @@ def main(argv=None) -> int:
         print("✅ 路径写法归一：报告用的相对路径全部委托 _rel_posix，拿两张真登记表"
               f"（DEV_PATH_EXEMPT / TAB_BODY_EXITS 共 {len(DEV_PATH_EXEMPT) + len(TAB_BODY_EXITS)} 个键）"
               "在 POSIX 与 Windows 两种分隔符形状上都对拍过，旧写法不能分辨新旧这一格也响了")
+
+    ledger_gate = check_page_ledger_gate()
+    if ledger_gate:
+        bad += 1
+        print("❌ 通道账不合格（记账口径借了拉黑那张，或「取页失败」那句被各处自己拼——"
+              "于是详情腿整条不通时，报告只写得出「取页失败 0 页｜最后一次=（无）」）：")
+        for p in ledger_gate:
+            print(f"   · {p}")
+            print(f"::error::通道账口径与念法：{p}")
+    else:
+        print(f"✅ 通道账口径与念法：拉黑与记账两张表同源而分列（共用 {PAGE_LEDGER_PARSER}），"
+              f"深链那一支只问 {PAGE_LEDGER_ACCOUNT_GATE}；那句念法只住在 "
+              f"{PAGE_LEDGER_HANDLE} 里（镜像两份逐字节相同、{len(PAGE_LEDGER_CASES)} 档事实"
+              "真跑过对拍，计数为 0 也照念原因），每一路 stats() 都念好那一格交出去")
+
+    lamp_gate = check_human_wait_lamp_gate()
+    if lamp_gate:
+        bad += 1
+        print("❌ 「这一路正停在等人」那盏灯不合格（旁路自己养措辞表、赋值不走把手、"
+              "或全链路没有一处真的点亮它——灯不亮就等于把等到超时说成采不到）：")
+        for p in lamp_gate:
+            print(f"   · {p}")
+            print(f"::error::等人灯把手：{p}")
+    else:
+        print(f"✅ 等人灯把手：{WAIT_LAMP} 的赋值只来自 {WAIT_HANDLE}()（或由收口处置空），"
+              f"措辞表与两个把手都住在 WAIT-BLOCK 内（镜像两份逐字节相同、{len(WAIT_CASES)} 档"
+              f"原因真跑过对拍），{WAIT_CLEARR}() 统一灭灯，且交付链里确实有点亮它的那一处")
 
     for label, path in CALLERS.items():
         if not path.exists():
@@ -8460,6 +9189,8 @@ def main(argv=None) -> int:
           "交付链每份 .py 都不用到只有打包机那个解释器之后才成立的写法（本机比 CI 新不算绿）、"
           "取 bash 只走一个把手（执行前换成解析出的绝对路径、靠版本横幅认它是不是 bash）、"
           "报告用的相对路径与 git 写法同源（两种分隔符形状都拿真登记表对拍过）、"
+          "通道账的两张口径表同源而分列、那句念法只住一个把手（每一路都念好那一格交出去）、"
+          "等人那盏灯只能由把手点亮且全链路真的点亮过（措辞只住 WAIT-BLOCK、收口统一灭灯）、"
           "注释里每一句指路节号都走得通")
     return 0
 

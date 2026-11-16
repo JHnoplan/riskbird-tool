@@ -1418,8 +1418,12 @@ check("14h 反向对照：旧口径（进过种子库就永不重采）在这张
 # 同一件事两套结论的账，用户按哪一句处置都是错的。
 _FRAG14 = ("增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)",
            "另有 {pend} 家欠补联系人，下轮自动重采",
-           # 收尾「取页失败」片段（挂在结束行的那一笔链路账）
-           'f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"',
+# 通道账那一格（2026-11-16 第十三轮实机后改的）：收尾不再内联拼那句话，两边都调同一个
+# 把手名。钉「函数定义行 + 调用处」两条而不是钉整句 f-string：内联那句一拆成把手，片段
+# 就两边都不在了（上一版夹具正是这样红的），而真正不能退回去的是「只有一处拼法」这件事。
+# 分支对不对不在这里比——片段比不出分支，见 14o 的 exec 对拍。
+           'def page_ledger_line(page_fail, last_page_error, cap=60):',
+           'page_ledger_line(self._page_fail, self._last_page_error)',
            # 「本页一页都没取到」两支出文案：请求层报过错 / 请求层没报错（超末页 404、频控空页）
            'f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"',
            'f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "',
@@ -1545,6 +1549,68 @@ check("14n- 反向对照：把熔断插入语拆掉（退回上一版写法）�
           'else:\n    mark, why = "⚠", "｜本轮零产出（见上方账目）"\n',
           _page_fail=3, stat_listed=0, _dead_hosts={"b2b.11467.com": "…"})[1],
       "拆掉插入语还能渲染出「熔断」=判据在比注释而不是比代码")
+# 14o 通道账那一格的渲染：两边**真的 exec** 同一组事实，必须逐字同答。
+# 为什么 14i 那格片段比完还要再来这一格：这一格的要害是分支（计数为 0 时说不说话），
+# 而分支从片段里看不出来——把 `not pf and not err` 写成 `not pf`、或在调用处再包一层
+# `if page_fail`，定义行与调用行都仍然逐字同在。后者正是本轮修掉的那个谎：顺企网详情腿
+# 14 次 TLS 握手失败全在日志里，计数却是 0（`_page_fail` 只数列表页，见 _note_page_fail），
+# 于是收尾与体检一起念「取页失败 0 页｜最后一次=（无）」，而汇总行的处方写着「去看取页
+# 失败那一格非零」——等于把人指向一个 0。所以这里喂四档事实，重点盯第二档。
+def _fn_src14(src, name):
+    """按名字从源码里抠出一枚模块级函数的**原文**（含 def 行，可独立 exec）。
+
+    只认模块顶层：藏在类里或别的同名函数都算判据抓错了对象，宁可比错之前先响。
+    """
+    hits = [n for n in ast.parse(src).body
+            if isinstance(n, ast.FunctionDef) and n.name == name]
+    if len(hits) != 1:
+        check(f"14o- {name} 在源码里取得唯一（找到 {len(hits)} 处）", False,
+              "两处=拼法又分叉了，零处=把手被改名或删掉，判据已无对拍对象")
+        return ""
+    return ast.get_source_segment(src, hits[0]) or ""
+
+
+_LEDGER_CASES = [
+    ("列表页整页取不到（计数与原因都有）", 3, "【连不上·无应答】b2b.11467.com:443｜timed out"),
+    ("详情腿整条不通、列表页正常（本轮修的就是这一档）", 0,
+     "【TLS握手失败】shop.11467.com｜Hostname mismatch, certificate is not valid"),
+    ("一笔账都没有（不许凭空念一句「取页失败 0 页」当证据）", 0, ""),
+    ("有原因但没分过型（原样念，不许因为认不出类别就整格吞掉）", 0, "HTTP 403 防采插页"),
+]
+_fn14_c = _fn_src14(_src_cdp14, "page_ledger_line")
+_fn14_a = _fn_src14(_src_a1614, "page_ledger_line")
+_ns14 = {"short_reason": cdp_base.short_reason}
+_a14 = dict(_ns14)
+exec(compile(_fn14_c, "<cdp-page-ledger>", "exec"), _ns14)      # noqa: S102
+exec(compile(_fn14_a, "<a1688-page-ledger>", "exec"), _a14)     # noqa: S102
+_cdp_ledger, _a16_ledger = _ns14["page_ledger_line"], _a14["page_ledger_line"]
+_bad14o = [f'{_lbl}: 基类={_cdp_ledger(_p, _e)!r} 1688={_a16_ledger(_p, _e)!r}'
+           for _lbl, _p, _e in _LEDGER_CASES if _cdp_ledger(_p, _e) != _a16_ledger(_p, _e)]
+check(f"14o 同一组事实喂两边 page_ledger_line，{len(_LEDGER_CASES)} 档逐字同答",
+      not _bad14o and len(_LEDGER_CASES) >= 4, str(_bad14o))
+check("14o- 计数为 0 但有原因时**照念**（这一档塌成空串就是本轮那个谎）；"
+      "两半都没有才交空串（没发生的事不编一句话）",
+      _cdp_ledger(0, "【TLS握手失败】shop.11467.com｜Hostname mismatch").startswith(
+          "取页失败 0 页（最后一次：【TLS握手失败】")
+      and _cdp_ledger(3, "") == "取页失败 3 页（最后一次：未记录）"
+      and _cdp_ledger(0, "") == "" and _cdp_ledger(None, "") == "",
+      repr([_cdp_ledger(_p, _e) for _, _p, _e in _LEDGER_CASES]))
+# 反向对照：把上一版的口径（拿计数决定原因说不说）原样 exec 一遍，它必须与把手**不同答**，
+# 否则 14o 比的是函数名而不是分支——恒绿的判据比没有判据更糟（同 14l）。
+_OLD_LEDGER = ("def page_ledger_line(page_fail, last_page_error, cap=60):\n"
+               "    return (f'取页失败 {page_fail} 页（最后一次：'\n"
+               "            f'{short_reason(last_page_error, cap)}）' if page_fail else '')\n")
+_ns_old = dict(_ns14)
+exec(compile(_OLD_LEDGER, "<old-page-ledger>", "exec"), _ns_old)    # noqa: S102
+_old_ledger = _ns_old["page_ledger_line"]
+check("14o-- 反向对照：旧口径在「详情腿不通」那档交出空串（整格消失），与把手不同答；"
+      "在计数非零那档与把手同答（说明差别确实落在分支上，不是随手挑的两句）",
+      _old_ledger(0, "【TLS握手失败】shop.11467.com｜Hostname mismatch") == ""
+      and _old_ledger(3, "【连不上·无应答】b2b.11467.com:443｜timed out")
+      == _cdp_ledger(3, "【连不上·无应答】b2b.11467.com:443｜timed out")
+      and _old_ledger(0, "") == _cdp_ledger(0, ""),
+      repr([_old_ledger(_p, _e) for _, _p, _e in _LEDGER_CASES]))
+
 check("14j 欠账计数真的能数出来（台账里一半待补采就不能报「已经采全」）",
       _cdp_cls._seen_store_pending.__name__ == _a16_cls._seen_store_pending.__name__
       and _a16_cls._seen_store_pending(
@@ -1552,11 +1618,14 @@ check("14j 欠账计数真的能数出来（台账里一半待补采就不能报
                           "_entry_locked": staticmethod(_a16_cls._entry_locked)})()) == 1,
       "数不出「还欠几家」的账目只是把 0 家说成两句好听的话")
 
-# 14k 「0 家」的四类归因（链路没通／在等人／增量库全跳过／真零产出）读的是 stats() 里
-# 同名的四格，不是日志文案。少一路给键，那一队在实机体检里就只剩「采不到」这一个结论
+# 14k 「0 家」的归因（链路没通／在等人／增量库全跳过／真零产出）读的是 stats() 里
+# 同名的几格，不是日志文案。少一路给键，那一队在实机体检里就只剩「采不到」这一个结论
 # ——2026-11-15 那轮 4 站「采不到」逐一定性后没一站是代码问题，缺的就是这几格。
 # 结构判据扫源码，新增通道忘了给键会在门禁里红，而不是等线上出假红。
-_ATTR_KEYS = ("page_fail", "last_page_error", "waiting", "incr_skip")
+# 2026-11-16 补第五键 page_ledger：计数与原因分家后，「这一格怎么念」也必须由 stats()
+# 预渲染好交出去（读家有五处：GUI 看板/分站 tooltip/健康红牌/会话总账/实机体检），
+# 各处自己拼就会长出两种念法——循环依赖纪律见 channel_health 顶部注释。
+_ATTR_KEYS = ("page_fail", "last_page_error", "page_ledger", "waiting", "incr_skip")
 
 
 def _stats_blocks(src):
@@ -1590,7 +1659,7 @@ for _f14 in (HERE / "cdp_base.py", HERE / "site_adapters.py"):
         _m14 = _stats_missing(_b)
         if _m14:
             _bad_stats14.append(f"{_f14.name}: 缺 {'、'.join(_m14)}")
-check("14k 每一路 stats() 都给全「链路/等人」四键（缺一路=那一路的在等人被报成采不到）",
+check("14k 每一路 stats() 都给全「链路/等人」五键（缺一路=那一路的在等人被报成采不到）",
       not _bad_stats14, str(_bad_stats14))
 check("14l 反向对照：少给键的 stats() 确实会被 14k 抓住（这条判据不是摆设）",
       _stats_missing('return {"pages": 0, "ok": 0}') == list(_ATTR_KEYS)

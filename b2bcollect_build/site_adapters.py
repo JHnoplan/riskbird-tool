@@ -284,15 +284,12 @@ LIST_BLOCK_WATCH_HEARTBEAT = 300
 # 轮次用尽（parallel_session._list_block_cycles）才如实结束本路。
 LIST_BLOCK_WATCH_ROUND_MAX = 3600
 
-# 「这一路正停在等人」的原因标签：与 cdp_base._waiting_human / ali1688_crawler 用同两个词
-# （登录／人工过验证）。界面看板、结束日志、实机体检读的是同一个键，措辞在一处分叉，
-# 另一处就会出现「在等登录」被读成「采不到」——2026-11-15 那轮体检正是这么绕的远路。
-_LOGIN_WAIT_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")
-
-
-def _human_wait_label(reason):
-    """拦截原因 → 要等人做什么（"登录" / "人工过验证"）。"""
-    return "登录" if any(w in str(reason or "") for w in _LOGIN_WAIT_WORDS) else "人工过验证"
+# 「这一路正停在等人」的措辞只有一处定义：cdp_base 的 WAIT-BLOCK（`human_wait_label`），
+# 名单通道直接 import 那个把手，1688 镜像那份逐字节相同、由门禁按标记对拍。
+# 本模块以前自己养过一张 `_LOGIN_WAIT_WORDS`，并在注释里写着「与 cdp_base._waiting_human
+# 用同两个词」——而 cdp_base 这一半从来没把那格赋过值（关键词站等到超时，体检报告仍写
+# 「等人=（无）」）。注释声称同源而代码不同源，比两处分叉更坏：它让下一个查这问题的人
+# 直接跳过这一格。现在这里一个词也不定义。
 
 
 def _list_channel_extras(owner):
@@ -301,9 +298,11 @@ def _list_channel_extras(owner):
     page_fail / last_page_error / incr_skip 在名单通道**结构上不存在**：这一路不按页取数据
     （一家一次查询），也不靠种子库去重（防重复由待采名单的 tried 台账负责）。把没发生的
     事编成计数，就是在给归因层造假证据；所以这里如实给 0，真正的链路失败落在 failed 格
-    （OUTCOME_RETRY＝根本没查成），等人工落在 waiting 格（见 _human_wait）。
+    （OUTCOME_RETRY＝根本没查成），等人工落在 waiting 格（见 _human_wait）。渲染好的
+    `page_ledger` 同理交空串：没发生的事不编一句「取页失败 0 页」给人当证据。
     """
     return {"page_fail": 0, "last_page_error": "",
+            "page_ledger": "",
             "waiting": str(getattr(owner, "_waiting_human", "") or ""),
             "incr_skip": 0}
 
@@ -316,15 +315,18 @@ def _human_wait(owner, reason):
     「0 家」就会把「这一路停在验证页前」报成「这个平台采不到」，而正确的处置是
     「人去把验证过完」。用 ctx 包住整段等待，解除／超时／用户停止三条出口共用
     同一个 finally，绝不留下长亮的灯。
+
+    本函数不碰 `_waiting_human` 那一格：点灯与归还都由 cdp_base 的 WAIT-BLOCK 接手
+    （`human_wait_hold` / `human_wait_release`）。以前这里写的是 `owner._waiting_human = prev`
+    一句恢复——语义对（嵌套等待时内层不许灭外层的光），但形状上它是一个旁路赋值：
+    灯只能由把手点亮这条纪律（构建前硬门第 38 条）管不到它，而下一个读代码的人得先
+    相信「prev 确实是上一个把手交出的值」才能确认这里没错。
     """
-    prev = str(getattr(owner, "_waiting_human", "") or "")
-    owner._waiting_human = _human_wait_label(reason)
+    prev = cdp_base.human_wait_hold(owner, reason)
     try:
         yield
     finally:
-        # 恢复而不是清空：爱企查的 _wait_unblock_limited 会再回调 _wait_unblock（嵌套一
-        # 层），直接清空会让外层还在等验证时灯先灭掉（少报「在等人」同样是错账）
-        owner._waiting_human = prev
+        cdp_base.human_wait_release(owner, prev)
 
 
 def _shell_check(result):
@@ -687,6 +689,10 @@ if HAS_1688:
                     "no_contact": no_contact, "failed": failed, "got": len(self.results),
                     "page_fail": self._page_fail,
                     "last_page_error": self._last_page_error,
+                    # 这一格是渲染好的一句（与 cdp_base.stats() 同键、同把手）：各读家自己
+                    # 决定「计数为 0 要不要说原因」就会长出两种念法（由来见 page_ledger_line）
+                    "page_ledger": cdp_base.page_ledger_line(self._page_fail,
+                                                             self._last_page_error),
                     "waiting": self._waiting_human,
                     "incr_skip": self._incremental_skipped,
                     "pf_miss": self._pf_dropped,      # 省份把关：确认外省已排除
@@ -1317,7 +1323,7 @@ if HAS_RB:
         def _wait_unblock(self, reason, max_wait=None):
             cap = int(getattr(self, "block_wait_limit", 600) or 600)
             wait = min(int(max_wait or cap), cap)
-            self._waiting_human = _human_wait_label(reason)   # 等人工期间账目要看得见
+            self._waiting_human = cdp_base.human_wait_label(reason)   # 等人工期间账目要看得见
             try:
                 import block_guard
                 # heal 只做不打断人工的动作（把焦点认领回自己的标签，不导航不刷新）；

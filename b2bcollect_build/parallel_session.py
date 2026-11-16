@@ -881,9 +881,9 @@ class ParallelSession:
                   if (s.get('pf_miss') or s.get('pf_unknown')) else "")
             # 链路/等人两笔跟着汇总账目走：某一路「0 家」的来路要在总账里就说清楚，
             # 不能只写在它自己那一站的结束行里——用户看的是这份汇总（同名口径见 cdp_base）
-            lk = (f"｜取页失败 {s['page_fail']} 页"
-                  f"（最后一次：{short_reason(s.get('last_page_error'), 60)}）"
-                  if s.get('page_fail') else "")
+            # 这一句取采集器渲染好的 page_ledger：它自己不再决定「计数为 0 要不要念原因」
+            # （顺企网 2026-11-16：详情腿 14 次 TLS 失败、列表页全正常，只念计数就全隐身）
+            lk = (f"｜{s['page_ledger']}" if str(s.get('page_ledger') or '').strip() else "")
             wt = f"｜仍在等{s['waiting']}" if str(s.get('waiting') or '').strip() else ""
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
                       f"无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"

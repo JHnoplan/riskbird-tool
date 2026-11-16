@@ -1077,7 +1077,7 @@ def _bash_argv(*rest):
     由来（2026-11-16 云端 Windows run 43860712318）：这一份用例原本有 5 处各自取 bash——4 处
     把裸名字 `"bash"` 直接交给 `subprocess.run`，1 处 `shutil.which("bash")`。在 Mac 与 Linux 上
     两种取法拿到的是同一个程序，所以这条分叉从来没被看见过；Windows 上裸名字走 `CreateProcess`
-    的目录搜索顺序，先命中 `System32\bash.exe`（WSL 存根：它不跑我们的脚本，只答一句 UTF-16 的话
+    的目录搜索顺序，先命中 `System32\\bash.exe`（WSL 存根：它不跑我们的脚本，只答一句 UTF-16 的话
     并以 rc=1 退掉），而 `shutil.which` 按 PATH 拿到的是 Git 的 cygwin——同一轮日志里两句「现场」
     互相打脸，人照着其中一句去查就查不到真原因。第 35 条就是为这一件事立的。
     取不到时返回 (None, 为什么取不到)，调用方要么把它写成一句响的，要么明说跳过，
@@ -9618,12 +9618,13 @@ def first_line(text, limit=120):
     #    想得到的形状，证明不了「今天已经修好的那几处」从此还有人看着。
     #    其中第一行就是本段立项那一行：第十一轮实机报告念出过
     #    `深链被拒: china.makepolo.com 42 次（… 仅这一条深链，通道入）`。
+    #    「健康牌上最后一次取页失败」那一行本来也在这里，2026-11-16 迁到了 AX 节（第 37 条）：
+    #    健康牌现在不自己收口原因了，那一格改读采集器渲染好的 `page_ledger`，因此本族钉子
+    #    在真树上已经是 0 处（不是它漏了，是口径换了主人）——拿旧写法反证第 30 条也不会响，
+    #    因为 `short_reason(...)` 本来就是把手调用；它真正违反的是「念法只住把手」。
     _RETIRE = (
         ("实机报告的渲染层（立项那一行）", "debug/platform_live_check.py",
          "short_reason(v[1], limit)", "str(v[1])[:46]", "读一本"),
-        ("健康牌上最后一次取页失败", "b2bcollect_build/channel_health.py",
-         "short_reason(s.get('last_page_error'), 40)",
-         "str(s.get('last_page_error'))[:40]", "读一本"),
         ("本地压缩包展开失败", "b2bcollect_build/local_scan.py",
          'f"展开时出错：{first_line(e, 80)}"', 'f"展开时出错：{str(e)[:80]}"', "str(e)"),
     )
@@ -10799,6 +10800,80 @@ def test_python_floor_gate():
                         "（两边不一致＝判据比打包机还瞎，那正是本条款要治的病）")
         finally:
             shutil.rmtree(_pd, ignore_errors=True)
+
+    # ── 8) 转义立场（34e/34f/34g，2026-11-16 一次抓到三条，全住在注释与文档里）──
+    #     这一族比超地板的写法更阴：它不需要新解释器就能写出来，也不需要被跑到。
+    #     `System32\bash.exe` 在非 raw 串里是一个退格吃掉那个 b，`D:\a\...` 是响铃+回车，
+    #     拿它当引用写的 `\x00` 是真 NUL，而 `\.` 现在是警告、以后是 SyntaxError。
+    #     三条都是本轮写其它条款时留下的，所以「今天不许误伤」那一半与「必须响」同样重要：
+    #     拿误伤当判据，下一个人会先把门改松。
+    _b8 = chr(92)
+    for _name, _src, _must, _key in (
+        ("反斜杠被解成退格", 'x = "System32' + _b8 + 'bash.exe"' + NL, True, "真的有一个退格 BS"),
+        ("反斜杠被解成 NUL", 'x = "W' + _b8 + 'x00i"' + NL, True, "真的有一个NUL"),
+        ("不成转义的那个点", 'x = "D:' + _b8 + '."' + NL, True, "不成转义的字"),
+        ("docstring 里引用一个换行",
+         'def f():' + NL + '    """裸 `' + _b8 + 'n` 就这样。"""' + NL + '    return 1' + NL,
+         True, "反引号引用的"),
+        # 上面那一档拿长度就能拦，下面两档拿长度就拦不住——它们正是旧口径「反引号里那段
+        # 超过 24 字符就放过」留给的那条缝，而缝里装的恰好是 Windows 路径（`\t`、`\n`）。
+        # 2026-11-16 写完 34f 第一版后拿真树扫了一遍：仓里 6 处「该放过」的写法全都只含
+        # 真换行，所以区分器应该是「这个控制字符是不是转义解出来的」而不是「这段有多长」。
+        ("长路径里被解出的空行（旧口径按长度放过的那一档）",
+         'def f():' + NL + '    """见 `C:' + _b8 + 'network' + _b8 + 'new_dir` 这个目录"""'
+         + NL + '    return 1' + NL,
+         True, "真空行 LF"),
+        ("长路径里被解出的制表符（同一档，`C:\\temp` 那一类）",
+         'def f():' + NL + '    """配置在 `C:' + _b8 + 'tools' + _b8 + 'temp_build_x` 下面"""'
+         + NL + '    return 1' + NL,
+         True, "制表符 TAB"),
+        # 反向：三种「写对了就不许响」的形状。拿误伤当判据，下一个人会先把门改松。
+        ("合法：反引号里真的引用了一段跳行代码（真源现有 6 处就长这样）",
+         'def f():' + NL + '    """卡片 `<a title="x"' + NL + '     href="y"> 一行一个属性"""'
+         + NL + '    return 1' + NL,
+         False, ""),
+        ("合法：反斜杠打成两条再引用（那两个字符就是要显示出来）",
+         'def f():' + NL + '    """源码里写的是 `' + _b8 + _b8 + 'n` 这两个字"""'
+         + NL + '    return 1' + NL,
+         False, ""),
+        ("合法：raw docstring 里引用 `\\n`（本来就不该被解）",
+         'def f():' + NL + '    r"""裸 `' + _b8 + 'n` 就这样。"""' + NL + '    return 1' + NL,
+         False, ""),
+        ("整个常量就是一枚分隔符（写它的人真要那个字节）", 'SEP = "' + _b8 + 'x1e"' + NL, False, ""),
+        ("反斜杠打成两条（本轮给出的修法）", 'x = "System32' + _b8 + _b8 + 'bash.exe"' + NL, False, ""),
+        ("raw 串里的 Windows 路径", 'x = r"D:' + _b8 + 'a' + _b8 + 'riskbird"' + NL, False, ""),
+    ):
+        _probs = gate.check_python_floor(files={"f34e.py": _src})
+        _txt = "".join(_probs)
+        if _must:
+            _assert(_key in _txt,
+                    f"转义对照「{_name}」必须被点名（实际={_probs[:1] or '一声不响'}）")
+            _assert("f34e.py" in _txt, f"转义对照「{_name}」报出来要点名是哪一份")
+        else:
+            _assert_eq([p for p in _probs if "f34e.py" in p], [],
+                       f"转义对照「{_name}」不许误伤（写对了就不许响）：{_probs[:1]}")
+
+    # 真树反证：本轮那三处全部长在门禁自己那份文件里，所以「改回旧写法」不拿合成代码，
+    # 而是拿今天已改准的那一句倒回去——两者都要在（只测合成样品的话，真树再长出第四处也没人拦）。
+    _esc_today = [p for p in gate.check_python_floor() if "控制字符" in p or "不成转义" in p]
+    _assert_eq(_esc_today, [], f"第 34 条转义那一族今天在真树上全绿（实际={_esc_today[:1]}）")
+    _assert(gate._FLOOR_FACTS["escape_files"] == gate._FLOOR_FACTS["files"] > 100,
+            "编译那一路扫的份数要与取树那一路一致且成规模（实得 "
+            + str(gate._FLOOR_FACTS["escape_files"]) + "/" + str(gate._FLOOR_FACTS["files"])
+            + "）：两个计数分叉就是有一类文件在某一问里隐身")
+    _in8 = dict(gate._dev_path_inputs())
+    _k8 = next((p for p in _in8 if str(p).endswith("check_packaging_manifest.py")), None)
+    _assert(_k8 is not None, "门禁真源本身要在第 34 条视野里（它自己也是交付链的一份 .py）")
+    if _k8 is not None:
+        _b8src = _in8[_k8]
+        _assert(_b8src.count("System32" + _b8 + _b8 + "bash.exe") >= 1,
+                "夹具钉的那一句必须还在真树上（漂了＝这一格在空跑）")
+        _in8[_k8] = _b8src.replace("System32" + _b8 + _b8 + "bash.exe",
+                                   "System32" + _b8 + "bash.exe", 1)
+        _got8 = [p for p in gate.check_python_floor(files=_in8) if "退格" in p]
+        _assert(any("check_packaging_manifest.py" in p for p in _got8),
+                f"把门禁自己那句改回旧写法必须响（实际={_got8[:1] or '一声不响'}）")
+
     shutil.rmtree(_tmp, ignore_errors=True)
 
 
@@ -11030,6 +11105,245 @@ def test_path_label_gate():
             f"第 36 条不许在空视野上报绿：{_hits[:2]}")
 
 
+def _ax_files():
+    """拿一份真视野的完整快照：反向对照只改其中那一刀（只喂一份会撞「缺镜像」的噪点）。"""
+    return dict(_manifest_gate()._runtime_reason_sources())
+
+
+def _ax_patch(files, rel, old, new):
+    """把某个文件里的 old 换成 new；old 不在位就直接响——静默没改到等于这一格空转。"""
+    gate = _manifest_gate()
+    key = next((p for p in files if gate._rel_label(p) == rel), None)
+    _assert(key is not None, f"这一格反证要改的文件 {rel} 必须在视野里（不在就只能空转）")
+    text = files[key]
+    _assert(old in text, f"{rel} 里必须还钉得住这一刀（{old[:44]}）——"
+                         "拿不到就是夹具钉的已不是现在那份代码，这一格反证不成立")
+    files[key] = text.replace(old, new)
+    return files
+
+
+def test_page_ledger_gate():
+    """AX. 通道账：两张口径表同源分列、那句念法只住把手（第 37 条硬门）。"""
+    print("\n═══ AX. 取页失败那一格不许说谎：口径两张表、念法一个把手（第 37 条硬门）═══")
+    gate = _manifest_gate()
+
+    # 1) 现状：真源全绿；且行为对拍真的跑了那几档事实（不是视野空了才绿）
+    _assert_eq(gate.check_page_ledger_gate(), [], "第 37 条：通道账在真源上必须全绿")
+    _assert(len(gate.PAGE_LEDGER_CASES) >= 4,
+            f"行为对拍只有 {len(gate.PAGE_LEDGER_CASES)} 档，判不到本轮修的那几类形状就是在空转")
+    _assert_eq(len([c for c in gate.PAGE_LEDGER_CASES if "本轮那一档" in c[0]]), 1,
+               "夹具里必须恰好有一档是「本轮那一档」（少了这一格就在判另一件事）")
+
+    # 2) 本轮那个谎的形状：两份把手同时退化成「拿计数决定原因说不说」。
+    # 逐字节仍相同、调用处也没动，只有行为对拍能看见这一刀——这正是 AX-2 存在的理由。
+    _f = _ax_patch(_ax_files(), "b2bcollect_build/cdp_base.py",
+                   "    if not pf and not err:", "    if not pf:")
+    _f = _ax_patch(_f, "ali1688_build/ali1688_crawler.py",
+                   "    if not pf and not err:", "    if not pf:")
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert(any("详情腿整条不通" in h for h in _hits),
+            f"把手退化成「计数为 0 就闭嘴」时必须响：{_hits[:3]}")
+    _assert(not any("不是逐字节相同" in h for h in _hits),
+            f"两份同步改，逐字节对拍不该抢行为对拍的案子（报了就是拿它冒充行为判据）：{_hits[:3]}")
+
+    # 3) 口径借错表：深链那一支去问拉黑门，就是顺企网那 14 次 TLS 失败掉在账外的正身
+    _hits = gate.check_page_ledger_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/cdp_base.py",
+        f"not {gate.PAGE_LEDGER_ACCOUNT_GATE}(last)", f"not {gate.PAGE_LEDGER_CONNECT_GATE}(last)"))
+    _assert(any("_note_fetch_fail" in h for h in _hits),
+            f"深链那一支借拉黑表必须被点名：{_hits[:3]}")
+
+    # 4) 两张表合回一张：拉黑纪律会再次把账拦在门外（两个分支各验一次，缺一边就是空判）
+    _hits = gate.check_page_ledger_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/cdp_base.py",
+        'PAGE_FAIL_KINDS = DEAD_HOST_KINDS + ("TLS握手失败",)', "PAGE_FAIL_KINDS = DEAD_HOST_KINDS"))
+    _assert(any("那个形状" in h for h in _hits),
+            f"两张表直接合一（不再同源分列）要响：{_hits[:3]}")
+    _hits = gate.check_page_ledger_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/cdp_base.py",
+        'PAGE_FAIL_KINDS = DEAD_HOST_KINDS + ("TLS握手失败",)',
+        "PAGE_FAIL_KINDS = DEAD_HOST_KINDS + ()"))
+    _assert(any("多出 0 档" in h for h in _hits),
+            f"形状对、但比拉黑表多不出任何一档也要响（那一档就是 TLS）：{_hits[:3]}")
+
+    # 5) 第二把刀与少给键：新写一路自己拼那句话 / stats 只给计数不给念法
+    _f = _ax_files()
+    _f[Path("b2bcollect_build/zz_ax_inline.py")] = (
+        'def page_ledger_line(page_fail, last_page_error, cap=60):\n'
+        '    return ""\n\n\ndef render(pf, err):\n'
+        '    return f"取页失败 {pf} 页（最后一次：{err}）" if pf else ""\n')
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert(any("zz_ax_inline.py 第 6 行自己拼了一句" in h for h in _hits),
+            f"再拼一句「计数+原因」那个形状必须响：{_hits[:3]}")
+    _f = _ax_files()
+    _f[Path("b2bcollect_build/zz_ax_stats.py")] = (
+        'class C:\n    def stats(self):\n        return {"page_fail": 0, "got": 0}\n')
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert(any("没透出 page_ledger" in h for h in _hits),
+            f"stats 给了计数不给念法必须响：{_hits[:3]}")
+
+    # 5b) 藏在 f-string **占位符里面**的第二处拼法也要响（这一格是 2026-11-16 补的）：
+    #     上一版 37e 只收 `node.values` 顶层那几段字面，于是探针里那句
+    #     `f"…{_pf_line(st) or '取页失败 0 页（最后一次：未记录）'}…"` 直接逃掉——
+    #     它比顶层写法更像把手（连括号都同），却藏在判据看不见的地方。
+    _f = _ax_files()
+    _f[Path("b2bcollect_build/zz_ax_nested.py")] = (
+        "def render(st, line):\n"
+        "    return f\"  链路: {line or '取页失败 0 页（最后一次：未记录）'}｜\"\n")
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert(any("zz_ax_nested.py 第 2 行自己拼了一句" in h for h in _hits),
+            f"拼法装在占位符里也得点名（否则这一族只要换个写法就永久逃掉）：{_hits[:3]}")
+
+    # 5c) 反向的反向：如实说「没有」的那一句不该被误伤——它只许提计数，不许配原因槽。
+    #     今天真树上的两处就长这个形状（健康牌与实机体检），把它们喂回去必须不响，
+    #     否则下一班会把「如实交空」那一格也改成借把手拼一句。
+    _f = _ax_files()
+    _f[Path("b2bcollect_build/zz_ax_honest_zero.py")] = (
+        "def render(st):\n"
+        "    return f\"链路: {st.get('page_ledger') or '本轮没有取页失败记录'}｜\"\n")
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert_eq([h for h in _hits if "zz_ax_honest_zero.py" in h], [],
+               f"只提计数、不配原因槽的那句不许误伤：{_hits[:3]}")
+
+    # 5d) 真树反证（不是合成代码）：今天已经改成「只念渲染好的那一格」的两处，
+    #     倒回自己拼那一刀必须被第 37 条当场抓住。这一格是从第 30 条的 _RETIRE 里
+    #     迁过来的：那边钉的是「`short_reason(…40)` 在真树恰好一处」，而健康牌现在
+    #     一个 `short_reason(` 都不留（读的是 page_ledger），钉子留在旧口径上只会假响。
+    _RS = dict(gate._runtime_reason_sources())
+    for _label, _rel, _now, _old in (
+        ("健康牌那一格", "b2bcollect_build/channel_health.py",
+         'bits.append(str(s["page_ledger"]))',
+         "bits.append(f\"取页失败 {s['page_fail']} 页（最后一次："
+         "{short_reason(s.get('last_page_error'), 40)}）\")"),
+        ("实机体检的链路行", "debug/platform_live_check.py",
+         "or '本轮没有取页失败记录'", "or '取页失败 0 页（最后一次：未记录）'"),
+    ):
+        _k = next((p for p in _RS if gate._rel_label(p) == _rel), None)
+        _assert(_k is not None, f"{_rel} 必须在第 37 条视野里（读不到就没法做这一格对照）")
+        if _k is None:
+            continue
+        _body = _RS[_k]
+        _assert_eq(_body.count(_now), 1,
+                   f"{_label}：现写法片段在真树上应恰好一处（漂了＝这一格在空跑）")
+        _hits = [h for h in gate.check_page_ledger_gate({**_RS, _k: _body.replace(_now, _old, 1)})
+                 if "自己拼了一句" in h]
+        _assert_eq(len(_hits), 1,
+                   f"{_label}：倒回自己拼必须响一条第 37 条（实际={_hits[:1]}）")
+
+    # 6) 不误伤：中文里带「取页失败」四个字但不是那一格（日志文案／聚合总数）
+    _f = _ax_files()
+    _f[Path("b2bcollect_build/zz_ax_words.py")] = (
+        'def log(last, url, pfail):\n'
+        '    print(f"  ⚠ HTTP 取页失败（{last}）：{url[:70]}")\n'
+        '    print(f"｜取页失败 {pfail} 页")\n'
+        '    print(f"｜{pfail} 路最后一次取页失败但未计入页数")\n')
+    _hits = gate.check_page_ledger_gate(_f)
+    _assert_eq([h for h in _hits if "zz_ax_words.py" in h], [],
+               f"日志文案与聚合行不该被误伤（误伤一次，下一个真漏接的人就被当噪音放过）：{_hits[:3]}")
+
+    # 7) 空转保险：视野一份都没有、只有一份解析不过的 .py、真源不在位，都不许报绿
+    _hits = gate.check_page_ledger_gate({})
+    _assert(any("一份源码都没读到" in h for h in _hits), f"空视野不许绿：{_hits[:2]}")
+    _hits = gate.check_page_ledger_gate({Path("b2bcollect_build/zz_ax_broken.py"): "def ("})
+    _assert(any("扫了 0 份源码" in h for h in _hits),
+            f"全解不过不许默默少一份，要报「等于没跑」：{_hits[:2]}")
+    _hits = gate.check_page_ledger_gate({Path("b2bcollect_build/other.py"): "x = 1\n"})
+    _assert(any("真源不在位" in h for h in _hits), f"真源缺席不许绿：{_hits[:2]}")
+
+
+def test_human_wait_lamp_gate():
+    """AY. 等人那盏灯只能由把手点亮（第 38 条硬门）。"""
+    print("\n═══ AY. 灯不亮就是把「等到超时」说成「采不到」：等人灯只由把手点亮（第 38 条硬门）═══")
+    gate = _manifest_gate()
+
+    # 1) 现状全绿，且措辞档位与灯的状态机都真跑过
+    _assert_eq(gate.check_human_wait_lamp_gate(), [], "第 38 条：等人灯在真源上必须全绿")
+    _assert(len(gate.WAIT_CASES) >= 6,
+            f"措辞对拍只有 {len(gate.WAIT_CASES)} 档，分不出登录/过码两档就是在空转")
+
+    # 2) 本轮那个谎的形状：灯只被 init/清空/读取，从没有一处点亮它（形状判据全绿）。
+    # 三处点灯都在名单上：两份镜像各自那一处 + 名单通道（爱企查）那一处，少改一处就不响。
+    _f = _ax_patch(_ax_files(), "b2bcollect_build/cdp_base.py",
+                   "_waiting_human = human_wait_label(", "_wait_off = human_wait_label(")
+    _f = _ax_patch(_f, "ali1688_build/ali1688_crawler.py",
+                   "_waiting_human = human_wait_label(", "_wait_off = human_wait_label(")
+    _f = _ax_patch(_f, "b2bcollect_build/site_adapters.py",
+                   "_waiting_human = cdp_base.human_wait_label(",
+                   "_wait_off = cdp_base.human_wait_label(")
+    _hits = gate.check_human_wait_lamp_gate(_f)
+    _assert(any("从没亮过" in h for h in _hits),
+            f"灯不亮必须响（本轮那个谎就是这个形状）：{_hits[:3]}")
+    _assert(any("没有 _waiting_human 这一格" in h for h in _hits),
+            f"灯被改名时状态机对拍也得点名（它比「没亮」更难靠肉眼看出来）：{_hits[:3]}")
+
+    # 3) 恢复写成旁路赋值（上一轮 site_adapters 的真实形状），与硬写一句措辞
+    _f = _ax_patch(_ax_files(), "b2bcollect_build/site_adapters.py",
+                   "    prev = cdp_base.human_wait_hold(owner, reason)",
+                   '    prev = str(getattr(owner, "_waiting_human", "") or "")\n'
+                   "    owner._waiting_human = prev")
+    _hits = gate.check_human_wait_lamp_gate(_f)
+    _assert(any("赋成了 'prev'" in h for h in _hits),
+            f"「恢复上一个值」写成旁路赋值也要响：{_hits[:3]}")
+    _hits = gate.check_human_wait_lamp_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/site_adapters.py", "def _shell_check(result):",
+        'def _bad_lamp(owner):\n    owner._waiting_human = "登录"\n\n\ndef _shell_check(result):'))
+    _assert(any("赋成了 \"'登录'\"" in h for h in _hits),
+            f"硬写一个措辞进那一格必须响：{_hits[:3]}")
+
+    # 4) 旁路再养一枚措辞把手（上一轮 site_adapters 那个形状）必须响
+    _hits = gate.check_human_wait_lamp_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/site_adapters.py", "def _shell_check(result):",
+        'def human_wait_label(reason, login=None):\n    return "登录"\n\n\n'
+        'def _shell_check(result):'))
+    _assert(any("又养了一枚 human_wait_label" in h for h in _hits),
+            f"非镜像那两份再定义措辞把手必须响：{_hits[:3]}")
+
+    # 5) 两份镜像分叉：措辞常量改一个字，逐字节与行为两道都得各自响一次
+    _hits = gate.check_human_wait_lamp_gate(_ax_patch(
+        _ax_files(), "ali1688_build/ali1688_crawler.py",
+        'HUMAN_WAIT_MANUAL_LABEL = "人工过验证"', 'HUMAN_WAIT_MANUAL_LABEL = "人工验证"'))
+    _assert(any("不是逐字节相同" in h for h in _hits), f"镜像分叉要逐字节响：{_hits[:3]}")
+    _assert(any("档不同答" in h for h in _hits), f"镜像分叉要行为也响（两道彼此独立）：{_hits[:3]}")
+
+    # 6) 两种生命周期谎：收口不关灯（长亮）/ 归还退化成清空（该亮时不亮）
+    _hits = gate.check_human_wait_lamp_gate(_ax_patch(
+        _ax_files(), "b2bcollect_build/cdp_base.py",
+        '        self._waiting_human = ""\n        self._release_verify_tab()',
+        '        self._release_verify_tab()'))
+    _assert(any("里没把 _waiting_human 置空" in h for h in _hits),
+            f"收口不关灯必须响（人早走了、报告还说在等人）：{_hits[:3]}")
+    _f = _ax_patch(_ax_files(), "b2bcollect_build/cdp_base.py",
+                   'owner._waiting_human = str(prev or "")', 'owner._waiting_human = ""')
+    _f = _ax_patch(_f, "ali1688_build/ali1688_crawler.py",
+                   'owner._waiting_human = str(prev or "")', 'owner._waiting_human = ""')
+    _hits = gate.check_human_wait_lamp_gate(_f)
+    _assert(any("human_wait_release 走出" in h for h in _hits),
+            f"「归还」退化成「清空」：形状合法（在块内）、逐字节仍相同，"
+            f"只有灯的状态机对拍能看见这一刀：{_hits[:3]}")
+    _assert(not any("不是逐字节相同" in h for h in _hits),
+            f"这一刀两份同步改，逐字节对拍不该抢状态机对拍的案子：{_hits[:3]}")
+
+    # 7) 词表被清空（两份同步）：「等登录」退到保守那一档，两道措辞判据必须响
+    _f = _ax_patch(_ax_files(), "b2bcollect_build/cdp_base.py",
+                   'HUMAN_WAIT_LOGIN_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")',
+                   "HUMAN_WAIT_LOGIN_WORDS = ()")
+    _f = _ax_patch(_f, "ali1688_build/ali1688_crawler.py",
+                   'HUMAN_WAIT_LOGIN_WORDS = ("登录", "扫码", "未登录", "会话失效", "空壳")',
+                   "HUMAN_WAIT_LOGIN_WORDS = ()")
+    _hits = gate.check_human_wait_lamp_gate(_f)
+    _assert(any("念成同一句" in h for h in _hits),
+            f"词表清空后「等登录」与「过验证」塌成一句，必须响：{_hits[:3]}")
+
+    # 8) 空转保险
+    _hits = gate.check_human_wait_lamp_gate({})
+    _assert(any("一份源码都没读到" in h for h in _hits), f"空视野不许绿：{_hits[:2]}")
+    _hits = gate.check_human_wait_lamp_gate({Path("b2bcollect_build/zz_ay_broken.py"): "def ("})
+    _assert(any("扫了 0 份源码" in h for h in _hits),
+            f"全解不过不许默默少一份，要报「等于没跑」：{_hits[:2]}")
+    _hits = gate.check_human_wait_lamp_gate({Path("b2bcollect_build/other.py"): "x = 1\n"})
+    _assert(any("真源不在位" in h for h in _hits), f"真源缺席不许绿：{_hits[:2]}")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -11067,6 +11381,8 @@ SECTIONS = (
     test_listing_accountability_gate,
     test_tree_cache_gate,
     test_python_floor_gate,
+    test_page_ledger_gate,
+    test_human_wait_lamp_gate,
 )
 
 
