@@ -188,13 +188,44 @@ def _is_blank_url(url: str) -> bool:
     return any(u.startswith(b) for b in BLANK_TAB_URLS)
 
 
-def list_page_targets(port: int = DUAL_PORT) -> list:
-    """共享浏览器里所有可见页面（type=page）"""
+# Chrome 的 /json/close 是**异步**的：回执 200（body 常写 Target is closing）后，这一枚还能在
+# /json/list 里挂上几百毫秒。只查一次就报「关不掉」会让用户去手动收一枚早就关掉的窗口
+# （2026-11-16 第十二轮实机在 b2bcollect 那一侧刚吃过这个假警）；本目录是独立交付包，
+# 拿不到 `shared_chrome.TAB_CLOSE_SETTLE`，所以内联一份同节奏。
+TAB_CLOSE_SETTLE = (0.2, 0.4, 0.8)
+
+
+class TabListUnavailable(RuntimeError):
+    """标签列表**压根没读到**：这和「读到了、里面是空的」是两句话。
+
+    与 `b2bcollect_build/shared_chrome.py` 同一口径；本目录是独立交付包（装不进那一份），
+    所以内联一份同名同义的把手。为什么要分这一档：旧写法把查询失败吞成 []，于是
+    「已清理 N 个窗口（现在剩 0 个页面）」这句话在控制面不通时照样念得出来——把
+    「我不知道」念成「没事」，用户就不会去查那个其实还挂着的窗口。"""
+
+
+def _first_line(e) -> str:
+    """失败原因只取整行、**不按字符数切**（切在中间就长成半截词，见第 30 条）。"""
+    s = str(e).strip()
+    return s.splitlines()[0] if s else e.__class__.__name__
+
+
+def list_page_targets(port: int = DUAL_PORT, strict: bool = False) -> list:
+    """共享浏览器里所有可见页面（type=page）。
+
+    `strict=False`（默认）查询失败回 []：调用方只把它当「现在挂着哪些窗口」的提示。
+    `strict=True` 把失败原因抛成 `TabListUnavailable`：凡是**拿这份列表当证据下结论**的
+    地方（「这一枚真的关掉了吗」「现在还剩几个」）都必须走这一档。
+    """
     try:
         data = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=3).json()
-    except Exception:
+    except Exception as e:
+        if strict:
+            raise TabListUnavailable(f"{type(e).__name__}：{_first_line(e)}") from e
         return []
     if not isinstance(data, list):
+        if strict:
+            raise TabListUnavailable(f"回执不是一页列表（读到的是 {type(data).__name__}）")
         return []
     return [t for t in data if isinstance(t, dict) and t.get("type") == "page"]
 
@@ -218,7 +249,13 @@ def cleanup_blank_tabs(log, keep_ids=(), port: int = DUAL_PORT) -> int:
     keep_ids 里指定的会话标签即使正好是空白也不关。返回实际关闭数。
     """
     keep = {str(i) for i in keep_ids if i}
-    pages = list_page_targets(port)
+    try:
+        pages = list_page_targets(port, strict=True)
+    except TabListUnavailable as e:
+        # 读不到列表就当「没有空白窗口要洗」然后一声不响地返回 0，与上面那一族同形：
+        # 下一轮开窗占内存的真相就成了没人知道的一件事。这里不猜，只把没核对说出来。
+        log(f"⚠ 清理空白窗口这一步没读到标签列表（{e}）：没核对成，不代表已经干净")
+        return 0
     targets = [t for t in pages
                if _is_blank_url(t.get("url")) and str(t.get("id")) not in keep]
     # 绝不把最后一个窗口也关掉：0 窗口的 Chrome 会让接下来的附加拿不到句柄，
@@ -226,18 +263,51 @@ def cleanup_blank_tabs(log, keep_ids=(), port: int = DUAL_PORT) -> int:
     targets = targets[:max(0, len(pages) - 1)]
     if not targets:
         return 0
-    closed = 0
+    # 回执不是事实：Chrome 的 `/json/close` 是**异步**的（回执 200 后这一枚还能在列表里
+    # 挂上几百毫秒），而对已经不存在的 target 它也回 200（body 写 No such target）。
+    # 旧写法“请求没抛异常”就 `closed += 1`，把两个方向都记错了：没关掉的计成了战绩，
+    # 本来就不在的也算到我们头上。现在先收集“待确认”，统一复查一次列表才下结论。
+    # 而 `except …: pass` 那一格吞掉的正是「这一枚还挂在用户屏幕上」（第 32g 同族）。
+    pending, reasons = [], []
     for t in targets:
         tid = t.get("id")
         if not tid:
             continue
         try:
-            requests.get(f"http://127.0.0.1:{port}/json/close/{tid}", timeout=3)
-            closed += 1
-        except Exception:
-            pass
+            r = requests.get(f"http://127.0.0.1:{port}/json/close/{tid}", timeout=3)
+        except Exception as e:
+            reasons.append(f"关闭请求没送达（{type(e).__name__}：{_first_line(e)}）")
+            pending.append(tid)
+            continue
+        if "no such target" in (getattr(r, "text", "") or "").lower():
+            continue          # 我们动手前它就不在了，不计进「本次清理了几个」
+        pending.append(tid)
+    closed = 0
+    if pending:
+        # 逐次复查（异步关闭要给它落地时间）：任何一次查不到就算关掉，每次都还在才算没关掉
+        still, alive = list(pending), None
+        for gap in TAB_CLOSE_SETTLE:
+            time.sleep(gap)
+            try:
+                alive = {str(x.get("id")) for x in list_page_targets(port, strict=True)}
+            except TabListUnavailable as e:
+                reasons.append(f"复查标签列表没送达（{e}）：{len(still)} 枚不确定还在不在")
+                break
+            still = [tid for tid in still if str(tid) in alive]   # 还在列表里的才算没关掉
+            if not still:
+                break
+        closed = len(pending) - len(still)
+        if still and alive is not None:
+            reasons.append(f"{len(still)} 枚回执 200 但逐次复查仍在列表里")
     if closed:
-        log(f"🧹 已清理 {closed} 个空白窗口（共享浏览器现在剩 {len(list_page_targets(port))} 个页面）")
+        try:
+            tail = f"（共享浏览器现在剩 {len(list_page_targets(port, strict=True))} 个页面）"
+        except TabListUnavailable as e:
+            tail = f"（现在剩几个页面没读到：{e}）"
+        log(f"🧹 已清理 {closed} 个空白窗口{tail}")
+    if reasons:
+        log(f"⚠ 清理空白窗口这一步有 {len(reasons)} 处没做成（{'；'.join(reasons[:3])}）——"
+            f"这里只关空白页、不碰带内容的窗口，看不惯可以手动收")
     return closed
 
 

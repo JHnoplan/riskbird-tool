@@ -201,8 +201,11 @@ w._clear_blocked_state()
 assert w._blocked_info == [] and w.blocked_lbl.isHidden()
 print("⑤ 界面提示：显示/区分平台/解除/收尾 ✓")
 
-# ── 6. 空白窗口清理 ──────────────────────────────────
-TABS = [
+# ── 6. 空白窗口清理：只关空白、keep 生效、不误伤，而且「关掉」只能拿重查当证据 ──
+# 与 b2bcollect 第 32j 条同一族（构建前硬门会扫 riskbird_build）：旧写法把「请求没抛异常」
+# 当成「已关掉」（closed += 1），而 Chrome 的 /json/close 是异步的、对不存在的 target 也回
+# HTTP 200；列表查询失败又吞成 []，于是「剩 0 个页面」这句在控制面不通时照样念得出口。
+ALL_TABS = [
     {"type": "page", "id": "t1", "url": "chrome://newtab/", "title": "新标签页"},
     {"type": "page", "id": "t2", "url": "about:blank", "title": ""},
     {"type": "page", "id": "t3", "url": "https://www.qizhidao.com/companies/1", "title": "企知道"},
@@ -210,13 +213,17 @@ TABS = [
     {"type": "page", "id": "t5", "url": "chrome://new-tab-page/", "title": ""},
     {"type": "service_worker", "id": "s1", "url": "https://x/y", "title": ""},
 ]
-closed = []
+GONE, SHOWN_ONCE, closed = set(), set(), []
+# MODE：lag＝关掉后下一次列表查询里仍看得见（异步落地）；resist＝回执漂亮但永远不掉下去；
+# boom_at＝第 N 次列表查询直接抛挂（控制面不通）。
+MODE = {"lag": False, "resist": (), "boom_at": 0}
+LIST_QUERIES = [0]
 real_get = ds.requests.get
 
 
 class FakeResp:
-    def __init__(self, payload):
-        self._p = payload
+    def __init__(self, payload, text=""):
+        self._p, self.text = payload, text
 
     def json(self):
         return self._p
@@ -224,26 +231,91 @@ class FakeResp:
 
 def fake_get(url, timeout=None):
     if url.endswith("/json/list"):
-        return FakeResp(list(TABS))
+        LIST_QUERIES[0] += 1
+        if MODE["boom_at"] and LIST_QUERIES[0] >= MODE["boom_at"]:
+            raise ConnectionError("127.0.0.1 拒绝连接")
+        shown = [dict(t) for t in ALL_TABS
+                 if t["id"] not in GONE or t["id"] in SHOWN_ONCE]
+        SHOWN_ONCE.clear()
+        return FakeResp(shown)
     if "/json/close/" in url:
-        closed.append(url.rsplit("/", 1)[-1])
-        return FakeResp("Target is being attached")
+        tid = url.rsplit("/", 1)[-1]
+        closed.append(tid)
+        if tid in MODE["resist"]:
+            return FakeResp("", text="Target is closing")   # 回执漂亮，这一枚就是不掉下去
+        if MODE["lag"]:
+            SHOWN_ONCE.add(tid)                             # 本次重查还看得见
+        GONE.add(tid)
+        return FakeResp("", text="Target is closing")
     return FakeResp({})
 
 
 ds.requests.get = fake_get
 try:
+    def _reset():
+        GONE.clear(); SHOWN_ONCE.clear(); closed.clear()
+        LIST_QUERIES[0] = 0
+
     msgs = []
     n = ds.cleanup_blank_tabs(msgs.append, keep_ids=["t5"])
     assert closed == ["t1", "t2"], f"只应关空白页且尊重 keep：{closed}"
-    assert n == 2 and any("已清理 2 个空白窗口" in m for m in msgs)
-    # 没有空白页时不应该有多余动作
-    closed.clear()
-    TABS[:] = [t for t in TABS if t["id"] in ("t3", "t4")]
+    assert n == 2 and any("已清理 2 个空白窗口" in m for m in msgs), msgs
+    assert not any("没做成" in m for m in msgs), msgs
+    # 没有空白页时不应该有多余动作（t1/t2/t5 这三枚空白全从列表里拿掉，只剩两个会话页）
+    _reset()
+    GONE.update(["t1", "t2", "t5"])
     assert ds.cleanup_blank_tabs(msgs.append) == 0 and closed == []
+
+    # 6b 「只信回执」那一族：回执 200 但这一枚就是不掉下去 → 不许记成已清理，必须开口
+    _reset(); MODE["resist"] = ("t1", "t2")
+    msgs = []
+    n = ds.cleanup_blank_tabs(msgs.append, keep_ids=["t5"])
+    assert n == 0, f"回执 200 不等于关掉，两枚都还在列表里却报了战绩：{n}"
+    assert any("没做成" in m and "仍在列表里" in m for m in msgs), msgs
+    MODE["resist"] = ()
+
+    # 6c 我们动手前它就不在了（Chrome 对不存在的 target 也回 200）→ 不计进本次战绩
+    _reset()
+
+    def _fake_get_nosuch(url, timeout=None):
+        if "/json/close/" in url:
+            closed.append(url.rsplit("/", 1)[-1])
+            return FakeResp("", text="No such target id: xxx")
+        return fake_get(url, timeout)
+
+    _keep = ds.requests.get
+    ds.requests.get = _fake_get_nosuch
+    msgs = []
+    n = ds.cleanup_blank_tabs(msgs.append)
+    ds.requests.get = _keep
+    assert n == 0 and not any("已清理" in m for m in msgs), f"本来就不在的算到我们头上了：{n} {msgs}"
+
+    # 6d 开头那份枚举就读不到 → 不许一声不响地回 0（那听起来像「已经干净」）
+    _reset(); MODE["boom_at"] = 1
+    msgs = []
+    assert ds.cleanup_blank_tabs(msgs.append) == 0
+    assert any("没读到标签列表" in m and "ConnectionError" in m for m in msgs), msgs
+
+    # 6e 关闭发了、复查那一步读不到 → 不许说「已清理 N」，要说没核对上
+    _reset(); MODE["boom_at"] = 2
+    msgs = []
+    n = ds.cleanup_blank_tabs(msgs.append)
+    assert n == 0 and any("没送达" in m and "不确定还在不在" in m for m in msgs), f"{n} {msgs}"
+    assert not any("已清理" in m for m in msgs), msgs
+    MODE["boom_at"] = 0
+
+    # 6f 异步落地（关掉后第一次重查仍看得见、下一次才消失）：这一枚确实关掉了，
+    # 只查一次的写法会在这一形上响假警（第十二轮实机中国制造网那句就长这样）；
+    # 而旧写法根本不复查，连这个输入都接不住
+    _reset(); MODE["lag"] = True
+    msgs = []
+    n = ds.cleanup_blank_tabs(msgs.append, keep_ids=["t5"])
+    MODE["lag"] = False
+    assert n == 2 and any("已清理 2 个空白窗口" in m for m in msgs), f"异步落地被判成没关掉：{n} {msgs}"
+    assert not any("没做成" in m for m in msgs), msgs
 finally:
     ds.requests.get = real_get
-print("⑥ 空白窗口清理：只关空白、keep 生效、不误伤 ✓")
+print("⑥ 空白窗口清理：只关空白、keep 生效、回执不算数（重查才算）、读不到要说没读到 ✓")
 
 # ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
 # 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器

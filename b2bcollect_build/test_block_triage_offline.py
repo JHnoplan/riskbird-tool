@@ -2215,10 +2215,15 @@ check("14b 账上没有砍单时返回空串：调用方必须退回旧那句，
 _c14._note_early_skip("橡胶手套")
 _c14._note_early_skip("橡胶手套")
 _c14._note_detail_filter("橡胶手套")
+# 条目账也得记上：第十三轮之前这一句是拿「只有砍单数」的账念出来的，而那种账下
+# 「只回 1 条」与「回 30 条全被砍」长得一模一样（四档分叉见本节 26b）
+_c14._note_listed("橡胶手套", 12)
 _r14 = _c14._kw_zero_reason("橡胶手套")
 check("14b- 有砍单时说清阶段与家数，并明说「不是平台没数据」＋该改判定口径",
       "列表页早过滤砍 2 家" in _r14 and "详情页复核砍 1 家" in _r14
       and "不是平台没数据" in _r14 and "相关性口径" in _r14, _r14)
+check("14b-- 同一句里必须连同「站方回了几条」一起念（只有砍单数时，个位数货源与全被砍两种局"
+      "长得一模一样，处方正好相反）", "累计回 12 条" in _r14 and "另外 9 条没被砍" in _r14, _r14)
 check("14b== 反向对照：旧那三档里根本没有「相关性」这一档（本轮要堵的就是这个洞）",
       "相关性" not in "被拦/链路未通/本页无数据"
       and 'self._kw_zero_reason(kw)' in _crawl_src14
@@ -2227,8 +2232,18 @@ check("14b== 反向对照：旧那三档里根本没有「相关性」这一档�
 
 # 14d/14e 体检器侧：diff=unknown 时有没有砍单账决定 ❌/⚠ 与处方方向
 _k14 = _live._kw_starve({"kw_filtered": {"橡胶手套": 7}}, "橡胶手套")
-check("14d 体检器读得到逐词砍单账（与 cdp_base 同一套键名，十路一把尺子）",
-      _k14 == "详情页复核砍 7 家" and _live._kw_starve({}, "橡胶手套") == "", repr(_k14))
+check("14d 体检器读得到逐词砍单账（与 cdp_base 同一套键名，十路一把尺子）；条目账没记上时"
+      "它必须自己承认「说不出站方回了几条」（拿没记账的数冒充货量是反方向的谎）",
+      _k14 == "详情页复核砍 7 家、站方回货：条目账没记上（说不出这一词站方回了几条）"
+      and _live._kw_starve({}, "橡胶手套") == "", repr(_k14))
+check("14d+- 条目账记上时，同一句要念出自报与解析两个数（两种局处方相反）",
+      _live._kw_starve({"kw_filtered": {"k": 7}, "kw_items": {"k": 7},
+                        "kw_claimed": {"k": 30}}, "k")
+      == "详情页复核砍 7 家、站方回货：自报 30 条、解析到 7 条"
+      and _live._kw_starve({"kw_items": {"k": 9}}, "k") == ""
+      and _live._kw_starve({"kw_early": {"k": 2}, "kw_claimed": {"k": 2}}, "k")
+      == "列表页早过滤砍 2 家、站方回货：自报 2 条",
+      _live._kw_starve({"kw_filtered": {"k": 7}, "kw_items": {"k": 7}}, "k"))
 _m14, _v14 = _live._attrib({"listed": 47, "kw_filtered": {"橡胶手套": 7}}, 39, False, "",
                            diff="unknown", peer=60, killed="「橡胶手套」" + _k14)
 check("14d- 差分没跑成＋账上有砍单：必须红，处方改成「判定口径」，不许再劝人换词复跑",
@@ -2256,6 +2271,61 @@ check("14f- 聚合键必须复用 cdp_base 那一份（两处各算一遍，口�
 check("14f== 反向对照（旧渲染）：按主机逐家拼接的那句 3000 字文案不许复活在体检器里",
       "sorted(_deep.items())" not in _fn_seg(_LIVE_SRC, "_fmt_site")
       and "_deep_group(" in _fn_seg(_LIVE_SRC, "_fmt_site"))
+
+# 14f2 同一本账两种念法（2026-11-16 第十二轮实机 马可波罗）：体检器那边 14f 早就按主域
+# 聚合了，采集器收尾那一行却还在按主机逐家拼接——46 家商铺念出 1254 字，读数的人读不动，
+# 「这一条腿今天不通」就又回到没人看见。两边必须共用同一个聚合键、同一个把手。
+_AH14 = {f"shop{i}.cn.makepolo.com": [1, "HTTP 403（这一家的这条资源不给看）"] for i in range(46)}
+_AH14["a.aipage.net"] = [3, "HTTP 403"]
+_acct14 = _c14._host_account_line(_AH14, "深链被拒")
+check("14f2 采集器收尾那一行也按主域聚合：46 家商铺并成一段、次数照加（旧写法同输入 1254 字）",
+      _acct14 == "｜深链被拒 cn.makepolo.com 46 次、a.aipage.net 3 次"
+      and len(_acct14) < 60
+      and len("｜深链被拒 " + "、".join(f"{h} {v[0]} 次" for h, v in sorted(_AH14.items()))) > 1000,
+      _acct14)
+check("14f2- 段内按次数降序：把只挂 1 次的那家排在最前，读的人第一眼看到的就是最不重要的那条",
+      _c14._host_account_line({"a.x.com": [1, "r"], "b.x.com": [9, "r"],
+                               "c.y.com": [4, "r"]}, "落点不符")
+      == "｜落点不符 b.x.com 9 次、c.y.com 4 次、a.x.com 1 次")
+check("14f2== 空账返回空串：调用方据此**不说**这一格（拿「｜深链被拒 0 次」顶上去＝凭空造一格）",
+      _c14._host_account_line({}, "深链被拒") == ""
+      and _c14._host_account_line(None, "深链被拒") == "")
+check("14f2=== 聚合键只认 _deep_log_key 那一份（14f- 已把体检器那一侧钉住，这一条钉采集器这一侧）",
+      "_deep_log_key" in _fn_seg(_HTTP_SRC["cdp_base.py"], "_host_account_line"))
+_TITLE14 = ("深链被拒", "落点不符")
+
+
+def _acct_off_helper(src_text):
+    """收尾那两笔主机账「念出来时没走把手」的那几处：标题字面量只许出现在
+    `_host_account_line(...)` 的实参里。按 AST 认，注释里的旧写法不算（同 23g 那条教训：
+    把旧写法写进注释就集体失灵）。"""
+    _t14o = _ast.parse(src_text)
+    _p14o = {}
+    for _n14o in _ast.walk(_t14o):
+        for _c14o in _ast.iter_child_nodes(_n14o):
+            _p14o[_c14o] = _n14o
+    bad = []
+    for _n14o in _ast.walk(_t14o):
+        if not (isinstance(_n14o, _ast.Constant) and isinstance(_n14o.value, str)
+                and any(x in _n14o.value for x in _TITLE14)):
+            continue
+        _par14 = _p14o.get(_n14o)
+        if (isinstance(_par14, _ast.Call) and isinstance(_par14.func, _ast.Attribute)
+                and _par14.func.attr == "_host_account_line"):
+            continue
+        bad.append((_n14o.lineno, _n14o.value[:24]))
+    return bad
+
+
+check("14f2==== 结构判据：收尾那两笔主机账只许由把手念出来（退回就地拼接、或把手换个名字，都当场响）",
+      not _acct_off_helper(_crawl_src13), str(_acct_off_helper(_crawl_src13)))
+_old14f2 = ('if s.get("deep_block"):\n    lk += "｜深链被拒 " + "、".join(\n'
+             '        f"{h} {v[0]} 次" for h, v in sorted(s["deep_block"].items()))\n')
+check("14f2===== 判据不是空跑：修复前那三行与「把手改名」两种形状喂给同一条判据都必须响并点出行号"
+      "（永真式反向对照比没有更坏：下一次真分叉会混在噪音里）",
+      _acct_off_helper(_old14f2) == [(2, "｜深链被拒 ")]
+      and _acct_off_helper('lk += self._acct(s.get("deep_block"), "深链被拒")\n') == [(1, "深链被拒")],
+      f"{_acct_off_helper(_old14f2)} ↔ {_acct_off_helper('lk += self._acct(s.get(\"deep_block\"), \"深链被拒\")\n')}")
 
 # 14g 同族类目桥：这一词被砍光的根因修复（实机取证写进表注释，泛词一律不收）
 import keyword_expander as _ke14                                    # noqa: E402
@@ -4752,6 +4822,24 @@ class _Resp25j:
         self.status_code, self.text = status, text
 
 
+class _Seq25j:
+    """按脚本回标签列表的假把手：`pages` 里每一项是一次查询的结果（或一个异常）。
+
+    连 `strict` 一起记下来：25j-9= 要验的就是「拿列表当证据的那一次走的是严格口径」。
+    脚本用完后重复最后一项（而不是报 IndexError）：那样才能拿「查了几次」当差分证据。
+    """
+
+    def __init__(self, pages):
+        self.pages, self.calls = list(pages), []
+
+    def __call__(self, port=9255, strict=False, **_):
+        self.calls.append((port, strict))
+        item = self.pages[min(len(self.calls) - 1, len(self.pages) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class _Local25j:
     """假的本机控制面：可按脚本回响应，也可把请求直接抛挂。"""
 
@@ -4770,7 +4858,7 @@ class _Local25j:
 
 try:
     _sc25.local_session = lambda: _Local25j()
-    _sc25.list_page_targets = lambda port=9255: []
+    _sc25.list_page_targets = lambda port=9255, **_: []
     check("25j-1 没给 target_id 时不许回空串（什么都没关却说「已还完」是同一句谎）",
           "没关" in (_sc25.close_tab(9255, "") or ""), repr(_sc25.close_tab(9255, "")))
 
@@ -4783,10 +4871,46 @@ try:
     check("25j-3 关完再查一次列表，查不到才算真的关掉（Chrome 对不存在的 target 也回 200，"
           "只信回执就会被它骗成成功）",
           _sc25.close_tab(9255, "TAB-GONE") == "", repr(_sc25.close_tab(9255, "TAB-GONE")))
-    _sc25.list_page_targets = lambda port=9255: [{"id": "TAB-ALIVE", "url": "https://x/"}]
+    _sc25.list_page_targets = lambda port=9255, **_: [{"id": "TAB-ALIVE", "url": "https://x/"}]
     _why25j2 = _sc25.close_tab(9255, "TAB-ALIVE")
     check("25j-4 回执 200 但标签还在列表里时不许当作成功（带上回执给人看）",
           "标签仍在列表里" in _why25j2 and "HTTP 200" in _why25j2, repr(_why25j2))
+
+    # 25j-9/10：同一枚标签的「在不在」只能拿复查当证据，而证据本身也有读不到的时候。
+    # 由来（2026-11-16 第十二轮实机 中国制造网）：收工那行「标签仍在列表里（关闭回执 HTTP 200
+    # Target is closing）」是一句假警——Chrome 的 /json/close 是异步的，回执 200 时这一枚还能
+    # 在 /json/list 里挂上几百毫秒，旧写法只查一次就把「还在收尾」说成「没关掉」。
+    _sq25j = _Seq25j([[{"id": "TAB-LATE"}], [], []])
+    _sc25.list_page_targets = _sq25j
+    _why25j9 = _sc25.close_tab(9255, "TAB-LATE")
+    check("25j-9 回执 200 后第一次复查仍在、第二次不在 → 不许报失败（旧写法只查一次，"
+          "就在这一形上响假警；本项输入它能接住、旧写法接不住，不是拿旧样本喂判据）",
+          _why25j9 == "" and len(_sq25j.calls) == 2, repr(_why25j9) + " " + str(_sq25j.calls))
+    check("25j-9= 拿列表当证据的那几次查询必须全部走严格口径（strict=True）：默认口径读不到时"
+          "回 []，「控制面不通」会被念成「已经还完」", all(s for _, s in _sq25j.calls),
+          str(_sq25j.calls))
+    _sq25j2 = _Seq25j([[{"id": "TAB-REALLY-ALIVE"}]])
+    _sc25.list_page_targets = _sq25j2
+    _why25j9b = _sc25.close_tab(9255, "TAB-REALLY-ALIVE")
+    check("25j-9== 每次都查到在才算真没关掉，并把「复查了几次」交上去（读的人才知道这不是"
+          "没等够，而是真的没关掉）",
+          "标签仍在列表里" in _why25j9b and f"{len(_sc25.TAB_CLOSE_SETTLE)} 次" in _why25j9b
+          and len(_sq25j2.calls) == len(_sc25.TAB_CLOSE_SETTLE),
+          repr(_why25j9b) + " " + str(len(_sq25j2.calls)))
+    _sq25j3 = _Seq25j([[]])
+    _sc25.list_page_targets = _sq25j3
+    check("25j-9=== 第一次就不在 → 只查一次就收（不许为了兜圈盲睡三轮，收工是八路并行的）",
+          _sc25.close_tab(9255, "TAB-QUICK") == "" and len(_sq25j3.calls) == 1,
+          str(_sq25j3.calls))
+    _sq25j4 = _Seq25j([_sc25.TabListUnavailable("ConnectionError: 127.0.0.1 拒绝连接")])
+    _sc25.list_page_targets = _sq25j4
+    _why25j10 = _sc25.close_tab(9255, "TAB-UNKNOWN")
+    check("25j-10 复查本身没送达时不许回空串（旧写法：查询失败吞成 [] → 「不在了」 → 向用户"
+          "宣布已还完，与 32e/32g 那一族同形）",
+          _why25j10 != "" and "没送达" in _why25j10 and "手动确认" in _why25j10
+          and "ConnectionError" in _why25j10, repr(_why25j10))
+    check("25j-10= 也不许把它说成「仍在列表里」：我们根本没看见它在不在了，只能说没核对上",
+          "仍在列表里" not in _why25j10, repr(_why25j10))
 
     # release_tabs：拿到的事实必须点名说出来，而且不能因为一枚没关就少关下一枚
     _at25j, _lg25j = [], []
@@ -4798,12 +4922,20 @@ try:
     _real_close_keep = _sc25.close_tab
     _sc25.close_tab = _fake_close25j
     try:
-        _sc25.list_page_targets = lambda port=9255: [{"id": "A"}, {"id": "B"}, {"id": "C"}]
+        _sc25.list_page_targets = lambda port=9255, **_: [{"id": "A"}, {"id": "B"}, {"id": "C"}]
         _sc25.release_tabs(["A", "B"], 9255, lambda m: _lg25j.append(m))
         check("25j-5 收工批次里每一枚都要试过（没关掉那一枚不许把计数减掉，否则下一枚被连带不关）",
               _at25j == ["A", "B"], str(_at25j))
         check("25j-6 批次收工里没关掉的那一枚必须点名（旧写法连 log 参数都从不调用）",
               len(_lg25j) == 1 and "A" in _lg25j[0] and "手动" in _lg25j[0], str(_lg25j))
+        # 同一批收工的另一条死路：列表本身读不到 → `keep_alive = len([]) = 0` → `keep_alive > 1`
+        # 把整批归还动作全跳过，日志却照旧一路念到「收工」（这一枚标签根本没人去关）。
+        _lg25j11 = []
+        _sc25.list_page_targets = _Seq25j([_sc25.TabListUnavailable("ConnectionError: 控制面不通")])
+        _sc25.release_tabs(["T1", "T2"], 9255, lambda m: _lg25j11.append(m))
+        check("25j-11 收工批次里列表读不到时必须开口（不许一声不响地把整批归还跳过去）",
+              len(_lg25j11) == 1 and "没核对" in _lg25j11[0] and "手动确认" in _lg25j11[0]
+              and "ConnectionError" in _lg25j11[0], str(_lg25j11))
     finally:
         _sc25.close_tab = _real_close_keep
 
@@ -5024,6 +5156,461 @@ check("25i-5 处方只说自己那一档：no_page 不许顺手把站方那几�
               for w in ("该修我们的解析", "站方自己没登", "根本没有联系方式栏")),
       _plc25._nc_advice({"nc_kinds": {"no_page": 3}}))
 
-print("㉕ 无联系方式分档 + 砍单记名 + 借标签归还：三本账各自只有一个把手，并被四处读到 ✓")
+# ── 25k 证据那句话本身：120 字窗口切在标签中间时，报告里不许留下没合口的半截标签 ──
+# 由来（2026-11-16 第十二轮实机 马可波罗）：账目行末尾那句
+#   ｜无联系方式分档：站方藏着 …… 9 家（证据：联系电话 ：→点击查看联系 <img style="margi）
+# 一句话里两处「半截词就是说谎」：`margi` 是被裸字符切砍掉一半的属性名，而整句读起来
+# 像我们的解析坏了——页面上写的其实只是「点击查看联系」（站方藏着，该换通路不该改代码）。
+_SLOT_DANGLE = ('<td>联系电话</td><td>：</td>'
+                '<a href="#" style="margin-top: 5px">点击查看联系</a><img style="margi')
+_k25k, _e25k = cdp_base.contact_slot_state(_SLOT_DANGLE)
+check("25k 尾巴不许影响档位（判定仍用完整窗口，切晚了才不会把 hidden 判成别的档）",
+      _k25k == "hidden", f"{_k25k} {_e25k}")
+check("25k- 证据里没有没合口的标签、也没有被砍成一半的属性名（`<` 要么带 `>` 一起留下、要么整截收掉）",
+      "<" not in _e25k and "margi" not in _e25k, _e25k)
+check("25k-2 收掉尾巴不等于收掉证据：页面原文那三个字必须还在（下一轮要靠它去页面上核对）",
+      "点击查看" in _e25k, _e25k)
+_old25k = ""
+for _m25k in cdp_base.CONTACT_SLOT_LABEL_RE.finditer(_SLOT_DANGLE):
+    _w25k = re.sub(r"\s+", " ", cdp_base.CONTACT_SLOT_TAG_RE.sub(
+        " ", _SLOT_DANGLE[_m25k.end():_m25k.end() + 120])).strip()
+    if any(h in _w25k[:16] for h in cdp_base.CONTACT_SLOT_HIDDEN):
+        _old25k = f"{_m25k.group(0).strip()}→{_w25k[:24]}"      # 旧那一刀：裸字符切、不剥尾巴
+        break
+check("25k== 判据不是空跑：同一份 HTML 走修复前那一刀，必须真能现出那截没合口的尾巴"
+      "（不然上面三条就是在空集合上报绿；差分只看「尾巴没合口」这一性质，不看具体断在哪几个字——"
+      "断点随窗口起点偏移而变，性质才随写法而变）",
+      "<" in _old25k and ">" not in _old25k.split("<", 1)[1] and "<" not in _e25k, _old25k)
+for _in25k, _want25k in (("点击查看<img style=\"margi", "点击查看"),
+                         ("登录可见</a><img src=\"a", "登录可见</a>"),
+                         ("价格 <100 元", "价格 <100 元"),            # 正文里的裸 `<` 不是标签
+                         ("a < b 登录后可见", "a < b 登录后可见"),
+                         ("<a href=\"tel:13800138000", "<a href=\"tel:13800138000")):
+    _got25k = (cdp_base.CONTACT_SLOT_DANGLING_RE.sub("", _in25k).strip() or _in25k)
+    check(f"25k-3 尾巴小刀只切「没合口的标签」：{_in25k!r} → {_want25k!r}"
+          f"（切错方向就会把真证据吃掉，那比半截词更糟）", _got25k == _want25k, _got25k)
+_k25k4, _e25k4 = cdp_base.contact_slot_state('<p>联系电话</p><td><a href="tel:13800138000')
+check("25k-4 整窗就是一截未合口标签时退回原文而不是编一句漂亮话：那一截里真有号码，"
+      "它是 miss 档唯一的凭据（换成「看不到」这种话等于把号码从证据里弄没）",
+      _k25k4 == "miss" and "13800138000" in _e25k4, f"{_k25k4} {_e25k4}")
+_LONGWIN25k = '<p>联系电话：</p>' + "点击查看，厂家直营支持定制可开票据，" * 4
+_k25kl, _e25kl = cdp_base.contact_slot_state(_LONGWIN25k)
+check("25k-5 生成处不再管长度：窗口里多长就交多长（旧写法先按 24 字一刀把句子砍在词中间，"
+      "而渲染那一刀本来就会把整句收到人眼读得动的长度——两把刀上限互相不知情，留一把就够）",
+      _k25kl == "hidden" and len(_e25kl) > len("联系电话：→") + 24, f"{_k25kl}｜{len(_e25kl)} 字｜{_e25kl[:40]}")
+_line25kl = cdp_base.nc_kinds_text({_k25kl: 1}, {_k25kl: _e25kl})
+check("25k-6 但渲染那一刀必须在：整句有界、括号成对（一刀都不切就变回 120 字 × 六档没人读得动，"
+      "而「只许一刀」被人拆成零刀同样是这一条要拦住的事）",
+      len(_line25kl) < 160 and _line25kl.count("（") == _line25kl.count("）"), _line25kl)
+
+# 32i 的真身跑在真源上（不另写一份离线副本：两份实现早晚分叉，这里要钉的就是门禁本体）
+check("25k-7 两份镜像现网都绿：分档证据这一本账只挨了渲染那一刀（32i 本尊）",
+      not _g32._nc_evidence_no_cut_problems("cdp_base.py", _ast.parse(_HTTP_SRC["cdp_base.py"]))
+      and not _g32._nc_evidence_no_cut_problems("ali1688_crawler.py",
+                                                _ast.parse(_SRC14["ali1688_crawler.py"])),
+      " ｜ ".join((_g32._nc_evidence_no_cut_problems("cdp_base.py", _ast.parse(_HTTP_SRC["cdp_base.py"]))
+                   + _g32._nc_evidence_no_cut_problems("ali1688_crawler.py",
+                                                       _ast.parse(_SRC14["ali1688_crawler.py"]))
+                   )[:2]))
+for _lbl25k, _old25k_a, _new25k_a, _shape25k in (
+        ("记账处退回预收口", "self._nc_evidence[kind] = evid.strip()",
+         "self._nc_evidence[kind] = short_reason(evid, 60)", "short_reason"),
+        ("生成处裸字符切", 'best, evid = kind, f"{m.group(0).strip()}→{tail}"',
+         'best, evid = kind, f"{m.group(0).strip()}→{show[:24]}"', "切到 24 字"),
+        ("换个名字再切（两步写法）", 'tail = CONTACT_SLOT_DANGLING_RE.sub("", show).strip() or show',
+         "tail = show[:24]", "切到 24 字"),
+        ("渲染那一刀被拆掉", 'one += f"（证据：{short_reason(ev[k], 46)}）"',
+         'one += f"（证据：{ev[k]}）"', "一处都没收口")):
+    _base25k = _HTTP_SRC["cdp_base.py"]
+    _mut25k = _base25k.replace(_old25k_a, _new25k_a, 1)
+    check(f"25k-7- 「{_lbl25k}」这一形要在样本里真改得动（改不动就是拿旧样本喂判据，"
+          f"下一条「必须响」就变成永真）", _mut25k != _base25k, _old25k_a[:60])
+    _got25k7 = _g32._nc_evidence_no_cut_problems(_lbl25k, _ast.parse(_mut25k))
+    check(f"25k-7== 「{_lbl25k}」必须响并点名形状（{_shape25k}）：只改一行的分叉也要接住",
+          any(_shape25k in x for x in _got25k7), str([x.splitlines()[0][:70] for x in _got25k7]))
+check("25k-7=== 120 字窗口不算收口（它有下界，算「取哪一段正文」）：误伤一次，"
+      "下一次就有人把这一条改成永真",
+      "25 字" not in "".join(_g32._nc_cut_shapes(
+          _ast.parse("def f(page, m):\n    return page[m.end():m.end() + 120]\n"))),
+      str(_g32._nc_cut_shapes(_ast.parse("def f(page, m):\n    return page[m.end():m.end() + 120]\n"))))
+_c25._nc_kinds, _c25._nc_evidence, _c25._detail_html = {}, {}, ""
+_c25.NO_DETAIL_EVIDENCE = "本站详情只取列表卡字段（靠列表明文组装）" * 4      # 长过旧那把 60 字的刀
+_c25._note_no_contact()
+check("25k-8 账上存原文：长过 60 字的声明不再被记账那一刀砍成「…」——旧写法先切 60、渲染再切 46，"
+      "两把刀的上限互相不知情（把渲染上限调到 90 也照样只看到 60 那刀留下的省略号）",
+      "…" not in _c25._nc_evidence["no_page"]
+      and _c25._nc_evidence["no_page"] == _c25.NO_DETAIL_EVIDENCE,
+      _c25._nc_evidence["no_page"][:70])
+_line25k = cdp_base.nc_kinds_text({"no_page": 2}, dict(_c25._nc_evidence))
+check("25k-9 渲染那一刀仍是唯一一刀：句子有界、括号成对（切在人眼读得动的长度上，不切在词中间）",
+      len(_line25k) < 140 and _line25k.count("（") == _line25k.count("）"), _line25k)
+del _c25.NO_DETAIL_EVIDENCE
+
+# ── 25l 第 32j 条：拿标签列表当「关掉了吗／还剩几个」的证据时只能走严格口径，且关后要重查 ──
+# 不另写一份离线副本：要钉的就是门禁本体（两份实现早晚分叉）。三份真源现网都得绿，
+# 再逐一退回修复前的形状，每条都得响——判据看不见回归就等于没修。
+_TAB_SRC25l = {}
+for _rel25l in ("b2bcollect_build/shared_chrome.py", "b2bcollect_build/site_adapters.py",
+                "riskbird_build/dual_session.py"):
+    _p25l = _g32.ROOT / _rel25l
+    _TAB_SRC25l[_rel25l] = (_p25l.read_text(encoding="utf-8", errors="replace")
+                            if _p25l.is_file() else "")
+check("25l-0 三份「关标签」的现场都读到了（读不到就是一份空视野，下面那句「都绿」没有任何含义）",
+      all(_TAB_SRC25l.values()), str({k: len(v) for k, v in _TAB_SRC25l.items()}))
+_got25l = [f"{_rel25l}：{x}" for _rel25l, _t25l in _TAB_SRC25l.items()
+           for x in _g32._tab_list_strict_problems(_rel25l, _ast.parse(_t25l))]
+check("25l-1 现网三份真源都绿（32j 本尊）：亲自发 /json/close 的函数会重查、重查走严格口径；"
+      "也不误伤拿同一把手做展示的地方（`acquire_tab`/`set_all_windows_state` 仍是默认口径，"
+      "它们只「看看现在挂着哪些」，不拿它下结论）", not _got25l,
+      " ｜ ".join(x.splitlines()[0][:100] for x in _got25l))
+for _lbl25l, _key25l, _old25l, _new25l, _shape25l in (
+        ("重查退回默认口径（读不到回 [] → 「已经不在了」）", "b2bcollect_build/shared_chrome.py",
+         'ids = {t.get("id") for t in list_page_targets(port, strict=True)}',
+         'ids = {t.get("id") for t in list_page_targets(port)}', "默认口径"),
+        ("重查拆掉（只信回执，第十二轮那句假警与风鸟那句「已清理」都长这样）",
+         "b2bcollect_build/shared_chrome.py",
+         'ids = {t.get("id") for t in list_page_targets(port, strict=True)}',
+         "ids = set()", "从不回头重查"),
+        ("携命名空间的写法也不许漏（site_adapters 那一腿）", "b2bcollect_build/site_adapters.py",
+         "targets = sc.list_page_targets(self.debug_port, strict=True)",
+         "targets = sc.list_page_targets(self.debug_port)", "默认口径"),
+        ("开头那份枚举也不许当「已经干净」（风险：安静地少洗了一批窗口）",
+         "riskbird_build/dual_session.py", "pages = list_page_targets(port, strict=True)",
+         "pages = list_page_targets(port)", "默认口径")):
+    _base25l = _TAB_SRC25l[_key25l]
+    _mut25l = _base25l.replace(_old25l, _new25l, 1)
+    check(f"25l-2- 「{_lbl25l}」要在样本里真改得动（改不动就是拿旧样本喂判据，下一条就是永真）",
+          _mut25l != _base25l, _old25l[:70])
+    _got25l2 = _g32._tab_list_strict_problems(_key25l, _ast.parse(_mut25l))
+    check(f"25l-2== 「{_lbl25l}」必须响并点名形状（{_shape25l}）：只改一行的分叉也要接住",
+          any(_shape25l in x for x in _got25l2),
+          " ｜ ".join(x.splitlines()[0][:100] for x in _got25l2))
+check("25l-3 只看调用实参里的字符串，不看注释：`site_adapters` 的 docstring 里就写着「/json/close "
+      "关闭」，拿全文子串发判会把一个只写了注释的函数当成干这事的（误伤一次就有人改成永真）",
+      not _g32._calls_tab_close(_ast.parse(
+          'def f():\n    """改走 CDP /json/list 只读 URL、/json/close 关闭"""\n    return 1\n')),
+      "docstring 里的 /json/close 被当成了关闭动作")
+print("25l 第 32j 条（标签列表口径 + 关后重查）本尊跑在真源上，四种退回形状全响 ✓")
+
+print("㉕ 无联系方式分档 + 砍单记名 + 借标签归还：三本账各自只有一个把手、并被四处读到；"
+      "证据那句只挨渲染那一刀；标签列表当证据时口径不混、关后必重查 ✓")
+
+# ── ㉖ 列表条目账：说不出「站方这一词回了几条」，就不许替读者挑处方（第 33 条） ──
+# 由来（2026-11-16 第十二轮实机 中国制造网「窗帘导轨」）：那一词零净新增，日志与体检报告都写
+# 「站方回的货有……该复核的是相关性口径/同族类目桥」。真去取那一页，站方自己写着「共找到 1 个」——
+# 砍掉 1 家必然零产出，把相关性阈值改到天上也变不出货。账上只有「砍了几家」时，「这一词只回 1 条」
+# 与「回 30 条全被砍」这两种**处方正好相反**的局只能念成同一句话，那句话就是谎。
+# 本节钉四件事：①条目账走唯一把手、且是真翻页循环落下来的（26a）；②四档处方各归各位，同一砍单
+# 数下回货 1 条与 30 条必须给不同的话（26b）；③档位住在 KW_THIN_SUPPLY_ITEMS、索引说明住在
+# SEARCH_INDEX_NOTE，改常量话术就跟着改（26c/26d）；④构建前第 33 条硬门的本尊跑在真源上，
+# 每一种退回形状都得响（26e）；外加站方自报那一格的取数口径（26f）。
+from mic_crawler import MicCrawler as _Mic26                      # noqa: E402
+
+
+class _Fix26(CdpSiteCrawler):
+    """最小夹具站：翻页走基类**真循环**（`_iter_keyword`），只把取页/解析换成定好的样本。
+
+    ENTRIES 每一项＝这一页我们解析到的条数；CLAIMS 每一项＝站方在这一页自报的总数。
+    三本账（总账 / kw_items / kw_claimed）都必须由这一趟真循环记下来，夹具才不是在替注释作证。
+    """
+    PLATFORM_SLUG = "fix26"
+    PLATFORM_NAME = "条目账夹具站"
+    ENTRIES = (1,)
+    CLAIMS = ()
+    SEED = 0              # 预置「增量库已含」的条数：它们进不了产出，但照样进条目账
+    THIN = None           # 实例级覆盖 KW_THIN_SUPPLY_ITEMS（None＝用类里那一档）
+    INDEX_NOTE = None     # 实例级覆盖 SEARCH_INDEX_NOTE
+
+    def _is_session_alive(self):
+        return True
+
+    def start_browser(self):
+        return True
+
+    def is_relevant(self, kw, text):
+        return True                   # 早过滤这一刀由另一条夹具单独管，这里只验「详情复核」
+
+    def build_search_url(self, kw, page):
+        if page == 1 and self.SEED:
+            # crawl() 一进门就把 _seen_members 清了，所以只能在第一页取 URL 时种回去
+            self._seen_members |= {f"{self.PLATFORM_SLUG}:p1i{i}" for i in range(2, self.SEED + 2)}
+        return (f"https://fix26.test/s?k={kw}&p={page}" if page <= len(self.ENTRIES) else "")
+
+    def _goto(self, url):
+        self._pg26 = getattr(self, "_pg26", 0) + 1
+        return True
+
+    def _html(self):
+        idx = self._pg26 - 1
+        n = self.CLAIMS[idx] if idx < len(self.CLAIMS) else None
+        return f'共找到 <span class="red">{n}</span>个 公司' if n is not None else "这一页没写总数"
+
+    def parse_list(self, html, kw):
+        cnt = self.ENTRIES[self._pg26 - 1]
+        return [{"公司名称": f"夹具厂{self._pg26}第{i}号有限公司",
+                 "memberId": f"p{self._pg26}i{i}"} for i in range(1, cnt + 1)]
+
+    def list_has_more(self, html, page):
+        return page < len(self.ENTRIES)
+
+    # 站方自报总数那一格直接借真源：夹具自己再抄一遍正则，就成了「夹具替自己的实现作证」
+    parse_listed_total = _Mic26.parse_listed_total
+
+    def crawl_detail(self, stub):
+        rec = self._base_rec(stub)
+        rec["公司名称"] = stub.get("公司名称", "")
+        self._keep_detail("<html>这一页没有联系电话栏</html>")
+        rec["状态"] = "类目不符(已过滤)"        # 全砍：让这一词落到零净新增那一档
+        return rec
+
+
+def _run26(entries=(1,), claims=(), seed=0, thin=None, note=None):
+    c = _Fix26()
+    c.incremental = c.resume = False
+    c.ENTRIES, c.CLAIMS, c.SEED = entries, claims, seed
+    c._pg26 = 0
+    if thin is not None:
+        c.KW_THIN_SUPPLY_ITEMS = thin
+    if note is not None:
+        c.SEARCH_INDEX_NOTE = note
+    _e, lg = equip(c)
+    c.crawl(["窗帘导轨"])
+    return c, next((m for m in lg if "零净新增" in m), "")
+
+
+_c26a, _why26a = _run26(entries=(1,), claims=(1,))
+check("26a 真翻页循环把三本账一起落下来了（总账 + 我们解析到的分词账 + 站方自报账）",
+      _c26a.stat_listed == 1 and _c26a.kw_items == {"窗帘导轨": 1}
+      and _c26a.kw_claimed == {"窗帘导轨": 1},
+      f"{[_c26a.stat_listed, _c26a.kw_items, _c26a.kw_claimed]}")
+check("26a- stats() 把两本分词账透出（界面与体检器读的就是这一份，少一格那一处就回到只看砍单数）",
+      _c26a.stats()["kw_items"] == {"窗帘导轨": 1}
+      and _c26a.stats()["kw_claimed"] == {"窗帘导轨": 1},
+      str({k: v for k, v in _c26a.stats().items() if k.startswith("kw_")})[:160])
+_c26m, _ = _run26(entries=(5, 5), claims=(10, 10))
+check("26a-2 站方每页报的都是**整个查询**的总数：按页取最大值而不是求和（三页 10 条不能记成 30）",
+      _c26m.kw_claimed == {"窗帘导轨": 10} and _c26m.kw_items == {"窗帘导轨": 10},
+      f"{[_c26m.kw_items, _c26m.kw_claimed]}")
+
+# ① 个位数货源 → 换词/换索引；② 回货多且全被砍 → 相关性口径。两者砍单数都是 1，处方必须相反
+check("26b-1 只回 1 条时那句必须说「换关键词或搜索索引」，不许把读者支使去改相关性阈值",
+      "个位数" in _why26a and "该换的是关键词或搜索索引" in _why26a
+      and "该复核的是相关性口径" not in _why26a, _why26a[:200])
+_c26b, _why26b = _run26(entries=(30,), claims=(30,))
+check("26b-2 同样砍 1 家、但回货 30 条时那句必须改口「该复核相关性口径」（两种局不许共用一句）",
+      "累计回 30 条" in _why26b and "该复核的是相关性口径/同族类目桥" in _why26b
+      and "个位数" not in _why26b, _why26b[:200])
+check("26b-3 同一砍单数下两档处方真的分叉了（这一条是整个 ㉖ 节立项的那件事）",
+      _why26a != _why26b and "变不出货" in _why26a and "链路通" in _why26b)
+_c26c, _why26c = _run26(entries=(1,), claims=(30,))
+check("26b-4 站方自报 30 条而我们只认出 1 条 → 这一档的锅在解析口径，既不是货源也不是相关性",
+      "自报 30 条" in _why26c and "列表解析只认出 1 条" in _why26c
+      and "该修的是列表卡片解析口径" in _why26c, _why26c[:200])
+
+
+class _Fix26NoBook(_Fix26):
+    """修复前那一形：这一路只往总账里 +=，分词账永远是空的。"""
+
+    def _iter_keyword(self, kw):
+        self.stat_pages += 1
+        self.stat_listed += 5                       # 旧写法：只有全局数，答不了「这一词几条」
+        self._note_early_skip(kw, "夹具厂1第1号有限公司")
+        return iter(())
+
+
+_c26d, _why26d = None, ""
+_i26d = _Fix26NoBook()
+_i26d.incremental = _i26d.resume = False
+_i26d._pg26 = 0
+_e26d, _lg26d = equip(_i26d)
+_i26d.crawl(["窗帘导轨"])
+_why26d = next((m for m in _lg26d if "零净新增" in m), "")
+check("26b-5 条目账没记上时，那句必须先承认「说不出站方回了几条」并点名把手，"
+      "而不是替读者挑一个可能完全相反的处方（说不出就报自己的缺账）",
+      "列表条目账没记上" in _why26d and "_note_listed" in _why26d
+      and "该复核的是相关性口径" not in _why26d and "个位数" not in _why26d, _why26d[:200])
+check("26b-6 砍单名单跟数字一起给（「该复核」这句处方必须有材料：复核的人手上得有几家名字）",
+      "夹具厂1第1号有限公司" in _why26d, _why26d[-90:])
+
+# ── 26c 档位与索引说明都住在常量里：改常量话术就跟着改，句子里不许写死数字 ──
+_, _why26c0 = _run26(entries=(1,), claims=(1,), thin=0)
+check("26c 上限调到 0 时「只回 1 条」就不再被算作货源薄（档位真源是 KW_THIN_SUPPLY_ITEMS，"
+      "不是句子内写死的数字）", "个位数" not in _why26c0 and "累计回 1 条" in _why26c0,
+      _why26c0[:160])
+_, _why26c1 = _run26(entries=(30,), claims=(30,), thin=100)
+check("26c- 上限调到 100 时 30 条也被称为货源薄（同一档位表在两档之间挪边界，话术必须跟着换档）",
+      "个位数货量" in _why26c1, _why26c1[:160])
+_, _why26n = _run26(entries=(1,), claims=(1,), note="这一路搜的是公司目录而不是产品目录")
+check("26c-2 站点写明 SEARCH_INDEX_NOTE 时那句要原样带上（告诉读者该换的是索引；基类默认空串时"
+      "这一句一个字都不许编）", "公司目录" in _why26n, _why26n[:160])
+check("26c-3 基类默认交回空串：不知道这一路是什么索引就不许说（说错索引比不说更害人）",
+      cdp_base.CdpSiteCrawler.SEARCH_INDEX_NOTE == "",
+      repr(cdp_base.CdpSiteCrawler.SEARCH_INDEX_NOTE)[:80])
+
+# ── 26d 体检器的「薄/不薄」判定：拿没记账的数判案是反方向的谎 ──
+check("26d 两条腿读的是同一本账（体检器与归因句两种口径时，报告与日志会各说一句相反的处方）",
+      _plc25._kw_supply({"kw_items": {"k": 1}, "kw_claimed": {"k": 30}}, "k") == (1, 30)
+      and _plc25._kw_supply({}, "k") == (None, None),
+      str(_plc25._kw_supply({"kw_items": {"k": 1}}, "k")))
+check("26d- 账上没条目数时不许判成「货源薄」（宁可退回旧那句，也不把我们的解析漏说成平台没货）",
+      _plc25._kw_thin({"kw_filtered": {"k": 1}}, "k") is False,
+      "没记账被当成货源薄")
+check("26d-2 自报 30 条而只认出 1 条是「解析漏」，不是「货源薄」：两档处方相反",
+      _plc25._kw_thin({"kw_items": {"k": 1}, "kw_claimed": {"k": 30}}, "k") is False)
+check("26d-3 两本账都是 1 条才是货源薄（上限同样取自 KW_THIN_SUPPLY_ITEMS，不另写一个数）",
+      _plc25._kw_thin({"kw_items": {"k": 1}}, "k") is True
+      and _plc25._kw_thin({"kw_items": {"k": cdp_base.CdpSiteCrawler.KW_THIN_SUPPLY_ITEMS}}, "k")
+      is True
+      and _plc25._kw_thin({"kw_items": {"k": cdp_base.CdpSiteCrawler.KW_THIN_SUPPLY_ITEMS + 1}},
+                           "k") is False)
+
+# ── 26e 站方自报那一格：真页形状、千分位、没那句话、以及「只报告不记账」 ──
+_mic26 = _Mic26.__new__(_Mic26)
+check("26e 站方写着「共找到 1 个」时交出 1（第十二轮实机那一页的取证形状）",
+      _mic26.parse_listed_total('前缀共找到 <span class="red">1</span>个 <h1 class="red">'
+                                '<strong>窗帘导轨</strong></h1>公司 后缀') == 1,
+      str(_mic26.parse_listed_total('共找到 <span class="red">1</span>个公司')))
+check("26e- 千分位不能截成 1（把 1,234 念成 1 就正好把「货源足」说成「货源薄」）",
+      _mic26.parse_listed_total('共找到 <span class="red">1,234</span>个公司') == 1234,
+      str(_mic26.parse_listed_total('共找到 <span class="red">1,234</span>个公司')))
+check("26e-2 页面上没那句话时交回 None：说不出＝不知道，不许拿解析到的条数冒充站方自报",
+      _mic26.parse_listed_total("这一页没写总数") is None
+      and _mic26.parse_listed_total("") is None and _mic26.parse_listed_total(None) is None)
+check("26e-3 有「共找到」但窗口里没有数字时也交回 None（不许从句子外面随便拓一个数）",
+      _mic26.parse_listed_total("共找到 个公司" + " filler" * 40 + "9999") is None
+      and _mic26.parse_listed_total("共找到 个公司 9 家") == 9,          # 窗口内才作数
+      str(_mic26.parse_listed_total("共找到 个公司" + " filler" * 40 + "9999")))
+_mic26.stat_listed, _mic26.kw_items, _mic26.kw_claimed = 0, {}, {}
+_mic26.parse_listed_total('共找到 <span class="red">7</span>个公司')
+check("26e-4 这一钩子只报告不记账（两处写＝两本账；记账统一住在 _note_listed）",
+      _mic26.stat_listed == 0 and not _mic26.kw_items and not _mic26.kw_claimed,
+      f"{[_mic26.stat_listed, _mic26.kw_items, _mic26.kw_claimed]}")
+check("26e-5 中国制造网确实接上了这一格（没接的站只能念「这一词一共只回 N 条」那一档）",
+      _Mic26.SEARCH_INDEX_NOTE and "companysearch" in _Mic26.SEARCH_INDEX_NOTE,
+      _Mic26.SEARCH_INDEX_NOTE[:60])
+
+print("㉖ 列表条目账：三本账由真翻页循环一起落；四档处方各归各位（1 条↔换词、30 条↔改口径、"
+      "自报>解析↔修解析、没记账↔承认说不出）；档位与索引说明都住在常量里 ✓")
+
+# ── 26g 机器判据：直接跑构建前第 33 条硬门的本尊，每一种退回形状都必须响 ──
+_g33 = _g32 if _g32 is not None else _load_gate31()[0]
+check("26g 门禁脚本可加载（加载不到就等于离线这一侧对条目账失明）", _g33 is not None, _g32err)
+if _g33 is not None:
+    _P33 = _g33.check_listing_accountability()
+    check("26g0 现网真源上第 33 条全绿（下面每一档反向对照都拿它当对照面）", not _P33,
+          " ｜ ".join(x.splitlines()[0] for x in _P33[:4]))
+    _F33 = _g33._runtime_reason_sources()
+    check(f"26g0- 第 33 条的视野不是空集合（读了 {len(_F33)} 份交付链源码）",
+          len(_F33) > 40, str(len(_F33)))
+
+    def _mut33(muts, extra=None):
+        """把真源改回修复前的形状再让门禁本尊判一次（锚点对不上就当场响，不许拿旧样本喂判据）。
+
+        `extra` 是给「整段删除/注入一段代码」那种形状留的口子（按行删、插函数体，replace 做不了）。
+        """
+        f = dict(_F33)
+        for rel, old, new in muts:
+            hit = False
+            for p in list(f):
+                if str(p).endswith(rel):
+                    assert old in f[p], f"26g 夹具锚点对不上真源（{rel}）：{old[:70]}"
+                    f[p] = f[p].replace(old, new)
+                    hit = True
+            assert hit, f"26g 视野里没有 {rel}"
+        if extra:
+            extra(f)
+        return _g33.check_listing_accountability(f)
+
+    _DROP_ANCHOR = lambda f: [f.__setitem__(
+        p, re.sub(r"^\s*self\.kw_filtered = \{\}\n", "", f[p], flags=re.M))
+        for p in list(f) if "self.kw_filtered = {}" in f[p]]
+    _ADD_BOOK = lambda f: [f.__setitem__(
+        p, f[p].replace("    def _note_early_skip", "    def _note_probe(self, kw):\n"
+                        "        self.kw_probe[kw] = 1\n        return 1\n\n"
+                        "    def _note_early_skip", 1))
+        for p in list(f) if "    def _note_early_skip" in f[p]]
+
+    _MUT33 = {
+        "某一站又自己 `+=` 总账（条目账长出第二个写点，分词账就永远是空的）":
+            ([("b2bcollect_build/b2b168_crawler.py",
+               "self._note_listed(kw, len(entries), self.parse_listed_total(html))",
+               "self.stat_listed += len(entries)")], "第二个写点"),
+        "把手只记总账（分词账那一格被摘掉，归因句照样说不出货量）":
+            ([("b2bcollect_build/cdp_base.py",
+               "self.kw_items[key] = self.kw_items.get(key, 0) + n", "pass")], "只记总账"),
+        "两份镜像把手行为分叉（1688 那一包给出另一种归因）":
+            ([("ali1688_build/ali1688_crawler.py",
+               "self.kw_claimed[key] = max(self.kw_claimed.get(key, 0), c)",
+               "self.kw_claimed[key] = c")], "行为不同"),
+        "归因句不读条目账（记了不念，两种局又念成同一句）":
+            ([("b2bcollect_build/cdp_base.py", "items = self.kw_items.get(kw)",
+               "items = None")], "记了不念"),
+        "清零点漏一本（上一轮的回货量冒充本轮证据）":
+            ([("b2bcollect_build/cdp_base.py",
+               "        self.kw_items = {}\n        self.kw_claimed = {}",
+               "        self.kw_claimed = {}")], "却没清 kw_items"),
+        "新加一本逐词账却从来不清":
+            ([], _ADD_BOOK, "没有任何清零点"),
+        "拿 getattr 的默认值读总账（缺账被盖成「这本账是 0」）":
+            ([("ali1688_build/ali1688_crawler.py",
+               'if self._page_fail and not self.stat_listed:',
+               'if self._page_fail and not getattr(self, "stat_listed", 0):')], "兜了默认值"),
+        "site_adapters 不再透出条目账（界面那一处回到只看砍单数）":
+            ([("b2bcollect_build/site_adapters.py",
+               '"kw_items": dict(self.kw_items), "kw_claimed": dict(self.kw_claimed),',
+               "")], "真取用"),
+        "体检器把键名改掉（读不到就当没这本账）":
+            ([("debug/platform_live_check.py", 'st.get("kw_items")', 'st.get("kw_items_x")')],
+             "真取用"),
+        "钩子自己动了条目账（两处写＝两本账）":
+            ([("b2bcollect_build/mic_crawler.py", '        i = (html or "").find(LISTED_TOTAL_MARK)',
+               '        self.stat_listed += 0\n        i = (html or "").find(LISTED_TOTAL_MARK)')],
+             "只许**报告**"),
+        "四档处方合回同一顶帽子（旧那句谎的机器形状：句子还在、只是两档说了同一件事）":
+            ([("b2bcollect_build/cdp_base.py", "该换的是关键词或搜索索引",
+               "该复核的是相关性口径")], None, "再也没人说这几句处方"),
+        "上限写死成数字（档位表从常量跳回句子里，下一档改常量就听不见了）":
+            ([("b2bcollect_build/cdp_base.py", "if items <= self.KW_THIN_SUPPLY_ITEMS:",
+               "if items <= 3:")], None, "KW_THIN_SUPPLY_ITEMS"),
+    }
+    for _l33, _v33 in _MUT33.items():
+        _m33, _x33, _want33 = _v33 if len(_v33) == 3 else (_v33[0], None, _v33[1])
+        _got33 = _mut33(_m33, _x33)
+        check(f"26g- 「{_l33}」必须响并点名「{_want33}」", any(_want33 in x for x in _got33),
+              " ｜ ".join(x.splitlines()[0][:110] for x in _got33) or "判据没响＝这一形今天没人管")
+    _got33 = _mut33([], _DROP_ANCHOR)
+    check("26g- 「kw_filtered 的清零点被整处删掉」必须响（锚不见了不等于账干净，那一形最安静）",
+          any("没有一处把" in x or "没有任何清零点" in x for x in _got33),
+          " ｜ ".join(x.splitlines()[0][:110] for x in _got33) or "判据没响")
+
+    def _drop_zero(f):
+        for p in list(f):
+            if "    def _kw_zero_reason(self, kw):" in f[p]:
+                i = f[p].index("    def _kw_zero_reason(self, kw):")
+                j = f[p].index("    def ", i + 10)
+                f[p] = f[p][:i] + f[p][j:]
+
+    _got33 = _mut33([], _drop_zero)
+    check("26g- 「归因把手被整份删掉」必须响：上面每一档都是「函数不在就返 []」的形状，"
+          "安静放行等于把门拆了", any("没有 `_kw_zero_reason`" in x for x in _got33),
+          " ｜ ".join(x.splitlines()[0][:110] for x in _got33) or "判据没响")
+    _got33 = _mut33([("b2bcollect_build/cdp_base.py",
+                      "_why = self._kw_zero_reason(kw)", "_why = \"\"")])
+    check("26g- 「定义了却从不叫」也必须响（四档处方写好了没人念，用户那一行还是旧那句）",
+          any("从没有被调用" in x for x in _got33),
+          " ｜ ".join(x.splitlines()[0][:110] for x in _got33) or "判据没响")
+    _got33 = _g33.check_listing_accountability({})
+    check("26g- 空视野不许绿（读不到源码时「每一路都记账了」这句话没有任何含义）",
+          bool(_got33) and any("一份源码都没读到" in x for x in _got33), str(_got33)[:120])
+    _got33 = _g33.check_listing_accountability(
+        {"x.py": "def f():\n    x = (\n"})
+    check("26g- 解析不过的那一份按不合格算，不许安静跳过", bool(_got33), str(_got33)[:120])
+    check("26g- 记账把手与总账同名才罚：`stat_listed_x` 那种改名累加不该被当成第二把刀"
+          "（误伤一次就有人把判据改成永真）",
+          not _g33._listed_write_problems("x.py", _g33._listed_facts(
+              "x.py", "class C:\n    def f(self):\n        self.stat_listed_x += 1\n")))
+print("26g 第 33 条本尊跑在真源上：真树全绿 + 十四种退回形状各响 ✓")
+
+print("㉗ 第 33 条（列表条目账）：门禁本尊与四档处方在离线这一侧对拍过 ✓")
 
 print(f"\n全部 {ok} 项断言通过 ✅")

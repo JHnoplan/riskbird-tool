@@ -10110,6 +10110,216 @@ def test_no_contact_accountability_gate():
             "（把已声明详情不取页的站说成「忘了接」，开的是一张执行不了的假处方）")
 
 
+def test_listing_accountability_gate():
+    print("\n═══ AS. 列表条目账：第 33 条逐处退回修前原样（必须响）═══")
+    # 由来（2026-11-16 第十二、十三轮实机 中国制造网「窗帘导轨」）：某一词零净新增时，归因句
+    # 只会说「站方回的货有、该复核相关性口径」。真去查页面，站方自报「共找到 1 个」——约束项
+    # 在货源而不在本机闸门，那句话把人支使去改一个改了也没用的东西。要分得开「只回 1 条」与
+    # 「回 30 条全被砍」，账上必须有「这一词站方回了几条」，而这一笔以前**只以全局 stat_listed
+    # 存在**、且各站自己 `+=`（漏写一路＝那一词的条目账永远是空的）。
+    # 第 33 条管六问：33a 写只许住在一个把手、把手必须三本账一起落、两份镜像同行为、报告钩子
+    # 不许顺手记账、不许拿 getattr 的默认值当证据；33b 按词账本按轮起账、四处渲染真取用；
+    # 33c 归因句真读它并且四档各指一种责任方。
+    # 这一节与 AR 节同一立场：**只审判据是不是真的在管事**。每一处都退回修前那几个字节，
+    # 门不响就是判据在这一形上闭着眼（AP／AQ／AR 三节都是这样把判据自己的盲区逼出来的）。
+    gate = _manifest_gate()
+    _rs = gate._runtime_reason_sources()
+    _today = gate.check_listing_accountability(dict(_rs))
+    _assert_eq(_today, [], f"第 33 条今天必须真绿（实际={_today[:2]}）")
+
+    def _m(fname_end, old, new, need, label, cnt=1):
+        """把一处已修好的写法退回修前原样：第 33 条必须响，而且要念得出是哪一处。
+
+        只喂 `files` 一条通道不是偷工：`check_listing_accountability` 的视野就是第 30 条那一份
+        `_runtime_reason_sources()`（已含 debug/ 里的体检器），判据没有第二种读法，夹具就不该
+        多一条腿——腿一多就会长出「改的那条通道其实不生效」的假响（AR 节为此吃过一次）。"""
+        files, done = dict(_rs), 0
+        for k in [x for x in _rs if str(x).endswith(fname_end)]:
+            if old in _rs[k]:
+                files[k] = _rs[k].replace(old, new, cnt)
+                done += 1
+        _assert(done, f"{label}：{fname_end} 里对不上这个锚点（真写法改了而夹具还在替旧代码"
+                      "作证，这一格就变成空跑）")
+        if not done:
+            return
+        _assert(files != _rs, f"{label}：替换没产生任何差别（喂进去的是原件）")
+        got = [p for p in gate.check_listing_accountability(files) if p not in _today]
+        _assert(got, f"{label}：把已修好的写法退回修前原样，第 33 条却没响——判据在这一形上有盲区")
+        _assert(any(need in p for p in got),
+                f"{label}：响的话要念得出是哪一处（要含「{need}」，实际={got[:2]}）")
+
+    def _syn33(src, want_fire, label, need=""):
+        """合成形状：只拦「说谎的那一种」，不拦「怎么说谎的形状」——正反两面都要喂。
+
+        响的那一面还要问一句「响的是不是这一格」：33b-2 的措辞是**全链**性质（整条交付链
+        没人读这本账），行首根本没有文件名——只按「响里含不含夹具名」筛就会把这一问当成
+        不响（本轮就是这么错过一次）。所以默认按文件名算，全链那一格额外点名 `need`。"""
+        files = dict(_rs)
+        files[_REPO / "b2bcollect_build/zz_fixture_as_crawler.py"] = src
+        got = [p for p in gate.check_listing_accountability(files) if p not in _today]
+        if not want_fire:
+            _assert_eq(got, [], f"{label}：合格形状不许响（误伤一次，下一个真漏的人就会被当噪音）")
+            return
+        _assert(got, f"{label}：把说谎那一形喂进去，第 33 条却没响")
+        _anchor = need or "zz_fixture_as"
+        _assert(any(_anchor in p for p in got), f"{label}：响的话要念得出这一格（需含「{_anchor}」）")
+        _else = [p for p in got if "zz_fixture_as" not in p and not (need and need in p)]
+        _assert_eq(_else, [], f"{label}：新响的每一条都得能算到这一格头上（别处连带响＝这一格在赌运气）")
+
+    # ── 1) 33a 一把刀：逐站各退一次 ──
+    # 为什么要一圈都退而不是抽一站：判据是「扫每个函数体里的 `self.stat_listed +=`」，
+    # 谁要把扫法改窄（只认 crawl、只认某个目录），只退某一站的那一格仍会响；逐站退过，
+    # 改窄的人当场看见有几格哑掉。
+    for _f33 in ("cdp_base.py", "b2b168_crawler.py", "gys_crawler.py", "solarbe_crawler.py",
+                 "gi_crawler.py", "qihuo11467_crawler.py", "maimaib2b_crawler.py",
+                 "makepolo_crawler.py", "aipage_crawler.py", "gongchang_crawler.py",
+                 "ali1688_crawler.py"):
+        _src33 = next(v for k, v in _rs.items() if str(k).endswith(_f33))
+        _old33 = next((l for l in _src33.splitlines() if "self._note_listed(" in l), "")
+        _assert(_old33, f"33a：{_f33} 里找不到 `self._note_listed(` 的调用点（这一路何时退过门？）")
+        if not _old33:
+            continue
+        _m(_f33, _old33.strip(), "self.stat_listed += len(entries)", "第二个写点",
+           f"33a：{_f33} 退回自记总账（这一词的条目账从此永远是空的）")
+
+    # ── 2) 33a-2/33a-3 把手本体：三本账一起落，两份镜像同行为 ──
+    _m("cdp_base.py", "        self.kw_items[key] = self.kw_items.get(key, 0) + n",
+       "        pass", "只记总账", "33a-2：把手退回只加全局数（旧各站写法搬进把手）")
+    _m("ali1688_crawler.py", "        self.kw_items[key] = self.kw_items.get(key, 0) + n",
+       "        pass", "只记总账", "33a-2：1688 那一包的把手同样不许少记一本")
+    _m("ali1688_crawler.py", "self.kw_claimed[key] = max(self.kw_claimed.get(key, 0), c)",
+       "self.kw_claimed[key] = c", "行为不同",
+       "33a-3：只改一边（每页报的都是整个查询的总数，取小时翻页会把它当上一轮的账求和）")
+    _m("cdp_base.py", "    def _note_listed(self, kw, count, claimed=None):",
+       "    def _note_listed_x(self, kw, count, claimed=None):", "没有 `_note_listed`",
+       "33a-3：把手改名——后缀会让「按名字找把手」的判据静默过关")
+
+    # ── 3) 33a-4 报告钩子只许开口，不许记账 ──
+    _m("mic_crawler.py", '        i = (html or "").find(LISTED_TOTAL_MARK)',
+       '        self.stat_listed += 0\n        i = (html or "").find(LISTED_TOTAL_MARK)',
+       "自己动了条目账", "33a-4：MIC 的自报数钩子顺手记一笔（两处写＝两本账）")
+
+    # ── 4) 33a-5 拿默认值当证据：旧 1688 那句「一页都没取到」就是这么变成永久真话的 ──
+    _m("ali1688_crawler.py", "if self._page_fail and not self.stat_listed:",
+       'if self._page_fail and not getattr(self, "stat_listed", 0):', "兜了默认值",
+       "33a-5：收尾那句退回 getattr 兜 0（缺账被念成「这本账是 0」）")
+
+    # ── 5) 33b 按轮起账：上一轮的回货量不该冒充本轮的「货源薄」证据 ──
+    _m("cdp_base.py", "        self.kw_items = {}\n        self.kw_claimed = {}",
+       "        self.kw_claimed = {}", "却没清 kw_items",
+       "33b：三处起账点都少带一本（跨轮脏账）", -1)
+    _m("ali1688_crawler.py", "        self.kw_items = {}\n        self.kw_claimed = {}",
+       "        self.kw_claimed = {}", "却没清 kw_items",
+       "33b：1688 那一包的起账点同样少带一本", -1)
+    _m("cdp_base.py", "        self.kw_filtered = {}", "        pass", "整本换掉",
+       "33b：锚的清零点被整处删掉（所有按词证据都跳进本轮那句处方）", -1)
+
+    # ── 6) 33b-3 四处渲染真取用：只删一处就能验证「少一处念不到货量」──
+    _m("site_adapters.py",
+       '"kw_items": dict(self.kw_items), "kw_claimed": dict(self.kw_claimed),', "",
+       "真取用", "33b-3：适配器不再把条目账透给看板与体检器")
+    _m("platform_live_check.py", 'st.get("kw_items")', 'st.get("kw_items_x")',
+       "真取用", "33b-3：验收报告自己取错了键（拿不到那一本只会说「货没记上」）")
+    # 口径细化（本轮 `_scan_attrs` 的 reads 那一课）：只把账本当**写入地址**碰一下（`self.kw_items[k] = …`）
+    # 不算取用——拿「Load 上下文」当「读」时，渲染层可以靠一行写入哄绿（那一行本来就只会
+    # 把上一笔加上去，一句货量也没念）。正向形状由上面两条退修前原样的夹具反面作证。
+    _m("ali1688_crawler.py", "            _it, _cl = self.kw_items.get(k), self.kw_claimed.get(k)",
+       "            _it, _cl = 0, 0\n            self.kw_items[k] = 0\n            self.kw_claimed[k] = 0",
+       "真取用", "33b-3：1688 收尾只把两本账当写入地址碰一下（念出口的还是 0）")
+
+    # ── 7) 33c 归因句：读了吗／分叉了吗／旋钮从哪来／把手还在被叫吗 ──
+    _m("cdp_base.py", "        items = self.kw_items.get(kw)", "        items = None",
+       "没读 kw_items", "33c：归因句不再看条目账（四档塌回旧那一档）")
+    _m("cdp_base.py", "该换的是关键词或搜索索引", "该复核的是相关性口径",
+       "再也没人说这几句处方", "33c：两档处方合回一句（只数 return 条目哄不过这一问）")
+    _m("cdp_base.py", "if items <= self.KW_THIN_SUPPLY_ITEMS:", "if items <= 3:",
+       "KW_THIN_SUPPLY_ITEMS", "33c-3：边界写死在句子里（改常量的人不会通知归因句）")
+    _m("cdp_base.py", "    def _kw_zero_reason(self, kw):", "    def _kw_zero_reason_x(self, kw):",
+       "没有 `_kw_zero_reason`", "33c-2：把手被改名（上面几问都是「函数不在就返 []」的形状）")
+    _m("cdp_base.py", "                    _why = self._kw_zero_reason(kw)",
+       '                    _why = ""', "从没有被调用",
+       "33c-2：四档写好了却没人念（定义进不了眼睛，调用才能）")
+
+    # ── 8) 形状的正反两面：误伤一次，下一个真漏的人就会被当成噪音放过去 ──
+    _syn33("class A:\n    def crawl(self):\n        self.stat_listed += len(self.entries)\n",
+           True, "33a：站里第二把刀（总账与分词账分家）")
+    _syn33("class A:\n    def crawl(self):\n        self._note_listed(self.kw, len(self.entries))\n",
+           False, "33a：走把手的合格写法（不许因为名字里有把手字样就误伤）")
+    _syn33("class A:\n    def _note_listed(self, kw, count, claimed=None):\n"
+           "        self.stat_listed += int(count or 0)\n", True,
+           "33a-2：把手只记总账")
+    _syn33("class A:\n    def _note_listed(self, kw, count, claimed=None):\n"
+           "        self.stat_listed += int(count or 0)\n"
+           "        self.kw_items[kw] = self.kw_items.get(kw, 0) + int(count or 0)\n"
+           "        self.kw_claimed[kw] = int(claimed or 0)\n", False,
+           "33a-2：三本账一起落（不许把新写的把手一律判成漏）")
+    _syn33("class A:\n    def stats(self):\n        self.kw_zz_dead = {}\n"
+           "        self.kw_zz_dead['x'] = 1\n        return 1\n", True,
+           "33b-2：新加一本按词账却全链没人读（记了不念＝没记）", need="kw_zz_dead")
+    _syn33("class A:\n    def stats(self):\n        self.kw_zz_live = {}\n"
+           "        self.kw_zz_live['x'] = 1\n        return dict(self.kw_zz_live)\n", False,
+           "33b-2：同一本账透给了 stats()（新账不是罪，没人读才是）")
+    _syn33("class A:\n    def _kw_zero_reason(self, kw):\n"
+           "        return \"零净新增：该换的是关键词或搜索索引\"\n", True,
+           "33c：四档合回一句死写（两种相反的局交给同一个动作去改）")
+    _syn33("class A:\n    def tail(self):\n        return getattr(self, \"_pf_unknown\", 0)\n", False,
+           "33a-5：另一本账用 getattr 兜默认值不归这一条管（误伤就会把真漏当噪音）")
+
+    # ── 9) 视野断了不许绿，登记表空转也不许绿 ──
+    _assert(any("一份源码都没读到" in p for p in gate.check_listing_accountability({})),
+            "33：视野为空时报的是「这句话没有含义」而不是合格")
+    _broken = dict(_rs)
+    _broken[next(k for k in _broken if str(k).endswith("cdp_base.py"))] = "def x(:\n    pass\n"
+    _assert(any("解析不过" in p for p in gate.check_listing_accountability(_broken)),
+            "33：某一份被改坏到解析不过时要按不合格算，而不是那一整份从此没人管")
+    # 登记表与视野必须同源：LEDGER_READERS 里那一处如果不在这一条的视野里（文件被搬走），
+    # 33b-3 会对它**一个字都不说**——表还在、判据却扫不到，这一格就变成摆设。
+    _labels33 = {gate._rel_label(p) for p in _rs}
+    _assert_eq([rel for rel in gate.LEDGER_READERS if rel not in _labels33], [],
+               "四处读家必须全部在第 33 条的视野里（搬走一处＝那一处静默脱管）")
+    _assert_eq(len(gate.LEDGER_READERS), 4, "读家登记表要说死四处（少登记一处＝那一处又只看得"
+                                          "到砍单数，而这一条拦的正是「只看砍单数」）")
+    # 四句处方登记表自己也要有性质：拿句子与源码对拍时，把两边**一起**改掉就能把 33c 腾空。
+    # 这里钉的是「每一句指的必须是不同的责任方」——不是数句子条数。
+    _own33 = ("解析", "_note_listed", "关键词", "相关性")
+    _hit33 = []
+    for _p33 in gate.LISTED_PRESCRIPTIONS:
+        _who33 = [t for t in _own33 if t in _p33]
+        _assert(len(_who33) == 1,
+                f"处方「{_p33}」指到的责任方要唯一（候选={_who33}）：两句指同一方＝有一档被"
+                "合回同一顶帽子，登记表也跟着空转")
+        _hit33 += _who33
+    _assert_eq(sorted(_hit33), sorted(_own33),
+               "四句处方与四种责任方必须一一对上（我们的解析／我们缺账／站方货源／相关性阈值）")
+    _assert_eq(gate.LISTED_KNOBS, ("KW_THIN_SUPPLY_ITEMS", "SEARCH_INDEX_NOTE"),
+               "旋钮登记表要说死：个位数那一档的边界与索引说明都得从类属性取")
+    _assert_eq(len(set(gate.LISTED_KW_BUCKETS)), 2,
+               "分词账两本要说死（我们解析到的／站方自报的）：只钉一本时，渲染层可以只念一本"
+               "而把「卡片改版只认出 1 家」与「站方本就只回 1 条」念成同一句")
+
+    # ── 9) 本条只许一个解析入口（派生事实缓存那一层的性质判据）──
+    # 由来：`check_listing_accountability` 旧形状是「每个函数 ast.walk 四次」，85 份源码一次
+    # 6.1 秒；本节把整条门跑 40 多轮，整套门禁因此从 8 分钟涨到 10 分钟并把批跑看门狗（600s）
+    # 拦断。修法是「一遍扫描 + 按 (文件名, 内容指纹) 缓存派生事实」——加了缓存就必须管它：
+    # ① 判据里不许再出现第二处 ast.walk／ast.parse（有第二把刀＝缓存可以被绕过，而绕过那一
+    #    条正是上一轮 33b-2／33b-3 空转的形状）；
+    # ② 缓存必须按**内容**而不是按文件名生效：上面几十轮里同一批文件名反复换过写法，若旧账
+    #    没随内容退干净，真源原样再喂一次就会拿着最后一次的坏写法念绿。
+    import inspect as _insp33
+    _body33 = "".join(_insp33.getsource(getattr(gate, _fn33)) for _fn33 in (
+        "_listed_write_problems", "_listed_handle_problems", "_ledger_cycle_problems",
+        "_listed_read_default_problems", "_listed_reader_problems",
+        "_listed_zero_reason_problems", "check_listing_accountability"))
+    for _bad33 in ("ast.walk(", "ast.parse("):
+        _assert(_bad33 not in _body33,
+                f"第 33 条的六问里出现了第二处 `{_bad33}`：派生事实缓存可以被绕过（而绕过那一条"
+                "就是「判据空转」那一族原病），本条只许从 `_listed_facts` 拿事实")
+    _assert("_listed_facts(" in _body33, "本条必须从 `_listed_facts` 取事实")
+    _assert_eq(gate.check_listing_accountability(dict(_rs)), [],
+               "把全部真源原样再喂一次必须还是绿的：派生事实缓存在这里按内容生效，"
+               "任何一处旧账没退干净都会在这一句上露出来")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -10142,6 +10352,7 @@ SECTIONS = (
     test_tab_body_identity_gate,
     test_nav_evidence_gate,
     test_no_contact_accountability_gate,
+    test_listing_accountability_gate,
 )
 
 

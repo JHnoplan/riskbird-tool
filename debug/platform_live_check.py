@@ -25,7 +25,11 @@
   7) 砍单归因：某一词零净新增时，必须分得开「平台真没货」与「站方回了货、被本机
      相关性闸门判成类目不符」（kw_filtered/kw_early 两本账）——后者的处方是改判定
      口径，写成「差分没跑成、建议换词复跑」会把人支使去查本来没毛病的链路
-     （2026-11-15 实机：世界工厂网「橡胶手套」7 条全被砍）。
+     （2026-11-15 实机：世界工厂网「橡胶手套」7 条全被砍）；而「砍了几家」还必须配上
+     「站方一共回了几条」（kw_items/kw_claimed 两本账）：砍掉 1 家可能是这一词只回 1 条
+     （换词换索引），也可能是 30 条里的 1 条（改相关性口径），两种念法写成同一句时
+     前一种的读者会去改一个改了也没用的东西（2026-11-16 实机：中国制造网「窗帘导轨」
+     站方自报「共找到 1 个」，报告却写「该复核的是相关性口径」）。
 最后再走一遍生产漏斗 clean_records，并按档打印（喂进 → 严格档剔 → 剔无效 → 跨平台合并 →
 四项全空剔（分来源点名）→ 入库）：某站被整批吞掉要能当场说出吞在哪一档、属于哪一路。
 通路账（stats()["legs"]）单独成行——站方改版会掐死某一条取号通路，而只累加、从不外读的
@@ -57,7 +61,7 @@ import parallel_session as ps_mod                      # noqa: E402
 from parallel_session import ParallelSession, SITE_ORDER, SITE_NAMES, STATS_LABELS  # noqa: E402
 # 失败原因的**收口**只准用一个把手：探针自己写一份 [:70] 就会与采集器那份长得不一样，
 # 同一件故障在日志里是一个词被截断、在报告里是另一个词被截断（判据与由来见 cdp_base.short_reason）
-from cdp_base import short_reason               # noqa: E402
+from cdp_base import short_reason, CdpSiteCrawler               # noqa: E402
 # 分档的说词只许取采集器那一个把手（nc_kinds_text）：探针自己写一份就会出现同一笔账两种处方
 from cdp_base import nc_kinds_text              # noqa: E402
 
@@ -130,6 +134,33 @@ def _peer_for(reports, slug):
                            and not str((r[7] or {}).get("waiting") or "")])
 
 
+def _kw_supply(st, kw):
+    """这一词站方回了多少条：(我们解析到的, 站方自报的)，没记账的那一本交回 None。
+
+    为什么不能只拿解析数当货量：解析数只说明我们抓到了几条。站方自报的比它多时，
+    约束项在**我们的列表解析**（该修卡片选择器）；两者相当且都是个位数时，约束项在
+    **货源**（该换词或换索引）。只有砍单数时这两种局在报告里长得一模一样。
+    """
+    it = (st.get("kw_items") or {}).get(kw)
+    cl = (st.get("kw_claimed") or {}).get(kw)
+    return (int(it) if it is not None else None, int(cl) if cl is not None else None)
+
+
+def _kw_thin(st, kw):
+    """这一词的约束项是不是「货源薄」（站方回得只有一两条）：账上没条目数时交回 False。
+
+    说不出就不算薄：宁可退回旧那句「该复核判定口径」，也不许拿一个没记账的数去把一个
+    真该修解析的站判成「平台没货」（那一形是反向的谎：把我们的锅说成站方的锅）。
+    """
+    it, cl = _kw_supply(st, kw)
+    if it is None and cl is None:
+        return False
+    got = it if it is not None else cl
+    if cl is not None and it is not None and cl > it:
+        return False        # 站方有货而我们没抓到：这是解析漏，不是货源薄
+    return got <= CdpSiteCrawler.KW_THIN_SUPPLY_ITEMS
+
+
 def _kw_starve(st, kw):
     """这一词零净新增时，问一句「货是不是被本机自己的相关性闸门砍掉的」。
 
@@ -144,6 +175,18 @@ def _kw_starve(st, kw):
         seg.append(f"详情页复核砍 {det} 家" + _cut_names(st.get("kw_filtered_names"), kw, "复核"))
     if ear:
         seg.append(f"列表页早过滤砍 {ear} 家" + _cut_names(st.get("kw_early_names"), kw, "早过滤"))
+    if not seg:
+        # 没砍单就一个字都不说：调用方（starved 那一路）拿这一句当「被自己砍过」的唯一凭据，
+        # 货量那一笔虽然也想露出来，但把它接在空句后面等于把「没人砍」的词递成「砍过」的证据。
+        return ""
+    # 货量跟着砍单数一起报：只说砍了几家时，读的人分不清「只回 1 条砍 1 家」与「回 30 条砍 30 家」
+    it, cl = _kw_supply(st, kw)
+    if it is not None or cl is not None:
+        both = (f"自报 {cl} 条、解析到 {it} 条" if cl is not None and it is not None
+                else f"自报 {cl} 条" if cl is not None else f"解析到 {it} 条")
+        seg.append(f"站方回货：{both}")
+    else:
+        seg.append("站方回货：条目账没记上（说不出这一词站方回了几条）")
     return "、".join(seg)
 
 
@@ -414,8 +457,19 @@ def _attrib(st, n, blocked, reason, diff="ok", peer=0, killed="", zero=(), imp=N
         if killed:
             # 「差分没跑成」与「差分被自己的相关性判定砍成没跑成」是两回事：后者不需要
             # 换词、不需要复跑，需要的是复核判定口径（同族类目桥），所以处方必须改写
+            starved = [k for k in (zero or ()) if _kw_starve(st, k)]
+            thin = [k for k in starved if _kw_thin(st, k)]
+            if thin and len(thin) == len(starved):
+                # 全是「站方只回个位数条」的词：约束项在货源，不在本机闸门。把这一形打成 ❌
+                # 会把读者支使去改一个改了也没用的口径（2026-11-16 实机「窗帘导轨」：
+                # 站方自报「共找到 1 个」，旧报告给的却是「该改的是判定口径」）
+                return "⚠", (f"{n} 家但{who}零产出：站方对这些词只回个位数条（{killed}）"
+                              "——不是链路问题，改本机相关性口径也变不出货；"
+                              "该换的是关键词或这一路的搜索索引" + _impnote)
             return "❌", (f"{n} 家但{who}零产出：站方回了货、被本机相关性闸门砍掉"
                           f"（{killed}）——不是平台没货、也不是链路问题，该改的是判定口径"
+                          + (f"（其中 {'、'.join('「%s」' % k for k in thin)} 是站方只回几条，"
+                             "改口径救不回来）" if thin else "")
                           + _impnote)
         return "⚠", (f"{n} 家但{who} 0 家：差分没跑成，"
                       "这一轮的产出不能证明关键词真的生效（换词复跑一遍再看）" + _impnote)

@@ -512,6 +512,11 @@ CONTACT_SLOT_NUM_RE = re.compile(r"1[3-9]\d{9}|0\d{2,3}-?\d{7,8}|400[-\s]?\d{3}[
 # 剥标签用的小刀：`<[^>]{1,160}>` 而不是一路 `<[^>]+>`——模板里偶有把 `<` 写在文字里的脏页，
 # 不限长度就会从那个 `<` 一路吞到下一个 `>`，把整段正文当作一个标签吃掉（证据跟着失真）。
 CONTACT_SLOT_TAG_RE = re.compile(r"<[^>]{1,160}>")
+# 只剥「没合口的半截标签尾巴」：窗口是 120 字硬切的，切在标签中间时上面那把刀要不到 `>`、
+# 剥不动，于是 `<img style="margi` 这种残句会一路活到报告里（2026-11-16 第十二轮实机马可波罗）。
+# 要求 `<` 后面紧跟标签名字符（字母/`/`/`!`）：`价格 <100 元`、`a < b` 这类正文里的裸 `<`
+# 不算标签，否则会把真证据（含号码）从尾巴上吃掉——那才是把证据改没了的那类谎。
+CONTACT_SLOT_DANGLING_RE = re.compile(r"<[a-zA-Z/!][^>]*$")
 # 砍单样本：每个词只留几家、名字收到多长（取用方见 _cut_sample）。
 # 3 家×2 阶段是「一眼能判这一刀该不该砍」的最少样本量，再多界面那一行就没人读了。
 CUT_SAMPLE_CAP = 3
@@ -544,7 +549,17 @@ def contact_slot_state(html):
         else:
             continue            # 值是一段别的文字（栏位标题撞上表头等），不作证据
         if rank[kind] > rank.get(best, -1):
-            best, evid = kind, f"{m.group(0).strip()}→{show[:24]}"
+            # 尾巴只切**没合口的半截标签**，这一处不管长度：长度只在渲染那一个把手切一刀。
+            # 旧写法 `show[:24]` 是裸字符切，会把中文词砍成半截词（第 30 条），而渲染那一刀
+            # 本来就会把整句收到人眼读得动的长度——两把刀的上限互相不知情，留一把就够。
+            # 剥尾巴也不碰档位判定（判定仍用完整窗口，切晚了才不会改结论）：窗口是 120 字
+            # 硬切的，切在标签中间时 `CONTACT_SLOT_TAG_RE` 要不到 `>`、剥不动，于是
+            # `<img style="margi` 这种残句会一路活到报告里（2026-11-16 第十二轮实机马可波罗）。
+            # 整窗就是一截未合口标签时**退回原文**而不是编一句描述：`<a href="tel:13800…` 这种
+            # 切在标签里的窗口本身就是 miss 档唯一的凭据，换成「窗口里只剩半截标签」这种话
+            # 等于把号码从证据里弄没了——那是比半截词更糟的那类谎（说了句不存在于页面的话）。
+            tail = CONTACT_SLOT_DANGLING_RE.sub("", show).strip() or show
+            best, evid = kind, f"{m.group(0).strip()}→{tail}"
     return (best or "no_slot"), evid
 
 
@@ -1036,6 +1051,15 @@ class CdpSiteCrawler:
     HTTP_CHALLENGE_SHELL_WINDOW = 60000   # 签名在 <head> 的脚本里，只在前 60KB 内找
     # 深链「按 URL 的死因原件」的条数上限：一轮几百家用不完，超了丢最早那条（见 _note_deep_block）。
     DEEP_WHY_CAP = 400
+    # 「站方这一词一共只回这么多条」的上限：小于等于它，约束项就是**货源**，不是本机闸门。
+    # 为什么是 3：这类目录站正常一页就有 20~30 条，个位数回货说明站方手里就没这几家；
+    # 即便一刀不砍也变不出可用样本——此时把处方写成「复核相关性口径」是把读者支使去改一个
+    # 改了也没用的东西（2026-11-16 第十二轮实机 中国制造网「窗帘导轨」：站方页面自报
+    # 「共找到 1 个 窗帘导轨 公司」，我们那 1 条还砍掉了，账上却写成「该复核的是相关性口径」）。
+    KW_THIN_SUPPLY_ITEMS = 3
+    # 这一路的搜索索引口径（子类按站点写明）：归因要说「该换词还是该换索引」时必须引用它，
+    # 否则「换个关键词」对「这一路压根不是产品索引」的站是无效建议。空串＝不知道，就不许说。
+    SEARCH_INDEX_NOTE = ""
 
     BLOCK_POLL = 15                 # 看门狗恢复探测间隔（秒）——仅针对可人工解除的验证页
     # IP 级限流的探测间隔：必须远大于验证页那种。拿 15s 去探一个正在冷却的 IP，
@@ -1219,6 +1243,13 @@ return '';})()"""
         # 就只能听我说。由来见 _note_early_skip。
         self.kw_early_names = {}
         self.kw_filtered_names = {}
+        # 「站方回了多少条」的两本分词账（走 _note_listed 把手，各站不许自己累加）：
+        #   kw_items   —— 本轮这一词**我们解析到**的列表条目数
+        #   kw_claimed —— 站方在这一页**自己说**的结果总数（实现了 parse_listed_total 的站才有）
+        # 由来见 _kw_zero_reason：只有「砍了几家」这一本账时，「站方只回 1 条」与「站方回 30 条
+        # 全被砍」在日志里长得一模一样，而这两句的处方完全相反（换词换索引 / 改相关性口径）。
+        self.kw_items = {}
+        self.kw_claimed = {}
         # 本轮因**判定规则更新**而重新评估的旧「类目不符」家数（口径见 _relevance_revision）：
         # 增量库存的是结论不是事实，规则改了不重评＝修好的口径对被误杀那批家永远不生效。
         self._rel_refilter = 0
@@ -2525,6 +2556,26 @@ return '';})()"""
         parts = [x for x in (host or "").split(".") if x]
         return ".".join(parts[-3:]) if len(parts) > 3 else (host or "")
 
+    @classmethod
+    def _host_account_line(cls, mapping, title):
+        """`｜{标题} {主域} N 次、…`：主机那本账（深链被拒 / 落点不符）只在渲染时按主域聚合。
+
+        为什么聚合要放在渲染处而不是记账处：账本身必须按主机细分（熔断、冷却、下一轮
+        重试都是按主机算的），只有「说一句话」这一步该按主域。第十二轮实机就是这一格穿
+        了：马可波罗每家商铺一个子域，账目那一行念出 46 段、3000 字，而体检报告那边早就
+        按主域聚合了——**同一本账两种念法**，日志读的人只会当成 46 台机器坏了。
+        聚合口径只认 `_deep_log_key` 一份真源（platform_live_check._deep_group 也走它），
+        两处各算一遍就会各自漂移，那是处方对不上账的老病根。
+        """
+        agg = {}
+        for host, val in (mapping or {}).items():
+            key = cls._deep_log_key(str(host))
+            agg[key] = agg.get(key, 0) + int((val or [0, ""])[0])
+        if not agg:
+            return ""
+        return (f"｜{title} " + "、".join(
+            f"{h} {n} 次" for h, n in sorted(agg.items(), key=lambda kv: (-kv[1], kv[0]))))
+
     @staticmethod
     def _deep_why_key(url):
         """URL 死因那本账的**键**：只剥掉锚点。为什么要有这一个把手——「按 URL 查死因」
@@ -3634,27 +3685,88 @@ return '';})()"""
         self.kw_filtered[kw] = self.kw_filtered.get(kw, 0) + 1
         self._cut_sample(self.kw_filtered_names, kw, name)
 
+    def parse_listed_total(self, html):
+        """站方在列表页上**自己说**的结果总数（默认不猜，返回 None；子类按站点实现）。
+
+        为什么要有这一格：「我们解析到 N 条」只说明我们的手抓到了几条，说明不了站方给了
+        几条。两者不一致时该修的是解析口径（我们的锅），而旧账本只有后者，于是「站方回了
+        30 家、卡片改版只认出 1 家」会被写成「这一词货源薄」——把人支使去换词，真凶就在
+        解析函数里（2026-11-16 实机 中国制造网「窗帘导轨」取证时正是靠页面上那句
+        「共找到 1 个」才把「货源薄」与「解析漏」分开）。取不到就交回 None：说不出＝不知道，
+        不许编一个数上去。
+        """
+        return None
+
+    def _note_listed(self, kw, count, claimed=None):
+        """列表页「站方回了多少条」的**唯一**记账把手：总账、分词账、站方自报账一起落。
+
+        为什么必须走把手而不是各站自己 `self.stat_listed += len(entries)`：总账只有一个
+        全局数，回答不了「这一词为什么零产出」；而 `_kw_zero_reason` 要说「站方只回 1 条
+        （换词换索引）」还是「回 30 条全被砍（改相关性口径）」，凭的正是这一词的条目数。
+        各站自己累加时，漏写一处＝那一词的条目账永远是空的，归因句就只能退回旧那一种念法
+        （与 `_note_early_skip`/`_note_detail_filter` 同一族纪律，判据见第 33 条硬门）。
+        `claimed` 是站方自报的总数（只有实现了 `parse_listed_total` 的站才有）：每一页报的
+        都是整个查询的总数，所以按页取**最大值**而不是求和。
+        """
+        n = int(count or 0)
+        self.stat_listed += n
+        key = str(kw or "")
+        if not key:
+            return n
+        self.kw_items[key] = self.kw_items.get(key, 0) + n
+        if claimed is not None:
+            c = int(claimed)
+            self.kw_claimed[key] = max(self.kw_claimed.get(key, 0), c)
+        return n
+
     def _kw_zero_reason(self, kw):
-        """某一词零净新增时，账上能不能说出「货是被本机相关性闸门砍的」。
+        """某一词零净新增时，账上能不能说出「货是被谁挡住的」。
 
         第五类归因（前四类：被拦/链路未通/本页无数据/增量库全跳过）：链路是通的、站方
         也回了货，只是本机判定把这一词整批判成类目不符。混进旧那三档，读的人会去查网络、
         换关键词，而真正该动的是相关性口径（同族类目桥）——2026-11-15 实机「橡胶手套」
         7 条全砍就是这么被写成「差分没跑成，建议换词复跑」的。返回空串＝说不出，调用方
         必须退回旧那句，不许编。
+        【第十三轮补的分叉】光知道「砍了几家」还不够，必须知道「站方一共回了几条」：砍 1 家
+        可能是这一词只有 1 条货（处方＝换词/换索引），也可能是 30 条里的 1 条（处方＝改相关性
+        口径）。两种念法都写成后者时，前一种的读者会去改一个改了也没用的东西（2026-11-16 实机
+        中国制造网「窗帘导轨」：站方自报「共找到 1 个」，日志却说「该复核的是相关性口径」）。
         """
         det = self.kw_filtered.get(kw, 0)
         ear = self.kw_early.get(kw, 0)
         if not (det or ear):
             return ""
+        cut = det + ear
         how = "、".join(x for x in (f"详情页复核砍 {det} 家" if det else "",
                                     f"列表页早过滤砍 {ear} 家" if ear else "") if x)
         # 名单跟着数字一起给：这句处方是「该复核相关性口径」，而复核的人手上必须有几家
         # 名字可看，否则「该复核」等于把活推回去却没给材料（样本由来见 _cut_sample）。
         who = "、".join(x for x in (self._cut_note(self.kw_filtered_names, kw, "复核"),
                                     self._cut_note(self.kw_early_names, kw, "早过滤")) if x)
-        return (f"零净新增：站方回的货有，但{how}（链路通、不是平台没数据）"
-                f"——该复核的是相关性口径/同族类目桥{who}")
+        items = self.kw_items.get(kw)
+        claimed = self.kw_claimed.get(kw)
+        # ① 站方自报的比解析到的多：锅在解析口径，既不是货源也不是相关性
+        if items is not None and claimed is not None and claimed > items:
+            return (f"零净新增：站方在这一词自报 {claimed} 条，我们的列表解析只认出 {items} 条"
+                    f"（其中 {cut} 家被本机相关性闸门砍掉）——该修的是列表卡片解析口径，"
+                    f"既不是搜索词也不是相关性阈值{who}")
+        # ② 条目账压根没记上：说不出货量就不许替读者挑处方（这一句是报我们自己缺账）
+        if items is None:
+            return (f"零净新增：本机砍了 {cut} 家（{how}），但这一词的列表条目账没记上——"
+                    f"说不出站方回了几条，先补上 _note_listed 记账再谈处方{who}")
+        # ③ 站方回得少：约束项在货源，一刀不砍也变不出可用样本
+        if items <= self.KW_THIN_SUPPLY_ITEMS:
+            src = (f"站方自报 {claimed} 条" if claimed is not None
+                   else f"站方这一词一共只回 {items} 条")
+            idx = f"，{self.SEARCH_INDEX_NOTE}" if self.SEARCH_INDEX_NOTE else ""
+            return (f"零净新增：{src}{idx}——个位数货量下砍掉 {cut} 家就必然零产出；"
+                    f"该换的是关键词或搜索索引，改相关性口径也变不出货{who}")
+        # ④ 货多、太全被砍：没被砍的那一部分必须说清楚，别让读者以为砍单数＝回货数
+        rest = ("" if items == cut else
+                f"，另外 {items - cut} 条没被砍（增量库已含或详情没出可用数据，"
+                f"见本轮跳过/无联系方式两笔账）")
+        return (f"零净新增：站方回的货有（这一词累计回 {items} 条），但{how}{rest}"
+                f"（链路通、不是平台没数据）——该复核的是相关性口径/同族类目桥{who}")
 
     def _keep_detail(self, html):
         """把「这一家的详情页正文」留给无联系方式分档（取用方见 _note_no_contact），原样返回便于链式。
@@ -3703,7 +3815,10 @@ return '';})()"""
         if kind not in self._nc_evidence:
             # 每档只留第一条证据：这一格是给人抽看「那句话到底是不是站方写的」，
             # 留全量会让账变成没人读的日志；要全量请回废数据那条路（add_waste）。
-            self._nc_evidence[kind] = short_reason(evid, 60)
+            # 账上存**原文**、这里不收口：长度只在渲染那一个把手处切一刀（nc_kinds_text）。
+            # 记账处先切一次、渲染处再切一次就是 30a-2 那一形「调完把手又补一刀」——两刀的
+            # 上限互相不知情，46 那一刀会把 60 那一刀留下的省略号再切成半截。
+            self._nc_evidence[kind] = evid.strip()
         self._detail_html = ""
 
     def is_relevant(self, kw, text):
@@ -3791,6 +3906,10 @@ return '';})()"""
             # 逐词相关性砍单账：某一词零净新增时，这一本账区分「闸门砍的」与「平台没货」
             "kw_filtered": dict(self.kw_filtered),
             "kw_early": dict(self.kw_early),
+            # 「站方回了多少条」的两本分词账：只有砍单数时，「货源薄」与「全被砍」两种
+            # 相反的处方会念成同一句（由来见 _kw_zero_reason；没有这两格就必须说「没记上」）
+            "kw_items": dict(self.kw_items),
+            "kw_claimed": dict(self.kw_claimed),
             # 砍单名单样本（逐词前几家）：有数字没名单，「该复核口径」这句处方就落不了地
             "kw_filtered_names": {k: list(v) for k, v in self.kw_filtered_names.items()},
             "kw_early_names": {k: list(v) for k, v in self.kw_early_names.items()},
@@ -3861,7 +3980,9 @@ return '';})()"""
                 self._note_page_fail("页面取回为空（会话断开或渲染未完成）")
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
-            self.stat_listed += len(entries)
+            # 条目账走唯一把手（总账 + 分词账 + 站方自报账）：`_kw_zero_reason` 要说得出
+            # 「这一词站方只回 1 条」还是「回 30 条全被砍」，凭的就是这一笔
+            self._note_listed(kw, len(entries), self.parse_listed_total(html))
             if not entries:
                 empty_streak += 1
                 if empty_streak >= 2:
@@ -3954,6 +4075,9 @@ return '';})()"""
         # 就只能听我说。由来见 _note_early_skip。
         self.kw_early_names = {}
         self.kw_filtered_names = {}
+        # 条目账同样按轮起账：跨轮累加会把上一轮的回货量冒充本轮的「货源薄」证据
+        self.kw_items = {}
+        self.kw_claimed = {}
         self._rel_refilter = 0
         self._pf_dropped = 0
         self._pf_unknown = 0
@@ -4191,15 +4315,12 @@ return '';})()"""
         # 深链被拒的账在正常出货的轮次里也要露出来：某一家的联系页 403 不代表本机被限流，
         # 但「这一条腿今天不通」必须看得见——不然读数的人只知道「共 N 家」，不知道少的是哪条通路，
         # 也就没人去换通路（马可波罗 product/contact 两条腿就是靠这一格现形的）
-        if s.get("deep_block"):
-            lk += "｜深链被拒 " + "、".join(
-                f"{h} {v[0]} 次" for h, v in sorted(s["deep_block"].items()))
+        # 按主域聚合（与体检报告同一家口径）：每家一个子域的站，按主机念会念出几十段同一件事
+        lk += self._host_account_line(s.get("deep_block"), "深链被拒")
         # 落点不符（导航请求的那一页与浏览器实际留下的那一页不是同一页）在旧口径里只进 stats()
         # 不进人眼：2026-11-16 自查发现全局 grep 不到一处渲染。这一笔记的是「我们以为在看的
         # 那一页其实不是」——它正是「把别人的页当这一家」那一类事故的先兆，念不出来就等于没记。
-        if s.get("landing"):
-            lk += "｜落点不符 " + "、".join(
-                f"{h} {v[0]} 次" for h, v in sorted(s["landing"].items()))
+        lk += self._host_account_line(s.get("landing"), "落点不符")
         # 「无联系方式 N 家」单说数字不办事：各档的处方互相矛盾（修代码 / 换通路 / 不用管 /
         # 判不了），必须当场报哪一档；miss 与 unknown 是我们自己的账、no_page 是本站定的
         # 设计边界，所以排在前头（先认自己这一侧，再把站方的账放后面）
@@ -4264,6 +4385,9 @@ return '';})()"""
         # 就只能听我说。由来见 _note_early_skip。
         self.kw_early_names = {}
         self.kw_filtered_names = {}
+        # 条目账同样按轮起账：跨轮累加会把上一轮的回货量冒充本轮的「货源薄」证据
+        self.kw_items = {}
+        self.kw_claimed = {}
         self._rel_refilter = 0
         self._pf_dropped = 0
         self._pf_unknown = 0

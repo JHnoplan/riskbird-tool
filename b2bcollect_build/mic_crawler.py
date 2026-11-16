@@ -49,6 +49,13 @@ _CO_NAME_ANCHOR = re.compile(
     r'[^>]*title="([^"]+)"', re.I)
 _MAIN_PROD_RE = re.compile(r'主\s*营\s*产品[：:]\s*(.+?)\s*(?:经营模式|身份认证|>|$)', re.S)
 
+# 站方在搜索结果页**自报**的总条数：`<div class="lst-lead-node">共找到
+# <span class="red">1</span>个 <h1 class="red"><strong>窗帘导轨</strong></h1>公司</div>`
+# （2026-11-16 实机取证留档）。它是「货源薄」与「卡片改版导致解析漏」的唯一分界：
+# 只报我们解析到的条数时，这两种局的日志长得一模一样。
+LISTED_TOTAL_MARK = "共找到"
+LISTED_TOTAL_WINDOW = 120     # 剥掉标签后只在这段窗口里找第一个数字
+
 # 供应商子域：捕获完整主机（cn 或 en 后缀），详情 URL 用实际捕获到的主机，避免硬编码 .cn
 SUBDOMAIN_RE = re.compile(r'https?://([a-z0-9][a-z0-9\-]{1,40})\.((?:cn|en)\.made-in-china\.com)', re.I)
 EXCLUDED_SUBS = {'www', 'cn', 'en', 'm', 'static', 'res', 'search', 'login', 'member',
@@ -121,6 +128,11 @@ class MicCrawler(CdpSiteCrawler):
     SAFE_TITLE_HINTS = ("中国制造网", "Made-in-China", "Wholesale", "products",
                         "公司", "供应商", "制造商", "厂家", "联系方式")
     MIN_PAGE_CHARS = 800
+    # 这一路搜的是**公司目录**（companysearch.do），不是产品目录：产品长词能命中的公司
+    # 本来就少。归因句在「个位数回货」那一档会原样引用这一句，告诉读者该换的是搜索索引，
+    # 而不是让他去改本机相关性阈值（由来见 cdp_base.SEARCH_INDEX_NOTE）。
+    SEARCH_INDEX_NOTE = ("这一路搜的是公司目录（companysearch.do）而不是产品目录，"
+                         "产品长词能命中的公司本来就少")
 
     def __init__(self, port=9255):
         super().__init__(port)
@@ -157,6 +169,26 @@ class MicCrawler(CdpSiteCrawler):
             if en:
                 return url.replace("comProvince=nolimit", f"comProvince={en}")
         return url
+
+    def parse_listed_total(self, html):
+        """站方自己写在搜索页上的总条数（拿不到就返回 None，不拿解析数冒充）。
+
+        为什么只有这一站实现了：MIC 的卡片解析靠 `class="co-name"` 这一枚锚点，站方改版
+        时会安静地少认几家——少认到 1 家时，旧账本只会念「站方回的货有、该复核相关性口径」，
+        而真凶在解析函数里。这一格把「站方说有几条」与「我们抓到几条」分成两个数并排放，
+        两种处方（换索引 / 修解析）才各归各位（判据见 cdp_base._kw_zero_reason 与第 33 条硬门）。
+        """
+        i = (html or "").find(LISTED_TOTAL_MARK)
+        if i < 0:
+            return None
+        window = re.sub(r"<[^>]+>", " ", html[i:i + LISTED_TOTAL_WINDOW])
+        m = re.search(r"([\d,]{1,9})", window)
+        if not m:
+            return None
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
 
     def parse_list(self, html, kw):
         """公司搜索页：从 class="co-name" 锚点逐张卡片取子域/主机/中文公司名 + 主营产品。

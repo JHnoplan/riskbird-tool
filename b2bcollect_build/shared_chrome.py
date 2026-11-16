@@ -258,13 +258,40 @@ def _launch_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
     return False
 
 
-def list_page_targets(port: int = PORT) -> list:
-    """共享浏览器里所有可见页面（type=page）。查询失败返回 []。"""
+class TabListUnavailable(RuntimeError):
+    """标签列表**压根没读到**：这和「读到了、里面没有这一枚」是两句话。
+
+    旧写法把查询失败吞成 []，于是同一个 [] 既表示「浏览器里没有页面」也表示「控制面不通」。
+    上层 `close_tab` 拿它当证据宣布「这一枚已经还完了」，其实就是把「我不知道」念成
+    「没事」——和第 32g 条那一族（最底层把事实抹平，上面整座账退化成自证清白）同一种病。"""
+
+
+# Chrome 的 /json/close 是**异步**的：回执 200（body 常写 `Target is closing`）之后，这一枚
+# 还可能留在 /json/list 里几十到几百毫秒。2026-11-16 第十二轮实机：中国制造网收工就报了一句
+# 假警「标签仍在列表里（关闭回执 HTTP 200 Target is closing）」，让用户去手动关一枚其实早就
+# 关掉的标签。归因说错方向比不说更坏——所以按下面的节奏逐次复查，**任何一次查不到就算关掉**，
+# 每次都还在才把失败交上去（最后一个间隔给得宽一点，慢机器上也在范围内）。
+TAB_CLOSE_SETTLE = (0.2, 0.4, 0.8)
+
+
+def list_page_targets(port: int = PORT, strict: bool = False) -> list:
+    """共享浏览器里所有可见页面（type=page）。
+
+    `strict=False`（默认）：查询失败回 []。调用方只把它当「现在挂着哪些标签」的提示，
+    读不到就当没有——用于展示、统计这类说错也不改变下一步动作的场合。
+    `strict=True`：把失败原因抛成 `TabListUnavailable`。凡是**拿这份列表当证据下结论**的
+    调用方（关完标签要确认这一枚真的不在了）都必须走这一档，否则「没读到」就会被
+    读成「已经空了」。
+    """
     try:
         data = local_session().get(local_url(port, "/json/list"), timeout=3).json()
-    except Exception:
+    except Exception as e:
+        if strict:
+            raise TabListUnavailable(f"{type(e).__name__}：{first_line(e, 80)}") from e
         return []
     if not isinstance(data, list):
+        if strict:
+            raise TabListUnavailable(f"回执不是一页列表（读到的是 {type(data).__name__}）")
         return []
     return [t for t in data if isinstance(t, dict) and t.get("type") == "page"]
 
@@ -294,7 +321,10 @@ def close_tab(port: int = PORT, target_id: str = ""):
     这一层先把真相交出来。
 
     只信回执不信事实：Chrome 对不存在的 target 也回 HTTP 200（body 写 No such target），
-    所以关完再查一次列表——**在列表里查不到才算关掉**，与 `list_page_targets` 同一口径。"""
+    所以关完要再查列表——**在列表里查不到才算关掉**。但反过来也一样：列表这一刻还查得到
+    这一枚，也不等于没关掉（`/json/close` 是异步的，见 `TAB_CLOSE_SETTLE`），所以按那个节奏
+    逐次复查；而**复查本身没送达**时更不许挑一句最好听的说——那一枚到底还在不在是未知数，
+    就照实说未知，请用户手动确认。"""
     if not target_id:
         return "没给出 target_id，这一枚没关"
     said = ""
@@ -303,10 +333,17 @@ def close_tab(port: int = PORT, target_id: str = ""):
         said = f"HTTP {r.status_code} {first_line((r.text or '').strip(), 60)}"
     except Exception as e:
         return f"关闭请求没送达（{type(e).__name__}）：{first_line(e, 80)}"
-    ids = {t.get("id") for t in list_page_targets(port)}
-    if target_id not in ids:
-        return ""
-    return f"标签仍在列表里（关闭回执 {said or '无'}）"
+    for gap in TAB_CLOSE_SETTLE:
+        time.sleep(gap)
+        try:
+            ids = {t.get("id") for t in list_page_targets(port, strict=True)}
+        except TabListUnavailable as e:
+            return (f"关闭回执 {said or '无'}，但复查标签列表没送达（{e}）：这一枚到底关掉了"
+                    f"没有是未知数，请在共享 Chrome 里手动确认一眼（不影响已采数据）")
+        if target_id not in ids:
+            return ""
+    return (f"标签仍在列表里（等 {'+'.join(str(g) for g in TAB_CLOSE_SETTLE)} 秒逐次复查 "
+            f"{len(TAB_CLOSE_SETTLE)} 次都还在，关闭回执 {said or '无'}）")
 
 
 def _is_blank(url: str) -> bool:
@@ -359,10 +396,23 @@ def acquire_tab(port: int = PORT, url: str = "about:blank", domain: str = "",
 
 def release_tabs(pinned_ids, port: int = PORT, log=None):
     """收工：只关掉本工具 pin 的标签，共享浏览器保留（下次直接复用）。
-    同时解除这些标签的认领，避免认领表残留导致下次误判标签已被占用。"""
+    同时解除这些标签的认领，避免认领表残留导致下次误判标签已被占用。
+
+    开头的列表查询走严格口径：旧写法读不到就回 []，于是「控制面不通」被当成
+    「一个标签都不剩」——`keep_alive > 1` 这一档当场把整批归还动作全跳过，日志却照旧
+    一路念到「收工」，用户的 Chrome 里挂着一堆没人认领的标签（与 32e/32g 同一族病）。
+    这里选择「宁可一个不关（误关最后一个窗口会让下一轮附加直接挂），也要把没核对说出来」。"""
     log = log or (lambda m: None)
     claimed = _CLAIMED.setdefault(port, {})
-    tabs = list_page_targets(port)
+    try:
+        tabs = list_page_targets(port, strict=True)
+    except TabListUnavailable as e:
+        for tid in pinned_ids or []:
+            claimed.pop(tid, None)
+        log(f"⚠ 收工归还标签这一步没核对：读共享浏览器的标签列表失败（{e}）——"
+            f"为避免误关最后一个窗口，这一批 pin 的标签没动，请在共享 Chrome 里手动确认"
+            f"（不影响已采数据）")
+        return
     keep_alive = len(tabs)
     for tid in pinned_ids or []:
         claimed.pop(tid, None)

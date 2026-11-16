@@ -343,7 +343,8 @@ class Qihuo11467Crawler(CdpSiteCrawler):
                 return
             entries = self.parse_list(html, kw)
             self.stat_pages += 1
-            self.stat_listed += len(entries)
+            # 条目账走唯一把手（总账 + 分词账 + 站方自报账）：见 cdp_base._kw_zero_reason
+            self._note_listed(kw, len(entries), self.parse_listed_total(html))
             if not entries:
                 empty += 1
                 if empty >= 1:

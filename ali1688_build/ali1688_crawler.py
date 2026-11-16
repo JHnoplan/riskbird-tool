@@ -391,6 +391,11 @@ CONTACT_SLOT_NUM_RE = re.compile(r"1[3-9]\d{9}|0\d{2,3}-?\d{7,8}|400[-\s]?\d{3}[
 # 剥标签用的小刀：`<[^>]{1,160}>` 而不是一路 `<[^>]+>`——模板里偶有把 `<` 写在文字里的脏页，
 # 不限长度就会从那个 `<` 一路吞到下一个 `>`，把整段正文当作一个标签吃掉（证据跟着失真）。
 CONTACT_SLOT_TAG_RE = re.compile(r"<[^>]{1,160}>")
+# 只剥「没合口的半截标签尾巴」：窗口是 120 字硬切的，切在标签中间时上面那把刀要不到 `>`、
+# 剥不动，于是 `<img style="margi` 这种残句会一路活到报告里（2026-11-16 第十二轮实机马可波罗）。
+# 要求 `<` 后面紧跟标签名字符（字母/`/`/`!`）：`价格 <100 元`、`a < b` 这类正文里的裸 `<`
+# 不算标签，否则会把真证据（含号码）从尾巴上吃掉——那才是把证据改没了的那类谎。
+CONTACT_SLOT_DANGLING_RE = re.compile(r"<[a-zA-Z/!][^>]*$")
 # 砍单样本：每个词只留几家、名字收到多长（取用方见 _cut_sample）。
 # 3 家×2 阶段是「一眼能判这一刀该不该砍」的最少样本量，再多界面那一行就没人读了。
 CUT_SAMPLE_CAP = 3
@@ -423,7 +428,17 @@ def contact_slot_state(html):
         else:
             continue            # 值是一段别的文字（栏位标题撞上表头等），不作证据
         if rank[kind] > rank.get(best, -1):
-            best, evid = kind, f"{m.group(0).strip()}→{show[:24]}"
+            # 尾巴只切**没合口的半截标签**，这一处不管长度：长度只在渲染那一个把手切一刀。
+            # 旧写法 `show[:24]` 是裸字符切，会把中文词砍成半截词（第 30 条），而渲染那一刀
+            # 本来就会把整句收到人眼读得动的长度——两把刀的上限互相不知情，留一把就够。
+            # 剥尾巴也不碰档位判定（判定仍用完整窗口，切晚了才不会改结论）：窗口是 120 字
+            # 硬切的，切在标签中间时 `CONTACT_SLOT_TAG_RE` 要不到 `>`、剥不动，于是
+            # `<img style="margi` 这种残句会一路活到报告里（2026-11-16 第十二轮实机马可波罗）。
+            # 整窗就是一截未合口标签时**退回原文**而不是编一句描述：`<a href="tel:13800…` 这种
+            # 切在标签里的窗口本身就是 miss 档唯一的凭据，换成「窗口里只剩半截标签」这种话
+            # 等于把号码从证据里弄没了——那是比半截词更糟的那类谎（说了句不存在于页面的话）。
+            tail = CONTACT_SLOT_DANGLING_RE.sub("", show).strip() or show
+            best, evid = kind, f"{m.group(0).strip()}→{tail}"
     return (best or "no_slot"), evid
 
 
@@ -596,6 +611,13 @@ class Ali1688Crawler:
         # 砍单记名 + 无联系方式分档（口径同 cdp_base.__init__，由来见 cdp_base 那两段注释）
         self.kw_early_names = {}
         self.kw_filtered_names = {}
+        # 「站方回了多少条」的账（与 cdp_base 同一族：总账 + 两本分词账，走 _note_listed 把手）：
+        # 1688 的收尾那句「本轮零产出」要在「链路没通／增量库全跳过／这一词本就只回几条」
+        # 之间分叉，而旧写法连 `stat_listed` 都没在这份里赋过值——读它的地方只能拿 getattr
+        # 兑一个 0，于是「只要有一页取失败」就被念成「一页都没取到」（第十三轮实机查到）。
+        self.stat_listed = 0
+        self.kw_items = {}
+        self.kw_claimed = {}
         self._nc_kinds = {}
         self._nc_evidence = {}
         self._detail_html = ""
@@ -710,7 +732,9 @@ class Ali1688Crawler:
             evid = declared or "本站详情页没把正文留给分档判据（接 _keep_detail 才有这一档）"
         self._nc_kinds[kind] = self._nc_kinds.get(kind, 0) + 1
         if kind not in self._nc_evidence:
-            self._nc_evidence[kind] = short_reason(evid, 60)
+            # 账上存**原文**、这里不收口：长度只在渲染那一个把手处切一刀（nc_kinds_text）。
+            # 记账处先切一次、渲染处再切一次就是 30a-2 那一形「调完把手又补一刀」（口径同 cdp_base）。
+            self._nc_evidence[kind] = evid.strip()
         self._detail_html = ""
 
     def _note_early_skip(self, kw, name=""):
@@ -724,6 +748,40 @@ class Ali1688Crawler:
         self._filtered_count += 1
         self.kw_filtered[kw] = self.kw_filtered.get(kw, 0) + 1
         self._cut_sample(self.kw_filtered_names, kw, name)
+
+    def parse_listed_total(self, html):
+        """站方在列表页上**自己说**的结果总数（默认不猜，返回 None；子类按站点实现）。
+
+        为什么要有这一格：「我们解析到 N 条」只说明我们的手抓到了几条，说明不了站方给了
+        几条。两者不一致时该修的是解析口径（我们的锅），而旧账本只有后者，于是「站方回了
+        30 家、卡片改版只认出 1 家」会被写成「这一词货源薄」——把人支使去换词，真凶就在
+        解析函数里（2026-11-16 实机 中国制造网「窗帘导轨」取证时正是靠页面上那句
+        「共找到 1 个」才把「货源薄」与「解析漏」分开）。取不到就交回 None：说不出＝不知道，
+        不许编一个数上去。
+        """
+        return None
+
+    def _note_listed(self, kw, count, claimed=None):
+        """列表页「站方回了多少条」的**唯一**记账把手：总账、分词账、站方自报账一起落。
+
+        为什么必须走把手而不是各站自己 `self.stat_listed += len(entries)`：总账只有一个
+        全局数，回答不了「这一词为什么零产出」；而 `_kw_zero_reason` 要说「站方只回 1 条
+        （换词换索引）」还是「回 30 条全被砍（改相关性口径）」，凭的正是这一词的条目数。
+        各站自己累加时，漏写一处＝那一词的条目账永远是空的，归因句就只能退回旧那一种念法
+        （与 `_note_early_skip`/`_note_detail_filter` 同一族纪律，判据见第 33 条硬门）。
+        `claimed` 是站方自报的总数（只有实现了 `parse_listed_total` 的站才有）：每一页报的
+        都是整个查询的总数，所以按页取**最大值**而不是求和。
+        """
+        n = int(count or 0)
+        self.stat_listed += n
+        key = str(kw or "")
+        if not key:
+            return n
+        self.kw_items[key] = self.kw_items.get(key, 0) + n
+        if claimed is not None:
+            c = int(claimed)
+            self.kw_claimed[key] = max(self.kw_claimed.get(key, 0), c)
+        return n
 
     def _note_page_fail(self, err=""):
         """记一笔「这一页列表根本没取到」——只在翻页层调用，一页最多一次。
@@ -1835,6 +1893,9 @@ class Ali1688Crawler:
                 return
             html = self.driver.page_source
             offers = self._parse_list_page(html)
+            # 条目账走唯一把手（总账 + 分词账）：收尾那句「本轮零产出」要分得清「一页都没
+            # 取到」与「取到了但一家没出」，凭的就是这一笔
+            self._note_listed(kw, len(offers), self.parse_listed_total(html))
             if not offers:
                 self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
@@ -1920,6 +1981,7 @@ class Ali1688Crawler:
                 self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
             entries = self._parse_company_page(self.driver.page_source)
+            self._note_listed(kw, len(entries), self.parse_listed_total(self.driver.page_source))
             if not entries:
                 empty_streak += 1
                 if empty_streak >= 2:
@@ -2150,6 +2212,7 @@ class Ali1688Crawler:
                 return
             src = self.driver.page_source
             pairs = self._parse_main_search_page(src)
+            self._note_listed(kw, len(pairs), self.parse_listed_total(src))
             if page == 1 and self.relevance_guard:
                 # 顺带取该关键词的预测类目集（同一页源码，零额外请求）
                 self._guard_pred = self._parse_keywords_category(src)
@@ -2458,6 +2521,11 @@ class Ali1688Crawler:
         self.kw_early = {}
         self.kw_early_names = {}
         self.kw_filtered_names = {}
+        # 条目账按轮起账（口径同 cdp_base）：跨轮累加会把上一轮的回货量冒充本轮的证据，
+        # 而 stat_listed 不清零更会让收尾那句「一页都没取到」永远响不起来
+        self.kw_items = {}
+        self.kw_claimed = {}
+        self.stat_listed = 0
         # 分档账同样按轮起账：跨轮累加会把上一轮的「站方没登」冒充本轮的责任判定
         self._nc_kinds = {}
         self._nc_evidence = {}
@@ -2633,8 +2701,16 @@ class Ali1688Crawler:
         for k in sorted(set(self.kw_filtered_names) | set(self.kw_early_names)):
             one = "、".join(x for x in (self._cut_note(self.kw_filtered_names, k, "复核"),
                                         self._cut_note(self.kw_early_names, k, "早过滤")) if x)
+            # 回货数跟着名单一起给，并把「站方自报」与「我们解析到」分开念：只念后者时，
+            # 「卡片改版只认出 1 家」会被念成「这一词本就只回 1 条」——两种局的处方正好相反
+            # （一个修解析、一个换词）。口径同 cdp_base._kw_zero_reason 的四档分叉。
+            _it, _cl = self.kw_items.get(k), self.kw_claimed.get(k)
+            if _it and _cl and _cl > _it:
+                got = f"（站方自报 {_cl} 条、列表解析只认出 {_it} 条：该修卡片解析口径）"
+            elif _it:
+                got = f"（站方这一词回了 {_it} 条）"
             if one:
-                parts.append(f"「{k}」{one}")
+                parts.append(f"「{k}」{one}{got}")
         samp = ("，砍单样本：" + " ".join(parts)) if parts else ""
         # 「0 新增」必须有一句解释从哪来：跳过多少家、其中多少家还欠一次补联系人。
         # 只有「种子库累计 N 家」这一句是不够的——它说的是库有多大，不是这轮为什么没活。
@@ -2664,7 +2740,7 @@ class Ali1688Crawler:
             # 和增量库把这一轮全跳过了（种子库已含，链路是通的，要新数据得换词）。
             # 合成一句「见上方账目」时，上一轮就是这么把 3 站全跳过、1 站网络不可达
             # 都报成「采不到」的（判据片段与 cdp_base 逐字对拍，见第 14 节）。
-            if self._page_fail and not getattr(self, "stat_listed", 0):
+            if self._page_fail and not self.stat_listed:
                 mark, why = "⛔", (f"｜链路未通：{self._page_fail} 页一页都没取到，"
                                    "这不是本站没有数据（先查出口网络/域名可达，再谈代码）")
             elif self._incremental_skipped:

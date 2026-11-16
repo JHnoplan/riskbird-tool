@@ -564,13 +564,23 @@ if HAS_1688:
             改走 CDP /json/list 只读 URL、/json/close 关闭，全程不激活任何标签。
 
             没剪掉的那几枚必须开口（第 32g 条）：旧写法一层 `except …: pass` 把整个
-            清理动作抹平，堆在窗口里的标签就成了「没人认领的孤儿」，下一轮只能另开。"""
+            清理动作抹平，堆在窗口里的标签就成了「没人认领的孤儿」，下一轮只能另开。
+
+            标签列表**压根没读到**也不能当作「没有多余标签」：那一档同样得开口（只说一次，
+            这一函数每次导航后都会被调，逐次重念就成了噪声）。"""
             try:
                 import shared_chrome as sc
                 own = getattr(self, "_tab", None)
                 if not own:
                     return
-                targets = sc.list_page_targets(self.debug_port)
+                try:
+                    targets = sc.list_page_targets(self.debug_port, strict=True)
+                except sc.TabListUnavailable as e:
+                    if not getattr(self, "_prune_warned", False):
+                        self._prune_warned = True
+                        self._log(f"⚠ 清理 1688 多余标签这一步没读到标签列表（{e}）："
+                                  f"弹出的新标签可能留着，不影响已采数据")
+                    return
                 ids = {t.get("id") for t in targets}
                 # 句柄与 target id 对不上（异常情形）：宁可不剪也不误关自己的标签
                 if own not in ids:
@@ -641,20 +651,10 @@ if HAS_1688:
                 self.stat_pages += 1       # 列表页翻页计数（三个渠道 URL 都带 beginPage）
             return super()._goto(url, tries=tries)
 
-        def _parse_list_page(self, html):
-            offers = super()._parse_list_page(html)
-            self.stat_listed += len(offers or [])
-            return offers
-
-        def _parse_company_page(self, html):
-            entries = super()._parse_company_page(html)
-            self.stat_listed += len(entries or [])
-            return entries
-
-        def _parse_main_search_page(self, src):
-            pairs = super()._parse_main_search_page(src)
-            self.stat_listed += len(pairs or [])
-            return pairs
+        # 条目账（stat_listed / kw_items / kw_claimed）不在这里记：记账住在真源
+        # `Ali1688Crawler` 的三个翻页循环里（走 `_note_listed` 把手）。这里曾覆写三个
+        # `_parse_*` 自己 `+=`：同一笔账两个地方各记一次，把手接入后就会翻倍读数，
+        # 而「谁在记总账」也从此说不清（第 33 条硬门的 33a：累加只许住在一个把手里）。
 
         def stats(self):
             """与 cdp_base.stats() 同构的账目（GUI 看板/结束日志直接复用渲染）。
@@ -679,6 +679,9 @@ if HAS_1688:
                     # 逐词相关性砍单账：与 cdp_base.stats() 同两把键，体检器一套判据吃十路
                     # （缺一格就把「闸门砍光这一词」报成「平台没货」，见第 ⑭ 节）
                     "kw_filtered": dict(self.kw_filtered), "kw_early": dict(self.kw_early),
+                    # 「站方回了多少条」的两本分词账（与 cdp_base.stats() 同两把键）：
+                    # 缺一格，体检器就只能把「这一词本就只回 1 条」与「30 条全被砍」念成同一句
+                    "kw_items": dict(self.kw_items), "kw_claimed": dict(self.kw_claimed),
                     # 判定规则更新后本轮重判的旧「类目不符」家数（与 cdp_base 同键）
                     "rel_refilter": self._rel_refilter,
                     "no_contact": no_contact, "failed": failed, "got": len(self.results),
@@ -700,6 +703,9 @@ if HAS_1688:
             self._early_skipped = 0
             self.kw_filtered = {}
             self.kw_early = {}
+            # 条目账与砍单账同口径按轮起账（真源在 Ali1688Crawler.crawl，这里是适配层自己的收尾）
+            self.kw_items = {}
+            self.kw_claimed = {}
             self._rel_refilter = 0
             # 链路账与等人账同 cdp_base.reset_run_state 口径：跨轮不清会让上一轮的网络
             # 故障冒充本轮的归因，界面在本轮早已正常时继续喊「等你登录」

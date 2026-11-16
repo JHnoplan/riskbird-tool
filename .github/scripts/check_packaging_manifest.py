@@ -5550,7 +5550,11 @@ def _mirror_local_names(node) -> set:
 
 
 def _mirror_self_attrs(node) -> set:
-    """这个函数读过的 `self.X`（只算读：写不改变镜像要不要补一份默认值）。"""
+    """这个函数碰过的 `self.X`：读、以及「只作为写入地址出现」的都在内（口径与 `_attr_reads` **有意**不同）。
+
+    镜像要拿这些名字去问「类上有没有默认值」：`self.x[k] = 1` 这一行运行时同样要求 `self.x`
+    已经绑定，漏算一个就是把一份跑不起来的镜像交出去。33b-2 问的是「这本账有人念吗」，那边
+    必须把写入地址剔掉——同一个语法节点在两条判据里要的是两回事，这里写下来免得下一个人直接照抄。"""
     return {n.attr for n in ast.walk(node)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
             and n.value.id == "self" and isinstance(n.ctx, ast.Load)}
@@ -5975,8 +5979,13 @@ def check_tab_body_identity(files=None) -> list:
 #   ③ 六份纯 HTTP 站把 `close_browser` 覆写成空壳 `return None`，降级取页时借来的标签一路
 #      留到收工之后（用户的共享 Chrome 里挂着一枚 maimaib2b 的标签没人认领）。
 #      → 借来的标签必须还，空壳覆写必须当场响。
-# 三条都是同一族病：**账在内存里累加，却从不外读**（与通路账 legs、落点账 landing 同族）。
-# 所以本条判的全是结构与同源，不判任何一次实机的运气。
+#   ④（2026-11-16 第十二轮实机、同一本账现形的第四件事）马可波罗那句「证据」长成
+#      `联系电话 ：→点击查看联系 <img style="margi`：120 字窗口切在标签中间、裸字符切把
+#      属性名砍成半截，而记账那一行先切 60、渲染再切 46，两把刀的上限互相不知情。
+#      → 这一本账从生成到入账只许零刀，唯一那一刀住在 `nc_kinds_text`（32i；反向的
+#        「一刀都不切」同样要响，120 字证据 × 六档没人读得动）。
+# 四件都是同一族病：**账在内存里累加，却从不外读**（与通路账 legs、落点账 landing 同族），
+# 而外读出来的那一句本身也要只由一个把手收口。所以本条判的全是结构与同源，不判任何一次实机的运气。
 NC_BLOCK_MARKS = ("CONTACT_SLOT_LABEL_RE", "# ── [NC-BLOCK-END]")
 NC_MIRROR_FILES = ("b2bcollect_build/cdp_base.py", "ali1688_build/ali1688_crawler.py")
 # 32c 分档账在 stats() 里的三格：计数、证据、以及给三处渲染共用的那一句人话
@@ -6297,6 +6306,157 @@ def _nc_fn_core(fn):
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
+# 32i 分档证据从生成到入账经过的名字：改名要连这一行一起改，否则 32i 会报「认不出证据串
+# 是哪个名字」而不是安静地放空（在空集合上报绿等于这一条没跑）。
+NC_EVIDENCE_NAMES = ("evid", "tail")
+NC_EVIDENCE_LEDGER = "_nc_evidence"
+NC_RENDER_HANDLE = "nc_kinds_text"
+NC_CUT_HANDLES = ("short_reason", "first_line")
+
+
+def _nc_cut_shapes(node) -> list:
+    """表达式里的「收口」形状：从 0 开始、上界是常量的前缀切，或对收口把手的调用。
+    带下界的切片（120 字窗口 `page[m.end():m.end() + 120]`）算「取哪一段正文」、不算收口：
+    把它一起禁掉就是误伤，而误伤一次，下一次就有人把这一条改成永真。"""
+    out = []
+    for x in ast.walk(node):
+        if (isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Slice)
+                and x.slice.lower is None and isinstance(x.slice.upper, ast.Constant)
+                and isinstance(x.slice.upper.value, int)):
+            out.append(f"切到 {x.slice.upper.value} 字")
+        elif isinstance(x, ast.Call):
+            _nm = getattr(x.func, "id", None) or getattr(x.func, "attr", "")
+            if _nm in NC_CUT_HANDLES:
+                out.append(f"{_nm}(...)")
+    return out
+
+
+def _nc_evidence_writes(tree):
+    """往分档证据上写东西的那些赋值（生成处的 `evid`/`tail`、入账处的 `_nc_evidence[…]`）。"""
+    got = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Assign):
+            continue
+        hit = False
+        for t in n.targets:
+            for x in ast.walk(t):
+                if isinstance(x, ast.Name) and x.id in NC_EVIDENCE_NAMES:
+                    hit = True
+                elif (isinstance(x, ast.Subscript) and isinstance(x.value, ast.Attribute)
+                      and x.value.attr == NC_EVIDENCE_LEDGER):
+                    hit = True
+        if hit:
+            got.append(n)
+    return got
+
+
+def _nc_evidence_no_cut_problems(label: str, tree) -> list:
+    """32i：这一本账只许挨一刀，而那一刀住在渲染把手里——生成与入账两处都不许收口。
+
+    由来（2026-11-16 第十二轮实机 马可波罗）：记账那行先 `short_reason(evid, 60)`、渲染再切 46，
+    两把刀的上限互相不知情（把渲染上限调到 90 也照样只看到 60 那一刀留下的省略号）；而
+    `show[:24]` 那一刀把半截属性名 `<img style="margi` 留成了报告里的「证据」，读起来像
+    我们的解析坏了——页面上其实只写了「点击查看联系」（那一档该换通路，不该去改解析）。
+    两个方向都要钉：只钉「不许多刀」会被人把渲染那一刀也一并拆掉（120 字证据 × 六档没人读得动），
+    所以同时要求渲染把手本体里真的存在那一刀。
+    """
+    problems = []
+    writes = _nc_evidence_writes(tree)
+    for n in writes:
+        shapes = _nc_cut_shapes(n.value)
+        if shapes:
+            problems.append(
+                f"{label} 第 {n.lineno} 行把分档证据按长度收了口（{'、'.join(shapes)}）：这一本账"
+                f"从生成到渲染只许挨一刀，那一刀住在 `{NC_RENDER_HANDLE}`——两把刀的上限互相"
+                f"不知情，读到那句「证据」就没人负责")
+    render = [f for f in ast.walk(tree)
+              if isinstance(f, ast.FunctionDef) and f.name == NC_RENDER_HANDLE]
+    if not writes and not render:
+        problems.append(
+            f"{label} 里既找不到分档证据的写入处（{'/'.join(NC_EVIDENCE_NAMES)} 与 "
+            f"`{NC_EVIDENCE_LEDGER}[…]`）、也找不到 `{NC_RENDER_HANDLE}` 把手本体：视野断了的时候"
+            f"这一条等于没跑，证据变量改名要连登记表一起改")
+        return problems
+    if not render:
+        problems.append(f"{label} 里没有 `{NC_RENDER_HANDLE}` 把手本体：渲染那一刀没地方住，"
+                        f"而生成处的刀刚刚被这一条收掉——同一本账又变回没人读得动的一坨")
+    elif not _nc_cut_shapes(render[0]):
+        problems.append(
+            f"{label} 的 `{NC_RENDER_HANDLE}`（第 {render[0].lineno} 行）里一处都没收口：证据最长 "
+            f"120 字 × 六档，界面那一行没人读得动——「刀只许一把」的另一半是这一把不许缺席")
+    return problems
+
+
+# 32j 「关/归还标签」这一层读标签列表的口径：必须分得清「读不到」与「读到了、里面没这一枚」。
+TAB_LIST_HANDLE = "list_page_targets"
+TAB_LIST_STRICT_KW = "strict"
+TAB_CLOSE_URL_MARK = "/json/close"
+
+
+def _calls_tab_close(fn) -> bool:
+    """这个函数自己向 Chrome 发「关标签」请求吗。
+
+    只看**调用实参**里的字符串：`site_adapters` 的 docstring 里就写着「/json/close 关闭」，
+    拿全文子串发判会把一个只是把动作写进注释的函数当成干这事的（误伤一次就有人改成永真）。"""
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Call):
+            continue
+        for a in list(n.args) + [kw.value for kw in n.keywords]:
+            for x in ast.walk(a):
+                if (isinstance(x, ast.Constant) and isinstance(x.value, str)
+                        and TAB_CLOSE_URL_MARK in x.value):
+                    return True
+    return False
+
+
+def _tab_list_calls(fn):
+    """这个函数里读标签列表的那几处调用（含 `sc.list_page_targets(...)` 这种带命名空间的写法）。"""
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call):
+            nm = getattr(n.func, "id", None) or getattr(n.func, "attr", "")
+            if nm == TAB_LIST_HANDLE:
+                yield n
+
+
+def _is_strict_list_call(call) -> bool:
+    return any(kw.arg == TAB_LIST_STRICT_KW and isinstance(kw.value, ast.Constant)
+               and kw.value.value is True for kw in call.keywords)
+
+
+def _tab_list_strict_problems(label: str, tree) -> list:
+    """32j：拿标签列表当「关掉了吗 / 还剩几个」的证据时，必须走严格口径，且在关闭之后重查。
+
+    由来（2026-11-16 第十二轮实机 中国制造网）：`shared_chrome.close_tab` 发完 `/json/close`
+    只查**一次**列表就下结论「标签仍在列表里（回执 HTTP 200 Target is closing）」——Chrome 这条
+    接口是异步的，回执 200 时 target 还能在 /json/list 里挂上几百毫秒，于是用户被喊去手动关
+    一枚早就关掉的标签（归因说错方向比不说更坏）。同一函数还有第二句谎：列表查询失败被
+    `except` 吞成 []，而 [] 在它手里就是「不在了」——把「我不知道」念成「没事」，与本轮一直在
+    消灭的那一族（32e/32g：最底层把事实抹平，上面整座账退化成自证清白）同形。
+    两个方向都要钉：只钉口径会被人把重查删掉（退回「只信回执」），所以同时要求关之后得有一次重查。
+    """
+    problems = []
+    for fn in (f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+               and (_calls_tab_close(f) or _release_actions_in(f))):
+        lists = sorted(_tab_list_calls(fn), key=lambda c: c.lineno)
+        # 只拿**调用那一行**当关闭时刻：不把函数自己的定义行算进来（否则「重查在关闭之后」
+        # 会被一次只发生在关闭**之前**的枚举诓成绿），也不拿全文子串（docstring 会说话）。
+        closers = [n.lineno for n in ast.walk(fn)
+                   if isinstance(n, ast.Call) and _calls_tab_close(n)]
+        for call in lists:
+            if not _is_strict_list_call(call):
+                problems.append(
+                    f"{label} 第 {call.lineno} 行的 `{fn.name}` 用默认口径读标签列表（"
+                    f"`{TAB_LIST_HANDLE}(port)` 读不到时回 []）：那份 [] 既可能是「一个都不剩」也"
+                    f"可能是「控制面不通」，拿它宣布「已经还完」就是把「我不知道」念成「没事」"
+                    f"→ 要下结论就传 `{TAB_LIST_STRICT_KW}=True` 并把读不到的原因说出来")
+        if closers and not any(c.lineno > min(closers) for c in lists):
+            problems.append(
+                f"{label} 的 `{fn.name}` 自己发 {TAB_CLOSE_URL_MARK} 却从不回头重查标签列表"
+                f"（第 {min(closers)} 行之后没有 `{TAB_LIST_HANDLE}` 调用）：「关掉」这件事只能靠"
+                f"**重查事实**认定——Chrome 对不存在的 target 也回 HTTP 200，只信回执就必响假成功")
+    return problems
+
+
 def check_no_contact_accountability(files=None, texts=None) -> list:
     """无联系方式责任分档 + 砍单记名 + 借标签归还（第 32 条）。
 
@@ -6332,6 +6492,7 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
         problems += _nc_cut_arg_problems(_rel_label(path), tree)
         problems += _tab_release_problems(_rel_label(path), tree)
         problems += _tab_silent_release_problems(_rel_label(path), tree)
+        problems += _tab_list_strict_problems(_rel_label(path), tree)
     if judged == 0:
         problems.append(f"第 32 条扫了 0 份源码（视野里 {len(files)} 项全解析失败）：这一条等于没跑")
 
@@ -6455,6 +6616,427 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
                     f"记账把手 {m} 在两份镜像里行为不同（{NC_MIRROR_FILES[0]} 第 {fa.lineno} 行 ↔ "
                     f"{NC_MIRROR_FILES[1]} 第 {fb.lineno} 行）：同一笔账在 1688 包里会给出"
                     f"另一种归因。修前一边={ca.splitlines()[:2]} 修后一边={cb.splitlines()[:2]}")
+
+    # 32i 分档证据这句话从生成到入账只许零刀，唯一那一刀住在渲染把手里。
+    # 由来（2026-11-16 第十二轮实机 马可波罗）：记账那行先 `short_reason(evid, 60)`、渲染再切 46，
+    # 两把刀的上限互相不知情（把渲染上限调到 90 也照样只看到 60 那一刀留下的省略号）；而
+    # `show[:24]` 那一刀把半截属性名 `<img style="margi` 留成了报告里的「证据」，读起来像
+    # 我们的解析坏了。这一条只盯「从 0 开始、上界是常量」那种切（120 字窗口有下界，算
+    # 「取哪一段正文」、不算收口），所以能接住换名字、换把手的两步写法。
+    for rel in NC_MIRROR_FILES:
+        t = texts.get(rel) or _text_of(files, rel) or ""
+        try:
+            _ti = ast.parse(t)
+        except SyntaxError:
+            continue                      # 32a/32c 已就这一份报过「解析不过」，这里不叠第二条
+        problems += _nc_evidence_no_cut_problems(rel, _ti)
+    return problems
+
+
+# ── 33：列表条目账（「站方这一词回了几条」）───────────────────────────────
+# 由来（2026-11-16 第十二轮实机 中国制造网「窗帘导轨」）：某一词零净新增时，归因句只会说
+# 「站方回的货有、该复核相关性口径」。真去查页面，站方自报「共找到 1 个」——约束项在货源
+# 而不在本机闸门，那句话把读者支使去改一个改了也没用的东西。要分得开这两种局，账上必须
+# 有「这一词站方回了几条」，而这一笔以前**只以全局 `stat_listed` 存在**、且各站自己累加。
+# 这一条门管三件事：写只许住在一个把手里（33a）、账按轮清干净且不许记了没人读（33b）、
+# 归因句真去读它（33c）。
+LISTED_HANDLE = "_note_listed"
+LISTED_TOTAL_HOOK = "parse_listed_total"
+LISTED_TOTAL_ATTR = "stat_listed"
+LISTED_KW_BUCKETS = ("kw_items", "kw_claimed")
+LISTED_ZERO_FN = "_kw_zero_reason"
+LEDGER_PREFIX = "kw_"
+LEDGER_ANCHOR = "kw_filtered"
+# 33b-3 必须把条目账念出去的几处（与第 32 条 NC_READERS 同一族：少一处，那一处就退回
+# 「只看砍单数」的老念法）。判的是**真取用**（读 `self.<账名>` 或取 stats() 里那个键），
+# 注释／docstring 里写了书名不算：拿子串判时，把渲染那句改回旧说法也照样能绿。
+# 每一处都要念**两本**账（我们解析到的 + 站方自报的）：只念 kw_items 时，「卡片改版只认出 1 家」
+# 与「站方本就只回 1 条」在渲染层又长成同一句——而这两种局的处方正好相反（修解析 / 换词）。
+LEDGER_READERS = ("b2bcollect_build/cdp_base.py", "ali1688_build/ali1688_crawler.py",
+                  "b2bcollect_build/site_adapters.py", "debug/platform_live_check.py")
+# 33b 的锚：这一族账的清零点都以「砍单账 kw_filtered 被**整体重赋**」为标志（__init__ / crawl /
+# reset_run_state）。认锚而不是认函数名：函数改名、多一个副本都躲不开这一条。
+# 「整体重赋」与「按键写」必须分开看（真树第一次跑就交了这个学费）：`_note_detail_filter` 里那句
+# `self.kw_filtered[kw] += 1` 也是「写入」，拿「写过」当锚时，记账把手自己会被罚成
+# 「清账没清全」——误伤一次，下一次真漏清的那处就会被当成噪音放过去（25h 同族教训）。
+
+
+def _new_rec() -> dict:
+    """一段语法（模块级或某个函数体）的 `self.<attr>` 台账：本条六问要的只有这些。"""
+    return {"assigned": set(), "rebound": set(), "key_written": set(), "reads": set(),
+            "calls": set(), "consts": set(), "attrs_any": set(), "bare_total": [],
+            "getattr_book": [], "say_strings": [], "say_count": 0}
+
+
+def _merge_rec(dst, src):
+    for k in ("assigned", "rebound", "key_written", "reads", "calls", "consts", "attrs_any"):
+        dst[k] |= src[k]
+    dst["bare_total"] += src["bare_total"]
+    dst["getattr_book"] += src["getattr_book"]
+    dst["say_strings"] += src["say_strings"]
+    dst["say_count"] += src["say_count"]
+    return dst
+
+
+def _scan_attrs(nodes) -> dict:
+    """**一次**扫完这批语法节点里的写入/整体重赋/按键写/真读取/被调用名。
+
+    口径与逐条 `ast.walk` 完全一致，但只走一遍：旧形状是「每个函数 ast.walk 四次」，
+    85 份源码跑一次本条要 6 秒，而反向对照夹具要把整条门跑 45 次（frozen 的 AS 节）——
+    整套门禁因此从 8 分钟涨到 10 分钟并把批跑看门狗（600s）拦断。详见 `_listed_facts`。
+
+    `reads` 里刻意**剔掉「只作为写入地址出现」的 Load**（`addr`）：`self.kw_items[key] = …`
+    在语法树上的 `self.kw_items` 也是 Load，认它就算「读过」，那么 33b-2「记了不念」那一问
+    对逐词账永久空转（本轮 AS 节反向对照当场拓出的洞）。只能**逐节点**剔、不能按名字剔：
+    `self.kw_yield[kw] = self.kw_yield.get(kw, 0) + 1` 同一行里同名既是写入地址又是真取值，
+    按名字剔会把整本账抹成「没人读」（本轮第一版就这么把真货 kw_yield 报成死账）。
+    下标里的读（`self.a[self.k] = 1` 中的 `self.k`）仍算读：那是真取值。
+    """
+    rec = _new_rec()
+    addr = set()                      # 只作为「写入地址」出现的 `self.<attr>` 节点
+    for n in nodes:
+        if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in targets:
+                if (isinstance(n, ast.AugAssign) and isinstance(t, ast.Attribute)
+                        and t.attr == LISTED_TOTAL_ATTR):
+                    rec["bare_total"].append(n.lineno)     # 33a：条目账又长出了第二把刀
+                base = t
+                while isinstance(base, ast.Subscript):
+                    if (isinstance(base.value, ast.Attribute)
+                            and isinstance(base.value.value, ast.Name)
+                            and base.value.value.id == "self"):
+                        rec["key_written"].add(base.value.attr)
+                        rec["assigned"].add(base.value.attr)
+                        addr.add(id(base.value))
+                    base = base.value
+                if (isinstance(base, ast.Attribute)
+                        and isinstance(base.value, ast.Name) and base.value.id == "self"):
+                    rec["assigned"].add(base.attr)
+                    if (isinstance(n, (ast.Assign, ast.AnnAssign))
+                            and isinstance(base.ctx, ast.Store)):
+                        rec["rebound"].add(base.attr)
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute):
+                rec["calls"].add(f.attr)
+                if (f.attr == "clear" and isinstance(f.value, ast.Attribute)
+                        and isinstance(f.value.value, ast.Name)
+                        and f.value.value.id == "self"):
+                    rec["rebound"].add(f.value.attr)
+                    rec["assigned"].add(f.value.attr)
+            if (isinstance(f, ast.Name) and f.id == "getattr" and len(n.args) >= 3
+                    and isinstance(n.args[0], ast.Name) and n.args[0].id == "self"
+                    and isinstance(n.args[1], ast.Constant)
+                    and n.args[1].value in ({LISTED_TOTAL_ATTR} | set(LISTED_KW_BUCKETS))):
+                rec["getattr_book"].append((n.lineno, n.args[1].value))
+        elif isinstance(n, ast.Attribute):
+            rec["attrs_any"].add(n.attr)
+            if (isinstance(n.ctx, ast.Load) and isinstance(n.value, ast.Name)
+                    and n.value.id == "self" and id(n) not in addr):
+                rec["reads"].add(n.attr)
+        elif isinstance(n, ast.Constant):
+            if isinstance(n.value, str) and n.value in LISTED_KW_BUCKETS:
+                rec["consts"].add(n.value)
+        elif isinstance(n, ast.Return) and n.value is not None:
+            if (isinstance(n.value, ast.JoinedStr)
+                    or (isinstance(n.value, ast.Constant)
+                        and n.value.value not in ("", None))):
+                rec["say_count"] += 1
+                rec["say_strings"] += [s.value for s in ast.walk(n.value)
+                                       if isinstance(s, ast.Constant)
+                                       and isinstance(s.value, str)]
+    return rec
+
+
+_LISTED_FACTS: dict = {}
+
+
+def _listed_facts(label, text) -> dict:
+    """一份源码在第 33 条里需要的全部事实，按 (文件名, 内容指纹) 缓存。
+
+    缓存的是**派生集合与字符串**而不是语法树：反向对照夹具一次只改一份源码，45 轮跑下来
+    活的只有一份源码的 AST，内存跟着源码走而不跟着夹具次数走。
+    指纹拿 `hash(text)`：CPython 把字符串的 hash 存在对象里，而夹具喂进来的多是同一批 str
+    对象（只换掉被改那一份），所以取指纹几乎免费。
+    """
+    key = (label, len(text), hash(text))
+    got = _LISTED_FACTS.get(key)
+    if got is not None:
+        return got
+    tree = ast.parse(text)                # SyntaxError 由调用方兜（按不合格算）
+    groups, parent, order = {None: []}, {None: None}, []
+    stack = [(tree, None)]
+    while stack:
+        node, cur = stack.pop()
+        groups[cur].append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            groups[node] = []
+            parent[node] = cur
+            order.append(node)
+            cur = node
+        stack.extend((ch, cur) for ch in reversed(list(ast.iter_child_nodes(node))))
+        # 真前序：父在子前、同层按源码序；子节点继承当前最内层函数 `cur`
+    own = {k: _scan_attrs(v) for k, v in groups.items()}
+    sub = {k: _merge_rec(_new_rec(), v) for k, v in own.items()}
+    for fn in reversed(order):            # 前序反过来＝子一定先于父被并上去＝与 ast.walk(fn) 同集合
+        _merge_rec(sub[parent[fn]], sub[fn])
+    handles = [f for f in order if f.name == LISTED_HANDLE and isinstance(f, ast.FunctionDef)]
+
+    def _in_handle(node):
+        p = node
+        while p is not None:
+            if p in handles:
+                return True
+            p = parent[p]
+        return False
+
+    # 33b-3 要看的是「**除了把手以外**有没有人念这本账」：`_note_listed` 里那句取值不算念给用户
+    out_rec = _new_rec()
+    for k, v in own.items():
+        if k is not None and _in_handle(k):
+            continue
+        _merge_rec(out_rec, v)
+    funcs = [{"name": f.name, "lineno": f.lineno,
+              "sync": isinstance(f, ast.FunctionDef),
+              "rec": sub[f]} for f in order]
+    facts = {"file": sub[None], "outside_handle": out_rec, "funcs": funcs,
+             "handle_core": _nc_fn_core(handles[0]) if handles else None}
+    if len(_LISTED_FACTS) > 4096:         # 宁可重算，不许把上一轮的派生账当本轮证据
+        _LISTED_FACTS.clear()
+    _LISTED_FACTS[key] = facts
+    return facts
+
+
+def _fn_fact(facts, name) -> dict:
+    """按名字找那个函数（只认 `def`，与修前一致：`async def _note_listed` 不该被当成把手）。"""
+    return next((f for f in facts["funcs"] if f["name"] == name and f["sync"]), None)
+
+
+# 本条要的三种「碰过这本账」的口径必须分开看（`_scan_attrs` 一趟同时给出，以前是四个 helper
+# 各走一遍语法树）：拿错口径当锚，误伤一次就会让下一次真漏被当噪音放过去（25h 同族教训）。
+#   assigned    —— 任何写入，含 `self.x[k] = …` 这种按键写（记账把手自己会被算成「清过账」）
+#   rebound     —— 只算**整本换掉**：`self.x = {}`、`self.x.clear()`。按键写与 `+=` 都是在记
+#                  新的一笔、不是在清旧账，所以 33b 的「起账点/清零点」只能认这一种
+#   key_written —— 只算按键写（`self.x[k] = …`）：这本账是逐词累加的、会跨轮，因此必须
+#                  有自己的清零点
+#   reads       —— 真**念过**的取值（逐节点剔掉只当写入地址用的 Load，口径理由见 `_scan_attrs`
+#                  自己的 docstring）：`self.kw_items[key] = …` 只说明有人在写，说明不了有人在念
+
+
+def _listed_write_problems(label, facts) -> list:
+    """33a：条目账只许住在把手里。别处再 `self.stat_listed += …` 就是第二把刀。"""
+    out = []
+    for fn in facts["funcs"]:
+        if fn["name"] == LISTED_HANDLE:
+            continue
+        for ln in fn["rec"]["bare_total"]:
+            out.append(f"{label} 第 {ln} 行在 `{fn['name']}` 里直接给 `{LISTED_TOTAL_ATTR}` "
+                       f"累加：条目账有了第二个写点。总账与分词账（{'、'.join(LISTED_KW_BUCKETS)}）"
+                       f"必须同一处落，否则漏写的那一路归因句永远念旧那一种说法"
+                       f"（请改调 `{LISTED_HANDLE}`）")
+    return out
+
+
+def _listed_handle_problems(label, facts) -> list:
+    """33a-2 把手本体必须三本账一起落：只记总账时分词账永远是空的，归因句照样说不出货量。"""
+    fns = [f for f in facts["funcs"] if f["name"] == LISTED_HANDLE and f["sync"]]
+    if not fns:
+        return []
+    out = []
+    if len(fns) > 1:
+        out.append(f"{label} 里 `{LISTED_HANDLE}` 出现了 {len(fns)} 次（第 "
+                   f"{'、'.join(str(f['lineno']) for f in fns)} 行）：两份把手谁生效没人说得上")
+    miss = sorted(({LISTED_TOTAL_ATTR} | set(LISTED_KW_BUCKETS)) - fns[0]["rec"]["assigned"])
+    if miss:
+        out.append(f"{label} 的 `{LISTED_HANDLE}` 没写 {'、'.join(miss)}：这就是「条目账只记总账」"
+                   "那一形——归因句拿不到这一词的货量，只能退回旧那种处方")
+    return out
+
+
+def _ledger_cycle_problems(label, facts) -> list:
+    """33b：按词账本必须「哪里清砍单账、哪里就清它」（防脏账跨轮冒充本轮证据）。"""
+    book = facts["file"]
+    ledgers = {a for a in book["assigned"] if a.startswith(LEDGER_PREFIX)}
+    if LEDGER_ANCHOR not in ledgers:
+        return []
+    out = []
+    resets = 0
+    for fn in facts["funcs"]:
+        if LEDGER_ANCHOR not in fn["rec"]["rebound"]:
+            continue
+        resets += 1
+        miss = sorted(k for k in ledgers - fn["rec"]["rebound"])
+        if miss:
+            out.append(f"{label} 的 `{fn['name']}`（第 {fn['lineno']} 行）清了 `{LEDGER_ANCHOR}` 却没清 "
+                       f"{'、'.join(miss)}：这一本账会跨轮累加，上一轮的回货量/砍单数会冒充"
+                       "本轮的归因证据（读数错得比缺数更难查）")
+    if ledgers and not resets:
+        out.append(f"{label} 里 {'、'.join(sorted(ledgers))} 全都在记逐词账，却没有一处把 `{LEDGER_ANCHOR}` "
+                   "整本换掉：清零点被删掉时，上一轮的所有按词证据都会累进本轮那句处方"
+                   f"（在 `{LEDGER_ANCHOR}` 被重赋的那几处一起起账）")
+    # 逐词记账的每一本 kw_ 账都必须有自己的清零点：只盯锚看时，新加一本账「从来不清」或者
+    # 「只在锚没被清的那处清」都不会响（本轮加 kw_items/kw_claimed 时就是这么差点漏掉续采那一路）。
+    for ledger in sorted(ledgers & book["key_written"]):
+        if ledger not in book["rebound"]:
+            out.append(f"{label} 的 `{ledger}` 逐词累加却在全份源码里没有任何清零点："
+                       f"这一本账会一直跨轮累加（`{LEDGER_ANCHOR}` 被清的那几处也要一起清）")
+    return out
+
+
+def _listed_read_default_problems(label, facts) -> list:
+    """33a-5 这三本账不许拿 `getattr` 的默认值当证据。
+
+    由来（本轮同类查全拓出来的那一处）：1688 收尾那句写的是
+    `if self._page_fail and not getattr(self, "stat_listed", 0):`，而 `Ali1688Crawler` 当时
+    从来没有绑过 `stat_listed`——默认值把「这本账根本不存在」吹成「这本账是 0」，于是那句
+    「一页都没取到」在任何一轮都是真的。账本在类里一定有初值（33b 管的就是这一条），兜默认值
+    只会把缺账盖成数据。**直接读 `self.<attr>`**：真没绑定就该在运行时响，而不是拿 0 谎报。
+    """
+    out = []
+    for ln, name in facts["file"]["getattr_book"]:
+        out.append(f"{label} 第 {ln} 行拿 `getattr(self, \"{name}\", 默认值)` 读条目账："
+                   "兜了默认值就把「这一本账根本没绑过」念成「这一本账是 0」（旧 1688 那句「一页都没"
+                   "取到」就是这么变成永久真话的）——这本账在类里必须有初值，请直接读 `self."
+                   f"{name}`（33b 管的就是初值与清零点）")
+    return out
+
+
+def _listed_reader_problems(label, facts) -> list:
+    """33b-3 条目账必须被每一处渲染真取用一次。读属性与取 stats() 里那个键都给算。
+
+    但**把手自己那一笔不算**：`_note_listed` 里那句 `self.kw_items.get(key, 0) + n` 是写入前的
+    取值，一句货量也没念给用户——把它当「取用」，渲染层改成只留记账也能哄绿（本轮 AS 节的
+    反向对照拓出的另一形）。这一口径已由 `_listed_facts` 提前算成 `outside_handle`。
+    同一个取值在 33c 那边算读（归因句靠取值说话），在这一问里不算。
+    """
+    if label not in LEDGER_READERS:
+        return []
+    out = facts["outside_handle"]
+    hit = out["reads"] | out["consts"]
+    miss = [k for k in LISTED_KW_BUCKETS if k not in hit]
+    if miss:
+        return [f"{label} 没把条目账 {'、'.join(miss)} 真取用一次（读 `self.<账名>` 或取 "
+                f"stats() 里那个键都算，注释里写了不算）：这一处看见的还是那句没有货量的处方，"
+                "「站方只回 1 条」与「30 条全被砍」在用户眼睛里又长成同一句"]
+    return []
+
+
+# 33c 四档处方的关键词。为什么要拿句子而不是只数 return 条目：把两档合成一句时，代码里照样
+# 可以留着四个 return（只是后面三句与第一句同话），数条目那条判据不会响。四句处方各自对应
+# 一种约束项（解析／缺账／货源／相关性），少一句就是有一档被合回了同一顶帽子。
+LISTED_PRESCRIPTIONS = ("该修的是列表卡片解析口径", "先补上 _note_listed",
+                        "该换的是关键词或搜索索引", "该复核的是相关性口径")
+# 33c-3 两句阈外话的「旋钮」必须从类属性取：个位数那一档的边界住在 KW_THIN_SUPPLY_ITEMS，
+# 索引说明住在 SEARCH_INDEX_NOTE。写死在句子里时，改常量的人不会有人通知那句话。
+LISTED_KNOBS = ("KW_THIN_SUPPLY_ITEMS", "SEARCH_INDEX_NOTE")
+
+
+def _listed_zero_reason_problems(label, facts) -> list:
+    """33c：归因句必须真去读条目账，且必须分叉（只有一种处方等于没分）。"""
+    fn = _fn_fact(facts, LISTED_ZERO_FN)
+    if fn is None:
+        return []
+    rec = fn["rec"]
+    out = []
+    miss = [k for k in LISTED_KW_BUCKETS if k not in rec["reads"]]
+    if miss:
+        out.append(f"{label} 的 `{LISTED_ZERO_FN}` 没读 {'、'.join(miss)}：条目账记了不念，"
+                   "「站方只回 1 条」与「30 条全被砍」又会念成同一句")
+    if rec["say_count"] < 3:
+        out.append(f"{label} 的 `{LISTED_ZERO_FN}` 只剩 {rec['say_count']} 张处方（原本四档：解析漏／"
+                   "账没记上／货源薄／全被砍）：分叉被改回死写一种时，这一词的真正约束项又没人说了")
+    # 四句处方逐句点名：只数 return 条目时，把两档合成同一顶帽子照样能绿（见常量表上方注释）
+    said = "\n".join(rec["say_strings"])
+    lost = [p for p in LISTED_PRESCRIPTIONS if p not in said]
+    if lost:
+        out.append(f"{label} 的 `{LISTED_ZERO_FN}` 再也没人说这几句处方：{'、'.join(lost)}——"
+                   "每一句对应一种约束项（我们的解析／我们自己缺账／站方货源／相关性阈值），"
+                   "合回一句就等于把两种相反的局交给同一个动作去改")
+    _hard = [k for k in LISTED_KNOBS if k not in rec["attrs_any"]]
+    if _hard:
+        out.append(f"{label} 的 `{LISTED_ZERO_FN}` 不再读 `{'、'.join(_hard)}`：这一档的边界/说词被"
+                   "写死在句子里，改常量的人不会有人通知归因句（两种念法又分家）")
+    return out
+
+
+def check_listing_accountability(files=None) -> list:
+    """列表条目账：记账一个把手、按轮起账、归因句真读它（第 33 条）。
+
+    `files` 是给离线夹具留的注入口（与第 32 条同口径）：判据必须能被反向对照——把真源改回
+    修复前的写法（各站自己 `+=`、把手只记总账、归因句不读条目账、清零点漏一本）都要响。
+    """
+    problems = []
+    files = _runtime_reason_sources() if files is None else dict(files)
+    if not files:
+        return ["第 33 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「条目账都在把手里」这句话没有任何含义"]
+    seen, judged = {}, 0
+    read_all = set()
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        label = _rel_label(path)
+        try:
+            facts = _listed_facts(label, text)
+        except SyntaxError as e:
+            problems.append(f"{label} 解析不过（第 {e.lineno} 行 {e.msg}）：第 33 条"
+                            "读不到这一份的写法，按不合格算而不是按「这处没问题」算")
+            continue
+        judged += 1
+        seen[label] = facts
+        read_all |= facts["file"]["reads"]
+        problems += _listed_write_problems(label, facts)
+        problems += _listed_handle_problems(label, facts)
+        problems += _ledger_cycle_problems(label, facts)
+        problems += _listed_read_default_problems(label, facts)
+        problems += _listed_reader_problems(label, facts)
+        problems += _listed_zero_reason_problems(label, facts)
+    if judged == 0:
+        problems.append(f"第 33 条扫了 0 份源码（视野里 {len(files)} 项全解析失败）：这一条等于没跑")
+
+    # 33b-2 「只累加、从不外读」：按词账本在整份交付链里必须至少被读过一次（含 stats() 透出）
+    written = set()
+    for facts in seen.values():
+        written |= {a for a in facts["file"]["assigned"] if a.startswith(LEDGER_PREFIX)}
+    dead = sorted(written - read_all)
+    if dead:
+        problems.append(f"按词账本 {'、'.join(dead)} 只被写过、交付链里没一处读它：这一本账进不了"
+                        "任何一句归因，等于没记（与通路账「只累加不外读」同一族原病）")
+
+    # 33a-3 两份镜像的把手本体必须同行为（与 32h 同一口径：docstring 可以差，行为不许）
+    def _facts_named(name):
+        return next((f for lbl, f in seen.items() if lbl.endswith(name)), None)
+
+    fa, fb = _facts_named("cdp_base.py"), _facts_named("ali1688_crawler.py")
+    if fa is not None and fb is not None:
+        ca, cb = fa["handle_core"], fb["handle_core"]
+        if ca is None or cb is None:
+            problems.append(f"两份镜像里有一份没有 `{LISTED_HANDLE}`（cdp_base "
+                            f"{'有' if ca else '无'} ↔ 1688 {'有' if cb else '无'}）："
+                            "1688 那一包的条目账没人记，收尾那句就只能拿 0 当证据")
+        elif ca != cb:
+            problems.append(f"`{LISTED_HANDLE}` 在两份镜像里行为不同（cdp_base ↔ ali1688_crawler）："
+                            "同一笔条目账在 1688 包里会给出另一种归因。修前一边="
+                            + str(ca.splitlines()[:2]) + " 修后一边=" + str(cb.splitlines()[:2]))
+
+    # 33a-4 站方自报总数这一钩子只许**报告**，不许自己记账（记账统一住在把手里）
+    for label, facts in seen.items():
+        fn = _fn_fact(facts, LISTED_TOTAL_HOOK)
+        if fn is not None and fn["rec"]["assigned"] & ({LISTED_TOTAL_ATTR} | set(LISTED_KW_BUCKETS)):
+            problems.append(f"{label} 的 `{LISTED_TOTAL_HOOK}` 自己动了条目账：这一钩子只许**报告**"
+                            f"站方自报几条，记账统一住在 `{LISTED_HANDLE}`（两处写＝两本账）")
+
+    # 33c-2 归因把手必须存在且真被叫到：上面几档都是「函数不在就返 []」的形状，函数被整份
+    # 删掉时必须响而不是默默放行（删掉后用户那一行就退回写死的「被拦/链路未通/本页无数据」）。
+    for label, facts in seen.items():
+        if not label.endswith("cdp_base.py"):
+            continue
+        if _fn_fact(facts, LISTED_ZERO_FN) is None:
+            problems.append(f"{label} 里没有 `{LISTED_ZERO_FN}`：某一词零净新增时那句「货是被谁挡住的」"
+                            "又住回调用点写死的那一句，四档处方（解析漏／账没记上／货源薄／全被砍）没处放")
+            continue
+        if LISTED_ZERO_FN not in facts["file"]["calls"]:
+            problems.append(f"{label} 里 `{LISTED_ZERO_FN}` 从没有被调用：四档处方写好了却没人念，"
+                            "用户那一行还是旧那句（定义进不了眼睛，调用才能）")
     return problems
 
 
@@ -6878,6 +7460,20 @@ def main(argv=None) -> int:
               f"两份镜像的判据段逐字节相同、记账把手（{'、'.join(NC_ACCOUNT_FNS)}）行为指纹相同"
               f"（{NC_MIRROR_FILES[0]} ↔ {NC_MIRROR_FILES[1]}）")
 
+    listed_gate = check_listing_accountability()
+    if listed_gate:
+        bad += 1
+        print("❌ 列表条目账不合格（「站方这一词回了几条」说不出，于是「只回 1 条」与「回 30 条"
+              "全被砍」只能念成同一句处方）：")
+        for p in listed_gate:
+            print(f"   · {p}")
+            print(f"::error::列表条目账：{p}")
+    else:
+        print("✅ 列表条目账：每一路翻页都走唯一把手落三本账（总账 + 我们解析到的分词账 + "
+              f"站方自报账），两份镜像（{' ↔ '.join(NC_MIRROR_FILES)}）行为指纹相同；每一本按词账"
+              "都在砍单账被清的那几处一起起账、且交付链里至少被读一次；归因句按四档分叉"
+              "（解析漏／账没记上／个位数货源（上限住在 KW_THIN_SUPPLY_ITEMS）／全被砍）")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -6913,6 +7509,7 @@ def main(argv=None) -> int:
           "离线套件的判定与退出码同源、批跑清单里的套件都在提交里、交付链没有开发机绝对路径、"
           "临时目录只在同口径的那一处被读、模块级没有取用早于绑定的名字、"
           "失败原因只按一个把手收口（半截词／丢前缀／孤括号都算不合格）、"
+          "列表条目账只住在一个把手里且被归因句读到（「站方回了几条」说不出就算不合格）、"
           "从浏览器标签交出去的正文都先过了页面身份门（串页假数据算不合格）、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "注释里每一句指路节号都走得通")

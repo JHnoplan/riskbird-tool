@@ -266,7 +266,9 @@ class AipageCrawler(CdpSiteCrawler):
                     return
             entries = self.parse_list(data, kw)
             self.stat_pages += 1
-            self.stat_listed += len(entries)
+            # 条目账走唯一把手（总账 + 分词账 + 站方自报账）：某一词零产出时要说「货源薄」还是
+            # 「全被砍」，凭的就是这一词的回货数（见 cdp_base._kw_zero_reason）
+            self._note_listed(kw, len(entries), self.parse_listed_total(data))
             if not entries:
                 self._log(self._no_result_line(kw, f"第 {page} 页", data) + "，停止翻页")
                 return
