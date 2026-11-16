@@ -168,6 +168,51 @@ ROOT = Path(__file__).resolve().parents[2]
 ADAPTERS = ROOT / "b2bcollect_build" / "site_adapters.py"
 BUILD_DIR = ROOT / "b2bcollect_build"
 
+# ── 判据自己的取树层：一份源码在一个进程里只解析一次，展开结果挂在节点上复用 ──
+# 由来（2026-11-16 第十四轮）：第 30/31/32/33 条每次都把 85 份源码整片重扫，单次 4.7～7.8 秒；
+# frozen 的反向对照夹具（AP/AQ/AR/AS 四节）要把整条门各跑 40～80 次，而**每一格只改一份源码**，
+# 其余 84 份字节完全没动。整套门禁因此从 8 分钟涨到 10 分钟，把批跑看门狗（600s/套件）拦断，
+# 屏幕上只留下一句没有名字的 HANG。慢的不是判定，是反复展开语法树：32j 对每个函数走一遍、
+# 又对函数里每个 Call 再走一遍（O(n²)），一次调用展开 390 万棵树。
+# 这一层只缓存**语法树与它的展开结果**，不缓存任何判定结论：判据代码一行口径都不改，
+# 夹具照旧跑门禁真身，同一份字节不再被扫第二遍。缓存按内容指纹（文件名, 长度, hash）取，
+# 改一个字节就是另一份证据；上一轮那份坏字节不会被这一轮拿去做担保。
+_TREE_CACHE: dict = {}
+
+
+def _file_tree(label, text):
+    """解析一份源码；同一份字节（按 `label` + 内容指纹）在一个进程里只解析一次。
+
+    SyntaxError 原样抛给调用方——「解析不过按不合格算」那一档口径在每一条款里都各自兜着，
+    这一层不许替它决定是红是绿。
+    """
+    key = (label, len(text), hash(text))
+    got = _TREE_CACHE.get(key)
+    if got is None:
+        got = ast.parse(text, filename=label)
+        if len(_TREE_CACHE) > 512:          # 宁可重算，不许把上一轮的树当本轮证据
+            _TREE_CACHE.clear()
+        _TREE_CACHE[key] = got
+    return got
+
+
+def _walk(node):
+    """`ast.walk` 的**同序**版本（同样是 breadth-first），但同一节点只展开一次。
+
+    展开结果挂在节点自己身上（`node.__dict__`，ast 的字段名都不带下划线前缀，撞不上），
+    于是生命周期跟着语法树走：树被缓存放多久，这份展开就有效多久；树被回收，缓存一起没了
+    ——不留 `id()` 那种「换了主人还认得旧门牌」的隐患。
+    """
+    got = node.__dict__.get("_gate_walk")
+    if got is None:
+        got = [node]
+        i = 0
+        while i < len(got):
+            got.extend(ast.iter_child_nodes(got[i]))
+            i += 1
+        node.__dict__["_gate_walk"] = got
+    return got
+
 # 三处打包入口必须同口径：任何一处漏抄，那个平台的产物就少一块功能。
 CALLERS = {
     "Windows workflow": ROOT / ".github" / "workflows" / "build-b2bcollect.yml",
@@ -253,7 +298,7 @@ def module_manifest() -> tuple:
 
 
 def _adapter_tree():
-    return ast.parse(ADAPTERS.read_text(encoding="utf-8"), filename=str(ADAPTERS))
+    return _file_tree(str(ADAPTERS), ADAPTERS.read_text(encoding="utf-8"))
 
 
 def shadowed_modules() -> dict:
@@ -624,12 +669,11 @@ def check_tracked(add_data: list, text: str = "") -> list:
 def local_imports(path: Path) -> set:
     """一个 .py 里 import 到的**同目录**模块文件名（ast 扫，不执行、不装依赖）。"""
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"),
-                         filename=str(path))
+        tree = _file_tree(str(path), path.read_text(encoding="utf-8", errors="replace"))
     except (SyntaxError, ValueError, OSError):
         return set()
     names = set()
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
                 names.add(a.name.split(".")[0])
@@ -1833,15 +1877,15 @@ def check_text_io_encoding(paths: tuple = None) -> list:
             continue
         src = path.read_text(encoding="utf-8", errors="replace")
         try:
-            tree = ast.parse(src, filename=str(path))
+            tree = _file_tree(str(path), src)
         except SyntaxError as e:
             problems.append(f"{rel} 第 {e.lineno} 行语法读不懂（{e.msg}）："
                             "第 12 条在它上面没跑，这份脚本连 CI 都进不去")
             continue
-        reconf = [n.lineno for n in ast.walk(tree)
+        reconf = [n.lineno for n in _walk(tree)
                   if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "reconfigure"
                   and _kwarg(n, "encoding") is not None]
-        writes = [n for n in ast.walk(tree)
+        writes = [n for n in _walk(tree)
                   if isinstance(n, ast.Call) and _console_writer(n) and _has_non_ascii(n)]
         if writes and not reconf:
             first = min(n.lineno for n in writes)
@@ -1855,7 +1899,7 @@ def check_text_io_encoding(paths: tuple = None) -> list:
                 f"{rel}：reconfigure 在第 {min(reconf)} 行，但第一次中文写控制台在第 "
                 f"{min(n.lineno for n in writes)} 行——编码要在**第一次写控制台之前**定好，"
                 "晚一步那一句就已经抛了")
-        for n in ast.walk(tree):
+        for n in _walk(tree):
             if not isinstance(n, ast.Call) or _call_target(n) not in SUBPROC_FUNCS:
                 continue
             loc = f"{rel} 第 {n.lineno} 行 subprocess.{_call_target(n)}"
@@ -2228,8 +2272,12 @@ def _code_only_text(text: str) -> str:
     `PIP_NET_FLAGS` 删成 `()` 之后那条判据照样闭口不言、报绿。注释与 docstring 是写给下一个
     读代码的人的，不该替代码作证（第 11 条把 shell 交给 `bash -n` 真解析器是同一个道理）。
     """
+    # 这里**故意**不走 `_file_tree`：本函数会就地摘掉每个 body 开头的 docstring（下面那句
+    # `body.pop(0)`），吃了共享缓存就把别人的语法树改脏了——下一条款拿到的是一份没有
+    # docstring 的树（第 18 条判的正是「docstring 不许替代码作证」，它自己反倒把证据改了）。
+    # 要进这一层先得做到不改树；这一处宁可重解析一份私有的。
     tree = ast.parse(text)
-    for node in list(ast.walk(tree)):
+    for node in list(_walk(tree)):
         body = getattr(node, "body", None)
         if isinstance(body, list):
             while (body and isinstance(body[0], ast.Expr)
@@ -2324,7 +2372,7 @@ def check_pip_source_resilience(workflows: tuple = None, installer_text: str = "
             installer_text = PIP_INSTALLER.read_text(encoding="utf-8", errors="replace")
     if installer_text:
         try:
-            tree = ast.parse(installer_text)
+            tree = _file_tree(str(PIP_INSTALLER), installer_text)
             code = _code_only_text(installer_text)
         except SyntaxError as exc:
             problems.append(f"pip_install.py 第 {exc.lineno} 行语法过不去（{exc.msg}）："
@@ -2451,12 +2499,12 @@ def _packaged_source_files(externals: tuple = None) -> list:
 def _top_level_imports(path: Path) -> set:
     """一个源文件里所有**顶层** import 名（`from a.b import c` 取 a，相对导入不参与）。"""
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+        tree = _file_tree(str(path), path.read_text(encoding="utf-8", errors="replace"))
     except (SyntaxError, ValueError):
         raise SystemExit(f"{path} 语法过不去：第三方 import 对拍读不到东西，"
                          "这一步不能安静跳过（读不到就是没验）")
     names = set()
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name.split(".")[0])
@@ -3980,7 +4028,7 @@ def _temp_read_sites(text):
     这么写」得到的多是假红；真出现了，补一行成本很低，而漏一条的成本是又长出一次 ``C:\\temp``。
     """
     try:
-        tree = ast.parse(text)
+        tree = _file_tree("", text)
     except SyntaxError as e:
         return [], {}, f"第 {e.lineno} 行 {e.msg}"
     spans = {}          # 行号 -> 所在最外层函数名（顶层代码不进这张表）
@@ -4001,7 +4049,7 @@ def _temp_read_sites(text):
                 and isinstance(z.value, ast.Name) and z.value.id == "os")
 
     hits = []
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and node.func.attr in TEMP_ENV_READS and _is_os_environ(node.func.value):
             first = node.args[0] if node.args else None
@@ -4019,7 +4067,7 @@ def _temp_read_sites(text):
 def _helper_body(text, name):
     """顶层 def name 的函数体（去掉 docstring）的结构指纹：(指纹或 None, 错误说明或 None)。"""
     try:
-        tree = ast.parse(text)
+        tree = _file_tree("", text)
     except SyntaxError as e:
         return None, f"解析不过（第 {e.lineno} 行 {e.msg}）"
     found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
@@ -4136,7 +4184,7 @@ _NAME_EXEMPT = frozenset(dir(builtins)) | {
 def _import_first_line(tree) -> dict:
     """import 绑定的名字 -> 它最早出现在第几行（同名字被 import 两次时取最早那处）。"""
     out = {}
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Import):
             pairs = [((a.asname or a.name).split(".")[0], node.lineno) for a in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -4159,7 +4207,7 @@ def _any_binding_name(tree) -> set:
     out = set()
 
     def add_target(node):
-        for x in ast.walk(node):
+        for x in _walk(node):
             if isinstance(x, ast.Name):
                 out.add(x.id)
 
@@ -4171,7 +4219,7 @@ def _any_binding_name(tree) -> set:
         if a.kwarg:
             out.add(a.kwarg.arg)
 
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             out.add(node.name)
             if not isinstance(node, ast.ClassDef):
@@ -4266,7 +4314,7 @@ def check_module_name_binding(files=None) -> list:
         if not rel.endswith(".py"):
             continue                        # shell 与 workflow 是另一种语言、另一种名字规则
         try:
-            tree = ast.parse(text)
+            tree = _file_tree(rel, text)
         except SyntaxError as e:
             problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：第 27 条读不到这一份的"
                             "取用与绑定，按不合格算而不是按「这处没问题」算")
@@ -4450,7 +4498,7 @@ def _slice_of_first_line(tree) -> list:
     后面紧跟一个数字切片，**只可能**是在收一句失败原因——这正是这一族的形状。
     """
     hits = []
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
             continue
         up = node.slice.upper
@@ -4473,7 +4521,7 @@ def _gate_slice_of_handle(tree) -> list:
     误报过（名字里带 text/body 的切片大多是正文与公司名），误报的代价是人们把整条门关掉。
     """
     hits = []
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)
                 and node.slice.lower is None
                 and isinstance(node.slice.upper, ast.Constant)
@@ -4500,7 +4548,7 @@ def _reads_reason(node, names) -> bool:
     """这一段表达式是不是在「读一本原因账」：碰到登记的账键字面量、账属性、或已经
     被认定为原因的名字。只认这三个来源，不认变量名里带 err/msg/reason 的写法（本轮
     扫到的 10 处那种误报根源就在按名字切）。"""
-    for sub in ast.walk(node):
+    for sub in _walk(node):
         if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
                 and sub.value in REASON_LEDGER_KEYS):
             return True
@@ -4516,7 +4564,18 @@ def _scope_nodes(scope) -> list:
 
     为什么按作用域而不是整份文件共用一张：本轮先试过后一种，`r`/`e`/`rec` 这些在某个
     函数里确实接过原因的短名，会把原因色传染到全仓同一个短名——第一次实跑就报出 127 处，
-    其中真正是缺陷的只 7 处。误报到这个量级，下一条门就会被人关掉。"""
+    其中真正是缺陷的只 7 处。误报到这个量级，下一条门就会被人关掉。
+
+    同一个节点只算一次（与 `_walk` 同一个把手、同一个理由：结果挂在节点自己身上，生命周期
+    跟着语法树走，不留 `id()` 那种「换了主人还认得旧门牌」的隐患）。这一层不是可有可无的微调：
+    本条款的「原因色」是**不动点迭代**出来的（`_reason_names_of` 与 `_reason_param_taint` 各最多
+    八轮），同一个作用域在一轮判定里被重建十几遍——2026-11-16 实测本条款热路径 8 成时间花在
+    这里（14572 次调用），也是 frozen 套件超 600s 被看门狗掐断的直接原因之一。
+    调用方只许读返回的这个表（三处调用点均为只读遍历），否则缓存就是错的账本。
+    """
+    got = scope.__dict__.get("_gate_scope")
+    if got is not None:
+        return got
     out, stack = [], [scope]
     while stack:
         n = stack.pop()
@@ -4525,6 +4584,7 @@ def _scope_nodes(scope) -> list:
                 and n is not scope):
             continue
         stack.extend(ast.iter_child_nodes(n))
+    scope.__dict__["_gate_scope"] = out
     return out
 
 
@@ -4547,7 +4607,7 @@ def _reason_names_of(scope, seed=None) -> set:
             for d in dsts:
                 if d is None:
                     continue
-                for x in ast.walk(d):
+                for x in _walk(d):
                     if isinstance(x, ast.Name) and x.id not in names:
                         names.add(x.id)
                         grew = True
@@ -4565,7 +4625,7 @@ def _reason_param_taint(tree) -> dict:
     —「修好了但门判不出回归」与「没修」对下一个人来说是同一件事。只认本文件里定义过的函数名，
     不认跨文件调用（那需要全局调用图，而且这一族把把手就住在本文件）。不动点最多八轮。"""
     fns = {}
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fns.setdefault(n.name, n)
     taint = {name: set() for name in fns}
@@ -4600,7 +4660,7 @@ def _reason_param_taint(tree) -> dict:
 def _slice_of_exception_str(tree) -> list:
     """30a-3：`str(异常)[:N]`。没有 `splitlines()[0]` 那一跳的同一件事。"""
     hits = []
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if not _int_slice(node):
             continue
         base = node.value
@@ -4614,7 +4674,7 @@ def _slice_of_exception_str(tree) -> list:
 
 def _slice_of_reason_ledger(tree) -> list:
     """30a-4：读原因账的那一刀（含隔着循环变量与隔着函数形参那两跳）。返回 (行号, 命中的格子)。"""
-    scopes = [tree] + [n for n in ast.walk(tree)
+    scopes = [tree] + [n for n in _walk(tree)
                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
     taint = _reason_param_taint(tree)
     hits = []
@@ -4624,7 +4684,7 @@ def _slice_of_reason_ledger(tree) -> list:
             if not _int_slice(node):
                 continue
             bad = set()
-            for sub in ast.walk(node.value):
+            for sub in _walk(node.value):
                 if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
                         and sub.value in REASON_LEDGER_KEYS):
                     bad.add(sub.value)
@@ -4721,7 +4781,7 @@ def check_reason_one_handle(files=None, handle_src=None, mirrors=None) -> list:
     used_exempt = set()
     for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
         try:
-            tree = ast.parse(text)
+            tree = _file_tree(_rel_label(path), text)
         except SyntaxError as e:
             problems.append(f"{path.name} 解析不过（第 {e.lineno} 行 {e.msg}）：第 30 条读不到"
                             "这一份的收口写法，按不合格算而不是按「这处没问题」算")
@@ -4879,7 +4939,7 @@ TAB_ID_HANDLES = ("_page_key", "_tab_page_is", "_tab_body_for")
 
 def _tab_html_call(node) -> bool:
     return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-               and c.func.attr == "_html" for c in ast.walk(node))
+               and c.func.attr == "_html" for c in _walk(node))
 
 
 def _tab_body_out(value, tainted) -> bool:
@@ -4899,7 +4959,7 @@ def _tab_body_out(value, tainted) -> bool:
 def _ast_safe_parse(text):
     """给 31b 用：坏语法的那一份已经由 31a 单独报过了，这里不能再抛异常把整条门带走。"""
     try:
-        return ast.parse(text)
+        return _file_tree("", text)          # 同一份字节在一个进程里只解析一次
     except SyntaxError:
         return ast.parse("")
 
@@ -4918,13 +4978,13 @@ def _tab_tainted_names(fn) -> set:
     names = set()
     for _ in range(4):
         before = set(names)
-        for n in ast.walk(fn):
+        for n in _walk(fn):
             if not isinstance(n, ast.Assign):
                 continue
             # ① 直接：`html = self._html()`、`html = (self._html() or "")[:N]` 这类混合表达式
             # ② 间接：右边任何位置出现已污染的名字（Call 的参数、元组元素、切片都算）
             hit = _tab_html_call(n.value) or any(
-                isinstance(x, ast.Name) and x.id in names for x in ast.walk(n.value))
+                isinstance(x, ast.Name) and x.id in names for x in _walk(n.value))
             if not hit:
                 continue
             for t in n.targets:
@@ -4947,23 +5007,23 @@ def _tab_body_exits(tree) -> list:
     仍然算有门。所以改成「列全部 + 逐项验声明」。
     """
     out = []
-    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+    for fn in (n for n in _walk(tree) if isinstance(n, ast.FunctionDef)):
         if not _tab_html_call(fn):
             continue
         body_src = ast.unparse(fn)
         tainted = _tab_tainted_names(fn)
         if not tainted and not any(isinstance(n, ast.Return) and _tab_html_call(n)
-                                   for n in ast.walk(fn)):
+                                   for n in _walk(fn)):
             continue
         how = []
-        for n in ast.walk(fn):
+        for n in _walk(fn):
             if isinstance(n, ast.Return) and n.value is not None and _tab_body_out(n.value, tainted):
                 how.append("return")
             if (isinstance(n, ast.Call)
                     and any(k in (getattr(n.func, "attr", "") or getattr(n.func, "id", ""))
                             for k in ("_parse", "parse_", "_extract"))
                     and any(isinstance(x, ast.Name) and x.id in tainted
-                            for a in n.args for x in ast.walk(a))):
+                            for a in n.args for x in _walk(a))):
                 how.append("parser")
         if how:
             gates = [k for k in TAB_ID_GATES if k + "(" in body_src]
@@ -5230,7 +5290,7 @@ TAB_ENV_EXEMPT = {
 def _tab_env_assign(text: str, name: str):
     """模块级 `name = …` 那一行的**原文**（逐字节对拍用）；没有或解析不过则 None。"""
     try:
-        tree = ast.parse(text)
+        tree = _file_tree("", text)
     except SyntaxError:
         return None
     for st in tree.body:
@@ -5252,7 +5312,7 @@ def _tab_env_assign_node(tree, name: str):
 def _tab_env_arg_strings(tree) -> list:
     """会被**当成参数用**的字符串常量：列表/元组成员、调用实参（含 f-string 的固定前缀）。"""
     out = []
-    for sub in ast.walk(tree):
+    for sub in _walk(tree):
         if isinstance(sub, (ast.List, ast.Tuple)):
             cand = [e.value if isinstance(e, ast.Starred) else e for e in sub.elts]
         elif isinstance(sub, ast.Call):
@@ -5281,7 +5341,7 @@ def _tab_env_launch_lists(tree) -> list:
     会把「按目录名匹配旧进程」那些正当写法一路报成缺陷，而报多了就没人再理会这一条。
     """
     hits = []
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, ast.Call):        # Selenium 那一路
             f = node.func
             if isinstance(f, ast.Attribute) and f.attr == "add_argument":
@@ -5332,7 +5392,7 @@ def _tab_env_node_has_flag(node) -> bool:
 
 def _tab_calls_name(node, name: str) -> bool:
     return any(isinstance(x, ast.Call) and isinstance(x.func, ast.Name)
-               and x.func.id == name for x in ast.walk(node))
+               and x.func.id == name for x in _walk(node))
 
 
 def _tab_env_gate_problems(files: dict) -> list:
@@ -5454,7 +5514,7 @@ def _tab_chrome_env_problems(rel: str, text: str, tree, mirrors=False) -> list:
     if mirrors:
         return problems        # 副本没有「复用旧实例」这一支，问它等于问一段不存在的代码
     # 31g-4 复用旧实例时那句提示要接线，而且要真的落在提示分支里
-    reuse = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+    reuse = next((n for n in _walk(tree) if isinstance(n, ast.FunctionDef)
                   and n.name == TAB_ENV_REUSE_FN), None)
     if reuse is None:
         problems.append(f"{rel} 没有 {TAB_ENV_REUSE_FN}：「先前就开着的 Chrome 没带这个开关」"
@@ -5466,8 +5526,8 @@ def _tab_chrome_env_problems(rel: str, text: str, tree, mirrors=False) -> list:
         spoken = any(isinstance(n, ast.If)
                      and _tab_calls_name(n.test, TAB_ENV_PROBE_FN)
                      and any(isinstance(x, ast.Call) and _tab_is_log(x)
-                             for st in list(n.body) + list(n.orelse) for x in ast.walk(st))
-                     for n in ast.walk(reuse))
+                             for st in list(n.body) + list(n.orelse) for x in _walk(st))
+                     for n in _walk(reuse))
         if not spoken:
             problems.append(f"{rel}::{TAB_ENV_REUSE_FN} 问到了却没说：那句话要落在提示分支里"
                             "（`if …: log(…)`）——只调用一次是给自己记账，不给用户交代")
@@ -5526,7 +5586,7 @@ TAB_ENV_CASES = (
 
 def _mirror_load_names(node) -> set:
     """节点里以**读**的方式出现的名字（含嵌套表达式、f-string、推导式里的）。"""
-    return {n.id for n in ast.walk(node)
+    return {n.id for n in _walk(node)
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
 
 
@@ -5535,7 +5595,7 @@ def _mirror_local_names(node) -> set:
     海象、global/nonlocal。自由名字必须把它们减掉，否则每个局部变量都会被当成「模块级依赖」，
     闭包就把整份源码拖进镜像了（那样还不如直接 import）。"""
     bound = set()
-    for n in ast.walk(node):
+    for n in _walk(node):
         if isinstance(n, ast.arg):
             bound.add(n.arg)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -5555,7 +5615,7 @@ def _mirror_self_attrs(node) -> set:
     镜像要拿这些名字去问「类上有没有默认值」：`self.x[k] = 1` 这一行运行时同样要求 `self.x`
     已经绑定，漏算一个就是把一份跑不起来的镜像交出去。33b-2 问的是「这本账有人念吗」，那边
     必须把写入地址剔掉——同一个语法节点在两条判据里要的是两回事，这里写下来免得下一个人直接照抄。"""
-    return {n.attr for n in ast.walk(node)
+    return {n.attr for n in _walk(node)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
             and n.value.id == "self" and isinstance(n.ctx, ast.Load)}
 
@@ -5595,10 +5655,10 @@ def _tab_identity_gate_class(src: str, reason_src: str = ""):
     行为与真源不同却刚好通过期望表，从此「门改了口径、判据没跟上」再没人知晓。
     """
     tree = _ast_safe_parse(src)
-    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    fns = {n.name: n for n in _walk(tree) if isinstance(n, ast.FunctionDef)}
     if not set(TAB_ID_HANDLES[:2]) <= set(fns):
         return None, f"{TAB_ID_SOURCE} 里找不到 {TAB_ID_HANDLES[:2]}（门被改名或搬走，判据与代码分叉了）"
-    cls = next((c for c in ast.walk(tree) if isinstance(c, ast.ClassDef)
+    cls = next((c for c in _walk(tree) if isinstance(c, ast.ClassDef)
                 and any(isinstance(m, ast.FunctionDef) and m.name == "_tab_page_is"
                         for m in c.body)), None)
     if cls is None:
@@ -5725,12 +5785,12 @@ def _tab_log_texts(fn) -> list:
     只取 `_log` 的参数：注释与 docstring 里允许出现「挑战跑完了」这种叙述（那是在讲来历），
     但念给用户听的那一句不允许——它必须只陈述拿得到的证据。"""
     out = []
-    for node in ast.walk(fn):
+    for node in _walk(fn):
         if not (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute) and node.func.attr == "_log"):
             continue
         for arg in list(node.args) + [k.value for k in node.keywords]:
-            out += [c.value for c in ast.walk(arg)
+            out += [c.value for c in _walk(arg)
                     if isinstance(c, ast.Constant) and isinstance(c.value, str)]
     return out
 
@@ -5744,7 +5804,7 @@ def _tab_nav_evidence_problems(rel: str, tree, strict_names=False) -> list:
     """
     problems = []
     by_name = {}
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if isinstance(n, ast.FunctionDef):
             by_name.setdefault(n.name, n)
     for fname, marks, why in TAB_NAV_RULES:
@@ -5787,7 +5847,7 @@ def _tab_exit_problems(rel: str, tree, row: dict) -> list:
     """一个模块的「出口清单 ↔ 在案登记」差分。"""
     problems = []
     for fn_name, lineno, how, gates in _tab_body_exits(tree):
-        fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+        fn = next((n for n in _walk(tree) if isinstance(n, ast.FunctionDef)
                    and n.name == fn_name and n.lineno == lineno), None)
         if fn_name not in row:
             problems.append(
@@ -5828,7 +5888,7 @@ def check_tab_body_identity(files=None) -> list:
     judged = 0
     for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
         try:
-            tree = ast.parse(text)
+            tree = _file_tree(_rel_label(path), text)
         except SyntaxError as e:
             problems.append(f"{path.name} 解析不过（第 {e.lineno} 行 {e.msg}）：第 31 条读不到"
                             "这一份的取页写法，按不合格算而不是按「这处没问题」算")
@@ -5848,7 +5908,7 @@ def check_tab_body_identity(files=None) -> list:
             problems.append(f"登记表里的 {rel} 不在视野里：这一条门对它已经失明")
             continue
         tree = _ast_safe_parse(text)
-        names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        names = {n.name for n in _walk(tree) if isinstance(n, ast.FunctionDef)}
         exits = {e[0] for e in _tab_body_exits(tree)}
         for fn_name in row:
             if fn_name not in names:
@@ -5863,7 +5923,7 @@ def check_tab_body_identity(files=None) -> list:
     for name in TAB_ID_HANDLES:
         defs = [str(_rel_label(p)) for p, t in files.items()
                 if any(isinstance(n, ast.FunctionDef) and n.name == name
-                       for n in ast.walk(_ast_safe_parse(t)))]
+                       for n in _walk(_ast_safe_parse(t)))]
         if not defs:
             problems.append(f"全仓没有 {name}：身份门的真源被删了——各站那些「取回正文」的路此后再"
                             "没有任何东西拦着串页")
@@ -6066,7 +6126,7 @@ def _nc_read_hits(tree):
     把它们一个个标出来排除掉（否则「说词在文档里」依然能冒充「词在日志里」）。
     """
     skip = set()
-    for node in ast.walk(tree):
+    for node in _walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             body = list(getattr(node, "body", []))
             if (body and isinstance(body[0], ast.Expr)
@@ -6074,7 +6134,7 @@ def _nc_read_hits(tree):
                     and isinstance(body[0].value.value, str)):
                 skip.add(id(body[0].value))
     calls, keys, words = set(), set(), set()
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if isinstance(n, ast.Call):
             f = n.func
             calls.add(f.attr if isinstance(f, ast.Attribute)
@@ -6101,7 +6161,7 @@ def _nc_detail_evidence_problems(label: str, tree):
     不跨类猜，偶然同名不算通路。抽象桩不归这一条管（它一页都不取）。
     """
     problems = []
-    for cd in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+    for cd in (n for n in _walk(tree) if isinstance(n, ast.ClassDef)):
         fns = {}
         for n in cd.body:
             if isinstance(n, ast.FunctionDef):
@@ -6123,7 +6183,7 @@ def _nc_detail_evidence_problems(label: str, tree):
                 if cur in seen:
                     continue
                 seen.add(cur)
-                for c in ast.walk(fns[cur]):
+                for c in _walk(fns[cur]):
                     if not isinstance(c, ast.Call):
                         continue
                     f = c.func
@@ -6147,7 +6207,7 @@ def _nc_detail_evidence_problems(label: str, tree):
 def _nc_cut_arg_problems(label: str, tree):
     """32b 砍单记账的调用点必须把公司名传进去（把手本体除外，它就在那里写名单）。"""
     problems = []
-    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+    for call in (n for n in _walk(tree) if isinstance(n, ast.Call)):
         f = call.func
         if not (isinstance(f, ast.Attribute) and f.attr in CUT_NOTE_HANDLES):
             continue
@@ -6163,7 +6223,7 @@ def _nc_cut_arg_problems(label: str, tree):
 def _nc_call_names(node) -> list:
     """这个节点里出现过的**被调用者名字**（属性调用取尾名，裸调用取名）。"""
     out = []
-    for n in ast.walk(node):
+    for n in _walk(node):
         if isinstance(n, ast.Call):
             f = n.func
             out.append(f.attr if isinstance(f, ast.Attribute)
@@ -6182,7 +6242,7 @@ def _release_actions_in(node) -> list:
     下一个真静默的人就会被当成噪音放过去。"""
     out = []
     stmts = node if isinstance(node, (list, tuple)) else [node]
-    for n in [c for st in stmts for c in ast.walk(st)]:
+    for n in [c for st in stmts for c in _walk(st)]:
         if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
             continue
         attr = n.func.attr
@@ -6228,7 +6288,7 @@ def _silent_release_excepts(fn, whole_fn_is_release: bool = False) -> list:
     除了 pass 与孤零零一行字符串，什么语句都算「干了点事」：这一条故意写得保守，只拦
     「静默把失败抹平」那一种形状，不把重试、赋值一并当成漏报。"""
     out = []
-    for node in ast.walk(fn):
+    for node in _walk(fn):
         if not isinstance(node, ast.Try):
             continue
         if not whole_fn_is_release and not _release_actions_in(node.body):
@@ -6244,7 +6304,7 @@ def _silent_release_excepts(fn, whole_fn_is_release: bool = False) -> list:
 def _tab_release_problems(label: str, tree):
     """32e 覆写了 close_browser 就必须真的关点东西（空壳＝借来的标签没人认领）。"""
     problems = []
-    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+    for fn in (n for n in _walk(tree) if isinstance(n, ast.FunctionDef)
                and n.name == "close_browser"):
         body = [st for st in fn.body
                 if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
@@ -6281,7 +6341,7 @@ def _tab_silent_release_problems(label: str, tree):
     """32g 不覆写 close_browser 的站也得过这一问：只要函数在干「关/归还」，
     里面 `except …: pass` 都算静默失败（判据本体在 _silent_release_excepts 里同一段）。"""
     problems = []
-    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+    for fn in (n for n in _walk(tree) if isinstance(n, ast.FunctionDef)
                and n.name != "close_browser"      # 那一枚由 _tab_release_problems 统一判，不报两遍
                and (n.name in TAB_RELEASE_FNS or _does_tab_release(n))):
         # 名字在登记表里的＝它自己就是归还本体，整函数算；只被动作认出来的
@@ -6319,7 +6379,7 @@ def _nc_cut_shapes(node) -> list:
     带下界的切片（120 字窗口 `page[m.end():m.end() + 120]`）算「取哪一段正文」、不算收口：
     把它一起禁掉就是误伤，而误伤一次，下一次就有人把这一条改成永真。"""
     out = []
-    for x in ast.walk(node):
+    for x in _walk(node):
         if (isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Slice)
                 and x.slice.lower is None and isinstance(x.slice.upper, ast.Constant)
                 and isinstance(x.slice.upper.value, int)):
@@ -6334,12 +6394,12 @@ def _nc_cut_shapes(node) -> list:
 def _nc_evidence_writes(tree):
     """往分档证据上写东西的那些赋值（生成处的 `evid`/`tail`、入账处的 `_nc_evidence[…]`）。"""
     got = []
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if not isinstance(n, ast.Assign):
             continue
         hit = False
         for t in n.targets:
-            for x in ast.walk(t):
+            for x in _walk(t):
                 if isinstance(x, ast.Name) and x.id in NC_EVIDENCE_NAMES:
                     hit = True
                 elif (isinstance(x, ast.Subscript) and isinstance(x.value, ast.Attribute)
@@ -6369,7 +6429,7 @@ def _nc_evidence_no_cut_problems(label: str, tree) -> list:
                 f"{label} 第 {n.lineno} 行把分档证据按长度收了口（{'、'.join(shapes)}）：这一本账"
                 f"从生成到渲染只许挨一刀，那一刀住在 `{NC_RENDER_HANDLE}`——两把刀的上限互相"
                 f"不知情，读到那句「证据」就没人负责")
-    render = [f for f in ast.walk(tree)
+    render = [f for f in _walk(tree)
               if isinstance(f, ast.FunctionDef) and f.name == NC_RENDER_HANDLE]
     if not writes and not render:
         problems.append(
@@ -6398,11 +6458,11 @@ def _calls_tab_close(fn) -> bool:
 
     只看**调用实参**里的字符串：`site_adapters` 的 docstring 里就写着「/json/close 关闭」，
     拿全文子串发判会把一个只是把动作写进注释的函数当成干这事的（误伤一次就有人改成永真）。"""
-    for n in ast.walk(fn):
+    for n in _walk(fn):
         if not isinstance(n, ast.Call):
             continue
         for a in list(n.args) + [kw.value for kw in n.keywords]:
-            for x in ast.walk(a):
+            for x in _walk(a):
                 if (isinstance(x, ast.Constant) and isinstance(x.value, str)
                         and TAB_CLOSE_URL_MARK in x.value):
                     return True
@@ -6411,7 +6471,7 @@ def _calls_tab_close(fn) -> bool:
 
 def _tab_list_calls(fn):
     """这个函数里读标签列表的那几处调用（含 `sc.list_page_targets(...)` 这种带命名空间的写法）。"""
-    for n in ast.walk(fn):
+    for n in _walk(fn):
         if isinstance(n, ast.Call):
             nm = getattr(n.func, "id", None) or getattr(n.func, "attr", "")
             if nm == TAB_LIST_HANDLE:
@@ -6435,12 +6495,12 @@ def _tab_list_strict_problems(label: str, tree) -> list:
     两个方向都要钉：只钉口径会被人把重查删掉（退回「只信回执」），所以同时要求关之后得有一次重查。
     """
     problems = []
-    for fn in (f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+    for fn in (f for f in _walk(tree) if isinstance(f, ast.FunctionDef)
                and (_calls_tab_close(f) or _release_actions_in(f))):
         lists = sorted(_tab_list_calls(fn), key=lambda c: c.lineno)
         # 只拿**调用那一行**当关闭时刻：不把函数自己的定义行算进来（否则「重查在关闭之后」
         # 会被一次只发生在关闭**之前**的枚举诓成绿），也不拿全文子串（docstring 会说话）。
-        closers = [n.lineno for n in ast.walk(fn)
+        closers = [n.lineno for n in _walk(fn)
                    if isinstance(n, ast.Call) and _calls_tab_close(n)]
         for call in lists:
             if not _is_strict_list_call(call):
@@ -6482,7 +6542,7 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
     judged = 0
     for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
         try:
-            tree = ast.parse(text)
+            tree = _file_tree(_rel_label(path), text)
         except SyntaxError as e:
             problems.append(f"{_rel_label(path)} 解析不过（第 {e.lineno} 行 {e.msg}）：第 32 条"
                             "读不到这一份的写法，按不合格算而不是按「这处没问题」算")
@@ -6515,7 +6575,7 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
         t = texts.get(rel) or ""
         mode, phrase = NC_READ_RULES[rel]
         try:
-            tree = ast.parse(t)
+            tree = _file_tree(rel, t)
         except SyntaxError as e:
             problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：这一处读不到，"
                             "按不合格算而不是按「这一处没问题」算")
@@ -6545,13 +6605,13 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
     # `def release_tab` 这一子串会被 `def release_tab_x` 那种改名后缀哄成绿（AR 反向对照抓到）——
     # 改名之后每一处 `self.release_tab(...)` 都会 AttributeError，而判据还在说「唯一入口在」。
     try:
-        _base_tree = ast.parse(base)
+        _base_tree = _file_tree(NC_MIRROR_FILES[0], base)
     except SyntaxError as e:
         _base_tree = None
         problems.append(f"{NC_MIRROR_FILES[0]} 解析不过（第 {e.lineno} 行 {e.msg}）：这一条读不"
                         "到把手本体，按不合格算而不是按「入口还在」算")
     if _base_tree is not None and "release_tab" not in {
-            n.name for n in ast.walk(_base_tree) if isinstance(n, ast.FunctionDef)}:
+            n.name for n in _walk(_base_tree) if isinstance(n, ast.FunctionDef)}:
         problems.append(f"{NC_MIRROR_FILES[0]} 里没有 `release_tab` 把手：归还动作没有唯一入口，"
                         "各站会各写一份关标签（而「关失败」最容易在各份里被 except: pass 抹平）"
                         "；把手改名要同时改这一条，否则上层每一处调用都是死的而判据看不见")
@@ -6585,14 +6645,14 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
     for rel in NC_MIRROR_FILES:
         t = texts.get(rel) or _text_of(files, rel) or ""
         try:
-            _tree = ast.parse(t)
+            _tree = _file_tree(rel, t)
         except SyntaxError as e:
             problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：这一处读不到记账把手，"
                             "按不合格算而不是按「两边都读不到就算一致」算")
             _mh[rel] = {}
             continue
         got = {}
-        for n in ast.walk(_tree):
+        for n in _walk(_tree):
             if not (isinstance(n, ast.FunctionDef) and n.name in NC_ACCOUNT_FNS):
                 continue
             if n.name in got:
@@ -6626,7 +6686,7 @@ def check_no_contact_accountability(files=None, texts=None) -> list:
     for rel in NC_MIRROR_FILES:
         t = texts.get(rel) or _text_of(files, rel) or ""
         try:
-            _ti = ast.parse(t)
+            _ti = _file_tree(rel, t)
         except SyntaxError:
             continue                      # 32a/32c 已就这一份报过「解析不过」，这里不叠第二条
         problems += _nc_evidence_no_cut_problems(rel, _ti)
@@ -6743,7 +6803,7 @@ def _scan_attrs(nodes) -> dict:
                     or (isinstance(n.value, ast.Constant)
                         and n.value.value not in ("", None))):
                 rec["say_count"] += 1
-                rec["say_strings"] += [s.value for s in ast.walk(n.value)
+                rec["say_strings"] += [s.value for s in _walk(n.value)
                                        if isinstance(s, ast.Constant)
                                        and isinstance(s.value, str)]
     return rec
@@ -6764,7 +6824,7 @@ def _listed_facts(label, text) -> dict:
     got = _LISTED_FACTS.get(key)
     if got is not None:
         return got
-    tree = ast.parse(text)                # SyntaxError 由调用方兜（按不合格算）
+    tree = _file_tree(label, text)        # SyntaxError 由调用方兜（按不合格算）
     groups, parent, order = {None: []}, {None: None}, []
     stack = [(tree, None)]
     while stack:

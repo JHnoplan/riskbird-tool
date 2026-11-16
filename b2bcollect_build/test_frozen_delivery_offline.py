@@ -6171,6 +6171,9 @@ def _switches_state() -> dict:
     return {k: getattr(sys, k, None) for k in _SYS_SNAPSHOT}
 
 
+_SECTION_COST = {}          # 节名 → 本套跑下来的墙钟秒数（只给收尾那一句看）
+
+
 def _run(section):
     """跑一节，跑完立刻核对运行形态开关：谁拨走没收回就点谁的名。
 
@@ -6179,9 +6182,22 @@ def _run(section):
     这种和产品毫不相干的栈——排查的人会先去查产品代码。按节点名把这件事的成本从「翻一
     整套用例」压回「看那一个函数」。最后一道总量核对仍然保留在 main() 末尾：它管的是
     「每节都恢复到了上一节留下的错值」这种逐节看不出、但结果与开跑前不一致的形态。
+
+    顺带记下每一节的耗时：批跑看门狗（600s/套件）只能告诉你「这一路没跑完」，说不出
+    慢在哪一节、是哪一节把整套件顶过去的（本轮 AS 节刚加进去时就是这样：套件从 5 分钟
+    涨到 10 分钟，屏幕上只有一句 HANG）。逐节记账后，最后一道判据能点出名字。
+
+    但只记「跑完的那一节」等于没记：被看门狗掐断的那一轮，收尾那句「最慢小节」根本
+    来不及打印（2026-11-16 那一轮就是这样：明知超了 600s，却拿不出是哪一节的半句证据，
+    只能靠人手工一节一节量）。所以**开跑前**先把节名打出去：日志的最后一行就是那一个
+    正在吃时间的小节——与「FAIL 行必须自带理由」「取不到字节数也要把取不到说出来」同一族。
     """
     before = _switches_state()
+    _t = time.perf_counter()
+    print(f"▶ {section.__name__}", flush=True)
     section()
+    _SECTION_COST[section.__name__] = _SECTION_COST.get(section.__name__, 0.0) + (
+        time.perf_counter() - _t)
     after = _switches_state()
     diff = [f"sys.{k}: {before[k]!r} → {after[k]!r}"
             for k in before if before[k] != after[k]]
@@ -10320,6 +10336,170 @@ def test_listing_accountability_gate():
                "任何一处旧账没退干净都会在这一句上露出来")
 
 
+def test_tree_cache_gate():
+    print("\n═══ AT. 取树只一个把手：门禁内部的语法树层（绕过／登记空转／改脏共享树 各必须响）═══")
+    # 由来（2026-11-16 frozen 套件超 600s 被批跑看门狗掐断）：第 30/31/32 条每跑一次都把同一批
+    # 交付链源码重新 `ast.parse` 一遍，再对每个节点重走一次 `ast.walk`（实测：第 32 条一次调用
+    # 展开 390 万棵树呈 O(n²)，第 30 条把同一个作用域重建 14572 次）。修法是在门禁里加一层
+    # 公共设施：同一份字节只解析一次（`_file_tree`）、同一个节点只展开一次（`_walk`、
+    # `_scope_nodes` 的 memo）。优化后 frozen 从 588.8s 降到 201.7s，且 33 项门禁改前改后
+    # stdout 逐字节相同。
+    # 但**公共设施没有判据就会被绕过**：下一个加条款的人各 parse 各的，这一层就只盖住了
+    # 四分之一（与第 33 条管「条目账只住在一个把手」完全同一个道理）。反过来，谁把一份
+    # **会就地改节点**的写法接进缓存，缓存就会替所有人把证据改脏——本仓真实就有这一处：
+    # `_code_only_text` 靠 `body.pop(0)` 摘 docstring（第 18 条判的正是「docstring 不许替代码
+    # 作证」，它自己反倒改树）。所以这一节两半都要：①绕过与登记空转必须响；②按内容生效、
+    # 不改共享树、有上界这三条性质都要有行为夹具，而不是只读一段源码字符串。
+    gate = _manifest_gate()
+    _src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(encoding="utf-8")
+
+    # 登记表：每一处「不许吃 `_file_tree`」的 `ast.parse` 都要写明理由（与 DEV_PATH_EXEMPT、
+    # DIVERGENT_VENDORED 同一族规矩：豁免必须带理由，且必须真对得上——对不上就是空转）。
+    _allowed = {
+        "got = ast.parse(text, filename=label)": "把手本体：整层只许这一处真的去解字节",
+        "tree = ast.parse(text)": "`_code_only_text` 会就地摘 docstring（body.pop），故意吃一份私有树",
+        'return ast.parse("")': "`_ast_safe_parse` 的坏语法兜底：交一份空树，不让异常带走整条门",
+        'got = _tab_exit_problems("夹具", ast.parse(frag), dict(table))': "内联夹具片段，不是磁盘源码",
+        'got = _tab_nav_evidence_problems("夹具", ast.parse(frag))': "内联夹具片段，不是磁盘源码",
+        'got = _tab_chrome_env_problems("夹具", frag, ast.parse(frag))': "内联夹具片段，不是磁盘源码",
+    }
+
+    def _tree_layer_problems(src, allowed=_allowed, whole=False):
+        """只认**代码里的调用**：取树只一个把手，新 parse 点要么改调 `_file_tree`、要么登记理由。
+
+        拿 AST 而不是正则抓行：注释与 docstring 里写一句 `ast.parse(` 不算绕过（本仓第 18 条
+        同一口径），而正则恰好会在那种句子上假响一次、逼下一个人把判据改松。
+
+        `whole` 决定要不要查「登记表空转」：那一问的口径是「**整份门禁真源**里每一处登记都还
+        对得上」，合成片段里本来就只有几行，拿它去要求六条全在就是误伤（本轮第一跑就红在这一句，
+        红得对：判据错了就得修判据，而不是给夹具补上六条假登记）。
+        """
+        import ast as _A
+        try:
+            tree = _A.parse(src)
+        except SyntaxError as e:
+            return [f"这份源码解析不过（第 {e.lineno} 行 {e.msg}）：读不到写法就按不合格算，"
+                    "不许当作「没有绕过」"]
+        lines = src.splitlines()
+        hits = []
+        for n in _A.walk(tree):
+            if not (isinstance(n, _A.Call) and isinstance(n.func, _A.Attribute)
+                    and isinstance(n.func.value, _A.Name) and n.func.value.id == "ast"
+                    and n.func.attr in ("parse", "walk")):
+                continue
+            hits.append((n.lineno, n.func.attr, lines[n.lineno - 1].strip()))
+        out = [f"第 {ln} 行又自己 `ast.walk(`：语法树展开只许走 `_walk`，绕过这一层就是第二把刀"
+               f"（代价已经量过：单次调用 390 万次展开）：{txt}"
+               for ln, kind, txt in hits if kind == "walk"]
+        used = set()
+        for ln, kind, txt in hits:
+            if kind != "parse":
+                continue
+            if txt in allowed:
+                used.add(txt)
+                continue
+            out.append(f"第 {ln} 行出现未登记的 `ast.parse(`：要进这一层就改调 `_file_tree`，"
+                       f"确实不许共享的就在登记表里写清理由：{txt}")
+        if whole:
+            idle = sorted(set(allowed) - used)
+            if idle:
+                # 把登记的理由一起念出来：只报一行代码文本时，读的人还得自己去找那是哪个函数
+                # （而这一格拦的恰好就是「豁免必须带理由」，理由不在报告里就等于没登记）
+                out.append("登记表里这几条 `ast.parse(` 在真源已经找不到了（登记了却没人在用＝这一格"
+                           "在空转，下一次真绕过不会被报出来）："
+                           + "；".join(f"{k}（登记的理由：{allowed[k]}）" for k in idle))
+        return out
+
+    _got26 = _tree_layer_problems(_src, whole=True)
+    _assert_eq(_got26, [], f"门禁真源的取树口径必须收干净（实际={_got26[:2]}）")
+
+    # 正向不许误伤：只在注释／docstring 里提到 `ast.parse(` 的写法不算绕过
+    _assert_eq(_tree_layer_problems(
+        'def f(tree):\n    """旧写法是 ast.parse(text)，现在走把手"""\n'
+        '    # 这里曾经自己 ast.walk(tree)\n    return list(_walk(tree))\n'), [],
+        "误伤一次，下一个真绕过就被当噪音（本仓多处吃过这一条）")
+    for _tag26, _frag26 in (
+            ("条款自己解一份磁盘源码",
+             "def check_x(files):\n    tree = ast.parse(files['a.py'])\n    return list(_walk(tree))\n"),
+            ("条款自己走一遍语法树",
+             "def check_y(tree):\n    return [n for n in ast.walk(tree) if isinstance(n, ast.Call)]\n")):
+        _p26 = _tree_layer_problems(_frag26)
+        _assert(bool(_p26), f"反向对照（{_tag26}）：绕过把手必须响，否则这一层只盖住了四分之一")
+        _assert(any("未登记" in x or "ast.walk" in x for x in _p26),
+                f"反向对照（{_tag26}）：响的话要念得出是哪一行、该改调哪个把手（实际={_p26[:1]}）")
+    _idle_src = _src.replace("    tree = ast.parse(text)\n    for node in list(_walk(tree)):",
+                             "    tree = _file_tree('', text)\n    for node in list(_walk(tree)):", 1)
+    _assert(_idle_src != _src,
+            "夹具没换到一个字节＝这一档在空转（本轮第一版就是这样写错的：缩进按 8 个空格找，"
+            "真源是 4 个，于是报「判据没响」而其实是模拟没发生）")
+    _idle26 = _tree_layer_problems(_idle_src, whole=True)
+    _assert(any("已经找不到了" in x and "_code_only_text" in x for x in _idle26),
+            "反向对照（登记的那一处被接进缓存）：登记表空转必须响，而且要点名到 `_code_only_text`"
+            "——这一句同时钉住了「它不许吃共享树」那个决策（吃了就会把全仓的 docstring 摘干净）"
+            f"（实际={_idle26[:1]}）")
+
+    # 行为层①：`_walk` 与 `ast.walk` 同序同集合，但同一个节点只展开一次
+    import ast as _A26
+    _t28 = _A26.parse("def f():\n    g(1)\n\nclass C:\n    def m(self):\n        h(2)\n")
+    _assert_eq(gate._walk(_t28), list(_A26.walk(_t28)),
+               "`_walk` 必须与 `ast.walk` 交同一批节点、同一个顺序（口径不许被偷偷换成带剪枝的）")
+    _assert(gate._walk(_t28) is gate._walk(_t28),
+            "同一个节点只许展开一次（这一层存在的全部理由）")
+
+    # 行为层②：`_scope_nodes` 不下钻嵌套函数，且同一个作用域只算一次
+    _sc_src = "def outer():\n    a = 1\n    def inner():\n        b = 2\n    return a\n"
+    _outer = next(n for n in _A26.walk(_A26.parse(_sc_src))
+                  if isinstance(n, _A26.FunctionDef) and n.name == "outer")
+    _sc28 = gate._scope_nodes(_outer)
+    _assert(not any(isinstance(x, _A26.Name) and x.id == "b" for x in _sc28),
+            "`_scope_nodes` 不许下钻嵌套函数（否则某个函数里接过原因的短名会把原因色传染全仓，"
+            "本轮实测误报 127 处，其中真缺陷只 7 处）")
+    _assert(gate._scope_nodes(_outer) is _sc28,
+            "同一个作用域只许算一次（本条款的「原因色」是不动点迭代八轮，重建表就是那 14572 次）")
+
+    # 行为层③：缓存按**内容**取证据，改一个字节就得换一份事实
+    _lab28 = "_probe_tree_cache.py"
+    _fa28 = gate._listed_facts(_lab28, "class C:\n    def m(self):\n        self.aa = 1\n")
+    _fb28 = gate._listed_facts(_lab28, "class C:\n    def m(self):\n        self.bb = 1\n")
+    _assert_eq(sorted(_fa28["file"]["assigned"]), ["aa"], "同一个 label 的第一份字节给第一份事实")
+    _assert_eq(sorted(_fb28["file"]["assigned"]), ["bb"],
+               "同一个 label 换了字节必须换事实（按文件名取缓存的话，这一句会念回上一份的账）")
+    _assert(gate._listed_facts(_lab28, "class C:\n    def m(self):\n        self.aa = 1\n") is _fa28,
+            "同一份字节第二次取必须复用那份事实（不然这一层没帮上忙）")
+
+    # 行为层④：`_code_only_text` 不许吃 `_file_tree`——先拿反证演示把危害演示出来
+    _demo28 = "def f():\n    \"\"\"证言\"\"\"\n    g(1)\n"
+    _sh28 = gate._file_tree("_probe_shared_tree.py", _demo28)
+    _sh28.body[0].body.pop(0)                     # 模拟「就地改共享树」那种写法
+    _sh28b = gate._file_tree("_probe_shared_tree.py", _demo28)
+    _assert(_sh28b is _sh28 and not any(
+        isinstance(x, _A26.Expr) and isinstance(x.value, _A26.Constant)
+        and isinstance(x.value.value, str) for x in _sh28b.body[0].body),
+        "这一条是**反证演示**：`_file_tree` 交出的就是同一份共享树，谁 pop 一下，后面每一条款读到的"
+        "都是被摘掉 docstring 的那一份——所以「只有不改树的写法许进来」不是洁癖，上面登记表那条"
+        "理由得一直被咬住")
+    _said28 = gate._code_only_text(_demo28)
+    _assert("证言" not in _said28 and "g(1)" in _said28,
+            "`_code_only_text` 自己的本职必须还在（剔 docstring、留真会执行的代码）："
+            "万一有人把它改成不剔了，下面那条「不许吃缓存」的豁免就成了无成本的洁癖")
+
+    # 行为层⑤：缓存自己得收口（一个进程跑 45 节，每节几十份夹具）
+    for _i28 in range(600):
+        gate._file_tree(f"_probe_cap_{_i28}.py", f"x = {_i28}\n")
+    _assert(len(gate._TREE_CACHE) <= 512,
+            f"`_TREE_CACHE` 必须有上界（宁可重算，不许把上一轮的树当本轮证据）："
+            f"实际={len(gate._TREE_CACHE)}")
+
+    # 行为层⑥：四个热条款真源上跑绿，且重复跑不许飘（缓存不许让判定随调用次数变化）
+    for _fn28 in ("check_reason_one_handle", "check_tab_body_identity",
+                  "check_no_contact_accountability", "check_listing_accountability"):
+        _r28 = getattr(gate, _fn28)()
+        _assert_eq(_r28, [], f"{_fn28} 今天必须真绿")
+        _assert_eq(getattr(gate, _fn28)(), _r28,
+                   f"{_fn28} 第二次跑必须与第一次逐条相同（判定不许随调用次数漂移）")
+    print("AT 取树只一个把手：绕过必响／登记空转必响／四条性质有行为夹具 ✓")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -10353,6 +10533,7 @@ SECTIONS = (
     test_nav_evidence_gate,
     test_no_contact_accountability_gate,
     test_listing_accountability_gate,
+    test_tree_cache_gate,
 )
 
 
@@ -10360,6 +10541,9 @@ def main():
     print("═══ 打包态交付链 离线测试 ═══")
     for section in SECTIONS:
         _run(section)
+    _cost = sorted(_SECTION_COST.items(), key=lambda kv: -kv[1])
+    print("\n═══ 最慢小节（秒）：" + "、".join(f"{n} {s:.1f}" for n, s in _cost[:8]) + " ═══")
+    print(f"    合计 {sum(s for _, s in _cost):.1f}s / {len(_cost)} 节")
     # 收尾硬判据：每一节拨走的运行形态开关都必须自己收回去。不查这一条的话，「邻居
     # 没收拾」这种缺陷要等下一节撞出一个与产品毫不相干的栈才会被发现——本轮 T 节把
     # sys.executable 还原成 None，红的是隔了一整节的 U 节（Path(None) 的 TypeError），
