@@ -11344,6 +11344,75 @@ def test_human_wait_lamp_gate():
     _assert(any("真源不在位" in h for h in _hits), f"真源缺席不许绿：{_hits[:2]}")
 
 
+def test_trap_handler_defined_gate():
+    """AZ. trap 触发时它调到的函数必须已经存在（第 39 条硬门）。"""
+    print("\n═══ AZ. 陷阱不许撞 command not found：trap 只许调到已定义的函数（第 39 条硬门）═══")
+    gate = _manifest_gate()
+
+    # 1) 现状：真源全绿，而且这一格真的看到了陷阱（看不到就会假绿）
+    _assert_eq(gate.check_trap_handler_defined(), [], "第 39 条：trap 处理器在真源上必须全绿")
+    _seen = 0
+    for _rel in gate.SHELL_SOURCES:
+        _p = gate.ROOT / _rel
+        if not _p.is_file():
+            continue
+        _seen += sum(1 for _ln in _p.read_text(encoding="utf-8", errors="replace").splitlines()
+                     if gate.SHELL_TRAP_PAT.match(_ln))
+    _assert(_seen >= 5, f"这一格在真源上只看到 {_seen} 句 trap，与交付链实际登记的量级不符："
+                        "视野断了它也会报绿（5 是本轮逐份点名数出来的下限，取制品 2 句、"
+                        "批跑 1 句、本机打包 2 句）")
+
+    # 2) 本轮那个缺陷的原形：函数写在 trap 之后。逐字节只差一个位置，行为完全两样，
+    # 所以只能拿这种成对夹具对拍——拿「真源现在绿」当判据的下一位会把这一族改回去。
+    _old = ("#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+            "on_exit() {\n  bg_reap\n  return 0\n}\n"
+            "trap 'on_exit' EXIT\n"
+            "bg_reap() {\n  :\n}\nexit 7\n")
+    _hits = gate.check_trap_handler_defined(texts=[("zz_trap_old.sh", _old)])
+    _assert(any("bg_reap" in h and "第 8 行" in h for h in _hits),
+            f"「函数写在 trap 之后」必须响、要点名是哪个函数（实际={_hits[:1] or '一声不响'}）")
+    _new = ("#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+            "bg_reap() {\n  :\n}\n"
+            "on_exit() {\n  bg_reap\n  return 0\n}\n"
+            "trap 'on_exit' EXIT\nexit 7\n")
+    _assert_eq(gate.check_trap_handler_defined(texts=[("zz_trap_new.sh", _new)]), [],
+               "同样的调用关系、只是把函数搬到 trap 之前，就不许响（本轮给出的修法）")
+
+    # 3) 传递闭包：只看直接调用的判据会在这一档假绿
+    _deep = ("set -Eeuo pipefail\na() {\n  b\n}\n"
+             "trap 'a' EXIT\nb() {\n  :\n}\n")
+    _hits = gate.check_trap_handler_defined(texts=[("zz_trap_deep.sh", _deep)])
+    _assert(any("b()" in h for h in _hits),
+            f"隔一层的调用也要查到（实际={_hits[:1] or '一声不响'}）")
+
+    # 4) 注释不是调用：真源里就有一句「调用点在下面的 on_exit」，拿它当调用会在合格脚本上假响
+    _doc = ("set -Eeuo pipefail\non_exit() {\n  # 收口统一走 later()，见下面那一段\n  :\n}\n"
+            "trap 'on_exit' EXIT\nlater() {\n  :\n}\n")
+    _assert_eq(gate.check_trap_handler_defined(texts=[("zz_trap_doc.sh", _doc)]), [],
+               "只出现在注释里的名字不算调用（误伤一次，下一个人就把判据改松）")
+
+    # 5) 函数体切不出来要报「判不了」，不许静默跳过（25/26/28 条同一课）
+    _broken = "set -Eeuo pipefail\non_exit() {\n  later\n}\ntrap 'on_exit' EXIT\nlater() {\n  {\n"
+    _hits = gate.check_trap_handler_defined(texts=[("zz_trap_unbalanced.sh", _broken)])
+    _assert(any("没配平" in h for h in _hits),
+            f"花括号配不了平要响「这一格判不了」（实际={_hits[:1] or '一声不响'}）")
+
+    # 6) 空视野不许绿
+    _hits = gate.check_trap_handler_defined(sources=(), texts=())
+    _assert(any("不许报绿" in h for h in _hits),
+            f"一份 shell 都没读到时不许绿（实际={_hits[:1] or '一声不响'}）")
+
+    # 7) 本轮那次搬迁必须还在：取制品脚本里 bg_reap 的定义要在 trap 登记之上。
+    # 这一档不拿合成代码对拍（上面那些已经够），它只钉「真源今天修的那一处没漂回去」。
+    _t = (gate.ROOT / "debug" / "fetch_b2bcollect_artifacts.sh").read_text(
+        encoding="utf-8", errors="replace").splitlines()
+    _trapln = next((i for i, ln in enumerate(_t, 1) if "trap 'on_exit' EXIT" in ln), 0)
+    _defln = next((i for i, ln in enumerate(_t, 1) if ln.startswith("bg_reap() {")), 0)
+    _assert(0 < _defln < _trapln,
+            f"bg_reap 的定义必须在 trap 登记之前（实得定义第 {_defln} 行、trap 第 {_trapln} 行）："
+            "倒回去就是本轮那三件代价（退码被 127 顶掉、清理不跑、零异常日志）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -11383,6 +11452,7 @@ SECTIONS = (
     test_python_floor_gate,
     test_page_ledger_gate,
     test_human_wait_lamp_gate,
+    test_trap_handler_defined_gate,
 )
 
 

@@ -141,8 +141,10 @@
      37 「取页失败」那一格的口径表与念法都只许一处（拉黑一台主机与进不进通道账是两张表：
         借拉黑表判记账，详情腿整条不通也会写成「0 页｜最后一次=（无）」）/
      38 「这一路在等谁」那盏灯只许由把手点亮与归还（旁路赋一个字符串，下一轮就没人
-        知道它是不是也在词表上；只被 init/清/读却从没点过，就是把等到超时说成采不到））：
-     这十八条各自的由来与口径写在**它们函数上方**的注释块里——那十八条都是
+        知道它是不是也在词表上；只被 init/清/读却从没点过，就是把等到超时说成采不到）/
+     39 trap 的处理器被触发时，它调到的每一个函数都必须已经定义（函数写在 trap 后面，
+        就是拿「脚本一定能跑到那一行」当隐含条件））：
+     这十九条各自的由来与口径写在**它们函数上方**的注释块里——那十九条都是
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
 
@@ -8642,6 +8644,112 @@ def check_human_wait_lamp_gate(files=None) -> list:
     return problems
 
 
+# ── 第 39 条：trap 的处理器在被触发那一刻，它调到的每一个函数都必须已经定义 ──────
+# 由来（2026-11-16 本机自审抓到）：debug/fetch_b2bcollect_artifacts.sh 那句
+# `trap 'on_exit' EXIT` 里的 on_exit 本身在 trap 之前已定义，看起来合格；但它体内第一句
+# 调的是 bg_reap——那函数写在三百行之后。bash 到**触发那一刻**才查函数名，于是「脚本还没
+# 走到那三百行就退出」的那几条路（SHA 不合法 exit 2、取不回 tree exit 7、收到 TERM exit 3）
+# 里，处理器当场撞上一句 `bg_reap: command not found`；而这份脚本带 `set -Eeuo pipefail`，
+# 处理器从那一句起就中断，代价是三件事：
+#   ①真正的失败原因被顶掉（本机实测：本该是 rc=7 的那次早退变成 rc=127）；
+#   ②紧跟在后面的 `rm -rf "$WORK"` 不再执行——这一份脚本专门修过的「崩一次留一份 883MB」
+#      原地复活，而且只在失败路径上复活（成功路径从来不需要清理）；
+#   ③全程没有一行异常日志，只有 stderr 上那一句 command not found。
+# 本机拿同一份 on_exit 跑了正反两序：旧序 rc=127 且清理没跑，新序 rc=7 且清理跑完。
+# 判据只做一件机械的事：把 trap 处理器里的名字沿函数体传递展开（去掉注释行，不然
+# 「调用点在下面的 on_exit」这种话会把不相干的名字拽进来），任何一个在被展开到的那一刻
+# 还未定义的都要响。函数体切不出来就报「这一格判不了」而不是跳过——能报绿的空集合
+# 比不报绿更危险（25/26/28 条同一课）。视野用 SHELL_SOURCES，与第 28 条同一张登记表，
+# 不开第二份 shell 名单。
+SHELL_TRAP_PAT = re.compile(r"^\s*trap\s+(['\"])(.+?)\1\s+([A-Za-z0-9_-]+)")
+SHELL_FUNC_DEF_PAT = re.compile(r"^\s*(?:function\s+)?([A-Za-z_]\w*)\s*(?:\(\s*\))?\s*\{")
+SHELL_WORD_PAT = re.compile(r"[A-Za-z_]\w*")
+
+
+def _shell_function_bodies(text: str) -> tuple:
+    """按花括号配平切出每个函数体：返回 ({名字: (定义行号, 体内文本)}, 切不出体的名字)。
+
+    体内文本剔掉注释行：这一条要判的是「调用关系」，而注释里一句「调用点在上面的 on_exit」
+    并不是调用——拿它当调用就会在完全合格的脚本上假响一次，而下一个人会把判据改松。
+    """
+    lines = text.splitlines()
+    bodies, unparsed = {}, []
+    i = 0
+    while i < len(lines):
+        m = SHELL_FUNC_DEF_PAT.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name, depth, j = m.group(1), 0, i
+        while j < len(lines):
+            depth += lines[j].count("{") - lines[j].count("}")
+            if depth <= 0 and j >= i:
+                break
+            j += 1
+        if j >= len(lines) or depth > 0:
+            unparsed.append(name)         # 花括号到文件尾都没配平：这一份的调用关系读不到
+            i += 1
+            continue
+        if name not in bodies:
+            kept = [ln for ln in lines[i:j + 1] if not ln.strip().startswith("#")]
+            bodies[name] = (i + 1, "\n".join(kept))
+        i = j + 1
+    return bodies, unparsed
+
+
+def check_trap_handler_defined(sources=None, texts=()) -> list:
+    r"""第 39 条：trap 登记时，处理器能递达的每一个函数都必须已经在它上面。
+
+    sources/texts 与第 28 条同口径（登记表可整体替换，texts 是内存里的 [(标签, 脚本)]）：
+    离线对拍要能拿「同一份 on_exit，函数在 trap 前 / 在 trap 后」这一对喂进来，要求后者
+    必响、前者干净；还要验证「只出现在注释里的名字」不许误伤。判据验不出「坏了会响」
+    就等于没有判据。
+    """
+    sources = SHELL_SOURCES if sources is None else tuple(sources)
+    corpus = []
+    for rel in sources:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                    # 不在位由第 9/11 条点名，这里不重复报
+        corpus.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+    for label, script in texts:
+        corpus.append((label, script))
+    if not corpus:
+        return ["第 39 条一份 shell 都没读到（登记表里的路径在磁盘上都不在位、喂进来的夹具"
+                "也是空的）：这时「陷阱都在定义之后」这句话没有任何含义，不许报绿"]
+    problems = []
+    for label, text in corpus:
+        funcs, unparsed = _shell_function_bodies(text)
+        for name in sorted(set(unparsed)):
+            problems.append(f"{label}：{name}() 的花括号到文件尾都没配平，这一条读不到它的调用关系"
+                            "——按不合格算而不是按「这处没问题」算（真要是 heredoc 里的花括号带偏了，"
+                            "就把那一段改成不依赖配平的写法）")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            t = SHELL_TRAP_PAT.match(line)
+            if not t:
+                continue
+            known = set(funcs)
+            pending = sorted(known & set(SHELL_WORD_PAT.findall(t.group(2))))
+            seen, called, todo = set(), set(pending), list(pending)
+            while todo:
+                n = todo.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                inner = sorted(known & set(SHELL_WORD_PAT.findall(funcs[n][1])))
+                called.update(inner)
+                todo.extend(x for x in inner if x not in seen)
+            for n in sorted(called):
+                if funcs[n][0] > lineno:
+                    problems.append(
+                        f"{label}：第 {lineno} 行登记的 {t.group(3)} 陷阱最终会调用 {n}()，而它到第 "
+                        f"{funcs[n][0]} 行才被定义——bash 在**触发那一刻**才查函数名，所以脚本只要"
+                        f"没走到那一行就退出，处理器就会撞在 `{n}: command not found` 上；带 errexit "
+                        "时处理器从这里中断，①真实退出码被 127 顶掉、②排在后面的清理不再执行。"
+                        "把函数定义（连同它依赖的状态变量初始化）搬到 trap 登记之前")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -9147,6 +9255,18 @@ def main(argv=None) -> int:
         print(f"✅ 等人灯把手：{WAIT_LAMP} 的赋值只来自 {WAIT_HANDLE}()（或由收口处置空），"
               f"措辞表与两个把手都住在 WAIT-BLOCK 内（镜像两份逐字节相同、{len(WAIT_CASES)} 档"
               f"原因真跑过对拍），{WAIT_CLEARR}() 统一灭灯，且交付链里确实有点亮它的那一处")
+
+    trap_order = check_trap_handler_defined()
+    if trap_order:
+        bad += 1
+        print("❌ shell 的陷阱处理器调到了「登记之后才被定义」的函数（早退那一条路上"
+              "它会拿一句 command not found 顶掉真实退出码、并跳过排在后面的清理）：")
+        for p in trap_order:
+            print(f"   · {p}")
+            print(f"::error::陷阱处理器：{p}")
+    else:
+        print(f"✅ 陷阱处理器：{len(SHELL_SOURCES)} 份手写 shell 里每一句 trap 能递达的函数"
+              "都在登记之前就已定义（沿函数体传递展开、注释里的指路话不算调用）")
 
     for label, path in CALLERS.items():
         if not path.exists():
