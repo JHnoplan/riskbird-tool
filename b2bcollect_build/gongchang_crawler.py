@@ -348,7 +348,7 @@ class GongchangCrawler(CdpSiteCrawler):
                 # 早过滤
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e.get("公司名称", ""))
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e.get("公司名称", ""), "memberId": mid})
@@ -390,6 +390,7 @@ class GongchangCrawler(CdpSiteCrawler):
             rec["状态"] = "详情页导航失败"
             return self._finalize_rec(rec, stub)
         # 解析详情页
+        self._keep_detail(detail_html)   # 留给「无联系方式」分档（世界工厂网就是靠这一格定性的）
         data = self._parse_detail_page(detail_html)
         # 合并数据（详情页优先，列表页兜底）
         for k, v in data.items():

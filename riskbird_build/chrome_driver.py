@@ -324,7 +324,10 @@ def classify_driver_error(msg, drv_ver="", chrome_ver="", pages=None) -> str:
 def _short_err(e) -> str:
     """chromedriver 的报错动辄几十行堆栈，只留第一行给人看"""
     s = str(e) or e.__class__.__name__
-    return s.splitlines()[0][:180]
+    # 只取首行、**不按字符数切**：这一句会被拼进「哪个驱动为什么起不来」的说明里，
+    # 切在中间就长成一串半截字符。本目录是独立包（装不进 b2bcollect_build/text_shape.py），
+    # 所以这一族在这里的合格写法就是「整行带出」，见判据第 30 条的第三支口径。
+    return s.splitlines()[0]
 
 
 # Selenium Manager 是按父进程的 PATH 找现成驱动的，而改 PATH 是**进程级**动作：
@@ -583,7 +586,7 @@ def destroy(driver, log=None) -> None:
     try:
         driver.quit()                            # 被 _arm_quit 绑过 → 顺带收进程（幂等）
     except Exception as e:
-        log(f"   结束浏览器会话时报错（不影响收工，子进程照常回收）：{_short_err(e)[:90]}")
+        log(f"   结束浏览器会话时报错（不影响收工，子进程照常回收）：{_short_err(e)}")
     stop_service(service)
     cost = time.monotonic() - t0
     if cost > 2:
@@ -666,10 +669,10 @@ def create(options, log=None, ports=None, retries: int = 3):
             where = f"{Path(p).parent.name}/{Path(p).name}"
             if kind == "version":
                 log(f"  本地驱动版本不符（{where} {dver or '?'}，Chrome {cver or '?'}）："
-                    f"{msg[:100]}，换下一个…")
+                    f"{msg.splitlines()[0]}，换下一个…")
             else:
                 log(f"  本地驱动连不上浏览器（{where} {dver or '?'}：端口在但这一刻没接受"
-                    f"驱动的连接，稍后重试通常就好）：{msg[:100]}，换下一个…")
+                    f"驱动的连接，稍后重试通常就好）：{msg.splitlines()[0]}，换下一个…")
             return None
 
     for p in paths:

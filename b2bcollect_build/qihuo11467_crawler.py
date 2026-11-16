@@ -156,22 +156,42 @@ class Qihuo11467Crawler(CdpSiteCrawler):
         except Exception:
             return False
 
-    def _fetch_via_tab(self, url):
+    def _fetch_via_tab(self, url, deep=False):
         """降级取页：HTTP 仍被拦但浏览器能开，临时用共享 Chrome 标签取同一页，
-        让采集继续（比 HTTP 慢，但远好过整轮空转）。返回与 _fetch 同构的 (html, 最终URL)。"""
+        让采集继续（比 HTTP 慢，但远好过整轮空转）。返回与 _fetch 同构的 (html, 最终URL)。
+
+        `deep=True` 时这一页是某一家的深链：判插页只为了「这页到底给不给看」，不许顺手
+        改写通道级的分诊状态（`_block_kind`）——旧写法在这里没传 url，但 `_block_kind`
+        仍会被这一家的页面翻一次，与「深链不参与控制流」的口径分叉。
+        """
         try:
             self._cdp_navigate(url)
             self._wait_ready(None, timeout=20)
             self._mark_activity()
             html = self._html() or ""
-            if html and not self.http_block_reason(200, html):
+            if html and not self.http_block_reason(200, html, "", deep=deep):
+                if deep:
+                    # 上面那道判据只看「这页像不像被拦」，它认不出「这页是不是这一家」：
+                    # 站方在 429/挑战之后常把地址落到首页或别的商户页上，那种页照样是
+                    # 200、照样有正文，于是首页的联系方式会被写成这一家的（串页假数据）。
+                    # 列表页不能加这道门——search.php 本来就靠重定向拿 SEO 基址，调用方
+                    # 要的就是那个最终地址；深链要的必须是「我要的那一页」。
+                    body, why = self._tab_body_for(url, body=html)
+                    if not body:
+                        self._log(f"   ⚠ 借标签取页不能交：{why}——这一家按取页失败记账，"
+                                  f"不拿别的页当这一页")
+                        return "", url
+                    return body, url
                 return html, (self._current_url() or url)
         except Exception:
             pass
         return "", url
 
     # ── 裸 HTTP 取页：站点偶发 connection reset（非封禁），退避重建连接池重试 ──
-    def _fetch(self, url, tries=4, allow_redirects=True, guarded=True):
+    def _fetch(self, url, tries=4, allow_redirects=True, guarded=True, deep=False):
+        """取一页。`deep=True`＝请求的是**某一家的深链**（商铺首页/contact.asp），不是通道
+        入口：它的被拒只记深链单笔账、不写 `_block_reason`、不把恢复探测钉在那条深链上
+        （理由与实测数据见 cdp_base._note_fetch_fail）。标签兜底照旧保留。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
@@ -180,19 +200,35 @@ class Qihuo11467Crawler(CdpSiteCrawler):
             # 降级模式下隔 20 页探一次 HTTP 是否已恢复，恢复就切回不占标签的快路
             self._fallback_pages += 1
             if self._fallback_pages % 20:
-                return self._fetch_via_tab(url)
+                return self._fetch_via_tab(url, deep=deep)
             if not self.probe_block():
                 self._browser_fallback = False
                 self._block_reason = ""
                 self._release_verify_tab()
                 self._log("  ✅ 顺企网 HTTP 链路已恢复，切回纯 HTTP 快路")
         last = ""
+        deep_refused = ""
         for i in range(max(1, tries)):
             try:
                 r = self._session.get(url, timeout=http_timeout(25), allow_redirects=allow_redirects)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url)
+                block = self.http_block_reason(r.status_code, r.text, url, deep=deep)
                 if block:
+                    if deep:
+                        # 这一家不给看：只记深链账，标签兜底照旧走（见下方 deep_refused）
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._fetch(url, tries=1,
+                                                allow_redirects=allow_redirects,
+                                                guarded=False, deep=deep))
+                        if got is not None:
+                            return got
+                        last = f"HTTP {r.status_code}（深链被拒，通道入口未受影响）"
+                        break
                     # 防采/限流插页：对着它重试只会加重风控，直接交看门狗处置
                     self._block_reason = block
                     last = f"HTTP {r.status_code}（防采插页）"
@@ -215,14 +251,20 @@ class Qihuo11467Crawler(CdpSiteCrawler):
             if self.handle_http_block(url):
                 self._block_reason = ""
                 return self._fetch(url, tries=tries, allow_redirects=allow_redirects,
-                                   guarded=False)
+                                   guarded=False, deep=deep)
             # 等不到 HTTP 恢复：标签能正常开本站就降级继续采，别让整轮卡死
             if self._tab_page_ok():
                 self._browser_fallback = True
                 self._fallback_pages = 0
                 self._log("  ⚠ 顺企网 HTTP 仍被拦，本轮临时改走浏览器标签续采")
-                return self._fetch_via_tab(url)
-        self._note_request_error(last)
+                return self._fetch_via_tab(url, deep=deep)
+        # 深链被拒：不为它整通道等放行（通道那本账只由入口页写，2026-11-15 马可波罗
+        # 就是被钉在深链上白等 765 秒），但本站 429 返的是 v.js 挑战、浏览器执行 JS 就能
+        # 过，所以这一页仍值得用标签再取一次。取不到就安静返回：账已在 `_note_deep_block`
+        # 记过，逐家再刷「请求失败」会把整轮日志淹没（口径见 cdp_base._note_fetch_fail）。
+        if deep_refused:
+            return self._fetch_via_tab(url, deep=True) if self._tab_page_ok() else ("", url)
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ 顺企网请求失败（{last}）：{url[:70]}")
         return "", url
 
@@ -325,7 +367,7 @@ class Qihuo11467Crawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -352,20 +394,23 @@ class Qihuo11467Crawler(CdpSiteCrawler):
         shop = f"https://{sub}.11467.com/"
         rec["公司网址"] = shop
         rec["详情URL"] = shop
-        contact_html, _ = self._fetch(shop + "contact.asp")
+        contact_html, _ = self._fetch(shop + "contact.asp", deep=True)
+        self._keep_detail(contact_html)   # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         if not contact_html:
             # contact.asp 偶发 404/失败：只取商铺首页，仍空才判失败
-            home_html, _ = self._fetch(shop)
+            home_html, _ = self._fetch(shop, deep=True)
             if not home_html:
                 rec["状态"] = "详情页导航失败"
                 return rec
+            self._keep_detail(home_html)
             data = self._parse_home(home_html, stub)
         else:
             data = self._parse_contact(contact_html)
             need_more = not (data.get("联系人") and (data.get("手机") or data.get("电话"))) \
                 or not data.get("主营产品")
             if need_more:
-                home_html, _ = self._fetch(shop, tries=2)
+                home_html, _ = self._fetch(shop, tries=2, deep=True)
+                self._keep_detail(home_html)
                 if home_html:
                     for k, v in self._parse_home(home_html, stub).items():
                         if v and not data.get(k):

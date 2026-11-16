@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cdp_base
+import text_shape
 from cdp_base import CdpSiteCrawler, BLOCK_TAG_IP, BLOCK_TAG_CAP
 from b2b168_crawler import B2b168Crawler
 from parallel_session import ParallelSession
@@ -987,12 +988,61 @@ _head_cut = sorted(p.name for p in Path(__file__).resolve().parent.glob("*_crawl
                    if "str(e).splitlines()[0][" in p.read_text(encoding="utf-8"))
 check("11p 没有一份站点采集器还在自己 str(e).splitlines()[0][:N]（截断只交给分型器）",
       not _head_cut, "、".join(_head_cut))
-# 整形了却不记账 = 界面照样问不到（本轮 gys 就是这样：日志说得出、账上是空的）
+# 整形了却不记账 = 界面照样问不到（本轮 gys 就是这样：日志说得出、账上是空的）。
+# 自第 ⑬ 节起，取页失败的分账统一走 `_note_fetch_fail(last, deep)`（它内部就是
+# `_note_request_error`，只是多问一句「这一笔是通道入口的还是某一家的深链」），
+# 所以两个名字都算记了账——只认真名就会把接入分账的站点判成漏记，门自己造假红。
 _unrecorded = sorted(p.name for p in Path(__file__).resolve().parent.glob("*_crawler.py")
                      if "_shape_request_error(" in p.read_text(encoding="utf-8")
-                     and "_note_request_error(" not in p.read_text(encoding="utf-8"))
+                     and "_note_request_error(" not in p.read_text(encoding="utf-8")
+                     and "_note_fetch_fail(" not in p.read_text(encoding="utf-8"))
 check("11q 整形过的站点一定也记了账（只打日志的失败在界面上等于没发生）",
       not _unrecorded, "、".join(_unrecorded))
+
+# 11r 「本工具自己已经定过性的句子」不许被分型器降级。由来（2026-11-15 实机 1688）：
+#     翻页层把 `_goto` 留下的原因又包了一层——`列表页导航失败（【被拦停】防采页没等到放行…）`，
+#     旧判据只有 `startswith("【")`，于是这句被洗成 `【未分型】｜列表页导航失败（【被拦停】…）`，
+#     收尾句、GUI 账目行与体检报告念的全是降级版（那一轮的 1688 明明写着「在等人过验证」，
+#     界面上却只剩「未分型」）。
+_SHAPE_NESTED = (
+    ("被拦停", "列表页导航失败（【被拦停】防采页没等到放行（等人过验证或等 IP 冷却））"),
+    ("页面未就绪", "导航失败（【页面未就绪】等不到 https://a.b/c 的完整正文）"),
+    ("连不上·无应答", "翻页失败（【连不上·无应答】b2b.11467.com:443｜Connection timed out）"),
+)
+for _tk, _tt in _SHAPE_NESTED:
+    _ts = _shape(_tt)
+    check(f"11r 括号里已有的类别【{_tk}】被提回开头，不再降级成未分型",
+          _ts.startswith(f"【{_tk}】") and "未分型" not in _ts, _ts)
+    check(f"11r- 标签与证据一个都不丢（提类别不许顺手删掉「哪一层没做成」）",
+          _tt.split("（")[0] in _ts and _tt.split("】", 1)[1].rstrip("）") in _ts, _ts)
+    check(f"11s 整过形之后再过一次分型器不变样（嵌套这一档也要幂等）",
+          _shape(_ts) == _ts, _shape(_ts))
+# 11t 反向对照：这三句**都不以【开头**——旧那条 `startswith("【")` 判据必然放过去，
+#     这正是「已经有结论却被洗成缺口」的入口。不钉这一条，11r 可能只是碰巧。
+check("11t 反向对照：旧判据只看句首，这三句在旧尺子下全掉进未分型",
+      all(not t.startswith("【") and "【" in t for _k, t in _SHAPE_NESTED))
+# 11u 词表之外的【】不许冒充类别：站点原文里的「访问过于频繁」不是本工具下的结论，
+#     认回来就是把「未分型」这个缺口清单悄悄抹掉（缺口看不见就再也补不上，见 11k）。
+_forged = _shape("导航失败（【访问过于频繁】站点让等一下）")
+check("11u 只认自己词表里的类别（站点文案的【】不许顶掉缺口标记）",
+      _forged.startswith("【未分型】") and "访问过于频繁" in _forged, _forged)
+# 11v 边界一致：熔断账/看门狗用的 `_DEAD_HOST_RE` 允许类别前有 12 个字加一个左括号，
+#     分型器用的是同一个边界。两处数字一旦分叉，就会出现「账上算网络、日志说未分型」的
+#     两套结论，所以按 DEAD_HOST_KINDS 全档逐一走一遍。
+_vgap = [k for k in cdp_base.DEAD_HOST_KINDS
+         if not cdp_base.request_error_is_connect(_shape(f"列表页导航失败（【{k}】x）"))]
+check("11v 连接类每一档从嵌套形状里都能提回来，且仍算网络账（与 _DEAD_HOST_RE 同一边界）",
+      not _vgap, "、".join(_vgap))
+# 11w 1688 那份镜像同答（同一条句子两边必须同一句话，见 11l/11m 的同一族纪律）
+check("11w 嵌套类别这一档两份镜像逐字同答",
+      all(_a16_shape(t) == _shape(t) for _k, t in _SHAPE_NESTED),
+      str([(_k, _a16_shape(t)) for _k, t in _SHAPE_NESTED if _a16_shape(t) != _shape(t)][:1]))
+# 11x 结构判据（同类查全）：两份文件的**词表与正则**也必须同字节。只比答案比不出
+#     「一边多登记了一个 token」——那种分叉要等下一句新文案才会暴露。
+check("11x 类别词表与嵌套正则两份同字节（新加一档只加一边＝有一个平台一直降级）",
+      _between(_src_cdp11, "_OWN_KIND_TOKENS = tuple(", "reverse=True)))")
+      == _between(_src_a1611, "_OWN_KIND_TOKENS = tuple(", "reverse=True)))"),
+      "_OWN_KIND_TOKENS/_NESTED_KIND_RE 两份不一致")
 print("⑪ 请求层失败分型：类别在头部， [:40]/[:60]/[:70] 三档截断之后仍读得出方向 ✓")
 
 # ══════════════════════════════════════════════════════════
@@ -1587,7 +1637,7 @@ check("12m- 反向对照：gi 引导那一处的原样写法做成夹具必须�
           'try:\n    r = s.get(url, timeout=http_timeout(25))\n'
           'except Exception as e:\n'
           '    self._note_request_error(e)\n'
-          '    self._log(f"  ⚠ 首页会话引导失败（{self._last_page_error[:70]}）")\n')
+          '    self._log(f"  ⚠ 首页会话引导失败（{short_reason(self._last_page_error, 70)}）")\n')
       and not _raw_exc_slice_problems(
           'x = str(rec["备注"])[:80]\nnote = str(cfg)[:40]\n'),
       "抓不到旧写法、或对与异常无关的截断误响，都会让这条门下一个人整个关掉")
@@ -1739,5 +1789,3241 @@ check("12n=- 反向对照：gi 探测里那句 `f\"{NET_FAIL_TAG}{type(e).__name
           if isinstance(x, _ast.Name) and x.id == "NET_FAIL_TAG"]))
 print("⑫ 主机级熔断 + 连接/读数超时拆分：连不上的主机不再吃整轮预算 ✓")
 
+# ══════════════════════════════════════════════════════════
+# ⑬ 深链被拒 ≠ 通道级拦停：某一家的 403 不该把整条通道钉死
+# ══════════════════════════════════════════════════════════
+# 由来（2026-11-15 第四轮实机，马可波罗整轮只出 4 家、白等 765 秒）：
+#   contact_us.html 大面积 403，而同机同期搜索页/产品页/商铺首页全 200。旧口径把
+#   这一句写进 `_block_reason`，并把 `_block_probe_url` 钉在那条永远不会放行的深链上：
+#   「恢复探测」探的就是它 → 永远不成功 → 整条通道按 IP 冷却干等，而数据一直在。
+#   这是 probe 这一族的第八个缺陷，只是这回藏在「深链 vs 入口」的粒度上。
+# 口径（唯一真源＝cdp_base.http_block_reason 的 deep 分支）：
+#   · 通道入口被拒＝本机出口的问题 → 写通道账、钉探测页、看门狗等放行；
+#   · 某一家的深链被拒＝这一家/这条路的问题 → 只进 stats()["deep_block"] 单笔账，
+#     不参与控制流；但深链的**连接类**死法照旧进通道账（连不上是主机的属性）。
+_DEEP_AWARE = {                      # 会产生深链请求的站：这些 helper 必须分两本账
+    "makepolo_crawler.py": ["_fetch"],
+    "b2b168_crawler.py": ["_fetch"],
+    "aipage_crawler.py": ["_fetch"],
+    "maimaib2b_crawler.py": ["_fetch"],
+    "qihuo11467_crawler.py": ["_fetch"],
+    "solarbe_crawler.py": ["_fetch"],
+    "gys_crawler.py": ["_http_get", "_fetch_raw"],
+}
+# 反向登记：这些站今天**不产生深链请求**，所以没有第二本账可分。理由写死在这儿——
+# 哪天给它们加了详情请求，13f 会响，逼着把分账一起接上，而不是悄悄退回旧口径。
+_DEEP_WAIVED = {
+    "gi_crawler.py": "详情是纯本地组装，一个请求都不发（站方对详情/内容页吃 IP 配额）",
+    "mic_crawler.py": "详情走共享 Chrome 标签，整条路径根本不写通道级 _block_reason",
+    "gongchang_crawler.py": "频控自成一套 _thin_shell_streak，同样不写通道级 _block_reason",
+}
+# 全站「会写通道级 `_block_reason`（非清空）」的函数总表。这张表由下面的判据从源码
+# **现算再逐字对照**：多一处（新增升级通道账的地方没登记）或少一处（那条路被删了却没
+# 更新这里）都会响。刻意做成全集，是为了让「下一个站长出同形缺陷」必须过一次人工登记。
+_BLOCK_WRITERS = {
+    "aipage_crawler.py": {"_fetch"}, "b2b168_crawler.py": {"_fetch"},
+    "gi_crawler.py": {"_fetch"}, "gys_crawler.py": {"_http_get", "_fetch_raw"},
+    "maimaib2b_crawler.py": {"_fetch"}, "makepolo_crawler.py": {"_fetch"},
+    "qihuo11467_crawler.py": {"_fetch"}, "solarbe_crawler.py": {"_fetch"},
+}
+
+
+def _fn_seg(src, name):
+    """某个函数的源码段（取第一个同名定义）。"""
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        if fn.name == name:
+            return _ast.get_source_segment(src, fn) or ""
+    return ""
+
+
+def _block_writers(src):
+    """这一份文件里把**非空**原因写进通道级 `_block_reason` 的函数名集合。"""
+    out = set()
+    for fn in (n for n in _ast.parse(src).body if isinstance(n, _ast.ClassDef)):
+        for m in (x for x in _ast.walk(fn) if isinstance(x, _ast.FunctionDef)):
+            for st in (s for s in _ast.walk(m) if isinstance(s, _ast.Assign)):
+                if not any(isinstance(t, _ast.Attribute) and t.attr == "_block_reason"
+                           for t in st.targets):
+                    continue
+                val = (ast_get(src, st.value) or "").strip()
+                if val and val not in ('""', "''") and not val.startswith("''"):
+                    out.add(m.name)
+    return out
+
+
+def ast_get(src, node):
+    return _ast.get_source_segment(src, node) or ""
+
+
+def _deep_wiring_problems(src, helpers):
+    """登记的取页 helper 有没有真的分两本账。返回问题清单（空＝合格）。"""
+    bad = []
+    for h in helpers:
+        seg = _fn_seg(src, h)
+        if not seg:
+            bad.append(f"{h}：登记表里的 helper 不在源码里（改名要同步这张表）")
+            continue
+        head = seg.split("\n", 1)[0]
+        if "deep" not in head:
+            bad.append(f"{h}：签名没有 deep 形参（{head.strip()[:60]}）")
+        for c in (n for n in _ast.walk(_ast.parse(seg)) if isinstance(n, _ast.Call)):
+            called = getattr(c.func, "attr", "") or getattr(c.func, "id", "")
+            if called == "http_block_reason" and not any(k.arg == "deep" for k in c.keywords):
+                bad.append(f"{h}：http_block_reason 没表态 deep=（默认按通道算）")
+            if called == "_note_request_error":
+                bad.append(f"{h}：直接记通道账，绕过了深链/通道的分账把手")
+        if "self._block_reason = " in seg and "_note_deep_block(" not in seg:
+            bad.append(f"{h}：会写通道账却没有深链那一本账")
+    return bad
+
+
+# 13a 基类：deep 只回原因，通道状态一件都不许动
+_c13 = B2b168Crawler()
+_c13.reset_run_state()
+_probe_before, _kind_before, _ra_before = (_c13._block_probe_url, _c13._block_kind,
+                                           _c13._retry_after)
+_deep_reason = _c13.http_block_reason(403, "x", "http://shop7.cn.makepolo.com/contact_us.html",
+                                      headers={"Retry-After": "60"}, deep=True)
+check("13a 深链 403：回原因，但不钉探测页、不分诊、不记 Retry-After、不写拦截原因",
+      "通道入口未受影响" in _deep_reason and _c13._block_probe_url == _probe_before
+      and _c13._block_kind == _kind_before and _c13._retry_after == _ra_before
+      and not _c13._block_reason,
+      f"reason={_deep_reason} probe={_c13._block_probe_url!r} kind={_c13._block_kind!r} "
+      f"retry={_c13._retry_after!r} block={_c13._block_reason!r}")
+_entry_reason = _c13.http_block_reason(403, "x", "http://caigou.makepolo.com/spc_new.php?a=1",
+                                       headers={"Retry-After": "60"})
+check("13a- 反向对照（同一函数同一状态码）：通道入口那一跳必须照旧钉探测页＋分诊＋Retry-After",
+      "HTTP 403" in _entry_reason and _c13._block_probe_url.endswith("spc_new.php?a=1")
+      and _c13._block_kind == "ip" and _c13._retry_after == 60,
+      f"probe={_c13._block_probe_url} kind={_c13._block_kind} retry={_c13._retry_after}")
+_shell_deep = _c13.http_block_reason(200, "访问过于频繁，请稍后再试", "http://a.b/x.html",
+                                     deep=True)
+_probe_after_shell_deep = _c13._block_probe_url      # 深链那一跳不许动上一条钉好的探测页
+_shell_entry = _c13.http_block_reason(200, "访问过于频繁，请稍后再试", "http://a.b/list.php")
+check("13a= 薄壳体积那一支同样分两档：深链只回原因，入口照旧钉页",
+      "深链" in _shell_deep and "通道入口未受影响" in _shell_deep
+      and _shell_entry == "防采插页（访问过于频繁）"
+      and _probe_after_shell_deep.endswith("spc_new.php?a=1")
+      and _c13._block_probe_url.endswith("list.php"),
+      f"deep={_shell_deep} entry={_shell_entry} "
+      f"probe_after_deep={_probe_after_shell_deep} probe_now={_c13._block_probe_url}")
+check("13a== 反向对照：deep 形参不在签名里（退回旧口径）时判据抓得住",
+      bool(_deep_wiring_problems(
+          'class A:\n    def _fetch(self, url):\n'
+          '        b = self.http_block_reason(403, "", url)\n'
+          '        if b:\n            self._block_reason = b\n'
+          '        self._note_request_error("HTTP 403")\n        return ""\n', ["_fetch"])))
+
+# 13b 深链账：首次打一行、复记只累加；stats 与收尾账目都读得到；reset 起账
+_lines = []
+_c13._log = lambda msg, *a: _lines.append(msg)
+_c13.reset_run_state()
+_c13._note_deep_block("http://shop7.cn.makepolo.com/contact_us.html", _deep_reason)
+_c13._note_deep_block("http://shop7.cn.makepolo.com/contact_us.html", _deep_reason)
+_s13 = _c13.stats()
+check("13b 同一主机复记只累加、日志只打第一次那一行（第 37 条重复日志不是账）",
+      len(_lines) == 1 and _s13["deep_block"].get("shop7.cn.makepolo.com", [0])[0] == 2,
+      f"行数={len(_lines)} 账={_s13['deep_block']}")
+check("13b- 深链账是机器可读的（界面/体检器问得出主机与原因）",
+      "deep_block" in _s13 and _deep_reason[:20] in str(_s13["deep_block"]), str(_s13["deep_block"]))
+# 13b2 日志的**聚合口径**：马可波罗每家商铺一个子域，按主机逐家开口会把一轮刷成
+# 52 行同一句话（2026-11-14 实机）——刷屏的账等于没账，人只会跳过。账仍按主机细分。
+_rs13 = _fn_seg(_HTTP_SRC["cdp_base.py"], "reset_run_state")
+_lines2 = []
+_c13._log = lambda msg, *a: _lines2.append(msg)
+_c13.reset_run_state()
+for _u13 in ("http://sgjjskjc.cn.makepolo.com/contact_us.html",
+             "http://gulnag.cn.makepolo.com/contact_us.html",
+             "http://shop7.cn.makepolo.com/contact_us.html",
+             "http://a.aipage.net/detail/x.html"):
+    _c13._note_deep_block(_u13, _deep_reason)
+_s13b = _c13.stats()
+check("13b2 同主域三家商铺合成一行、别的主域各开一行：账按每家都记到（4 个主机）",
+      len(_lines2) == 2 and len(_s13b["deep_block"]) == 4
+      and {"sgjjskjc.cn.makepolo.com", "gulnag.cn.makepolo.com"} <= set(_s13b["deep_block"])
+      and "cn.makepolo.com" in _lines2[0] and "a.aipage.net" in _lines2[1],
+      f"行数={len(_lines2)} 行={_lines2} 账={_s13b['deep_block']}")
+check("13b2- 聚合键＝最后三段（≈主域）：商铺子域并到 cn.makepolo.com，"
+      "三段主机原样保留，空主机不炸（键算错会把别的主域一起吞掉）",
+      _c13._deep_log_key("sgjjskjc.cn.makepolo.com") == "cn.makepolo.com"
+      and _c13._deep_log_key("a.aipage.net") == "a.aipage.net"
+      and _c13._deep_log_key("www.11467.com") == "www.11467.com"
+      and _c13._deep_log_key("") == "",
+      f"{_c13._deep_log_key('sgjjskjc.cn.makepolo.com')} "
+      f"{_c13._deep_log_key('a.aipage.net')}")
+_lines3 = []
+_c13._log = lambda msg, *a: _lines3.append(msg)
+_c13.reset_run_state()
+_c13._note_deep_block("http://newshop.cn.makepolo.com/contact_us.html", _deep_reason)
+check("13b2= reset 之后同主域必须重新开口（跨轮静音＝下一轮真不通没人知道），"
+      "聚合凭据与账一起清零",
+      len(_lines3) == 1 and _c13._deep_logged == {"cn.makepolo.com"}
+      and list(_c13._deep_blocks) == ["newshop.cn.makepolo.com"],
+      f"行数={len(_lines3)} 凭据={_c13._deep_logged} 账={list(_c13._deep_blocks)}")
+check("13b2== 反向对照：聚合凭据不在 reset_run_state 里清零的话，第二轮就永远静音",
+      "self._deep_blocks = {}" in _rs13 and "_deep_logged" in _rs13,
+      "reset_run_state 没清 _deep_logged")
+_c13._note_request_error(_deep_reason)          # 收尾那行的深链段与 page_fail 无关，先清
+_c13._last_page_error = ""
+_c13.reset_run_state()
+check("13b= reset_run_state 把深链账与通道三件（探测页/分诊/Retry-After）一起清零",
+      _c13.stats()["deep_block"] == {} and _c13._block_probe_url == ""
+      and _c13._block_kind == "" and _c13._retry_after == 0
+      and not _c13._block_reason,
+      f"probe={_c13._block_probe_url!r} kind={_c13._block_kind!r} retry={_c13._retry_after}")
+_crawl_src13 = "\n".join(_ast.get_source_segment(_HTTP_SRC["cdp_base.py"], n) or ""
+                         for n in _ast.walk(_ast.parse(_HTTP_SRC["cdp_base.py"]))
+                         if isinstance(n, _ast.FunctionDef) and n.name == "crawl")
+check("13b== 收尾账目格把深链被拒念出来（只记 stats 不渲染＝用户仍然看不见）",
+      's.get("deep_block")' in _crawl_src13 and "深链被拒" in _crawl_src13,
+      "收尾那行找不到深链段")
+
+# 13c 分账把手：四档各有归属（深链×状态码 / 深链×连接 / 入口×任意 / 深链×无异常）
+for _nm, _deep, _txt, _want in (
+        ("深链·状态码级被拒", True, "HTTP 403（深链被拒，通道入口未受影响）", False),
+        ("深链·连接类死法", True, "【连不上·无应答】b2b.11467.com:443｜Connection timed out", True),
+        ("入口·状态码级被拒", False, "HTTP 502 站点返回 502", True),
+        ("深链·没有异常可记", True, "", False)):
+    _c13.reset_run_state()
+    _got = _c13._note_fetch_fail(_txt, _deep)
+    _st = _c13.stats()
+    check(f"13c {_nm}：{'该' if _want else '不该'}进通道取页账"
+          f"（{'连不上是主机属性，照记' if _want else '被拒是那一家/那条路的属性'}）",
+          _got is _want and bool(_st["last_page_error"]) is _want,
+          f"返回={_got} last_page_error={_st['last_page_error']!r}")
+_c13.reset_run_state()
+_c13._note_fetch_fail("【连不上·无应答】shop9.cn.makepolo.com:80｜Connection timed out", True)
+check("13c- 深链的连接类死法同样累计熔断连击（否则只在大站深链上暴露的断路永远拉黑不了）",
+      _c13._dead_strikes.get("shop9.cn.makepolo.com") == 1, str(_c13._dead_strikes))
+
+# 13d 结构判据：每张登记表的 helper 都真分了账（正对照＝仓库现状，反对照＝旧写法）
+_bad13 = {}
+for _f13, _hs13 in _DEEP_AWARE.items():
+    _p = _bad13.setdefault(_f13, [])
+    _p.extend(_deep_wiring_problems(_HTTP_SRC[_f13], _hs13))
+    if "deep=True" not in _fn_seg(_HTTP_SRC[_f13], "crawl_detail"):
+        _p.append("crawl_detail 里没有一处 deep=True（deep 形参成了空转的旋钮）")
+_bad13 = {k: v for k, v in _bad13.items() if v}
+check(f"13d {len(_DEEP_AWARE)} 站取页层都按「深链/入口」分账（{sum(len(v) for v in _DEEP_AWARE.values())} 个 helper）",
+      not _bad13, str(_bad13))
+check("13d- 反向对照：把 deep 参数删掉 / 不表态 deep= / 绕过把手，三种旧写法都要响",
+      bool(_deep_wiring_problems('class A:\n    def _fetch(self, url, deep=False):\n'
+                                 '        b = self.http_block_reason(403, "", url, deep=deep)\n'
+                                 '        self._note_request_error("x")\n        return ""\n',
+                                 ["_fetch"])
+      and _deep_wiring_problems('class A:\n    def _fetch(self, url):\n'
+                                '        b = self.http_block_reason(403, "", url, deep=False)\n'
+                                '        self._note_fetch_fail("x", deep)\n        return ""\n',
+                                ["_fetch"])
+      and _deep_wiring_problems('class A:\n    def _fetch(self, url, deep=False):\n'
+                                '        self._block_reason = "x"\n        return ""\n',
+                                ["_fetch"])))
+
+# 13e 总表逐字对拍：谁会把被拒升级成通道账，必须当场登记（同类查全的门）
+_now13 = {p.name: _block_writers(s) for p, s in
+          ((HERE / n, src) for n, src in _HTTP_SRC.items() if n.endswith("_crawler.py"))
+          if _block_writers(s)}
+check("13e 全站『升级通道账』的函数总表与登记表完全一致（新增一处必须先来过目）",
+      _now13 == _BLOCK_WRITERS, f"现算={_now13}")
+check("13e- 反向对照：一个把深链 403 写进通道账的新函数会被现算抓到",
+      _block_writers('class A:\n    def _fetch_detail(self, u):\n'
+                     '        b = self.http_block_reason(403, "", u)\n'
+                     '        self._block_reason = b\n        return ""\n') == {"_fetch_detail"})
+
+# 13f 豁免三站：理由必须仍然成立（不成立就要迁进登记表，而不是把门关掉）
+_waive_bad = []
+for _f13, _why in _DEEP_WAIVED.items():
+    _src13 = _HTTP_SRC[_f13]
+    _det = _fn_seg(_src13, "crawl_detail")
+    if _f13 == "gi_crawler.py":
+        if "self._fetch(" in _det:
+            _waive_bad.append("gi：详情开始发请求了，豁免理由失效 → 必须接入 deep 分账")
+        _ov = _fn_seg(_src13, "http_block_reason")
+        if "deep=False" not in _ov.split("\n", 1)[0] or "deep=deep" not in _ov:
+            _waive_bad.append("gi：http_block_reason 覆写没收 deep 或没透传给基类（基类加参数就失联）")
+    elif _block_writers(_src13):
+        _waive_bad.append(f"{_f13}：出现了写通道账的函数，豁免理由（{_why}）已不成立")
+check("13f 豁免三站的理由逐条仍然成立（豁免表不是永久免检）", not _waive_bad, str(_waive_bad))
+
+# 13g 通路取证固化：马可波罗那三条实测结论不许在代码里悄悄翻案
+_mpsrc = _HTTP_SRC["makepolo_crawler.py"]
+check("13g 产品页走 http（https 那张证书是 WAF 默认证书，hostname 对不上→每次都 SSLError）",
+      'PRODUCT_URL = "http://china.makepolo.com' in _mpsrc and "volcwaf" in _mpsrc,
+      "PRODUCT_URL 或取证注释不见了")
+check("13g- 联系页被拒时有第二条腿（商铺首页 12/12 全 200 是实测样本，不是猜的）",
+      "SHOP_HOME_URL = " in _mpsrc and "SHOP_HOME_URL.format(slug=slug)" in _mpsrc
+      and "12/12" in _mpsrc, "第二条腿或它的实机样本量被删了")
+check("13g= 图片码那条路的死因不再被吞（停用日志必须带上最后一次为什么）",
+      "img_last" in _mpsrc and "最后一次：%s" in _mpsrc
+      and "except Exception:\n                body = b\"\"" not in _mpsrc,
+      "码图的 except 又变回吞原因了：停用图片码时用户只会看到「不放号码图」")
+# 13h 体检器的判据盲区：有产出那一侧过去只看「>0」，4 家与 62 家同样打 ✅
+# ——2026-11-15 第四轮马可波罗整轮 4 家、白等 765 秒，报告当时给的就是 ✅
+#   「4 家 / 命中 4 / 差分与来源戳 OK」。深链账与同轮参照这两格就是为了堵这个洞。
+_mk13 = {"page_fail": 0, "listed": 30, "failed": 0,
+         "deep_block": {"cn.makepolo.com": [37, "HTTP 403（深链被拒，通道入口未受影响）"]}}
+_h13, _v13 = _live._attrib(_mk13, 4, False, "", diff="unknown", peer=40)
+check("13h 深链账 + 产出显著低于同轮参照：必须红，且把证据（哪台主机、多少次）带进结论",
+      _h13 == "❌" and "深链被拒" in _v13 and "cn.makepolo.com" in _v13 and "37" in _v13,
+      _v13)
+_h13b, _v13b = _live._attrib({"page_fail": 0, "listed": 40, "failed": 30}, 5, False, "",
+                             diff="ok", peer=40)
+check("13h- 详情失败造成的低产出同样要红（少了 35 家不是平台没货，是落地这条腿坏了）",
+      _h13b == "❌" and "详情失败" in _v13b, _v13b)
+_h13c, _v13c = _live._attrib({"page_fail": 0, "listed": 12}, 3, False, "", diff="ok", peer=40)
+check("13h-- 账上没证据的低产出只给 ⚠（把「平台本来货少」也判成缺陷，下一轮就没人信这份报告）",
+      _h13c == "⚠" and "无异常证据" in _v13c, _v13c)
+_h13d, _v13d = _live._attrib(_mk13, 4, False, "", imp=4)
+check("13h--- 反向对照（旧口径本身）：不传差分状态与参照时旧判据确实放行——"
+      "所以「产出>0 即合格」这句话必须由夹具钉死不许复活"
+      "（这一条必须显式传 imp：复算不成时新判档会拦下来，那就不是在验旧口径而是在验新档）",
+      _h13d == "", f"{_h13d} {_v13d}")
+
+# 13i 差分三态：跑不成 ≠ 跑通过
+_d_ok = _live._diff_judge({"泵": {"A", "B", "C"}, "生物质锅炉": {"D", "E", "F"}}, ["泵", "生物质锅炉"])[0]
+_d_sus = _live._diff_judge({"泵": {"A", "B", "C"}, "生物质锅炉": {"A", "B", "D"}}, ["泵", "生物质锅炉"])[0]
+_d_unk = _live._diff_judge({"泵": {"A", "B"}}, ["泵", "生物质锅炉"])[0]
+check("13i 差分三态分得开：显著不同=ok、高度重合=suspect、第二词没出货=unknown（不是 ok）",
+      _d_ok == "ok" and _d_sus == "suspect" and _d_unk == "unknown",
+      f"{_d_ok}/{_d_sus}/{_d_unk}")
+_sus13 = _live._attrib({"page_fail": 0}, 60, False, "", diff="suspect", peer=60)
+check("13i- 假命中（suspect）在 _attrib 里必须比产出高低优先判红，且结论说「不能用」",
+      _sus13[0] == "❌" and "不能用" in _sus13[1], str(_sus13))
+check("13i== 旧的假安心文案「差分与来源戳 OK」不许复活（那行字在差分没跑成时是谎）",
+      "差分与来源戳 OK" not in _LIVE_SRC and "差分 OK" in _LIVE_SRC)
+
+# 13j 同轮参照的算法性质：中位数、剔 0、样本不足不装懂
+check("13j 参照取中位数不是取最大值（某站恰好爆量会把基线抬到谁都过不了）",
+      _live._peer_baseline([4, 22, 33, 40, 47, 62, 74]) == 40, str(_live._peer_baseline([4, 22, 33, 40, 47, 62, 74])))
+check("13j- 样本不足两站时返回 0（没有参照就不判产出高低，比硬造一个基线诚实）",
+      _live._peer_baseline([47]) == 0 and _live._peer_baseline([]) == 0
+      and _live._peer_baseline([0, 0]) == 0)
+
+
+def _rep(slug, n, blocked=False, waiting="", err="", imp=None, imp_err=""):
+    """按 main 里 reports 元组的字段顺序造一条假读数（下标 0/2/5/7/9/11 被 _peer_for 读到）。
+    imp=None＝这一路没复算入库口径（真读数里只有「没有清洗映射」或复算异常才会是 None），
+    此时参照退回原始家数——与 _peer_for 的口径一致。imp_err 是复算不成的原因（第 15 格）。"""
+    return (slug, slug, n, n, 0, blocked, "", {"waiting": waiting}, "ok", err, "", imp, [], "",
+            imp_err)
+
+
+check("13k 参照剔掉自己/拦停/等人/读数失败四种（每种留下的 0 家都会把满轮正常的站判成异常）",
+      _live._peer_for([_rep("a", 4), _rep("b", 60), _rep("c", 70), _rep("d", 80)], "a") == 70
+      and _live._peer_for([_rep("a", 4), _rep("b", 0, blocked=True), _rep("c", 70),
+                           _rep("d", 80)], "a") == 75
+      and _live._peer_for([_rep("a", 4), _rep("b", 0, waiting="登录"), _rep("c", 70),
+                           _rep("d", 80)], "a") == 75
+      and _live._peer_for([_rep("a", 4), _rep("b", 0, err="boom"), _rep("c", 70),
+                           _rep("d", 80)], "a") == 75,
+      f"含自己={_live._peer_for([_rep('a', 4), _rep('b', 60), _rep('c', 70), _rep('d', 80)], 'a')}")
+check("13k- 反向对照：把「自己」留在参照里（旧写法）基线就会被异常低的这一路亲手拉低",
+      _live._peer_baseline([4, 60, 70, 80]) != _live._peer_for(
+          [_rep("a", 4), _rep("b", 60), _rep("c", 70), _rep("d", 80)], "a"))
+# 13k= 参照基数换成「可入库数」：抓到 60 家、能入库 3 家那种路，不许再拿 60 去抬基线，
+#      也不许因为它原始数够高就躲过产出异常判定（马可波罗 51 家/可入库 2 家的真实形状）。
+_p16peer = _live._peer_for([_rep("a", 4), _rep("b", 60, imp=3), _rep("c", 70, imp=4),
+                            _rep("d", 80, imp=5)], "a")
+check("13k= 同轮参照按可入库数算，不是按抓到的家数算",
+      _p16peer == 4 and _live._peer_baseline([60, 70, 80]) == 70,
+      f"imp 基数={_p16peer}｜原始基数={_live._peer_baseline([60, 70, 80])}")
+
+# 13l 报告渲染：深链账要单独成行、差分状态要跟着返回值走，读数只问 stats
+_f13 = _fn_seg(_LIVE_SRC, "_fmt_site")
+check("13l 体检报告把深链被拒单独念成一行（自第 ㉓ 节起这一行只由 `_host_reason_line` 写出），"
+      "并把差分状态随元组返回（判定不回头猜文案）",
+      "deep_block" in _f13 and '_host_reason_line("深链被拒"' in _f13
+      and 'f"  {title}: "' in _LIVE_SRC
+      and _f13.rstrip().endswith("imp_n, zero, _legs, imp_err)"),
+      _f13.rstrip()[-90:])
+# 反向对照不在这里重抄一份：「把那一行改回就地 [:46]」那一形由 23h/23j- 直接拿真把手跑，
+# 这里再写一条「替换后字符串不在原文里」式的永真断言，只会多一条骗过所有人的绿。
+check("13l- BLOCK_WORDS 认得「深链被拒」这一行（这一族的原因可能只有「访问过于频繁」而没有"
+      " 403，被关键字表筛掉就等于把唯一能定性的证据扔了）",
+      bool(re.search(r"BLOCK_WORDS\s*=.*深链被拒", _LIVE_SRC, re.S)))
+check("13l-- main 的 ✅ 那行只念真判过的格子（没有参照时明说「未判」，不许写「相当」）",
+      "同轮参照不足" in _fn_seg(_LIVE_SRC, "main")
+      and "产出与同轮参照" in _fn_seg(_LIVE_SRC, "main"))
+print("⑬ 深链被拒 vs 通道级拦停分账：一家商铺的 403 不再钉死整条通道 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑭ 逐词相关性砍单账：某一词零产出时，「本机闸门砍的」与「平台真没货」必须分得开
+# 由来（2026-11-15 第五轮实机，世界工厂网关键词「橡胶手套」）：站方回了 7 条列表条目，
+# 7 条全被详情复核判「类目不符」，而日志写的是「⚠ 「橡胶手套」无新增产出（被拦/链路未通/
+# 本页无数据）」，体检报告跟着写「差分没跑成，建议换词复跑」——三条处方没有一条指向真正
+# 该动的地方（相关性口径/同族类目桥）。这是「归因分档」这一族的第五个缺陷，也是唯一一个
+# 出在有产出那一侧的：产出总量正常（39 家），坏的是**某一个词被整词砍光**这件事看不见。
+# 口径：两本按词账（kw_early＝列表页早过滤，kw_filtered＝详情页复核）由唯一把手写，
+#      收尾归因、stats 读数、体检器三处都只问这两本账，不许再猜日志文案。
+# ════════════════════════════════════════════════════════════════════════
+_SRC14 = dict(_HTTP_SRC)
+_SRC14["ali1688_crawler.py"] = (HERE.parent / "ali1688_build" / "ali1688_crawler.py").read_text(
+    encoding="utf-8")
+# 1688 不在 b2bcollect_build 下，但同属交付链，同类查全必须把它算进扫描集
+_SRC14["site_adapters.py"] = _HTTP_SRC["site_adapters.py"]
+
+
+def _aug_sites(src):
+    """源码对 `_early_skipped`/`_filtered_count` 做 `+=` 的函数名（把手本体走登记表放行）。"""
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        for st in (s for s in _ast.walk(fn) if isinstance(s, _ast.AugAssign)):
+            t = st.target
+            if isinstance(t, _ast.Attribute) and t.attr in ("_early_skipped", "_filtered_count"):
+                out.append(f"{fn.name}:{t.attr}")
+    return out
+
+
+_crawl_src14 = "\n".join(
+    _ast.get_source_segment(_SRC14["cdp_base.py"], n) or ""
+    for n in _ast.walk(_ast.parse(_SRC14["cdp_base.py"]))
+    if isinstance(n, _ast.FunctionDef) and n.name == "crawl")
+
+
+_ALLOWED_AUG = {"_note_early_skip:_early_skipped", "_note_detail_filter:_filtered_count"}
+_bad14 = {n: sorted(set(_aug_sites(s)) - _ALLOWED_AUG) for n, s in _SRC14.items()}
+_bad14 = {k: v for k, v in _bad14.items() if v}
+check(f"14c 相关性计数只许由把手写（扫了 {len(_SRC14)} 份交付链源码，裸 += 一律算未登记）",
+      not _bad14, str(_bad14))
+# 反向对照要按**同一把尺子**量：把手本体里 += 是合法的（那本来就是唯一记账口），
+# 调用点里 += 才是未登记。所以判据必须是「减掉登记表还剩不剩」，不是「扫不扫得到」。
+check("14c- 反向对照：调用点裸 += 当场响；同样一行搬进把手本体就合法",
+      set(_aug_sites('class A:\n    def _fetch(self, kw):\n        self._early_skipped += 1\n'
+                     '        return 1\n')) - _ALLOWED_AUG
+      and not set(_aug_sites('class A:\n    def _note_early_skip(self, kw):\n'
+                             '        self._early_skipped += 1\n        return 1\n')) - _ALLOWED_AUG)
+
+# 14a 把手行为：两本账各自按词累加，全局数同步，reset 一起清零
+_c14 = B2b168Crawler()
+_c14.reset_run_state()
+_c14._note_early_skip("橡胶手套")
+_c14._note_early_skip("橡胶手套")
+_c14._note_detail_filter("泵")
+_s14 = _c14.stats()
+check("14a 早过滤与复核分两本按词账，全局数同步（只有全局数就分不开「砍的」与「没货」）",
+      _s14["kw_early"] == {"橡胶手套": 2} and _s14["kw_filtered"] == {"泵": 1}
+      and _s14["early"] == 2 and _s14["filtered"] == 1,
+      f"early={_s14['kw_early']} filtered={_s14['kw_filtered']}")
+_c14.reset_run_state()
+check("14a- reset_run_state 把两本按词账一起清零（跨轮留着＝上一轮的判定冒充本轮归因）",
+      _c14.stats()["kw_early"] == {} and _c14.stats()["kw_filtered"] == {},
+      str(_c14.stats()["kw_early"]))
+
+# 14b 归因把手：三种账各说什么（这一句是收尾日志里唯一决定处方方向的话）
+check("14b 账上没有砍单时返回空串：调用方必须退回旧那句，不许编归因",
+      _c14._kw_zero_reason("没跑过的词") == "", repr(_c14._kw_zero_reason("没跑过的词")))
+_c14._note_early_skip("橡胶手套")
+_c14._note_early_skip("橡胶手套")
+_c14._note_detail_filter("橡胶手套")
+_r14 = _c14._kw_zero_reason("橡胶手套")
+check("14b- 有砍单时说清阶段与家数，并明说「不是平台没数据」＋该改判定口径",
+      "列表页早过滤砍 2 家" in _r14 and "详情页复核砍 1 家" in _r14
+      and "不是平台没数据" in _r14 and "相关性口径" in _r14, _r14)
+check("14b== 反向对照：旧那三档里根本没有「相关性」这一档（本轮要堵的就是这个洞）",
+      "相关性" not in "被拦/链路未通/本页无数据"
+      and 'self._kw_zero_reason(kw)' in _crawl_src14
+      and "无新增产出（被拦/链路未通/本页无数据）" in _crawl_src14,
+      "crawl 收尾分支没接把手，或旧那句被删掉了")
+
+# 14d/14e 体检器侧：diff=unknown 时有没有砍单账决定 ❌/⚠ 与处方方向
+_k14 = _live._kw_starve({"kw_filtered": {"橡胶手套": 7}}, "橡胶手套")
+check("14d 体检器读得到逐词砍单账（与 cdp_base 同一套键名，十路一把尺子）",
+      _k14 == "详情页复核砍 7 家" and _live._kw_starve({}, "橡胶手套") == "", repr(_k14))
+_m14, _v14 = _live._attrib({"listed": 47, "kw_filtered": {"橡胶手套": 7}}, 39, False, "",
+                           diff="unknown", peer=60, killed="「橡胶手套」" + _k14)
+check("14d- 差分没跑成＋账上有砍单：必须红，处方改成「判定口径」，不许再劝人换词复跑",
+      _m14 == "❌" and "相关性闸门砍掉" in _v14 and "判定口径" in _v14
+      and "换词复跑" not in _v14, f"{_m14} {_v14}")
+_m14b, _v14b = _live._attrib({"listed": 40}, 39, False, "", diff="unknown", peer=60)
+check("14d== 反向对照：账上没有砍单时旧那句 ⚠ 必须原样保留（新归因不许把旧档吞掉）",
+      _m14b == "⚠" and "换词复跑" in _v14b, f"{_m14b} {_v14b}")
+_m14c, _v14c = _live._attrib({"listed": 40, "kw_early": {"橡胶手套": 9}}, 39, False, "",
+                             diff="unknown", peer=60, killed="「橡胶手套」列表页早过滤砍 9 家")
+check("14e 早过滤砍光这一档同样要说出来（这一类连详情页都没进，取证只能来自 kw_early）",
+      _m14c == "❌" and "早过滤" in _v14c, f"{_m14c} {_v14c}")
+_m14d, _v14d = _live._attrib({"listed": 40, "kw_filtered": {"数控机床": 60}}, 4, False, "",
+                             diff="ok", peer=60, killed="「数控机床」详情页复核砍 60 家")
+check("14e- 低产出那一档也把砍单当决定性证据（旧版只认深链/取页/详情失败三种）",
+      _m14d == "❌" and "相关性砍单" in _v14d and "闸门砍的" in _v14d, f"{_m14d} {_v14d}")
+
+# 14f 深链账的渲染聚合（马可波罗每家商铺一个子域：按主机念＝3000 字一坨）
+_d14 = _live._deep_group({f"shop{i}.cn.makepolo.com": [1, "HTTP 403（这一家的这条资源不给看）"]
+                          for i in range(50)})
+check("14f 深链账按主域聚合渲染：50 家商铺并成一句话，条数照加",
+      list(_d14) == ["cn.makepolo.com"] and _d14["cn.makepolo.com"][0] == 50, str(_d14))
+check("14f- 聚合键必须复用 cdp_base 那一份（两处各算一遍，口径早晚会自己漂移）",
+      "_deep_log_key" in _fn_seg(_LIVE_SRC, "_deep_group"))
+check("14f== 反向对照（旧渲染）：按主机逐家拼接的那句 3000 字文案不许复活在体检器里",
+      "sorted(_deep.items())" not in _fn_seg(_LIVE_SRC, "_fmt_site")
+      and "_deep_group(" in _fn_seg(_LIVE_SRC, "_fmt_site"))
+
+# 14g 同族类目桥：这一词被砍光的根因修复（实机取证写进表注释，泛词一律不收）
+import keyword_expander as _ke14                                    # noqa: E402
+_pe14 = _ke14.peer_words("橡胶手套")
+check("14g 「手套」族桥接上：乳胶/防护/劳保这类类目层写法算同族（实机砍掉的湖南奥龙就是这类）",
+      "个体防护" in _pe14 and "乳胶手套" in _pe14 and "劳保用品" in _pe14, str(_pe14))
+_c14.relevance_guard = True
+check("14g- 桥生效的正对照：主营只写行业大类的乳胶制品厂判为相关",
+      _c14.is_relevant("橡胶手套", "湖南省奥龙时代乳胶制品有限公司 工业防护,防护装备,个体防护"))
+check("14g== 反向对照（泛词不许放宽）：同一批里「地桩,餐车,滚筒刷」「包装膜胶带」仍判不相关——"
+      "桥表只收类目层词，收泛词等于把垃圾商家放进来",
+      not _c14.is_relevant("橡胶手套", "阳东县江华实业有限公司 地桩,新能源智能餐车,滚筒刷")
+      and not _c14.is_relevant("橡胶手套", "河南省蓝天医疗器械有限公司 棉花包装膜胶带,不干胶原材料"))
+check("14g=== 机床族桥不许被这次新增挤掉（老证据必须还在表里）",
+      "加工中心" in _ke14.peer_words("数控机床") and "电火花" in _ke14.peer_words("机床"))
+
+# 14h 1688 那一路（不在 b2bcollect_build 下，但同属交付链）必须同口径
+_a14 = _SRC14["ali1688_crawler.py"]
+check("14h 1688 同样接上两本按词账（十路一体：缺一格就把「砍光这一词」报成「1688 没货」）",
+      "_note_early_skip" in _a14 and "_note_detail_filter" in _a14
+      and "self.kw_early[kw]" in _a14 and "self.kw_filtered[kw]" in _a14,
+      "1688 侧把手缺失")
+check("14h- 适配器的 stats() 必须把两把键透出去（不给＝体检器对 1688 永远读不到这一格）",
+      "kw_filtered" in _1688_stats_src and "kw_early" in _1688_stats_src,
+      "Ali1688Site.stats() 没透两本按词账")
+# 把手调用点数量本身就是回归线：早过滤每站一处（9 站＋1688 两处＝11 个调用点），
+# 详情复核只在两个基类里做（cdp_base 一处＋1688 两处）。
+# 而且从本轮起**调用点必须把公司名传进去**：只有一本计数时，那句处方（「该复核判定口径」）
+# 执行不了——复核的人手上没名单（2026-11-16 第十轮实机：三个 ❌ 全站都只说「该复核」）。
+_CALL14_EARLY = re.compile(r"_note_early_skip\(kw,\s*[^\s)]")
+_CALL14_DETAIL = re.compile(r"_note_detail_filter\(kw,\s*[^\s)]")
+_early_calls = {n: len(_CALL14_EARLY.findall(s)) for n, s in _SRC14.items()}
+_detail_calls = {n: len(_CALL14_DETAIL.findall(s)) for n, s in _SRC14.items()}
+check("14h== 每一路交付链源码都要有把手，且调用点必须传公司名（只给计数不给名单的处方落不了地）",
+      sum(_early_calls.values()) >= 11 and sum(_detail_calls.values()) >= 3,
+      f"early={sum(_early_calls.values())} detail={sum(_detail_calls.values())} "
+      f"{({k: v for k, v in _early_calls.items() if v})}")
+# 反向对照：把某一站的传名改成裸调用，回归线必须当场把它名出来（不然这一条只是今天对了）
+_bare14 = _SRC14["gys_crawler.py"].replace(
+    "self._note_early_skip(kw, e[\"公司名称\"])", "self._note_early_skip(kw)")
+check("14h=== 反向对照：同一把尺子量「裸调用」必须归 0（不然下一站漏传名字没人拦）",
+      _bare14 != _SRC14["gys_crawler.py"] and not _CALL14_EARLY.search(_bare14),
+      "克隆没生效或判据读不到裸调用")
+
+print("⑭ 逐词相关性砍单账：某一词被闸门砍光不再被说成「平台没货」 ✓")
+
+# ═══════════════════════════════════════════════════════════════════════
+# ⑮ 判定规则版本化：改了相关性口径，种子库里旧的「类目不符」盖章必须作废重判
+# 由来（2026-11-15 补「手套」族桥后自查）：第 ⑭ 节把归因修准了，但**修好的口径对
+# 已经被误杀入库的那批家一个字都不生效**——早过滤砍掉时按「关键词#主体」写进种子库，
+# 下一轮命中即跳过，连判定都不再走一次。增量缓存的是**结论**不是**事实**，规则升级
+# 不让旧结论作废，用户就只能手动清库（等于把修复作废）。
+# 口径：判定规则指纹（桥表+规则函数源码）写进条目 rv；rv 不配的「类目不符」不再锁定；
+# 单轮重判限量（补旧账不许挤掉本轮新货）；改判相关并入库时旧章当场撕掉（否则永远收敛不了）。
+# ═══════════════════════════════════════════════════════════════════════
+_c15 = B2b168Crawler()
+_rev15 = _c15._relevance_revision()
+check("15a 规则指纹取得到、且同一段代码连取两次同值（每轮算出不同版本号＝种子库天天被重洗）",
+      _rev15 != "rev0" and len(_rev15) == 12 and _c15._relevance_revision() == _rev15,
+      repr(_rev15))
+_ke15 = sys.modules["keyword_expander"]
+_ke15.PEER_CATEGORY["__探针族__"] = ("甲类", "乙类")
+type(_c15)._REL_REV = None
+_rev15b = _c15._relevance_revision()
+del _ke15.PEER_CATEGORY["__探针族__"]
+type(_c15)._REL_REV = None
+check("15b 桥表加一族（本轮就干了这件事）＝指纹必变；撤掉探针后指纹回到原值（不是每次取都变）",
+      _rev15b != _rev15 and _c15._relevance_revision() == _rev15,
+      f"{_rev15} vs {_rev15b}")
+
+_c15._seen_store = {
+    "b2b168:橡胶手套#旧版无rv": {"at": "2026-11-14 10:00:00", "st": "类目不符(已过滤)"},
+    "b2b168:泵#旧规则判的": {"at": "2026-11-14 11:00:00", "st": "类目不符(已过滤)", "rv": "zzzzzzzzzzzz"},
+    "b2b168:泵#新规则判的": {"at": "2026-11-14 12:00:00", "st": "类目不符(已过滤)", "rv": _rev15},
+    "b2b168:采过且齐了": {"at": "2026-11-14 13:00:00", "st": "成功", "ct": 1},
+}
+_lk15 = _c15._locked_keys()
+check("15c 陈旧「类目不符」不再命中即跳过（旧版没写 rv 也算陈旧），新判定与正常记录照旧锁",
+      _lk15 == {"b2b168:泵#新规则判的", "b2b168:采过且齐了"}, str(sorted(_lk15)))
+check("15c- 陈旧名单不算「欠补联系人」（两本账各说各的，混了界面的待办数就是假的）",
+      _c15._seen_store_pending() == 0, str(_c15._seen_store_pending()))
+
+
+def _locked_keys_old(store):
+    """旧口径原样请回来：种子库只要进过就永久免检（陈旧判定也锁着）。"""
+    return {k for k, v in store.items() if CdpSiteCrawler._entry_locked(v)}
+
+
+check("15c== 反向对照：旧 _locked_keys 在这张表上确实把两条陈旧判定一起锁死（15c 不是装饰）",
+      _locked_keys_old(_c15._seen_store) - _lk15 ==
+      {"b2b168:橡胶手套#旧版无rv", "b2b168:泵#旧规则判的"},
+      str(sorted(_locked_keys_old(_c15._seen_store))))
+_c15._commit_to_store({"状态": "类目不符(已过滤)", "关键词": "泵", "memberId": "旧规则判的"})
+check("15d 重判后再判一次不符＝盖上带新指纹的章（同一轮不许反复重判同一家）",
+      _c15._seen_store["b2b168:泵#旧规则判的"]["rv"] == _rev15,
+      str(_c15._seen_store["b2b168:泵#旧规则判的"]))
+_c15._commit_to_store({"状态": "成功", "关键词": "泵", "memberId": "旧规则判的",
+                       "公司名称": "湖南奥龙乳胶制品", "电话": "0731-1234567"})
+check("15e 改判相关并入库＝旧「类目不符」章当场撕掉（留着它每轮都进重判名单，永远收敛不了）",
+      "b2b168:泵#旧规则判的" not in _c15._seen_store,
+      str(sorted(_c15._seen_store)))
+
+_st15 = {f"b2b168:泵#{i}": {"at": f"2026-11-{i:04d} 10:00:00",
+                           "st": "类目不符(已过滤)", "rv": "zzzzzzzzzzzz"}
+         for i in range(300)}
+_c15._seen_store = dict(_st15)
+_k15 = _c15._stale_filtered_keys()
+check("15f 单轮重判有上限，且取的是判定时间最近的一批（一次性放开上千家＝风控预算全花在补旧账）",
+      len(_k15) == _c15.REL_REFILTER_CAP == 200
+      and _k15 == {f"b2b168:泵#{i}" for i in range(100, 300)}, f"{len(_k15)} 家")
+_c15._seen_store = {f"b2b168:泵#{i}": {"at": f"2026-11-{i:04d} 10:00:00",
+                                       "st": "类目不符(已过滤)", "rv": _rev15}
+                    for i in range(50)}
+check("15g 全新一轮（所有章都带当前指纹）＝重判名单空（这条路径只在规则真升级那轮才付代价）",
+      _c15._stale_filtered_keys() == set(), str(len(_c15._stale_filtered_keys())))
+
+# 15h 取不到规则指纹时的降级：宁可不做重评，也不许每轮算出不同版本号把库洗一遍
+_ke_keep = sys.modules.get("keyword_expander")
+sys.modules["keyword_expander"] = None      # 打包缺模块/导入被打断时的真实形态
+type(_c15)._REL_REV = None
+try:
+    _rev15f = _c15._relevance_revision()
+    _c15._seen_store = {"b2b168:泵#降级": {"at": "2026-11-14 10:00:00",
+                                          "st": "类目不符(已过滤)", "rv": _rev15}}
+    _lk15f = _c15._locked_keys()
+finally:
+    sys.modules["keyword_expander"] = _ke_keep
+    type(_c15)._REL_REV = None
+check("15h 规则取不到（模块缺失/源码读不出）＝退回常量并按「不重判」降级，绝不每轮漂移版本号",
+      _rev15f == "rev0" and "b2b168:泵#降级" in _lk15f, f"{_rev15f} {_lk15f}")
+check("15h- 指纹取一次就缓存（每轮重算＝每轮读一遍源码；同一进程内改表不生效是刻意的）",
+      _c15._relevance_revision() == _rev15)
+
+# 15i/15j 交付链接线：crawl 起账与扣账、stats 读数、1688 同口径
+_st15src = _fn_seg(_SRC14["cdp_base.py"], "stats")
+check("15i crawl 把重判家数记进本轮账，并从「联系人曾取空」那句里扣掉（不扣＝报错误的待办数）",
+      "self._rel_refilter = len(self._stale_filtered_keys())" in _crawl_src14
+      and "- self._rel_refilter" in _crawl_src14
+      and "相关性判定规则已更新" in _crawl_src14)
+check("15i- stats 透出 rel_refilter（体检器/界面问得到这一格，不靠读日志文案）",
+      '"rel_refilter": self._rel_refilter' in _st15src, _st15src[:0])
+_rs15 = _fn_seg(_SRC14["cdp_base.py"], "reset_run_state")
+check("15j reset_run_state 把重判账清零（跨轮留着＝上一轮规则升级的账冒充本轮又重判了一遍）",
+      "_rel_refilter" in _rs15 or "_rel_refilter" in _crawl_src14, _rs15[:0])
+_a15 = _SRC14["ali1688_crawler.py"]
+check("15k 1688 同口径接上（十路一体：这一路不接，改判后的旧盖章就永远免检）",
+      "_stale_filtered_keys" in _a15 and "_relevance_revision" in _a15
+      and "self._rel_refilter = len(self._stale_filtered_keys())" in _a15
+      and '"rv": self._relevance_revision()' in _a15, "1688 侧未接线")
+check("15k- 1688 的重判账同样进 stats（适配器读数与 cdp_base 同一把键）",
+      "rel_refilter" in _1688_stats_src, "Ali1688Site.stats() 没透 rel_refilter")
+check("15l 两边同用一枚 FILTERED_STATE 常量（判定作废认的是状态字面量，两处拼写漂移就认不出）",
+      CdpSiteCrawler.FILTERED_STATE == _a1688.Ali1688Crawler.FILTERED_STATE == "类目不符(已过滤)"
+      and "st == self.FILTERED_STATE" in _SRC14["cdp_base.py"]
+      and "st == self.FILTERED_STATE" in _a15)
+# 15m 十路共用一本日志：每行必须自带「是谁说的」。1688 那一以前只打时间戳，
+# 实机体检日志里就会出现一句认不出主人的话（第 13 行「重新评估 31 家」）
+_log15 = _fn_seg(_SRC14["ali1688_crawler.py"], "_log")
+check("15m 1688 的日志前缀与九路同形（[时间][平台]）：并行混排时每一行都认得出是谁说的",
+      "][{self.PLATFORM_NAME}] " in _log15, _log15)
+check("15m- 反向对照：旧那句只打时间戳的写法不许复活（无主的行等于没记账）",
+      "strftime('%H:%M:%S')}] {msg}" not in _log15, _log15)
+
+print("⑮ 判定规则版本化：改了相关性口径，旧的「类目不符」盖章不再免检 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑯ 「这条数据能不能用」只许有一把尺子 + 漏斗必须按档说出原因
+# 由来（2026-11-15/16 实机体检，马可波罗）：分站报告用「电话/手机/邮箱/公司网址任一」
+# 把 51 家全判成命中并打 ✅，而生产漏斗按「手机号/固话/邮箱/微信号四项全空」剔掉 49 条，
+# 汇总只留下一句「漏斗吞掉 50 条」。两件事各自都对，拼在一起就是没人能回答
+# 「到底能不能采到数据」——弱的那把尺子负责打勾，吞掉的那一档却连分解都拿不出来。
+# 口径：①判定与复算一律走 make_row + filter_import_rows（生产同源，探针不另写一份）；
+#      ②build_clean_rows 把每一档的数写进 stats_out，clean_records 汇成 funnel_out；
+#      ③体检器按档打印并点名「四项全空」属于哪一路；④两道判据（_has_contact 与
+#      filter_import_rows）必须逐行同答案，对不上就是有人新刻了一把尺子。
+# ════════════════════════════════════════════════════════════════════════
+import customer_library_cleaner as _cl                                    # noqa: E402
+
+_cl_src = (Path(__file__).resolve().parent / "customer_library_cleaner.py").read_text(
+    encoding="utf-8")
+_cx16 = B2b168Crawler()
+_rows16 = [
+    {"公司名称": "甲一机械有限公司", "手机": "13800001111", "数据来源": "八方资源网"},
+    {"公司名称": "甲二机械有限公司", "电话": "0755-88889999", "数据来源": "八方资源网"},
+    {"公司名称": "甲三机械有限公司", "公司网址": "http://www.jia3.example.com",
+     "数据来源": "八方资源网"},      # 只有官网：宽口径算命中，入库口径算死数据
+]
+_wide16 = sum(1 for r in _rows16 if any(str(r.get(k) or "").strip() for k in _live.CONTACT_KEYS))
+check("16a 体检器复算可入库数走生产同一把尺子：只有官网的那一家判「不能入库」（宽口径判 3/3）",
+      _live._importable(_cx16, _rows16) == (2, "") and _wide16 == 3,
+      f"入库口径={_live._importable(_cx16, _rows16)}｜宽口径={_wide16}")
+check("16a- 没货/复算不了必须返回 None 而不是 0：0 会把正常的一路判成死数据（探针自己造红）",
+      _live._importable(_cx16, []) == (None, "")
+      and _live._importable(type("NoMap", (), {"PLATFORM_NAME": "x"})(), _rows16)[0] is None)
+
+# 16b 「抓到 N 家、能入库 0 家」是独立的一档，比低产出、比差分都先判红
+_m16, _v16 = _live._attrib({"legs": {"联系页": 12, "商铺首页": 3}, "leg_pid_raw": "0/40"},
+                           51, False, "", diff="ok", peer=40, imp=0)
+check("16b 全是死数据必须判红，且把通路账带进结论（马可波罗 51 家那轮的真实形状）",
+      _m16 == "❌" and "一条都不能用" in _v16 and "通路账" in _v16 and "0/40" in _v16, _v16)
+check("16b- 同一读数不传 imp（复算不了）时不许判红——判红必须基于测过的数，"
+      "但也不许就此放行（探针自己的故障不能冒充绿）",
+      _live._attrib({"legs": {"联系页": 12}}, 51, False, "", diff="ok", peer=0, imp=None)[0]
+      == "⚠")
+# 16b2 标题句只许说测到的事实：旧写法在最前面替分档下了结论（「取号通路没出货」），
+# 而同一行的后半句按分档可能写「这不是通路缺陷」——世界工厂网那 6 家全是站方没登的一轮，
+# 两句自相矛盾地印在同一行里，读的人只会照着前半句去修本来没坏的通路。
+_m16b2, _v16b2 = _live._attrib({"listed": 6, "nc_kinds": {"blank": 6},
+                                "nc_evidence": {"blank": "联系电话→-"}},
+                               6, False, "", diff="ok", peer=9, imp=0)
+check("16b2 四项全空且分档说「站方没登」时，标题句不许抢答「通路没出货」（只看事实，责任归下一行）",
+      _m16b2 == "❌" and "取号通路没出货" not in _v16b2
+      and "站方自己没登" in _v16b2 and "一行都进不了客户库" in _v16b2, _v16b2)
+# 16b3 同一形状换一档：已声明「详情不取页」的站（跨国采购网）拿到的必须是自己的处方，
+# 不许再写「先给这站的 crawl_detail 接上 _keep_detail」——那张处方对这站根本执行不了。
+_m16b3, _v16b3 = _live._attrib({"listed": 1, "nc_kinds": {"no_page": 1},
+                                "nc_evidence": {"no_page": "本站详情不取页（列表页明文组装）"}},
+                               1, False, "", diff="ok", peer=9, imp=0)
+check("16b3 no_page 那一档的处方不许是「接把手」（给已声明设计边界的站开假处方，是另一种谎）",
+      _m16b3 == "❌" and "_keep_detail" not in _v16b3
+      and "详情不取页" in _v16b3 and "这不是漏接把手" in _v16b3, _v16b3)
+_m16c, _v16c = _live._attrib({"listed": 51, "page_fail": 0}, 51, False, "",
+                             diff="ok", peer=40, imp=3)
+check("16c 可入库率是大头缺口时，证据链要把「四项全空 48 家」念出来（旧写法只念第一条证据），"
+      "且账上没有分档时不许再写「先修取号通路」这种没证据的处方",
+      _m16c == "❌" and "四项全空 48 家" in _v16c and "可入库仅 3/51" in _v16c
+      and "先修取号通路" not in _v16c and "不在「无联系方式」这一档" in _v16c, _v16c)
+# 16c- 账上有分档时结论必须跟着分档走：马可波罗那一轮「无联系方式」根本没被记上
+# （那批只有官网，状态是「成功」），把这种局说成「站方没登」同样是说谎
+_m16c3, _v16c3 = _live._attrib(
+    {"listed": 51, "nc_kinds": {"blank": 40}, "nc_evidence": {"blank": "联系电话→- "}},
+    51, False, "", diff="ok", peer=40, imp=3)
+check("16c- 分档为 blank 时处方必须是「站方自己没登、要换词换站」，不许说修解析",
+      _m16c3 == "❌" and "站方自己没登" in _v16c3 and "先修我们的解析" not in _v16c3,
+      _v16c3)
+check("16c== 反向对照（旧那句处方）：「先修取号通路再谈换词」不得在任何一档里复活"
+      "（档位直接取自 NC_KIND_ORDER，新增一档不必回来补这里的枚举）",
+      "先修取号通路再谈换词" not in "\n".join(
+          _live._attrib({"nc_kinds": {k: 9}}, 51, False, "",
+                        diff="ok", peer=40, imp=3)[1]
+          for k in cdp_base.NC_KIND_ORDER)
+          + _v16c + _v16c3)
+
+# 16d 零产出的词必须点名（旧文案硬写「第二个关键词」，实机点错了一个词）
+_m16d, _v16d = _live._attrib({"listed": 12, "kw_early": {"泵": 3}}, 12, False, "",
+                             diff="unknown", peer=0, zero=["泵"],
+                             killed="「泵」列表页早过滤砍 3 家")
+check("16d 差分跑不成时点名**真正**零产出的词（旧文案把第一个词写成「第二个关键词」）",
+      _m16d == "❌" and "「泵」零产出" in _v16d and "第二个关键词" not in _v16d, _v16d)
+check("16d- 没点名时也只能说「其中一个关键词」，不许猜位置",
+      "其中一个关键词" in _live._attrib({"listed": 9}, 9, False, "", diff="unknown")[1])
+check("16d== 通路账按请求数倒序、并带上「列表卡带产品 id」的比例（静默断腿要一眼看出断在哪）",
+      _live._legs_line({"legs": {"图片码": 2, "产品页": 40, "联系页": 12}, "leg_pid_raw": "40/40"})
+      == "产品页 40 次、联系页 12 次、图片码 2 次｜列表卡带产品 id 40/40"
+      and _live._legs_line({}) == "")
+
+# 16e/16f build_clean_rows 的 stats_out：每一档的数 + 四项全空按来源归账
+_rec16 = [
+    {"公司名": "合并甲公司", "电话": "13800001111", "数据来源": "甲平台", "状态": ""},
+    {"公司名": "合并甲公司", "电话": "0755-88889999", "数据来源": "乙平台", "状态": ""},
+    {"公司名": "只有官网乙公司", "官网": "http://www.y.example.com", "数据来源": "甲平台", "状态": ""},
+    {"公司名": "查不到的丙公司", "数据来源": "甲平台", "状态": "未找到"},
+    {"公司名": "只有微信丁公司", "微信号": "wx_ding_1", "数据来源": "乙平台", "状态": ""},
+]
+_logs16, _waste16, _st16 = [], [], {}
+_rows16b = _cl.build_clean_rows(_rec16, log=_logs16.append, waste_sink=_waste16.extend,
+                                stats_out=_st16)
+check("16e 漏斗分档数外读：原始/剔无效/跨平台合并/行数/四项全空各是多少，一目了然",
+      _st16["in"] == 5 and _st16["invalid"] == 1 and _st16["merged"] == 1
+      and _st16["rows"] == 3 and _st16["no_contact"] == 1, str(_st16))
+check("16e- 四项全空必须按来源归账（哪一路成批死数据，就去修哪一路的取号通路）",
+      _st16["no_contact_by_source"] == {"甲平台": 1}
+      and "只有官网乙公司" in _waste16, f"{_st16['no_contact_by_source']} {_waste16}")
+check("16e== 账目同时进日志：吞掉的那一档说不出归属，报表就还是一句「吞了 50 条」",
+      any("四项（手机/固话/邮箱/微信）全空" in x and "甲平台 1 条" in x for x in _logs16),
+      "‖".join(_logs16)[-160:])
+# 16e=== 自己给自己挖的那个坑：跨平台合并的一行有两个来源，按来源归会计两次。
+#        若把「分项合计」当成剔除条数，filter_import_rows 剔 1 条、账上写 2 条，
+#        体检器那句「口径分叉」自检就会当场谎报——行数与归属分布必须是两个字段。
+_multi16 = [{"公司名": "两站都没号的公司", "官网": "http://a.example.com", "数据来源": "甲平台", "状态": ""},
+            {"公司名": "两站都没号的公司", "地址": "广东省东莞市", "数据来源": "乙平台", "状态": ""}]
+_st16m, _lg16m = {}, []
+_rows16m = _cl.build_clean_rows(_multi16, log=_lg16m.append, stats_out=_st16m)
+check("16e=== 合并来的死数据只算 1 条，但两个来源各记一次（分项合计大于条数是设计不是分叉）",
+      _st16m["no_contact"] == 1 and _st16m["no_contact_by_source"] == {"甲平台": 1, "乙平台": 1}
+      and CdpSiteCrawler.filter_import_rows(_rows16m) == []      # 真剔了 1 条＝与行数对得上
+      and "分项合计可能大于条数" in _lg16m[-1], f"{_st16m}｜{_lg16m[-1:]}")
+check("16f 不传 stats_out 时行为与旧版一致（老调用方一行不改也不炸，账只是不外读）",
+      len(_cl.build_clean_rows(_rec16, log=lambda m: None)) == 3)
+check("16f- 入库口径与 _has_contact 逐行同答案（对不上＝有人又刻了一把尺子）",
+      all(bool(_cl._has_contact(r)) == bool(CdpSiteCrawler.filter_import_rows([r]))
+          for r in _rows16b), str(_rows16b))
+
+# 16g 端到端：ParallelSession.clean_records 的 funnel_out 与分站复算必须同一个数
+_f16 = {}
+_raw16 = [
+    {"公司名称": "漏斗甲机械", "手机": "13800002222", "数据来源": "八方资源网", "关键词": "泵"},
+    {"公司名称": "漏斗乙机械", "邮箱": "a@example.com", "数据来源": "八方资源网", "关键词": "泵"},
+    {"公司名称": "漏斗丙贸易", "公司网址": "http://www.loubing.example.com",
+     "数据来源": "八方资源网", "关键词": "生物质锅炉"},
+]
+_kept16 = ps.clean_records(records=_raw16, log=lambda m: None, funnel_out=_f16)
+check("16g clean_records 交出整条漏斗的账：喂进/剔无效/合并/四项全空/入库，每一档都有数",
+      _f16["fed"] == 3 and _f16["rows"] == 3 and _f16["invalid"] == 0
+      and _f16["merged"] == 0 and _f16["import_dropped"] == 1 and len(_kept16) == 2, str(_f16))
+check("16g- 两道判据在真漏斗上也必须同数（import_dropped == no_contact，本轮实机分叉的那一处）",
+      _f16["import_dropped"] == _f16["no_contact"] == 1
+      and _f16["no_contact_by_source"] == {"八方资源网": 1}, str(_f16))
+check("16g== 分站复算与整条漏斗同一个口径：同一批行两边都得说「能入库 2 条」",
+      len(_kept16) == _live._importable(ps.crawlers["b2b168"], _raw16)[0] == 2,
+      f"漏斗={len(_kept16)}｜分站={_live._importable(ps.crawlers['b2b168'], _raw16)}")
+
+# 16h 结构判据（同类查全）：宽口径只许留在对照行里，判定与渲染都必须接上新尺子
+check("16h 四项全空只有一把尺子：build_clean_rows 问 _has_contact，不再自己拆一遍电话/邮箱",
+      "_has_contact(row)" in _fn_seg(_cl_src, "build_clean_rows")
+      and "split_phones(f.get" not in _fn_seg(_cl_src, "build_clean_rows"),
+      _fn_seg(_cl_src, "build_clean_rows")[:0])
+check("16h- 体检器把可入库数传进判定，且复算走 _importable（不是又写一份判断）",
+      "imp=imp_n" in _fn_seg(_LIVE_SRC, "main")
+      and "_importable(crawler, rows)" in _fn_seg(_LIVE_SRC, "_fmt_site"))
+check("16h== 旧的假安心文案「{n} 家 / 命中 {contact_n}/{n}」不许复活（马可波罗假绿的原文）",
+      'f"{n} 家 / 命中 {contact_n}/{n}' not in _LIVE_SRC
+      and "elif contact_n * 2 < n" not in _LIVE_SRC)
+check("16i 漏斗账必须**打印**出来（只算不念，报告还是那一句「吞掉 50 条」）",
+      "漏斗分解" in _LIVE_SRC and "funnel_out=funnel" in _LIVE_SRC
+      and "四项全空按来源" in _LIVE_SRC)
+check("16i- 口径分叉自检也在打印里：两道判据数对不上要当场响，不等下一轮人去猜",
+      "口径分叉" in _LIVE_SRC and "必有一把是错的" in _LIVE_SRC)
+
+# 16j 「探针没测到」与「站点没货」必须是两种颜色：None 那一档只许说「未判」，
+#     不许顺着旧写法长出一个 ✅（假绿的最后半条路：绿灯本身没坏，只是通往绿灯的
+#     那条路上多了一格没测，而报告把「没测」念成了「没问题」）
+_m16j, _v16j = _live._attrib({"listed": 40}, 40, False, "", diff="ok", peer=0, imp=None,
+                             imp_err="AttributeError：缺字段「电话」")
+check("16j 复算不成单独成档（⚠ 未判）并念出为什么不成（旧写法在这里直接打 ✅）",
+      _m16j == "⚠" and "AttributeError" in _v16j and "不许把它当绿" in _v16j, _v16j)
+check("16j- 反向对照：测过且全都能用时这一档不许开口（「未判」不许变成常驻结论）",
+      _live._attrib({"listed": 40}, 40, False, "", diff="ok", peer=0, imp=40) == ("", ""))
+check("16j= 故障要跟着每一条更重的结论走（低产出那一档不许把「没测到」吞掉）",
+      "入库口径未判" in _live._attrib({"listed": 40, "failed": 30}, 5, False, "",
+                                      diff="ok", peer=40, imp=None)[1])
+check("16j== 产出异常那句不许拿抓到的家数冒充「可入库 N 家」（没测就是没测）",
+      "可入库 未测" in _live._attrib({"listed": 12}, 3, False, "", diff="ok", peer=40)[1])
+_m16k, _v16k = _live._importable(type("BadMap", (), {"PLATFORM_NAME": "x"})(), _rows16)
+check("16k 缺清洗映射时原因要写清楚（旧文案硬写「没有清洗映射」，异常那一支的原因被吞）",
+      _m16k is None and "_to_cleaner_record" in _v16k, repr(_v16k))
+check("16k- main 侧还有第二道锁：_attrib 万一放行，imp 缺失时 ✅ 那支也不许打勾",
+      "elif imp_n is None" in _fn_seg(_LIVE_SRC, "main")
+      and "不许打绿" in _fn_seg(_LIVE_SRC, "main")
+      and "else '未复算'" not in _LIVE_SRC)
+print("⑯ 入库口径一把尺子 + 漏斗按档说原因（含通路账）：51 家假 ✅ 那一族当场判红 ✓")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑰ 「清空历史种子库」：清了要真清得动，没清成要说得出（2026-11-16 全局自审）
+# 由来：站点侧真正拦住一家公司的这一格是内存集合 _seen_members，而关键词站的
+# clear_seen_store 过去只清盘上文件与 _seen_store 字典（1688 那一路却两样都清，两把
+# 尺子）；更坏的一半是 unlink 失败被 except: pass 吞掉后照样 return True，界面于是
+# 弹「历史种子库已清空」。用户信了这句话，下一轮看到的仍是「命中即跳过 0 家」——
+# 与「这个平台采不到数据」完全同形，却比它更难查（账上一点痕迹都没有）。
+# 口径：①清库动作只有 cdp_base.reset_seen_store 一份实现（独立 1688 包同名语义逐字对拍）；
+#      ②三样一起清：盘上文件、内存字典、内存去重集合；③删不掉要说得出原因并落进账；
+#      ④会话层逐路点名失败，全清成功才许闭嘴；⑤界面两处入口共用同一份说法。
+# ════════════════════════════════════════════════════════════════════════
+import tempfile as _tf17                                     # noqa: E402
+
+_AD_SRC17 = (_REPO / "b2bcollect_build" / "site_adapters.py").read_text(encoding="utf-8")
+_A1688_SRC17 = (_REPO / "ali1688_build" / "ali1688_crawler.py").read_text(encoding="utf-8")
+_GUI_SRC17 = (_REPO / "b2bcollect_build" / "b2bcollect_gui.py").read_text(encoding="utf-8")
+_AGUI_SRC17 = (_REPO / "ali1688_build" / "ali1688_gui.py").read_text(encoding="utf-8")
+
+
+class _SeedCrawler17(B2b168Crawler):
+    """只借基类的清库动作，落点换到临时目录——绝不拿开发机上真种子库做删除实验。"""
+
+    def __init__(self, path):
+        super().__init__()
+        self._seen_store_path = path
+
+
+_tmp17 = Path(_tf17.mkdtemp(prefix="seed17_"))
+_CDP_SRC17 = (_REPO / "b2bcollect_build" / "cdp_base.py").read_text(encoding="utf-8")
+_reset17 = _fn_seg(_CDP_SRC17, "reset_seen_store")
+_p17 = _tmp17 / "seen_store_b2b168.json"
+_p17.write_text('{"甲公司": {"at": "x", "st": "成功", "ct": 1}}', encoding="utf-8")
+_c17 = _SeedCrawler17(_p17)
+_c17._seen_store = {"b2b168:name:甲公司": {"at": "x"}}
+_c17._seen_members = {"b2b168:name:甲公司", "甲公司"}
+check("17a 清库三样一起清：盘上文件、内存字典、**内存去重集合**（最后那样才是真拦着公司的这一格）",
+      _c17.clear_seen_store() is True and not _p17.exists()
+      and _c17._seen_store == {} and _c17._seen_members == set()
+      and _c17._seed_clear_error == "", f"{_c17._seed_clear_error!r} 文件在否={_p17.exists()}")
+check("17a- 反向对照：旧写法只清字典不清 _seen_members——点了「清空」这一轮照样跳过全部",
+      "_seen_members = set()" in _reset17)
+
+_dir17 = _tmp17 / "占位目录"                       # unlink 一个目录：mac 抛 IsADirectoryError、
+_dir17.mkdir()                                    # Windows 抛 PermissionError，都是 OSError
+_c17b = _SeedCrawler17(_dir17)
+_c17b._seen_store = {"k": {}}
+_c17b._seen_members = {"k"}
+check("17b 删不掉时不许假成功：返回 False 且原因进账（旧写法在这里 except: pass 后 return True）",
+      _c17b.clear_seen_store() is False and "Error" in _c17b._seed_clear_error
+      and _dir17.exists(), repr(_c17b._seed_clear_error))
+check("17b- 失败也不留半成品：内存两样照样清掉，用户修好权限再清一次时不该还有旧集合拦人",
+      _c17b._seen_store == {} and _c17b._seen_members == set())
+check("17b== 清库不许把异常抛给调用方（只读卷上抛出去就是「点按钮整个工具没反应」）",
+      "except Exception as e" in _reset17 and "raise" not in _reset17)
+
+_ada17 = _def_src(_AD_SRC17, "clear_seen_store", "Ali1688Site")
+_cdb17 = _def_src(_CDP_SRC17, "clear_seen_store", "CdpSiteCrawler")
+check("17c 清库动作只有一份实现：1688 适配器与基类都只是薄薄一层，删文件那一句只在 "
+      "reset_seen_store 里出现一次",
+      "cdp_base.reset_seen_store" in _ada17 and "unlink()" not in _ada17
+      and "reset_seen_store(" in _cdb17 and "unlink()" not in _cdb17
+      and _reset17.count("unlink()") == 1, f"适配器={_ada17[:60]}｜基类={_cdb17[:60]}")
+_seg17d = _fn_seg(_A1688_SRC17, "clear_seen_store")
+check("17d 独立 1688 包那份（本包不 import cdp_base，是同一语义的第二处）三样都对齐",
+      "_seen_members = set()" in _seg17d and "_seed_clear_error" in _seg17d
+      and "return False" in _seg17d
+      and "except Exception:\n            pass\n        return True" not in _seg17d, _seg17d[:80])
+
+# 17e 会话层汇总：真实种子库先脱钩（落点改到临时目录），再拿两路假件试判据
+_saved17 = {}
+for _o17 in list(ps.crawlers.values()) + list(ps.channels.values()):
+    _pp = getattr(_o17, "_seen_store_path", None)
+    if _pp is not None:
+        _saved17[id(_o17)] = _pp
+        _o17._seen_store_path = _tmp17 / f"脱钩_{getattr(_o17, 'PLATFORM_SLUG', 'x')}.json"
+
+
+class _FakeBad17:
+    PLATFORM_NAME = "坏路甲"
+
+    def clear_seen_store(self):
+        self._seed_clear_error = "OSError：模拟只读卷"
+        return False
+
+
+class _FakeNone17:
+    PLATFORM_NAME = "没有清库入口的路"
+
+
+_log17, _old_log17 = [], ps._log
+ps._log = _log17.append
+ps.crawlers["_fake_bad17"] = _FakeBad17()
+ps.channels["_fake_none17"] = _FakeNone17()
+try:
+    ps.clear_seen_store()
+    _miss17 = dict(ps._seed_clear_missed)
+    ps.channels.pop("_fake_none17")                 # 只留「都能清成」的那些路
+    ps.crawlers.pop("_fake_bad17")
+    _n_ok17 = ps.clear_seen_store()                 # 第二次：临时目录里没文件，全路都应清成
+    _miss_ok17 = list(ps._seed_clear_missed)
+finally:
+    ps._log = _old_log17
+    ps.crawlers.pop("_fake_bad17", None)
+    ps.channels.pop("_fake_none17", None)
+    for _o17 in list(ps.crawlers.values()) + list(ps.channels.values()):
+        if id(_o17) in _saved17:
+            _o17._seen_store_path = _saved17[id(_o17)]
+check("17e 会话层逐路点名没清成的（路名＋原因），并提醒「下一轮仍会命中即跳过」",
+      "模拟只读卷" in _miss17.get("坏路甲", "")
+      and "没有清库入口的路" in _miss17
+      and any("没清干净" in x for x in _log17), str(_miss17))
+check("17e- 「没有这一格」与「没清成」分得开：前者说入口缺失，后者带真实原因",
+      "入口" in _miss17.get("没有清库入口的路", ""), str(_miss17))
+check("17e== 全清成功时不许无端报警（告警只跟着失败响，否则下一轮没人看这句话）",
+      _miss_ok17 == [] and _n_ok17 >= 9 and not any("没清干净" in x for x in _log17[1:]),
+      f"{_miss_ok17} 成功路数={_n_ok17}")
+
+check("17f 界面两处入口共用同一份说法（过去工具栏讲事实、「开始新任务」无条件讲「已清空」）",
+      _GUI_SRC17.count('"历史种子库已清空。"') == 1
+      and _GUI_SRC17.count("_clear_seen_store_now()") >= 2
+      and "部分没清成" in _GUI_SRC17)
+check("17f- 独立 1688 界面同样按返回值说话，不看按钮点了没",
+      "ok = self.crawler.clear_seen_store()" in _AGUI_SRC17 and "没清成" in _AGUI_SRC17)
+print("⑰ 清种子库：三样一起清 + 失败说得出原因 + 逐路点名（假「已清空」那一族封死）✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑱ 两种「拿回来了但没用」：HTTP 200 的整页质询壳 ＋ 商铺首页 block2 壳
+# ════════════════════════════════════════════════════════════════════════
+# 由来（2026-11-15 第七轮实机，马可波罗 34 家只有 6 家可入库，通路账「码图 0 次」）：
+#   A) 请求量上来之后站方回 **HTTP 200 + 整页火山引擎 WAF 质询壳**（14711 字节，可见文本只有
+#      「正在检测」）。旧插页判据要求「体积 < HTTP_BLOCK_MAX_BYTES」，大壳整个放过去，被当
+#      正常页解析出 0 条 →「这家店没联系方式」。症状与「平台就是不给号」同形，处方却完全不同。
+#   B) 商铺首页是 **block2 壳**：标签带 class、值落在紧接其后的那一条 span、码图是
+#      buildStringToimg**2**.php?…&fei=1&en_corpid=<每店一份的密文>。旧 _FIELD_RE 只认不带
+#      属性的 <span>、旧 _CODE_RE 被那个 2 顶开 → 这一跳拿回 44KB 却一个字段、一张码图原料
+#      都读不出（旧注释还写着「两页壳同构、原样能用」，是一句错话）。
+# 夹具都是按实机留档的**形状**逐条转写的（公司名/号码/ token 换成假值），所以能随代码提交、
+# 每轮回归都真跑——不依赖 debug/fixtures/ 里那些含真实数据的留档页面。
+import makepolo_crawler as _mp18                                       # noqa: E402
+
+_MP_WAF_SHELL = ('<!DOCTYPE html><html><head><script>var c={"v":1,"cid":"a","seed":"b",'
+                 '"token":"eyJhbGciOiJFZDI1NTE5IiwidHlwIjoiWUFmX1ZlcmlmaWNhdGlvbl9jaGFsbGVuZ2UifQ"};'
+                 '</script><script src="https://lf-rc1.yhgfb-cn-static.com/obj/rc-verifycenter/'
+                 'sec_sdk_build/4.0.18/captcha/index.js"></script>'
+                 '<script>new Image().src="https://waf-captcha-proxy.volcbiz.com/p?x=1";</script>'
+                 '</head><body><div id="app">正在检测</div></body></html>')
+_MP_REAL_HOME = ('<html><head><title>某公司商铺-马可波罗网</title></head><body>'
+                 + '<div class="connect_msg"><span class="block2">联系人：</span>'
+                   '<span class="block2" style="color:#333;">时晓琳</span> <br/>'
+                   '<span class="block2">手机：</span> <span class="block2" '
+                   'id=\'yellow_left_link_block2\'> <em class="yellow_left_mobile_cpc"> '
+                   '<img src="/purchase/buildStringToimg2.php?t_page=y_left&phone=' + "9e54" + "T" * 50
+                   + '&fei=1&en_corpid=5255N-KT7-ABC"/></em> </span> <br/>'
+                   '<span class="block2" >固定电话：</span><span class="block2"> '
+                   '<em class="show_cpc_fixphone"><img src="/purchase/buildStringToimg2.php'
+                   '?t_page=y_left&phone=3d83' + "T" * 50 + '&fei=2&en_corpid=5255N-KT7-ABC"/></em>'
+                   ' <!-- --> <!-- <em class="show_sub_cpc_fixphone">025-****1400</em>--> </span>'
+                   '<span class="block2">传真：</span><span class="block2" style="color:#333;"></span>'
+                   '<span class="block2">公司地址：</span><span class="block2">南京市江宁区某路 9 号</span>'
+                   '</div>' + "<p>主营产品 输送机 配件</p>" * 60 + '</body></html>')
+_MP_WEAK_ONLY = ('<html><body>正常详情页正文 ' + "真页正文 " * 400 + '<script src="https://lf-rc1'
+                 '.yhgfb-cn-static.com/obj/rc-verifycenter/sec_sdk_build/4.0.18/captcha/index.js">'
+                 '</script></body></html>')
+_MP_CP_LIST = ('<div class="pro_list"><a href="/product/101104014473.html">输送机 A</a>'
+               '<a href="//china.makepolo.com/product-detail/101104014515.html">输送机 B</a></div>')
+
+
+def _mp_fields(page):
+    """把 crawl_detail 里那三行取值口径原样复算一遍（判据改了这里就跟着红）。"""
+    out = {}
+    for k, v in _mp18._FIELD_RE.findall(_mp18._COMMENT_RE.sub(" ", page or "")):
+        v = _mp18.clean_text(v)
+        v = _mp18._CODE_STRIP_RE.sub("", v).strip(" ：:|/")
+        if v and (k not in out or not out[k]):
+            out[k] = v[:120]
+    return out
+
+
+# 18a 质询壳判据：三条签名齐全才算，弱签名独中不算，超出前 60KB 窗口不算
+check("18a 200·整页质询壳认得出（旧体积判据放过的那一档）",
+      CdpSiteCrawler._looks_like_challenge_shell(_MP_WAF_SHELL) is True)
+check("18a- 反向对照：真商铺页（44KB 量级、带 block2 与码图）不许判成壳",
+      CdpSiteCrawler._looks_like_challenge_shell(_MP_REAL_HOME) is False)
+check("18a= 只预载了验证 SDK 的正常页不算壳（弱签名独中不许开火——误判的代价是整条通道白等冷却）",
+      CdpSiteCrawler._looks_like_challenge_shell(_MP_WEAK_ONLY) is False)
+check("18a== 窗口是有边的：签名藏在 60KB 之后就不算（判据口径与常量一致）",
+      CdpSiteCrawler._looks_like_challenge_shell("x" * 70000 + _MP_WAF_SHELL) is False)
+
+# 18b 通道级分诊：档位跟着「本站借不借得到浏览器」，不是跟着「这是不是验证页」
+_c18 = _mp18.MakepoloCrawler()
+_c18.reset_run_state()
+_r18 = _c18.http_block_reason(200, _MP_WAF_SHELL, "http://caigou.makepolo.com/spc_new.php?q=1")
+check("18b 裸 HTTP 站（BLOCK_OPEN_BROWSER=False）撞壳：按冷却档处置，但原因仍写清是人机验证壳",
+      _c18._block_kind == "ip" and "人机验证壳" in _r18 and _c18._block_needs_js is True
+      and _c18._block_probe_url.endswith("spc_new.php?q=1"),
+      f"kind={_c18._block_kind} reason={_r18}")
+_c18b = _mp18.MakepoloCrawler()
+_c18b.BLOCK_OPEN_BROWSER = True                     # 同一个站、同一份壳，只是借得到标签页
+_c18b.reset_run_state()
+_r18b = _c18b.http_block_reason(200, _MP_WAF_SHELL, "http://caigou.makepolo.com/x")
+check("18b- 借得到浏览器的站撞同一份壳：归 captcha（执行 JS 确实能过），且文案不带「HTTP」"
+      "（上层拿它兜底判 IP 限流，带上这个词就把能过的页误杀成干等）",
+      _c18b._block_kind == "captcha" and "HTTP" not in _r18b and "浏览器执行 JS" in _r18b, _r18b)
+_c18c = _mp18.MakepoloCrawler()
+_c18c.reset_run_state()
+_k0, _p0, _n0 = _c18c._block_kind, _c18c._block_probe_url, _c18c._block_needs_js
+_r18c = _c18c.http_block_reason(200, _MP_WAF_SHELL, "http://a.cn.makepolo.com/contact_us.html",
+                                deep=True)
+check("18c 深链那一跳的壳照旧只回原因：通道三件状态一件都不动（与 13a 同口径，只是这一档是 200）",
+      "人机验证壳" in _r18c and "通道入口未受影响" in _r18c
+      and (_c18c._block_kind, _c18c._block_probe_url, _c18c._block_needs_js) == (_k0, _p0, _n0),
+      f"reason={_r18c}")
+
+# 18d 浏览器那条路同样认壳（正文几十字、HTML 上万字节，旧那道体积门正好放过）
+_c18d = B2b168Crawler()
+_c18d.reset_run_state()
+_c18d._current_url = lambda: "http://a.cn.makepolo.com/"
+_c18d._title = lambda: "某公司商铺"
+_c18d._page_state = lambda: {"len": 6}
+_c18d._eval = lambda *a: ""
+_c18d._html = lambda: _MP_WAF_SHELL
+check("18d 浏览器链路：正文极小 + HTML 很大 + 命中签名 → 判壳（不再当正常页解析出 0 条）",
+      "人机验证壳" in (_c18d._detect_block() or ""), _c18d._detect_block())
+_c18d._html = lambda: _MP_REAL_HOME
+check("18d- 反向对照：同样「正文小 HTML 大」的正常页不误判", _c18d._detect_block() == "")
+
+# 18e 冷却档的劝告话跟着事实走：壳页上不许说「这不是验证码」
+_c18e = _mp18.MakepoloCrawler()
+_ev18, _lg18 = equip(_c18e)
+_c18e._block_needs_js = True
+_c18e._wait_manual_unblock("站点返 200 但整页正文是人机验证壳", lambda: "还在拦", max_wait=0)
+_c18f = _mp18.MakepoloCrawler()
+_ev18f, _lg18f = equip(_c18f)
+_c18f._wait_manual_unblock("站点返回 HTTP 502（IP 级限流/冷却，非验证码）", lambda: "还在拦",
+                           max_wait=0)
+check("18e 壳页：说「这是 JS 质询壳，页里没有可点的框」（旧那句「这不是验证码」在这种页上是假话）",
+      any("JS 质询壳" in m for m in _lg18) and not any("这不是验证码" in m for m in _lg18),
+      str(_lg18))
+check("18e- 反向对照：真·IP 限流那一档的说法一字不改（改这一族文案要两处都对得上）",
+      any("这不是验证码，人工点不掉" not in m and "IP 级限流/冷却" in m for m in _lg18f)
+      and not any("JS 质询壳" in m for m in _lg18f), str(_lg18f))
+
+# 18f/g/h block2 壳的字段判据：放宽只多认形状，旧模板与「空值不串栏」都不许退化
+_f18 = _mp_fields(_MP_REAL_HOME)
+check("18f 商铺首页 block2 壳：值落在下一条带属性的 span 里也读得出（旧写法整页读空）",
+      _f18.get("联系人") == "时晓琳" and "某路 9 号" in _f18.get("公司地址", ""), str(_f18))
+check("18f- 码图栏不算明文值（摘掉整条 URL 后剩空串就不入库），注释里的掩码更不算",
+      "手机" not in _f18 and "固定电话" not in _f18 and "传真" not in _f18
+      and "1400" not in str(_f18.values()) and "****" not in str(_f18.values()), str(_f18))
+check("18g 反向对照：旧两种模板（值在同一条 span / 在 <li> 里）一字不变仍命中",
+      _mp_fields('<div><span>手机：13812345678</span><span>联系人：王强</span></div>')
+      == {"手机": "13812345678", "联系人": "王强"}
+      and _mp_fields('<ul><li>联系电话：0755-12345678</li></ul>')["联系电话"] == "0755-12345678")
+check("18h 空值栏不许串走下一栏的值（跨一条开标签放宽之后的必查项）",
+      _mp_fields('<span>传真：</span><span></span><span>地址：</span><span>深圳市xx路</span>')
+      == {"地址": "深圳市xx路"})
+
+# 18i/j 码图：归属照旧、URL 必须照页面原样（fei/en_corpid 少一个就 0 字节）
+_c18g = _mp18.MakepoloCrawler()
+_c18g.reset_run_state()
+_c18g._log = lambda *a, **k: None
+_tk18 = _c18g._shop_code_tokens(_MP_REAL_HOME, "njyuantai01")
+check("18i buildStringToimg**2**.php 认得（旧 `_\\.php` 被那个 2 顶开＝通路账「码图 0 次」的根因）",
+      len(_tk18) == 2 and all(t[2].startswith("/purchase/buildStringToimg2.php") for t in _tk18))
+check("18i- 页面原样 URL 带着 fei 与 en_corpid（重建 URL 会丢这两个参数，站方回 0 字节）",
+      all("fei=" in t[2] and "en_corpid=" in t[2] for t in _tk18), str([t[2][:60] for t in _tk18]))
+check("18i= 推广位仍然一张不收（判据放宽只多认形状，归属这道闸没松）",
+      _c18g._shop_code_tokens('<div class="phone_mask_list"><span>现货微信同步</span>'
+                              '<img src="/purchase/buildStringToimg2.php?t_page=y_left&phone='
+                              + "T" * 54 + '&fei=1&en_corpid=ZZZ"/></div>', "njyuantai01") == [])
+_u18 = []
+
+
+class _R18:
+    content, status_code, headers, text = b"", 200, {}, ""
+
+
+class _S18:
+    def get(self, url, timeout=None, headers=None):
+        _u18.append(url)
+        return _R18()
+
+
+_c18g._session = _S18()
+_c18g._pace_before_request = lambda *a, **k: None
+_c18g._codes("njyuantai01", _MP_REAL_HOME, "http://njyuantai01.cn.makepolo.com/")
+check("18j 取图请求＝页面原样 src 拼成的绝对地址（base 用这张页真正来自的那条 URL）",
+      _u18 and all(u.startswith("http://njyuantai01.cn.makepolo.com/purchase/"
+                               "buildStringToimg2.php?") and "en_corpid=" in u for u in _u18),
+      str(_u18[:2]))
+_u18.clear()
+_c18g._codes("njyuantai01", '<li>联系电话：<img src="/purchase/buildStringToimg.php?t_page=y_left'
+               '&phone=' + "T" * 54 + '"/></li>', "http://njyuantai01.cn.makepolo.com/"
+                                                 "contact_us.html")
+check("18j- 反向对照：旧 contact_us 形状（没有 fei/en_corpid）照旧走同一条相对拼接",
+      len(_u18) == 1 and _u18[0].endswith("buildStringToimg.php?t_page=y_left&phone=" + "T" * 54),
+      str(_u18))
+
+# 18k 第三条腿（列表卡 id 不给看 → 本店产品中心页的 id）：出货/配额/没原料/归属四档
+_MP_PRODUCT = ('<h2>公司名片</h2><ul class="mes_cont"><li>手机号：<span>13675360858 </span></li>'
+               '<li>联系人：<span>张艳美</span></li><li>公司名称：<span>'
+               '<a href="//shangdonghaiguang.cn.makepolo.com">山东某设备有限公司</a></span></li></ul>'
+               '<div class="supplier_b_mes"><span>电</span>话 :&nbsp;0536-2105088 &nbsp;'
+               '<span>地</span>址 :&nbsp;潍坊市某区某路 1 号</div>')
+_MP_PRODUCT_OTHER = _MP_PRODUCT.replace("shangdonghaiguang", "burenslug")
+
+
+def _mp_with(pages, slug="shangdonghaiguang"):
+    """装一台只发字典里那些页的采集器（返回 (crawler, 请求列表, 日志列表)）。"""
+    cc = _mp18.MakepoloCrawler()
+    cc.reset_run_state()
+    hits = []
+    lgs = []
+    cc._log = lambda m="", *a: lgs.append(str(m))
+    cc._pace_before_request = lambda *a, **k: None
+
+    class _RR:
+        def __init__(self, body, code):
+            self.content = body.encode("utf-8")
+            self.status_code = code
+            self.headers = {}
+            self.text = body
+
+    class _SS:
+        def get(self, url, timeout=None, headers=None):
+            hits.append(url)
+            # 先按「路径结尾」配、再退回「包含」：商铺首页那条键（…makepolo.com/）同时也是
+            # 产品中心页 URL 的一段前缀，只按包含配会把这一跳喂成首页（夹具自己先骗了判据）
+            for key, (body, code) in pages.items():
+                if url.endswith(key):
+                    return _RR(body, code)
+            for key, (body, code) in pages.items():
+                if key in url:
+                    return _RR(body, code)
+            return _RR("", 404)
+
+    cc._session = _SS()
+    return cc, hits, lgs
+
+
+_c18h, _u18h, _lg18h = _mp_with({"companyProduct.html": (_MP_CP_LIST, 200),
+                                 "101104014473": (_MP_PRODUCT, 200)})
+_pd18 = _c18h._shop_product_alternates("shangdonghaiguang", {})
+check("18k 列表卡 id 不给看时，自家产品中心页的 id 能把明文手机取回来（实机：同店另一 id 给全量名片）",
+      _pd18.get("手机") == "13675360858" and _pd18.get("联系人") == "张艳美"
+      and _c18h._cp_hits == 1 and _c18h._cp_shops == 1, str(_pd18))
+check("18k- 两种产品链接形状都认（商铺自己的 /product/<id>.html 与站方 /product-detail/<id>.html）",
+      _mp18._CP_PID_RE.findall(_MP_CP_LIST) == ["101104014473", "101104014515"])
+_c18i, _u18i, _lg18i = _mp_with({"companyProduct.html": (_MP_CP_LIST, 200),
+                                 "101104014473": (_MP_PRODUCT_OTHER, 200)})
+_pd18b = _c18i._shop_product_alternates("shangdonghaiguang", {})
+check("18k= 归属闸门不许因为「id 来自本店页面」就免检：名片指向别家子域照样整页丢弃",
+      not _pd18b.get("手机") and _c18i._cp_hits == 0, str(_pd18b))
+_c18j, _u18j, _lg18j = _mp_with({"companyProduct.html": ("<html>一个 id 都没列</html>", 200)})
+_c18j._shop_product_alternates("shangdonghaiguang", {})
+check("18k== 这一跳 200 却没列出一个 id：开口说「这条腿没原料」，不悄悄空转（站方改 JS 注水就长这样）",
+      any("没原料" in m for m in _lg18j) and len([u for u in _u18j if "product-detail" in u]) == 0,
+      str(_lg18j))
+_c18k, _u18k, _lg18k = _mp_with({"companyProduct.html": (_MP_CP_LIST, 200),
+                                 "101104014473": (_MP_PRODUCT, 200)})
+_c18k._cp_shops = _c18k.CP_SHOP_CAP
+_pd18c = _c18k._shop_product_alternates("shangdonghaiguang", {})
+check("18k=== 成本闸真的落下：配额走满后一家也不多打，但要说一次上限在哪（悄悄烧预算最贵）",
+      not _u18k and any("上限" in m for m in _lg18k), str(_lg18k))
+
+# 18l 通路账渲染：第三条腿的账看得见，且没有这条腿的站不许凭空多一段
+_s18 = _c18h.stats()
+check("18l 第三条腿的账进 stats（走了几家/出货几家），号码来源仍只算「产品页」那一格",
+      _s18.get("cp_leg") == "自家产品中心 1/1 家" and _s18["legs"]["产品页"] == 0, str(_s18))
+check("18l- 体检器把这段渲染进通路账那一行",
+      "自家产品中心 1/1 家" in _live._legs_line(_s18), _live._legs_line(_s18))
+check("18l= 反向对照：没走过这条腿时渲染与旧口径一字不变（不给别的站凭空多一段空账）",
+      _live._legs_line({"legs": {"产品页": 3}, "leg_pid_raw": "5/8"})
+      == "产品页 3 次｜列表卡带产品 id 5/8"
+      and _live._legs_line({}) == "")
+
+# 18m 两条页腿都没正文时，那一行说的是真死因
+_c18l = _mp18.MakepoloCrawler()
+_c18l.reset_run_state()
+_c18l._note_deep_block("http://a.cn.makepolo.com/contact_us.html",
+                       "HTTP 403（这一家的这条资源不给看，通道入口未受影响）")
+_c18l._note_deep_block("http://a.cn.makepolo.com/",
+                       _c18l.http_block_reason(200, _MP_WAF_SHELL, "http://a.cn.makepolo.com/",
+                                               deep=True))
+check("18m 死因按真话拼：403 那页说 403，200 壳那页说人机验证壳（旧写法两页一律印「都不给看（403）」）",
+      "HTTP 403" in _c18l._refuse_why((("联系页", "http://a.cn.makepolo.com/contact_us.html", 403),
+                                       ("商铺首页", "http://a.cn.makepolo.com/", 200)))
+      and "人机验证壳" in _c18l._refuse_why((("商铺首页", "http://a.cn.makepolo.com/", 200),)),
+      _c18l._refuse_why((("联系页", "http://a.cn.makepolo.com/contact_us.html", 403),
+                         ("商铺首页", "http://a.cn.makepolo.com/", 200))))
+check("18m- 没发出请求／账上没原因时不编原因（只说空响应）",
+      _c18l._refuse_why((("联系页", "http://nope.example/x", 0),)) == "联系页空响应"
+      and _c18l._refuse_why((("联系页", "", 0),)) == "两条页腿都没发出请求",
+      _c18l._refuse_why((("联系页", "http://nope.example/x", 0),)))
+
+# 18n 端到端：联系页 403 → 首页 block2 → 列表 id 是通用壳 → 自家产品中心 → 名片明文手机
+_SHELL_PAGE = "<html><head><title>马可波罗</title></head><body>" + "推荐产品 " * 1200 + "</body></html>"
+_c18m, _u18m, _lg18m = _mp_with({"contact_us.html": ("", 403),
+                                 "shangdonghaiguang.cn.makepolo.com/": (_MP_REAL_HOME, 200),
+                                 "product-detail/9999999": (_SHELL_PAGE, 200),
+                                 "companyProduct.html": (_MP_CP_LIST, 200),
+                                 "101104014473": (_MP_PRODUCT, 200)})
+_rec18 = _c18m.crawl_detail({"公司名称": "山东某设备有限公司", "公司ID": "shangdonghaiguang",
+                             "关键词": "输送机", "主营产品": "输送机",
+                             "产品ID": "999999999999", "公司网址": ""})
+check("18n 端到端（第七轮那一路的形状）：状态成功、手机取到、通路账与第三条腿都有数",
+      _rec18["状态"] == "成功" and _rec18["手机"] == "13675360858"
+      and _c18m.stats()["legs"]["产品页"] == 2 and _c18m.stats()["cp_leg"] == "自家产品中心 1/1 家",
+      str(_rec18) + str(_c18m.stats()["legs"]))
+check("18n- 这一家花的请求有数（403 一次 + 首页 + 两个列表 id 之一 + 产品中心 + 出货那一跳）："
+      "预算要能对着账看",
+      len(_u18m) <= 6, str(_u18m))
+check("18n== 收尾账目格把深链原因念出来这件事仍然成立（新增一档不许把 13b 的渲染判据挤掉）",
+      's.get("deep_block")' in _fn_seg(_HTTP_SRC["cdp_base.py"], "crawl")
+      and CdpSiteCrawler.HTTP_CHALLENGE_SHELL_WINDOW > CdpSiteCrawler.HTTP_BLOCK_MAX_BYTES)
+print("⑱ 200·整页质询壳 + block2 壳：拿回来了读不出／被拦了说成没货，这一族两处都堵上 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑲ 同一族缺陷在别的站的形状：本站自己的体积门只看「太薄」，看不到「太大的人机验证壳」
+# ════════════════════════════════════════════════════════════════════════
+# ⑱ 把 cdp_base.http_block_reason 补上签名判据之后，同类查全查出三处「各站自己写的体积门」：
+#   · maimaib2b._tab_real_page —— 它刻意不调 http_block_reason（那函数会改分诊状态，
+#     一次取页判断不该把「等人工」扭成「干等冷却」），所以基类的新档对它**不生效**；
+#     CF 质询页 outerHTML 实测 44675 字符 > 本站体积门 15000，旧判据直接放行给解析器；
+#   · gys._html_abnormal —— 恢复探测（probe_block 第 154 行）拿它判「已解除」，
+#     体积这一条只拦 <3000 的薄页，大壳会被判成正常页 → 谎报恢复；
+#   · qihuo11467.probe_block —— 它的体积门后面跟着 `not self.http_block_reason(...)`，
+#     基类新档自动生效，属于「已经安全的那一类」，19c 钉住它不许被改成裸体积判断。
+# 判据本身是纯函数（不看体积、不改任何状态），所以能安全接进这些「只看不记账」的位置。
+import gys_crawler as _g19                                             # noqa: E402
+import maimaib2b_crawler as _mb19                                      # noqa: E402
+
+_BIG_SHELL = _MP_WAF_SHELL + "<div class='pad'>" + "正在为您验证，请稍候 " * 2000 + "</div>"
+_BIG_REAL = ("<html><head><title>供应商网-企业列表</title></head><body>"
+             + "<div class='card'>某机械设备有限公司 张经理 13800000000</div>" * 60
+             + "</body></html>")
+check("19 夹具本身的体积：壳页 15KB 以上（否则体积门这条判据测不出来）",
+      len(_BIG_SHELL) > max(_mb19.Maimaib2bCrawler.HTTP_BLOCK_MAX_BYTES,
+                            _g19.GysCrawler.HTTP_BLOCK_MAX_BYTES or 3000, 3000),
+      str(len(_BIG_SHELL)))
+
+# 19a gys：大壳不许当正常页（取页与恢复探测两条支路共用这一个判据）
+check("19a gys 的 _html_abnormal 现在认得大壳（旧写法只看体积，十几 KB 的质询壳会被当正常页交回）",
+      _g19.GysCrawler._html_abnormal(_BIG_SHELL) is True
+      and _g19.GysCrawler._html_abnormal(_BIG_REAL) is False)
+check("19a- 反向对照：薄页那一档旧口径不许回归（空页/短页仍算异常）",
+      _g19.GysCrawler._html_abnormal("") is True
+      and _g19.GysCrawler._html_abnormal("<html>短</html>") is True)
+
+# 19b maimaib2b：标签那一页是不是真内容（它刻意绕开 http_block_reason，所以必须自己看签名）
+
+
+class _MB19Stub:
+    """只喂 _tab_real_page 用到的那几把手：插页特征词按本站词表、解析按「有没有卡片」。"""
+    HTTP_BLOCK_MAX_BYTES = _mb19.Maimaib2bCrawler.HTTP_BLOCK_MAX_BYTES
+    HTTP_BLOCK_MARKS = _mb19.Maimaib2bCrawler.HTTP_BLOCK_MARKS
+    _looks_like_challenge_shell = _mb19.Maimaib2bCrawler._looks_like_challenge_shell
+
+    def __init__(self, cards=0, text_len=9000):
+        self._cards, self._text_len = cards, text_len
+
+    def _auto_challenge_page(self):
+        return False
+
+    def parse_list(self, page, kw):
+        return [{}] * self._cards
+
+    def _page_state(self):
+        return {"len": self._text_len}
+
+
+check("19b 麦麦B2B：CF/WAF 质询壳渲染后有 9000 字可见文本也不算真页（旧判据只看体积门会放行）",
+      _mb19.Maimaib2bCrawler._tab_real_page(_MB19Stub(), _BIG_SHELL) is False)
+check("19b- 真列表页（能解析出卡片）照旧算真页，薄壳（<15000 带 Just a moment）照旧算插页",
+      _mb19.Maimaib2bCrawler._tab_real_page(_MB19Stub(cards=2), _BIG_REAL) is True
+      and _mb19.Maimaib2bCrawler._tab_real_page(
+          _MB19Stub(), "<html><body>Just a moment</body></html>") is False)
+
+# 19c 同类查全的机器判据：任何「拿体积当插页判据」的函数都必须同时问一次签名判据
+_SIG_RE = __import__("re").compile(r"len\([^()]*\)\s*[<>]=?\s*\d{3,}")
+
+
+def _shell_gate_problems(src):
+    """返回「有体积门、没签名判据」的函数名。
+
+    只划这类形状：函数体里既有 len(...) 与三位以上数字的比较，又读 HTTP_BLOCK_MARKS
+    （＝它在判『这页是不是插页』），却没调 _looks_like_challenge_shell／没把判定
+    交给 http_block_reason。后者是基类那条已经含新档的总判据，走它也算合格。
+    """
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        seg = _ast.get_source_segment(src, fn) or ""
+        if not _SIG_RE.search(seg) or "HTTP_BLOCK_MARKS" not in seg:
+            continue
+        if "_looks_like_challenge_shell" in seg or "http_block_reason" in seg:
+            continue
+        out.append(fn.name)
+    return out
+
+
+_gate_hits = {n: v for n, s in _HTTP_SRC.items() if (v := _shell_gate_problems(s))}
+check(f"19c 全仓体积门判插页的地方都接上了签名判据（{len(_HTTP_SRC)} 份采集器源码，一处不许漏）",
+      not _gate_hits, str(_gate_hits))
+check("19c- 反向对照：⑱/⑲ 之前的两种旧写法必须被这条判据点出来（判据本身不许是摆设）",
+      _shell_gate_problems(
+          'class A:\n    def _tab_real_page(self, page):\n'
+          '        if len(page) < 15000 and any(m in page for m in self.HTTP_BLOCK_MARKS):\n'
+          '            return False\n        return True\n') == ["_tab_real_page"]
+      and _shell_gate_problems(
+          'class A:\n    def _html_abnormal(html):\n'
+          '        if len(html) < 3000:\n            return True\n'
+          '        return any(m in html for m in HTTP_BLOCK_MARKS)\n') == ["_html_abnormal"]
+      and not _shell_gate_problems(
+          'class A:\n    def _tab_real_page(self, page):\n'
+          '        if self._looks_like_challenge_shell(page):\n            return False\n'
+          '        if len(page) < 15000 and any(m in page for m in self.HTTP_BLOCK_MARKS):\n'
+          '            return False\n        return True\n')
+      and not _shell_gate_problems(
+          'class A:\n    def probe(self, r):\n'
+          '        if r.status_code == 200 and len(r.text) >= 2000 \\\n'
+          '                and not self.http_block_reason(r.status_code, r.text):\n'
+          '            return ""\n'))
+check("19c== gys 那句「已解除」的判据确实共用同一个把手（各写一份＝下一个新壳形态只补一处）",
+      "_html_abnormal" in _fn_seg(_HTTP_SRC["gys_crawler.py"], "probe_block"),
+      _fn_seg(_HTTP_SRC["gys_crawler.py"], "probe_block")[:200])
+print("⑲ 体积门这一族查全：三处本站判据补上签名档，机器判据钉住『下一个站长别再漏』 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ⑳ 深链死因「按主机留最后一条」= 把别人的死因安在这一条腿上（2026-11-16 实机假话）
+# ════════════════════════════════════════════════════════════════════════
+# 第八轮实机马可波罗日志（本轮抓到、当场修）：
+#   两条页腿都没拿到正文（联系页 HTTP 403（正文是 200·人机验证壳（站方 WAF 质询…·仅这一条深链，通道入口未）、
+#   商铺首页 HTTP 200（…））
+# 联系页明明是 403，后面括号里却是商铺首页那页的壳原因——`_deep_blocks` 按主机归并、
+# 每主机只留**最后一次**原因，而同一主机下两条路径的死因本来就可以不同（这正是 ⑬ 分账的
+# 前提）。而且那句还被 `[:48]` 拦腰截断成「通道入口未」，读的人既拿到假原因又拿到半截话。
+# 修法：主机账（条数/收尾一行）不动，另立一本**按 URL** 的死因原件；取原因只按 URL 查，
+# 查不到就只报状态码（不编），截断一律落在分隔符上。
+_host1, _url1 = "sjdskjc.cn.makepolo.com", "http://sjdskjc.cn.makepolo.com/contact_us.html"
+_url2 = "http://sjdskjc.cn.makepolo.com/"
+_c20 = _mp18.MakepoloCrawler()
+_c20.reset_run_state()
+_c20._note_deep_block(_url1, "HTTP 403（这一家的这条资源不给看，通道入口未受影响）")
+_c20._note_deep_block(_url2, _c20.http_block_reason(200, _MP_WAF_SHELL, _url2, deep=True))
+_w20 = _c20._refuse_why((("联系页", _url1, 403), ("商铺首页", _url2, 200)))
+check("20a 同一主机两条路径、两种死因：各念各的，403 那一腿不许带上「人机验证壳」",
+      "人机验证壳" not in _w20.split("、")[0] and "人机验证壳" in _w20.split("、")[1], _w20)
+check("20a- 主机账照旧按主机聚合（条数与收尾那一行不受影响，别把 ⑬ 的分账改坏）",
+      len(_c20.stats()["deep_block"]) == 1
+      and sum(v[0] for v in _c20.stats()["deep_block"].values()) == 2,
+      str(_c20.stats()["deep_block"]))
+check("20b 没记过的 URL 就只报状态码：宁可不说话，也不把同主机别人的原因搬过来",
+      _c20._refuse_why((("产品页", "http://sjdskjc.cn.makepolo.com/product/1.html", 439),))
+      == "产品页 HTTP 439",
+      _c20._refuse_why((("产品页", "http://sjdskjc.cn.makepolo.com/product/1.html", 439),)))
+check("20b- 反向对照：旧写法（按主机取原因）在同样两笔账上会说假话——这条差分就是本节的立项依据",
+      "人机验证壳" in str((_c20._deep_blocks.get(_host1) or [0, ""])[1]))
+
+# 20c 截断只落在分隔符上（半截话比不说更误导）
+_long = "正文是 200·人机验证壳（站方 WAF 质询，页里只有「正在检测」）·仅这一条深链，通道入口未受影响"
+_s20 = CdpSiteCrawler._why_short(_long)
+check("20c 深链那半句是重复信息（这话本来就只在深链路上说），短版把它去掉",
+      _s20 == "正文是 200·人机验证壳（站方 WAF 质询，页里只有「正在检测」）", _s20)
+_s20b = CdpSiteCrawler._why_short("这一家的这条资源不给看，通道入口未受影响，"
+                                  "所以这一条腿按每家记账而不是整通道停手，"
+                                  "下一次撞见同主域只累加不重复报", limit=30)
+check("20c- 真要截断时截在标点前并带省略号，绝不留「通道入口未」这种半截词",
+      _s20b.endswith("…") and not _s20b.rstrip("…").endswith(("未", "过", "的")), _s20b)
+check("20c== 短句原样返回（判据不许把正常句子改花）",
+      CdpSiteCrawler._why_short("HTTP 403 拒绝") == "HTTP 403 拒绝")
+
+# 20d 有界：满了丢最早，别拿上一轮的旧原因念今天这一条
+_c20d = _mp18.MakepoloCrawler()
+_c20d.reset_run_state()
+_c20d.DEEP_WHY_CAP = 3
+for _i in range(5):
+    _c20d._note_deep_block(f"http://s{_i}.cn.makepolo.com/contact_us.html", f"原因{_i}")
+check("20d URL 死因原件有界（超上限丢最早那条），主机账的条数仍然全在",
+      len(_c20d._deep_why) == 3 and _c20d._deep_block_why("http://s0.cn.makepolo.com/contact_us.html") == ""
+      and _c20d._deep_block_why("http://s4.cn.makepolo.com/contact_us.html") == "原因4"
+      and sum(v[0] for v in _c20d._deep_blocks.values()) == 5,
+      str(_c20d._deep_why))
+check("20d- 同一条 URL 再撞时原因会被最新那句覆盖（站方从限流壳换成放行，账要跟着改口）",
+      _c20d._note_deep_block("http://s4.cn.makepolo.com/contact_us.html", "原因4新")
+      == "s4.cn.makepolo.com"
+      and _c20d._deep_block_why("http://s4.cn.makepolo.com/contact_us.html") == "原因4新")
+check("20d== reset_run_state 也清这本账：跨轮留着，下一轮同一条 URL 换了死因也会被旧那句念出来",
+      "self._deep_why = {}" in _fn_seg(_HTTP_SRC["cdp_base.py"], "reset_run_state"),
+      _fn_seg(_HTTP_SRC["cdp_base.py"], "reset_run_state")[:120])
+
+# 20e 机器判据：不许再有「拿主机账配单条 URL」的写法
+# 合法碰这本主机账的只有这几处：写字人、按主机念次数的收尾、以及两处按轮清零。
+_DEEP_HOST_OK = {"_note_deep_block", "_undo_deep_block", "stats", "reset_run_state", "__init__"}
+
+
+def _host_why_problems(src):
+    """除了那几处合法用法，任何函数都不许再碰 `_deep_blocks`。
+
+    合法写字人只有两个：**记**（`_note_deep_block`）与**退**（`_undo_deep_block`——
+    补救腿把这一家救回来了要退一笔，否则账上写着「被拒」而实际已出货＝假归因）。
+    剩下三处（`stats`、`reset_run_state`、`__init__`）是读账和清零。
+    其它地方碰这本「每主机只留最后一条」的账，就必然是同主机两条路径互相顶包——
+    那一本从来就不是按 URL 设计的。要读原因只有 `_deep_block_why(url)` 这一把手，
+    它查不到就回空串（不编）。
+    """
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        seg = _ast.get_source_segment(src, fn) or ""
+        if "_deep_blocks" in seg and fn.name not in _DEEP_HOST_OK:
+            out.append(fn.name)
+    return out
+
+
+_h_hits = {n: v for n, s in _HTTP_SRC.items() if (v := _host_why_problems(s))}
+check("20e 全仓没有第二处「按主机找单条 URL 的死因」（gys/11467 等深链账同口径，一处不许漏）",
+      not _h_hits, str(_h_hits))
+check("20e- 反向对照：⑳ 修前那一行写法必须被这条判据点出来，而按 URL 读原因的写法不许误响",
+      _host_why_problems('class A:\n    def _refuse_why(self, legs):\n'
+                         '        return self._deep_blocks.get(self._host_of(u))[1]\n')
+      == ["_refuse_why"]
+      and not _host_why_problems('class A:\n    def _refuse_why(self, legs):\n'
+                                 '        return self._deep_block_why(u)\n'
+                                 '    def _note_deep_block(self, url, reason):\n'
+                                 '        self._deep_blocks[h] = [1, reason]\n'))
+print("⑳ 深链死因按 URL 立原件：同主机两种死因不许互相顶包，半截话也不许再上日志 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ㉑ JS 质询壳的第三条路：借一枚标签把挑战跑完，再把通行证抄回裸 HTTP 会话
+# ════════════════════════════════════════════════════════════════════════
+# ⑱ 把壳**认出来**之后，第八轮实机（2026-11-16，注塑机/消防水带）的账显示：认出来仍然
+# 只是不说谎，数据还是没拿回来——马可波罗商铺首页 41 跳里 19 跳是壳，而 BLOCK_OPEN_BROWSER
+# =False 的站按 ip 档处置就是「等站方放行」，等于这一路当天作废。
+# 壳里那段 JS 是**机器自己就能跑完**的（不需要任何人操作），所以这与「叫人工过滑块」是两件事：
+# 借一枚标签（open_verify_page 那套现成机制）跑完挑战 → 抄通行证 → 重试这一跳。
+# 关键是这条腿的**成败口径要诚实**：跑完挑战≠后面那一跳一定出数据，所以账上只写「跑完几次」，
+# 而每一跳的结果仍由深链账自己回答；预算（每轮上限 + 一条链最多重一次）必须真落下。
+_c21 = _mp18.MakepoloCrawler()
+_c21.reset_run_state()
+_ev21, _lg21 = equip(_c21)
+_c21._pace_before_request = lambda *a, **k: None
+_open21, _rel21 = [], []
+_c21.open_verify_page = lambda url="": _open21.append(url) or True
+_c21._release_verify_tab = lambda: _rel21.append(1)
+
+
+class _R21:
+    def __init__(self, body, code):
+        self.content = body.encode("utf-8")
+        self.status_code = code
+        self.headers = {}
+        self.text = body
+
+
+class _SS21:
+    """按「第几次请求」回第几份正文：壳 → （借标签跑完）→ 真页。"""
+
+    def __init__(self, seq):
+        self.seq, self.n = seq, 0
+
+    def get(self, url, timeout=None, headers=None):
+        body, code = self.seq[min(self.n, len(self.seq) - 1)]
+        self.n += 1
+        return _R21(body, code)
+
+
+# 21a 五档成败：预算用满／借不到标签／挑战没跑完／没抄到通行证／跑通
+_c21._session = _SS21([(_MP_WAF_SHELL, 200), (_MP_REAL_HOME, 200)])
+_c21._html = lambda: _MP_WAF_SHELL                    # 标签里那页还是壳
+_c21._harvest_browser_cookies = lambda: 2
+_ft21 = _c21._fetch("http://a.cn.makepolo.com/", enc="utf-8", tries=1, guarded=False, deep=True)
+check("21a 挑战没跑完（标签里那页还是壳）：不许谎报成功，这一跳照旧按深链被拒收尾",
+      _c21._js_tab_tries == 1 and _c21._js_tab_hits == 0 and not _ft21
+      and any("还是质询壳" in m for m in _lg21), str(_c21._js_tab_tries))
+check("21a- 失败也把临时借的标签还掉（finally 那条路，挂着标签＝占着别人的窗口）",
+      _rel21 == [1], str(_rel21))
+_c21._session = _SS21([(_MP_WAF_SHELL, 200), (_MP_REAL_HOME, 200)])   # 每一档都从「第一跳就是壳」重新起
+_c21._html = lambda: _MP_REAL_HOME                    # 挑战跑完了，标签里那页像真页
+_c21._harvest_browser_cookies = lambda: 0             # 但通行证一条都没抄到
+_c21._current_url = lambda: "http://a.cn.makepolo.com/index.html"   # 站方把挑战后的落点改去了首页
+_c21._fetch("http://a.cn.makepolo.com/contact_us.html", enc="utf-8", tries=1, guarded=False, deep=True)
+check("21b 跑完挑战却抄不到通行证：说清「站方把放行记在 IP 上」，不许算成这条腿成功了",
+      _c21._js_tab_hits == 0 and any("没抄到本站通行证" in m for m in _lg21),
+      str(_c21._js_tab_hits))
+check("21b- 同主机但落点不是这一页：身份门必须拒收，且拒收的理由要说得出（串页假数据比采不到更坏）",
+      _c21._js_tab_body_hits == 0
+      and any("标签落的不是这一页" in m and "a.cn.makepolo.com/index.html" in m for m in _lg21),
+      str(_lg21[-2:]))
+# 21b2 第九轮实机逼出来的第二条出货路：马可波罗 3/3 全是「挑战跑完了、浏览器里一条本站
+# cookie 都没有」——放行记在 IP／会话上，requests 那条 TLS 指纹对不上。此时标签里那一页
+# **已经是真页**，旧写法把它扔掉、回去重走注定还是壳的 HTTP 一跳，这条腿就永远 0 命中。
+_c21._session = _SS21([(_MP_WAF_SHELL, 200), (_MP_REAL_HOME, 200)])
+_c21._harvest_browser_cookies = lambda: 0             # 站方就是不按 cookie 放行
+_c21._current_url = lambda: "http://a.cn.makepolo.com/contact_us.html"   # 落点正是我要的这一页
+_ft21b2 = _c21._fetch("http://a.cn.makepolo.com/contact_us.html", enc="utf-8", tries=1,
+                      guarded=False, deep=True)
+check("21b2 抄不到通行证但标签里就是这一页：正文直接拿走，这条腿从此能出数（不再只能报「等站方放行」）",
+      "block2" in (_ft21b2 or "") and _c21._js_tab_body_hits == 1 and _c21._js_tab_hits == 0,
+      str(_ft21b2)[:60])
+check("21b2- 走标签取页这一档时**不再多发那一跳**（裸 HTTP 明知还是壳，重取只是白花一次配额）",
+      _c21._session.n == 1, f"请求={_c21._session.n}")
+_c21._session = _SS21([(_MP_WAF_SHELL, 200), (_MP_REAL_HOME, 200)])
+_c21._harvest_browser_cookies = lambda: 3
+_c21._js_tab_tries = 0
+_open21.clear()                       # 本档只看「这一跳」借了几次标签，不累计前两档
+_ft21b = _c21._fetch("http://a.cn.makepolo.com/", enc="utf-8", tries=1, guarded=False, deep=True)
+check("21c 端到端：第一跳是壳 → 借标签跑完挑战并抄回通行证 → 重试这一跳拿到 block2 真页",
+      "block2" in (_ft21b or "") and _c21._js_tab_hits == 1 and _c21._js_tab_tries == 1,
+      str(_ft21b)[:60])
+check("21c- 借标签确实只多花了一次请求（壳 1 次 + 重试 1 次），预算不是纸面上的",
+      _c21._session.n == 2 and _open21 == ["http://a.cn.makepolo.com/"],
+      f"请求={_c21._session.n} 借页={_open21}")
+_c21._session = _SS21([(_MP_WAF_SHELL, 200), (_MP_REAL_HOME, 200)])          # 这一档：站方每一跳都回壳
+_c21._js_tab_hits = 0                              # 21c/21b2 已让这条腿出过货，预算放开到 40
+_c21._js_tab_body_hits = 0                         # 「预算由账给」要成立，先清零这一轮的账
+_c21._js_tab_tries = _c21.JS_SHELL_TAB_MAX
+_open21.clear()
+_c21._fetch("http://a.cn.makepolo.com/", enc="utf-8", tries=1, guarded=False, deep=True)
+check("21d 每轮上限真的落下：到点就不再开标签，并说一句「已到上限」（不开口就是悄悄放弃这条路）",
+      not _open21 and any("已到上限" in m for m in _lg21), str(_open21))
+check("21d- 上限那句要念得出**是几次**：只说「已到上限」而数字来自哪一档没人知道，调参时必猜错",
+      any(f"已到上限（{_c21.JS_SHELL_TAB_MAX} 次）" in m for m in _lg21), str(_lg21[-1:]))
+# 21d2 预算由账给：一次货都没出只许试错 3 次；出过货放开到 40——同一个数字要么把能出货的
+# 路堵死，要么让出不了货的路白烧标签（马可波罗两种结局都实测过）。
+_c21._js_tab_tries = _c21.JS_SHELL_TAB_MAX
+check("21d2 这条腿本轮一次货都没出→预算就是试错档（JS_SHELL_TAB_MAX）",
+      _c21._js_tab_budget() == _c21.JS_SHELL_TAB_MAX, str(_c21._js_tab_budget()))
+_c21._js_tab_body_hits = 1
+check("21d2- 只要**标签取页**出过一次货（抄不到通行证那种站）预算就该放开——旧口径只认 cookie"
+      "那一档，马可波罗正好卡在这一档被 3 次判死",
+      _c21._js_tab_budget() == _c21.JS_SHELL_TAB_MAX_OK, str(_c21._js_tab_budget()))
+_c21._js_tab_body_hits, _c21._js_tab_hits = 0, 1
+check("21d2== 抄通行证出过货同样放开预算（两条出货路对称）",
+      _c21._js_tab_budget() == _c21.JS_SHELL_TAB_MAX_OK, str(_c21._js_tab_budget()))
+_c21._js_tab_hits = 0
+check("21d2=== 预算按轮清零：上一轮 0 命中不许把这一轮直接判死",
+      _c21._js_tab_budget() == _c21.JS_SHELL_TAB_MAX, str(_c21._js_tab_budget()))
+
+# 21d- 闩：重取到的那一跳**又是壳**时不许再借一次标签（预算会全烧在同一家身上）
+_c21l = _mp18.MakepoloCrawler()
+_c21l.reset_run_state()
+_evl, _lgl = equip(_c21l)
+_c21l._pace_before_request = lambda *a, **k: None
+_opens_l = []
+_c21l.open_verify_page = lambda url="": _opens_l.append(url) or True
+_c21l._release_verify_tab = lambda: None
+_c21l._html = lambda: _MP_REAL_HOME               # 标签里那页能跑完挑战
+_c21l._harvest_browser_cookies = lambda: 3
+_c21l._session = _SS21([(_MP_WAF_SHELL, 200)] * 9)    # 但这一家就是不给真页
+_c21l._fetch("http://a.cn.makepolo.com/", enc="utf-8", tries=1, guarded=False, deep=True)
+check("21d- 同一条调用链最多因壳重取一次：重试回来的还是壳时不再借第二次标签（旧写法会把"
+      "整轮预算钉死在一家门上）",
+      _c21l._js_tab_tries == 1 and len(_opens_l) == 1 and _c21l._session.n == 2,
+      f"借标签={_c21l._js_tab_tries} 开页={len(_opens_l)} 请求={_c21l._session.n}")
+
+# 21e 通道入口那一档：跑通就不进几十分钟的 IP 等待；跑不通照旧等（不许假装解开了）
+_c21e = _mp18.MakepoloCrawler()
+_c21e.reset_run_state()
+_ev21e, _lg21e = equip(_c21e)
+_c21e._block_reason = ""
+_c21e._block_needs_js = True
+_c21e._solve_js_shell_via_tab = lambda url: True
+check("21e 通道级撞上壳且借标签跑通：直接返回「可续采」，不进 IP 档那几十分钟干等",
+      _c21e.handle_http_block("http://cn.makepolo.com/", "站点返 200 但整页正文是人机验证壳")
+      is True and not FT.slept, str(FT.slept[:3]))
+_c21f = _mp18.MakepoloCrawler()
+_c21f.reset_run_state()
+_ev21f, _lg21f = equip(_c21f)
+_c21f._block_needs_js = True
+_c21f._solve_js_shell_via_tab = lambda url: False
+_c21f.probe_block = lambda: "站点返 200 但整页正文是人机验证壳"
+_c21f.BLOCK_POLL_IP, _c21f.BLOCK_MAX_WAIT_IP = 45, 45
+FT.reset()
+check("21f- 反向对照：这条腿跑不通时照旧按 IP 档等待，不因「试过标签」就谎报已解除",
+      _c21f.handle_http_block("http://cn.makepolo.com/", "站点返 200 但整页正文是人机验证壳")
+      is False, "")
+
+# 21g 抄 Cookie 的域：没声明 BLOCK_COOKIE_DOMAIN 的站退回 HOME_DOMAIN（漏了就永远抄 0 条）
+_c21g = _mp18.MakepoloCrawler()
+_c21g.reset_run_state()
+_got21 = []
+
+
+class _J21:
+    def set(self, name, value, domain=None, path=None):
+        _got21.append((name, domain))
+
+
+_c21g._session = __import__("types").SimpleNamespace(cookies=_J21())
+_c21g.pin_tab_id = "TAB1"
+_c21g._send = lambda method, timeout=None: {"result": {"cookies": [
+    {"name": "wdw", "value": "x", "domain": ".makepolo.com", "path": "/"},
+    {"name": "other", "value": "y", "domain": ".example.com", "path": "/"}]}}
+check("21g 马可波罗没写 BLOCK_COOKIE_DOMAIN，抄 Cookie 退回 HOME_DOMAIN 并只收本站那条",
+      _c21g.BLOCK_COOKIE_DOMAIN == "" and _c21g._harvest_browser_cookies() == 1
+      and _got21 == [("wdw", ".makepolo.com")], str(_got21))
+
+# 21h 机器判据：**看过 HTTP 响应**才记深链账的函数必须同时挂上这条腿（七站同形状，抄漏就分叉）。
+# 为什么以 `http_block_reason(` 为界：这条腿干的事是「把裸 HTTP 会话没跑成的 JS 挑战交给浏览器跑一遍」，
+# 而 gys `_fetch_raw` 那一处记的是**浏览器已经渲染完仍然停在插页**（`深链渲染出防采插页（浏览器同样不给看）`）——
+# 再借一枚标签只是把刚失败的那件事重做一遍，那种调用点不该被误伤（误伤＝下一站真漏了时判据已被人当噪音跳过）。
+def _shell_leg_problems(src):
+    out = []
+    for fn in (n for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.FunctionDef)):
+        seg = _ast.get_source_segment(src, fn) or ""
+        args = [a.arg for a in (fn.args.args + fn.args.kwonlyargs)]
+        if ("deep" in args and "_note_deep_block(" in seg
+                and "http_block_reason(" in seg and "_deep_shell_retry(" not in seg):
+            out.append(fn.name)
+    return out
+
+
+_leg_hits = {n: v for n, s in _HTTP_SRC.items()
+             if n != "cdp_base.py" and (v := _shell_leg_problems(s))}
+check(f"21h 每一站的深链分支都接上了「借标签跑壳」这条腿（{len(_HTTP_SRC) - 1} 份源码）",
+      not _leg_hits, str(_leg_hits))
+check("21h- 反向对照：只记深链账、不接这条腿的旧形状必须被点出来",
+      _shell_leg_problems('class A:\n    def _fetch(self, url, deep=False):\n'
+                          '        block = self.http_block_reason(r.status_code, r.text, url, deep=deep)\n'
+                          '        if block:\n            self._note_deep_block(url, block)\n'
+                          '            return ""\n') == ["_fetch"])
+check("21h= 上限/等待/开关都是类常量（写死在函数里＝下一个站想调就得改代码）",
+      all(hasattr(CdpSiteCrawler, x) for x in
+          ("BLOCK_JS_SHELL_TAB", "JS_SHELL_TAB_MAX", "JS_SHELL_TAB_WAIT", "DEEP_WHY_CAP")))
+check("21h== 浏览器渲染那一档的死链账不许被这条判据误伤（判据只问『看过响应体』的调用点，"
+      "否则 gys 那种合法豁免会被当成噪音整条划掉）",
+      _shell_leg_problems('class A:\n    def _fetch_raw(self, url, deep=False):\n'
+                          '        if self._is_abnormal_page() and deep:\n'
+                          '            self._note_deep_block(url, "深链渲染出防采插页")\n'
+                          '        return "", ""\n') == [])
+# gys 这一处是真豁免还是漏接，得由源码自己回答：它渲染那一路确实没经过 http_block_reason
+check("21h=== gys `_fetch_raw` 的深链账确实只来自浏览器渲染（不是漏接这条腿的借口）",
+      "http_block_reason(" not in (_ast.get_source_segment(
+          _HTTP_SRC["gys_crawler.py"],
+          next(n for n in _ast.walk(_ast.parse(_HTTP_SRC["gys_crawler.py"]))
+               if isinstance(n, _ast.FunctionDef) and n.name == "_fetch_raw")) or ""))
+# ── 21i 身份门本体：从浏览器标签把正文当「某一家的深链正文」交出去之前，必须证明
+#    标签当前那一页就是我要的那一页。域名＋路径算同一页，query 里那串质询令牌不算。
+_c21i = _mp18.MakepoloCrawler()
+_c21i.reset_run_state()
+equip(_c21i)
+_WANT21 = "http://a.cn.makepolo.com/contact_us.html"
+_c21i._pace_before_request = lambda *a, **k: None
+_id_cases = [
+    ("同一页", _WANT21, _WANT21, True, ""),
+    ("站方在地址后面补了质询令牌（路径没变）", _WANT21, _WANT21 + "?__jsl_clearance=s", True, ""),
+    ("锚点不同仍是同一页", _WANT21, _WANT21 + "#contact", True, ""),
+    ("末尾斜杠写法差异", "http://a.cn.makepolo.com/shop/", "http://a.cn.makepolo.com/shop", True, ""),
+    ("同主机不同路径（落到别家/首页）", _WANT21, "http://a.cn.makepolo.com/index.html",
+     False, "标签落的不是这一页"),
+    ("换到别家子域（马可波罗每家一个子域）", _WANT21, "http://b.cn.makepolo.com/contact_us.html",
+     False, "标签不在本站"),
+    ("标签停在验证页", _WANT21, "http://www.makepolo.com/verify", False, "标签不在本站"),
+    ("地址根本读不出来", _WANT21, "", False, "标签不在本站"),
+]
+for _lbl21, _want, _cur, _exp_ok, _exp_why in _id_cases:
+    _c21i._current_url = (lambda u=_cur: u)
+    _ok21, _why21 = _c21i._tab_page_is(_want)
+    check(f"21i 身份门·{_lbl21} → {'放行' if _exp_ok else '拒收（' + _exp_why + '）'}",
+          _ok21 is _exp_ok and (_exp_ok or _exp_why in _why21), f"{_ok21}｜{_why21}")
+# token 模式（mic 那种「凭 supplier user 串在地址里」的站）：认地址里的凭据，不硬比路径
+_c21i._current_url = lambda: "https://www.mic.cn/shop/ab123-contact-us.html"
+check("21i-token 给了凭据时按「同主机＋地址带这段」判，站方改写文件名不该把它拒掉",
+      _c21i._tab_page_is("https://www.mic.cn/shop/ab123-contact.html", token="ab123") == (True, ""), "")
+_c21i._current_url = lambda: "https://www.mic.cn/shop/zz999-contact.html"     # 标签其实在别家
+check("21i-token- 反向对照：标签停在**别家**的页上就必须拒（把 A 家的页当 B 家＝串页）",
+      _c21i._tab_page_is("https://www.mic.cn/shop/ab123-contact.html", token="ab123")[0] is False
+      and "凭据" in _c21i._tab_page_is("https://www.mic.cn/shop/ab123-contact.html",
+                                        token="ab123")[1],
+      str(_c21i._tab_page_is("https://www.mic.cn/shop/ab123-contact.html", token="ab123")))
+# same_host=False：请求的主机名本来就是猜的（mic 英文子域），站方换主机名不算换供应商
+_c21i._current_url = lambda: "https://www.mic.cn/showroom/ab123/"
+check("21i-same 猜出来的子域被站方领到统一 showroom 路径：凭据还在→放行（继续要求同主机＝把好渠道判死）",
+      _c21i._tab_page_is("https://ab123.mic.cn/", token="ab123", same_host=False)[0] is True, "")
+check("21i-same- 反向对照：同一地址上不许顺手放掉身份——去掉凭据后这条跨主机路必须被拒",
+      _c21i._tab_page_is("https://ab123.mic.cn/", same_host=False)[0] is False, "")
+check("21i-same== 反向对照：带着凭据但标签其实是别家（换主机≠免检）",
+      _c21i._tab_page_is("https://ab123.mic.cn/", token="zz999", same_host=False)[0] is False, "")
+# 正文那一档：地址对了还要问「这页能不能算正文」
+for _lbl21, _body21, _exp in [
+        ("空正文", "", "读不出来"),
+        ("还是质询壳", _MP_WAF_SHELL, "还是质询壳"),
+        ("几十十字的跳转中间态", "<html>" + "x" * 200 + "</html>", "不像一页正文")]:
+    _c21i._current_url = lambda: _WANT21
+    _c21i._html = lambda b=_body21: b
+    _got21i, _why21i = _c21i._tab_body_for(_WANT21)
+    check(f"21i-体积/内容门·{_lbl21}：不许当正文交出，且要说清为什么（{_exp}）",
+          not _got21i and _exp in _why21i, f"{_why21i}")
+_c21i._current_url = lambda: _WANT21
+_c21i._html = lambda: _MP_REAL_HOME
+check("21i== 地址对、内容像一页正文→放行（这条腿的正路不能被门误伤）",
+      _c21i._tab_body_for(_WANT21)[0] == _MP_REAL_HOME, "")
+
+# ── 21j 回账配对：调用方的固定顺序是「先记被拒、再叫这条腿」，腿成了不回账，体检报告就会
+#    把一条能出数据的路判成「近乎零产出」（第九轮实机马可波罗正是这一档）。
+_c21j = _mp18.MakepoloCrawler()
+_c21j.reset_run_state()
+equip(_c21j)
+_U21 = "http://a.cn.makepolo.com/contact_us.html"
+_c21j._note_deep_block(_U21, "HTTP 200（正文是 200·人机验证壳）")
+check("21j 夹具成立：记完之后主机账 1 笔、URL 死因 1 条、同主域已开口",
+      _c21j._deep_blocks["a.cn.makepolo.com"][0] == 1 and _c21j._deep_block_why(_U21)
+      and "cn.makepolo.com" in _c21j._deep_logged, str(_c21j._deep_blocks))
+_c21j._undo_deep_block(_U21)
+check("21j- 补救腿出货后主机账与 URL 死因都要退干净（留着就是归因说谎）",
+      "a.cn.makepolo.com" not in _c21j._deep_blocks and _c21j._deep_block_why(_U21) == "",
+      f"{_c21j._deep_blocks}｜{_c21j._deep_why}")
+check("21j== 连「同主域只开口一次」那份静音凭据一起撤：这一路后面真被拒时还得再说话",
+      "cn.makepolo.com" not in _c21j._deep_logged, str(_c21j._deep_logged))
+_c21j._note_deep_block(_U21, "HTTP 403 防采插页")
+_c21j._note_deep_block("http://b.cn.makepolo.com/x.html", "HTTP 403 防采插页")
+_c21j._undo_deep_block(_U21)
+check("21j=== 只退这一家：同主机别的路径的账不许被一起抹掉（退多了＝把真被拒的说成没被拒）",
+      _c21j._deep_blocks.get("b.cn.makepolo.com", [0])[0] == 1, str(_c21j._deep_blocks))
+_c21j._undo_deep_block(_U21)
+check("21j==== 重复退不许把账退成负数（负数会在收尾那行念出「被拒 -1 次」这种疯话）",
+      all(v[0] >= 0 for v in _c21j._deep_blocks.values())
+      and _c21j._deep_blocks.get("a.cn.makepolo.com") is None, str(_c21j._deep_blocks))
+_c21j._undo_deep_block("http://never-noted.cn.makepolo.com/y.html")
+check("21j===== 没记过的 URL 退账不许抛异常（补救腿常在异常路径上，炸了会把正文一起吞掉）", True)
+# 端到端：腿从标签取到正文时，回账必须跟着发生（不是只靠调用方记得写）
+_c21k = _mp18.MakepoloCrawler()
+_c21k.reset_run_state()
+_evk, _lgk = equip(_c21k)
+_c21k._pace_before_request = lambda *a, **k: None
+_c21k.open_verify_page = lambda url="": True
+_c21k._release_verify_tab = lambda: None
+_c21k._html = lambda: _MP_REAL_HOME
+_c21k._harvest_browser_cookies = lambda: 0
+_c21k._current_url = lambda: "http://a.cn.makepolo.com/contact_us.html"
+_c21k._session = _SS21([(_MP_WAF_SHELL, 200)])
+_c21k._note_deep_block("http://a.cn.makepolo.com/contact_us.html", "HTTP 200（正文是 200·人机验证壳）")
+_out21k = _c21k._deep_shell_retry("http://a.cn.makepolo.com/contact_us.html", 200,
+                                  _MP_WAF_SHELL, lambda: "")
+check("21j2 端到端：标签取页这条路出货时，深链那本账当场退一笔（不用调用方自己记得）",
+      _out21k == _MP_REAL_HOME and "a.cn.makepolo.com" not in _c21k._deep_blocks
+      and _c21k._js_tab_body_hits == 1, str(_c21k._deep_blocks))
+check("21j2- 退完这笔之后 stats() 里不能再出现这一路（收尾那行念的是**净**被拒数）",
+      "a.cn.makepolo.com" not in str(_c21k.stats().get("deep_block", "")),
+      str(_c21k.stats().get("deep_block")))
+_c21m = _mp18.MakepoloCrawler()
+_c21m.reset_run_state()
+equip(_c21m)
+_c21m._harvest_browser_cookies = lambda: 4
+_c21m._js_tab_body = ""
+check("21j3 抄到通行证那一档：正文格必须是空的（两条出货路不许互相冒充，否则 _deep_shell_retry"
+      "会把空串当『标签已经交货』收走）",
+      _c21m._deep_shell_retry("http://a.cn.makepolo.com/x.html", 200, _MP_WAF_SHELL,
+                              lambda: "REFETCHED") == "REFETCHED"
+      and _c21m._js_tab_body == "", "")
+
+# ── 21k 机器判据：**直接跑构建前那条硬门（第 31 条）本尊**，不在这里重写一遍判据。
+#    为什么必须复用而不是抄一份：同一个族在本仓已经有过两次教训——抄一份就会长成两份口径，
+#    而改实现的人只会撞到其中一份（第 30 条的把手、`_page_key` 都是这样收拢的）。这里跑真的那份，
+#    离线开发环与构建前门禁就对「什么算串页出口」只有一套答案。
+#    判据的存在理由：同一个坑在四个站各长了一遍（麦麦只防了「重载回哪一页」、顺企网只看主机名、
+#    MIC 只拒 errordocs、gys 只断域名），靠人记是记不住的——第五个站一定会漏。
+def _load_gate31():
+    import importlib.util
+    path = HERE.parent / ".github" / "scripts" / "check_packaging_manifest.py"
+    if not path.is_file():
+        return None, f"{path} 读不到：第 31 条的门不在位（这一条不许默默跳过，要响）"
+    spec = importlib.util.spec_from_file_location("_gate31_mirror", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return None, f"门禁脚本加载失败（{type(e).__name__}: {e}）：第 31 条没有对照面"
+    return mod, ""
+
+
+_gate31, _gate31_err = _load_gate31()
+check("21k 构建前那条硬门（第 31 条）能加载——加载不到就等于离线这一侧失明",
+      not _gate31_err, _gate31_err)
+if _gate31 is not None:
+    _p31 = _gate31.check_tab_body_identity()
+    check("21k 全交付链「把标签正文交出去」的每一处出口都在案、且登记的门真在源码里",
+          not _p31, " ｜ ".join(x.splitlines()[0] for x in _p31[:4]))
+    # 反向对照：门被逐处摘掉时判据必须响（这些形状就是本次修复前的原样，取自真实源码）
+    _frag31 = {
+        "摘掉 gys 深链那道门": ('class A:\n    def _fetch_raw(self, url, deep=False):\n'
+                               '        self._goto(url, expect_domain="gys.cn")\n'
+                               '        rendered = self._html()\n'
+                               '        return rendered, "browser"\n'),
+        "摘掉麦麦取正文那道门（只把 _html() 直接交出）": ('class A:\n    def _fetch_via_tab(self, url):\n'
+                                                        '        html = self._html()\n'
+                                                        '        return html\n'),
+        "把门改成死代码后仍然交出正文（关键字在≠门在）": ('class A:\n    def _fallback_en(self, user, rec):\n'
+                                                        '        html = self._html()\n'
+                                                        '        self._parse_contact(html, rec)\n'),
+        # 这一形专门钉「污点传播只认 Call」那个盲区：门摘掉时人常写成元组转手，出口若因此从
+        # 清单上消失，表里那一行会反过来变成「过期登记」，把删门糊成「这条腿已经不取标签了」
+        "摘门时把正文经元组赋值转手（body, why = html, \"\"）": ('class A:\n    def _fetch_via_tab(self, url, rec):\n'
+                                                              '        html = self._html()\n'
+                                                              '        body, why = html, ""\n'
+                                                              '        return body\n'),
+    }
+    for _lbl31, _src31 in _frag31.items():
+        _t31 = _ast.parse(_src31)
+        # 摘门之后两种「有人在管」的样子都拦不住：①这条出口从没登记过；②登记成域名级
+        # `_goto`（表好看、源码里也真有 `_goto(`，可签名带着「这一家」的把手，域名级不够）
+        _row31 = {n: (g[0] if g else "_goto") for n, _l, _h, g in
+                  _gate31._tab_body_exits(_t31)}
+        _got31 = _gate31._tab_exit_problems("夹具", _t31, {})
+        _got31b = _gate31._tab_exit_problems("夹具", _t31, _row31)
+        check(f"21k- 反向对照（{_lbl31}）：未登记的出口必须被点出来",
+              bool(_got31), str(_got31))
+        check(f"21k-1b 反向对照（{_lbl31}）：拿域名级门糊深链出口也必须被点出来",
+              bool(_got31b), str(_got31b))
+    check("21k-2 反向对照：登记了 `_tab_body_for` 而源码里那道门已被摘掉 → 必须响",
+          bool(_gate31._tab_exit_problems(
+              "夹具", _ast.parse('class A:\n    def _fetch_via_tab(self, url):\n'
+                                 '        html = self._html()\n        return html\n'),
+              {"_fetch_via_tab": "_tab_body_for"})), "")
+    check("21k-3 反向对照：深链只登记域名级 `_goto`（签名里带着「这一家」的把手）→ 必须响",
+          bool(_gate31._tab_exit_problems(
+              "夹具", _ast.parse('class A:\n    def _fetch_page(self, user, rec):\n'
+                                 '        self._goto(url)\n        html = self._html()\n'
+                                 '        self._parse_contact(html, rec)\n'),
+              {"_fetch_page": "_goto"})), "")
+    check("21k== 反向对照：在案且门在位的两种写法都不许误响（误伤一次，判据下一次就被人当噪音划掉）",
+          _gate31._tab_exit_problems(
+              "夹具", _ast.parse('class A:\n    def _fetch_via_tab(self, url):\n'
+                                 '        body, why = self._tab_body_for(url)\n'
+                                 '        return body\n'),
+              {"_fetch_via_tab": "_tab_body_for"}) == []
+          and _gate31._tab_exit_problems(
+              "夹具", _ast.parse('class A:\n    def _iter_keyword(self, kw):\n'
+                                 '        self._goto(url, expect_domain="x.com")\n'
+                                 '        html = self._html()\n'
+                                 '        return self.parse_list(html, kw)\n'),
+              {"_iter_keyword": "_goto"}) == [], "")
+    check("21k==2 反向对照：能力探针（交出去的是判断不是正文）不进出口清单",
+          _gate31._tab_body_exits(_ast.parse('class A:\n    def _tab_page_ok(self, url):\n'
+                                             '        return bool(self._tab_real_page'
+                                             '(self._html() or ""))\n')) == [], "")
+    check("21k=== 身份门的地址判据只有一份真源：三个把手都只准定义在基类",
+          all(sum(s.count(f"def {n}(") for s in _HTTP_SRC.values()) == 1
+              for n in _gate31.TAB_ID_HANDLES),
+          str({n: [f for f in _HTTP_SRC if f"def {n}(" in _HTTP_SRC[f]]
+               for n in _gate31.TAB_ID_HANDLES}))
+print("㉑ 壳认出来之后还要能自己走过去：借标签跑挑战＋抄通行证＋标签取页＋账上看得见 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ㉒ 原因的收口只准一个把手：半截词比不说更误导
+# ════════════════════════════════════════════════════════════════════════
+# 由来（2026-11-16 第八轮实机体检报告里原样的一行）：
+#   ❌ 顺企网: 链路未通：2 页一页都没取到（最后一次：【连不上·无应答】b2b.11467.com:443｜
+#      Connection to b2b.11467.com timed out. (con）——先查出口网络/域名可达…
+# 这一句每个字都对，唯独最后被 [:70] 剪掉了半边：`(con）` 里那个右括号还是分型器补的，
+# 补完又被剪——读的人既要猜「timed out 之后还有什么」，又要猜那对括号是不是我漏看的。
+# 同一条链上有三处各写各的截断（分型器 cap、日志 [:60]/[:70]、体检报告 [:70]），⑳ 修掉的
+# 「通道入口未」只是其中一档。整族收进 `short_reason` 一个把手，并用机器判据钉住其余各处。
+_SR = cdp_base.short_reason
+_R22 = ("【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. "
+        "(connect timeout=10)")
+_s22 = _SR(_R22, 70)
+check("22a 实机那一句收口后断在标点前：括号里那段整块不保留，也不留半截词",
+      _s22.endswith("timed out.…") and "connect timeout" not in _s22
+      and _s22.startswith("【连不上·无应答】b2b.11467.com:443"), _s22)
+check("22a- 【类别】主机:端口｜ 这一截永远整段留住（上限再小也留住）：处方就写在前缀里",
+      _SR(_R22, 30).startswith("【连不上·无应答】b2b.11467.com:443｜Connection")
+      and len(_SR(_R22, 30)) > 30, _SR(_R22, 30))
+check("22b 本来就读得完的句子一个字都不改（收口不是改写，也不是加话）",
+      _SR("HTTP 403（这一家的这条资源不给看）", 48) == "HTTP 403（这一家的这条资源不给看）")
+check("22c 整句一个边界都没有时**宁可整句带省略号**，也不截半截词",
+      _SR("x" * 90, 20) == "x" * 90 + "…", _SR("x" * 90, 20)[:24])
+
+# 22d 机器性质：拿 ⑪ 那批**真实异常文本**逐档收口，断点必须落在原句的边界上
+_bad22 = []
+for _k22, _c22, _t22, _p22 in _ERR_SAMPLES:
+    _orig22 = _shape(_as_err(_c22, _t22))
+    for _cap22 in (24, 40, 60, 70, 110):
+        _r22 = _SR(_orig22, _cap22)
+        if _r22 == _orig22:
+            continue
+        _base = _r22.split("…", 1)[0]
+        if not _base or not _orig22.startswith(_base):
+            _bad22.append((_k22, _cap22, _r22))
+        elif (len(_base) < len(_orig22)
+              and _base[-1] not in cdp_base._REASON_BREAKS
+              and _orig22[len(_base)] not in cdp_base._REASON_BREAKS):
+            _bad22.append((_k22, _cap22, "断点不在边界上：" + _r22))
+        # 带类别的句子：`【…】host:port｜` 这一截在任何上限下都必须整段还在（处方在前缀里）
+        if _orig22.startswith("【") and "｜" in _orig22 and not _base.startswith(
+                _orig22.split("｜", 1)[0] + "｜"):
+            _bad22.append((_k22, _cap22, "前缀被截短：" + _base))
+check(f"22d 每一档收口的断点都落在原句的标点/词边界上（{len(_ERR_SAMPLES)} 档真异常 × 5 档上限）",
+      not _bad22, str(_bad22[:2]))
+check("22d- 收口后括号必成对（旧写法先补右括号再一刀切，实机就长出 `(con）`）",
+      all(_SR(_shape(_as_err(_c22, _t22)), _cap22).count("(") ==
+          _SR(_shape(_as_err(_c22, _t22)), _cap22).count(")")
+          for _k22, _c22, _t22, _p22 in _ERR_SAMPLES for _cap22 in (24, 40, 60, 70, 110)))
+
+# 22f 反向对照（立项依据）：同一句真异常按**旧渲染写法**收口，必须真的长出半截话
+_old22 = _shape(_as_err("ConnectTimeout", _ERR_SAMPLES[0][2]))[:70]
+check("22f 反向对照：旧写法 `整形后的句子[:70]` 在这一档上确实截出孤括号/半截词"
+      "（不响就是这条门没有存在必要）",
+      _old22.count("(") != _old22.count(")") or bool(re.search(r"[A-Za-z]{3}$", _old22)), _old22)
+
+# 22g 机器判据（同类查全）：交付链里**已经定过性的原因句子**不许再被谁自己 [:N]
+_REASON_NAMES = ("why", "shape", "reason", "last_err", "still", "msg",
+                 "_last_page_error", "last_page_error", "read_err")
+
+
+def _slice_problems(src):
+    out = []
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Subscript) and isinstance(node.slice, _ast.Slice)
+                and node.slice.lower is None
+                and isinstance(node.slice.upper, _ast.Constant)
+                and isinstance(node.slice.upper.value, int)):
+            seg = _ast.get_source_segment(src, node.value) or ""
+            if any(re.search(rf"\b{n}\b", seg) for n in _REASON_NAMES):
+                out.append(f"第 {node.lineno} 行 {seg}[:{node.slice.upper.value}]")
+    return out
+
+
+_slice_srcs = dict(_HTTP_SRC)
+_slice_srcs["ali1688_crawler.py"] = _src_a1611
+_slice_srcs["platform_live_check.py"] = _LIVE_SRC
+_slice_srcs.update({p.name: p.read_text(encoding="utf-8") for p in
+                    (HERE / "b2bcollect_gui.py", HERE / "parallel_session.py") if p.exists()})
+_hits22 = {n: v for n, s in _slice_srcs.items() if (v := _slice_problems(s))}
+check(f"22g 交付链没有一处还在对定过性的原因自己 [:N]（扫了 {len(_slice_srcs)} 份源码）",
+      not _hits22, str(_hits22))
+check("22g- 反向对照：这一族历史上写过的三种形状（日志 [:60]／报告 [:70]／深链 [:48]）都得被点出来",
+      _slice_problems('self._log(f"（{why[:60]}）")')
+      and _slice_problems('x = f"{last_err[:70]}"')
+      and _slice_problems('return self._why_short(reason)[:48]'),
+      "抓不到旧写法＝这条门下一个人只会把它整个关掉")
+check("22g== 走把手的写法与「跟原因无关的截断」都不许误响（误响＝真缺口被当成噪音划掉）",
+      not _slice_problems('self._log(short_reason(why, 60))')
+      and not _slice_problems('self._log(url[:70])')
+      and not _slice_problems('note = str(rec["备注"])[:80]'))
+
+# 22h 两份镜像（1688 独立包自己一份）：收口这件事分叉＝同一件故障两边读出两种长度。
+#     自第 ㉓ 节起真源搬到 b2bcollect_build/text_shape.py，1688 那份照旧内联，所以这里比的
+#     是**把手整段**（断点表 + 连接符表 + `_is_break` + 两个函数），与硬门 30b 同一段边界。
+_HANDLE_SRC = (_REPO / "b2bcollect_build" / "text_shape.py").read_text(encoding="utf-8")
+_REASON_BLOCK = ("# 可断的位置", "    return short_reason(s.splitlines()[0], limit)")
+check("22h 把手整段两份镜像**同字节**（只比答案比不出「断点表」被谁悄悄改短）",
+      _between(_HANDLE_SRC, *_REASON_BLOCK) == _between(_src_a1611, *_REASON_BLOCK),
+      "text_shape 与 ali1688_crawler 内联那段有差异")
+check("22h- 分型器收口两份同字节（一边截词一边不截＝两套结论）",
+      _between(_src_cdp11, "def _request_error_detail(text, cap):",
+               "    return short_reason(seg, cap)\n")
+      == _between(_src_a1611, "def _request_error_detail(text, cap):",
+                  "    return short_reason(seg, cap)\n"))
+check("22h== 两份镜像在体检报告那一档（cap=70）逐字同答",
+      all(_a16_shape(_as_err(_c22, _t22), cap=70) == _shape(_as_err(_c22, _t22), cap=70)
+          for _k22, _c22, _t22, _p22 in _ERR_SAMPLES),
+      "1688 与其余站在同一句异常上读出两种短版")
+check("22h=== cdp_base 只做转出口，不许再留第二份实现（两处把手＝下一轮分叉的起跑线）",
+      "from text_shape import" in _src_cdp11
+      and "def short_reason(" not in _src_cdp11 and "def first_line(" not in _src_cdp11
+      and cdp_base.short_reason is text_shape.short_reason
+      and cdp_base.first_line is text_shape.first_line)
+
+# 22j ⑳ 那把深链短版把手现在只做「剥重复尾巴」，截断本身交给同一个收口
+_fn22 = next(n for n in _ast.walk(_ast.parse(_src_cdp11))
+             if isinstance(n, _ast.FunctionDef) and n.name == "_why_short")
+_why_seg22 = _ast.get_source_segment(_src_cdp11, _fn22) or ""
+_own_cut22 = [n.lineno for n in _ast.walk(_fn22)
+              if isinstance(n, _ast.Subscript) and isinstance(n.slice, _ast.Slice)
+              and getattr(n.slice.upper, "id", "") == "limit"]
+check("22j 深链短版不再自己截字（截断这件事全仓只留在 short_reason 一处），剥尾巴照旧",
+      not _own_cut22 and "short_reason(" in _why_seg22 and "仅这一条深链" in _why_seg22,
+      f"自己截字的行：{_own_cut22}")
+check("22j- 实机那类长句走剥尾巴＋收口之后，「通道入口未」这种半截说法不再出现",
+      "通道入口未…" not in CdpSiteCrawler._why_short(_long := (
+          "HTTP 200（正文是 200·人机验证壳（站方 WAF 质询，页里只有「正在检测」）"
+          "·仅这一条深链，通道入口未受影响）·后面还有第二种死因要说"), 48)
+      and not CdpSiteCrawler._why_short(_long, 48).endswith("通道入口未"),
+      CdpSiteCrawler._why_short(_long, 48))
+print("㉒ 原因收口只有一个把手：断在边界上、前缀整段留住、括号不成对不许上日志 ✓")
+
+# ════════════════════════════════════════════════════════════════════════
+# ㉓ 「按字符数切一句话」这一族在交付链里有 41 处：一次修全，并把形状钉死
+# ════════════════════════════════════════════════════════════════════════
+# 由来（㉒ 之后自审，2026-11-16）：㉒ 把「已经分过型的原因」收进把手，可当时那条判据（11p）
+# 扫的是 `*_crawler.py`，而同一形状 `str(e).splitlines()[0][:120]` 还留在 cdp_base /
+# b2bcollect_gui / parallel_session / site_adapters / access_guard / channel_health /
+# local_scan / oss_pool_client 里，一共 41 处各写各的。**判据的视野比缺陷小，就等于没修**：
+# 用户最先读到的半截词，恰恰出在 GUI 告警与会话日志这些路上。
+# 现在真源是 b2bcollect_build/text_shape.py（零依赖，所以最先加载的权限自检也接得到），
+# 1688 独立包内联同一段，另两个接不到把手的位置走「整行带出」。本节钉六件事：
+#   23a 把手零依赖（不许拉 requests/selenium/cdp_base，否则 access_guard 起不来）；
+#   23b 旧形状在三个交付目录的运行时代码里归零（与硬门 30a 同视野同形状，两份判据互咬）；
+#   23c first_line 只做「先取首行、再按边界收」，空文本回空串（调用方那档 `or 类名` 照旧）；
+#   23d 夹在两个词字符中间的分隔符**不算边界**（本轮性质判据在真源自己身上抓出的三条）；
+#   23e OSS 的 XML 错误体改成「取值」而不是截断（旧写法只留下半截标签）；
+#   23f 已经收口的一句话不许再被 `[:N]` 补一刀（硬门 30a-2 的形状，chrome_driver 那处就是漏网）。
+import oss_pool_client as _opc
+_ts = text_shape
+
+# 全仓「把一句话收成一行」的把手名：调完它们又补 `[:N]` 等于把选好的边界重新劈开（23f）。
+_ts_HANDLES = {"short_reason", "first_line", "_oss_brief", "_short_err", "_why_short",
+               "_request_error_detail", "request_error_shape", "probe_block_reason",
+               "http_block_reason"}
+
+
+def _top_import_names(src):
+    tree = _ast.parse(src)
+    out = set()
+    for node in tree.body:
+        if isinstance(node, _ast.Import):
+            out |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, _ast.ImportFrom) and node.module and node.level == 0:
+            out.add(node.module.split(".")[0])
+    return out
+
+
+check("23a 把手只依赖标准库 re（access_guard 要在采集器全坏时还能说话，不能为了缩一句话拉起整套浏览器栈）",
+      _top_import_names(_HANDLE_SRC) <= {"re"}, str(sorted(_top_import_names(_HANDLE_SRC))))
+check("23a- 反向对照：把手里多 import 一个 requests 必须响（不响就是这条判据只看得到自己想到的）",
+      _top_import_names("import re\nimport requests\n") > {"re"})
+
+_BUILD_DIRS = (_REPO / "b2bcollect_build", _REPO / "ali1688_build", _REPO / "riskbird_build")
+
+
+def _reason_sources():
+    out = {}
+    for d in _BUILD_DIRS:
+        for p in sorted(d.glob("*.py")):
+            if p.name.startswith(("test_", "debug_", "probe_")):
+                continue
+            out[p] = p.read_text(encoding="utf-8", errors="replace")
+    return out
+
+
+def _zero_index(node):
+    """这个 Subscript 是不是 `[0]`：Python 3.9 起解析树里不再有 `ast.Index` 那层壳。
+    （判据只认旧壳的话，在 3.13 上一条也命中不了——23b- 那条反向对照就是为了拦住这种空壳。）"""
+    if not isinstance(node, _ast.Subscript):
+        return False
+    sl = node.slice
+    if isinstance(sl, _ast.Index):
+        sl = sl.value
+    return isinstance(sl, _ast.Constant) and sl.value == 0
+
+
+def _shape_hits(src, rel="", exempt=None):
+    """四种形状：`X.splitlines()[0][:N]`、`把手(...)[:N]`、`str(异常)[:N]`、
+    读一本收过口的原因账又切一刀（含隔着循环变量那一跳）。
+
+    为什么这里要自己实现一份而不是只调门禁：第 30 条在本仓已经 twice 拓过「只有一份实现」的
+    教训（11p 只扫 *_crawler.py、判据只认旧解析树壳）。两份独立实现对着同一份代码互咬，
+    才能拓住「门禁自己把眼睛改窄」这一种进不去的坏法；豁免表则**只取门禁那一份**（下面
+    23b== 钉两处读到的必须同一张），否则豁免会在一个地方慢慢长开。"""
+    exempt = exempt if exempt is not None else _ts_EXEMPT
+    out = []
+    tree = _ast.parse(src)
+
+    def _slices(nodes):
+        for node in nodes:
+            if not (isinstance(node, _ast.Subscript) and isinstance(node.slice, _ast.Slice)
+                    and node.slice.lower is None
+                    and isinstance(node.slice.upper, _ast.Constant)
+                    and isinstance(node.slice.upper.value, int)):
+                continue
+            yield node
+
+    # 前三形不需要同名字表，所以走全树；只有「读原因账」那一形必须按作用域算
+    # 上一版本这里错用了 `_scope_nodes(tree)`（它不下钻嵌套函数）——函数体里写的
+    # `str(e)[:60]` 全部看不见，整条判在空跑；23g- 就是拦住这一种错用
+    for node in _slices(_ast.walk(tree)):
+        base = node.value
+        if (_zero_index(base) and isinstance(base.value, _ast.Call)
+                and isinstance(base.value.func, _ast.Attribute)
+                and base.value.func.attr == "splitlines"):
+            out.append(node.lineno)
+        elif isinstance(base, _ast.Call):
+            fn = base.func.id if isinstance(base.func, _ast.Name) else getattr(base.func, "attr", "")
+            if fn in _ts_HANDLES:
+                out.append(node.lineno)
+    for node in _slices(_ast.walk(tree)):
+        base = node.value
+        if (isinstance(base, _ast.Call) and isinstance(base.func, _ast.Name)
+                and base.func.id == "str" and len(base.args) == 1
+                and isinstance(base.args[0], _ast.Name)
+                and re.fullmatch(r"(?:e|err|exc|ex|error|exception)\d*", base.args[0].id)):
+            out.append(node.lineno)
+    scopes = [tree] + [n for n in _ast.walk(tree)
+                       if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.Lambda))]
+    taint = _ts_param_taint(tree)
+    lines = src.split("\n")
+    for sc in scopes:
+        names = _reason_names_of(sc, taint.get(getattr(sc, "name", "")))
+        for node in _slices(_scope_nodes(sc)):
+            bad = set()
+            for sub in _ast.walk(node.value):
+                if (isinstance(sub, _ast.Constant) and isinstance(sub.value, str)
+                        and sub.value in _ts_LEDGER_KEYS):
+                    bad.add(sub.value)
+                elif isinstance(sub, _ast.Attribute) and sub.attr in _ts_LEDGER_ATTRS:
+                    bad.add(sub.attr)
+                elif isinstance(sub, _ast.Name) and sub.id in names:
+                    bad.add(sub.id)
+            if not bad:
+                continue
+            if (rel, lines[node.lineno - 1].strip()) in exempt:
+                continue
+            out.append(node.lineno)
+    return sorted(set(out))
+
+
+_ts_LEDGER_KEYS = frozenset({
+    "last_page_error", "last_goto_error", "block_reason", "dead_hosts", "deep_block",
+    "landing", "page_error", "nav_error", "load_error", "reason", "_ai_reason",
+    "error", "errs", "read_err", "imp_err", "last_err"})
+_ts_LEDGER_ATTRS = frozenset({"_last_page_error", "_last_goto_error", "_block_reason",
+                             "_page_error"})
+
+
+def _scope_nodes(scope):
+    """本作用域的节点，不下钻嵌套函数/lambda（名字表必须按作用域算，理由见 23i）。"""
+    out, stack = [], [scope]
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        if (isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.Lambda))
+                and n is not scope):
+            continue
+        stack.extend(_ast.iter_child_nodes(n))
+    return out
+
+
+def _reason_names_of(scope, seed=None):
+    names = set(seed or ())
+    binders = [n for n in _scope_nodes(scope)
+               if isinstance(n, (_ast.Assign, _ast.For, _ast.comprehension))]
+    for _ in range(8):
+        grew = False
+        for node in binders:
+            if isinstance(node, _ast.Assign):
+                src, dsts = node.value, list(node.targets)
+            else:
+                src, dsts = node.iter, [node.target]
+            if not any((isinstance(s, _ast.Constant) and isinstance(s.value, str)
+                        and s.value in _ts_LEDGER_KEYS)
+                       or (isinstance(s, _ast.Attribute) and s.attr in _ts_LEDGER_ATTRS)
+                       or (isinstance(s, _ast.Name) and s.id in names)
+                       for s in _ast.walk(src)):
+                continue
+            for d in dsts:
+                if d is None:
+                    continue
+                for x in _ast.walk(d):
+                    if isinstance(x, _ast.Name) and x.id not in names:
+                        names.add(x.id)
+                        grew = True
+        if not grew:
+            break
+    return names
+
+
+def _ts_param_taint(tree):
+    """把原因色跨过函数边界递一次（与硬门 `_reason_param_taint` 同一件事的另一份实现）。
+    不递这一跳就判不出「把渲染处退回旧写法」：账在调用点、刀在被调函数里（本轮立项那一行）。"""
+    fns = {}
+    for n in _ast.walk(tree):
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            fns.setdefault(n.name, n)
+    taint = {name: set() for name in fns}
+    for _ in range(8):
+        grew = False
+        for caller in fns.values():
+            names = _reason_names_of(caller, taint.get(caller.name))
+            for node in _scope_nodes(caller):
+                if not (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                        and node.func.id in fns):
+                    continue
+                callee = fns[node.func.id]
+                aarg = [a.arg for a in callee.args.posonlyargs + callee.args.args
+                        if a.arg != "self"]
+                for i, a in enumerate([x for x in node.args
+                                       if not isinstance(x, _ast.Starred)]):
+                    if i < len(aarg) and _reads25(a, names) and aarg[i] not in taint[callee.name]:
+                        taint[callee.name].add(aarg[i])
+                        grew = True
+                for kw in node.keywords:
+                    if kw.arg is None or not _reads25(kw.value, names):
+                        continue
+                    for i, an in enumerate(aarg):
+                        if an == kw.arg and an not in taint[callee.name]:
+                            taint[callee.name].add(an)
+                            grew = True
+        if not grew:
+            break
+    return taint
+
+
+def _reads25(node, names):
+    for sub in _ast.walk(node):
+        if (isinstance(sub, _ast.Constant) and isinstance(sub.value, str)
+                and sub.value in _ts_LEDGER_KEYS):
+            return True
+        if isinstance(sub, _ast.Attribute) and sub.attr in _ts_LEDGER_ATTRS:
+            return True
+        if isinstance(sub, _ast.Name) and sub.id in names:
+            return True
+    return False
+
+
+# 豁免表只取门禁那一份：两份判据共用一张表，才是「互咬」而不是「各说各话」。
+_ts_EXEMPT = frozenset(_gate31.REASON_SLICE_EXEMPT) if _gate31 is not None else frozenset()
+
+
+_rs = _reason_sources()
+_bad23 = {p.relative_to(_REPO).as_posix(): _shape_hits(t, p.relative_to(_REPO).as_posix())
+          for p, t in _rs.items()
+          if _shape_hits(t, p.relative_to(_REPO).as_posix())}
+check(f"23b 三个交付目录 {len(_rs)} 份运行时代码里，四种「按字符数切一句话」的形状都归零"
+      "（视野与硬门 30a/30a-2/30a-3/30a-4 同口径）",
+      not _bad23, str(sorted(_bad23.items())))
+check("23b- 反向对照：这一族历史上写过的四种形状（异常取首行又切 [:120]／收口结果 [:40]／"
+      "整行把手 [:90]／裸 str(异常) [:60]）都得被点出来",
+      bool(_shape_hits('x = str(e).splitlines()[0][:120]'))
+      and bool(_shape_hits('z = short_reason(err, 70)[:40]'))
+      and bool(_shape_hits('w = f"{_short_err(e)[:90]}"'))
+      and bool(_shape_hits('s = f"展开时出错：{str(exc)[:60]}"')),
+      "抓不到旧写法＝下一轮同类写法又会混进来")
+check("23b== 走把手的写法与公司名/URL 那种「本来就该限宽」的切片都不许误响",
+      not _shape_hits('log(short_reason(why, 70))')
+      and not _shape_hits('name = rec["公司名称"][:24]')
+      and not _shape_hits('u = url[:80]'))
+
+_LONG_ERR = ("ConnectionError: HTTPSConnectionPool(host='b2b.11467.com', port=443): "
+             "Max retries exceeded with url: /search/%E5%85%89%E4%BC%8F.html "
+             "(Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at "
+             "0x7f9e>, 'Connection to b2b.11467.com timed out. (connect timeout=10)'))\n"
+             "Traceback (most recent call last):\n  File \"crawl.py\", line 88, in run")
+_f23 = _ts.first_line(_LONG_ERR, 120)
+check("23c first_line 只留异常第一行（堆栈不进日志一行里），而且这一行仍按边界收口",
+      "Traceback" not in _f23 and not _f23.endswith("_") and _f23.endswith("…")
+      and "ConnectionError" in _f23, _f23[-40:])
+check("23c- 空异常文本回空串：调用方近旁那档 `or type(e).__name__` 兜底照旧成立",
+      _ts.first_line("") == "" and _ts.first_line(None) == ""
+      and _ts.first_line("   \n  ") == "")
+check("23c== 短得不用再收的句子一个字都不改（收口不是改写）",
+      _ts.first_line("ValueError: bad html", 120) == "ValueError: bad html")
+
+check("23d 夹在两个词字符中间的分隔符不算边界：b2b.11467 / com:443 / 客户库.xls / 哈利·波特 "
+      "这四处断刀都是劈词（本轮性质判据在真源自己身上抓出来的正是前三条）",
+      not _ts._is_break("b2b.11467", 4) and not _ts._is_break("11467.com:443", 10)
+      and not _ts._is_break("读不了：客户库.xlsx", 8) and not _ts._is_break("哈利·波特", 3))
+check("23d- 句子结尾的标点、括号后面的间隔号仍然是边界（否则整句一个边界都没有，"
+      "收口只能整句带省略号，等于没缩）",
+      _ts._is_break("timed out. 下一句", 10) and _ts._is_break("冷却）·仅这一条", 4)
+      and _ts._is_break("a，b", 2) and _ts._is_break("x｜y", 2))
+_R23_HOST = ("【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. "
+             "(connect timeout=10)")
+_half23 = [(n, _ts.short_reason(_R23_HOST, n)) for n in (30, 40, 60, 70, 120)
+           if re.search(r"(b2b\.|\.com:|\.cn:|客户库\.)…$", _ts.short_reason(_R23_HOST, n))]
+check("23d== 实机那一句在五档上限下都不长出 `b2b.`／`com:` 这种半截主机（要么整段在、"
+      "要么断在真边界后）", not _half23, str(_half23))
+
+_XML = ('<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code>'
+        '<Message>You have no right to access this object because of bucket acl.'
+        ' 这条资源的 ACL 不给这个 RAM 角色读，请改桶策略或者换一个可写的前缀再来一次。</Message>'
+        '<RequestId>652F0A9B1A2C3D4E5</RequestId><HostId>b2b-collect.oss-cn-shenzhen.aliyuncs.com</HostId>'
+        '<EC>0003-00000001</EC></Error>')
+_b23 = _opc._oss_brief(_XML)
+check("23e OSS 的 XML 错误体改成「取值」：Code/Message/RequestId/EC 四段都在，标签一个不留",
+      _b23.startswith("Code=AccessDenied") and "bucket acl" in _b23 and "652F0A9B1A2C3D4E5" in _b23
+      and "0003-00000001" in _b23 and "<" not in _b23, _b23)
+_old200 = _XML[:200]
+check("23e- 反向对照：旧写法 `resp.text[:200]` 在同一句上①念不出结论 ②把处置要引用的 "
+      "RequestId/EC 两格整格丢掉 ③留下一堆没合口的标签（这就是这一档立项的样子）",
+      "Code=AccessDenied" not in _old200 and "652F0A9B1A2C3D4E5" not in _old200
+      and "0003-00000001" not in _old200 and _old200.count("<") > _old200.count(">")
+      and _old200 != _XML, _old200[-30:])
+check("23e== 不是 XML（网关 HTML 错误页／空体）时退回同一个把手，空体说「空响应体」",
+      _opc._oss_brief("<html>502 Bad Gateway</html>").startswith("<html>")
+      and _opc._oss_brief("") == "（空响应体）"
+      and _opc._oss_brief("plain text") == "plain text"
+      and _opc._oss_brief("x" * 400).endswith("…"), _opc._oss_brief("x" * 400)[-14:])
+
+_cd_src = (_REPO / "riskbird_build" / "chrome_driver.py").read_text(encoding="utf-8")
+_f_short = next(n for n in _ast.walk(_ast.parse(_cd_src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "_short_err")
+_short_seg = _ast.get_source_segment(_cd_src, _f_short) or ""
+check("23f 第三支口径（接不到把手的独立包）＝整行带出：_short_err 只取首行、不按字符数切",
+      "splitlines()[0]" in _short_seg and not re.search(r"splitlines\(\)\[0\]\[:\d", _short_seg),
+      _short_seg)
+check("23f- 它的四个调用点也不许再补一刀（历史漏网就是 `{_short_err(e)[:90]}`：看着像走了口径，"
+      "实际又把边界劈开）",
+      not re.search(r"_short_err\([^)]*\)\[:\d", _cd_src),
+      "仍有 `把手(...)[:N]`")
+check("23f== 全仓「一句话收口」的实现只有两份：text_shape 与 1688 内联那份（第三支不产生新实现）",
+      sum("def short_reason(" in t for t in _rs.values()) == 2
+      and sum("def first_line(" in t for t in _rs.values()) == 2,
+      "又长出第三份断句实现＝下一轮分叉的起跑线")
+# ── 23g 同一族的第三种写法：`str(异常)[:N]`（本轮同类查全拓出来的最大一族：28 处）。
+#    为什么 23b 一开始看不见它：那条判据钉的是 `splitlines()[0][:N]` 这个形状，而
+#    `local_scan.py`/`access_guard.py`/riskbird 那几份写的是 `f"…失败：{str(e)[:60]}"`，
+#    没有「先取首行」那一跳。症状完全相同（异常里最长的恰恰是尾巴上的 Session info/路径），
+#    但形状不同就一路混过。口径按位置分两档：能接到把手的 b2bcollect 走 `first_line`，
+#    另两个独立包与三目录同名拷贝就整行带出（后者只能整行，因为抄一份断句进去就又长出第三份实现）。
+_TS_EXC_SHAPE = re.compile(r"str\((?:e|err|exc|ex|error|exception)\d*\)\[:\d")
+
+
+def _code_only(text):
+    """剔掉「不会执行到的一句话」之后的代码：整行注释与文档字符串（函数/模块级那句裸文本）。
+    这一族的注释与说明里本来就写着旧写法作为对比（cdp_base 那段「怎么读日志」的文档里就有一句
+    `except: return str(e)[:60]`），当代码扫会一直响。但不能反过来把句子都剔了：
+    带尾注释的真语句、以及 f-string 内联的写法都饶不了（见 23g==）。
+    只按 AST 剔「表达式语句就是一个字面串」那一段，不拿正则猜，也不依赖某个 Python 版本的
+    f-string 分词（旧版本里整条 f-string 是一个 STRING token，抹字符串就连同真代码一起抹了）。"""
+    lines = text.splitlines()
+    for n in _ast.walk(_ast.parse(text)):
+        if (isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Constant)
+                and isinstance(n.value.value, str)):
+            for i in range(n.lineno, (n.end_lineno or n.lineno) + 1):
+                if 1 <= i <= len(lines):
+                    lines[i - 1] = ""
+    return "\n".join(ln for ln in lines if not ln.lstrip().startswith("#"))
+
+
+check("23g 真树上 `str(异常)[:N]` 这一形归零：三个交付目录的运行时代码里一处也不留",
+      not any(_TS_EXC_SHAPE.search(_code_only(t)) for t in _rs.values()),
+      sorted(p.name for p, t in _rs.items() if _TS_EXC_SHAPE.search(_code_only(t))))
+check("23g== 只剔「不会执行的句子」：带尾注释的真语句、f-string 内联、以及写在字符串表达式里"
+      "的拼接都饶不了（不然下一个人只要把旧写法往注释里一写，这一判就集体失灵）",
+      bool(_TS_EXC_SHAPE.search(_code_only('x = f"败：{str(e)[:60]}"  # 旧写法')))
+      and not _code_only('# 这里写的是 str(e)[:60]\nx = 1\n').count("str(e)")
+      and not _code_only('def f():\n    """旧写法是 str(e)[:60]"""\n    return 1\n').count("str(e)")
+      and bool(_TS_EXC_SHAPE.search(_code_only('y = str(err1)[:80]')))
+      and bool(_TS_EXC_SHAPE.search(_code_only('def f(e):\n    raise RuntimeError("展平出错：%s" % str(e)[:60])\n'))))
+check("23g- 反向对照：这一形喂进去必须响（上一轮的判据正是只认 splitlines 那一跳，所以一路空跑）",
+      len(_shape_hits('def f(e):\n    return f"展开时出错：{str(e)[:80]}"\n')) == 1
+      and len(_shape_hits('def f(err1):\n    return str(err1)[:60]\n')) == 1)
+check("23g== 走 first_line 的写法、以及对**非异常变量**的 str(...)[:N] 都不许误响"
+      "（误响就会把界面那些「公司名限宽」的写法一起拖进噪音）",
+      not _shape_hits('def f(e):\n    return first_line(e, 80)\n')
+      and not _shape_hits('def f(row):\n    return str(row)[:20]\n')
+      and not _shape_hits('def f(x):\n    return str(x.get("地址"))[:30]\n'))
+_ls23 = next(t for p, t in _rs.items() if p.name == "local_scan.py")
+_qz23 = next(t for p, t in _rs.items() if p.name == "qizhidao_crawler.py")
+check("23g=== 两档口径各自落地：b2bcollect 那几处真改成了 first_line，riskbird 那几处真整行带出"
+      "（只查「形状归零」不够：两处都归零但其中一处是被删掉了调用，读报告的人就又看不见原因了）",
+      _ls23.count("first_line(e, 80)") == 2
+      and 'f"展开时出错：{first_line(e, 80)}"' in _ls23
+      and _ls23.count("first_line(e, 60)") == 6
+      and sum(t.count("first_line(e,") for t in _rs.values()) >= 12
+      and "{str(e)" not in _qz23 and "{e}" in _qz23,
+      f"local_scan={_ls23.count('first_line(e,')} qizhidao 仍带 str={{}}：{_qz23.count('{str(e)')}")
+
+# ── 23h 同一族的第四种写法：读一本**已经收过口的原因账**又切一刀。这一形是本轮立项的那一行：
+#    第十一轮实机报告里 `深链被拒: china.makepolo.com 42 次（…仅这一条深链，通道入）`。
+#    记账处（cdp_base._note_deep_block）走的是 short_reason(reason, 120)，渲染处当年写的是
+#    str(v[1])[:46]：两刀之间隔了一层字典与一层循环变量，三种已有形状都认不出来。
+_EXEMPT_LINE = 'on_progress(f"正在识别 {it[\'display\'][:30]}…", len(items), len(files))'
+_SRC23H = ('def f(st, files, items):\n'
+           '    _deep = st.get("deep_block") or {}\n'
+           '    for h, v in _deep.items():\n'
+           '        yield f"{h} {v[0]} 次（{str(v[1])[:46]}）"\n')
+check("23h 反向对照：实机那一行的原形（原因落进字典→循环变量接手→[:46]）必须被点出来",
+      len(_shape_hits(_SRC23H)) == 1, _shape_hits(_SRC23H))
+check("23h- 同一个位置改成走把手必须安静（不安静就是判据在挡所有切片，而不是只挡切原因）",
+      not _shape_hits(_SRC23H.replace("str(v[1])[:46]", "short_reason(v[1], 46)")))
+check("23h== 不隔那一跳的两种直读也得响：账键 s.get('last_page_error')[:40] 与账属性 "
+      "self._block_reason[:40]（channel_health / cdp_base 本轮各修掉一处）",
+      len(_shape_hits('def f(s):\n    return s.get("last_page_error")[:40]\n')) == 1
+      and len(_shape_hits('def f(self):\n    return f"仍在等验证（{self._block_reason[:40]}）"\n')) == 1)
+check("23h=== 数字账与名单账不许被误伤：同一本 stats 里 st.get('pages')[:3] / "
+      "st.get('kw_filtered')[:2] 都不是「一句原因」，判据不能见到 stats 就响",
+      not _shape_hits('def f(st):\n    return st.get("pages")[:3] + st.get("kw_filtered", {})[:2]\n'))
+check("23h4 豁免表只钉原文：同一行把上限从 30 改成 31（换了衣服）必须又响，"
+      "否则豁免表会长成谁也不敢删的抽屉",
+      len(_shape_hits('def g(items, files):\n    x = items.get("reason")\n    for it in items["deep_block"]:\n'
+                      f'        {_EXEMPT_LINE}\n', "b2bcollect_build/local_scan.py")) == 0
+      and len(_shape_hits('def g(items, files):\n    x = items.get("reason")\n    for it in items["deep_block"]:\n'
+                          f'        {_EXEMPT_LINE.replace("[:30]", "[:31]")}\n',
+                          "b2bcollect_build/local_scan.py")) == 1)
+_bad23_nox = {p.name: _shape_hits(t, p.relative_to(_REPO).as_posix(), exempt=frozenset())
+              for p, t in _rs.items()}
+check("23h5 今天那两处豁免都是「真的在用」：把表抽掉必须恰好报出那两处（一处也没报＝这一判在空跑）",
+      sorted(n for n, v in _bad23_nox.items() if v) == ["local_scan.py", "parallel_session.py"],
+      str({n: v for n, v in _bad23_nox.items() if v}))
+
+# ── 23i 名字传播必须按**函数作用域**算。本轮第一版实现把整份文件共用一张名字表，
+#    实跑报出 127 处、其中真缺陷只 7 处：`r`/`e`/`rec` 这些短名在某个函数里确实接过原因，
+#    就把原因色传染到全仓同名变量。误报到这个量级，下一条门就会被人整个关掉。
+_SRC23I = ('def a(st):\n'
+           '    r = st.get("reason")\n'
+           '    return r[:20]\n'           # 真缺陷：切的确实是原因
+           'def b(rows):\n'
+           '    for r in rows:\n'
+           '        yield r["display"][:20]\n')   # 同名但与本档无关
+check("23i 同一个短名在两个函数里：只有真接过原因账那一个要响（作用域不传染）",
+      len(_shape_hits(_SRC23I)) == 1, _shape_hits(_SRC23I))
+
+# ── 23j 行为对拍（不只是形状）：探针把这两行收成了 `_host_reason_line`，夹具直接喂一句
+#    真死因看它断在哪里。旧写法在这一句上切出的是「通道入口未受」——那半截词看着像能说清。
+_WHY23J = ("【被拦停】站点返 200 但整页正文是人机验证壳（WAF 质询）·仅这一条深链，"
+           "通道入口未受影响")
+_line23j = _live._host_reason_line("深链被拒", {"china.makepolo.com": [42, _WHY23J]})
+check("23j 探针那一行现在把 46 个字的上限断在真标点上：不出现「通道入」这种半截词、括号成对、以省略号收尾",
+      "通道入" not in _line23j and _line23j.endswith("仅这一条深链…）")
+      and _line23j.count("（") == _line23j.count("）")
+      and "42 次（" in _line23j, _line23j)
+check("23j- 反向对照：旧写法 str(原因)[:46] 在同一句上真的长出半截词（这就是立项那一行）",
+      _WHY23J[:46].endswith("未受") and "通道入口未受" in _WHY23J[:46], _WHY23J[:46])
+check("23j== 两处渲染（落点不符 / 深链被拒）共用同一支把手，不各写一遍"
+      "（只问会执行的代码：把手那段说明里本来就写着旧写法 `str(v[1])[:46]` 作为反面样本）",
+      _LIVE_SRC.count("_host_reason_line(") == 3
+      and 'f"{h} {v[0]} 次（{short_reason(v[1], limit)}）"' in _LIVE_SRC
+      and not re.search(r"str\(v\[1\]\)\[:\d", _code_only(_LIVE_SRC)),
+      _LIVE_SRC.count("_host_reason_line("))
+
+# ── 23k 两份判据互咬：离线自己那份与构建前那条硬门，必须在同一份代码上给同一个答案，
+#    并且视野里必须包含实机报告的渲染层（那行半截词就是从那里念出来的）。
+check("23k 硬门本尊今天对真实树报 0 条（与 23b 同一答案；两份判据互咬，不是一个抄一个）",
+      _gate31 is None or _gate31.check_reason_one_handle() == [],
+      str((_gate31.check_reason_one_handle() if _gate31 else _gate31_err)[:1]))
+_g23rs = _gate31._runtime_reason_sources() if _gate31 is not None else {}
+check("23k- 硬门视野包含 debug/platform_live_check.py：按目录名把它排除掉，"
+      "就等于「报告那一行永远没人判」——上一轮正是这样过的绿",
+      any(str(k).endswith("debug/platform_live_check.py") for k in _g23rs),
+      len(_g23rs))
+check("23k== 离线这一份的视野不比硬门窄：两份读到的文件集要一致（窄一份就是那一族没人判）",
+      _gate31 is None or {p.name for p in _rs} <= {Path(k).name for k in _g23rs},
+      sorted({p.name for p in _rs} - {Path(k).name for k in _g23rs}))
+
+# ── 23l 隔着函数那一跳（本轮立项那一行的完整形状）：账在**调用点**、刀在**被调函数**里。
+#    只按单个作用域算名字时，被调那个函数的形参永远接不到原因色——于是把渲染处退回
+#    `str(v[1])[:46]` 也不会响。「修好了但判据看不见回归」与「没修」对下一个人是同一件事。
+_SRC23L = ('def _host_line(title, mapping, limit=46):\n'
+           '    return f"  {title}: " + "｜".join(f"{h} {v[0]} 次（{str(v[1])[:46]}）"\n'
+           '                                   for h, v in (mapping or {}).items())\n'
+           'def fmt(st):\n'
+           '    _deep = st.get("deep_block") or {}\n'
+           '    return _host_line("深链被拒", _deep)\n')
+check("23l 跨函数那一跳要接到原因色：账在调用点、刀在被调函数里，退回旧写法要响",
+      len(_shape_hits(_SRC23L)) == 1, _shape_hits(_SRC23L))
+check("23l- 同一份代码改成走把手不许响（传染只认「这是一句原因」，不是「这是个参数」）",
+      not _shape_hits(_SRC23L.replace("str(v[1])[:46]", "short_reason(v[1], limit)")))
+check("23l== 调用点交的是数字账时不许传染（把 mapping 认成原因＝见参数就响的开始）",
+      not _shape_hits(_SRC23L.replace('st.get("deep_block")', 'st.get("pages")')))
+check("23l=== 两份实现对同一份跨函数代码同答案（一份响一份不响＝互咬没咬上）",
+      _gate31 is None or (
+          len([p for p in _gate31.check_reason_one_handle(
+              files={_REPO / "b2bcollect_build/zz_23l.py": _SRC23L})
+               if "按字符数切了一刀" in p]) == 1
+          and not [p for p in _gate31.check_reason_one_handle(
+              files={_REPO / "b2bcollect_build/zz_23l.py":
+                     _SRC23L.replace("str(v[1])[:46]", "short_reason(v[1], limit)")})
+               if "按字符数切了一刀" in p]))
+print("㉓ 半截词这一族：41 处独立写法收进一个把手，形状与性质两边都有人钉 ✓")
+
+# ══════════════════════════════════════════════════════════
+# ㉔ 导航层的事实必须留痕：「这一跳根本没发出去」不许被说成「站点在拦」，
+#    更不许被说成「挑战跑完了」
+# ══════════════════════════════════════════════════════════
+# 由来（2026-11-14~16 实机马可波罗）：借标签那条腿连着三轮 0/3，日志说的是「这条腿帮不上忙」，
+# 听起来像站点不给看。本机差分实测把方向整个翻了过来：同一台机器起两个 headless Chrome，
+# 只差 `--disable-features=HttpsUpgrades,…` 这一个开关——A 组连 example.com 的明文 http 都被
+# `net::ERR_BLOCKED_BY_CLIENT` 拦掉，B 组全部正常（马可波罗的深链本来就是 http，它的 https
+# 证书连自己域名都不覆盖）。根因在浏览器参数那一侧，而 `Page.navigate` **不抛异常**：它把
+# Chrome 的原话放在响应的 errorText 里，页面落在 `chrome-error://chromewebdata/`。旧写法把
+# 整份响应丢掉，于是那一格唯一的留痕没了，下游只能猜——猜错的代价是把预算喂给一条不走的路。
+# 这一节钉四件事：① errorText 必须被接住并按类别记账；②「没加载出来」那句必须念 Chrome 原话，
+# 且**方向只由分型器给**（分不上型就说还不知道）；③ 结论句不许把推测当观察（「挑战跑完了」）；
+# ④ 上面三条的判据本身要被反证一次。
+CHROME_ERR_URL = "chrome-error://chromewebdata/"
+_WANT24 = "http://a.cn.makepolo.com/contact_us.html"
+
+
+def _mk24():
+    """每一档都要一枚干净的爬虫：`_js_tab_tries` 的上限是 3，共用就会把后几档判成「预算用满」。"""
+    c = _mp18.MakepoloCrawler()
+    c.reset_run_state()
+    _e, lg = equip(c)
+    c._pace_before_request = lambda *a, **k: None
+    c.open_verify_page = lambda url="": True
+    c._release_verify_tab = lambda: None
+    c._harvest_browser_cookies = lambda: 0
+    return c, lg
+
+
+def _nav24(c, err_text, host="a.cn.makepolo.com"):
+    """把「Page.navigate 回了 errorText」这件事按真路径演一遍（不直接写那一格，写就验不到）。"""
+    c._cur_fetch_host = host
+    c._send = lambda method, params=None, timeout=None: {"result": {"errorText": err_text}}
+    return c._cdp_navigate(_WANT24)
+
+
+# 24a errorText 必须被接住，而且只有「连接阶段」那几档才进熔断账
+_c24 = _mk24()[0]
+check("24a Page.navigate 被拦时不抛异常：errorText 被接进 _last_nav_error（这件事唯一的留痕）",
+      _nav24(_c24, "net::ERR_BLOCKED_BY_CLIENT")
+      and _c24._last_nav_error == "net::ERR_BLOCKED_BY_CLIENT", _c24._last_nav_error)
+check("24a- 「浏览器拦下这一跳」不进主机熔断账：那是环境/参数问题，拉黑这台等于自己掐活路",
+      not _c24._dead_strikes, str(_c24._dead_strikes))
+_c24 = _mk24()[0]
+_nav24(_c24, "net::ERR_TIMED_OUT")
+check("24b 连不上那一档（net::ERR_TIMED_OUT）照旧进熔断账：真连不上时再开几次标签也白开",
+      _c24._last_nav_error == "net::ERR_TIMED_OUT"
+      and _c24._dead_strikes.get("a.cn.makepolo.com") == 1, str(_c24._dead_strikes))
+_c24 = _mk24()[0]
+_nav24(_c24, "net::ERR_BLOCKED_BY_CLIENT")
+_c24._send = lambda method, params=None, timeout=None: {"result": {}}
+_c24._cdp_navigate(_WANT24)
+check("24b- 反向对照：本轮导航干净时那一格必须被清空（留着上一家的原因，界面就会张冠李戴——"
+      "类别看着很像，方向却是错的）", _c24._last_nav_error == "", _c24._last_nav_error)
+
+# 24c 那句「没加载出来」：只陈述事实，方向交给类别词
+for _lbl24, _err24, _exp24 in [
+        ("浏览器把明文 http 升级失败后拦掉", "net::ERR_BLOCKED_BY_CLIENT", "浏览器拦下这一跳"),
+        ("证书 CN 不覆盖域名", "net::ERR_CERT_COMMON_NAME_INVALID", "TLS握手失败"),
+        ("站点在这条深链上直接回错误码", "net::ERR_HTTP_RESPONSE_CODE_FAILURE", "站点回了错误状态码"),
+        ("连接阶段没应答", "net::ERR_TIMED_OUT", "连不上·无应答")]:
+    _line24 = cdp_base.tab_load_failed_line(CHROME_ERR_URL, _err24)
+    check(f"24c {_lbl24}：Chrome 的原话被念出来，类别在前（{_exp24}）→ {_line24[:56]}",
+          "没加载出来" in _line24 and _exp24 in _line24, _line24)
+check("24c- 拿不到错误码时只说「页里没写着错误码」，绝不挑一个方向下结论",
+      cdp_base.tab_load_failed_line(CHROME_ERR_URL, "") .count("【") == 0
+      and "没写着错误码" in cdp_base.tab_load_failed_line(CHROME_ERR_URL, ""),
+      cdp_base.tab_load_failed_line(CHROME_ERR_URL, ""))
+check("24c-2 errorText 空着才退回错误页正文里那个码（复用旧标签/站方自己导航时正是这一档）",
+      "DNS解析不了" in cdp_base.tab_load_failed_line(
+          CHROME_ERR_URL, "", "This page isn’t valid. net::ERR_NAME_NOT_RESOLVED"),
+      cdp_base.tab_load_failed_line(CHROME_ERR_URL, "", "x net::ERR_NAME_NOT_RESOLVED y"))
+check("24c-3 反向对照：errorText 与正文里的码不一致时**只信本轮这次导航的**（上一跳留下的旧码"
+      "会把方向说反），且这一次是浏览器拦而不是连不上",
+      "浏览器拦下这一跳" in cdp_base.tab_load_failed_line(
+          CHROME_ERR_URL, "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_TIMED_OUT")
+      and "连不上" not in cdp_base.tab_load_failed_line(
+          CHROME_ERR_URL, "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_TIMED_OUT"),
+      cdp_base.tab_load_failed_line(CHROME_ERR_URL, "net::ERR_BLOCKED_BY_CLIENT",
+                                    "net::ERR_TIMED_OUT"))
+check("24c== 反向对照：正常页面上这一句必须完全闭嘴（把每一页都说成没加载出来＝新话术变成噪音）",
+      cdp_base.tab_load_failed_line(_WANT24, "", "net::ERR_TIMED_OUT in the text") == "",
+      cdp_base.tab_load_failed_line(_WANT24, "", "x"))
+
+# 24d 身份门那一侧：落到 Chrome 错误页时不许再交出一句没有方向的「标签不在本站」
+_c24d, _lg24d = _mk24()
+_nav24(_c24d, "net::ERR_BLOCKED_BY_CLIENT")
+_c24d._current_url = lambda: CHROME_ERR_URL
+_c24d._html = lambda: "<html>net::ERR_BLOCKED_BY_CLIENT</html>"
+_ok24d, _why24d = _c24d._tab_page_is(_WANT24)
+check("24d 身份门拒收这一页，并把 Chrome 原话一起交出去（上游拿到的不再是看不出方向的那句）",
+      _ok24d is False and "没加载出来" in _why24d and "浏览器拦下这一跳" in _why24d, _why24d)
+_c24d._current_url = lambda: "http://a.cn.makepolo.com/index.html"
+_c24d._last_nav_error = "net::ERR_BLOCKED_BY_CLIENT"
+_ok24d2, _why24d2 = _c24d._tab_page_is(_WANT24)
+check("24d- 反向对照：地址落在别家/首页那一档才是「串页」，**不许**被这轮的错误码污染成"
+      "「这一跳没发出去」（两种处方互斥）",
+      _ok24d2 is False and "标签落的不是这一页" in _why24d2 and "没加载出来" not in _why24d2,
+      _why24d2)
+
+# 24e 结论句：借标签那条腿撞上 chrome-error 时，三种方向各说各的话，且谁都不许说「跑完了」
+_NAV24_CASES = (
+    ("浏览器把这一跳拦下了", "net::ERR_BLOCKED_BY_CLIENT", "浏览器拦下这一跳",
+     "是浏览器没能把这一跳发出去"),
+    ("站点回错误状态码", "net::ERR_HTTP_RESPONSE_CODE_FAILURE", "站点回了错误状态码",
+     "站点在这条深链上直接回了错误码"),
+    ("连接阶段没应答", "net::ERR_TIMED_OUT", "连不上·无应答", "这一台连不上"),
+    ("认不出的错误码", "net::ERR_BRAND_NEW_THING", "未分型", "还没分上型"),
+)
+for _lbl24, _err24, _kind24, _tail24 in _NAV24_CASES:
+    _c24e, _lg24e = _mk24()
+    _nav24(_c24e, _err24)
+    _c24e._current_url = lambda: CHROME_ERR_URL
+    _c24e._html = lambda: "<html>whoops</html>"
+    _got24e = _c24e._solve_js_shell_via_tab(_WANT24, allow_body=True)
+    check(f"24e {_lbl24}：这条腿老实回 False，并把方向按类别说清（{_kind24}→{_tail24}）",
+          _got24e is False and any(_tail24 in m for m in _lg24e)
+          and any("没加载出来" in m and _kind24 in m for m in _lg24e),
+          str(_lg24e[-2:]))
+    check(f"24e- {_lbl24}：这一档一条通行证都没抄到、正文也没被交出（账上不许出现假命中）",
+          _c24e._js_tab_hits == 0 and _c24e._js_tab_body_hits == 0
+          and not _c24e._js_tab_body, str(_c24e._js_tab_body[:40]))
+    check(f"24e== {_lbl24}：没有任何一句把这一跳说成「挑战跑完了」（推测当观察＝这一族的根因）",
+          not any("跑完了" in m for m in _lg24e), str([m for m in _lg24e if "跑完" in m]))
+_c24f, _lg24f = _mk24()
+_c24f._html = lambda: _MP_REAL_HOME
+_c24f._current_url = lambda: _WANT24
+_c24f._harvest_browser_cookies = lambda: 3
+check("24f 反向对照：标签里真是那一页时这条照旧出货，新加的判据不许把正路误伤",
+      _c24f._solve_js_shell_via_tab(_WANT24) is True and _c24f._js_tab_hits == 1
+      and not any("没加载出来" in m for m in _lg24f), str(_lg24f[-1:]))
+_c24g, _lg24g = _mk24()
+_c24g._html = lambda: _MP_WAF_SHELL
+_c24g._current_url = lambda: _WANT24
+check("24g 壳一直没退时说的还是「那页还是质询壳：挑战没跑完」（这一档本来就没被误伤，钉住它别改坏）",
+      _c24g._solve_js_shell_via_tab(_WANT24) is False
+      and any("还是质询壳" in m and "挑战没跑完" in m for m in _lg24g)
+      and not any("没加载出来" in m for m in _lg24g), str(_lg24g[-1:]))
+
+# 24h 机器判据：直接跑构建前那条硬门里「导航证据」的本尊，判据自己也过一遍反证
+_gate31b, _g31err = _load_gate31()
+check("24h 门禁脚本可加载（拿不到就等于离线这一侧对导航证据失明）", not _g31err, _g31err)
+if _gate31b is not None:
+    _src24 = _HTTP_SRC["cdp_base.py"]
+    _t24 = _ast.parse(_src24)
+    check("24h 真源上三处证据都在、结论句只陈述观察",
+          not _gate31b._tab_nav_evidence_problems("cdp_base.py", _t24, strict_names=True),
+          " ｜ ".join(x.splitlines()[0] for x in
+                      _gate31b._tab_nav_evidence_problems("cdp_base.py", _t24,
+                                                           strict_names=True)[:3]))
+    _clone24 = {
+        "把 errorText 那一行摘掉（回到本轮修复前的原样）":
+            _src24.replace('err = str(((resp or {}).get("result") or {})'
+                           '.get("errorText") or "").strip()',
+                           'err = ""'),
+        "把「这一跳加载出来没有」那一问摘掉":
+            _src24.replace("                failed = self._tab_load_failed()\n"
+                           "                if failed:\n                    break\n", ""),
+        "把错误页判据改成就地重抄字面量":
+            _src24.replace("if not any(m in cur for m in CHROME_ERROR_URL_MARKS):",
+                           'if "chrome-error://" not in cur:'),
+        "结论句退回「挑战跑完了」":
+            _src24.replace('"   ⚠ 标签里那页已经不是质询壳了，这条腿却还是帮不上：既没抄到本站通行证"',
+                           '"   ⚠ 挑战跑完了，这条腿还是帮不上：既没抄到本站通行证"'),
+    }
+    for _lbl24, _s24 in _clone24.items():
+        _got24 = _gate31b._tab_nav_evidence_problems("克隆", _ast.parse(_s24), strict_names=True)
+        check(f"24h- 反向对照（{_lbl24}）：这一族退回去时判据必须响",
+              _s24 != _src24 and bool(_got24),
+              "克隆没生效（替换的锚点对不上真源）" if _s24 == _src24 else str(_got24))
+    # 24h-2 上面 24e 的行为对照要成立，那四句 tail 必须**各自独立**在源码里：两条路共用一句
+    # 话术、或者某一句被复制了两遍，24e 的 `any(...)` 就会蒙过去。这一条钉的是判据的地基。
+    _tails24 = [t for _l, _e, _k, t in _NAV24_CASES]
+    _fn24 = next(n for n in _ast.walk(_t24) if isinstance(n, _ast.FunctionDef)
+                 and n.name == "_solve_js_shell_via_tab")
+    _flat24 = _ast.unparse(_fn24)
+    check("24h-2 四种方向各有一句自己的话术（24e 的行为对照靠这一条才不是蒙对的）",
+          all(_flat24.count(t) == 1 for t in _tails24) and len(set(_tails24)) == len(_tails24),
+          {t: _flat24.count(t) for t in _tails24})
+print("㉔ 导航层的事实必须留痕：「这一跳没发出去」不许被说成站点在拦，更不许被说成挑战跑完了 ✓")
+
+# ══════════════════════════════════════════════════════════
+# ㉕ 无联系方式责任分档 + 砍单记名 + 借标签归还：三本「只累加、从不外读」的账
+# ══════════════════════════════════════════════════════════
+# 由来（2026-11-16 第十轮实机，同一个下午现形的三件事）：
+#   ① 世界工厂网「电梯导轨」推到 10 家、四项口径只剩 4 家，报告按旧口径写「大头连四项
+#      联系方式都没有，先修取号通路再谈换词」。真翻页面 `联系电话` 那一栏写着 `-`（站方已把
+#      号码改成「联系客服登记」才给）：通路没坏，这句谎却把人支使去改本来正确的解析代码。
+#      → 「无联系方式」必须按**是谁的责任**分档（档位与定序只由 NC_KIND_ORDER 定义，
+#        现共六档：miss/unknown/no_page/hidden/blank/no_slot）。
+#   ② 三个 ❌ 全站都只说「该复核判定口径」，可复核的人手上没有名单——一句无法执行的处方。
+#      → 砍单必须**记名**（每词每阶段留样本）。
+#   ③ 六份纯 HTTP 站把 `close_browser` 覆写成空壳 `return None`，降级取页时借来的标签一路
+#      留到收工之后（用户的共享 Chrome 里挂着一枚 maimaib2b 的商铺页没人认领）。
+#      → 借来的标签必须还，而且「关失败」不许被 `except: pass` 抹平成「已经收工」。
+# 本节先按**行为**对拍（判据喂真 HTML、把手走真路径、收尾走真 crawl），再由 25g 直接调用
+# 构建前第 32 条硬门的本尊：现网必须全绿，而每一族退回修复前的样子都必须响。
+
+# ── 25a 分档判据本体：只看「页面上那一栏自己怎么写」，不看任何站点的解析结果 ──
+_SLOT_BLANK = ('<table><tr><td>联系电话</td><td>-</td>'
+               '<td>公司地址</td><td>中山市小棚镇XX路 8 号</td></tr></table>')
+_SLOT_HIDDEN = '<div class="tel">联系电话：</div><div class="v">点击登录后查看号码</div>'
+_SLOT_KEFU = '<p>手机号码：<span>如需号码请联系客服登记</span></p>'
+_SLOT_MISS = '<dl><dt>手机号码</dt><dd>13800138000</dd></dl>'
+_SLOT_ENGLISH = ('<div class="contact">Tel: 0086-760-88886666</div>'
+                 '<div>Mobile: 13800138000</div>'
+                 '<script>var t = document.getElementsByTagName("a");</script>')
+_SLOT_BOTH = '<p>联系电话：-</p><p>手机号码：13900001111</p>'
+_SLOT_OTHER = '<tr><th>联系电话</th><th>面议</th></tr>'
+
+for _lbl25, _html25, _want25 in (("栏位在、值写着 `-`（世界工厂网今天的样子）", _SLOT_BLANK, "blank"),
+                                 ("点击查看才给号", _SLOT_HIDDEN, "hidden"),
+                                 ("栏位写着「联系客服登记」才给号", _SLOT_KEFU, "hidden"),
+                                 ("栏位在、值里本有号码（我们没抽走）", _SLOT_MISS, "miss"),
+                                 ("只有英文标签", _SLOT_ENGLISH, "no_slot"),
+                                 ("值是一段别的文字（不作证据）", _SLOT_OTHER, "no_slot"),
+                                 ("一页都没这一栏", "<p>公司简介</p>", "no_slot"),
+                                 ("空页", "", "no_slot")):
+    _k25, _e25 = cdp_base.contact_slot_state(_html25)
+    check(f"25a {_lbl25} → 判进 {_want25}", _k25 == _want25, f"实得 {_k25}｜{_e25}")
+check("25a- 两栏并存时先认我们自己的锅（有一处该取到没取到，把话说成「站方没给」就会让那条真缺陷隐身）",
+      cdp_base.contact_slot_state(_SLOT_BOTH)[0] == "miss", cdp_base.contact_slot_state(_SLOT_BOTH))
+check("25a-2 证据里带着原文那一小段（只报档位不报原文，下一轮想复查还得自己重翻页面）",
+      "联系电话" in cdp_base.contact_slot_state(_SLOT_BLANK)[1]
+      and "-" in cdp_base.contact_slot_state(_SLOT_BLANK)[1],
+      cdp_base.contact_slot_state(_SLOT_BLANK)[1])
+check("25a-3 英文标签不入表是**事实**而不是口味：Tel/mobile 进了表，viewport、"
+      "getElementsByTagName 这类脚本字节全被判成「一栏写着电话」，整页证据当场失真",
+      cdp_base.contact_slot_state(_SLOT_ENGLISH)[1] == "", cdp_base.contact_slot_state(_SLOT_ENGLISH)[1])
+# 号码只认栏位后面那一小段窗口：拿整页任意一处号码当证据，就是把「这一家」的账记到邻居家
+_W25 = cdp_base.contact_slot_state('<p>联系电话</p>' + "厂" * 200 + "13800138000")
+check("25a-4 号码离栏位超过一屏就不算这一栏的证据（窗口只取 120 字）",
+      _W25[0] != "miss", str(_W25))
+_dirty25 = "<" + "y" * 400 + ">13800138000"
+check("25a-5 剥标签的小刀限长：模板里把 `<` 写在文字里的脏页不许被一口吞掉整段正文",
+      "13800138000" in cdp_base.CONTACT_SLOT_TAG_RE.sub(" ", _dirty25), _dirty25[:24])
+
+# ── 25b 证据一次一清：后一页（更具体的那一页）覆盖前一页，空串不覆盖 ──
+_c25 = B2b168Crawler()
+_e25, _lg25 = equip(_c25)
+_c25._detail_html = ""
+check("25b _keep_detail 原样交回正文（写成链式才拦得住「取了不用」那一族：接在哪一步都不改流程）",
+      _c25._keep_detail(_SLOT_BLANK) == _SLOT_BLANK and _c25._detail_html == _SLOT_BLANK)
+_c25._keep_detail("")
+check("25b- 空串不许覆盖已有证据（非200/空页时把上一腿的证据抹掉，分档就退成没证据的 unknown）",
+      _c25._detail_html == _SLOT_BLANK, _c25._detail_html[:24])
+_c25._keep_detail(None)
+check("25b-2 连 None 也不许覆盖，并原样交回（helper 不许把取页结果改成另一种东西）",
+      _c25._detail_html == _SLOT_BLANK and _c25._keep_detail(None) is None)
+_c25._keep_detail(_SLOT_HIDDEN)
+check("25b-3 后一次取页覆盖前一次（多数站先商铺首页、后专用联系页，要问的是最后那一页）",
+      _c25._detail_html == _SLOT_HIDDEN)
+
+# ── 25c 分档记账：无证据时宁可说 unknown/no_page，也不许借 no_slot 把「我们没看」说成「页面没这一栏」──
+_c25.reset_run_state() if hasattr(_c25, "reset_run_state") else None
+_c25._nc_kinds, _c25._nc_evidence, _c25._detail_html = {}, {}, ""
+_c25._keep_detail(_SLOT_BLANK)
+_c25._note_no_contact()
+check("25c 有正文时按页面自己那句话定性（blank 就是站方这一家没登，不是我们的缺陷）",
+      _c25._nc_kinds == {"blank": 1} and "联系电话" in _c25._nc_evidence["blank"],
+      str(_c25._nc_evidence))
+check("25c- 证据用完即清：下一家不许拿着上一家的栏目当自己的分档凭据（串页说谎同一族）",
+      _c25._detail_html == "", _c25._detail_html[:24])
+_c25._note_no_contact()
+check("25c-2 拿不到正文时单列一档 unknown（不借 no_slot 的名义）：判不了就说判不了",
+      _c25._nc_kinds.get("unknown") == 1 and "没把正文留给" in _c25._nc_evidence["unknown"],
+      str(_c25._nc_evidence))
+_c25._nc_kinds, _c25._nc_evidence = {}, {}
+_c25.NO_DETAIL_EVIDENCE = "本站详情只取列表卡字段，本来就没有单店正文可判"
+_c25._note_no_contact()
+check("25c-3 类里声明过理由的站走 no_page（本站的设计边界），不许冒充 unknown（把手没接）："
+      "两者长相一样、处方相反——给已声明详情不取页的站开「先接把手」的处方是执行不了的谎",
+      _c25._nc_kinds == {"no_page": 1}
+      and "只取列表卡字段" in _c25._nc_evidence["no_page"], str(_c25._nc_evidence))
+del _c25.NO_DETAIL_EVIDENCE
+_c25._nc_kinds, _c25._nc_evidence = {}, {}
+_c25._note_no_contact()
+check("25c-3b 同一个把手、同一条无正文路径，把声明摘掉就必须换一档（no_page 不是给所有站兜底的"
+      "退路：它只在类里真写过理由时才成立）",
+      _c25._nc_kinds == {"unknown": 1}, str(_c25._nc_kinds))
+_c25._nc_kinds, _c25._nc_evidence, _c25._detail_html = {}, {}, ""
+_c25._keep_detail(_SLOT_BLANK)
+_c25._note_no_contact()
+_c25._keep_detail('<p>联系电话：</p><p>暂无</p>')
+_c25._note_no_contact()
+check("25c-4 每一档只留第一条证据（这一格是给人抽看「那句话到底是不是站方写的」，留全量就变没人读的日志）",
+      _c25._nc_kinds["blank"] == 2 and "-" in _c25._nc_evidence["blank"], str(_c25._nc_evidence))
+
+# ── 25d 砍单记名：只有一本计数时那句处方（「该复核判定口径」）是不可执行的 ──
+_c25.reset_run_state()
+for _i25 in range(6):
+    _c25._note_early_skip("电梯导轨", f"样本公司{_i25}")
+check(f"25d 每个词只留前 {cdp_base.CUT_SAMPLE_CAP} 家（这本账给人抽看不是名单导出，再多界面那一行就没人读）",
+      len(_c25.kw_early_names["电梯导轨"]) == cdp_base.CUT_SAMPLE_CAP,
+      str(_c25.kw_early_names))
+check("25d- 但计数照旧全量（样本只是给人看的，预算与差分靠的是数）",
+      _c25.kw_early["电梯导轨"] == 6, str(_c25.kw_early))
+_c25._note_early_skip("玻璃钢格栅", "")
+check("25d-2 名字传空就不进样本（不许用空字符串占住一个名额，那一档变成「有名无实」）",
+      _c25.kw_early_names.get("玻璃钢格栅", []) == [], str(_c25.kw_early_names))
+check("25d-3 没名单就返回空串——调用方照常拼，不许编一句空括号上日志",
+      _c25._cut_note(_c25.kw_early_names, "玻璃钢格栅", "早过滤") == "", "")
+_long25 = "中山市古镇镇长鸿电梯导轨配件厂、第二制造厂分厂中山部长长"
+_c25._note_detail_filter("电梯导轨", _long25)
+_s25 = _c25.kw_filtered_names["电梯导轨"][0]
+check(f"25d-4 名字里找到边界就按边界收口（上限 {cdp_base.CUT_NAME_CAP} 字）",
+      len(_s25) <= cdp_base.CUT_NAME_CAP + 2 and _long25.startswith(_s25.rstrip("…"))
+      and "、" not in _s25.rstrip("…"), _s25)
+_nobreak25 = "中山部长长长长长长长长长长长长长长长长长长长长长长长长有限公司分厂"
+_c25b = B2b168Crawler()
+equip(_c25b)
+_c25b._cut_sample(_c25b.kw_early_names, "电梯导轨", _nobreak25)
+check("25d-4b 一个边界都没有时宁可整名带出：半截公司名比长名字更误导"
+      "（复核的人拿着半截名根本搜不到这家，收口把手的契约写在 text_shape.short_reason）",
+      _c25b.kw_early_names["电梯导轨"] == [_nobreak25 + "…"], str(_c25b.kw_early_names))
+check("25d-5 零产出归因那句必须带着名单（报告说「该复核」，复核的人手上必须有几家名字可看）",
+      "样本公司0" in _c25._kw_zero_reason("电梯导轨"), _c25._kw_zero_reason("电梯导轨"))
+
+# ── 25e 说词只有一个把手：日志/GUI 看板/体检报告三处取同一张表 ──
+check("25e 空账返回空串（调用方据此**不说**这一格，不许编一句「无异常」顶上去）",
+      cdp_base.nc_kinds_text({}) == "" and cdp_base.nc_kinds_text(None) == "")
+_t25 = cdp_base.nc_kinds_text({"blank": 3, "miss": 1}, {"miss": "手机号码→13800138000"})
+check("25e- 渲染按固定序而不是字典序：没这张表就会排出 blank 在前，读的人第一眼就是「不是缺陷」",
+      _t25.index("栏位里本有号码") < _t25.index("站方这一家没登"), _t25)
+_all25 = cdp_base.nc_kinds_text({k: 1 for k in cdp_base.NC_KIND_ORDER})
+# 每一档必需自带一句自己的处方。这张表**故意不**从 NC_KIND_LABEL 自动推导：它是人写的
+# 「这一档该干什么」的清单，而 NC_KIND_ORDER 是产品侧的档位表。两表不一致就是
+# 「新增了一档而处方没跟上」，那一档会落回最后一句模棱两可的话（25e-4 管这个）。
+_EACH25 = {
+    "miss": "该修代码",
+    "unknown": "先接 _keep_detail",
+    "no_page": "详情不取页",
+    "hidden": "点击查看",
+    "blank": "不是缺陷",
+    "no_slot": "无从判定",
+}
+check(f"25e-2 每一档都带着自己的处方（{'／'.join(cdp_base.NC_KIND_ORDER)} 共 "
+      f"{len(cdp_base.NC_KIND_ORDER)} 档各说一句，合成一档就只剩一句模棱两可的话）",
+      set(_EACH25) == set(cdp_base.NC_KIND_ORDER)
+      and all(any(w in seg for seg in _all25.split("｜")) for w in _EACH25.values())
+      and _all25.count("1 家") == len(cdp_base.NC_KIND_ORDER),
+      f"档位表={set(cdp_base.NC_KIND_ORDER) ^ set(_EACH25)}｜渲染={_all25}")
+check("25e-3 miss 那一档把证据一并念出来（只报档位不报原文，下一轮复查还得自己重翻一百页）",
+      "证据" in _t25 and "13800138000" in _t25, _t25)
+check("25e-4 档位表里 miss/unknown 都在站方那两档前面（先认自己的锅这条纪律写在渲染层而不是靠自觉），"
+      "设计边界那一档（no_page）排在站方三档之前",
+      cdp_base.NC_KIND_ORDER[:2] == ("miss", "unknown")
+      and cdp_base.NC_KIND_ORDER.index("no_page")
+      < min(cdp_base.NC_KIND_ORDER.index(k) for k in ("hidden", "blank", "no_slot")),
+      str(cdp_base.NC_KIND_ORDER))
+check("25e-5 no_page 与 unknown 的处方不许合成一句（两者长相一样、动作相反：一个是本站已声明的"
+      "设计边界、一个是漏接把手；第十轮实机就是给已声明详情不取页的站开了张「先接把手」的假处方）",
+      "_keep_detail" not in cdp_base.NC_KIND_LABEL["no_page"]
+      and "_keep_detail" in cdp_base.NC_KIND_LABEL["unknown"], str(cdp_base.NC_KIND_LABEL))
+
+# ── 25f 收尾走真循环：从 crawl_detail 到那一行日志，中间不许有一环靠注释保证 ──
+class _Fix25(B2b168Crawler):
+    """最小夹具站：列表直接给出、详情只回一页正文，但**记账、分档、收尾渲染全走基类真路**。"""
+    PLATFORM_SLUG = "fix25"
+    PLATFORM_NAME = "夹具站"
+    STUBS = ({"公司名称": "夹具电梯导轨有限公司", "memberId": "a1"},
+             {"公司名称": "夹具玻璃钢格栅厂", "memberId": "a2"})
+    PAGE = _SLOT_BLANK
+    KEEP = True
+
+    def _is_session_alive(self):
+        return True
+
+    def start_browser(self):
+        return True
+
+    def _iter_keyword(self, kw):
+        self.stat_pages = 1
+        self.stat_listed = len(self.STUBS)
+        for _s in self.STUBS:
+            yield dict(_s)
+
+    def crawl_detail(self, stub):
+        rec = self._base_rec(stub)
+        rec["公司名称"] = stub.get("公司名称", "")
+        if self.KEEP:
+            self._keep_detail(self.PAGE)
+        rec["状态"] = "无联系方式"
+        return rec
+
+
+def _run25(page, keep=True):
+    c = _Fix25()
+    c.incremental = False
+    c.resume = False
+    c.KEEP, c.PAGE = keep, page
+    _e, lg = equip(c)
+    c.crawl(["电梯导轨"])
+    return c, [m for m in lg if "本轮账目" in m]
+
+_c25f, _acc25 = _run25(_SLOT_BLANK)
+check("25f 收尾那一行真念出了分档（不只在 stats() 里累加——「只累加从不外读」正是通路账那一族的原病）",
+      len(_acc25) == 1 and "无联系方式分档" in _acc25[0] and "站方这一家没登" in _acc25[0],
+      _acc25[-1][:120] if _acc25 else "没打出账目行")
+check("25f- 两家用同一页版式时也只留一条证据，但家数记两笔（否则「这一档几家」这句话没凭据）",
+      _c25f._nc_kinds == {"blank": 2}, str(_c25f._nc_kinds))
+_c25g, _acc25g = _run25(_SLOT_MISS)
+check("25f-2 miss 那一档进了账目行时，说词必须是「该修代码」（站方藏着与我们的锅不许合用一句话）",
+      any("栏位里本有号码" in m and "该修代码" in m for m in _acc25g), _acc25g[-1][:120] if _acc25g else "")
+_c25h, _acc25h = _run25("", keep=False)
+check("25f-3 忘了接证据的站，那一行只能说「本站没留正文证据（判不了）」——把「我们没看」说成"
+      "「页面没这一栏」就是同一方向的谎换个壳",
+      any("没留正文证据" in m for m in _acc25h), _acc25h[-1][:120] if _acc25h else "")
+_c25i = _Fix25()
+_c25i.incremental = _c25i.resume = False
+_e25i, _lg25i = equip(_c25i)
+_c25i._landing_mismatch = {"b2b168.com": [3, "落在别人家的 showroom"]}
+_c25i.crawl(["电梯导轨"])
+check("25f-4 落点不符那一笔在正常出货的轮次里也要露出来（旧口径只进 stats()，全局 grep 不到一处渲染）",
+      any("落点不符" in m and "b2b168.com 3 次" in m for m in _lg25i),
+      [m for m in _lg25i if "本轮账目" in m][-1][:120])
+check("25f-5 stats() 里三格同名字段同路进出（界面与体检器读的就是这一份，少一格那一处就回到只看总数）",
+      {"nc_kinds", "nc_evidence", "nc_note"} <= set(_c25f.stats())
+      and _c25f.stats()["nc_note"] == cdp_base.nc_kinds_text(_c25f._nc_kinds, _c25f._nc_evidence),
+      str(sorted(k for k in _c25f.stats() if k.startswith("nc_"))))
+
+# ── 25g 借标签必须还：行为、六站覆写、以及「关失败」不许被抹平 ──
+import shared_chrome as _sc25                                       # noqa: E402
+_closed25 = []
+_real_close25 = _sc25.close_tab
+
+
+def _rec25(port, tab):
+    _closed25.append((port, tab))
+
+
+_sc25.close_tab = _rec25
+try:
+    _c25r = B2b168Crawler()
+    _e, _lg25r = equip(_c25r)
+    _c25r.pin_tab_id = "TAB-1"
+    _c25r._borrowed_tab = True
+    check("25g 收工把借来的那枚标签真的关掉了（只改标志位不算关：共享 Chrome 里还挂着它）",
+          _c25r.close_browser() is None and _closed25 == [(_c25r.port, "TAB-1")], str(_closed25))
+    check("25g- 归还后 pin_tab_id 与借用标志一起复位（只清一个，下一轮就会去关一枚早已不存在的标签）",
+          _c25r.pin_tab_id == "" and _c25r._borrowed_tab is False, str(_c25r.pin_tab_id))
+    _closed25.clear()
+    _c25r.pin_tab_id = ""
+    check("25g-2 手里没标签时一声不响地过（纯 HTTP 站平时不碰浏览器，不许把共享 Chrome 拉起来陪跑）",
+          _c25r.release_tab("收工") is True and not _closed25, str(_closed25))
+
+    def _boom(port, tab):
+        raise OSError("连接被拒：Chrome 已经不在了")
+
+    _sc25.close_tab = _boom          # 下面六站那一圈要重新装回记录器，别把「关失败」带进对照
+    _c25r.pin_tab_id = "TAB-2"
+    _ok25r = _c25r.release_tab("过验证")
+    check("25g-3 关失败必须开口并回 False（旧写法 except: pass 把「没关掉」抹平成「已经收工」）",
+          _ok25r is False and any("归还标签没成功" in m and "TAB" not in m for m in _lg25r)
+          and any("过验证" in m for m in _lg25r), str(_lg25r[-2:]))
+    check("25g-4 归还没成功时仍然把 pin 清掉（不清就会被下一轮当成「还有一枚」反复关）",
+          _c25r.pin_tab_id == "")
+    # 六站覆写逐个跑一遍：这一族的病根正是「基类对了，覆写那一份是空壳」
+    import aipage_crawler as _m25a                                   # noqa: E402
+    import gi_crawler as _m25g                                       # noqa: E402
+    import maimaib2b_crawler as _m25m                                # noqa: E402
+    import solarbe_crawler as _m25s                                  # noqa: E402
+    import makepolo_crawler as _m25p                                  # noqa: E402
+    for _cls25 in (_m25a.AipageCrawler, _m25g.GiCrawler, _m25m.Maimaib2bCrawler,
+                   _c25r.__class__, _m25s.SolarbeCrawler, _m25p.MakepoloCrawler):
+        _sc25.close_tab = _rec25
+        _closed25.clear()
+        _c25s = _cls25()
+        equip(_c25s)
+        _c25s.pin_tab_id = f"TAB-{_c25s.PLATFORM_SLUG}"
+        _want25g = (f"TAB-{_c25s.PLATFORM_SLUG}",)
+        _c25s.close_browser()
+        check(f"25g-5 {_cls25.__name__} 的 close_browser 覆写不是空壳（本轮实机用户的 Chrome 里"
+              f"就挂着一枚 maimaib2b 的商铺页）",
+              _closed25 == [(_c25s.port, _want25g[0])] and _c25s.pin_tab_id == "",
+              str(_closed25))
+finally:
+    _sc25.close_tab = _real_close25
+
+# ── 25j 归还链路的「事实」必须一层层往上交：最底层报不了，上面每一句都是空话 ──
+# 25g 验的是「上层肯不肯说」，这一节验的是「上层拿不拿得到可说的东西」：
+# 旧写法里 shared_chrome.close_tab 把异常吞成 pass，cdp_base.release_tab 那句
+# 「关失败必须开口」就挂在一条永不执行的分支上——行为夹具不抽掉这一层，就一直照不到。
+_real_ls25j, _real_lpt25j = _sc25.local_session, _sc25.list_page_targets
+
+
+class _Resp25j:
+    def __init__(self, status=200, text="Target is closing"):
+        self.status_code, self.text = status, text
+
+
+class _Local25j:
+    """假的本机控制面：可按脚本回响应，也可把请求直接抛挂。"""
+
+    def __init__(self, script=None, boom=None):
+        self.script, self.boom, self.urls = list(script or []), boom, []
+
+    def get(self, url, timeout=0):
+        self.urls.append(url)
+        if self.boom is not None:
+            raise self.boom
+        return self.script.pop(0) if self.script else _Resp25j()
+
+    def put(self, url, timeout=0):
+        return self.get(url, timeout)
+
+
+try:
+    _sc25.local_session = lambda: _Local25j()
+    _sc25.list_page_targets = lambda port=9255: []
+    check("25j-1 没给 target_id 时不许回空串（什么都没关却说「已还完」是同一句谎）",
+          "没关" in (_sc25.close_tab(9255, "") or ""), repr(_sc25.close_tab(9255, "")))
+
+    _sc25.local_session = lambda: _Local25j(boom=ConnectionError("127.0.0.1 拒绝连接"))
+    _why25j = _sc25.close_tab(9255, "TAB-X")
+    check("25j-2 关闭请求没送达时必须把原因交上去（旧写法：except: pass 把这里抹平）",
+          "关闭请求没送达" in _why25j and "ConnectionError" in _why25j, repr(_why25j))
+
+    _sc25.local_session = lambda: _Local25j()
+    check("25j-3 关完再查一次列表，查不到才算真的关掉（Chrome 对不存在的 target 也回 200，"
+          "只信回执就会被它骗成成功）",
+          _sc25.close_tab(9255, "TAB-GONE") == "", repr(_sc25.close_tab(9255, "TAB-GONE")))
+    _sc25.list_page_targets = lambda port=9255: [{"id": "TAB-ALIVE", "url": "https://x/"}]
+    _why25j2 = _sc25.close_tab(9255, "TAB-ALIVE")
+    check("25j-4 回执 200 但标签还在列表里时不许当作成功（带上回执给人看）",
+          "标签仍在列表里" in _why25j2 and "HTTP 200" in _why25j2, repr(_why25j2))
+
+    # release_tabs：拿到的事实必须点名说出来，而且不能因为一枚没关就少关下一枚
+    _at25j, _lg25j = [], []
+
+    def _fake_close25j(port, tid):
+        _at25j.append(tid)
+        return "标签仍在列表里（关闭回执 HTTP 200）" if tid == "A" else ""
+
+    _real_close_keep = _sc25.close_tab
+    _sc25.close_tab = _fake_close25j
+    try:
+        _sc25.list_page_targets = lambda port=9255: [{"id": "A"}, {"id": "B"}, {"id": "C"}]
+        _sc25.release_tabs(["A", "B"], 9255, lambda m: _lg25j.append(m))
+        check("25j-5 收工批次里每一枚都要试过（没关掉那一枚不许把计数减掉，否则下一枚被连带不关）",
+              _at25j == ["A", "B"], str(_at25j))
+        check("25j-6 批次收工里没关掉的那一枚必须点名（旧写法连 log 参数都从不调用）",
+              len(_lg25j) == 1 and "A" in _lg25j[0] and "手动" in _lg25j[0], str(_lg25j))
+    finally:
+        _sc25.close_tab = _real_close_keep
+
+    # cdp_base.release_tab 必须消费返回值：只看异常接不到事实，等于白修了下面那一层
+    _c25j = B2b168Crawler()
+    _e25j, _lg25jc = equip(_c25j)
+    _real_close_keep2 = _sc25.close_tab
+    _sc25.close_tab = lambda port, tid: "标签仍在列表里（关闭回执 HTTP 200）"
+    try:
+        _c25j.pin_tab_id = "TAB-9"
+        _ok25j = _c25j.release_tab("收工")
+        check("25j-7 最底层回「没关掉」时 release_tab 必须回 False 并把那句话念完"
+              "（只听异常的实现会在这里直接报成功）",
+              _ok25j is False and any("归还标签没成功" in m and "标签仍在列表里" in m for m in _lg25jc),
+              str(_lg25jc[-1:]))
+    finally:
+        _sc25.close_tab = _real_close_keep2
+    _c25k = B2b168Crawler()
+    _e25k, _lg25kc = equip(_c25k)
+    _sc25.close_tab = lambda port, tid: ""
+    try:
+        _c25k.pin_tab_id = "TAB-10"
+        check("25j-8 最底层确认关掉时不编多余告警（日志里只留事实，不留「可能」）",
+              _c25k.release_tab("收工") is True and not _lg25kc, str(_lg25kc))
+    finally:
+        _sc25.close_tab = _real_close_keep2
+finally:
+    _sc25.local_session, _sc25.list_page_targets = _real_ls25j, _real_lpt25j
+
+# ── 25h 机器判据：直接跑构建前第 32 条硬门的本尊，退回修复前的每一族都必须响 ──
+_g32, _g32err = _load_gate31()
+check("25h 门禁脚本可加载（加载不到就等于离线这一侧对三本账失明）", not _g32err, _g32err)
+if _g32 is not None:
+    check("25h0 现网真源上第 32 条全绿（后面每一档反向对照都要拿它当对照面）",
+          not _g32.check_no_contact_accountability(),
+          " ｜ ".join(x.splitlines()[0] for x in _g32.check_no_contact_accountability()[:4]))
+    _F32 = _g32._runtime_reason_sources()
+    _T32 = {rel: (_g32.ROOT / rel).read_text(encoding="utf-8", errors="replace")
+            for rel in _g32.NC_READERS}
+    check(f"25h0- 第 32 条的视野不是空集合（读了 {len(_F32)} 份交付链源码）",
+          len(_F32) > 40, str(len(_F32)))
+
+    def _mut32(rel, old, new, cnt=1):
+        """把真源里的一段换回修复前的样子，再让门禁本尊判一次（锚点对不上就当场响）。
+
+        `cnt=-1` 那一档是「这一族每处都要改回去」的写法：把手在体检器里被 import 了一次、
+        调用了若干次，只改第一处就还是「代码没改干净」而不是「判据看不见」。"""
+        f, t, hit = dict(_F32), dict(_T32), False
+        for p in list(f):
+            if str(p).endswith(rel) and old in f[p]:
+                f[p] = f[p].replace(old, new, cnt)
+                hit = True
+        if rel in t and old in t[rel]:
+            t[rel] = t[rel].replace(old, new, cnt)
+            hit = True
+        assert hit, f"25h 夹具锚点对不上真源（{rel}）：源码改了形状而夹具还在替旧代码作证"
+        return _g32.check_no_contact_accountability(f, t)
+
+    _MUT32 = {
+        "把 aipage 详情那页的证据摘掉（回到只往 rec 里填字段）":
+            ("b2bcollect_build/aipage_crawler.py",
+             "self._keep_detail(", "self._keep_detail_x("),
+        "把基类早过滤的传名改回只传词（「该复核」又变成不行使的处方）":
+            ("b2bcollect_build/cdp_base.py",
+             'self._note_early_skip(kw, e.get("公司名称", ""))', "self._note_early_skip(kw)"),
+        "把手本体只 += 计数不写名单":
+            ("b2bcollect_build/cdp_base.py",
+             "self._cut_sample(self.kw_early_names, kw, name)", "pass"),
+        "stats() 不再透出 nc_note":
+            ("b2bcollect_build/cdp_base.py", '"nc_note": nc_kinds_text(', '"nc_note_x": nc_kinds_text('),
+        "收尾那一行退回只报「无联系方式 N」的总数":
+            ("b2bcollect_build/cdp_base.py", "｜无联系方式分档：", "｜无联系方式合计："),
+        "体检器自己拼说词（不走唯一把手，import 与调用点一起摘）":
+            ("debug/platform_live_check.py", "nc_kinds_text", "nc_say_it_my_way", -1),
+        "界面红牌那一行不读分档（两处取值一起改回去才叫不读）":
+            ("b2bcollect_build/channel_health.py", "nc_note", "nc_note_unused", -1),
+        "close_browser 又覆写成空壳":
+            ("b2bcollect_build/makepolo_crawler.py",
+             'self.release_tab("收工")', "self._borrowed_tab = False"),
+        "两份镜像只改一个字（1688 那一包不会自己报分叉）":
+            ("ali1688_build/ali1688_crawler.py", "站方藏着（点击查看", "站方藏着呢（点击查看"),
+        "镜像标记被改名（对拍两边都抓不到，必须响而不是默默相等）":
+            ("ali1688_build/ali1688_crawler.py", "# ── [NC-BLOCK-END]", "# ── [NC-BLOCK-EDN]"),
+        # ↓ 32g 本轮新立的那一问：最底层重新吞掉失败时，判据必须自己看到
+        "shared_chrome.close_tab 又把失败吞成 pass（最底层一吞，上面每一句「关失败必须开口」都变死分支）":
+            ("b2bcollect_build/shared_chrome.py",
+             '    except Exception as e:\n        return f"关闭请求没送达（{type(e).__name__}）：'
+             '{first_line(e, 80)}"',
+             '    except Exception:\n        pass'),
+    }
+    for _lbl32, _case32 in _MUT32.items():
+        _got32 = _mut32(*_case32)
+        check(f"25h- 反向对照（{_lbl32}）：这一族退回去时第 32 条必须响",
+              bool(_got32), "克隆没生效或判据看不见这一族" if not _got32 else "")
+    check("25h-2 换掉镜像那一个字，响的确实是「两份逐字节对拍」那一条（而不是被别的判据顺便拦下）",
+          any("分叉" in p for p in _mut32("ali1688_build/ali1688_crawler.py",
+                                          "站方藏着（点击查看", "站方藏着呢（点击查看")),
+          str(_mut32("ali1688_build/ali1688_crawler.py",
+                     "站方藏着（点击查看", "站方藏着呢（点击查看")[:1]))
+    # 正面形状：判据只拦「没说」，不拦「怎么说」——三种合格答案都必须安静
+    _SYN25 = {
+        "抽象桩（基类模板方法，它一页都不取）": (
+            "class A:\n    def crawl_detail(self, stub):\n"
+            '        """子类实现。"""\n        raise NotImplementedError\n', False),
+        "具体实现取了页却没留证据": (
+            "class A:\n    def crawl_detail(self, stub):\n        return self._parse(self._html())\n", True),
+        "证据在它调下去的第二条腿里（沿调用闭包找，不看它在第几层）": (
+            "class A:\n    def crawl_detail(self, stub):\n        return self._one(stub)\n"
+            "    def _one(self, stub):\n        return self._two()\n"
+            "    def _two(self):\n        return self._keep_detail(self._html())\n", False),
+        "确实没有单店正文可判，但写了理由": (
+            'class A:\n    NO_DETAIL_EVIDENCE = "详情不取页"\n'
+            "    def crawl_detail(self, stub):\n        return {}\n", False),
+        "砍单把手按关键字传名": (
+            "class A:\n    def _go(self, kw, rec):\n"
+            '        self._note_early_skip(kw, name=rec["公司名称"])\n', False),
+        "自己 quit 掉会话（不叫 release_tab 也算归还）": (
+            "class A:\n    def close_browser(self):\n        self._driver.quit()\n", False),
+        # ↓ 32g 按**动作**认人：改名、抽 helper、Selenium 写法都拦不住判据的视线
+        "归还动作换了名字（只按函数名登记表发判时这一形就能逃掉）": (
+            "class A:\n    def tidy_up(self):\n        try:\n"
+            "            self._close_own_tab()\n        except Exception:\n            pass\n", True),
+        "Selenium 写法 driver.close() 失败被吞（不写 close_browser 也一样要响）": (
+            "class A:\n    def _nav(self):\n        try:\n"
+            "            self.driver.close()\n        except Exception:\n            pass\n", True),
+        "文件 close 失败被吞（f.close() 不是关标签，不许误伤）": (
+            "class A:\n    def _read_cfg(self):\n        try:\n            f = open('x')\n"
+            "            f.close()\n        except Exception:\n            pass\n", False),
+        "归还放在 finally、except 只包导航（那一格不负责关标签，不许误伤）": (
+            "class A:\n    def _nav(self):\n        try:\n            self.driver.get('u')\n"
+            "        except Exception:\n            pass\n        finally:\n"
+            "            self._close_own_tab()\n", False),
+    }
+    for _lbl25s, (_src25s, _want_fire) in _SYN25.items():
+        _f25s = dict(_F32)
+        _f25s[_P12("b2bcollect_build/zz_fixture25_crawler.py")] = _src25s
+        _got25s = [p for p in _g32.check_no_contact_accountability(_f25s, dict(_T32))
+                   if "zz_fixture25" in p]
+        check(f"25h-3 「{_lbl25s}」期望{'响' if _want_fire else '不响'}"
+              f"（误伤一次，下一个真漏的人就会被当成噪音放过去）",
+              bool(_got25s) is _want_fire, str(_got25s[:1]))
+    # 视野断了不许报绿：三个 *_build 全落空时，「每一路都留了证据」这句话没任何含义
+    _empty32 = _g32.check_no_contact_accountability({}, {})
+    check("25h-4 反向对照：视野空集合时这一条必须响（在空集合上报绿等于这一条门没跑）",
+          _empty32 and "一份源码都没读到" in _empty32[0], str(_empty32[:1]))
+    # 两份镜像从离线这一侧也对拍一次（不依赖门禁脚本能跑）
+    _blk25a = _g32._nc_block_of(_T32["b2bcollect_build/cdp_base.py"])
+    _blk25b = _g32._nc_block_of(_T32["ali1688_build/ali1688_crawler.py"])
+    check(f"25h-5 两份分档判据逐字节相同（{len(_blk25a)} 字）：1688 是独立交付包不能 import，"
+          f"只能内联一份拷贝，而拷贝漂移时没人会发现",
+          _blk25a == _blk25b and len(_blk25a) > 1000, f"{len(_blk25a)} ↔ {len(_blk25b)}")
+    # 32h 本轮新立的那一问：NC-BLOCK 只圈住判据（常量与纯函数），而 no_page/unknown
+    # 这一分叉住在**方法体**里。只改镜像那一侧的方法体时判据段依旧逐字节相同，
+    # 1688 那一路就会悄悄退回「把已声明的设计边界说成忘了接把手」。
+    _h32 = _mut32("ali1688_build/ali1688_crawler.py",
+                  '            kind = "no_page" if declared else "unknown"',
+                  '            kind = "unknown"')
+    check("25h-6 镜像里把 no_page 分叉退回「一律 unknown」必须响在「行为指纹」那一条，"
+          "而不是误响在逐字节对拍那一条（这一形里判据段确实没动）",
+          any("行为不同" in p for p in _h32) and not any("分叉" in p for p in _h32),
+          str([p.splitlines()[0][:60] for p in _h32]))
+    check("25h-7 32h 不许误伤「注释不一样」：两份镜像的 docstring 本就该按读者写两份，"
+          "只改注释时行为指纹那一条必须安静（否则下一次真分叉会混在一堆噪音里）",
+          not any("行为不同" in p for p in _mut32(
+              "ali1688_build/ali1688_crawler.py", "按责任分档的唯一把手",
+              "按责任分档的唯一把手本体（注释换个说法）")),
+          str([p.splitlines()[0][:60] for p in _mut32(
+              "ali1688_build/ali1688_crawler.py", "按责任分档的唯一把手",
+              "按责任分档的唯一把手本体（注释换个说法）")]))
+    _kd32 = _mut32("ali1688_build/ali1688_crawler.py",
+                   '        if isinstance(html, str) and html:\n            self._detail_html = html',
+                   '        self._detail_html = html')
+    check("25h-8 另一个把手（_keep_detail）在镜像里退回「空串也覆盖」同样要响："
+          "非200/空页那一腿会把上一腿的证据抹掉，分档退成没证据的 unknown",
+          any("_keep_detail" in p and "行为不同" in p for p in _kd32),
+          str([p.splitlines()[0][:60] for p in _kd32]))
+
+# ── 25i 归因层：旧那句谎不许复活，每一档给的是不同的处方 ──
+import importlib.util as _ilu25                                      # noqa: E402
+_spec25 = _ilu25.spec_from_file_location("plc25", HERE.parent / "debug" / "platform_live_check.py")
+_plc25 = _ilu25.module_from_spec(_spec25)
+_spec25.loader.exec_module(_plc25)
+_ADVICE25 = {
+    "miss": ("先修我们的解析", "不该换成「站方没给」"),
+    "unknown": ("crawl_detail 接上 _keep_detail", "不该把没看说成没栏"),
+    "no_page": ("这不是漏接把手", "处方与 unknown 相反：已声明详情不取页的站只能加一条详情腿"),
+    "hidden": ("换通路", "不该让人去改本来正确的解析代码"),
+    "blank": ("换词或换站", "不是通路缺陷"),
+    "no_slot": ("取的是不是这一家的页", "先查串页"),
+}
+check("25i-0 处方表与档位表必须是同一集合（产品侧新增一档而这里没跟上，那一档就会落回"
+      "最后那句模棱两可的话——正是本节要消灭的那句谎）",
+      set(_ADVICE25) == set(cdp_base.NC_KIND_ORDER),
+      f"只差集={set(_ADVICE25) ^ set(cdp_base.NC_KIND_ORDER)}")
+for _k25i, (_want25i, _note25i) in _ADVICE25.items():
+    _adv25 = _plc25._nc_advice({"nc_kinds": {_k25i: 7}})
+    check(f"25i {_k25i} 那一档给的是自己的处方（{_want25i}）——{_note25i}",
+          _want25i in _adv25, _adv25)
+check("25i- 旧那句谎不得复活：把四项全空一律归给「取号通路」（世界工厂网今天就能拆穿它）",
+      not any("先修取号通路再谈换词" in _plc25._nc_advice({"nc_kinds": {k: 1}})
+              for k in _ADVICE25), str(_plc25._nc_advice({"nc_kinds": {"blank": 1}})))
+check("25i-2 一本账都没时不许编处方（说不出就闭嘴，这一格归详情失败/通路账去看）",
+      "详情失败" in _plc25._nc_advice({"nc_kinds": {}}) or "通路账" in _plc25._nc_advice({}),
+      _plc25._nc_advice({}))
+check("25i-3 体检报告那一行念的是唯一把手的句子（报告与日志两种说词时，「谁的责任」就没唯一答案）",
+      _plc25._nc_line({"nc_kinds": {"blank": 2}, "nc_evidence": {"blank": "联系电话→-"}})
+      == cdp_base.nc_kinds_text({"blank": 2}, {"blank": "联系电话→-"}),
+      _plc25._nc_line({"nc_kinds": {"blank": 2}}))
+check("25i-4 两档「拿不到证据」的处方必须相反：unknown 要接把手、no_page 不许接把手"
+      "（把两者归成一档，本轮就对跨国采购网说了那句执行不了的假处方）",
+      "_keep_detail" in _plc25._nc_advice({"nc_kinds": {"unknown": 3}})
+      and "_keep_detail" not in _plc25._nc_advice({"nc_kinds": {"no_page": 3}})
+      and "详情不取页" in _plc25._nc_advice({"nc_kinds": {"no_page": 3}}),
+      _plc25._nc_advice({"nc_kinds": {"no_page": 3}}))
+check("25i-5 处方只说自己那一档：no_page 不许顺手把站方那几档的话术带进来（一档一处方，"
+      "一句里出现三种动作等于没给处方）",
+      not any(w in _plc25._nc_advice({"nc_kinds": {"no_page": 3}})
+              for w in ("该修我们的解析", "站方自己没登", "根本没有联系方式栏")),
+      _plc25._nc_advice({"nc_kinds": {"no_page": 3}}))
+
+print("㉕ 无联系方式分档 + 砍单记名 + 借标签归还：三本账各自只有一个把手，并被四处读到 ✓")
 
 print(f"\n全部 {ok} 项断言通过 ✅")

@@ -120,7 +120,7 @@ check("底部那对假号同样不入库",
 # ── 6. crawl_detail 全流程（_fetch 走缓存，不触网）─────────────
 c._sleep = lambda: None
 asked = []
-def route(url, tries=3, guarded=True, referer=""):
+def route(url, tries=3, guarded=True, referer="", deep=False):
     asked.append(url)
     if url.endswith("link.html"):
         return cached(f"cdp_link_{url.split('/Shop/')[1].split('/')[0]}.html")
@@ -135,7 +135,7 @@ check("link.html 有号码就不多发商铺首页请求（省一次请求）",
       [u for u in asked if u.endswith("/") or "link.html" not in u] == [])
 
 asked.clear()
-def route2(url, tries=3, guarded=True, referer=""):
+def route2(url, tries=3, guarded=True, referer="", deep=False):
     asked.append(url)
     if "link.html" in url:
         return cached("cdp__hop_944956_link_html.html")
@@ -145,7 +145,7 @@ rec = c.crawl_detail({"公司名称": "德州市陵城区盈阳环保材料中�
                       "公司网址": "", "详情URL": "", "列表电话": "", "所在区域": "", "主营产品": ""})
 check("link.html 没号码 → 自动补取商铺首页（两跳兜底）", len(asked) == 2)
 check("首页底部也只有假号时，靠邮箱判成功而不是假号", rec.get("状态") == "成功" and rec.get("邮箱"))
-c._fetch = lambda url, tries=3, guarded=True, referer="": ""
+c._fetch = lambda url, tries=3, guarded=True, referer="", deep=False: ""
 r = c.crawl_detail({"公司名称": "取页失败的公司", "公司ID": "2", "所在区域": ""})
 check("拿不到页面判「详情页导航失败」（瞬时状态、可重采）",
       r.get("状态") == "详情页导航失败" and any(m in r["状态"] for m in c.TRANSIENT_MARKS))
@@ -206,6 +206,20 @@ def _ok_r(url, html):
 
 import cdp_base as _cb
 orig_harvest = _cb.CdpSiteCrawler._harvest_browser_cookies
+
+# 标签此刻停在哪儿。真浏览器里这就是被 Page.navigate 送过去的那一页的 location.href；
+# 旧夹具只桩了 _page_state/_html 却没桩 _current_url，身份门（cdp_base._tab_page_is）于是
+# 读到空地址、把整条降级取页判死——门是对的，缺的是夹具没给「标签在哪」这一格事实。
+_tab_at = [""]
+
+
+def _nav5(url, *a, **k):
+    _tab_at[0] = url
+
+
+def _url5():
+    return _tab_at[0]
+
 try:
     _cb.CdpSiteCrawler._harvest_browser_cookies = lambda self: 0   # 通行证就是抄不回
     body = cached("http_search_company_空调.html")
@@ -220,10 +234,10 @@ try:
     # ② 标签已能正常打开本站正文：转降级模式，探测返回「已解除」
     # 取页也换成假实现（真缓存页）：判据看的是「能不能把那一页取回来」，不是正文长度
     c5.pin_tab_id = "FAKE"
-    c5._page_state = lambda: {"url": "https://www.maimaib2b.com/search/Company/%E7%A9%BA%E8%B0%83/",
-                              "len": 42000}
+    c5._page_state = lambda: {"url": _tab_at[0], "len": 42000}
     c5._html = lambda: body
-    c5._cdp_navigate = lambda url, *a, **k: None   # 自测绝不真开浏览器
+    c5._cdp_navigate = _nav5                     # 自测绝不真开浏览器
+    c5._current_url = _url5
     c5._wait_ready = lambda *a, **k: None
     check("标签已能开正文：探测报已解除并转降级模式", c5.probe_block() == ""
           and c5._browser_fallback is True)
@@ -234,7 +248,7 @@ try:
 
     # ③ 降级取页：走标签导航拿正文，不再白发 HTTP
     nav = []
-    c5._cdp_navigate = lambda url, *a, **k: nav.append(url)
+    c5._cdp_navigate = lambda url, *a, **k: (nav.append(url), _nav5(url))
     c5._wait_ready = lambda *a, **k: None
     http_gets = len(c5._session.gets)
     got = c5._fetch("https://www.maimaib2b.com/search/Company/%E7%A9%BA%E8%B0%83/")
@@ -246,6 +260,36 @@ try:
     c5._fetch("https://www.maimaib2b.com/Shop/1/link.html")
     check("第 20 个请求才试 HTTP（前 19 个直接走标签）",
           c5._browser_fallback is True and len(c5._session.gets) == http_gets + 1)
+
+    # ④b 标签落点不是这一家：CF 过完盾常把地址落到首页或上一家的商铺，那种页里有公司名、
+    #     有电话，只是不是这一家——降级取页必须拒（2026-11-15 同类查全：旧写法只在「保底
+    #     重载回哪一页」那一步防了，取回正文这一步没防；判据与由来见 cdp_base._tab_body_for）。
+    #     注意夹具要模拟的是**站方把我们领到别处**（导航后落点≠请求的那一页），而不是先把
+    #     落点摆错再导航——真浏览器里导航那一步会自己把地址改回来，那样根本测不到这一形。
+    _land = [None]                     # 导航之后标签真正落在哪儿（None＝就落在请求的那一页）
+
+    def _nav_land(url, *a, **k):
+        _tab_at[0] = url if _land[0] is None else _land[0]
+
+    def _away():
+        # 每档先把标签挪到别处再发起请求：真浏览器里「上一家还在标签上」才是这一族的事故形状。
+        # 不挪就会踩到 `_fetch_via_tab` 的 same_page 短路（同一页不重复导航＝少重开一场挑战，
+        # 这个短路本身是对的），上一档留的目标页地址还在，门直接放行 → 夹具假通过、测不到东西。
+        _tab_at[0] = "https://www.maimaib2b.com/Shop/999/link.html"
+
+    c5._cdp_navigate = _nav_land
+    _away()
+    _land[0] = "https://www.maimaib2b.com/"
+    check("请求这一家、站方却把地址落到首页：必须拒取页（不许把首页当这一家）",
+          not c5._fetch("https://www.maimaib2b.com/Shop/1/link.html"))
+    _away()
+    _land[0] = ""
+    check("地址读不出来同样拒：宁可不取这一页，也不把没证明过的页写进这一家头上",
+          not c5._fetch("https://www.maimaib2b.com/Shop/1/link.html"))
+    _away()
+    _land[0] = None
+    check("正反对照：落点确实是请求的那一页时照旧出货（门不是判死这条腿，是要它证明自己）",
+          bool(c5._fetch("https://www.maimaib2b.com/Shop/1/link.html")))
 
     # ⑤ 通行证拿回会话：切回不占标签的快路并归还标签
     c5._fetch_via_tab = lambda url: ""          # 屏蔽标签链路，验证切回后走的是 HTTP
@@ -290,7 +334,7 @@ asserted_goto = []
 c6._goto = lambda url, *a, **k: asserted_goto.append(url) or (_ for _ in ()).throw(
     AssertionError("列表页绝不能走浏览器 _goto"))
 asked6 = []
-c6._fetch = lambda url, tries=3, guarded=True, referer="": (
+c6._fetch = lambda url, tries=3, guarded=True, referer="", deep=False: (
     asked6.append(url) or _mini(1, range(111, 121)) if url.endswith("%E7%A9%BA%E8%B0%83/")
     else (asked6.append(url) or _mini(2, range(121, 131))) if "/p2/" in url
     else (asked6.append(url) or _mini(3, range(131, 141))))
@@ -309,7 +353,7 @@ check("同一批公司不重复入库（去重台账生效，连续两页无新�
 
 asked6.clear()
 c6._seen_members = set()
-c6._fetch = lambda url, tries=3, guarded=True, referer="": (
+c6._fetch = lambda url, tries=3, guarded=True, referer="", deep=False: (
     asked6.append(url) or (_mini(1, range(201, 211)) if len(asked6) == 1 else ""))
 n3 = list(c6._iter_keyword("空调"))
 check("第 2 页取不到页面（到底或被拦到底）→ 立即停止翻页、不无限重试",
@@ -370,8 +414,15 @@ def _stub_tab(cw, url="https://www.maimaib2b.com/search/Company/%E5%88%B6%E5%86%
     """把标签那一侧全部换成假实现：只记录点了什么/导航去哪，绝不碰真浏览器。
     refresh＝主文档上那个「刷新此页面」链接的文字；frame_refresh＝它在跨域 iframe 里；
     widget＝页面上验证勾选框的屏幕位置（JSON 串，空串＝没有）；cookies＝标签里现有的本站 Cookie；
-    human＝页面上摆着要人亲手拖的滑块（非 Cloudflare 控件），空串＝没有。"""
+    human＝页面上摆着要人亲手拖的滑块（非 Cloudflare 控件），空串＝没有。
+
+    「标签停在哪儿」是一份事实、三处读法：真浏览器里 `_current_url`、`_page_state.url`
+    都是同一个 location.href，导航一次就跟着变。夹具必须保持同源——各桩各的会让
+    身份门（cdp_base._tab_page_is）要么读到没更新过的旧地址（假通过），要么读到空
+    （假红），2026-11-15 两种都撞过。
+    """
     nav, shown, logs, conns, cmds = [], [], [], [], _CmdLog()
+    at = [url]                                    # 标签当前真实停在哪儿
 
     def _ev(script, timeout=20):
         # 控件探针现在有两份：HUMAN_CAPTCHA_JS（要人亲手拖的滑块，只含腾讯/极验这些
@@ -388,10 +439,15 @@ def _stub_tab(cw, url="https://www.maimaib2b.com/search/Company/%E5%88%B6%E5%86%
     cw._block_probe_url = url
     cw._block_reason = "站点返 403 且是人机验证插页"
     cw._eval = _ev
-    cw._current_url = lambda: url
+    cw._current_url = lambda: at[0]
     cw._title = lambda: title
-    cw._page_state = lambda: {"rs": "complete", "url": url, "len": bodylen}
-    cw._cdp_navigate = lambda u: nav.append(u)
+    cw._page_state = lambda: {"rs": "complete", "url": at[0], "len": bodylen}
+
+    def _nav_fake(u, *a, **k):
+        at[0] = u                  # 导航的落点就是标签此刻的位置（同一份事实）
+        nav.append(u)
+
+    cw._cdp_navigate = _nav_fake
     cw._wait_ready = lambda dom=None, timeout=22: True
     cw._show_tab_window = lambda: shown.append(True)
     cw._log = lambda m: logs.append(m)
@@ -606,6 +662,10 @@ def _borrow(url=""):
 
 c14.open_verify_page = _borrow
 c14._eval = lambda script, timeout=20: ""      # 绝不碰真 9255（_tab_real_page 会先看一眼当前页）
+# 「标签在哪」这一格事实必须同源给出：真身 `_current_url` 就是 `_page_state` 里那串
+# location.href（见 cdp_base._page_state 的 JSON），上面把 `_eval` 桩成空串之后它读出来是空的，
+# 身份门 `_tab_page_is` 就把整条降级取页判死——门是对的，红的是夹具漏了一格（2026-11-15 同类查全）。
+c14._current_url = lambda: (c14._page_state() or {}).get("url", "")
 got14 = c14._fetch(c14.build_search_url("空调", 1))
 check(f"HTTP 403 但浏览器已放行 → 借标签把这 {len(c.parse_list(got14 or '', '空调'))} 家取回来",
       len(c.parse_list(got14 or "", "空调")) == 20 and c14._browser_fallback is True)
@@ -662,8 +722,10 @@ try:
         return p[0]
 
     def _st16():
+        # url 这格必须跟着「标签此刻在哪」走（夹具里由 `_cdp_navigate` 更新）：写死一个占位
+        # 地址会让身份门判「标签落的不是这一页」，把这段本意想测的「插页推一把后再取」变成假红。
         return {"rs": "complete",
-                "url": "https://www.maimaib2b.com/search/Company/x/", "len": state16["len"]}
+                "url": c16._current_url(), "len": state16["len"]}
 
     c16._html = _html16
     c16._page_state = _st16

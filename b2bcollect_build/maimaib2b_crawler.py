@@ -25,7 +25,7 @@
 import re
 import time
 import html as _htmlmod
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import requests
 
@@ -146,6 +146,11 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但**借来的一枚必须还**。空壳 `return None` 在降级取页模式下
+        会把借来过验证的标签一直留到收工之后（2026-11-16 第十轮实机：用户的共享 Chrome
+        里挂着一枚 www.maimaib2b.com/Shop/…/link.html 没人认领）；由来与判据见
+        cdp_base.CdpSiteCrawler.release_tab。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -267,6 +272,11 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         # 那个函数会顺手改写拦截分诊状态（_block_kind、_block_probe_url），
         # 而分诊状态是看门狗用来决定「等人工过验证」还是「等 IP 冷却」的依据，
         # 被一次取页判断改掉就会把后面整轮的处置方式带偏（该借标签的变成干等冷却）。
+        # ⚠ 但「整页质询壳」这一档不看体积（签名判据是纯函数，改不了任何状态，所以这里能用）：
+        # 站方换成火山引擎那种 WAF 壳时正文有十几 KB，体积门（15000）会把它放行给解析器，
+        # 解析出 0 家 →「这家没联系方式」＝归因说谎（2026-11-15 马可波罗实机同族缺陷）。
+        if self._looks_like_challenge_shell(page):
+            return False
         if len(page) < self.HTTP_BLOCK_MAX_BYTES and any(
                 m in page[:4000] for m in self.HTTP_BLOCK_MARKS):
             return False
@@ -277,24 +287,20 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         except Exception:
             return False
 
-    @staticmethod
-    def _page_key(u):
-        """取一个地址的「页面身份」：只看域名+路径，丢掉质询令牌那串 query。
-        Cloudflare 跳转时地址会变成 https://www.maimaib2b.com/?__cf_chl_rt_tk=xxx，
-        它跟目标页同一个会话、马上就要落回目标页，不能当成「另一个页」。"""
-        try:
-            p = urlsplit(u or "")
-            return (p.netloc.lower(), (p.path or "").rstrip("/")) if p.netloc else ("", "")
-        except Exception:
-            return ("", "")
+    # 「页面身份＝域名＋路径」这把尺子原先只有本类带了一份（`_page_key`），基类的
+    # 身份门 `_tab_body_for` 要用同一个口径时就会出现「两处判据不同」——所以真源搬进
+    # cdp_base.CdpSiteCrawler._page_key，这里不再覆写（覆写点在哪都会让另一处判错）。
 
-    def _fetch_via_tab(self, url):
+    def _fetch_via_tab(self, url, deep=False):
         """降级取页：HTTP 仍被拦但浏览器已过盾，临时用共享 Chrome 标签取同一页，
         让采集继续（比 HTTP 慢，但远好过整轮空等）。
         撞上还没放行的插页时不是直接拿空串：按看门狗同一套路推它（先点「刷新此页面」，
         插页上没入口就把它带回前台等它自己跑完，实测 10~50 秒会放行）再取。
         已经在去这一页的路上就**不要再导航**（实测 2026-11-03）：每导航一次就是
-        向站点重开一场挑战，连着几次就永远停在「Just a moment…」（248 秒不过）。"""
+        向站点重开一场挑战，连着几次就永远停在「Just a moment…」（248 秒不过）。
+
+        `deep` 只为日志措辞（这一家是某一家的深链还是列表页），身份门两者都过。
+        """
         if not self.pin_tab_id:
             return ""
         try:
@@ -316,8 +322,18 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         while True:
             html = self._html() or ""
             if self._tab_real_page(html):
+                # 「像真页」不等于「就是这一页」：这一枚标签是各家用来的，CF 过完盾常把地址
+                # 落到首页或上一家的结果页上，那种页里有公司名、有电话，只是**不是这一家**
+                # ——按内容判就把别人的联系方式写进这一家头上（串页假数据，比采不到更难发现；
+                # 2026-11-15 同类查全：旧写法只在上面那段「保底重载回哪一页」防了，取回正文
+                # 这一步没防）。判据与由来见 cdp_base._tab_body_for。
+                body, why = self._tab_body_for(url, body=html)
+                if not body:
+                    self._log(f"   ⚠ 借标签取页不能交：{why}——这一页按取页失败记账，"
+                              f"不拿别的页当这一页")
+                    return ""
                 self._mark_activity()
-                return html
+                return body
             # 不是插页却仍没内容＝这页本来就没东西（404/空结果），别对着它死等
             if waited >= self.TAB_WAIT_UNBLOCK or not self._auto_challenge_page():
                 return ""
@@ -335,7 +351,13 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         super()._after_block_cleared()
 
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
-    def _fetch(self, url, tries=3, guarded=True, referer=""):
+    def _fetch(self, url, tries=3, guarded=True, referer="", deep=False):
+        """取一页。`deep=True`＝请求的是**某一家的深链**（商铺页/联系页），不是通道入口：
+        它的被拒只记深链单笔账、不写 `_block_reason`、不把恢复探测钉在那条深链上
+        （理由与实测数据见 cdp_base._note_fetch_fail）。
+        ⚠ 但**借标签过盾这条路照常走**：本站是 Cloudflare 按域发证，深链 403 与入口 403
+        在「能不能靠过盾恢复」上是同一件事，2026-11-02 实测正是靠它把「制冷」第 1 页从
+        0 家救回来的，不能因为换了归因口径就把降级通道关掉。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
@@ -352,14 +374,30 @@ class Maimaib2bCrawler(CdpSiteCrawler):
             self._release_verify_tab()
             self._log("  ✅ 麦麦B2B HTTP 链路已恢复（通行证已拿回会话），切回不占标签的快路")
         last = ""
+        deep_refused = ""
         for i in range(max(1, tries)):
             try:
                 self._pace_before_request()
                 headers = {"Referer": referer} if referer else None
                 r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url, r.headers)
+                block = self.http_block_reason(r.status_code, r.text, url, r.headers,
+                                               deep=deep)
                 if block:
+                    if deep:
+                        # 这一家不给看：只记深链账，出口仍留给下面的借标签兜底
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._fetch(url, tries=1, guarded=False,
+                                                referer=referer, deep=deep))
+                        if got is not None:
+                            return got
+                        last = f"HTTP {r.status_code}（深链被拒，通道入口未受影响）"
+                        break
                     # CF 质询/限流：对着它重试只会加重风控，直接交看门狗（借标签过盾）
                     self._block_reason = block
                     last = f"HTTP {r.status_code}（防采插页）"
@@ -384,7 +422,8 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         if guarded and self._block_reason:
             if self.handle_http_block(url):
                 self._block_reason = ""
-                return self._fetch(url, tries=tries, guarded=False, referer=referer)
+                return self._fetch(url, tries=tries, guarded=False, referer=referer,
+                                   deep=deep)
             # 等不到 HTTP 恢复，但探测已判定标签能正常开本站：降级继续采
             if self._browser_fallback:
                 return self._fetch_via_tab(url)
@@ -392,7 +431,9 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         # 绝不能就这么返回空串——那一页的公司就整批丢了（实测 2026-11-02：探活报「已解除」
         # 把等待循环收了尾、标签也归还了，紧接着正式请求又 403，「制冷」第 1 页就这么 0 家）。
         # 只试一次（借标签会真开窗口），直到 HTTP 又成功拿到一页才重新给机会。
-        if self._block_reason and not self._fallback_attempted:
+        # `deep_refused` 也走这里：深链被拒不再升级成通道级拦停，但过盾仍然是这一页的
+        # 正解——归因口径换了不能把 2026-11-02 那条修复的兜底一起关掉。
+        if (self._block_reason or deep_refused) and not self._fallback_attempted:
             self._fallback_attempted = True
             if not self.pin_tab_id:
                 self.open_verify_page(url)
@@ -404,7 +445,7 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 self._block_reason = ""
                 self._log("  ↪ HTTP 仍拿不到页、浏览器已放行：改用标签取这一页（降级模式）")
                 return page
-        self._note_request_error(last)
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ 麦麦B2B 请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -517,7 +558,7 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -549,17 +590,20 @@ class Maimaib2bCrawler(CdpSiteCrawler):
             return rec
         url = LINK_URL.format(sid=sid)
         rec["详情URL"] = url
-        html = self._fetch(url, referer=stub.get("公司网址", HOME_URL))
+        html = self._fetch(url, referer=stub.get("公司网址", HOME_URL), deep=True)
         if not html:
             rec["状态"] = "详情页导航失败"
             return rec
+        self._keep_detail(html)      # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         for k, v in self._parse_link(html, stub).items():
             if v and not rec.get(k):
                 rec[k] = v
         # link.html 没拿到号码时，商铺首页底部「联系我们」还有一份
         if not (rec.get("手机") or rec.get("电话")):
             self._sleep()
-            home = self._fetch(f"https://www.maimaib2b.com/Shop/{sid}/", referer=url)
+            home = self._fetch(f"https://www.maimaib2b.com/Shop/{sid}/", referer=url,
+                             deep=True)
+            self._keep_detail(home)
             for k, v in self._parse_bottom(home).items():
                 if v and not rec.get(k):
                     rec[k] = v

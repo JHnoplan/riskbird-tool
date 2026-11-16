@@ -74,6 +74,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line
+
 try:
     from PyQt5.QtCore import QEvent, QObject, Qt, pyqtSignal
 except ImportError:  # 离线测试（无 PyQt5）仍可 import 本模块
@@ -462,7 +466,7 @@ def _write_json(path: Path, data) -> bool:
         except Exception:
             pass
         _note_state_problem(f"写入 {path.name} 失败（{type(e).__name__}: "
-                            f"{str(e)[:120]}），目录 {path.parent}")
+                            f"{first_line(e, 120)}），目录 {path.parent}")
         _forget_state_dir()      # 写失败 = 落点判定的凭据没了，下一次重新判定
         return False
 
@@ -851,14 +855,14 @@ class AccessGuard(QObject):
         except Exception as e:
             return None, "module", (
                 f"权限模块加载失败（{type(e).__name__}: "
-                f"{str(e).splitlines()[0][:120]}）")
+                f"{first_line(e, 120)}）")
         try:
             return OSSPoolClient(), "ok", ""
         except OSSCredentialError as e:
             return None, "credential", str(e)
         except Exception as e:
             return None, "other", (
-                f"{type(e).__name__}: {str(e).splitlines()[0][:120]}")
+                f"{type(e).__name__}: {first_line(e, 120)}")
 
     @classmethod
     def _must_client(cls, client=None):
@@ -1731,7 +1735,7 @@ class AccessGuard(QObject):
                 own.delete_key(cls._bind_key(phone))
             except OSSPoolError as e:
                 if "不存在" not in str(e):
-                    notes.append(f"{phone} 的设备记录没删掉（{str(e)[:60]}）")
+                    notes.append(f"{phone} 的设备记录没删掉（{first_line(e, 60)}）")
             except Exception as e:
                 notes.append(f"{phone} 的设备记录没删掉（{type(e).__name__}）")
         new_doc = cls._put_document(doc, dict(doc["grants"]), drop_accounts=targets,
@@ -1793,7 +1797,7 @@ class AccessGuard(QObject):
                 data, _ = own.download_json(cls._bind_key(phone))
             except OSSPoolError as e:
                 if "不存在" not in str(e):
-                    item["error"] = str(e)[:120]
+                    item["error"] = first_line(e, 120)
                 out.append(item)
                 continue
             except Exception as e:
@@ -1843,7 +1847,7 @@ class AccessGuard(QObject):
                 info["level_name"] = LEVEL_NAMES.get(info["level"], "")
                 info["in_whitelist"] = phone in doc["accounts"]
         except Exception as e:
-            info["acl_error"] = str(e)[:120]
+            info["acl_error"] = first_line(e, 120)
         if phone:
             guard.refresh_blocking(timeout=8.0)
             b = guard._binding or {}
@@ -2176,7 +2180,7 @@ def _channel_integrity(frozen: bool) -> Tuple[int, List[str]]:
     try:
         import site_adapters as _sa
     except Exception as e:
-        why = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+        why = f"{type(e).__name__}: {first_line(e, 160)}"
         lines.append(f"⚠️ acl-doctor：采集通道模块（site_adapters）加载失败 —— {why}")
         if frozen:
             return DOCTOR_EXIT_MODULE, lines
@@ -2370,7 +2374,7 @@ def doctor_lines() -> Tuple[int, List[str]]:
         k, d = AccessGuard._classify_oss_error(e)
         code = _DOCTOR_KIND_CODE.get(k, DOCTOR_EXIT_OTHER)
         say(f"❌ acl-doctor：权限名单读取失败（类别={k}）")
-        say(f"   · {type(e).__name__}: {str(e).splitlines()[0][:200]}")
+        say(f"   · {type(e).__name__}: {first_line(e, 200)}")
         say(f"   · 用户侧口径：{AccessGuard._unreachable_text(k)}")
         if "不存在" in str(e):
             say("   · 名单文件还没播种过：首次使用会自动建，本次判为通过。")
@@ -2407,7 +2411,7 @@ def doctor_lines() -> Tuple[int, List[str]]:
             say(f"   · 远端设备：{dev or '（无记录）'}  与本机一致={same}")
         except Exception as e:
             say(f"   · 远端设备记录读不到：{type(e).__name__}: "
-                f"{str(e).splitlines()[0][:120]}")
+                f"{first_line(e, 120)}")
 
     # 4) 其它同类密钥与可写性：这两项不影响门禁结论，但都是本轮缺陷的同族
     try:

@@ -64,6 +64,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line, short_reason
+
 # 后缀白名单与格式判据永远跟导入链路同源：扫描层认的文件类型 = 真上传能吃的类型，
 # 多一份少一份都会出现「扫得到却传不上」或「扫不到其实能传」
 from data_pool import (IMPORT_EXCEL_EXTS, IMPORT_ARCHIVE_EXTS,
@@ -437,7 +441,7 @@ def _walk_archive(arch_path: str, prefix: str, out: List[dict],
     except tarfile.TarError:
         notes.append((prefix, "压缩包已损坏，读不出来"))
     except (EOFError, OSError) as e:
-        notes.append((prefix, f"压缩包读不出来：{str(e)[:60]}"))
+        notes.append((prefix, f"压缩包读不出来：{first_line(e, 60)}"))
 
 
 def _emit_member(raw: bytes, arc: str, prefix: str, out: List[dict],
@@ -463,7 +467,7 @@ def _emit_member(raw: bytes, arc: str, prefix: str, out: List[dict],
     except OSError as e:
         # 磁盘写不下/没权限属于「这一刻的环境」，不是包内容的错：记账但不下结论
         notes.append((f"{prefix}/{arc.rsplit('/', 1)[-1]}",
-                      f"展开到缓存时失败：{str(e)[:60]}"))
+                      f"展开到缓存时失败：{first_line(e, 60)}"))
         return True
     out.append({"path": staged, "size": len(raw), "mtime": member_mtime,
                 "fp": fp, "logical": f"{prefix}/{arc}",
@@ -552,7 +556,7 @@ def _walk_zip(arch_path: str, prefix: str, out: List[dict],
                 except (NotImplementedError, RuntimeError, zipfile.BadZipFile,
                         OSError) as e:
                     notes.append((f"{prefix}/{pure}",
-                                  f"这个成员取不出来：{str(e)[:60]}"))
+                                  f"这个成员取不出来：{first_line(e, 60)}"))
                     continue
                 mts = _member_mtime(info.date_time) or mtime_fallback
                 if is_excel:
@@ -570,7 +574,7 @@ def _walk_zip(arch_path: str, prefix: str, out: List[dict],
                         _, nested_path = _stage_blob(raw, nested_ext + ".part", cache)
                     except OSError as e:
                         notes.append((f"{prefix}/{pure}",
-                                      f"展开嵌套包失败：{str(e)[:60]}"))
+                                      f"展开嵌套包失败：{first_line(e, 60)}"))
                         continue
                     if nested_path in seen:
                         continue
@@ -638,7 +642,7 @@ def _walk_tar(arch_path: str, prefix: str, out: List[dict],
                         raw = src.read(ARCHIVE_MEMBER_MAX_BYTES + 1)
                 except (OSError, tarfile.TarError) as e:
                     notes.append((f"{prefix}/{pure}",
-                                  f"这个成员取不出来：{str(e)[:60]}"))
+                                  f"这个成员取不出来：{first_line(e, 60)}"))
                     continue
                 mts = _member_mtime(m.mtime) or mtime_fallback
                 if is_excel:
@@ -651,7 +655,7 @@ def _walk_tar(arch_path: str, prefix: str, out: List[dict],
                         _, nested_path = _stage_blob(raw, nested_ext + ".part", cache)
                     except OSError as e:
                         notes.append((f"{prefix}/{pure}",
-                                      f"展开嵌套包失败：{str(e)[:60]}"))
+                                      f"展开嵌套包失败：{first_line(e, 60)}"))
                         continue
                     if nested_path in seen:
                         continue
@@ -700,7 +704,7 @@ def expand_archives(archives: List[dict],
                           origin=a["path"])
         except Exception as e:
             # 单个包炸掉不许拖垮整次扫描（但它必须被说出来，不能被当成「没数据」）
-            notes.append((prefix, f"展开时出错：{str(e)[:80]}"))
+            notes.append((prefix, f"展开时出错：{first_line(e, 80)}"))
             st["failed"] += 1
         if len(members) > before_m:
             st["expanded"] += 1
@@ -928,7 +932,7 @@ class Ledger:
                 continue
             e = self._touch(fp, f["path"], f.get("size", 0), f.get("mtime", 0))
             e["status"] = status
-            e["reason"] = (reason or f.get("reason") or "")[:200]
+            e["reason"] = short_reason(reason or f.get("reason") or "", 200)
             e["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             n += 1
         if n:
@@ -1232,7 +1236,7 @@ class PoolIndex:
             self.size = len(self.norm_contacts)
             self.ready = self.size > 0
         except Exception as e:
-            self.error = str(e)[:160]
+            self.error = first_line(e, 160)
 
     def sample_diff(self, previews: List[dict]) -> Tuple[int, int]:
         """看采样行里的公司名有多少池里还没有 → ``(采样公司数, 池里没有的家数)``。
@@ -1380,7 +1384,7 @@ def scan_all(roots: Optional[Iterable[str]] = None,
             fp, cached = ((f["fp"], False) if f.get("fp")
                           else ledger.fp_for(path, size, mtime))
         except Exception as e:
-            items.append(_mk(f, "", ST_UNREADABLE, f"算指纹失败：{str(e)[:80]}"))
+            items.append(_mk(f, "", ST_UNREADABLE, f"算指纹失败：{first_line(e, 80)}"))
             continue
         if ledger.ingested(fp):
             e = ledger.entry(fp) or {}
@@ -1582,7 +1586,7 @@ def _friendly_read_error(e: Exception) -> str:
         return "文件损坏或不是真正的 Excel（扩展名与实际格式不符）"
     if "permission" in low or "denied" in low or "权限" in s:
         return "没有读取权限（系统隐私设置里未授权该目录）"
-    return "读不了：" + (s.splitlines()[0][:100] if s else e.__class__.__name__)
+    return "读不了：" + (first_line(s, 100) or e.__class__.__name__)
 
 
 # 环境层面的故障码：这些错跟文件内容无关，是「这一刻的机器」不给读。

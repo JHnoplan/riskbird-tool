@@ -20,6 +20,9 @@ import tempfile
 import requests
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line
 
 # DeepSeek API 配置
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -379,10 +382,10 @@ def expand_with_deepseek(user_input: str, api_key: Optional[str] = None) -> Tupl
             if attempt < DEEPSEEK_MAX_RETRIES:
                 time.sleep(0.5)
                 continue
-            return [], f"api_error: {str(e)[:50]}"
+            return [], f"api_error: {first_line(e, 50)}"
         
         except (KeyError, IndexError, json.JSONDecodeError) as e:
-            return [], f"parse_error: {str(e)[:50]}"
+            return [], f"parse_error: {first_line(e, 50)}"
     
     return [], "max_retries_exceeded"
 

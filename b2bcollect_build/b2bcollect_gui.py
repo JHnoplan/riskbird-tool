@@ -132,7 +132,8 @@ def _report_fatal_startup(exc) -> None:
 try:
     from parallel_session import (ParallelSession, SITE_ORDER, SITE_NAMES,
                                   LIST_CHANNEL_SLUGS, STATS_LABELS, STATUS_ORDER, QZD_SLUG)
-    from cdp_base import BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler
+    from cdp_base import (BLOCK_TAG_IP, BLOCK_TAG_CAP, CdpSiteCrawler,
+                          short_reason, first_line)
     # 命中层级与保鲜期口径（功能 A/I 的单一真源）：界面上的天数、倍率、层级名都从
     # 这里取。写成死数字的话，调 TTL 那一轮界面还在讲旧天数——话术与口径分家，
     # 用户是按界面那句话来理解「多久会重问一次」的。
@@ -2787,7 +2788,7 @@ class MainWindow(QMainWindow):
         if not lost:
             return ""
         errs = MainWindow._lost_channels_errors()
-        lines = [f"　{SITE_NAMES.get(s, s)}：{str(errs.get(s) or '（无加载错误记录）')[:120]}"
+        lines = [f"　{SITE_NAMES.get(s, s)}：{short_reason(errs.get(s) or '（无加载错误记录）', 120)}"
                  for s in lost]
         return ("\n各路加载错误：" + "\n".join(lines)
                 + "\n发包方自查：在仓库里执行 python .github/scripts/check_packaging_manifest.py"
@@ -4017,7 +4018,7 @@ class MainWindow(QMainWindow):
                 ok, msg = getattr(self.session, method_name)(name)
                 self.session._log(("✅ " if ok else "⚠ ") + msg)
             except Exception as e:
-                self.session._log(f"⚠ 操作失败：{str(e).splitlines()[0][:120]}")
+                self.session._log(f"⚠ 操作失败：{first_line(e, 120)}")
             finally:
                 self._opening_check = False
 
@@ -4184,7 +4185,7 @@ class MainWindow(QMainWindow):
         try:
             rep = _kwexp.expand_keywords(raw)
         except Exception as e:
-            self._on_log(f"⚠ 智能解析失败：{str(e).splitlines()[0][:120]}")
+            self._on_log(f"⚠ 智能解析失败：{first_line(e, 120)}")
             return
         kws = rep["keywords"]
         if not kws:
@@ -4246,7 +4247,7 @@ class MainWindow(QMainWindow):
             n = len(extract_company_names(path))
         except Exception as e:
             n = -1
-            self._on_log(f"⚠ 公司名单预览失败：{str(e).splitlines()[0][:120]}")
+            self._on_log(f"⚠ 公司名单预览失败：{first_line(e, 120)}")
         if n > 0:
             self.lbl_co.setText(f"已选择：{fname}（识别到 {n} 家公司，开始采集后写入待采名单）")
             self._on_log(f"📋 已选择公司名单：{fname}，识别到 {n} 家公司"
@@ -4297,7 +4298,7 @@ class MainWindow(QMainWindow):
                 ok, msg = self.session.open_login_page(slug)
                 self.session._log(("✅ " if ok else "⚠ ") + msg)
             except Exception as e:
-                self.session._log(f"⚠ 打开{label}失败：{str(e).splitlines()[0][:120]}")
+                self.session._log(f"⚠ 打开{label}失败：{first_line(e, 120)}")
             finally:
                 self._opening_logins.discard(slug)
 
@@ -4319,8 +4320,28 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(self, "确认", "确定清空全部平台历史种子库？清空后将对同一批关键词从头重采。") \
                 == QMessageBox.Yes:
-            self.session.clear_seen_store()
+            self._clear_seen_store_now()
+
+    def _clear_seen_store_now(self):
+        """清种子库并**照实汇报**：全清掉说一句「已清空」，有路没清成就点名那几路。
+        两个入口（工具栏按钮、「开始新任务」里的勾选项）共用这一份说法，免得一处讲
+        事实、另一处无条件讲「已清空」。
+
+        为什么值得单独收口（2026-11-16 自审）：某一路 unlink 失败（只读卷/权限/被占）
+        时，过去照样弹完成框。用户信了这句话，下一轮看到的就是「命中即跳过 0 家」，
+        那与「这个平台采不到数据」是同一个症状，而他手上只有一句已经作废的安慰话。
+        """
+        self.session.clear_seen_store()
+        missed = list(getattr(self.session, "_seed_clear_missed", []) or [])
+        if not missed:
             QMessageBox.information(self, "完成", "历史种子库已清空。")
+            return True
+        QMessageBox.warning(
+            self, "部分没清成",
+            "这几路的历史种子库没清掉，下一轮仍会「命中即跳过」：\n"
+            + "\n".join(f"· {s}（{why}）" for s, why in missed)
+            + "\n\n原始表与待采名单不受影响；修好落点权限（或换可写目录）后再清一次。")
+        return False
 
     def _final_files_present(self, ts_dir):
         """三份产物是否都在：用户手动删过任一份，就不能再说「盘上是最新的」。"""
@@ -4421,8 +4442,12 @@ class MainWindow(QMainWindow):
         if total:
             self._final_save_sync()
         if chk_seen is not None and chk_seen.isChecked():
-            self.session.clear_seen_store()
-            self._on_log("🧹 历史种子库已清空（各平台跨运行去重记录全部删除）")
+            if self._clear_seen_store_now():
+                self._on_log("🧹 历史种子库已清空（各平台跨运行去重记录全部删除）")
+            else:
+                # 这句不许省略：日志里只留「已清空」会把上面那个警告框的事实抹掉，
+                # 用户回头翻日志只会看到一句与体感矛盾的话
+                self._on_log("🧹 历史种子库没有全部清干净——详见上方「部分没清成」框")
         self.session.reset_results()
 
         # 释放当前数据文件夹：_on_start 里 not self._first_start 分支会重建新时间戳目录
@@ -4579,7 +4604,7 @@ class MainWindow(QMainWindow):
                                                          want_slugs=want_slugs)
         except Exception as e:
             _started = False
-            self._on_log(f"⚠ 待采名单绑定失败（不影响关键词采集）：{str(e).splitlines()[0][:120]}")
+            self._on_log(f"⚠ 待采名单绑定失败（不影响关键词采集）：{first_line(e, 120)}")
         self._register_task(_tasks.TASK_STATUS_RUNNING)
         self._paused = False
         self.btn_start.setEnabled(False)
@@ -4721,7 +4746,7 @@ class MainWindow(QMainWindow):
                 return
         except Exception as e:
             # 判据本身出错（极端脏数据等）时退回老行为：宁可多写一次，不许漏落盘
-            self._on_log(f"⚠ 自动保存跳过判据没能算出来，按原样写一次：{str(e).splitlines()[0][:80]}")
+            self._on_log(f"⚠ 自动保存跳过判据没能算出来，按原样写一次：{first_line(e, 80)}")
         self.request_autosave()
 
     def request_autosave(self):
@@ -5373,7 +5398,7 @@ class MainWindow(QMainWindow):
                         # 在清单里把它当成待入库（这才是「预估与实际一致」）
                         empty_kept.append(it)
                 except Exception as e:
-                    failed.append((display, str(e).splitlines()[0][:120]))
+                    failed.append((display, first_line(e, 120)))
             if led is not None and empty_kept:
                 try:
                     from local_scan import ST_INVALID
@@ -5624,7 +5649,7 @@ class MainWindow(QMainWindow):
             return self.session.set_site_workers(n, announce=from_user)
         except Exception as e:
             self._on_log(f"⚠ 并发档位没设进去（{type(e).__name__}: "
-                         f"{str(e).splitlines()[0][:60]}）：仍按上一档跑，"
+                         f"{first_line(e, 60)}）：仍按上一档跑，"
                          f"不影响采集与回采本身")
             return None
 
@@ -5821,7 +5846,7 @@ class MainWindow(QMainWindow):
             # 参数组一起跳过，界面上只看得见「参数好像没恢复」，查不到为什么没恢复。
             # 现在如实点名（不改变「坏一个只少一个」的范围：质量三开关已被移出本 try）。
             self._on_log(f"ℹ 续采参数快照有一部分没恢复（{type(e).__name__}: "
-                         f"{str(e).splitlines()[0][:60]}）：其余参数保持界面上的当前值")
+                         f"{first_line(e, 60)}）：其余参数保持界面上的当前值")
         # 质量三开关在大 try **之后**单独恢复：一是它必须在 site_enrich 恢复完之后才能做
         # 依赖收敛，二是它不该被一个无关字段（比如老的 delay_between 写法）连累。
         self._restore_quality_switches(params)
@@ -5859,7 +5884,7 @@ class MainWindow(QMainWindow):
                 self._sync_quality_switches()
         except Exception as e:
             self._on_log(f"ℹ 质量口径开关没按上次任务恢复（{type(e).__name__}: "
-                         f"{str(e).splitlines()[0][:60]}）：当前勾的是什么就跑什么")
+                         f"{first_line(e, 60)}）：当前勾的是什么就跑什么")
 
     def _auto_expand_on_start(self):
         """点「开始采集」前自动展开关键词。
@@ -5876,7 +5901,7 @@ class MainWindow(QMainWindow):
         try:
             rep_ = _kwexp.expand_keywords(raw)
         except Exception as e:
-            self._on_log(f"⚠ 自动扩词失败（按你填的原词继续采）：{str(e).splitlines()[0][:120]}")
+            self._on_log(f"⚠ 自动扩词失败（按你填的原词继续采）：{first_line(e, 120)}")
             return
         kws = list(rep_.get("keywords") or [])
         if not kws or kws == self.keywords:
@@ -5932,7 +5957,7 @@ class MainWindow(QMainWindow):
         try:
             res = boost(list(self.keywords), kw_yield, min_yield=min_yield)
         except Exception as e:
-            self._on_log(f"⚠ 高产词派生新词失败：{str(e).splitlines()[0][:120]}")
+            self._on_log(f"⚠ 高产词派生新词失败：{first_line(e, 120)}")
             return
         added = res.get("added") or []
         if not added:
@@ -5956,7 +5981,7 @@ class MainWindow(QMainWindow):
             self.session.set_task_folder(self.session_dir)
             self.session.save_progress()
         except Exception as e:
-            self._on_log(f"⚠ 采集进度保存失败（不影响本次数据）：{str(e).splitlines()[0][:100]}")
+            self._on_log(f"⚠ 采集进度保存失败（不影响本次数据）：{first_line(e, 100)}")
         self._register_task(status)
 
     def _restore_site_checks(self, sites):
@@ -5996,7 +6021,7 @@ class MainWindow(QMainWindow):
                              f"在「历史任务」里选中它点「接着采这一条」即可继续")
         except Exception as e:
             # 对账失败绝不拖住启动：最坏就是界面还显示那条过期的「采集中」
-            self._on_log(f"⚠ 历史任务状态对账未完成：{str(e).splitlines()[0][:100]}")
+            self._on_log(f"⚠ 历史任务状态对账未完成：{first_line(e, 100)}")
 
     def _restore_last_task(self):
         """启动自动回填：取最近一条「能接着采」的任务，静默恢复关键词/参数/进度。"""
@@ -6097,7 +6122,7 @@ class MainWindow(QMainWindow):
                 seeded = self.session.seed_results(_tasks.read_records_from_xlsx(raw_path))
             except Exception as e:
                 self._on_log(f"⚠ 读回上次数据失败（不影响接着采，只是本轮不会累加显示旧数据）："
-                             f"{str(e).splitlines()[0][:120]}")
+                             f"{first_line(e, 120)}")
         # 关键词名单本身就在上面那个输入框里，这里再抄一遍就是把同一个事实摆成三份
         # （输入框 + 状态行 + 横幅），而横幅与状态行都是换行显示，白吃掉两行竖向空间——
         # 用户要的是「一屏看全」，界面就不该用重复内容把它撑爆。
@@ -6383,7 +6408,7 @@ class MainWindow(QMainWindow):
                 ok, reason = guard.check(wait=False)
                 parts.append("本机 ✓" if ok else "本机 ✕")
                 if not ok:
-                    tip = (reason or "").splitlines()[0][:60]
+                    tip = short_reason((reason or "").splitlines()[0], 60)
                     parts.append(tip)
                     self.acl_status_lbl.setStyleSheet(_status_badge_style("error"))
                 else:

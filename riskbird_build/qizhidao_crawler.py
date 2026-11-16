@@ -244,7 +244,7 @@ class QiZhiDaoCrawler:
                 time.sleep(2)
             names = [c.get("name") for c in (self.driver.get_cookies() or [])]
         except Exception as e:
-            return "unknown", f"读取 Cookie 失败：{str(e)[:60]}"
+            return "unknown", f"读取 Cookie 失败：{e}"
         return block_guard.login_state(names, self.PLATFORM_LABEL)
 
     def _gate(self):
@@ -405,17 +405,23 @@ class QiZhiDaoCrawler:
     def _restart_browser(self, headed: bool = True):
         """重启浏览器"""
         self._log("正在重启浏览器...")
+        stuck_tab = ""
         try:
             if self.shared_session:
                 # 共享模式下绝不能 quit（可能连带关掉另一个会话正在用的浏览器），只关自己的标签
-                self._close_own_tab()
+                stuck_tab = self._close_own_tab()
                 # 但这份 chromedriver 子进程必须收：马上要 start_browser 新建一个会话，
                 # 老的一直不收就是「每重启一次漏一个进程」（收法见 chrome_driver.release）
                 chrome_driver.release(self.driver)
             else:
                 chrome_driver.destroy(self.driver, self._log)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不能吞：这一步没跑成，旧会话/旧标签可能还挂着，下一轮 start_browser
+            # 就是在它们上面叠加（第 32g 条：抹平失败就等于把现场说成已清理）
+            self._log(f"⚠ 复位旧会话没跑成（{type(e).__name__}）——旧标签或旧 chromedriver "
+                      f"可能还挂着，若下一轮开不了浏览器请手动关掉 Chrome 再试")
+        if stuck_tab:
+            self._log(f"⚠ 复位前归还本站标签没成功：{stuck_tab}——共享 Chrome 里可能还挂着它")
         self.driver = None
         self._own_handle = None
         time.sleep(2)
@@ -423,20 +429,29 @@ class QiZhiDaoCrawler:
         self._log("浏览器已重启")
 
     def _close_own_tab(self):
-        """只关闭本会话独占的窗口/标签（共享浏览器保持运行）
+        """只关闭本会话独占的窗口/标签（共享浏览器保持运行）。返回 ""＝已还完或没东西可还；
+        否则返回一句失败原因交给调用方开口。
 
         只剩这一个窗口时不关：调试端口上 page target 归零后，chromedriver 附加会
         报「cannot connect to chrome」或直接挂住（2026-11-14 实机查出的根因），
-        下一轮任务与另外两路名单通道都必踩。留着它零副作用。"""
+        下一轮任务与另外两路名单通道都必踩。留着它零副作用。
+
+        为什么不自己吞掉异常：上层 `close_browser`/`_restart_browser` 都有「关失败必须
+        开口」这句话，靠的是异常往上传；最底层把异常吃掉，上面那句就成了死分支（第 32g 条）。"""
         try:
-            if self.driver is not None and self._own_handle:
-                handles = self.driver.window_handles
-                if self._own_handle in handles and len(handles) > 1:
-                    if self.driver.current_window_handle != self._own_handle:
-                        self.driver.switch_to.window(self._own_handle)
-                    self.driver.close()
-        except Exception:
-            pass
+            if self.driver is None or not self._own_handle:
+                return ""
+            handles = self.driver.window_handles
+            if self._own_handle not in handles:
+                return ""          # 已经不在了，等于还完了
+            if len(handles) <= 1:
+                return ""          # 只剩这一枚：故意不关（理由见上）
+            if self.driver.current_window_handle != self._own_handle:
+                self.driver.switch_to.window(self._own_handle)
+            self.driver.close()
+            return ""
+        except Exception as e:
+            return f"{type(e).__name__}"
 
     def _ensure_own_tab(self) -> bool:
         """共享模式下确保当前操作对象仍是自己的窗口（防止误碰另一个会话的页面）"""
@@ -537,16 +552,21 @@ class QiZhiDaoCrawler:
             else:
                 handles = self.driver.window_handles
                 if len(handles) > 1:
+                    stuck = 0
                     for h in handles[1:]:
                         try:
                             self.driver.switch_to.window(h)
                             self.driver.close()
                         except Exception:
-                            pass
+                            # 剪不干净的标签堆在窗口里，下一轮就是「莫名多一个页」（32g）
+                            stuck += 1
                     try:
                         self.driver.switch_to.window(handles[0])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._log(f"  ⚠ 切回主标签没成功（{type(e).__name__}）"
+                                  f"——多余标签可能还开着，请手动确认活动标签")
+                    if stuck:
+                        self._log(f"  ⚠ 有 {stuck} 枚多余标签没关掉，请手动确认窗口数量")
 
             # 2. 导航并验证（最多 3 次）
             domain = self.BASE_URL.split("//")[-1].split("/")[0]
@@ -565,15 +585,21 @@ class QiZhiDaoCrawler:
 
     def close_browser(self):
         """关闭浏览器"""
+        stuck_tab = ""
         try:
             if self.driver:
                 if self.shared_session:
                     # 共享浏览器：只关自己的标签，浏览器留给另一个会话继续用
-                    self._close_own_tab()
+                    stuck_tab = self._close_own_tab()
                 # destroy = 原来的 quit() + 收掉自己拉起的 chromedriver 子进程
                 chrome_driver.destroy(self.driver, self._log)
-        except Exception:
-            pass
+        except Exception as e:
+            # 旧写法 `except …: pass` 后面紧跟一句「浏览器已关闭」，那就是直接说谎：
+            # 会话可能还挂着，而读日志的人不会再去查（第 32g 条）
+            self._log(f"⚠ 关闭浏览器这一步没跑成（{type(e).__name__}）"
+                      f"——浏览器可能还开着，请手动确认")
+        if stuck_tab:
+            self._log(f"⚠ 归还本站标签没成功：{stuck_tab}——共享 Chrome 里可能还挂着它，请手动关掉")
         self.driver = None
         self._own_handle = None
         self._log("浏览器已关闭")
@@ -669,11 +695,11 @@ class QiZhiDaoCrawler:
                     self.driver = None
                     time.sleep(2)
                     if attempt == 1:
-                        result["错误"] = f"会话异常: {err_str[:100]}"
+                        result["错误"] = f"会话异常: {err_str.splitlines()[0]}"
                         return result
                 else:
-                    self._log(f"  ❌ 搜索失败: {err_str[:100]}")
-                    result["错误"] = err_str[:200]
+                    self._log(f"  ❌ 搜索失败: {err_str.splitlines()[0]}")
+                    result["错误"] = err_str.splitlines()[0]
                     return result
 
         return result
@@ -894,7 +920,7 @@ class QiZhiDaoCrawler:
             # 2026-11-04 09:35 实机：断网时这里抛 net::ERR_INTERNET_DISCONNECTED，
             # 旧代码 return "" 与「真查不到」同形，「青岛太平洋海洋工程(深圳)有限公司」
             # 就被记成「企知道查不到→永久丢弃」，而它只是那一刻没网。
-            why = str(e).splitlines()[0][:80] or type(e).__name__
+            why = str(e).splitlines()[0] or type(e).__name__
             self._hash_fail_reason = why
             self._last_fail_reason = f"搜索页打开失败（{why}）"
             self._log(f"  ❌ 备用方案失败: {e}")

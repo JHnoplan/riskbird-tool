@@ -41,7 +41,7 @@ except ImportError:
     import customer_library_cleaner as _cleaner
 
 from cdp_base import (clean_cell, CdpSiteCrawler, strict_keyword_filter,
-                         request_error_shape)
+                         request_error_shape, short_reason, first_line)
 # 官网回采联系方式的唯一口径实现（采集收尾与手动补采都走它，不在本文件重复写判据）。
 import website_contact as _site_wc
 # 命中层级/证据的列名单一来源 + 瀑布式多源补全（功能 A）。瀑布只在会话勾选上时接管
@@ -234,6 +234,7 @@ class ParallelSession:
         self.list_enabled = {slug: False for slug in self.channels}
         self._list_threads = {}                     # slug -> 看门狗线程
         self._list_rt = {}                          # slug -> 看门狗运行态
+        self._seed_clear_missed = []                # 上次清种子库没清成的路（见 clear_seen_store）
         self.pending = PendingCompanyList()
         self.pending.set_collected_probe(self._probe_collected)
         self._list_idle_exit = 300      # 名单空转这么久（秒）后通道休眠退出（看门狗）
@@ -657,7 +658,7 @@ class ParallelSession:
             os.replace(tmp, self.progress_path)
             return True
         except Exception as e:
-            self._log(f"⚠ 采集进度落盘失败（不影响本次采集）：{str(e).splitlines()[0][:100]}")
+            self._log(f"⚠ 采集进度落盘失败（不影响本次采集）：{first_line(e, 100)}")
             return False
 
     def load_progress(self, folder=""):
@@ -881,7 +882,7 @@ class ParallelSession:
             # 链路/等人两笔跟着汇总账目走：某一路「0 家」的来路要在总账里就说清楚，
             # 不能只写在它自己那一站的结束行里——用户看的是这份汇总（同名口径见 cdp_base）
             lk = (f"｜取页失败 {s['page_fail']} 页"
-                  f"（最后一次：{str(s.get('last_page_error') or '')[:60]}）"
+                  f"（最后一次：{short_reason(s.get('last_page_error'), 60)}）"
                   if s.get('page_fail') else "")
             wt = f"｜仍在等{s['waiting']}" if str(s.get('waiting') or '').strip() else ""
             self._log(f"📊 {name}：翻 {s['pages']} 页见 {s['listed']} 条｜成功 {s['ok']}｜"
@@ -999,7 +1000,7 @@ class ParallelSession:
         try:
             crawler.crawl(subset, start_index=start_index)
         except Exception as e:
-            crawler._log(f"❌ {crawler.PLATFORM_NAME}采集线程异常：{str(e).splitlines()[0][:160]}")
+            crawler._log(f"❌ {crawler.PLATFORM_NAME}采集线程异常：{first_line(e, 160)}")
         finally:
             self._merge_site_progress(crawler, subset)
 
@@ -1024,7 +1025,7 @@ class ParallelSession:
                 try:
                     names = extract_company_names(list_file, log=self._log)
                 except Exception as e:
-                    self._log(f"❌ 读取公司名单失败：{str(e).splitlines()[0][:120]}")
+                    self._log(f"❌ 读取公司名单失败：{first_line(e, 120)}")
                 if not names:
                     self._log("⚠ 名单文件里没识别到公司名（支持 xlsx/csv/txt，需有一列是公司名）")
         added = self.pending.bind(session_dir)      # 总是绑定：建任务文件夹 + 生成名单表
@@ -1570,7 +1571,7 @@ class ParallelSession:
                 rt["net_streak"] += 1
                 c.bump_stat()
                 self.pending.requeue(name, slug)
-                self._log(f"❌ {label}补采「{name}」异常：{str(e).splitlines()[0][:120]}"
+                self._log(f"❌ {label}补采「{name}」异常：{first_line(e, 120)}"
                           f"（已退回队首，下次接着补采）")
                 if rt["net_streak"] >= 4:
                     c0 = self.pending.counts(slug)
@@ -1912,7 +1913,7 @@ class ParallelSession:
         except Exception as e:
             # 附加报表失败绝不能连累主交付：这里只可能少一张表，不该少一条数据
             self._log(f"⚠ 线索分层报表没出（{type(e).__name__}: "
-                      f"{str(e).splitlines()[0][:80]}）：已采数据与两份既有产出不受影响")
+                      f"{first_line(e, 80)}）：已采数据与两份既有产出不受影响")
             return self._lead_stats
 
     def _report_channel_health(self, write_ledger=True):
@@ -2058,7 +2059,7 @@ class ParallelSession:
                 "只按行自带关键词判过；想按词筛请先在关键词框里填上再清洗")
 
 
-    def clean_records(self, records=None, log=None):
+    def clean_records(self, records=None, log=None, funnel_out=None):
         """跨站清洗：各站用自己的 _to_cleaner_record 映射（数据来源正确），
         合并后走一次 build_clean_rows 做跨站按公司名去重。企知道/风鸟/爱企查三路
         名单结果进的是**同一次**合并——用户要的「3 个平台采到的数据合并到一个文件」
@@ -2068,25 +2069,41 @@ class ParallelSession:
         原始表仍全量保留）。
         records=None：只清洗本次已勾选站点 + 有过产出的名单通道的实时结果；
         records 显式传入：按「数据来源」跨**全部**站点匹配（历史/导入数据可能
-        含当前未勾选的站，若仍按 enabled 过滤会静默丢掉这些行）。"""
+        含当前未勾选的站，若仍按 enabled 过滤会静默丢掉这些行）。
+        funnel_out：可选 dict，把这条漏斗的每一档（喂进多少、严格档剔多少、合并掉多少、
+        四项全空剔多少且属于哪一路、最后剩多少）交回调用方。挂这一格的动因是实机体检
+        只能说「入库原始合计 57 条 → 清洗后 7 条」，说不出 50 条吞在哪一档、哪一路——
+        说不出原因的漏斗等于没有漏斗，取号通路断了一整轮也没人会去看。"""
         log = log or self._log
         cleaner_recs = []
         gate = {"dropped": 0, "unknown": 0, "kept": 0, "total": 0}
+        fed = 0
         slugs = SITE_ORDER if records is not None else [s for s in SITE_ORDER if s in self.enabled]
         for slug in slugs:
             c = self.crawlers[slug]
             recs = c.snapshot_results() if records is None else \
                 [r for r in records if (r.get("数据来源") or "") == c.PLATFORM_NAME]
+            fed += len(recs)
             cleaner_recs.extend(c._to_cleaner_record(r) for r in self._strict_gate(recs, gate))
         for slug, c in self.channels.items():
             if records is None and not self._list_active(slug):
                 continue
             recs = c.snapshot_results() if records is None else \
                 [r for r in records if (r.get("数据来源") or "") == c.PLATFORM_NAME]
+            fed += len(recs)
             cleaner_recs.extend(c._to_cleaner_record(r) for r in self._strict_gate(recs, gate))
         self._strict_report(gate, log)
-        rows = _cleaner.build_clean_rows(cleaner_recs, log=log, waste_sink=self._waste_sink)
-        return self.filter_import_rows(rows, log=log)
+        cstats = {}
+        rows = _cleaner.build_clean_rows(cleaner_recs, log=log, waste_sink=self._waste_sink,
+                                         stats_out=cstats)
+        kept = self.filter_import_rows(rows, log=log)
+        if funnel_out is not None:
+            funnel_out.update(cstats)
+            funnel_out["fed"] = fed                      # 严格档之前喂进来的原始行数
+            funnel_out["gate"] = {k: v for k, v in gate.items() if k not in ("samples", "by_source")}
+            funnel_out["import_kept"] = len(kept)
+            funnel_out["import_dropped"] = len(rows) - len(kept)
+        return kept
 
     @staticmethod
     def filter_import_rows(rows, log=None):
@@ -2106,7 +2123,7 @@ class ParallelSession:
             try:
                 c.reset_run_state()
             except Exception as e:
-                self._log(f"⚠ {c.PLATFORM_NAME} 进度复位失败：{str(e).splitlines()[0][:80]}")
+                self._log(f"⚠ {c.PLATFORM_NAME} 进度复位失败：{first_line(e, 80)}")
         with self._lock:
             self._list_rt = {}
             self._list_threads = {}
@@ -2215,14 +2232,20 @@ class ParallelSession:
         return ok
 
     def close_browser(self):
-        """收工：关本工具的 CDP pin 标签＋各 Selenium 通道/名单通道自己的标签，共享 Chrome 保留。"""
+        """收工：关本工具的 CDP pin 标签＋各 Selenium 通道/名单通道自己的标签，共享 Chrome 保留。
+
+        三条腿任何一条没跑成都**必须开口**（第 32g 条）：旧写法全是 `except …: pass`，
+        于是用户看到「已收工」，共享 Chrome 里却挂着几枚没人认领的标签；下一轮
+        `acquire_tab` 又只能另开一枚，越跑越多。这里不扮成成功，只说哪一站没收到。"""
         import shared_chrome as sc
         targets = list(self.crawlers.values()) + list(self.channels.values())
         pinned = [c.pin_tab_id for c in targets if getattr(c, "pin_tab_id", "")]
         try:
             sc.release_tabs(pinned, self.port, self._log)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"⚠ 收工归还 {len(pinned)} 枚 pin 标签这一步没跑成："
+                      f"{short_reason(first_line(e, 80), 60)}"
+                      f"——共享 Chrome 里可能还挂着本站标签，请手动关掉（不影响已采数据）")
         for c in targets:
             c.pin_tab_id = ""
             if hasattr(c, "_ws_cache"):
@@ -2235,15 +2258,19 @@ class ParallelSession:
         if c1688 is not None:
             try:
                 c1688.close_browser()   # 适配器版：只关自己的标签，不碰共享 Chrome
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"⚠ {getattr(c1688, 'PLATFORM_NAME', '1688')} 收工没收到："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——该站标签可能还挂着，请手动关掉（不影响已采数据）")
         # 三路名单通道各自只关自己那个标签/会话（风鸟 close_tab 里连 chromedriver 会话
         # 都只 quit 自己附加的，绝不 quit 共享 Chrome）
         for c in self.channels.values():
             try:
                 c.close_tab()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"⚠ {getattr(c, 'PLATFORM_NAME', type(c).__name__)} 名单通道归还标签没收到："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——请手动关掉那一枚（不影响已采数据）")
 
     def open_login_page(self, slug):
         """界面「打开1688 / 打开企知道 / 打开风鸟 / 打开爱企查」按钮：确保共享 Chrome 在跑，
@@ -2337,7 +2364,7 @@ class ParallelSession:
                 self.set_browser_background(False)   # 还原/前置窗口，把页面递到眼前
                 return True, f"已在 Chrome 里打开 {name} 的网页，你看一眼就行"
         except Exception as e:
-            return False, f"打开失败：{str(e).splitlines()[0][:80]}"
+            return False, f"打开失败：{first_line(e, 80)}"
         return False, "打开失败：共享浏览器不可用（请确认已安装 Google Chrome）"
 
     def retry_site_now(self, name=""):
@@ -2371,10 +2398,39 @@ class ParallelSession:
         return False
 
     def clear_seen_store(self):
+        """清空**全部已注册路**的跨运行种子库，并把没清成的那几路当场点名。
+
+        两处都必须说得出（2026-11-16 全局自审）：
+          · 范围：界面按钮写的是「清空全部平台历史种子库」，过去只遍历 crawlers。
+            名单通道确实没有种子库（防重复由待采台账负责，见 site_adapters 注释），
+            但「没有」与「没清成」是两件事——把前者当后者会谎报，把后者当前者会漏清；
+          · 失败原因：单路 unlink 失败（只读卷/权限/文件被占）以前被一句 except 吞掉，
+            然后照样弹「历史种子库已清空」。用户信了这句话，下一轮看到的还是
+            「命中即跳过 0 家」，症状与「这个平台采不到数据」完全一样，而账上没痕迹。
+        返回成功路数；失败清单留在 ``self._seed_clear_missed`` 供界面与体检器读数。
+        """
+        missed = []
         n = 0
-        for c in self.crawlers.values():
-            c.clear_seen_store()
-            n += 1
+        for slug, c in list(self.crawlers.items()) + list(self.channels.items()):
+            name = SITE_NAMES.get(slug, getattr(c, "PLATFORM_NAME", slug))
+            clear = getattr(c, "clear_seen_store", None)
+            if not callable(clear):
+                missed.append((name, "这一路没有清种子库的入口"))
+                continue
+            try:
+                ok = bool(clear())
+            except Exception as e:
+                ok = False
+                missed.append((name, f"{type(e).__name__}：{first_line(e, 60)}"))
+                continue
+            if ok:
+                n += 1
+            else:
+                missed.append((name, str(getattr(c, "_seed_clear_error", "") or "未记录原因")))
+        self._seed_clear_missed = missed
+        if missed:
+            self._log("⚠ 种子库没清干净的这几路：" + "、".join(f"{s}（{why}）" for s, why in missed)
+                      + "——这几路下一轮仍会「命中即跳过」，不是平台没货")
         return n
 
     def seen_store_counts(self):

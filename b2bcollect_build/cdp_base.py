@@ -158,6 +158,19 @@ _REQUEST_ERROR_KINDS = (
                      "net::err_socket", "net::err_network_changed")),
     ("TLS握手失败", ("sslerror", "ssl:", "certificate", "handshake", "sslv3", "tlsv1",
                    "net::err_ssl", "net::err_cert")),
+    # Chrome 把「站点回了 4xx/5xx、页里又没有可看的内容」也算导航失败：照样落
+    # chrome-error://，可这句话的主语是**站点对这一条资源回了错误状态码**，既不是浏览器拦、
+    # 也不是网络不通。混进下一档会让人去改启动参数（2026-11-14 实机马可波罗的商铺深链正是
+    # 这一档：同一时刻通道入口照常 200、借标签那条腿 29/33 出货），而正确的处方是按每家深链
+    # 被拒记账、继续下一家。
+    ("站点回了错误状态码", ("err_http_response_code_failure",)),
+    # 浏览器自己把这次导航取消了：站点侧根本没看到流量，页面落在 `chrome-error://`。
+    # `ERR_BLOCKED_BY_CLIENT` 的实机由来是「始终使用更安全的连接」把明文 http 升级成
+    # https、升级失败又不退回明文（同机两个 Chrome 只差这一个开关的差分实测见
+    # shared_chrome.NO_HTTPS_UPGRADE_FEATURES）；另一支来源是扩展/本机策略。
+    # 它与「连不上」的处方完全不同：那一档查出口网络与域名可达，这一档查浏览器参数与
+    # 这一跳用的是哪种协议——所以刻意**不进** DEAD_HOST_KINDS，不该被主机熔断吃掉。
+    ("浏览器拦下这一跳", ("err_blocked_by_client", "err_blocked_by_administrator")),
     ("连不上·无应答", ("connecttimeout", "connect timeout", "timed out. (connect",
                      "operation timed out", "[errno 60]", "failed to establish a new connection",
                      "net::err_connection_timed_out", "net::err_timed_out",
@@ -179,6 +192,21 @@ _REQUEST_ERROR_KINDS = (
 # 而这几档恰恰是「等一等就好」与「改代码」的分界线。
 _HTTP_STATUS_KINDS = ((429, "HTTP 429·限流"), (403, "HTTP 403·风控/需验证"),
                       (407, "HTTP 407·要代理口令"), (404, "HTTP 404·这一页没了"))
+# ── 「本工具自己已经定过性的句子」的类别词表 ──────────────────────────────────────
+# 翻页层会把 `_goto` 留下的原因再包一层：`列表页导航失败（【被拦停】防采页没等到放行…）`。
+# 分型器过去只认 `startswith("【")`，于是这种**已经带着结论**的话被洗成
+# `【未分型】｜列表页导航失败（【被拦停】…）`（2026-11-15 实机 1688 的收尾句、GUI 账目行与
+# 体检报告念的全是降级后那一版）。左边界 12 字与 `_DEAD_HOST_RE` 同源——消费者（主机熔断账、
+# 看门狗的网络账）本来就能从这种嵌套形状里读出类别，分型器读不出就是两套尺子。
+# 只认这张表里的词：站点原文里的「【访问过于频繁】」之类不是我们的结论，不许冒充类别收口。
+_OWN_KIND_TOKENS = tuple(name for name, _ in _REQUEST_ERROR_KINDS) + tuple(
+    v for _, v in _HTTP_STATUS_KINDS) + ("被拦停", "页面未就绪", "一页都没取到")
+# 按长度倒序排：万一某个词是另一个词的前缀，交替式里短的先命中就会把长的截走
+# 第 1 组＝类别前面的那句标签（`列表页导航失败（`），它要说的是「哪一层没做成」，
+# 必须留在证据里；第 2 组＝类别本身。
+_NESTED_KIND_RE = re.compile(
+    r"^(.{0,12}?[（(])【(%s)】" % "|".join(re.escape(t)
+                                          for t in sorted(_OWN_KIND_TOKENS, key=len, reverse=True)))
 
 # ── 裸 HTTP 超时拆成「连接／读数」两个数 ─────────────────────────────────────────
 # 一个数当两个用的代价是本机实测出来的：顺企网整站无应答时 `timeout=25` 让每次重试都付满
@@ -223,6 +251,57 @@ def request_error_is_connect(shape):
     return bool(m and m.group(1) in DEAD_HOST_KINDS)
 
 
+def request_error_kind(shape):
+    """从**已分型**的失败原因里取回那个类别词（`【连不上·无应答】host:443｜…` → `连不上·无应答`）。
+
+    为什么单独立一枚：分型器的输出格式（类别在前、证据在后，还允许嵌在
+    `列表页导航失败（【被拦停】…）` 这种壳里）只有这里解释得对。各消费方自己去
+    `startswith("【")` 加分割，就会长出「有的认嵌套、有的不认」的两套尺子——本函数与
+    `request_error_is_connect` 共用同一个 `_DEAD_HOST_RE`，就是为了不分裂。
+    认不出类别时返回空串（而不是「未分型」）：调用方要能为「这句没被分过型」做别的处置。
+    """
+    m = _DEAD_HOST_RE.match(str(shape or ""))
+    return m.group(1) if m else ""
+
+
+# Chrome 自己的错误页只有这一个地址形状：`chrome-error://chromewebdata/`（错误正文由
+# Chrome 渲染，`document.URL` 就是这一串）。判据只在这一处写，别处再写一遍就会漏掉
+# 「站方把我们领到错误页」那一支（`chromewebdata` 也在同一枚主机上）。
+CHROME_ERROR_URL_MARKS = ("chrome-error://", "chromewebdata")
+
+
+def tab_load_failed_line(cur_url, nav_error="", body="", cap=120):
+    """标签当前地址落在 Chrome 错误页上时，那句带**这次导航为什么没成**的说明。
+    不是错误页就返回空串（调用方据此决定要不要开口）。
+
+    为什么做成模块级函数：同一句解释只能有一份 —— 身份门 `_tab_page_is` 与借标签那条腿
+    `_solve_js_shell_via_tab` 都要念它，写成实例方法就会让「只看地址、不看正文」的那一格
+    被迫去读整页 HTML（契约就变了），离线镜像夹具也得跟着多桩一枚方法。
+    取错误码的顺序是刻意的：先信本轮 `Page.navigate` 的 `errorText`（那是 Chrome 对**这次**
+    导航的原话），没有才从错误页正文里摘 `ERR_*`（复用旧标签、或导航由站方自己发起时
+    errorText 那格是空的）。两条都没有就说「没拿到错误码」，绝不编一个方向出来。
+    """
+    cur = str(cur_url or "")
+    if not any(m in cur for m in CHROME_ERROR_URL_MARKS):
+        return ""
+    why = str(nav_error or "").strip()
+    if not why:
+        m = re.search(r"ERR_[A-Z0-9_]{4,}", body or "")
+        why = "net::" + m.group(0) if m else ""
+    shape = request_error_shape(why, cap=cap) if why else ""
+    # 这一句只陈述事实、**不下结论**：方向由类别词（`【站点回了错误状态码】`／
+    # `【浏览器拦下这一跳】`／`【连不上·无应答】`）说，调用方按 `request_error_kind` 分叉。
+    # 在这里写死一句「是浏览器没发出去」，就会在站点回错误码那一档说反方向。
+    return f"标签这一跳没加载出来（{shape or 'Chrome 错误页，页里没写着错误码'}）"
+
+
+# 原因收口只准一个把手：`short_reason`／`first_line` 的真源在同目录 text_shape.py
+# （零依赖，所以权限自检、健康看板这类「最早加载、且要在采集器坏掉时还能说话」的
+# 链路也能 import 它，不必把 requests 与共享浏览器那一整套拖进来）。这里把它转出去
+# 只是保持既有import口径：全仓几十处 `from cdp_base import short_reason` 不用跟着改。
+from text_shape import _REASON_BREAKS, first_line, short_reason  # noqa: F401
+
+
 def _request_error_detail(text, cap):
     """把异常文本里「人能照着处置」的那一段剥出来：Caused by 之后优先，池头之后其次。"""
     seg = _ERR_CAUSED_RE.split(text, 1)[-1] if _ERR_CAUSED_RE.search(text) else text
@@ -238,7 +317,9 @@ def _request_error_detail(text, cap):
     opens = seg.count("(") - seg.count(")")
     if opens > 0:
         seg = seg + ")" * opens
-    return seg[:cap]
+    # 收口一律走 short_reason：以前这里是 `seg[:cap]`，正好把 `(connect timeout=25)` 截成
+    # `(connect timeout=2` ——分型器补的右括号又被下一档 [:60]/[:70] 剪掉，实机就是这么读出半截词的
+    return short_reason(seg, cap)
 
 
 def request_error_shape(err, cap=160):
@@ -246,6 +327,8 @@ def request_error_shape(err, cap=160):
 
     幂等：已经带类别的原文直接按 cap 收口，不再二次分型——各站 except 分支先调它一次
     （为了打日志），翻页层随后还会把它交给 `_note_request_error` 记账，两次必须同一句。
+    类别写在括号里的那一种（`列表页导航失败（【被拦停】…）`）同样算「已经带类别」：
+    把结论提回开头、剩下的当证据，**绝不降级成【未分型】**（词表与由来见 _OWN_KIND_TOKENS 上方）。
     认不出形状时返回 `【未分型】<清洗过的原文>`，**绝不返回空串、也绝不说「采不到」**：
     这一格将来还要长出新档，先让「没分上型」这件事本身可见。"""
     if err is None:
@@ -255,14 +338,19 @@ def request_error_shape(err, cap=160):
     if not text:
         return "未知请求失败"
     if text.startswith("【"):
-        return text[:cap]
+        return short_reason(text, cap)
     low = text.lower()
     kind = ""
-    for name, needles in _REQUEST_ERROR_KINDS:
-        if any(n in low for n in needles):
-            kind = name
-            break
     rest = text
+    nest = _NESTED_KIND_RE.match(text)
+    if nest:
+        kind = nest.group(2)
+        rest = nest.group(1) + text[nest.end():]
+    else:
+        for name, needles in _REQUEST_ERROR_KINDS:
+            if any(n in low for n in needles):
+                kind = name
+                break
     if not kind:
         m = _ERR_HTTP_STATUS_RE.search(text)
         if m:
@@ -402,6 +490,105 @@ def is_placeholder_number(val):
     if re.search(r"0{7,}", digits):
         return True
     return False
+
+
+# ── [NC-BLOCK-BEGIN] 无联系方式责任分档（本段与 ali1688_build/ali1688_crawler.py 逐字节对拍）
+# 「这一页到底有没有联系方式」以外，还有一句必须能回答的话：**没有是谁的责任**。
+# 由来（2026-11-16 第十轮实机世界工厂网）：「电梯导轨」抓到 10 家、四项口径只剩 4 家，
+# 报告按旧口径一律写成「大头连四项联系方式都没有，先修取号通路再谈换词」——可实际去
+# 看页面，`联系电话` 那一栏写着 `-`（站方已把号码改成「联系客服登记」才给）：通路没坏，
+# 归因却把人支使去改本来没毛病的解析代码。把别人的页当这一家是更坏的那一类说谎，
+# 而「把站方没给说成我们没取到」同样是指错方向的谎。
+# 所以这一族判据只看**页面上那一栏自己怎么写**，不看任何站点的解析结果：
+CONTACT_SLOT_LABEL_RE = re.compile(
+    r"(?:联系\s*电话|联系电话|手机\s*号码|移动电话|手机号码|手\s*机|电\s*话|传\s*真)"
+    r"[^<]{0,4}[:：]?")
+# 只认中文标签：早先试过把 `Tel`/`mobile` 也放进表里，结果 `viewport`、`getElementsByTagName`
+# 这类脚本字节全被判成「一栏写着电话」，整页证据当场失真。
+CONTACT_SLOT_BLANK = ("-", "—", "－", "–", "暂无", "未填写", "未公开", "待补充", "无", "N/A", "NA")
+CONTACT_SLOT_HIDDEN = ("点击查看", "查看号码", "显示号码", "登录", "扫码", "微信", "客服",
+                       "实名认证", "解锁", "开通会员", "免费热线登记")
+CONTACT_SLOT_NUM_RE = re.compile(r"1[3-9]\d{9}|0\d{2,3}-?\d{7,8}|400[-\s]?\d{3}[-\s]?\d{4}")
+# 剥标签用的小刀：`<[^>]{1,160}>` 而不是一路 `<[^>]+>`——模板里偶有把 `<` 写在文字里的脏页，
+# 不限长度就会从那个 `<` 一路吞到下一个 `>`，把整段正文当作一个标签吃掉（证据跟着失真）。
+CONTACT_SLOT_TAG_RE = re.compile(r"<[^>]{1,160}>")
+# 砍单样本：每个词只留几家、名字收到多长（取用方见 _cut_sample）。
+# 3 家×2 阶段是「一眼能判这一刀该不该砍」的最少样本量，再多界面那一行就没人读了。
+CUT_SAMPLE_CAP = 3
+CUT_NAME_CAP = 24
+
+
+def contact_slot_state(html):
+    """详情页「电话/手机」那一栏的证据分档 → (档位, 证据串)。
+
+      · `miss`    栏位在、值里**真有号码**，而本次一条都没抽走 —— 我们的解析漏了（该修代码）
+      · `hidden`  栏位写着「点击查看/登录后可见/联系客服登记」这类要交互才给号的话 —— 站方藏着
+      · `blank`   栏位在、值是 `-`/`暂无`/`未填写` 这类空占位 —— 站方这一家根本没登
+      · `no_slot` 整页找不到任何中文联系方式栏位 —— 这一页没这一栏，**无从判定**
+
+    多栏并存时按「先认我们自己的锅」定序：miss > hidden > blank > no_slot。理由很直接——
+    只要有一处是我们该取到没取到，把话说成「站方没给」就会让那条真缺陷永久隐身。
+    纯函数、无副作用（离线夹具与第 32 条硬门都直接喂 HTML 对拍）。
+    """
+    page = html or ""
+    best, evid = "", ""
+    rank = {"miss": 3, "hidden": 2, "blank": 1, "no_slot": 0}
+    for m in CONTACT_SLOT_LABEL_RE.finditer(page):
+        win = re.sub(r"\s+", " ", CONTACT_SLOT_TAG_RE.sub(" ", page[m.end():m.end() + 120])).strip()
+        if CONTACT_SLOT_NUM_RE.search(win):
+            kind, show = "miss", win
+        elif any(h in win[:16] for h in CONTACT_SLOT_HIDDEN):
+            kind, show = "hidden", win
+        elif not win or any(win.startswith(b) for b in CONTACT_SLOT_BLANK):
+            kind, show = "blank", (win or "（空）")
+        else:
+            continue            # 值是一段别的文字（栏位标题撞上表头等），不作证据
+        if rank[kind] > rank.get(best, -1):
+            best, evid = kind, f"{m.group(0).strip()}→{show[:24]}"
+    return (best or "no_slot"), evid
+
+
+# 分档的人话名字：日志、GUI 看板、体检报告三处只许取这一张表。
+# 各自写一句描述就会出现「同一笔账三种说词」，而这一本账的用处就是把说词定到一个处方上。
+NC_KIND_LABEL = {
+    "miss": "栏位里本有号码、我们一条也没抽走（解析缺陷，该修代码）",
+    "hidden": "站方藏着（点击查看/登录/联系客服登记才给）",
+    "blank": "站方这一家没登（栏位写 -／暂无，不是缺陷）",
+    "no_slot": "这一页没中文联系方式栏（无从判定）",
+    "unknown": "本站没留正文证据（判不了，先接 _keep_detail）",
+    # 「详情不取页」与「忘了接把手」必须分成两档：前者是本站定的设计边界（带理由声明），
+    # 后者是可修的记账漏接。合成一句「先接 _keep_detail」就是给一个已经声明过的站
+    # 开了一张执行不了的处方（2026-11-16 第十轮实机：跨国采购网详情吃 IP 配额、声明在先，
+    # 报告却写着「先给这站的 crawl_detail 接上 _keep_detail」）。
+    "no_page": "本站详情不取页（已声明），没有单店正文可判",
+}
+# 渲染时的固定序：先报我们自己的锅（miss/unknown），再报设计边界（no_page），最后报站方的锅。
+# 没这一张表就会按字典序排出「blank 在前、miss 在后」，读的人第一眼看到的就是“不是缺陷”。
+NC_KIND_ORDER = ("miss", "unknown", "no_page", "hidden", "blank", "no_slot")
+
+
+def nc_kinds_text(kinds, evidence=None):
+    """把「无联系方式」的责任分档收成一句人话——**渲染只此一个把手**（日志/GUI 看板/体检报告共用）。
+
+    为什么由记账的主人措词，而不是让每个读的人各写一遍：这一本账的全部用处就是把处方定到
+    一句话上，三处各写一遍就会出现「同一笔账三种说词」——界面上写「站方没给」、报告里写
+    「取号通路」，而这两个方向的动作是相反的。空账返回空串：调用方据此**不说**这一格，
+    不许编一句「无异常」顶上去。
+    """
+    kinds = kinds or {}
+    if not kinds:
+        return ""
+    ev = evidence or {}
+    order = [k for k in NC_KIND_ORDER if k in kinds]
+    order += sorted(k for k in kinds if k not in NC_KIND_ORDER)
+    seg = []
+    for k in order:
+        one = f"{NC_KIND_LABEL.get(k, k)} {kinds[k]} 家"
+        if ev.get(k):
+            one += f"（证据：{short_reason(ev[k], 46)}）"
+        seg.append(one)
+    return "｜".join(seg)
+# ── [NC-BLOCK-END]
 
 
 def parse_contact_field(raw):
@@ -767,6 +954,31 @@ def strict_keyword_filter(records, keywords, log=None):
     return kept, dropped, unknown
 
 
+def reset_seen_store(target, path):
+    """清掉**一路**的跨运行种子库：盘上文件、内存字典、内存去重集合，三样一起清。
+    返回原因串，空串代表清成了。
+
+    为什么要有这一格（而不是每个类自己写一遍）：
+      · 关键词站那份以前只清 ``_seen_store`` 字典，不清 ``_seen_members`` ——站点侧去重
+        读的正是后者，于是用户点了「清空种子库」、界面上说「已清空」，下一轮照样
+        命中即跳过 0 家（症状与「这个平台采不到数据」一模一样，最难查的那一类）；
+        1688 那一路不继承 CdpSiteCrawler，两处各写一遍就是这么分叉的；
+      · unlink 失败（只读卷/权限/文件被占）以前被 ``except: pass`` 吞掉并照样 return True，
+        等于对用户的假安心签字。失败原因落进 ``target._seed_clear_error``，
+        由 ParallelSession.clear_seen_store 汇总成一句能查的账。
+    """
+    target._seen_store = {}
+    target._seen_members = set()
+    reason = ""
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        reason = f"{type(e).__name__}：{short_reason(str(e).splitlines()[0], 60)}"
+    target._seed_clear_error = reason
+    return reason
+
+
 class CdpSiteCrawler:
     """站点采集器基类。子类须设置类属性并实现钩子方法。"""
 
@@ -802,6 +1014,29 @@ class CdpSiteCrawler:
     HTTP_CHALLENGE_MARKS = ("人机验证", "滑动验证", "安全验证", "请完成验证", "验证码",
                             "captcha", "recaptcha", "verify", "verification",
                             "challenge", "turnstile", "v.js", "cloudflare", "sufei")
+    # ── 【HTTP 200 · 挑战壳】第三种被拦形态：状态码正常，正文却整页换成人机验证壳 ──
+    # 2026-11-15 实机马可波罗商铺首页（留档 14711 字节、HTTP 200）回的是火山引擎 WAF 挑战壳：
+    # 正文里带 "typ":"WAF_VERIFICATION_CHALLENGE" 的 JWT、waf-captcha-proxy.volcbiz.com、
+    # rc-verifycenter/sec_sdk_build/4.0.18/captcha/index.js，可见文本只剩「正在检测」＋spinner。
+    # 同期同站取回的 7 份真页（商铺首页/产品中心/产品详情，25KB~66KB）三条签名**一条都没有**，
+    # 所以这三条签名足以把「壳」与「真页」分开，不需要拿体积当判据。
+    # （另一种 200 空页是站方的**通用产品壳**：正常 HTML、有标题有样式，只是没有「公司名片」块
+    #   ——那是「这个产品 id 不属于任何店」，不是拦截，两者绝不并档，判据也不同。）
+    # 旧判据「插页必须体积 < HTTP_BLOCK_MAX_BYTES」把这种壳放过去了：大壳被当正常页交给
+    # parse_list/字段解析，解析出 0 条——于是「一条数据都没拿到」在账上长成「这家店没联系方式」，
+    # 归因说谎：症状与「平台就是不给号」同形，处方却完全不同（等冷却／走浏览器，不是放弃这家）。
+    # 词表只收**整页挑战壳独有**的签名（正常商铺/列表/详情页不会自带 WAF 挑战 token）；
+    # captcha/verify 这类泛词一律不收——登录页、注册页本来就摆着验证码控件，
+    # 把它们误判成拦截会让整条通道白等冷却。
+    # 强签名（质询本身独有，单独命中即算）与弱签名（站方在正常页里也可能预载的 SDK 路径）
+    # 分两档：只有弱签名命中时不算壳——真页带 SDK 的情况一旦出现就被判拦截，代价是整条通道
+    # 白等冷却（比误判成「这家没数据」更贵），所以宁可要求它和另一条签名一起出现。
+    HTTP_CHALLENGE_SHELL_STRONG = ("waf_verification_challenge", "waf-captcha-proxy")
+    HTTP_CHALLENGE_SHELL_MARKS = HTTP_CHALLENGE_SHELL_STRONG + ("rc-verifycenter/sec_sdk_build",)
+    HTTP_CHALLENGE_SHELL_WINDOW = 60000   # 签名在 <head> 的脚本里，只在前 60KB 内找
+    # 深链「按 URL 的死因原件」的条数上限：一轮几百家用不完，超了丢最早那条（见 _note_deep_block）。
+    DEEP_WHY_CAP = 400
+
     BLOCK_POLL = 15                 # 看门狗恢复探测间隔（秒）——仅针对可人工解除的验证页
     # IP 级限流的探测间隔：必须远大于验证页那种。拿 15s 去探一个正在冷却的 IP，
     # 等于自己把冷却窗口打断（实测八方就是这样从软限流熬成硬封）。
@@ -809,7 +1044,7 @@ class CdpSiteCrawler:
     BLOCK_POLL_IP_MAX = 600         # IP 冷却探测间隔上限
     BLOCK_MAX_WAIT = 1800           # 单次等人工过验证的总时长上限（秒）
     BLOCK_MAX_WAIT_IP = 2700        # 单次等 IP 冷却的总时长上限（冷却本来就慢，别提前放弃）
-    BLOCK_COOKIE_DOMAIN = ""        # 纯 HTTP 站过验证后需要抄回的 cookie 域（子类设）
+    BLOCK_COOKIE_DOMAIN = ""        # 纯 HTTP 站过验证后需要抄回的 cookie 域（不设则退回 HOME_DOMAIN）
     # 「自动挑战页」卡住不动时主动推进（Cloudflare 那种只有转圈、没有任何可点控件的插页）。
     # 默认 False：只有明确实测过「刷新确实能让它继续走」的站才打开（2026-11-02 麦麦B2B 实测）。
     BLOCK_AUTO_REFRESH = False
@@ -855,6 +1090,23 @@ return '';})()"""
     # 被拦时是否借浏览器把验证页递到眼前：限流类站（等 IP 冷却就行）设 False，
     # 免得为了等冷却无端拉起一个 Chrome 窗口。
     BLOCK_OPEN_BROWSER = True
+    # 【JS 质询壳 · 借标签自解】站方回「HTTP 200 + 整页 WAF 质询壳」时，能跑完那段 JS 的
+    # 只有真浏览器——这与上面那条「叫人工过滑块」是两件事：这里没有任何东西要人点，只是借
+    # 一枚标签把挑战跑完，再把通行证抄回裸 HTTP 会话（2026-11-16 实机马可波罗：商铺首页
+    # 半数的跳数吃壳，按 IP 档干等的处方等于放弃这一路）。所以 BLOCK_OPEN_BROWSER=False 的
+    # 站也要有这一条腿，否则分诊只能报「等站方放行」。
+    BLOCK_JS_SHELL_TAB = True
+    JS_SHELL_TAB_MAX = 3          # 这条腿一次货都没出时一轮最多借几次：试错成本要封顶
+    JS_SHELL_TAB_MAX_OK = 40      # 出过货之后放开到这一档：账说它有用才给预算（见 _js_tab_budget）
+    JS_SHELL_TAB_WAIT = 10        # 挑战自己跑完的等待上限（秒），实测火山引擎 3~6 秒
+    # 标签里那份正文短于这一档就不算「一页正文」：宁可按被拒记账，也不把几十十字的
+    # 跳转中间态当成某一家的详情页交出去（那样解析出 0 个字段＝归因说「这家没联系方式」）
+    TAB_BODY_MIN_CHARS = 1200
+    # 浏览器导航层最后一次失败的原话（`net::ERR_…`）。`Page.navigate` 被拦时既不抛异常、
+    # location 也只剩 `chrome-error://`，这一格是那件事唯一的留痕。默认值放**类上**而不是
+    # 只写进 `__init__`：账目重置有整整三处（切站/续采/新轮各一份），少写一处就会让界面
+    # 读到上一轮留下的旧原因——类别看着很像，方向却是错的。
+    _last_nav_error = ""
 
     def __init__(self, port=9255):
         # ── CDP 连接状态必须最先建：下面两个字段是属性，setter 会用到 _io_lock/_ws
@@ -909,8 +1161,40 @@ return '';})()"""
         # 才清，只用于归因日志与界面读数，不参与任何控制流。
         self._run_abandon = ""
         self._block_kind = ""       # "ip"=IP 级限流（无页可点）/ "captcha"=可人工解除
+        # 通道级拦截是不是「要执行 JS 的质询壳」：分诊档位（等冷却 vs 叫人工）与这句事实
+        # 是两件事——裸 HTTP 站撞上壳只能按冷却档处置，但劝告话不能说成「这不是验证码」。
+        self._block_needs_js = False
         self._retry_after = 0       # 服务端 Retry-After 提示的秒数（有就听它的）
         self._block_probe_url = ""   # 探测用的代表页（就是刚被拦的那一页）
+        # **深链被拒**的单笔账（主机 → {原因, 次数}）：某一家的 contact_us.html 这类
+        # 资源级 403/429 与「本机被整站限流」是两回事——实测马可波罗 contact_us.html
+        # 返 403 的同时，搜索页、产品页、商铺首页全都 200（2026-11-15 实机取证）。
+        # 把深链的拒不登记下来就会只剩两种坏结局：要么被误写成 IP 冷却让整条通道干等
+        # （实测白等 765 秒），要么解析层直接说成「这家没数据」。账记在这一本，收尾与
+        # 体检报告都读它；判据见 test_block_triage_offline 第 ⑬ 节。
+        self._deep_blocks = {}
+        # 观测账：导航落点与请求地址不是同一页（按主机 [次数, 最后一次原因]）。这一格
+        # **不参与控制流**，只回答「浏览器站要不要也上身份门」（见 _note_landing_mismatch）
+        self._landing_mismatch = {}
+        # **同一条 URL 的死因原件**（URL → 原因，有界）：上面那本按主机归并，是为了
+        # 「收尾一行念得完」；但一条腿到底为什么没通，只能按 URL 查。2026-11-16 实机马可波罗：
+        # 同一家主机下 contact_us.html 回 403、商铺首页回 200+WAF 质询壳，主机账「留最后一条」
+        # 让 403 那一腿印上了壳的原因——归因说谎，照着假话去查路径的人永远查不到真凶。
+        # 查不到原样 URL 时宁可只报状态码（不编原因），也**不**回退到主机那一条。
+        self._deep_why = {}
+        # 借标签跑 JS 质询壳那一条腿的账（尝试/成功）：判据与理由见 _solve_js_shell_via_tab
+        self._js_tab_tries = 0
+        self._js_tab_hits = 0
+        # 出货的两条路分开记：抄回通行证（后面都走快路）／标签正文直接带走（每次都要一枚标签）。
+        # 合在一起记就没法回答「这条腿值不值得留」——0 次抄到 cookie 不等于 0 次出数。
+        self._js_tab_body_hits = 0
+        self._js_tab_body = ""            # 这次跑壳拿到的正文（由 _deep_shell_retry 取走）
+        self._shell_retry = False        # 重入闩：一条调用链最多因壳重取一次（见 _deep_shell_retry）
+        # 深链日志「同一主域只开口一次」的凭据（键＝_deep_log_key 归并后的主域）。
+        # 账必须按主机细分（哪家被拒要查得出来），但**日志**按主机打会让一轮刷出 52 行
+        # 同族噪音（2026-11-14 实机马可波罗），读的人只会当成刷屏直接跳过——那样这笔账
+        # 等于没写。所以第一次撞见某主域打一行说明，之后只累加不再重复播报。
+        self._deep_logged = set()
         self._borrowed_tab = False   # 纯 HTTP 站为过验证临时借的标签（恢复后归还）
         self._reloaded_once = False   # 本轮被拦是否已做过「保底整页重载」（重载会重开挑战，只做一次）
         self._turnstile_last_click = 0.0   # 上次替用户点验证勾选框的时刻（见 TURNSTILE_CLICK_COOLDOWN）
@@ -920,7 +1204,24 @@ return '';})()"""
 
         self._seen_store = {}
         self._seen_members = set()
+        self._seed_clear_error = ""       # 上次「清空种子库」没清成的原因（见 clear_seen_store）
         self._filtered_count = 0
+        # **逐词**相关性砍单账：只有全局总数不够回答「这一词为什么零产出」。
+        # 2026-11-15 实机：世界工厂网「橡胶手套」站方回了 7 条、7 条全被详情复核判
+        # 「类目不符」，而旧日志把它说成「被拦/链路未通/本页无数据」——三条处方没一条
+        # 对得上（真正该复核的是相关性口径与同族类目桥），体检报告也跟着错判成「差分没
+        # 跑成，建议换词复跑」。这一本账让「闸门砍的」和「平台没货的」从此分得开。
+        self.kw_filtered = {}
+        # 同一族的**列表页早过滤**逐词账（走 _note_early_skip 把手，各站不许自己 +=1）
+        self.kw_early = {}
+        # 砍单**记名**（每词每阶段只留前 CUT_SAMPLE_CAP 家）：只有一本「哪个词被砍了几家」的数，
+        # 答不了「这一刀该不该砍」——报告说「该复核的是判定口径」，而复核的人手上没有名单，
+        # 就只能听我说。由来见 _note_early_skip。
+        self.kw_early_names = {}
+        self.kw_filtered_names = {}
+        # 本轮因**判定规则更新**而重新评估的旧「类目不符」家数（口径见 _relevance_revision）：
+        # 增量库存的是结论不是事实，规则改了不重评＝修好的口径对被误杀那批家永远不生效。
+        self._rel_refilter = 0
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
@@ -932,6 +1233,14 @@ return '';})()"""
         # 统计都只给 0 家，于是 www.11467.com 整站 TCP 连不上被报成「顺企网采不到」。
         # 两者的处置完全相反（前者查网络出口，后者改代码），所以必须分账、必须分文案。
         self._page_fail = 0
+        # 「无联系方式」按**是谁的责任**分档的账（判据与由来见 contact_slot_state）：
+        # 站方没登、站方藏着、我们没解析到、页面根本没这一栏、详情不取页、没留正文证据——
+        # 每一档处方各不相同，合成一档就只能说一句模棱两可的「先修取号通路」。
+        self._nc_kinds = {}
+        self._nc_evidence = {}
+        # 各站解析详情页时留下的正文（谁留证据谁受益；没留时按有没有声明分成
+        # no_page（详情不取页，设计边界）与 unknown（把手没接，可修）两档）
+        self._detail_html = ""
         self._last_page_error = ""
         # `_goto` 当场那一次导航失败的分型原因（每次调用开头清空，只对本次调用有效）：
         # 列表页那句「导航失败」以前只能说「具体原因见紧邻上一行」，界面与体检器问不出类别，
@@ -1027,6 +1336,22 @@ return '';})()"""
             return net.split("]")[0].lstrip("[").lower()
         return net.split(":")[0].strip().lower()
 
+    @staticmethod
+    def _page_key(url):
+        """一个地址的「页面身份」：只看**域名＋路径**，丢掉 query 与 fragment。
+        （真源单一份：原先只有麦麦B2B 自己带了一份（`_page_key`），别的站各自用
+        「主机名对不对」当身份判据——同主机下首页与某一家的深链是同一个主机，那样
+        会把首页当成那一家的详情页收走，见 `_tab_body_for` 的由来。）
+
+        Cloudflare 跳转时地址会变成 `https://…/?__cf_chl_rt_tk=xxx`，它跟目标页同一
+        个会话、马上就要落回目标页，所以 query 这一段不能算进身份。
+        """
+        try:
+            p = urlparse(str(url or ""))
+        except Exception:
+            return ("", "")
+        return (p.netloc.lower(), (p.path or "").rstrip("/"))
+
     def _note_dead_host(self, shape):
         """连接阶段失败按主机累计；连续攒够 DEAD_HOST_STRIKES 次就把这个主机拉黑一轮。
 
@@ -1052,7 +1377,7 @@ return '';})()"""
             return ""
         self._dead_strikes[host] = self._dead_strikes.get(host, 0) + 1
         if self._dead_strikes[host] >= DEAD_HOST_STRIKES and host not in self._dead_hosts:
-            self._dead_hosts[host] = (time.time(), str(shape)[:120])
+            self._dead_hosts[host] = (time.time(), short_reason(shape, 120))
         return host
 
     def _skip_dead_host(self, url):
@@ -1068,12 +1393,12 @@ return '';})()"""
             self._dead_hosts.pop(host, None)
             self._dead_strikes.pop(host, None)
             self._dead_logged.discard(host)
-            self._log(f"  ♻️ {host} 冷却已满 {int(waited)}s，再给一次机会（上次：{why[:60]}）")
+            self._log(f"  ♻️ {host} 冷却已满 {int(waited)}s，再给一次机会（上次：{short_reason(why, 60)}）")
             return False
         if host not in self._dead_logged:
             self._dead_logged.add(host)
             self._log(f"  ⛔ {host} 连续 {self._dead_strikes.get(host, DEAD_HOST_STRIKES)} 次"
-                      f"连不上，本轮不再请求它（{why[:70]}）——这不是采不到：要换出口网络或等"
+                      f"连不上，本轮不再请求它（{short_reason(why, 70)}）——这不是采不到：要换出口网络或等"
                       f"站点恢复，改解析代码没有用；冷却 {DEAD_HOST_COOLDOWN}s 后会再试一次")
         return True
 
@@ -1119,7 +1444,7 @@ return '';})()"""
         """
         if not request_error_is_connect(shape):
             return ""
-        return f"{NET_FAIL_TAG}{label}没做成（不是站点在拦）：{str(shape)[:70]}"
+        return f"{NET_FAIL_TAG}{label}没做成（不是站点在拦）：{short_reason(shape, 70)}"
 
     def _probe_net_fail(self, err, label="恢复探测"):
         """上面那三种 except 分支的统一收口：**绝不回空串**。
@@ -1132,7 +1457,7 @@ return '';})()"""
         self._note_request_error(err)
         shape = str(self._last_page_error or "")
         return (self._probe_connect_word(shape, label)
-                or f"{label}没做成：{shape[:70] or '未分型（原因见紧邻上一行日志）'}")
+                or f"{label}没做成：{short_reason(shape, 70) or '未分型（原因见紧邻上一行日志）'}")
 
     def _probe_net_word(self, label="恢复探测"):
         """探测没抛异常、只是「这一页没东西」时补的那一句：只对网络账开口。
@@ -1180,7 +1505,7 @@ return '';})()"""
             # 就等于把前一种也归到「改代码」那一侧。
             if self._last_page_error:
                 return (f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"
-                        f"不是本站没有{noun}；最后一次：{self._last_page_error[:70]}）")
+                        f"不是本站没有{noun}；最后一次：{short_reason(self._last_page_error, 70)}）")
             return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
                     f"404 或频控空页；是哪一种看紧邻上一行）")
         return f"  「{kw}」{page_label}无{noun}"
@@ -1229,7 +1554,7 @@ return '';})()"""
         if verdict == "miss":
             self._pf_dropped += 1
             tag = "站方筛漏了、本地按地址拦下" if _pf.uses_param_filter(slug) else "跳过非目标省份商家"
-            self._log(f"🗺 [{pv_display}] {tag}：{name}（{text.strip()[:36]}）")
+            self._log(f"🗺 [{pv_display}] {tag}：{name}（{short_reason(text, 36)}）")
             return None
         self._pf_unknown += 1
         self._log(f"🗺 [{pv_display}] 页面与公司名都没写省份、无法确认，不入库：{name}")
@@ -1272,6 +1597,16 @@ return '';})()"""
     # 这么锁死的）。所以条目里记 ct（采到时联系人是否非空）：空联系人的记录允许再采
     # CONTACT_RETRY_MAX 次——补到联系人自然锁全，站点确未公开也在两次后放弃。
     CONTACT_RETRY_MAX = 2
+    # 「类目不符」在种子库里的状态字面量（各处统一引用，改文案只改这一处）
+    FILTERED_STATE = "类目不符(已过滤)"
+    # 规则更新后每轮最多重新评估多少家旧「类目不符」：一次性放开上千家＝把风控预算
+    # 全花在补旧账上，反而把本轮该采的新货挤掉。留下的按判定时间取最近的一批。
+    REL_REFILTER_CAP = 200
+    # 判定规则指纹的原料：这些函数/名字任一改动，指纹即变，旧的「类目不符」盖章作废
+    RELEVANCE_RULE_ATTRS = ("is_relevant", "_peer_words", "relevance_hit", "kw_grams")
+    # 指纹取不到时的降级常量（口径见 _stale_filtered：取不到就不动存量）
+    REL_REV_UNKNOWN = "rev0"
+    _REL_REV = None
 
     def _is_terminal(self, rec):
         st = rec.get("状态", "") or ""
@@ -1322,8 +1657,56 @@ return '';})()"""
             return True
         return int(entry.get("rt") or 0) >= cls.CONTACT_RETRY_MAX
 
+    @classmethod
+    def _relevance_revision(cls):
+        """相关性判定**规则**的指纹（版本号）。
+
+        增量缓存的是判定结论而不是事实：这一家算不算「橡胶手套」的同行，取决于桥表里有没有
+        「个体防护」这类词、取决于二字组那套命中规则长什么样。规则一改，旧结论必须整体作废，
+        否则修好的口径对被误杀入库的那批家永远不生效，用户只能手动清库（等于把修复作废）。
+        指纹只取判定真正读到的输入（同族类目桥表 + 规则函数源码），与运行时机、机器无关；
+        取不到就退回常量——宁可不做重评，也不要每轮算出不同版本号把种子库反复洗一遍。
+        """
+        if cls._REL_REV is None:
+            try:
+                import hashlib
+                import inspect
+                import keyword_expander as _ke
+                blob = repr(sorted(getattr(_ke, "PEER_CATEGORY", {}).items()))
+                for name in cls.RELEVANCE_RULE_ATTRS:
+                    # 判定规则一半挂在类上（is_relevant/_peer_words）、一半是模块级函数
+                    # （relevance_hit/kw_grams，清洗严格档与采集松档共用同一份）：两处都要取到
+                    obj = getattr(cls, name, None) or globals().get(name)
+                    if obj is None:
+                        continue
+                    blob += inspect.getsource(obj.__func__ if hasattr(obj, "__func__") else obj)
+                cls._REL_REV = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+            except Exception:
+                cls._REL_REV = cls.REL_REV_UNKNOWN
+        return cls._REL_REV
+
+    @classmethod
+    def _stale_filtered(cls, entry):
+        """这一条种子库记录是不是**旧规则**下判的「类目不符」——是就不该再命中即跳过。
+
+        指纹取不到（REL_REV_UNKNOWN）时一律判「不陈旧」：降级必须往「不动存量」的方向降,
+        否则一次导入失败就把上千家旧盖章一次性放开重戳，那是自己给自己招风控。"""
+        rev = cls._relevance_revision()
+        if rev == cls.REL_REV_UNKNOWN:
+            return False
+        return (isinstance(entry, dict) and entry.get("st") == cls.FILTERED_STATE
+                and entry.get("rv") != rev)
+
+    def _stale_filtered_keys(self):
+        """本轮值得重判的旧「类目不符」键（按判定时间倒序取最近 REL_REFILTER_CAP 家）。"""
+        stale = [(str((v or {}).get("at", "")), k) for k, v in self._seen_store.items()
+                 if self._stale_filtered(v)]
+        stale.sort(reverse=True)
+        return {k for _, k in stale[:self.REL_REFILTER_CAP]}
+
     def _locked_keys(self):
-        return {k for k, v in self._seen_store.items() if self._entry_locked(v)}
+        return {k for k, v in self._seen_store.items()
+                if self._entry_locked(v)} - self._stale_filtered_keys()
 
     def _seen_store_pending(self):
         """种子库还欠着几次「补联系人」的家数（收尾账目与渠道体检都用它）。"""
@@ -1362,18 +1745,30 @@ return '';})()"""
         return any(str(rec.get(k) or "").strip()
                    for k in ("联系人", "电话", "手机", "邮箱"))
 
+    def _filtered_mark(self, rec):
+        """这一家在本关键词下的旧「类目不符」章键（与 _commit_to_store 的写法一一对应）。"""
+        mid = str(rec.get("memberId") or rec.get("公司ID") or rec.get("公司名称") or "")
+        if not mid:
+            return ""
+        return f"{self.PLATFORM_SLUG}:{rec.get('关键词', '')}#{mid}"
+
     def _commit_to_store(self, rec):
         if not self.incremental or not self._is_terminal(rec):
             return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         st = rec.get("状态", "")
-        if st == "类目不符(已过滤)":
+        if st == self.FILTERED_STATE:
             # 相关性判定是「关键词相关」的：同一家对 A 词不符、对 B 词可能正是目标，
             # 故只按「关键词#主体」作用域记录，换关键词重跑仍会重新评估。
+            # rv＝判定规则指纹：规则更新后这一条旧结论自动作废（见 _relevance_revision）。
             mid = str(rec.get("memberId") or rec.get("公司ID") or rec.get("公司名称") or "")
             if mid:
-                self._seen_store[f"{self.PLATFORM_SLUG}:{rec.get('关键词','')}#{mid}"] = {"at": ts, "st": st}
+                self._seen_store[f"{self.PLATFORM_SLUG}:{rec.get('关键词','')}#{mid}"] = {
+                    "at": ts, "st": st, "rv": self._relevance_revision()}
             return
+        # 重判后改判「相关」并入库：旧的那枚「类目不符」章必须当场撕掉，否则这条陈旧
+        # 记录每轮都被算进待重判名单，重判账永远收敛不了（一家白重判一次就白戳一次详情页）
+        self._seen_store.pop(self._filtered_mark(rec), None)
         for k in self._rec_seen_keys(rec):
             old = self._seen_store.get(k) or {}
             has_contact = self._has_any_contact(rec)
@@ -1383,13 +1778,9 @@ return '';})()"""
             self._seen_store[k] = entry
 
     def clear_seen_store(self):
-        self._seen_store = {}
-        try:
-            if self._seen_store_path.exists():
-                self._seen_store_path.unlink()
-        except Exception:
-            pass
-        return True
+        """清空本站跨运行种子库。实现只在 :func:`reset_seen_store` 一处（为什么必须
+        只有一处、以及它治的是哪个「清了还跳过 0 家」的形状，见那里的注释）。"""
+        return reset_seen_store(self, self._seen_store_path) == ""
 
     @staticmethod
     def _stable_data_dir():
@@ -1653,7 +2044,7 @@ return '';})()"""
                 self._ws_cache = tab.get("webSocketDebuggerUrl") or ""
                 return True
         except Exception as e:
-            self._log(f"⚠ 取得标签失败：{str(e).splitlines()[0][:120]}")
+            self._log(f"⚠ 取得标签失败：{first_line(e, 120)}")
         return False
 
     def start_browser(self, headed=True):
@@ -1673,19 +2064,46 @@ return '';})()"""
             self._goto(self.BASE_URL, expect_domain=self.HOME_DOMAIN or None, tries=2)
         return True
 
-    def close_browser(self):
-        """收工：只关自己那个标签，共享 Chrome 保留（下次直接复用）。"""
-        import shared_chrome as sc
-        try:
-            if self.pin_tab_id:
-                sc.close_tab(self.port, self.pin_tab_id)
-        except Exception:
-            pass
+    def release_tab(self, why=""):
+        """按**硬事实**归还手里拿着的那枚标签（只认 `pin_tab_id`，不看 `_borrowed_tab`
+        这类意图标志——理由与 `_tab_needed` 同一句：标志可能被别处清了标签却忘了复位）。
+
+        由来（2026-11-16 第十轮实机收报）：六个「不常驻标签、被质询时才借」的纯 HTTP 站
+        把 `close_browser()` 覆写成空壳 `return None`，而它们一旦进入降级取页模式就一直
+        握着那枚标签到收工——本轮跑完，用户的共享 Chrome 里留着
+        `www.maimaib2b.com/Shop/<id>/link.html` 一枚没人认领的标签。生产入口走会话级收工
+        （`ParallelSession.close_browser` 会把所有 pin 一起 release），所以这个洞在界面上
+        暂时看不见；但「谁拿着标签谁就得还」不能取决于调用方记得走哪条路：体检探针就是
+        另一条路（它按每站自己的 `close_browser` 收尾），一轮漏一枚，跑十轮就是十枚。
+        关失败也**必须开口**：旧写法 `except Exception: pass` 会把「没关掉」抹平成
+        「已经收工」，读日志的人以为浏览器是干净的。
+        """
+        tab = getattr(self, "pin_tab_id", "") or ""
         self.pin_tab_id = ""
         self._ws_cache = ""
-        # 标签已经收回，「临时借来过验证」这个状态也必须一起落地：留着它，下一轮
-        # 就会拿着一个已经不存在的标签去关页/等自愈（见 _release_verify_tab）。
+        # 标签收回与「临时借来过验证」必须同步失效：只清 pin_tab_id 而留着借页标志，
+        # 下一轮就会去归还一枚早已不存在的标签（见 _release_verify_tab）。
         self._borrowed_tab = False
+        if not tab:
+            return True
+        import shared_chrome as sc
+        # 关没关掉先听最底层那个函数的**返回值**，不是只听「有没有抛异常」：它把异常吞成
+        # pass 时，只看 except 就是永不执行的分支（第 32g 条已在 shared_chrome 修掉）。
+        # 两条通道都接：返回值是主路，万一它自崩也不能把整轮收工带倒，但崩了就得说。
+        try:
+            reason = sc.close_tab(self.port, tab) or ""
+        except Exception as e:
+            reason = f"{type(e).__name__}: {first_line(e, 80)}"
+        if not reason:
+            return True
+        self._log(f"⚠ {self.PLATFORM_NAME} 收工归还标签没成功（{short_reason(first_line(reason, 80), 60)}）"
+                  f"——共享 Chrome 里还挂着{'为「' + why + '」借的' if why else '本站那一枚'}标签，"
+                  f"请手动关掉（不影响已采数据）")
+        return False
+
+    def close_browser(self):
+        """收工：只关自己那个标签，共享 Chrome 保留（下次直接复用）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -1716,8 +2134,20 @@ return '';})()"""
     def _cdp_navigate(self, url):
         # Page.enable 不在这里发：持久连接建立时已经启用过（见 _open_conn），
         # 旧实现每条命令现开现关，所以才需要这一句「顺手把域打开」。
+        self._last_nav_error = ""
         try:
-            self._send("Page.navigate", {"url": url}, timeout=20)
+            resp = self._send("Page.navigate", {"url": url}, timeout=20)
+            # `Page.navigate` 被拦时**不抛异常**：它把 Chrome 的原话放在响应的 errorText 里
+            # （`net::ERR_BLOCKED_BY_CLIENT`／`net::ERR_CERT_COMMON_NAME_INVALID`／
+            # `net::ERR_TIMED_OUT`…），页面落在 `chrome-error://chromewebdata/`。旧写法把整份
+            # 响应丢掉了，于是「浏览器自己没把这一跳发出去」在下游一律表现为「挑战跑完了但
+            # 帮不上忙」（2026-11-14 实机马可波罗借标签那条腿 0/3 就是这么被说成站点问题的）。
+            err = str(((resp or {}).get("result") or {}).get("errorText") or "").strip()
+            if err:
+                self._last_nav_error = err
+                # 连不上那几档照旧进主机熔断账：这一台真连不上时，再开几次标签也是白开，
+                # 该省的是预算而不是换一条腿（口径与裸 HTTP 那侧完全同一张分型表）。
+                self._note_dead_host(request_error_shape(err, cap=160))
             return True
         except Exception as e:
             if self._session_dead(str(e)):
@@ -1728,6 +2158,28 @@ return '';})()"""
                 return True
             except Exception:
                 return False
+
+    def _tab_load_failed(self):
+        """标签是不是**根本没加载出一页东西**（停在 Chrome 自己的错误页上）：返回带 Chrome
+        原话的一句说明，正常加载出来时回空串。判据与话术本体在模块级
+        `tab_load_failed_line`（同一句解释只能有一份，`_tab_page_is` 也用它）。
+
+        为什么单独立一枚把手而不是让各处去看 `location.href` 的前缀：这一形的要害是
+        「**这次导航没发生成**」，它和「导航到了但被站方领到别处」是两回事——后者是身份门
+        该拒的串页，前者连正文都不存在，说成「挑战跑完了」就是说谎。由来与实测见
+        `_cdp_navigate` 里 errorText 那段（马可波罗的明文 http 深链被 Chrome 的
+        「始终使用更安全的连接」升级失败后拦掉，三次全废而日志一句真话没有）。
+        """
+        try:
+            cur = self._current_url() or ""
+        except Exception:
+            return ""
+        if not any(m in cur for m in CHROME_ERROR_URL_MARKS):
+            return ""                      # 先按地址筛掉，免得每页多读一次整页 HTML
+        # 判据只认 `CHROME_ERROR_URL_MARKS` 这一份：在这里再写一遍字面量，将来加一档错误页
+        # （站方自己把我们领到错误域那种）就会只补到 `tab_load_failed_line` 一侧，
+        # 这条把手先聋掉——而它才是「不许说挑战跑完了」的那道闸。
+        return tab_load_failed_line(cur, self._last_nav_error, self._html() or "")
 
     def _page_state(self):
         val = self._eval(
@@ -1794,7 +2246,7 @@ return '';})()"""
                 else:
                     self._cdp_navigate(url)
             except Exception as e:
-                raw = str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__
+                raw = first_line(e, 160) if str(e) else e.__class__.__name__
                 # 分型后的一句才交给日志与归因：类别在最前面，后面每一档 [:50]/[:60] 截断都截不掉它
                 # （旧写法从头部截 160 字，砍掉的恰好是 requests 里唯一决定方向的 `(Caused by …)`）。
                 # `_session_dead` 仍**先按原文判**：它的标记表是照着 CDP/requests 原文调出来的（见
@@ -1803,7 +2255,7 @@ return '';})()"""
                 msg = request_error_shape(e, cap=160)
                 self._last_goto_error = msg   # 只对本次 _goto 有效：翻页层据此说清败在哪一类
                 if self._session_dead(raw) or self._session_dead(msg):
-                    self._log(f"⚠ 标签/浏览器会话断开（{msg[:50]}），正在重取标签续采…（{i+1}/{tries}）")
+                    self._log(f"⚠ 标签/浏览器会话断开（{short_reason(msg, 50)}），正在重取标签续采…（{i+1}/{tries}）")
                     if not self.try_restore_session():
                         self._log("❌ 无法恢复浏览器会话，本轮结束（已采数据已保存）")
                         self._stop_requested = True
@@ -1828,6 +2280,7 @@ return '';})()"""
                     continue
                 # 最后一次仍未就绪但页面有内容：放行让上层解析（宁可得部分数据）
                 if self._html():
+                    self._note_landing_mismatch(url)
                     return True
                 # 异常分支之外还有一条「没导航成」的路：域名/正文判据始终等不到。这一条同样
                 # 要说得出类别，否则 `_goto_fail_reason` 会拿着**上一次重试**留下的旧原因说话。
@@ -1845,6 +2298,7 @@ return '';})()"""
                 # 过码后不再 continue 重试导航（那会触发新验证码）
                 continue
             self._mark_activity()
+            self._note_landing_mismatch(url)
             return True
         return False
 
@@ -1852,6 +2306,33 @@ return '';})()"""
     def _url_domain(url):
         m = re.match(r"https?://([^/]+)", url or "")
         return m.group(1) if m else None
+
+    def _note_landing_mismatch(self, want_url):
+        """观测位（**只记账、不改控制流**）：导航落点与请求的地址不是同一页。
+
+        为什么先只量不改：`_goto` 那道门断言的是**域名**，路径不同照样算成功；浏览器又会把
+        302 一路跟到底，所以「落点不是这一页」在浏览器站上一直存在。已经把身份门补在「把标签
+        正文当某一家的正文交出去」那四处把手上（马可波罗这条腿、麦麦B2B 与供应商网的降级取页、
+        顺企网深链），剩下浏览器站是**就地解析**（导航完直接读当前页），要不要也给它们加身份门
+        得看证据——有的站的详情地址本来就会规范化跳转，贸然而加会把好渠道判死（这一族的教训
+        在 mic 那条路上记过：内容判据不能替地址判据）。所以先量：这一格非零的站，下一轮照着
+        数据决定改哪一路；零就说明这条 hazard 在浏览器站上今天没发生，不动它才是有依据的结论。
+        """
+        host = self._host_of(want_url)
+        if not host:
+            return
+        try:
+            ok, why = self._tab_page_is(want_url)
+        except Exception:
+            return
+        if ok:
+            return
+        rec = self._landing_mismatch.setdefault(host, [0, ""])
+        rec[0] += 1
+        rec[1] = short_reason(why, 120)
+        if rec[0] == 1:      # 同主机只开口一次：这本账是量出来的，不是刷屏用的
+            self._log(f"   ℹ 观测：导航落点与请求的地址不是同一页（{short_reason(why, 60)}）"
+                      f"——本轮这一路不改判据，只记进收尾那行「落点不符」的账")
 
     def _goto_fail_reason(self, label="导航失败"):
         """翻页层「这一页根本没取到」的原因句：`_goto` 当场抓到了就写清楚，抓不到才指日志。
@@ -1901,6 +2382,17 @@ return '';})()"""
     # 只有「要人亲手拖/点才能过、且刷新会把进度清零」的控件才算这一份
     HUMAN_CAPTCHA_JS = _captcha_probe_js(_HUMAN_CAPTCHA_SELECTORS)
 
+    @classmethod
+    def _looks_like_challenge_shell(cls, body):
+        """正文是不是**整页**人机验证壳（HTTP 200 也会被吐出来，见常量处实机取证）。
+        与 `_looks_like_challenge` 的分工：那个问的是「插页里摆没摆着可人工过的验证」
+        （用来分诊 ip/captcha），这个问的是「这一整页是不是就是验证壳本身」。
+        命中口径：任一条强签名，或≥2 条签名同时出现（只有弱签名时不算，理由见常量处）。"""
+        low = (body or "")[:cls.HTTP_CHALLENGE_SHELL_WINDOW].lower()
+        hits = [m for m in cls.HTTP_CHALLENGE_SHELL_MARKS if m in low]
+        return bool(hits) and (any(m in hits for m in cls.HTTP_CHALLENGE_SHELL_STRONG)
+                               or len(hits) >= 2)
+
     def _detect_block(self):
         """以「URL 特征 + 标题特征 + 正文异常小」为判据，绝不对整页正文做关键词匹配
         （正常详情页里常内嵌『请输入验证码/访问过于频繁』等前端校验 JS 文案，全文匹配会误杀）。"""
@@ -1917,6 +2409,11 @@ return '';})()"""
         if body_len < self.SMALL_PAGE_CHARS:
             html = self._html()
             html_len = len(html)
+            # 【200 · 挑战壳】浏览器这条路同样会撞：壳页正文只有「正在检测」几十字，
+            # HTML 却上万字节，旧判据那道 html_len < SMALL_PAGE_CHARS*3 的门正好放过去
+            # （与 http_block_reason 同一族、同一份实机取证，见 HTTP_CHALLENGE_SHELL_MARKS）
+            if self._looks_like_challenge_shell(html):
+                return "整页是人机验证壳（WAF 质询，页里只有「正在检测」）"
             # HTTP 级拦截页/极小插页：正文与 HTML 都很小，且命中标题或正文拦截词
             if html_len < self.SMALL_PAGE_CHARS * 3:
                 if any(m in title for m in self.BLOCK_TITLE_MARKERS) and \
@@ -1935,7 +2432,7 @@ return '';})()"""
             return f"页面弹出验证控件（{hit[:24]}）"
         return ""
 
-    def http_block_reason(self, status, html="", url="", headers=None):
+    def http_block_reason(self, status, html="", url="", headers=None, deep=False):
         """裸 HTTP 响应是否防采/限流插页：状态码命中，或体积极小且带插页特征词。
         404 不在此列（商铺真失效是终态数据，不是风控）。命中时记下探测页，
         让看门狗之后就是探这一页能不能真拿到数据。
@@ -1948,13 +2445,25 @@ return '';})()"""
             = 人在浏览器里过一下确实能清 → 借标签把页面递到眼前，过完抄 clearance Cookie 续采。
             实测：顺企网 429 返的是 70 字节 v.js 挑战（浏览器执行 JS 就能过），归 captcha 才对；
             上一版按状态码一律归 ip，会把这种「其实能过」的拦截误杀成只能干等。
-        服务端给了 Retry-After 就记下来，冷却时长听它的而不是我们猜。"""
+        服务端给了 Retry-After 就记下来，冷却时长听它的而不是我们猜。
+
+        `deep=True` 是第三种来路，也是这一族最贵的错：**请求的是某一家的深链**
+        （商铺联系页、产品页、图片码），不是通道入口。深链被拒不等于本机被限流——
+        2026-11-15 实机马可波罗 contact_us.html 403，同期搜索页/产品页/商铺首页全 200。
+        旧口径把这一句写进 `_block_reason` 并 `_block_probe_url` 钉死在那条 403 的深链上，
+        于是「恢复探测」探的就是那条永远不会放的 URL：整条通道按 IP 冷却干等（实测 765 秒），
+        而数据其实一直在。所以 deep 分支**只回原因、不动任何通道级状态**，
+        记账交给调用方走 _note_deep_block（单笔账，不参与控制流）。"""
         try:
             code = int(status or 0)
         except (TypeError, ValueError):
             code = 0
         body = html or ""
         if code in self.HTTP_BLOCK_STATUS:
+            if deep:
+                # 这句会被 _note_deep_block 拼进「{host} 的深链被拒（…）」：原因里要说清
+                # 「通道入口没被限流」，不必再重复一遍「深链」
+                return f"HTTP {code}（这一家的这条资源不给看，通道入口未受影响）"
             if url:
                 self._block_probe_url = url
             self._block_kind = "captcha" if self._looks_like_challenge(body) else "ip"
@@ -1967,11 +2476,144 @@ return '';})()"""
         if body and len(body) < self.HTTP_BLOCK_MAX_BYTES:
             hit = next((m for m in self.HTTP_BLOCK_MARKS if m in body[:4000]), "")
             if hit:
+                if deep:
+                    return f"防采插页（{hit}）·仅这一条深链，通道入口未受影响"
                 if url:
                     self._block_probe_url = url
                 self._block_kind = "captcha" if self._looks_like_challenge(body) else "ip"
                 return f"防采插页（{hit}）"
+        # 【HTTP 200 · 挑战壳】状态码正常、正文整页是人机验证壳：由来与词表见
+        # HTTP_CHALLENGE_SHELL_MARKS 上方那段实机取证。放在体积判据之后、作为独立一档，
+        # 是因为它**不受体积限制**——站方给这种壳的字节数从 14KB 到 25KB 不等，
+        # 而正常页也远大于 3KB，只有签名本身能把两件事分开。
+        if code == 200 and self._looks_like_challenge_shell(body):
+            if deep:
+                return ("正文是 200·人机验证壳（站方 WAF 质询，页里只有「正在检测」）"
+                        "·仅这一条深链，通道入口未受影响")
+            if url:
+                self._block_probe_url = url
+            self._retry_after = self._parse_retry_after(headers)
+            # 「这是站方要执行 JS 的质询壳」单独记一笔：分诊档位仍然跟着**本站能不能借到浏览器**
+            # 走（下面两支），但那两句照着状态码说的「这不是验证码」的劝告话在壳页上是假话——
+            # 它确实是验证码一类的东西，只是页面连一个可点的框都没有，人工对着它也点不掉。
+            self._block_needs_js = True
+            # 分诊跟着**本站有没有浏览器标签可借**走，而不是跟着「这是不是验证页」走：
+            #   能开页（借共享 Chrome）→ captcha：把壳页递到眼前，执行完 JS 抄 clearance 续采；
+            #   开不了页（纯裸 HTTP 站，BLOCK_OPEN_BROWSER=False）→ 只能按 ip 那一档处置。
+            #     这不是把 WAF 质询误报成 IP 限流（原因原样写着「人机验证壳」），而是处方确实
+            #     只剩「等放行 / 换出口」——把 kind 设成 captcha 会让看门狗对着一群根本没有
+            #     验证框的人喊「请在 Chrome 窗口里手动过验证」，那是这一族的老毛病（白等 8 分钟
+            #     的供应商网 520 同款），只是这回骗人的是自家文案。
+            if getattr(self, "BLOCK_OPEN_BROWSER", True):
+                self._block_kind = "captcha"
+                # 与 captcha 档同一条纪律：文案里不出现「HTTP」，否则上层拿它兜底判成 IP 限流，
+                # 而这一种是浏览器执行一遍 JS 就会放的（叫人工干等冷却＝白等）
+                return "站点返 200 但整页正文是人机验证壳（WAF 质询，浏览器执行 JS 才会放）"
+            self._block_kind = "ip"
+            return ("站点返 200 但整页正文是人机验证壳（WAF 质询）：本站全程裸 HTTP、"
+                    "没有能执行那段 JS 的浏览器标签，只能等站方放行或换出口网络")
         return ""
+
+    @staticmethod
+    def _deep_log_key(host):
+        """深链日志的**聚合键**：取主机最后三段（≈主域）。
+
+        马可波罗每家商铺都是自己的子域（sgjjskjc.cn.makepolo.com…），按主机逐家打一行
+        会把整轮日志刷满同一句话（2026-11-15 实机一轮 52 行，人只会当成新的故障在查）。
+        账仍按主机细分（stats()["deep_block"] 保留每家），只是「说一句话」按主域来。
+        """
+        parts = [x for x in (host or "").split(".") if x]
+        return ".".join(parts[-3:]) if len(parts) > 3 else (host or "")
+
+    @staticmethod
+    def _deep_why_key(url):
+        """URL 死因那本账的**键**：只剥掉锚点。为什么要有这一个把手——「按 URL 查死因」
+        这句话在记、读、退三处都要出现，各写一遍 `(url or "").split("#")[0]` 迟早有一处
+        多剥一段（剥了 query 就成了「同路径不同参数的两条 URL 共用一个死因」，又是假话）。
+        """
+        return str(url or "").split("#")[0]
+
+    def _deep_block_why(self, url):
+        """这一条 URL 的死因原件；**查不到就说查不到**（回空串），绝不回退到同主机
+        别的路径那一条——那是把别人的死因安在这一条腿上（2026-11-16 实机就是这么说的假话）。"""
+        return str(self._deep_why.get(self._deep_why_key(url)) or "")
+
+    @staticmethod
+    def _why_short(reason, limit=48):
+        """把一句死因收成一行里能读的短版：先剥掉与这句话重复的「·仅这一条深链」尾巴，
+        再交给 `short_reason` 收口。旧实现在这里自己 `[:limit]`，实机日志里就长出
+        「…通道入口未」这种半截词——读到一半的话比读不到的话更误导。"""
+        r = str(reason or "").split("·仅这一条深链")[0].strip()
+        return short_reason(r, limit)
+
+    def _note_deep_block(self, url, reason):
+        """深链被拒记**单笔账**：不改 `_block_reason`、不钉探测页、不触发整通道冷却等待。
+
+        这一本账是给人看的（收尾日志与体检报告），不参与控制流——控制流仍然只认
+        通道级那一本，因为「入口页也被拒」才是限流。按主机归并是因为同一家的深链
+        反复撞同一原因，用户需要的是「这条路今天不通」而不是第 37 条重复日志。
+        """
+        host = self._host_of(url) or self._cur_fetch_host or "（未知主机）"
+        rec = self._deep_blocks.get(host)
+        # URL 那一本才是「这一条腿为什么没通」的原件：同一主机下不同路径的死因可以完全不同
+        # （实机：contact_us.html 403 / 商铺首页 200+质询壳），所以按原样 URL 各留一份。
+        # 有界靠「满了就丢最早那条」：一轮几百家用不完，但长期挂着旧任务的原因更坏。
+        why = short_reason(reason, 160)
+        if why:
+            k = self._deep_why_key(url)
+            if k not in self._deep_why and len(self._deep_why) >= self.DEEP_WHY_CAP:
+                self._deep_why.pop(next(iter(self._deep_why)), None)
+            self._deep_why[k] = why
+        if rec:
+            rec[0] += 1
+            rec[1] = short_reason(reason, 120)
+            return host
+        self._deep_blocks[host] = [1, short_reason(reason, 120)]
+        # 同一个主域只开口一次：后面那些家是同一条腿不通，不是新故障（聚合键见
+        # _deep_log_key；条数照旧进账，收尾那行会念出每台主机各被拒多少次）
+        key = self._deep_log_key(host)
+        if key in self._deep_logged:
+            return host
+        self._deep_logged.add(key)
+        # 这一句本来就只在深链路上说，原因里自带的「·仅这一条深链，通道入口未受影响」是重复信息；
+        # 收口交给同一个把手（判据与由来见 _why_short），别再各写一份截断
+        self._log(f"  · {key} 的深链被拒（{self._why_short(reason, 60)}）——这一条腿按每家记账，"
+                  f"通道入口照常，不整轮停手（同主域再撞只累加不重复报）")
+        return host
+
+    def _undo_deep_block(self, url):
+        """补救腿把这一家救回来了：深链那本账**退一笔**（口径与由来见 _deep_shell_retry）。
+
+        主机计数减到 0 就把这一路整条撤掉，连「同主域只开口一次」那份凭据一起撤——
+        留着它，这一路后面真被拒时一个字都不会再说（静音跨了一件事）。按 URL 存的死因
+        原件也撤：那条原因已经不成立，留着会在下一轮把新死因挤掉。
+        """
+        host = self._host_of(url) or self._cur_fetch_host
+        rec = self._deep_blocks.get(host) if host else None
+        if rec:
+            rec[0] = max(0, int(rec[0]) - 1)
+            if not rec[0]:
+                self._deep_blocks.pop(host, None)
+                self._deep_logged.discard(self._deep_log_key(host))
+        self._deep_why.pop(self._deep_why_key(url), None)
+
+    def _note_fetch_fail(self, last, deep=False):
+        """取页失败的账该记到哪一本：通道入口全记，深链只记**连接类**那一档。
+
+        为什么深链的状态码级被拒不进「取页失败」账：那一本（`_last_page_error`/
+        `page_fail`）的语义是「这条链路通不通」，主语是通道。2026-11-15 实机马可波罗
+        contact_us 大面积 403、同期搜索页 200，旧口径记完之后体检报告就成了
+        「取页失败 0 页｜最后一次=HTTP 403 防采插页」——链路明明活着，账上却说被拦，
+        接着把恢复探测钉在那条永远 403 的深链上，整条通道白等 765 秒。
+
+        但「连不上」是**主机**的属性，跟请求哪一页无关：深链的连接类失败照旧要进账，
+        该累计连击、该拉黑就拉黑（见 _note_dead_host），否则一条只在大站深链上暴露的
+        网络断路会被永久漏记。判定共用 DEAD_HOST_KINDS 那张表，不与拉黑口径分叉。
+        """
+        if deep and not request_error_is_connect(last):
+            return False
+        self._note_request_error(last)
+        return True
 
     def _looks_like_challenge(self, body):
         """插页里是不是真的摆着可人工过的验证（而不是纯粹拒 IP）。
@@ -2045,7 +2687,7 @@ return '';})()"""
             self._show_tab_window()
             return True
         except Exception as e:
-            self._log(f"⚠ 打开验证页失败：{str(e).splitlines()[0][:100]}")
+            self._log(f"⚠ 打开验证页失败：{first_line(e, 100)}")
             return False
 
     def _show_tab_window(self):
@@ -2314,21 +2956,194 @@ return '';})()"""
         """归还为过验证临时借的标签（本站自己的标签不动）。"""
         if not self._borrowed_tab:
             return
-        self._borrowed_tab = False
-        import shared_chrome as sc
+        self.release_tab("过验证")
+
+    def _js_tab_budget(self):
+        """这条腿本轮还能借几次标签——**预算由账给，不由注释给**。
+
+        一次货都没出过就只许试 `JS_SHELL_TAB_MAX` 次：每次都要开标签并等挑战，成本是真的，
+        纯试错不该吃掉整轮。出过货就放开到 `JS_SHELL_TAB_MAX_OK`——同一条腿在马可波罗上
+        实测过「3/3 抄不到通行证」与「一试中就出正文」两种结局，用同一个数字要么把能出货
+        的路堵死，要么让出不了货的路白烧标签。
+        """
+        if getattr(self, "_js_tab_hits", 0) or getattr(self, "_js_tab_body_hits", 0):
+            return self.JS_SHELL_TAB_MAX_OK
+        return self.JS_SHELL_TAB_MAX
+
+    def _tab_page_is(self, want_url, token="", same_host=True):
+        """标签此刻停的那一页**是不是我要的这一页**：返回 `(是否, 不是的话为什么)`。
+        这一格只问地址、不问正文——「内容像不像一页真东西」是各站自己的判据（mic 的 contact
+        页本来就可能很小），这里只管「别把别人的页当成这一家」。
+
+        `token`＝这一家在这条地址里独有的那段（mic 用供应商 user 串）：给了 token 就按
+        「同主机＋地址里带这个凭据」判，容得下站方把 `{user}-contact.html` 规范化成别的写法；
+        没给 token 就按域名＋路径整段对拍（`_page_key`），差一个路径段就不算同一页。
+
+        `same_host=False` 只配 `token` 用，给的是「**请求的主机名本来就是猜的**」那种路
+        （mic 英文子域兜底：`{user}.made-in-china.com` 不存在时站方会把它领到统一 showroom
+        路径下，主机名换了、那一页仍属于这一家）。这时唯一的身份就是地址里那串凭据——继续
+        要求同主机就会把这条会正常出货的路判死，而放弃检查则是把别人的页写进这一家头上。
+        """
         try:
-            if self.pin_tab_id:
-                sc.close_tab(self.port, self.pin_tab_id)
+            cur = self._current_url() or ""
         except Exception:
-            pass
-        self.pin_tab_id = ""
-        self._ws_cache = ""
+            return False, "标签当前地址读不出来"
+        key_want = self._page_key(want_url)
+        if not key_want[0]:
+            return False, "要的那一页地址读不出来"
+        key_cur = self._page_key(cur)
+        if key_cur[0] != key_want[0] and (token == "" or same_host):
+            # 落在 Chrome 自己的错误页时，「不在本站」这句太轻了：那一页连站点的字节都没有，
+            # 真正的原因是这次导航没发出去，Chrome 的原话（`net::ERR_…`）必须一起交出去，
+            # 否则上游只会拿着一句看不出方向的话收尾（判据与由来见 tab_load_failed_line；
+            # 这里**不读正文**，本格的契约就是「只看地址」）。
+            return False, (tab_load_failed_line(cur, self._last_nav_error) or
+                            f"标签不在本站（{short_reason(cur or '地址读不出来', 56)}）")
+        if token:
+            if str(token).lower() not in (cur or "").lower():
+                return False, f"标签里的地址没有这一家的凭据（当前 {short_reason(cur, 56)}）"
+            return True, ""
+        if key_cur != key_want:
+            return False, (tab_load_failed_line(cur, self._last_nav_error) or
+                            f"标签落的不是这一页（{short_reason(cur or '地址读不出来', 56)}）")
+        return True, ""
+
+    def _tab_body_for(self, want_url, body=None, token="", same_host=True):
+        """从浏览器标签里把正文交出去之前那道**身份门**：先过 `_tab_page_is`（这一页是不是
+        我要的那一页），再问这页能不能算正文（不是质询壳、体积不像跳转中间态）。
+        返回 `(正文, 不合格的原因)`，正文为空串时原因一定非空。
+
+        由来（2026-11-15 第九轮实机马可波罗＋随后的同类查全）：这条腿旧写法只问「那页还是不是
+        质询壳」，壳一退掉就把 `_html()` 当成这一家的正文交出去。可那枚标签是各家用来的，站方在
+        挑战之后常把地址落到首页或上一页的结果上——那种页里有公司名、有电话，**只是不是这一家**。
+        字段填到别人头上比采不到更难被发现（麦麦B2B 在 `_fetch_via_tab` 的注释里早记过同一个坑，
+        但只在「保底重载回哪一页」那一步防了，取回正文这一步没防；顺企网那份只看主机名不看路径，
+        同主机下首页与某一家的深链一样算「本站」，防不住）。身份判据只看域名＋路径
+        （`_page_key`），query 里那串质询令牌不算。
+        """
+        ok, why = self._tab_page_is(want_url, token=token, same_host=same_host)
+        if not ok:
+            return "", why
+        html = (self._html() if body is None else body) or ""
+        if not html:
+            return "", "标签里的正文读不出来"
+        if self._looks_like_challenge_shell(html):
+            return "", "标签里那页还是质询壳"
+        if len(html) < self.TAB_BODY_MIN_CHARS:
+            return "", f"标签里那页只有 {len(html)} 字符，不像一页正文"
+        return html, ""
+
+    def _solve_js_shell_via_tab(self, url, allow_body=False):
+        """借一枚浏览器标签把「HTTP 200·整页 JS 质询壳」跑完，再把通行证抄回裸 HTTP 会话。
+
+        为什么值得为 BLOCK_OPEN_BROWSER=False 的站破例开标签：那个开关说的是「这站没有可
+        人工过的滑块，别拉着用户干等」，这一条说的是另一件事——壳里那段 JS 机器自己就能跑完，
+        不需要任何人操作。两者同时成立时，旧实现只剩下「按 IP 档等冷却」这一种处方，等于把
+        这一路放弃掉（2026-11-16 实机马可波罗：商铺首页半数的跳数吃壳）。
+
+        返回 True 的口径是：**这条腿出货了**——要么抄回了通行证（调用方重试那一跳），要么
+        `self._js_tab_body` 里放着过了身份门（`_tab_body_for`）的正文。它不代表「后面那一跳
+        一定取到真页」，那一跳自己会回答，深链账会记下结果。失败一律说清为什么失败（起不了
+        浏览器／挑战没跑完／没抄到 cookie／正文过不了身份门／预算用满），这一条腿的价值靠
+        账判断，不靠注释里的好话。
+
+        挑战跑完之后两条出路按**成本**排序，不是随手二选一：
+          1) 抄通行证回裸 HTTP：抄一次，后面几百家都走快路，这是最便宜的结局；
+          2) 站方不按 cookie 放行时（2026-11-15 实机马可波罗 3/3 全是这一档：挑战跑完了，
+             浏览器里一条本站 cookie 都没有——放行记在浏览器会话／出口 IP 上，requests 那条
+             TLS 指纹对不上）——**标签里那一页此时已经是真页**，旧写法却把它扔掉、回去重走
+             注定还是壳的 HTTP 一跳，于是这条腿永远 0 命中，整路只能报「等站方放行」。
+        `allow_body` 默认 False 是有意留的：通道入口那一步（`handle_http_block`）问的是
+        「HTTP 这条路还能不能用」，拿正文糊上去会让控制流以为通了、然后每一跳再撞一次壳。
+        """
+        if not url or not getattr(self, "BLOCK_JS_SHELL_TAB", True):
+            return False
+        budget = self._js_tab_budget()
+        if self._js_tab_tries >= budget:
+            self._log(f"   · 借标签跑壳本轮已到上限（{budget} 次），"
+                      f"这一家按被拒记账，不再多开标签")
+            return False
+        self._js_tab_tries += 1
+        self._log("   🧪 这一页是站方的 JS 质询壳：借一个浏览器标签让它自己把挑战跑完"
+                  "（不需要你操作），跑完把通行证抄回 HTTP 会话")
+        if not self.open_verify_page(url):
+            self._log("   ⚠ 借不到标签（共享 Chrome 起不来或打不开这一页），这条腿今天走不通")
+            return False
+        try:
+            deadline = time.time() + self.JS_SHELL_TAB_WAIT
+            still_shell = True
+            failed = ""
+            while time.time() < deadline:
+                if self._stop_requested:
+                    return False
+                # 「已经不是质询壳」其实有三种完全不同的事实：真页、别家的页、以及**这一跳
+                # 根本没加载出来**（Chrome 自己的错误页，连站点的一个字节都没有）。旧写法只看
+                # 「不是壳」就宣布挑战跑完，于是第三种在最坏的位置上被说成「跑完了但帮不上忙」
+                # ——2026-11-14 实机马可波罗 3/3 全是这一档（判据与由来见 _tab_load_failed）。
+                failed = self._tab_load_failed()
+                if failed:
+                    break
+                if not self._looks_like_challenge_shell(self._html() or ""):
+                    still_shell = False
+                    break
+                time.sleep(1.0)
+            if failed:
+                # 同一句「没加载出来」背后是三种完全不同的处方，必须分开说（类别只由
+                # 分型器给，判据与 `request_error_kind` 同源；这里再猜一次就长成两套尺子）：
+                #   站点回了错误码 → 这一条深链不给看，通道入口照旧，按每家记账继续走；
+                #   连接阶段失败   → 这一台连不上，熔断账已经记上了，再开标签也是白开；
+                #   浏览器自己拦    → 环境/参数问题，与站点无关（旧共享 Chrome 没带开关那一档）。
+                shape = request_error_shape(self._last_nav_error, cap=160)
+                kind = request_error_kind(shape)
+                if kind == "站点回了错误状态码":
+                    tail = "站点在这条深链上直接回了错误码（通道入口未受影响）——按这一家被拒记账，继续下一家"
+                elif request_error_is_connect(shape):
+                    tail = "这一台连不上（已按主机记进熔断账）——再开几次标签也是白开，该等的是网络/站点"
+                elif kind in ("", "未分型"):
+                    # 分不上型就照实说「还不知道」：这一档的 Chrome 原话已经留在句里，人去查
+                    # 的那张表还在长。在这里替它挑一个方向（浏览器拦／站点拒）就是拿猜测当结论，
+                    # 而这三条处方互相排斥，猜错的那一次是把整轮预算喂给一条不走的路。
+                    tail = "这一跳的失败原因还没分上型——先照 Chrome 原话留着，别按猜的方向处置"
+                else:
+                    tail = "是浏览器没能把这一跳发出去，与站点无关——共享 Chrome 若是本工具升级前" \
+                           "就开着的，退出本工具重开一次即可"
+                self._log(f"   ⚠ {failed}：{tail}")
+                return False
+            if still_shell:
+                self._log(f"   ⚠ 等了 {self.JS_SHELL_TAB_WAIT}s 那页还是质询壳：挑战没跑完，"
+                          f"这一家按被拒记账")
+                return False
+            n = self._harvest_browser_cookies()
+            if n:
+                self._js_tab_hits += 1
+                self._log(f"   ✅ 标签里那页已经不是质询壳了，抄回 {n} 条通行证，重试这一跳")
+                return True
+            body, why = ("", "这一步只要通行证——通道入口问的是 HTTP 那条路能不能用，"
+                            "正文替它说话就是假绿")
+            if allow_body:
+                body, why = self._tab_body_for(url)
+            if body:
+                self._js_tab_body_hits += 1
+                self._js_tab_body = body
+                self._log(f"   ✅ 标签里那页已经不是质询壳了，但站方不按 cookie 放行（浏览器里"
+                          f"一条本站通行证都没有）：标签里那页已经就是这一页，正文直接拿走"
+                          f"（{len(body)} 字符）")
+                return True
+            self._log("   ⚠ 标签里那页已经不是质询壳了，这条腿却还是帮不上：既没抄到本站通行证"
+                      f"（站方可能把放行记在 IP／浏览器会话上），标签里那份也不能算这一页"
+                      f"（{why or '没让它取正文'}）")
+            return False
+        finally:
+            self._release_verify_tab()
 
     def _harvest_browser_cookies(self):
         """把标签里过验证拿到的 clearance cookie 抄给裸 HTTP 会话（CDP Storage.getCookies，
         含 httpOnly）：纯 HTTP 站靠它才能回到不占标签的快路上（见 mic_crawler 同源做法）。
         返回抄回的条数。"""
-        dom = getattr(self, "BLOCK_COOKIE_DOMAIN", "")
+        # 没显式声明 BLOCK_COOKIE_DOMAIN 的站退回 HOME_DOMAIN：抄 Cookie 的域本来就是
+        # 「这个站」，各再抄一遍常量只会漏（漏了的形状是「挑战明明跑完了却一条都没抄到」，
+        # 而那句话会被当成这条腿没用——白扔一条能出数据的腿）。
+        dom = getattr(self, "BLOCK_COOKIE_DOMAIN", "") or getattr(self, "HOME_DOMAIN", "")
         jar = getattr(self, "_session", None)
         if not dom or jar is None or not self.pin_tab_id:
             return 0
@@ -2350,6 +3165,43 @@ return '';})()"""
         except Exception:
             return 0
 
+    def _deep_shell_retry(self, url, status, body, refetch):
+        """深链回「200·JS 质询壳」时的补救把手：跑完挑战，把**这一条 URL** 的正文拿回来。
+
+        为什么放在基类而不是各站自己写：这条腿的判据（签名）、预算（每轮上限）、成败口径
+        都一模一样，抄七遍就会长成七份互不一致的账。`refetch()` 留给调用方——各站「再取一次
+        这一条」的签名本来就不同（enc/referer/method/POST 体），强行统一只会逼基类猜参数。
+
+        出货有两条路，顺序按成本排（见 `_solve_js_shell_via_tab`）：抄回通行证就值得再走
+        一遍裸 HTTP（快）；站方不按 cookie 放行时，过了身份门的标签正文就是这一页（慢，
+        但出数）。两条路成了之后**深链那本账都要退一笔**（`_undo_deep_block`）：调用方的固定
+        顺序是「先记被拒、再叫这条腿」，成了不回账，收尾与体检报告读到的就是「这条腿被拒
+        52 次」，而实际其中一部分已经出到正文——那会把一条能出数据的路判成「近乎零产出」。
+
+        返回 None ＝这条腿没出货（不是壳／借不到标签／预算用满／挑战没跑完／正文过不了
+        身份门），调用方照旧按深链被拒收尾；返回字符串＝这一条的正文（可能来自重取的那一跳，
+        也可能来自标签里那页；可能是空串，那一跳自己会说话）。
+        `_shell_retry` 这一枚闩保证一条调用链最多重一次：不然预算会全花在同一个资源上。
+        """
+        if not (url and status == 200 and not self._shell_retry
+                and self._looks_like_challenge_shell(body)):
+            return None
+        self._js_tab_body = ""
+        if not self._solve_js_shell_via_tab(url, allow_body=True):
+            return None
+        from_tab, self._js_tab_body = self._js_tab_body, ""
+        if from_tab:
+            self._undo_deep_block(url)
+            return from_tab
+        self._shell_retry = True
+        try:
+            out = refetch()
+        finally:
+            self._shell_retry = False
+        if out:
+            self._undo_deep_block(url)
+        return out
+
     def handle_http_block(self, url="", reason=""):
         """裸 HTTP 链路命中防采/限流的统一处置：弹提醒 → （确实可人工过的站）
         借浏览器把验证页送到用户眼前 → 看门狗轮询到恢复才返回 True，调用方据此重试同一个请求。
@@ -2358,6 +3210,13 @@ return '';})()"""
         if url:
             self._block_probe_url = url
         self._block_reason = reason or self._block_reason or "站点防采/限流插页"
+        # 通道入口也吃到 JS 质询壳时：先试「借标签把挑战跑完」这条腿，跑通了就直接续采，
+        # 不进下面那个几十分钟的 IP 档等待（旧实现里 BLOCK_OPEN_BROWSER=False 的站根本没有
+        # 这条路，只能干等——而壳是 JS 问题，不是出口 IP 问题）。
+        if getattr(self, "_block_needs_js", False) and \
+                not getattr(self, "BLOCK_OPEN_BROWSER", True) and \
+                self._solve_js_shell_via_tab(url or getattr(self, "BASE_URL", "")):
+            return True
         if getattr(self, "BLOCK_OPEN_BROWSER", True) and \
                 getattr(self, "_block_kind", "") != "ip":
             self.open_verify_page(url)
@@ -2368,6 +3227,7 @@ return '';})()"""
         """过完验证的收尾：抄 cookie 给 HTTP 会话，归还临时借的标签。"""
         self._harvest_browser_cookies()
         self._block_reason = ""
+        self._block_needs_js = False
         self._release_verify_tab()
 
     def _register_block(self):
@@ -2425,6 +3285,10 @@ return '';})()"""
         self._block_kind = "ip" if ip_mode else "captcha"
         strikes = self._register_block()
         self._blocked = True
+        # 「这一页有没有可人工点的框」是一件事（决定上面为什么按 ip 档处置），「这是不是
+        # 验证码」是另一件事：站方回 JS 质询壳时两句都是真的，旧那句「这不是验证码」在这种
+        # 页面上就是假话（用户照着去看页面，页面上明明写着「正在检测」）。
+        needs_js = bool(getattr(self, "_block_needs_js", False))
         # 前缀是给界面分型用的（界面不能再靠猜“reason 里有没有 HTTP”来定文案）
         tag = BLOCK_TAG_IP if ip_mode else BLOCK_TAG_CAP
         cap = self._max_blocks_ip if ip_mode else self._max_blocks
@@ -2434,21 +3298,24 @@ return '';})()"""
             self._log(f"   ⛔ {self._block_window // 60} 分钟内第 {strikes} 次被拦，判定持续限流。"
                       f"为保护 IP，{self.PLATFORM_NAME} 本轮到此为止（已采数据已保存）。")
             if ip_mode:
-                self._log(f"   💡 这不是验证码，人工点不掉。要恢复只能：①重拨宽带/换网络换个出口 IP（最快）；"
+                self._log(f"   💡 {'这是站方的 JS 质询壳：页面里根本没有可点的验证框，人工对着它也点不掉' if needs_js else '这不是验证码，人工点不掉'}。"
+                          f"要恢复只能：①重拨宽带/换网络换个出口 IP（最快）；"
                           f"②等 ≥30 分钟再跑；③把「采集间隔」调大（建议 8~15 秒）。已采数据不丢，下次从断点续采。")
             self._stop_requested = True
             self._blocked = False
             # 熔断收的轮：原因在这里就得写进耐久账，_after_block_cleared() 下一步就把
             # _block_reason 清空了（收尾那句要靠它复述「为什么是 0 家」）。
             self._run_abandon = (f"持续限流（{self._block_window // 60} 分钟内第 {strikes} 次被拦）："
-                                 f"{str(reason or self._block_reason or '')[:60]}")
+                                 f"{short_reason(reason or self._block_reason, 60)}")
             self._after_block_cleared()
             return False
         self._emit("blocked_signal", f"{tag}{self.PLATFORM_NAME}：{reason}")
         self._log(f"🛑 {reason}")
         if ip_mode:
-            self._log("   已暂停推进（不写入空记录）。这是 IP 级限流/冷却，没有验证码可点也不需要你操作，"
-                      "工具会拉长间隔实测，站点放行后自动续采。")
+            self._log("   已暂停推进（不写入空记录）。"
+                      + ("这是站方的 JS 质询壳（本页没有可点的验证框，人工过不去），"
+                         if needs_js else "这是 IP 级限流/冷却，没有验证码可点也不需要你操作，")
+                      + "工具会拉长间隔实测，站点放行后自动续采。")
         else:
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，"
                       "看门狗探测到验证已解除后会自动续采。")
@@ -2508,8 +3375,8 @@ return '';})()"""
                 # 而代码异常（AttributeError 之类）绝不能冒充网络账——那样真 bug 会被
                 # 说成「等网络恢复」，谁都不会去看栈。
                 shape = request_error_shape(e)
-                still = (f"{NET_FAIL_TAG}探测异常：{shape[:60]}"
-                         if request_error_is_connect(shape) else f"探测异常：{shape[:60]}")
+                still = ((f"{NET_FAIL_TAG}探测异常：" if request_error_is_connect(shape)
+                          else "探测异常：") + short_reason(shape, 60))
             # 探针带 NET_FAIL_TAG 前缀＝本机网络层就没通（断网/DNS/连接被重置），
             # 与「站点在拦」是两本账：文案、超时归因都按这个分叉走。
             if str(still).startswith(NET_FAIL_TAG):
@@ -2531,7 +3398,7 @@ return '';})()"""
                     word = "本机网络没通（不是站点在拦），等网络恢复后自动续采"
                 else:
                     word = "仍在等站点放行（IP 冷却，无需操作）" if ip_mode else "仍在等待验证"
-                self._log(f"   {word}…已等 {waited} 秒（{str(still)[:60]}）")
+                self._log(f"   {word}…已等 {waited} 秒（{short_reason(still, 60)}）")
         if ip_mode and net_hits:
             # 断网不能记到站点头上（2026-11-04 09:36 实机：断网期间一路写
             # 「IP 冷却，无需操作」，收工又写「等 IP 冷却超时」，用户以为站点封了他
@@ -2721,6 +3588,124 @@ return '';})()"""
         # 委托模块级实现：判定本体只许有一份（子类想改口径就覆写 is_relevant）
         return kw_grams(kw)
 
+    def _cut_sample(self, bucket, kw, name):
+        """砍单记名的唯一把手：每个词只留前 `CUT_SAMPLE_CAP` 家、名字按标点断句收口。
+
+        为什么只留样本不存全量：这本账是给**人抽看**用的（「这刀该不该砍」要靠眼睛判），
+        不是名单导出；全量导出已由废数据回流钩子（pending_companies.add_waste）那条路
+        负责。留全量只会把内存与界面那一行撑长到没人看。
+        """
+        text = str(name or "").strip()
+        if not text:
+            return
+        got = bucket.setdefault(kw, [])
+        if len(got) >= CUT_SAMPLE_CAP:
+            return
+        got.append(short_reason(text, CUT_NAME_CAP))
+
+    @staticmethod
+    def _cut_note(bucket, kw, stage):
+        """砍单样本渲染成一句「（复核砍掉：A、B、C）」；没有名单就返回空串，调用方照常拼。
+        只有一本计数时那句处方（「该复核判定口径」）是不可执行的——复核的人手上没名单。"""
+        got = bucket.get(kw) or []
+        if not got:
+            return ""
+        return f"（{stage}砍掉：{'、'.join(got)}）"
+
+    def _note_early_skip(self, kw, name=""):
+        """列表页早过滤**唯一**的记账把手：全局数、逐词数、逐词样本一起加。
+        为什么必须走把手而不是各站自己 `+= 1`：逐词那一本（`kw_early`）是「这一词零产出
+        到底是被闸门砍的还是平台没货」的唯一凭据，十个站里漏接一个，那个站的读数就会把
+        砍单说成「链路未通」（与 `_note_deep_block`/`_note_fetch_fail` 同一族纪律，
+        判据见 test_block_triage_offline 第 ⑭ 节）。
+        `name`（公司名）是本轮新加的：只有一本计数时，报告只能说「该复核的是判定口径」，
+        复核的人手上没有名单——2026-11-16 第十轮实机麦麦B2B/世界工厂网/中国制造网三个 ❌
+        全都是这句话，而谁都没去看砍掉的究竟是谁。第 32 条硬门管的就是「传名」这一环。
+        """
+        self._early_skipped += 1
+        self.kw_early[kw] = self.kw_early.get(kw, 0) + 1
+        self._cut_sample(self.kw_early_names, kw, name)
+
+    def _note_detail_filter(self, kw, name=""):
+        """详情页相关性复核砍单的**唯一**记账把手：与 `_note_early_skip` 成对，
+        同样必须按词记一遍、并把名字留一份样本（两阶段处方不同：早过滤是「列表卡文本
+        零重叠、连详情都没进」，复核是「进了详情、主营产品写着别的类目」）。"""
+        self._filtered_count += 1
+        self.kw_filtered[kw] = self.kw_filtered.get(kw, 0) + 1
+        self._cut_sample(self.kw_filtered_names, kw, name)
+
+    def _kw_zero_reason(self, kw):
+        """某一词零净新增时，账上能不能说出「货是被本机相关性闸门砍的」。
+
+        第五类归因（前四类：被拦/链路未通/本页无数据/增量库全跳过）：链路是通的、站方
+        也回了货，只是本机判定把这一词整批判成类目不符。混进旧那三档，读的人会去查网络、
+        换关键词，而真正该动的是相关性口径（同族类目桥）——2026-11-15 实机「橡胶手套」
+        7 条全砍就是这么被写成「差分没跑成，建议换词复跑」的。返回空串＝说不出，调用方
+        必须退回旧那句，不许编。
+        """
+        det = self.kw_filtered.get(kw, 0)
+        ear = self.kw_early.get(kw, 0)
+        if not (det or ear):
+            return ""
+        how = "、".join(x for x in (f"详情页复核砍 {det} 家" if det else "",
+                                    f"列表页早过滤砍 {ear} 家" if ear else "") if x)
+        # 名单跟着数字一起给：这句处方是「该复核相关性口径」，而复核的人手上必须有几家
+        # 名字可看，否则「该复核」等于把活推回去却没给材料（样本由来见 _cut_sample）。
+        who = "、".join(x for x in (self._cut_note(self.kw_filtered_names, kw, "复核"),
+                                    self._cut_note(self.kw_early_names, kw, "早过滤")) if x)
+        return (f"零净新增：站方回的货有，但{how}（链路通、不是平台没数据）"
+                f"——该复核的是相关性口径/同族类目桥{who}")
+
+    def _keep_detail(self, html):
+        """把「这一家的详情页正文」留给无联系方式分档（取用方见 _note_no_contact），原样返回便于链式。
+
+        为什么做成方法而不是各站自己 `self._detail_html = html`：调用点必须**只**出现在
+        `crawl_detail` 里拿到详情页正文之后。列表页正文不算证据——列表页那一栏写什么，与
+        「这一家的联系页给不给号」是两件事，拿前者当证据会把一个站的版式当成一百家的事实。
+        后一次取页覆盖前一次：多数的站都是先商铺首页、后专用联系页，分档要问的是最后那
+        一页（更具体的那个）。哪一站忘了接，收尾就报 `unknown` 并说出「没留正文」——
+        判据与这一族接入情况见第 32 条硬门。
+        """
+        if isinstance(html, str) and html:
+            self._detail_html = html
+        return html
+
+    def _note_no_contact(self):
+        """「无联系方式」按**责任在谁**分档的唯一把手（判据与由来见 contact_slot_state）。
+
+        由来（2026-11-16 第十轮实机世界工厂网）：「电梯导轨」抓到 10 家、四项口径只剩 4 家，
+        旧口径把这种局一律写成「大头连四项联系方式都没有，先修取号通路再谈换词」。真去翻
+        页面，`联系电话` 那一栏写着 `-`（站方已改成「联系客服登记」才给号）：通路根本没坏，
+        这句谎却把人支使去改本来正确的解析代码。各档处方互不相同，合成一档就只剩一句
+        模棱两可的话：
+          · miss    栏位在、值里真有号码 → 我们解析漏了（该修代码，且**只有这一档**该修代码）
+          · hidden  「点击查看/登录后可见/联系客服登记」 → 站方藏着（该换通路或换站，不是修解析）
+          · blank   值是 `-`/`暂无` → 站方这一家没登（不是缺陷，别拿它当通路坏了）
+          · no_slot 整页没有中文联系方式栏位 → 这一页没这一栏，**无从判定**
+        取不到正文证据时分两档说清楚：声明过「详情不取页」的站记 `no_page`（本站的设计边界，
+        处方是加一条详情腿或按列表页口径接受），没声明的记 `unknown`（把把手接上就能判）。
+        宁可承认没证据，也不许借 `no_slot` 的名义把「我们没看」说成「页面没这一栏」——那是
+        同一个方向的谎换个壳；反过来，把已声明的站说成「忘了接」同样是指错方向的谎。证据由
+        `crawl_detail` 里的 _keep_detail 交上来；确实没有单店正文可判的站要在类里声明
+        NO_DETAIL_EVIDENCE 并写明理由（两者都会响在第 32 条硬门上，不会静默滑过）。
+        """
+        html = self._detail_html or ""
+        if html:
+            kind, evid = contact_slot_state(html)
+        else:
+            # 本站没留证据：有声明就说声明为什么（像跨国采购网那样详情不取页、靠列表明文组装的站，
+            # 本来就没有单店正文可判），没声明就直说「忘了接」——两者都不是「页面没这一栏」，
+            # 但也不是同一张处方：no_page 要的是加一条详情腿，unknown 要的才是接把手。
+            declared = str(getattr(self, "NO_DETAIL_EVIDENCE", "") or "")
+            kind = "no_page" if declared else "unknown"
+            evid = declared or "本站详情页没把正文留给分档判据（接 _keep_detail 才有这一档）"
+        self._nc_kinds[kind] = self._nc_kinds.get(kind, 0) + 1
+        if kind not in self._nc_evidence:
+            # 每档只留第一条证据：这一格是给人抽看「那句话到底是不是站方写的」，
+            # 留全量会让账变成没人读的日志；要全量请回废数据那条路（add_waste）。
+            self._nc_evidence[kind] = short_reason(evid, 60)
+        self._detail_html = ""
+
     def is_relevant(self, kw, text):
         """关键词与「公司名+主营+标题」的相关性：中文二字组重叠或完整词组命中即相关。
         二字组仍不命中时再过一道**同族类目桥**（见 _peer_words）：同行在站上常把同一类
@@ -2803,7 +3788,20 @@ return '';})()"""
             "ok": self.stat_ok,
             "early": self._early_skipped,
             "filtered": self._filtered_count,
+            # 逐词相关性砍单账：某一词零净新增时，这一本账区分「闸门砍的」与「平台没货」
+            "kw_filtered": dict(self.kw_filtered),
+            "kw_early": dict(self.kw_early),
+            # 砍单名单样本（逐词前几家）：有数字没名单，「该复核口径」这句处方就落不了地
+            "kw_filtered_names": {k: list(v) for k, v in self.kw_filtered_names.items()},
+            "kw_early_names": {k: list(v) for k, v in self.kw_early_names.items()},
+            # 本轮因判定规则更新而重新评估的旧「类目不符」家数（0＝没有旧账要补）
+            "rel_refilter": self._rel_refilter,
             "no_contact": self.stat_no_contact,
+            # 「无联系方式」的责任分档（六档，取值与顺序只由 NC_KIND_ORDER 定义）与每档首条证据：
+            # 只有总数时「先修取号通路」永远是一句无法反驳也无法执行的话（见 _note_no_contact）
+            **({"nc_kinds": dict(self._nc_kinds), "nc_evidence": dict(self._nc_evidence),
+               "nc_note": nc_kinds_text(self._nc_kinds, self._nc_evidence)}
+               if self._nc_kinds else {}),
             "failed": self.stat_failed,
             # 「一页都没取到」几页：0 家时到底是「站点没数据」还是「链路没通」，
             # 界面与体检器都问这一个数，不许靠读日志文案猜（由来见 _no_result_line）
@@ -2812,6 +3810,23 @@ return '';})()"""
             # 本轮被主机级熔断拉黑的主机：界面/体检器靠它说「这一路本轮不再重试了」，
             # 而不是让下一个读红话的人以为还要再等等看（读数只在这张账上，不靠文案）
             "dead_hosts": {h: v[1] for h, v in sorted(self._dead_hosts.items())},
+            # 深链被拒（某一家的联系页/产品页被拒，通道入口照常）：[次数, 最后一次原因]。
+            # 与 dead_hosts 分两本账是必须的——前者处方是「换通路」，后者是「换出口网络」
+            "deep_block": {h: [v[0], v[1]] for h, v in sorted(self._deep_blocks.items())},
+            # 观测账：导航落点与请求地址不是同一页（不参与控制流，判据与理由见
+            # _note_landing_mismatch）。不记它，「浏览器站要不要也上身份门」就只能靠猜。
+            **({"landing": {h: [v[0], v[1]] for h, v in sorted(self._landing_mismatch.items())}
+                if self._landing_mismatch else {}}),
+            # 借浏览器标签跑完 JS 质询壳的账（走过这条路才有这一格）：这条路只在
+            # 「站方回 200+整页质询壳」时开一次标签，成本真实存在，所以必须看得见花了
+            # 几次、成了几次——不记它，下一次判断「这条腿到底值不值得留」就没有依据。
+            # 成的两档必须分开念：抄回通行证＝后面几百家都走快路（一次性的），
+            # 标签直接取正文＝每一家都要付一枚标签。混成一个数字，「这条腿值不值得」
+            # 就没法判断，预算（_js_tab_budget）也跟着失真。
+            **({"js_tab": f"借标签跑壳 成 {self._js_tab_hits + self._js_tab_body_hits}/"
+                          f"{self._js_tab_tries} 次"
+                          f"（抄通行证 {self._js_tab_hits}／标签取页 {self._js_tab_body_hits}）"}
+               if self._js_tab_tries else {}),
             "waiting": self._waiting_human,
             "incr_skip": self._incremental_skipped,
             "got": len(self.results),
@@ -2872,7 +3887,7 @@ return '';})()"""
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e.get("公司名称", ""))
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e.get("公司名称", ""), "memberId": mid})
@@ -2932,6 +3947,14 @@ return '';})()"""
         self._pause_requested = False
         self._seen_members = set()
         self._filtered_count = 0
+        self.kw_filtered = {}
+        self.kw_early = {}
+        # 砍单**记名**（每词每阶段只留前 CUT_SAMPLE_CAP 家）：只有一本「哪个词被砍了几家」的数，
+        # 答不了「这一刀该不该砍」——报告说「该复核的是判定口径」，而复核的人手上没有名单，
+        # 就只能听我说。由来见 _note_early_skip。
+        self.kw_early_names = {}
+        self.kw_filtered_names = {}
+        self._rel_refilter = 0
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
@@ -2941,6 +3964,14 @@ return '';})()"""
         self._incremental_skipped = 0
         # 链路账与「在等人」账也是每轮重起：上一轮断网/等登录不该盖到这一轮的归因上
         self._page_fail = 0
+        # 「无联系方式」按**是谁的责任**分档的账（判据与由来见 contact_slot_state）：
+        # 站方没登、站方藏着、我们没解析到、页面根本没这一栏、详情不取页、没留正文证据——
+        # 每一档处方各不相同，合成一档就只能说一句模棱两可的「先修取号通路」。
+        self._nc_kinds = {}
+        self._nc_evidence = {}
+        # 各站解析详情页时留下的正文（谁留证据谁受益；没留时按有没有声明分成
+        # no_page（详情不取页，设计边界）与 unknown（把手没接，可修）两档）
+        self._detail_html = ""
         self._last_page_error = ""
         self._waiting_human = ""
         # 主机熔断同样按轮起账：上一轮连不上的主机，这一轮（可能已经换了出口）必须重新试
@@ -2963,9 +3994,15 @@ return '';})()"""
             # 只把「已完整 / 重试已用尽」的条目当去重依据，缺联系人的历史条目自动解锁
             locked = self._locked_keys()
             self._seen_members |= locked
-            refill = seeded - len(locked)
+            # 判定规则升级后，旧的「类目不符」盖章不再免检（已被本轮重判的家会再写一次
+            # 带新 rv 的结论，所以下一轮这个数字自己会掉下去）
+            self._rel_refilter = len(self._stale_filtered_keys())
+            refill = seeded - len(locked) - self._rel_refilter
             if refill:
                 self._log(f"🔓 增量库内有 {refill} 家条目联系人曾取空，本轮重采补联系人")
+            if self._rel_refilter:
+                self._log(f"🔁 相关性判定规则已更新：本轮重新评估 {self._rel_refilter} 家旧"
+                          f"「类目不符」（单轮上限 {self.REL_REFILTER_CAP} 家，其余下轮续）")
 
         if not self._is_session_alive():
             if not self.start_browser():
@@ -3002,10 +4039,13 @@ return '';})()"""
                         break
                     while self._pause_requested and not self._stop_requested:
                         time.sleep(0.5)
+                    # 详情页证据一次一清：上一家的正文留在手上，下一家的「无联系方式」就会拿
+                    # 别人的栏位当证据——分档说谎与「深链原因不回退到主机账」是同一族纪律。
+                    self._detail_html = ""
                     try:
                         rec = self.crawl_detail(stub)
                     except Exception as e:
-                        raw = str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__
+                        raw = first_line(e, 160) if str(e) else e.__class__.__name__
                         # 分型后的一句才交给日志与归因：类别在最前面，后面每一档 [:50]/[:60] 截断都截不掉它
                         # （旧写法从头部截 160 字，砍掉的恰好是 requests 里唯一决定方向的 `(Caused by …)`）。
                         # `_session_dead` 仍**先按原文判**：它的标记表是照着 CDP/requests 原文调出来的（见
@@ -3013,14 +4053,15 @@ return '';})()"""
                         # 会让「会话已死→重启续采」这条自愈路径悄悄失效而不报任何错。
                         msg = request_error_shape(e, cap=160)
                         if self._session_dead(raw) or self._session_dead(msg):
-                            self._log(f"⚠ 详情处理中会话断开（{msg[:50]}），重启后续采…")
+                            self._log(f"⚠ 详情处理中会话断开（{short_reason(msg, 50)}），重启后续采…")
                             if not self.try_restore_session():
                                 self._stop_requested = True
                             continue
                         rec = self._base_rec(stub)
                         rec["状态"] = "详情解析异常"
                     if rec.get("状态") == "类目不符(已过滤)":
-                        self._filtered_count += 1
+                        # 全局数与逐词数一起记，走把手（见 _note_detail_filter）
+                        self._note_detail_filter(kw, rec.get("公司名称", ""))
                         self._commit_to_store(rec)
                         if self._filtered_count % 10 == 1:
                             self._log(f"  ⛔ 相关性不符已过滤 {self._filtered_count} 家"
@@ -3031,6 +4072,10 @@ return '';})()"""
                         self.stat_ok += 1
                     elif st in ("无电话(未公开)", "无联系方式"):
                         self.stat_no_contact += 1
+                        # 这一家没号码到底是站方没给还是我们没取到，只有页面自己能给答案
+                        # （分档的理由见 _note_no_contact；没留正文又没声明的站记 unknown，
+                        # 声明过「详情不取页」的站记 no_page——两者不是一张处方）
+                        self._note_no_contact()
                     else:
                         self.stat_failed += 1
                     self._add_result(rec)
@@ -3041,7 +4086,7 @@ return '';})()"""
                                f"｜间隔 {self._current_delay:.1f}s")
                     self._sleep()
             except Exception as e:
-                raw = str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__
+                raw = first_line(e, 160) if str(e) else e.__class__.__name__
                 # 分型后的一句才交给日志与归因：类别在最前面，后面每一档 [:50]/[:60] 截断都截不掉它
                 # （旧写法从头部截 160 字，砍掉的恰好是 requests 里唯一决定方向的 `(Caused by …)`）。
                 # `_session_dead` 仍**先按原文判**：它的标记表是照着 CDP/requests 原文调出来的（见
@@ -3049,7 +4094,7 @@ return '';})()"""
                 # 会让「会话已死→重启续采」这条自愈路径悄悄失效而不报任何错。
                 msg = request_error_shape(e, cap=160)
                 if self._session_dead(raw) or self._session_dead(msg):
-                    self._log(f"⚠ 「{kw}」处理中会话断开（{msg[:50]}），重启后续采…")
+                    self._log(f"⚠ 「{kw}」处理中会话断开（{short_reason(msg, 50)}），重启后续采…")
                     if not self.try_restore_session():
                         self._stop_requested = True
                 else:
@@ -3064,7 +4109,14 @@ return '';})()"""
                 if self.kw_yield.get(kw, 0) > yield_before:
                     self._kw_done.add(kw)
                 else:
-                    self._log(f"⚠ 「{kw}」无新增产出（被拦/链路未通/本页无数据），不记「已跑完」，下次自动重来")
+                    # 归因交给把手（可单测，且十路共用一句话）：账上有砍单就说砍单，
+                    # 说不出才退回旧那三档（被拦/链路未通/本页无数据）
+                    _why = self._kw_zero_reason(kw)
+                    if _why:
+                        self._log(f"⚠ 「{kw}」{_why}，不记「已跑完」，下次自动重来")
+                    else:
+                        self._log(f"⚠ 「{kw}」无新增产出（被拦/链路未通/本页无数据），"
+                                  f"不记「已跑完」，下次自动重来")
             if self.incremental:
                 self._save_seen_store()
             self._emit("kw_progress_signal", self.PLATFORM_SLUG, ki, len(kws))
@@ -3087,7 +4139,7 @@ return '';})()"""
         # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事
         # 只有取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与
         # ali1688_crawler 同构，对拍见 test_data_dir_offline.py 第 14 节）。
-        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"
+        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"
                     if self._page_fail else "")
         pend = self._seen_store_pending() if self.incremental else 0
         pending = f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else ""
@@ -3108,7 +4160,7 @@ return '';})()"""
             mark, why = "⛔", (f"｜仍在等{self._waiting_human}（不是采不到：等人处理完"
                                "会自动续采，这一路的配额没烧）")
         elif self._blocked:
-            mark, why = "⛔", f"｜仍在等验证（{str(self._block_reason or '')[:40]}）"
+            mark, why = "⛔", f"｜仍在等验证（{short_reason(self._block_reason, 40)}）"
         elif self._stop_requested:
             mark, why = "⏹", "｜本轮被停止"
         elif not self.results:
@@ -3130,16 +4182,34 @@ return '';})()"""
         s = self.stats()
         # 链路/等人两笔记进账目行：只出现在「共 0 家」那一行的话，正常出货的轮次里
         # 「有 3 页根本没取到」这笔坏账就永远看不见（少了几页同样是要紧的账）
-        lk = (f"｜取页失败 {s['page_fail']} 页（最后一次：{s['last_page_error'][:60]}）"
+        lk = (f"｜取页失败 {s['page_fail']} 页（最后一次：{short_reason(s['last_page_error'], 60)}）"
               if s["page_fail"] else "")
         # 熔断那一笔在正常出货的轮次里也要露出来：某台主机被跳过 5 页，账上只写「翻 5 页」
         # 就是「少了几页没人说」——与上面「链路账不许只在 0 家时才可见」同一口径。
         if s.get("dead_hosts"):
             lk += f"｜主机熔断 {'、'.join(s['dead_hosts'])}（本轮不再请求，冷却后自动再试）"
+        # 深链被拒的账在正常出货的轮次里也要露出来：某一家的联系页 403 不代表本机被限流，
+        # 但「这一条腿今天不通」必须看得见——不然读数的人只知道「共 N 家」，不知道少的是哪条通路，
+        # 也就没人去换通路（马可波罗 product/contact 两条腿就是靠这一格现形的）
+        if s.get("deep_block"):
+            lk += "｜深链被拒 " + "、".join(
+                f"{h} {v[0]} 次" for h, v in sorted(s["deep_block"].items()))
+        # 落点不符（导航请求的那一页与浏览器实际留下的那一页不是同一页）在旧口径里只进 stats()
+        # 不进人眼：2026-11-16 自查发现全局 grep 不到一处渲染。这一笔记的是「我们以为在看的
+        # 那一页其实不是」——它正是「把别人的页当这一家」那一类事故的先兆，念不出来就等于没记。
+        if s.get("landing"):
+            lk += "｜落点不符 " + "、".join(
+                f"{h} {v[0]} 次" for h, v in sorted(s["landing"].items()))
+        # 「无联系方式 N 家」单说数字不办事：各档的处方互相矛盾（修代码 / 换通路 / 不用管 /
+        # 判不了），必须当场报哪一档；miss 与 unknown 是我们自己的账、no_page 是本站定的
+        # 设计边界，所以排在前头（先认自己这一侧，再把站方的账放后面）
+        # 渲染走唯一把手（三处共用一句人话，见 nc_kinds_text 上方为什么要这样做）
+        nc = ("｜无联系方式分档：" + nc_kinds_text(s["nc_kinds"], s.get("nc_evidence"))
+              if s.get("nc_kinds") else "")
         wt = f"｜仍在等{s['waiting']}" if s["waiting"] else ""
         self._log(f"📊 {self.PLATFORM_NAME}本轮账目：翻 {s['pages']} 页共见 {s['listed']} 条列表条目｜"
                   f"成功 {s['ok']}｜无联系方式 {s['no_contact']}｜失败/可重采 {s['failed']}｜"
-                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}{lk}{wt}"
+                  f"早过滤 {s['early']}｜详情复核不相关 {s['filtered']}{lk}{wt}{nc}"
                   + (f"｜省份把关：外省 {s['pf_miss']}、属地未标注 {s['pf_unknown']}"
                      if self.province else ""))
         self._emit("crawl_finished_signal")
@@ -3187,18 +4257,60 @@ return '';})()"""
         self._block_times = []
         self._seen_members = set()
         self._filtered_count = 0
+        self.kw_filtered = {}
+        self.kw_early = {}
+        # 砍单**记名**（每词每阶段只留前 CUT_SAMPLE_CAP 家）：只有一本「哪个词被砍了几家」的数，
+        # 答不了「这一刀该不该砍」——报告说「该复核的是判定口径」，而复核的人手上没有名单，
+        # 就只能听我说。由来见 _note_early_skip。
+        self.kw_early_names = {}
+        self.kw_filtered_names = {}
+        self._rel_refilter = 0
         self._pf_dropped = 0
         self._pf_unknown = 0
         self._early_skipped = 0
         # 每轮重新起账：跨轮累加会把上一轮的跳过算进本轮，界面读数就废了
         self._incremental_skipped = 0
         self._page_fail = 0
+        # 「无联系方式」按**是谁的责任**分档的账（判据与由来见 contact_slot_state）：
+        # 站方没登、站方藏着、我们没解析到、页面根本没这一栏、详情不取页、没留正文证据——
+        # 每一档处方各不相同，合成一档就只能说一句模棱两可的「先修取号通路」。
+        self._nc_kinds = {}
+        self._nc_evidence = {}
+        # 各站解析详情页时留下的正文（谁留证据谁受益；没留时按有没有声明分成
+        # no_page（详情不取页，设计边界）与 unknown（把手没接，可修）两档）
+        self._detail_html = ""
         self._last_page_error = ""
         self._waiting_human = ""
         # 主机熔断账同样要清：「开始新任务」意味着重新给每台主机一次机会
         self._dead_strikes = {}
         self._dead_hosts = {}
         self._dead_logged = set()
+        # 深链被拒那本账也按轮起账（与熔断同口径）：上一轮「这家联系页不给看」
+        # 不该在新任务里继续顶格显示，站点哪天放行了读数要能自己归零
+        self._deep_blocks = {}
+        # URL 死因原件跟着清：留着它，下一轮同一条 URL 换了死因也会被旧的那句念出来
+        self._deep_why = {}
+        # 「落点不符」那本观测账也按轮起账：上一轮的落点问题不该顶替这一轮的读数
+        self._landing_mismatch = {}
+        # 借标签跑壳的预算也按轮起账：上一轮花光上限会让这一轮连试都不试
+        self._js_tab_tries = 0
+        self._js_tab_hits = 0
+        # 两条出货路分开记，上一轮「一次通行证都没抄到」不许把这一轮的预算判死
+        # （预算由账给，见 _js_tab_budget）
+        self._js_tab_body_hits = 0
+        self._js_tab_body = ""
+        # 「同主域只开口一次」的那份凭据必须跟着清零：否则新任务里同主域再撞就永远
+        # 不播报（日志静音跨轮），跟上面熔断的 `_dead_logged` 是同一个坑
+        self._deep_logged = set()
+        # 通道级拦截的**其余三件**同样按轮起账。旧实现只清了 `_block_reason`，留下
+        # `_block_probe_url`/`_block_kind`/`_retry_after` 跨轮：新一轮的拦截如果来自
+        # 不带 URL 的调用（浏览器判页那条路就是），恢复探测会去探**上一轮**那页、
+        # 分诊结论也沿用上一轮的——读起来就像「本轮没被拦却一直在等上一轮的页」。
+        # 深链账上线后这条更值得清：分账的前提是「通道那本每轮都是干净的」。
+        self._block_probe_url = ""
+        self._block_kind = ""
+        self._block_needs_js = False
+        self._retry_after = 0
         self.stat_listed = self.stat_pages = 0
         self.stat_ok = self.stat_no_contact = self.stat_failed = 0
         self.kw_yield = {}

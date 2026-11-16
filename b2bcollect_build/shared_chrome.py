@@ -20,6 +20,9 @@ from pathlib import Path
 
 import requests
 
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖。
+from text_shape import first_line
+
 PORT = 9255                     # 本工具专用调试端口（与 riskbird 9233、1688 9244 错开）
 CHROME_WAIT_SECONDS = 25
 BLANK_TAB_URLS = ("about:blank", "chrome://newtab/", "chrome://new-tab-page/")
@@ -111,6 +114,80 @@ def is_alive(port: int = PORT) -> bool:
         return False
 
 
+# ── 明文 http 那一跳必须真的发得出去（这台浏览器替我们做主的第 21 件事）──────────
+# Chrome 从「始终使用更安全的连接」（HTTPS-First / HttpsUpgrades）开始，会把**顶层** http
+# 导航先升级成 https；升级失败时它**不退回明文**，而是当场取消这次请求 —— CDP 侧收到的
+# 就是 `net::ERR_BLOCKED_BY_CLIENT`，页面落在 `chrome-error://chromewebdata/`。
+# 本机差分实测（2026-11-14，同机两个 headless Chrome，只差这一个开关，其余参数一致）：
+#   不带参数：http://example.com、http://china.makepolo.com/…、http://xxx.cn.makepolo.com/
+#             三个全部 ERR_BLOCKED_BY_CLIENT，正文 39 字符；
+#   带上参数：三个全部正常落到请求的那一页（example.com 1974 字符、马可波罗拿到站方原文）。
+# 为什么这一条对本工具是致命的：马可波罗的深链本来就是明文 http，而它的 https 证书连自己
+# 的域名都不覆盖（curl 实测 `no alternative certificate subject name matches target host
+# name 'china.makepolo.com'`）。于是「借浏览器标签把 JS 质询壳跑完」这条腿三次全废，
+# 日志里只剩一句「这条腿帮不上忙」，把环境自己拦掉了说成站点不给过。
+# 为什么只关自动升级、绝不关证书校验（`--ignore-certificate-errors`）：后者会让这台带着
+# 1688／riskbird 登录态的浏览器对**所有站点**失去中间人防护，是拿账号安全换一次取页；
+# 而「站点只给明文就按明文请求」与裸 HTTP 通道今天的行为等价，不新增任何风险面。
+# 为什么是**一份元组**而不是一个字符串：1688 与 riskbird 各自是独立包，import 不到这里，
+# 只能内联逐字节相同的副本（`ali1688_crawler._chrome_args`、`dual_session` 的启动列表）。
+# 「同一个环境开关只在一处生效」正是这一族事故的形状，所以构建前硬门第 31 条（31g）按整段
+# 对拍三份副本，并规定：任何在字符串常量里配 Chrome 启动参数的文件，要么带上这份开关，
+# 要么在门的豁免表里写下「这个浏览器为什么不必带」。
+NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"
+CHROME_NO_UPGRADE_FLAGS = (f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)
+_flag_warned = []                      # 复用旧 Chrome 时只提示一次（每进程）
+
+
+def _profile_cmdline() -> str:
+    """本工具配置目录那个 Chrome 的启动命令行（读不到就回空串，绝不抛）。
+    只用于判断「已在跑的实例带没带我们要的开关」，不做任何进程管理。
+    按目录**名**而不是全路径匹配：登录态目录搬迁过（%TEMP% → 持久目录），旧实例可能还
+    挂在老位置上，那一枚同样要能认出来。"""
+    try:
+        if sys.platform == "win32":
+            ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                  f"Where-Object {{ $_.CommandLine -like '*{PROFILE_DIR_NAME}*' }} | "
+                  "Select-Object -First 1 -ExpandProperty CommandLine")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=10)
+            return (out.stdout or "").strip()
+        env = dict(os.environ, COLUMNS="20000")     # 不然 ps 会按终端宽度截断长命令行
+        out = subprocess.run(["ps", "-Ao", "args="], capture_output=True, text=True,
+                             timeout=10, env=env)
+        return next((ln.strip() for ln in (out.stdout or "").splitlines()
+                     if f"user-data-dir=" in ln and PROFILE_DIR_NAME in ln), "")
+    except Exception:
+        return ""
+
+
+def missing_no_upgrade_flag() -> bool:
+    """已在跑的共享 Chrome 是不是**没有**关闭自动升级 https（本工具自己拉起的都算带上）。
+    读不到进程信息时按「不缺」处理：宁可少提示一次，也不要在证据不足时吓人。"""
+    line = _profile_cmdline()
+    return bool(line) and "HttpsUpgrades" not in line
+
+
+def ensure_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
+    """确保有一个带调试端口的共享 Chrome 在跑（已就绪则直接复用，不重启）。
+    并发安全：三站线程可能同时冷启动，用启动锁 + double-check 保证只拉起一个 Chrome，
+    否则后起的进程会 pkill 掉先起的、或抢同一 profile 单实例锁导致全部失败。"""
+    if is_alive(port):
+        # 复用旧实例时那一跳的成败已经由启动参数决定了：早先（本工具升级前）起来的 Chrome
+        # 没带这个开关，之后所有明文 http 深链都会被浏览器自己拦掉。这里必须说出来 ——
+        # 不说，用户看到的就是「站点像是不给过」；重启一次本工具（或让它自己拉 Chrome）即好。
+        if missing_no_upgrade_flag() and not _flag_warned:
+            _flag_warned.append(1)
+            log("⚠ 共享浏览器是先前就开着的，没带「不强制升级 https」的开关：明文 http 的"
+                "商铺页/详情页会被浏览器拦在加载之前（不是站点在拦）。退出本工具再重新打开"
+                "即可自动带上，之后无需再做别的")
+        return True
+    with _LAUNCH_LOCK:
+        if is_alive(port):
+            return True
+        return _launch_shared_chrome(log, port, headed)
+
+
 def _kill_profile_chrome(profile: Path):
     """只关闭使用本工具配置目录的 Chrome（绝不动用户自己的浏览器窗口）。"""
     try:
@@ -128,18 +205,6 @@ def _kill_profile_chrome(profile: Path):
         time.sleep(1.5)
     except Exception:
         pass
-
-
-def ensure_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
-    """确保有一个带调试端口的共享 Chrome 在跑（已就绪则直接复用，不重启）。
-    并发安全：三站线程可能同时冷启动，用启动锁 + double-check 保证只拉起一个 Chrome，
-    否则后起的进程会 pkill 掉先起的、或抢同一 profile 单实例锁导致全部失败。"""
-    if is_alive(port):
-        return True
-    with _LAUNCH_LOCK:
-        if is_alive(port):
-            return True
-        return _launch_shared_chrome(log, port, headed)
 
 
 def _launch_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
@@ -166,6 +231,9 @@ def _launch_shared_chrome(log, port: int = PORT, headed: bool = True) -> bool:
         "--hide-crash-restore-bubble",
         # 裸 CDP 附加时无法再传开关，反自动化检测必须在启动时带上
         "--disable-blink-features=AutomationControlled",
+        # 明文 http 深链不能被浏览器自己升级成 https 再拦掉（由来与差分实测见上面
+        # NO_HTTPS_UPGRADE_FEATURES 那段：马可波罗那条借标签的腿就是这么三次全废的）
+        *CHROME_NO_UPGRADE_FLAGS,
         "--disable-infobars",
         # 后台化支持：窗口最小化/标签不可见时不降级定时器、不冻结渲染进程，
         # 否则最小化后 JS 渲染站点的水合/就绪等待会被拖慢甚至静默卡死。
@@ -216,12 +284,29 @@ def open_tab(port: int = PORT, url: str = "about:blank"):
 
 
 def close_tab(port: int = PORT, target_id: str = ""):
+    """关掉一枚标签。**返回空串＝确认这一枚已经不在了；否则返回一句可读的失败原因。**
+
+    为什么必须交回事实而不是 `except Exception: pass`（第 32g 条当场抓到）：
+    上层 `cdp_base.release_tab` 写着「关失败必须开口」，可它靠的是**异常往上传**；
+    这一层把异常吞掉，上面那句就成了永远走不到的死分支——工具会心平气和地告诉用户
+    「已经收工」，而共享 Chrome 里其实还挂着那枚标签。最底层把事实抹平，上面整座账
+    就退化成自证清白，所以「谁拿着标签谁还」「关失败必须开口」这两条不变量必须由
+    这一层先把真相交出来。
+
+    只信回执不信事实：Chrome 对不存在的 target 也回 HTTP 200（body 写 No such target），
+    所以关完再查一次列表——**在列表里查不到才算关掉**，与 `list_page_targets` 同一口径。"""
     if not target_id:
-        return
+        return "没给出 target_id，这一枚没关"
+    said = ""
     try:
-        local_session().get(local_url(port, f"/json/close/{target_id}"), timeout=3)
-    except Exception:
-        pass
+        r = local_session().get(local_url(port, f"/json/close/{target_id}"), timeout=3)
+        said = f"HTTP {r.status_code} {first_line((r.text or '').strip(), 60)}"
+    except Exception as e:
+        return f"关闭请求没送达（{type(e).__name__}）：{first_line(e, 80)}"
+    ids = {t.get("id") for t in list_page_targets(port)}
+    if target_id not in ids:
+        return ""
+    return f"标签仍在列表里（关闭回执 {said or '无'}）"
 
 
 def _is_blank(url: str) -> bool:
@@ -282,8 +367,13 @@ def release_tabs(pinned_ids, port: int = PORT, log=None):
     for tid in pinned_ids or []:
         claimed.pop(tid, None)
         if tid and keep_alive > 1:
-            close_tab(port, tid)
-            keep_alive -= 1
+            reason = close_tab(port, tid)
+            if reason:
+                # 收工路径上也一样不许静默：这一枚没关掉，用户需要知道去哪手动收
+                log(f"⚠ 收工归还标签 {str(tid)[:12]} 没成功：{reason}——"
+                    f"共享 Chrome 里可能还挂着它，请手动关掉（不影响已采数据）")
+            else:
+                keep_alive -= 1
 
 
 def _browser_cmd(port, method, params, timeout=8):

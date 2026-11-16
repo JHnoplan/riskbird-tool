@@ -89,7 +89,7 @@ class YzdClient:
         except requests.exceptions.ConnectionError:
             raise YzdError(f"无法连接云展服务器（{API_BASE}），请检查网络")
         except Exception as e:
-            raise YzdError(f"{what}异常：{str(e)[:120]}")
+            raise YzdError(f"{what}异常：{e}")
         return self._unwrap(resp, what)
 
     # ── 接口3：校验手机号是否为云展动力账号 ──

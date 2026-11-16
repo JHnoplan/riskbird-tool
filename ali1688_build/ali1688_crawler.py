@@ -233,6 +233,19 @@ _REQUEST_ERROR_KINDS = (
                      "net::err_socket", "net::err_network_changed")),
     ("TLS握手失败", ("sslerror", "ssl:", "certificate", "handshake", "sslv3", "tlsv1",
                    "net::err_ssl", "net::err_cert")),
+    # Chrome 把「站点回了 4xx/5xx、页里又没有可看的内容」也算导航失败：照样落
+    # chrome-error://，可这句话的主语是**站点对这一条资源回了错误状态码**，既不是浏览器拦、
+    # 也不是网络不通。混进下一档会让人去改启动参数（2026-11-14 实机马可波罗的商铺深链正是
+    # 这一档：同一时刻通道入口照常 200、借标签那条腿 29/33 出货），而正确的处方是按每家深链
+    # 被拒记账、继续下一家。
+    ("站点回了错误状态码", ("err_http_response_code_failure",)),
+    # 浏览器自己把这次导航取消了：站点侧根本没看到流量，页面落在 `chrome-error://`。
+    # `ERR_BLOCKED_BY_CLIENT` 的实机由来是「始终使用更安全的连接」把明文 http 升级成
+    # https、升级失败又不退回明文（同机两个 Chrome 只差这一个开关的差分实测见
+    # shared_chrome.NO_HTTPS_UPGRADE_FEATURES）；另一支来源是扩展/本机策略。
+    # 它与「连不上」的处方完全不同：那一档查出口网络与域名可达，这一档查浏览器参数与
+    # 这一跳用的是哪种协议——所以刻意**不进** DEAD_HOST_KINDS，不该被主机熔断吃掉。
+    ("浏览器拦下这一跳", ("err_blocked_by_client", "err_blocked_by_administrator")),
     ("连不上·无应答", ("connecttimeout", "connect timeout", "timed out. (connect",
                      "operation timed out", "[errno 60]", "failed to establish a new connection",
                      "net::err_connection_timed_out", "net::err_timed_out",
@@ -254,6 +267,207 @@ _REQUEST_ERROR_KINDS = (
 # 而这几档恰恰是「等一等就好」与「改代码」的分界线。
 _HTTP_STATUS_KINDS = ((429, "HTTP 429·限流"), (403, "HTTP 403·风控/需验证"),
                       (407, "HTTP 407·要代理口令"), (404, "HTTP 404·这一页没了"))
+# ── 「本工具自己已经定过性的句子」的类别词表 ──────────────────────────────────────
+# 翻页层会把 `_goto` 留下的原因再包一层：`列表页导航失败（【被拦停】防采页没等到放行…）`。
+# 分型器过去只认 `startswith("【")`，于是这种**已经带着结论**的话被洗成
+# `【未分型】｜列表页导航失败（【被拦停】…）`（2026-11-15 实机 1688 的收尾句、GUI 账目行与
+# 体检报告念的全是降级后那一版）。左边界 12 字与 `_DEAD_HOST_RE` 同源——消费者（主机熔断账、
+# 看门狗的网络账）本来就能从这种嵌套形状里读出类别，分型器读不出就是两套尺子。
+# 只认这张表里的词：站点原文里的「【访问过于频繁】」之类不是我们的结论，不许冒充类别收口。
+_OWN_KIND_TOKENS = tuple(name for name, _ in _REQUEST_ERROR_KINDS) + tuple(
+    v for _, v in _HTTP_STATUS_KINDS) + ("被拦停", "页面未就绪", "一页都没取到")
+# 按长度倒序排：万一某个词是另一个词的前缀，交替式里短的先命中就会把长的截走
+# 第 1 组＝类别前面的那句标签（`列表页导航失败（`），它要说的是「哪一层没做成」，
+# 必须留在证据里；第 2 组＝类别本身。
+_NESTED_KIND_RE = re.compile(
+    r"^(.{0,12}?[（(])【(%s)】" % "|".join(re.escape(t)
+                                          for t in sorted(_OWN_KIND_TOKENS, key=len, reverse=True)))
+
+
+# 明文 http 不能被浏览器自己升级成 https 再拦掉：升级失败时 Chrome **不抛异常**，直接把这一跳
+# 取消，页面落在 `chrome-error://chromewebdata/`，`Page.navigate` 的响应里只剩一句
+# `net::ERR_BLOCKED_BY_CLIENT`——「环境自己拦掉了」就会被说成「站点不给过」。由来与同机差分实测
+# （两个 Chrome 只差这一枚开关）见 b2bcollect_build/shared_chrome 那段注释。
+# 1688 是另一个 PyInstaller 入口，import 不到那一份，所以这里内联**逐字节相同**的副本，
+# 由构建前硬门第 31 条（31g）整段对拍：只比启动参数在不在，比不出「副本少了一档 feature」，
+# 而少一档恰好会让另一条升级路径把同一枚事故原样复发。
+# 为什么只关自动升级、绝不关证书校验（后者会让带着登录态的浏览器对所有站点失去中间人防护）：
+# 同一份注释里已经写过，两处都别改。
+NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"
+CHROME_NO_UPGRADE_FLAGS = (f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)
+
+
+# 原因收口只准一个把手。真源在 b2bcollect_build/text_shape.py，1688 独立包装不进那一份
+# （它是另一个 PyInstaller 入口，只带 ali1688_build 自己的文件），所以这里内联一份
+# **逐字节相同**的实现，由离线夹具拿源码对拍（22h 与第 ㉓ 节）：只比函数返回值比不出「一边
+# 悄悄改了断点表」，那种分叉要换一种异常文本才会暴露。
+# 可断的位置：标点、全角分隔符、间隔号、空白（词与词之间）。**不**在任意字符之间断，
+# 这正是「一句话的开头」与「半截词」之间的区别。
+_REASON_BREAKS = "｜.：，、；)） ·"
+# 连接符：左边是词字符、右边也是词字符时，它属于**同一个词**内部，不算边界。
+# 由来（第 30 条性质判据在真源上抓到的三条）：`…｜Connection to b2b.`、`…读不了：客户库.`
+# 这两条是断在域名/文件名的点号后面（下一字是 `1`、`x`），`…com:` 是断在端号分隔符后面
+# （下一字是 `4`）——看起来都「断在标点后」，实际把一个词劈成两半。句子结尾的 `.` 后面
+# 跟的是空格，仍然算边界，所以只排除「两边都是词字符」这一种。间隔号同判：
+# `连不上·无应答` 是一个词，`冷却）·仅这一条` 才是两件事。
+_REASON_JOINERS = ".:：０．·"        # 全角点/冒号/间隔号同判
+
+
+def _is_break(s, k):
+    """下标 k-1 处那个字符，在 k 这个切点上算不算真正的词边界。"""
+    ch = s[k - 1]
+    if ch not in _REASON_BREAKS:
+        return False
+    if ch in _REASON_JOINERS:
+        left = s[k - 2] if k >= 2 else ""
+        right = s[k] if k < len(s) else ""
+        if left and right and (left.isalnum() or left in "-_") \
+                and (right.isalnum() or right in "-_"):
+            return False              # `b2b.11467` / `com:443` / `客户库.xls`：词内部
+    return True
+
+
+def short_reason(text, limit=60):
+    """把一句失败原因收成一行读得完的短版：**只在标点或词边界断开，绝不拦腰截字**。
+
+    `【类别】主机:端口｜` 这一截永远整段留住：处方（查出口网络还是改代码）就写在前缀里。
+    前缀之后若在 limit 内找不到边界，就**往后**找第一个边界——宁可多带几个字，
+    也不留半截词；整句一个边界都没有，就原句带省略号（长词本身就是信息）。
+    """
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(s) <= limit:
+        return s
+    head = 0
+    if s.startswith("【"):
+        i = s.find("｜")
+        if 0 < i:
+            head = i + 1              # 类别＋主机整段留住，哪怕它本身已经超过了 limit
+    stop = -1
+    for k in range(head + 1, min(len(s), max(limit, head)) + 1):
+        if _is_break(s, k):
+            stop = k
+    if stop < 0:
+        for i in range(head + 1, len(s)):
+            if _is_break(s, i):
+                stop = i
+                break
+    if stop < 0:
+        return s + "…"
+    out = s[:stop].rstrip("｜：，、； ")
+    tail = "…"
+    for op, cl in (("（", "）"), ("(", ")")):      # 断点前若留下没合口的括号，补上再收
+        gap = out.count(op) - out.count(cl)
+        if gap > 0:
+            tail += cl * gap
+    return out + tail
+
+
+def first_line(text, limit=120):
+    """把异常或多行文本收成一行：**先取首行（自然边界），再只在标点/词边界断**。
+
+    这一支是 `str(e).splitlines()[0][:N]` 的替代品（交付链曾有 30 多处这么写）。取首行
+    不算截断——异常消息第一行就是 `XxxError: 消息`；问题出在后面那一刀切在字符上，
+    于是 `Message: unknown error: net::ERR_CONNECTION_` 这种半截类名反复出现在日志里。
+    空文本回空串：调用方原本就在近旁留着 `or type(e).__name__` 这一档兜底。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    return short_reason(s.splitlines()[0], limit)
+
+
+# ── [NC-BLOCK-BEGIN] 无联系方式责任分档：与 b2bcollect_build/cdp_base.py 同段逐字节对拍
+# （1688 是独立交付包，不能 import 那边，所以按第 30 条同一族规矩内联一份拷贝；
+#   两份分叉会被第 32 条硬门直接判红，由来与六档处方见 cdp_base.contact_slot_state 上方）
+CONTACT_SLOT_LABEL_RE = re.compile(
+    r"(?:联系\s*电话|联系电话|手机\s*号码|移动电话|手机号码|手\s*机|电\s*话|传\s*真)"
+    r"[^<]{0,4}[:：]?")
+# 只认中文标签：早先试过把 `Tel`/`mobile` 也放进表里，结果 `viewport`、`getElementsByTagName`
+# 这类脚本字节全被判成「一栏写着电话」，整页证据当场失真。
+CONTACT_SLOT_BLANK = ("-", "—", "－", "–", "暂无", "未填写", "未公开", "待补充", "无", "N/A", "NA")
+CONTACT_SLOT_HIDDEN = ("点击查看", "查看号码", "显示号码", "登录", "扫码", "微信", "客服",
+                       "实名认证", "解锁", "开通会员", "免费热线登记")
+CONTACT_SLOT_NUM_RE = re.compile(r"1[3-9]\d{9}|0\d{2,3}-?\d{7,8}|400[-\s]?\d{3}[-\s]?\d{4}")
+# 剥标签用的小刀：`<[^>]{1,160}>` 而不是一路 `<[^>]+>`——模板里偶有把 `<` 写在文字里的脏页，
+# 不限长度就会从那个 `<` 一路吞到下一个 `>`，把整段正文当作一个标签吃掉（证据跟着失真）。
+CONTACT_SLOT_TAG_RE = re.compile(r"<[^>]{1,160}>")
+# 砍单样本：每个词只留几家、名字收到多长（取用方见 _cut_sample）。
+# 3 家×2 阶段是「一眼能判这一刀该不该砍」的最少样本量，再多界面那一行就没人读了。
+CUT_SAMPLE_CAP = 3
+CUT_NAME_CAP = 24
+
+
+def contact_slot_state(html):
+    """详情页「电话/手机」那一栏的证据分档 → (档位, 证据串)。
+
+      · `miss`    栏位在、值里**真有号码**，而本次一条都没抽走 —— 我们的解析漏了（该修代码）
+      · `hidden`  栏位写着「点击查看/登录后可见/联系客服登记」这类要交互才给号的话 —— 站方藏着
+      · `blank`   栏位在、值是 `-`/`暂无`/`未填写` 这类空占位 —— 站方这一家根本没登
+      · `no_slot` 整页找不到任何中文联系方式栏位 —— 这一页没这一栏，**无从判定**
+
+    多栏并存时按「先认我们自己的锅」定序：miss > hidden > blank > no_slot。理由很直接——
+    只要有一处是我们该取到没取到，把话说成「站方没给」就会让那条真缺陷永久隐身。
+    纯函数、无副作用（离线夹具与第 32 条硬门都直接喂 HTML 对拍）。
+    """
+    page = html or ""
+    best, evid = "", ""
+    rank = {"miss": 3, "hidden": 2, "blank": 1, "no_slot": 0}
+    for m in CONTACT_SLOT_LABEL_RE.finditer(page):
+        win = re.sub(r"\s+", " ", CONTACT_SLOT_TAG_RE.sub(" ", page[m.end():m.end() + 120])).strip()
+        if CONTACT_SLOT_NUM_RE.search(win):
+            kind, show = "miss", win
+        elif any(h in win[:16] for h in CONTACT_SLOT_HIDDEN):
+            kind, show = "hidden", win
+        elif not win or any(win.startswith(b) for b in CONTACT_SLOT_BLANK):
+            kind, show = "blank", (win or "（空）")
+        else:
+            continue            # 值是一段别的文字（栏位标题撞上表头等），不作证据
+        if rank[kind] > rank.get(best, -1):
+            best, evid = kind, f"{m.group(0).strip()}→{show[:24]}"
+    return (best or "no_slot"), evid
+
+
+# 分档的人话名字：日志、GUI 看板、体检报告三处只许取这一张表。
+# 各自写一句描述就会出现「同一笔账三种说词」，而这一本账的用处就是把说词定到一个处方上。
+NC_KIND_LABEL = {
+    "miss": "栏位里本有号码、我们一条也没抽走（解析缺陷，该修代码）",
+    "hidden": "站方藏着（点击查看/登录/联系客服登记才给）",
+    "blank": "站方这一家没登（栏位写 -／暂无，不是缺陷）",
+    "no_slot": "这一页没中文联系方式栏（无从判定）",
+    "unknown": "本站没留正文证据（判不了，先接 _keep_detail）",
+    # 「详情不取页」与「忘了接把手」必须分成两档：前者是本站定的设计边界（带理由声明），
+    # 后者是可修的记账漏接。合成一句「先接 _keep_detail」就是给一个已经声明过的站
+    # 开了一张执行不了的处方（2026-11-16 第十轮实机：跨国采购网详情吃 IP 配额、声明在先，
+    # 报告却写着「先给这站的 crawl_detail 接上 _keep_detail」）。
+    "no_page": "本站详情不取页（已声明），没有单店正文可判",
+}
+# 渲染时的固定序：先报我们自己的锅（miss/unknown），再报设计边界（no_page），最后报站方的锅。
+# 没这一张表就会按字典序排出「blank 在前、miss 在后」，读的人第一眼看到的就是“不是缺陷”。
+NC_KIND_ORDER = ("miss", "unknown", "no_page", "hidden", "blank", "no_slot")
+
+
+def nc_kinds_text(kinds, evidence=None):
+    """把「无联系方式」的责任分档收成一句人话——**渲染只此一个把手**（日志/GUI 看板/体检报告共用）。
+
+    为什么由记账的主人措词，而不是让每个读的人各写一遍：这一本账的全部用处就是把处方定到
+    一句话上，三处各写一遍就会出现「同一笔账三种说词」——界面上写「站方没给」、报告里写
+    「取号通路」，而这两个方向的动作是相反的。空账返回空串：调用方据此**不说**这一格，
+    不许编一句「无异常」顶上去。
+    """
+    kinds = kinds or {}
+    if not kinds:
+        return ""
+    ev = evidence or {}
+    order = [k for k in NC_KIND_ORDER if k in kinds]
+    order += sorted(k for k in kinds if k not in NC_KIND_ORDER)
+    seg = []
+    for k in order:
+        one = f"{NC_KIND_LABEL.get(k, k)} {kinds[k]} 家"
+        if ev.get(k):
+            one += f"（证据：{short_reason(ev[k], 46)}）"
+        seg.append(one)
+    return "｜".join(seg)
+# ── [NC-BLOCK-END]
 
 
 def _request_error_detail(text, cap):
@@ -271,7 +485,9 @@ def _request_error_detail(text, cap):
     opens = seg.count("(") - seg.count(")")
     if opens > 0:
         seg = seg + ")" * opens
-    return seg[:cap]
+    # 收口一律走 short_reason：以前这里是 `seg[:cap]`，正好把 `(connect timeout=25)` 截成
+    # `(connect timeout=2` ——分型器补的右括号又被下一档 [:60]/[:70] 剪掉，实机就是这么读出半截词的
+    return short_reason(seg, cap)
 
 
 def request_error_shape(err, cap=160):
@@ -279,6 +495,8 @@ def request_error_shape(err, cap=160):
 
     幂等：已经带类别的原文直接按 cap 收口，不再二次分型——各站 except 分支先调它一次
     （为了打日志），翻页层随后还会把它交给 `_note_request_error` 记账，两次必须同一句。
+    类别写在括号里的那一种（`列表页导航失败（【被拦停】…）`）同样算「已经带类别」：
+    把结论提回开头、剩下的当证据，**绝不降级成【未分型】**（词表与由来见 _OWN_KIND_TOKENS 上方）。
     认不出形状时返回 `【未分型】<清洗过的原文>`，**绝不返回空串、也绝不说「采不到」**：
     这一格将来还要长出新档，先让「没分上型」这件事本身可见。"""
     if err is None:
@@ -288,14 +506,19 @@ def request_error_shape(err, cap=160):
     if not text:
         return "未知请求失败"
     if text.startswith("【"):
-        return text[:cap]
+        return short_reason(text, cap)
     low = text.lower()
     kind = ""
-    for name, needles in _REQUEST_ERROR_KINDS:
-        if any(n in low for n in needles):
-            kind = name
-            break
     rest = text
+    nest = _NESTED_KIND_RE.match(text)
+    if nest:
+        kind = nest.group(2)
+        rest = nest.group(1) + text[nest.end():]
+    else:
+        for name, needles in _REQUEST_ERROR_KINDS:
+            if any(n in low for n in needles):
+                kind = name
+                break
     if not kind:
         m = _ERR_HTTP_STATUS_RE.search(text)
         if m:
@@ -365,6 +588,19 @@ class Ali1688Crawler:
         self._pf_dropped = 0         # 属地明确外省丢弃计数（适配器核验；结束行如实汇报）
         self._pf_unknown = 0         # 属地无法确认丢弃计数（同上，并回流待核实名单）
         self._filtered_count = 0     # 本轮类目过滤计数
+        # **逐词**相关性砍单账（与 cdp_base 同口径，由来见 cdp_base.__init__ 里 kw_filtered 那段）：
+        # 1688 一轮 0 家时，「本机闸门砍的」与「1688 真没这些公司」是两种完全不同的处方，
+        # 只有全局计数分不开这两句（判据见 test_block_triage_offline 第 ⑭ 节）。
+        self.kw_filtered = {}
+        self.kw_early = {}
+        # 砍单记名 + 无联系方式分档（口径同 cdp_base.__init__，由来见 cdp_base 那两段注释）
+        self.kw_early_names = {}
+        self.kw_filtered_names = {}
+        self._nc_kinds = {}
+        self._nc_evidence = {}
+        self._detail_html = ""
+        # 本轮因**判定规则更新**而重新评估的旧「类目不符」家数（口径同 cdp_base）
+        self._rel_refilter = 0
         self.debug_collect = False   # 开发调参：记录类目过滤判定输入（不影响生产行为）
         self._guard_debug = []
         self.expand_related = False  # 自动扩展相关关键词（1688 relativeWords 多为全站热搜，保守过滤后追加）
@@ -378,6 +614,7 @@ class Ali1688Crawler:
         self._seen_store_path = self._data_dir / "seen_store.json"
         self._profile_dir = self._profile_path()
         self._seen_members = set()   # 本轮已处理公司（memberId）去重
+        self._seed_clear_error = ""  # 上次「清空种子库」没清成的原因（见 clear_seen_store）
         self._early_skipped = 0      # 本轮列表页早过滤计数（未进详情即判无关）
         # 本轮「增量库已含所以跳过」计数：没有这一笔账，界面上就只剩「新增公司 0 家」，
         # 用户分不清「已经采全了」和「去重口径把活锁死了」——后者恰恰是本轮 1688 出 0 的形态
@@ -400,7 +637,10 @@ class Ali1688Crawler:
 
     # ── 日志 / 结果 ────────────────────────────────────────────
     def _log(self, msg):
-        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        # 前缀与 cdp_base._log 同形（[时间][平台] …）：1688 在 b2bcollect 里与另外九路
+        # 并行打同一本日志，只有本路不带平台名——多路混排时这一路说的话认不出是谁说的
+        # （2026-11-14 实机体检日志里第 13 行就是这样一句无主的话）。
+        line = f"[{time.strftime('%H:%M:%S')}][{self.PLATFORM_NAME}] {msg}"
         print(line, flush=True)
         if self.signals:
             try:
@@ -433,6 +673,58 @@ class Ali1688Crawler:
         # `(Caused by …)` 那一段（详见 request_error_shape 上方的由来）。
         self._last_page_error = request_error_shape(err, cap=160)
 
+    def _cut_sample(self, bucket, kw, name):
+        """砍单记名的唯一把手（每词只留前 CUT_SAMPLE_CAP 家，口径与 cdp_base 一致）。"""
+        text = str(name or "").strip()
+        if not text:
+            return
+        got = bucket.setdefault(kw, [])
+        if len(got) >= CUT_SAMPLE_CAP:
+            return
+        got.append(short_reason(text, CUT_NAME_CAP))
+
+    @staticmethod
+    def _cut_note(bucket, kw, stage):
+        """砍单样本渲染成一句「（复核砍掉：A、B、C）」；没有名单返回空串（口径同 cdp_base）。"""
+        got = bucket.get(kw) or []
+        if not got:
+            return ""
+        return f"（{stage}砍掉：{'、'.join(got)}）"
+
+    def _keep_detail(self, html):
+        """把这一家的联系页正文留给无联系方式分档（口径同 cdp_base._keep_detail）。"""
+        if isinstance(html, str) and html:
+            self._detail_html = html
+        return html
+
+    def _note_no_contact(self):
+        """「无联系方式」按责任分档的唯一把手（六档处方与由来见 cdp_base._note_no_contact）。"""
+        html = self._detail_html or ""
+        if html:
+            kind, evid = contact_slot_state(html)
+        else:
+            # 声明过「详情不取页」的站记 no_page（设计边界），没声明的记 unknown（把手没接）：
+            # 两者处方不同，合成一句就会给已声明的站开一张执行不了的处方
+            declared = str(getattr(self, "NO_DETAIL_EVIDENCE", "") or "")
+            kind = "no_page" if declared else "unknown"
+            evid = declared or "本站详情页没把正文留给分档判据（接 _keep_detail 才有这一档）"
+        self._nc_kinds[kind] = self._nc_kinds.get(kind, 0) + 1
+        if kind not in self._nc_evidence:
+            self._nc_evidence[kind] = short_reason(evid, 60)
+        self._detail_html = ""
+
+    def _note_early_skip(self, kw, name=""):
+        """列表页早过滤**唯一**的记账把手：全局数 + 逐词数 + 逐词样本一起加（口径同 cdp_base）。"""
+        self._early_skipped += 1
+        self.kw_early[kw] = self.kw_early.get(kw, 0) + 1
+        self._cut_sample(self.kw_early_names, kw, name)
+
+    def _note_detail_filter(self, kw, name=""):
+        """详情页类目复核砍单的**唯一**记账把手（计数与样本，口径同 cdp_base）。"""
+        self._filtered_count += 1
+        self.kw_filtered[kw] = self.kw_filtered.get(kw, 0) + 1
+        self._cut_sample(self.kw_filtered_names, kw, name)
+
     def _note_page_fail(self, err=""):
         """记一笔「这一页列表根本没取到」——只在翻页层调用，一页最多一次。
 
@@ -455,7 +747,7 @@ class Ali1688Crawler:
         if not got_page:
             if self._last_page_error:
                 return (f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"
-                        f"不是本站没有{noun}；最后一次：{self._last_page_error[:70]}）")
+                        f"不是本站没有{noun}；最后一次：{short_reason(self._last_page_error, 70)}）")
             return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
                     f"404 或频控空页；是哪一种看紧邻上一行）")
         return f"  「{kw}」{page_label}无{noun}"
@@ -510,6 +802,16 @@ class Ali1688Crawler:
     # 公司 0 家」——用户看到的就是「以前还能采到，现在一直是 0」，而日志里一个字都没提
     # 「为什么是 0」。
     CONTACT_RETRY_MAX = 2
+    # 「类目不符」在种子库里的状态字面量（各处统一引用，改文案只改这一处）
+    FILTERED_STATE = "类目不符(已过滤)"
+    # 规则更新后每轮最多重新评估多少家旧「类目不符」：一次性放开上千家＝把风控预算
+    # 全花在补旧账上，反而挤掉本轮该采的新货。取的是按判定时间最近的一批。
+    REL_REFILTER_CAP = 200
+    # 判定规则指纹的原料：这几个函数任一改动，指纹即变，旧的「类目不符」盖章作废
+    RELEVANCE_RULE_ATTRS = ("_kw_relevant", "_list_relevant")
+    # 指纹取不到时的降级常量（口径见 _stale_filtered：取不到就不动存量）
+    REL_REV_UNKNOWN = "rev0"
+    _REL_REV = None
 
     @staticmethod
     def _has_any_contact(rec) -> bool:
@@ -533,8 +835,56 @@ class Ali1688Crawler:
             return True
         return int(entry.get("rt") or 0) >= cls.CONTACT_RETRY_MAX
 
+    @classmethod
+    def _relevance_revision(cls):
+        """相关性判定**规则**的指纹（版本号）。
+
+        增量缓存的是判定结论而不是事实：这一家算不算目标同行，取决于二字组那套命中规则
+        长什么样、有哪些前缀后缀被剥掉。规则一改，旧结论必须整体作废，否则修好的口径对
+        被误杀入库的那批家永远不生效，用户只能手动清库（等于把修复作废）。
+        指纹只取判定真正读到的输入，与运行时机、机器无关；取不到就退回常量——宁可不做
+        重评，也不要每轮算出不同版本号把种子库反复洗一遍。
+        """
+        if cls._REL_REV is None:
+            try:
+                import hashlib
+                import inspect
+                import keyword_expander as _ke
+                blob = repr(sorted(getattr(_ke, "PEER_CATEGORY", {}).items()))
+                for name in cls.RELEVANCE_RULE_ATTRS:
+                    # 判定规则一半挂在类上（is_relevant/_peer_words）、一半是模块级函数
+                    # （relevance_hit/kw_grams，清洗严格档与采集松档共用同一份）：两处都要取到
+                    obj = getattr(cls, name, None) or globals().get(name)
+                    if obj is None:
+                        continue
+                    blob += inspect.getsource(obj.__func__ if hasattr(obj, "__func__") else obj)
+                cls._REL_REV = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+            except Exception:
+                cls._REL_REV = cls.REL_REV_UNKNOWN
+        return cls._REL_REV
+
+    @classmethod
+    def _stale_filtered(cls, entry):
+        """这一条种子库记录是不是**旧规则**下判的「类目不符」——是就不该再命中即跳过。
+
+        指纹取不到（REL_REV_UNKNOWN）时一律判「不陈旧」：降级必须往「不动存量」的方向降,
+        否则一次导入失败就把上千家旧盖章一次性放开重戳，那是自己给自己招风控。"""
+        rev = cls._relevance_revision()
+        if rev == cls.REL_REV_UNKNOWN:
+            return False
+        return (isinstance(entry, dict) and entry.get("st") == cls.FILTERED_STATE
+                and entry.get("rv") != rev)
+
+    def _stale_filtered_keys(self):
+        """本轮值得重判的旧「类目不符」键（按判定时间倒序取最近 REL_REFILTER_CAP 家）。"""
+        stale = [(str((v or {}).get("at", "")), k) for k, v in self._seen_store.items()
+                 if self._stale_filtered(v)]
+        stale.sort(reverse=True)
+        return {k for _, k in stale[:self.REL_REFILTER_CAP]}
+
     def _locked_keys(self):
-        return {k for k, v in self._seen_store.items() if self._entry_locked(v)}
+        return {k for k, v in self._seen_store.items()
+                if self._entry_locked(v)} - self._stale_filtered_keys()
 
     def _seen_store_pending(self):
         """种子库还欠着几次「补联系人」的家数（收尾账目与渠道体检都用它）。"""
@@ -578,18 +928,30 @@ class Ali1688Crawler:
             self._log(f"⚠ 种子库保存失败：{str(e).splitlines()[0]}")
             return False
 
+    def _filtered_mark(self, rec):
+        """这一家在本关键词下的旧「类目不符」章键（与 _commit_to_store 的写法一一对应）。"""
+        mid = str(rec.get("memberId") or "")
+        if not mid:
+            return ""
+        return f"{rec.get('关键词', '')}#{mid}"
+
     def _commit_to_store(self, rec):
         if not self.incremental or not self._is_terminal(rec):
             return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         st = rec.get("状态", "")
-        if st == "类目不符(已过滤)":
+        if st == self.FILTERED_STATE:
             # 类目不符是「关键词相关」的判定：同一家对 A 词不相关、对 B 词可能正是目标，
             # 故只按「关键词#公司」作用域记录，换关键词重跑时仍会重新评估，绝不全局误跳。
+            # rv＝判定规则指纹：规则更新后这一条旧结论自动作废（见 _relevance_revision）。
             mid = str(rec.get("memberId") or "")
             if mid:
-                self._seen_store[f"{rec.get('关键词','')}#{mid}"] = {"at": ts, "st": st}
+                self._seen_store[f"{rec.get('关键词','')}#{mid}"] = {
+                    "at": ts, "st": st, "rv": self._relevance_revision()}
             return
+        # 重判后改判「相关」并入库：旧的那枚「类目不符」章必须当场撕掉，否则这条陈旧
+        # 记录每轮都被算进待重判名单，重判账永远收敛不了（一家白重判一次就白戳一次详情页）
+        self._seen_store.pop(self._filtered_mark(rec), None)
         for k in self._rec_seen_keys(rec):
             old = self._seen_store.get(k) or {}
             has_contact = self._has_any_contact(rec)
@@ -599,13 +961,24 @@ class Ali1688Crawler:
             self._seen_store[k] = entry
 
     def clear_seen_store(self):
-        """清空跨运行种子库（用户想对同一批词从头重采时用）。"""
+        """清空跨运行种子库（用户想对同一批词从头重采时用）。
+
+        三样一起清：盘上文件、内存字典、**内存去重集合** ``_seen_members``。只清前两样
+        等于「点了清空、这一轮还在命中即跳过」——站点侧真正拦住一家公司的是后者。
+        unlink 失败（只读卷/权限/被占用）不再被 except 吞掉后照样报成功：那句
+        「历史种子库已清空」是用户对这一格的唯一凭据，它必须是事实。
+        口径与 b2bcollect 一侧的 ``cdp_base.reset_seen_store`` 逐字一致（本包不 import
+        cdp_base，所以这是同一份语义的第二处实现，改动必须两处一起改，对拍见
+        test_block_triage_offline 第 ⑰ 节）。"""
         self._seen_store = {}
+        self._seen_members = set()
+        self._seed_clear_error = ""
         try:
             if self._seen_store_path.exists():
                 self._seen_store_path.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            self._seed_clear_error = f"{type(e).__name__}：{short_reason(str(e).splitlines()[0], 60)}"
+            return False
         return True
 
     # ── Chrome 生命周期 ────────────────────────────────────────
@@ -863,7 +1236,7 @@ class Ali1688Crawler:
                                             options=opts)
                 except Exception as e:
                     last_exc = e
-                    msg = str(e).splitlines()[0][:140] if str(e) else e.__class__.__name__
+                    msg = first_line(e, 140) if str(e) else e.__class__.__name__
                     low = msg.lower()
                     if any(k in low for k in self.DRIVER_VERSION_MISMATCH_MARKS):
                         self._log(f"⚠ 内置驱动（{Path(drv).name}）与你的 Chrome（"
@@ -892,6 +1265,7 @@ class Ali1688Crawler:
             "--no-first-run", "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",
             "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+            *CHROME_NO_UPGRADE_FLAGS,          # 明文 http 不许被浏览器升级后拦掉（见上面那段）
             "--window-size=1440,960",
         ] + ([] if headed else ["--headless=new"])
 
@@ -934,7 +1308,7 @@ class Ali1688Crawler:
                 self.driver = self._attach()
             except Exception as e:
                 # 端口在但接不上：通常是崩溃/半死的旧实例，清掉重启一个干净的再接
-                self._log(f"⚠ 连接现有 Chrome 失败（{str(e).splitlines()[0][:100] if str(e) else e}），重启后重试…")
+                self._log(f"⚠ 连接现有 Chrome 失败（{first_line(e, 100) if str(e) else e}），重启后重试…")
                 self.close_browser()
                 self._kill_stale_profile_chrome()
                 try:
@@ -950,7 +1324,7 @@ class Ali1688Crawler:
                 try:
                     self.driver = self._attach()
                 except Exception as e3:
-                    self._log(f"❌ 连接 Chrome 失败：{str(e3).splitlines()[0][:200] if str(e3) else e3}")
+                    self._log(f"❌ 连接 Chrome 失败：{first_line(e3, 200) if str(e3) else e3}")
                     self._log("请手动关闭所有 Chrome 窗口后，再点一次「打开浏览器」；"
                               "若仍失败，重启一次电脑可释放被占用的独立配置目录。")
                     self.driver = None
@@ -970,8 +1344,12 @@ class Ali1688Crawler:
                 # reap_driver_service() 保证那份 chromedriver 子进程也跟着没。
                 try:
                     self.driver.quit()
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 不能吞：quit 没成功等于会话还挂着，下一轮 _attach 就可能
+                    # 「session not created」；只说一句失败在哪，比事后猜强（第 32g 条）
+                    self._log(f"⚠ 收工结束浏览器会话没成功（Ali1688Crawler）："
+                              f"{short_reason(first_line(e, 80), 60)}"
+                              f"——若下次打不开浏览器，请手动关掉所有 Chrome 窗口再试")
                 reap_driver_service(self.driver)
             self.driver = None
 
@@ -1015,7 +1393,12 @@ class Ali1688Crawler:
         self._tab = chosen
 
     def _prune_to_own_tab(self):
-        """关掉 1688 页面自动弹出的多余标签，只留自己的工作标签并切回。"""
+        """关掉 1688 页面自动弹出的多余标签，只留自己的工作标签并切回。
+
+        关不掉必须开口（第 32g 条）：这里原先两层 `except …: pass`，剪不干净的标签
+        就一直堆在共享 Chrome 里——用户看到的是「越跑越多窗口」，而日志一句没说。"""
+        stuck = 0
+        last = ""
         try:
             handles = self.driver.window_handles
             if len(handles) <= 1:
@@ -1027,15 +1410,22 @@ class Ali1688Crawler:
                     try:
                         self.driver.switch_to.window(h)
                         self.driver.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        stuck += 1
+                        last = first_line(e, 80)
             if self._tab in self.driver.window_handles:
                 self.driver.switch_to.window(self._tab)
             else:
                 self._tab = self.driver.window_handles[0]
                 self.driver.switch_to.window(self._tab)
-        except Exception:
-            pass
+            if stuck:
+                self._log(f"⚠ 有 {stuck} 枚 1688 弹出来的多余标签没关掉（最后原因："
+                          f"{short_reason(last, 60)}）——不影响已采数据，可在浏览器里手动收")
+        except Exception as e:
+            # 外层这一格只说「整步没跑成」，不反复报每一枚：剪标签不是采数据的必经动作，
+            # 说一次、带上真正的原因就够（与内层「枚数 + 最后原因」是两本账）
+            self._log(f"⚠ 清理多余标签这一步没跑成：{short_reason(first_line(e, 80), 60)}"
+                      f"——1688 弹出的新标签可能留着，不影响已采数据")
 
     def _goto(self, url, tries=4):
         # 惰性设置页面加载超时：避免个别资源卡住导致 driver.get 长时间挂起（夜间无人值守关键）
@@ -1083,7 +1473,7 @@ class Ali1688Crawler:
                     self.driver.get(url)
             except Exception as e:
                 # 只记录首行，避免 chromedriver 巨长堆栈刷屏；含超时/断网等
-                raw = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                raw = first_line(e, 200) if str(e) else e.__class__.__name__
                 # 分型后的一句才交给日志与归因：类别在最前面，后面每一档 [:60] 截断都截不掉它
                 # （旧写法从头部截，砍掉的恰好是 chromedriver 那句 `Message: unknown error:
                 # net::ERR_…` 里唯一决定方向的字样）。`_session_dead` 仍**先按原文判**：它的标记
@@ -1094,7 +1484,7 @@ class Ali1688Crawler:
                 if self._session_dead(raw) or self._session_dead(msg):
                     # 会话/浏览器已死：原地重试同一个 driver 永远救不回来，必须重启并
                     # 重新附加 Chrome（独立 profile 登录态保留），从卡住处续采而非崩线程。
-                    self._log(f"⚠ 浏览器会话已断开（{msg[:60]}），正在重启 Chrome 续采…（第{i + 1}/{tries}次）")
+                    self._log(f"⚠ 浏览器会话已断开（{short_reason(msg, 60)}），正在重启 Chrome 续采…（第{i + 1}/{tries}次）")
                     if not self.try_restore_session():
                         self._log("❌ 无法恢复浏览器会话，本轮到此结束（已采数据已保存，可稍后继续）")
                         self._stop_requested = True
@@ -1297,7 +1687,7 @@ class Ali1688Crawler:
                 self._stop_requested = True
                 self._waiting_human = ""      # 已经放弃等待并收轮，不再算「在等人」
                 self._run_abandon = (f"持续限流（{self._block_window // 60} 分钟内第 {strikes} 次被拦）："
-                                     f"{str(reason or '')[:60]}")
+                                     f"{short_reason(reason, 60)}")
                 return False
             self._log(f"🛑 {reason}")
             self._log("   已暂停推进（不写入空记录）。请在 Chrome 窗口里手动过验证，通过后自动继续。")
@@ -1464,7 +1854,7 @@ class Ali1688Crawler:
                     # 卡片文本与关键词/预测类目零重叠：连详情页都不必进（不占全局已见，
                     # 同一个公司对另一个关键词可能就是目标）
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, o.get("company") or cname)
                     self._seen_members.add(f"{kw}#{mid}")
                     continue
                 self._seen_members.add(mid)
@@ -1787,7 +2177,7 @@ class Ali1688Crawler:
                 # （省一次详情导航=提速+防封）。保守 fail-open，只在强信号零重叠时才跳过。
                 if self.relevance_guard and not self._list_relevant(p.get("company", ""), p.get("title", "")):
                     page_skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, p.get("company", ""))
                     continue
                 new += 1
                 yield {"keyword": kw, "page": page, "raw": {},
@@ -1992,6 +2382,7 @@ class Ali1688Crawler:
             rec["状态"] = "未登录-联系方式不可见"
             return rec
         chtml = self.driver.page_source
+        self._keep_detail(chtml)     # 留给「无联系方式」分档（口径同 cdp_base）
         rec.update(self._parse_contact(chtml))
         has_contact = any(rec[k] for k in ("电话", "手机", "邮箱", "地址"))
         # 联系方式页有两套模板（contactinfo.htm / contactinfo.html）：若当前模板没解析到，
@@ -2002,11 +2393,15 @@ class Ali1688Crawler:
             if alt and alt != contact:
                 self._sleep()
                 if self._goto(alt) and self._detect_block() != "__LOGIN__":
+                    self._keep_detail(self.driver.page_source)
                     r2 = self._parse_contact(self.driver.page_source)
                     rec.update({k: v for k, v in r2.items() if v})
                     has_contact = any(rec[k] for k in ("电话", "手机", "邮箱", "地址"))
         rec["状态"] = ("成功" if any(rec[k] for k in ("电话", "手机", "邮箱"))
                   else ("无电话(1688未公开)" if rec["地址"] else "无联系方式"))
+        if rec["状态"] != "成功":
+            # 没号码到底是卖家自己没填、要登录才给、还是我们解析漏了——只有那一页能回答
+            self._note_no_contact()
         return rec
 
     def _crawl_shop_company(self, entry):
@@ -2029,6 +2424,7 @@ class Ali1688Crawler:
         if self._detect_block() == "__LOGIN__":
             rec["状态"] = "未登录-联系方式不可见"
             return rec
+        self._keep_detail(self.driver.page_source)
         rec.update(self._parse_contact(self.driver.page_source))
         if not any(rec[k] for k in ("电话", "手机", "邮箱", "地址")):
             # 两套模板回退：.html 取不到就试 .htm
@@ -2036,9 +2432,12 @@ class Ali1688Crawler:
             self._sleep()
             if self._goto(alt) and self._detect_block() != "__LOGIN__":
                 rec["联系方式URL"] = alt
+                self._keep_detail(self.driver.page_source)
                 rec.update({k: v for k, v in self._parse_contact(self.driver.page_source).items() if v})
         rec["状态"] = ("成功" if any(rec[k] for k in ("电话", "手机", "邮箱"))
                   else ("无电话(1688未公开)" if rec["地址"] else "无联系方式"))
+        if rec["状态"] != "成功":
+            self._note_no_contact()
         # 联系页没给地址时，用公司卡片上的产地做兜底（不影响上面的状态判定口径）
         if not rec["地址"] and entry.get("location"):
             rec["地址"] = entry["location"]
@@ -2053,6 +2452,18 @@ class Ali1688Crawler:
         self._seen_members = set()
         self._filtered_count = 0
         self._early_skipped = 0
+        # 逐词那两本同样按轮起账（口径同 cdp_base.crawl）：跨轮累加的砍单数会把上一轮
+        # 的相关性判定冒充成本轮「这一词为什么零产出」的证据
+        self.kw_filtered = {}
+        self.kw_early = {}
+        self.kw_early_names = {}
+        self.kw_filtered_names = {}
+        # 分档账同样按轮起账：跨轮累加会把上一轮的「站方没登」冒充本轮的责任判定
+        self._nc_kinds = {}
+        self._nc_evidence = {}
+        self._detail_html = ""
+        # 本轮因**判定规则更新**而重新评估的旧「类目不符」家数（口径同 cdp_base）
+        self._rel_refilter = 0
         # 每轮重新起账：这个数跨轮累加会把「上一轮的跳过」算进本轮，界面读数就废了
         self._incremental_skipped = 0
         # 链路账与「等人」账同理（口径与 cdp_base.crawl 一致）：跨轮累加的「取页失败」
@@ -2072,9 +2483,15 @@ class Ali1688Crawler:
             # 永久盖章，之后每轮都是「新增公司 0 家」——那是本轮 1688 出 0 家的真凶）
             locked = self._locked_keys()
             self._seen_members |= locked
-            refill = len(self._seen_store) - len(locked)
+            self._rel_refilter = len(self._stale_filtered_keys())
+            refill = len(self._seen_store) - len(locked) - self._rel_refilter
             if refill:
                 self._log(f"🔓 增量库内有 {refill} 家条目联系人曾取空，本轮重采补联系人")
+            if self._rel_refilter:
+                # 判定规则升级后，旧的「类目不符」盖章不再免检（重判过的家会带上新 rv，
+                # 下一轮这个数字自然掉下去）
+                self._log(f"🔁 相关性判定规则已更新：本轮重新评估 {self._rel_refilter} 家旧"
+                          f"「类目不符」（单轮上限 {self.REL_REFILTER_CAP} 家，其余下轮续）")
 
         if self.driver is None or not self._is_session_alive():
             if not self.start_browser():
@@ -2127,7 +2544,7 @@ class Ali1688Crawler:
                         rec = self._crawl_company(offer)
                         if rec.get("状态") == "类目不符(已过滤)":
                             # 垃圾商家不进结果表，也省掉了联系方式页请求（防封关键）
-                            self._filtered_count += 1
+                            self._note_detail_filter(kw, rec.get("公司名称", ""))
                             self._commit_to_store(rec)   # 记住它，下轮连详情页都不必再进
                             if self._filtered_count % 10 == 1:
                                 self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
@@ -2148,7 +2565,7 @@ class Ali1688Crawler:
                     # 站外渠道历史上不进这个分支（因为没有 guard），现在与主搜同口径：
                     # 类目不符的只计数不入库，不拿垃圾商家撑行数。
                     if rec.get("状态") == "类目不符(已过滤)":
-                        self._filtered_count += 1
+                        self._note_detail_filter(kw, rec.get("公司名称", ""))
                         self._commit_to_store(rec)
                         if self._filtered_count % 10 == 1:
                             self._log(f"  ⛔ 类目不符已过滤 {self._filtered_count} 家"
@@ -2184,10 +2601,10 @@ class Ali1688Crawler:
             except Exception as e:
                 # 兜底：迭代器内直接读 driver.page_source/current_url 等极端时序下仍可能
                 # 抛会话失效。会话失效→重启续采；其它异常→跳过该关键词继续，绝不让线程崩。
-                raw = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                raw = first_line(e, 200) if str(e) else e.__class__.__name__
                 msg = request_error_shape(e, cap=160)
                 if self._session_dead(raw) or self._session_dead(msg):
-                    self._log(f"⚠ 「{kw}」处理中浏览器会话断开（{msg[:60]}），重启后续采…")
+                    self._log(f"⚠ 「{kw}」处理中浏览器会话断开（{short_reason(msg, 60)}），重启后续采…")
                     if not self.try_restore_session():
                         self._log("❌ 无法恢复浏览器会话，本轮结束（已采数据已保存，可稍后继续）")
                         self._stop_requested = True
@@ -2208,6 +2625,17 @@ class Ali1688Crawler:
                 tail += f"（另有 {self._pf_unknown} 家页面没写属地：已转企知道反查）"
         early = (f"，列表页早过滤 {self._early_skipped} 家(未进详情即省请求)"
                  if self._early_skipped else "")
+        # 砍单名单样本 + 「无联系方式是谁的责任」分档（口径与 cdp_base 收尾那一句一致）：
+        # 只有总数时，「N 家类目不相关」和「N 家没号码」都是无法执行的一句话
+        nc = ("，无联系方式分档：" + nc_kinds_text(self._nc_kinds, self._nc_evidence)
+              if self._nc_kinds else "")
+        parts = []
+        for k in sorted(set(self.kw_filtered_names) | set(self.kw_early_names)):
+            one = "、".join(x for x in (self._cut_note(self.kw_filtered_names, k, "复核"),
+                                        self._cut_note(self.kw_early_names, k, "早过滤")) if x)
+            if one:
+                parts.append(f"「{k}」{one}")
+        samp = ("，砍单样本：" + " ".join(parts)) if parts else ""
         # 「0 新增」必须有一句解释从哪来：跳过多少家、其中多少家还欠一次补联系人。
         # 只有「种子库累计 N 家」这一句是不够的——它说的是库有多大，不是这轮为什么没活。
         incr = (f"，增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)"
@@ -2216,7 +2644,7 @@ class Ali1688Crawler:
         # 都是 0、日志里只剩「共 0 家」，看的人以为站点没数据。「一页都没取到」这件事只有
         # 取页那一层知道，所以账要由它记、并在这句收尾里占一格（拼法与 cdp_base 同构，
         # 对拍见 b2bcollect_build/test_data_dir_offline.py 第 14 节）。
-        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"
+        pagefail = (f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"
                     if self._page_fail else "")
         pend = self._seen_store_pending() if self.incremental else 0
         pending = (f"，另有 {pend} 家欠补联系人，下轮自动重采" if pend else "")
@@ -2248,7 +2676,7 @@ class Ali1688Crawler:
         else:
             mark, why = "✅", ""
         self._log(f"{mark} 采集结束，共 {len(self.results)} 家公司"
-                  f"{why}{pagefail}{early}{incr}{pending}{tail}{saved}")
+                  f"{why}{pagefail}{early}{incr}{pending}{tail}{samp}{nc}{saved}")
         self._emit("crawl_finished_signal")
 
     # 兼容旧契约（GUI 可能调用）

@@ -311,6 +311,10 @@ class MicCrawler(CdpSiteCrawler):
             if r.status_code != 200 or not r.text:
                 return False
             r.encoding = "gbk"
+            # 分档证据：这一家的 contact 页正文（裸 HTTP 那条腿取到的就是它自己的页，
+            # 落点已由 302/验证码判断挡在前面）。「无联系方式」要说清是站方没登还是我们
+            # 没抽走，只有拿着这一页才判得出来（口径与由来见 cdp_base._keep_detail）。
+            self._keep_detail(r.text)
             self._parse_contact(r.text, rec)
             self._http_miss = 0
             rec["详情URL"] = url
@@ -330,7 +334,21 @@ class MicCrawler(CdpSiteCrawler):
         # 该供应商无中文 showroom：302 到 404 文档页（留在 made-in-china.com 域内，不算拦截）
         if "errordocs" in cur or "404" in cur:
             return ""
+        # 「导航成功」不等于「导航到了**这一家**」：浏览器会把 302 一路跟到底，落点可能是
+        # 首页或别人的 showroom——那种页里有公司名有电话，`_parse_contact` 会把它写进这一家
+        # 头上（串页假数据，比采不到更难被发现）。凭据用 user 串：站方把
+        # `{user}-contact.html` 规范化成别的写法也还在这一页，换了供应商就不算。
+        # 判据与由来见 cdp_base._tab_page_is（同类查全：马可波罗借标签取正文那一条腿同族）。
+        ok, why = self._tab_page_is(url, token=user)
+        if not ok:
+            rec["状态"] = f"详情页地址不是这一家（{why}）"
+            self._log(f"   ⚠ {user} 的 contact 页落点不对：{why}——这一家按未取到记账")
+            return ""
         html = self._html()
+        # 同上：这条腿落点已经过 `_tab_page_is` 认定是这一家，正文才配当分档证据。
+        # `_fallback_en` 那条腿取的是**英文子域**页，联系方式栏的标签是英文的，拿它当证据
+        # 会把「我们没看中文栏」误报成「这一页没中文联系方式栏」——所以那一路不留证据。
+        self._keep_detail(html)
         self._parse_contact(html, rec)
         rec["详情URL"] = url
         return html
@@ -424,6 +442,14 @@ class MicCrawler(CdpSiteCrawler):
             if not self._goto(alt, expect_domain="made-in-china.com", tries=1):
                 continue
             html = self._html()
+            # `_goto` 只断言父域：这个子域是**猜出来的**（站方常在英文子域不存在时把访客领到
+            # 统一 showroom 路径或别人的页面），而 `_parse_contact` 只看正文里有电话就往这一家
+            # 头上写。所以这里必须问一次「这一页还是不是这一家」——凭据用 user 串，站方换主机
+            # 名不算换供应商（same_host=False 的由来见 cdp_base._tab_page_is）。
+            ok, why = self._tab_page_is(alt, token=user, same_host=False)
+            if not ok:
+                self._log(f"   ⚠ {user} 的英文兜底页落点不是这一家（{why}）——这一路不取数据")
+                continue
             self._parse_contact(html, rec)
             if rec.get("手机") or rec.get("电话") or rec.get("邮箱"):
                 rec["详情URL"] = rec.get("详情URL") or alt

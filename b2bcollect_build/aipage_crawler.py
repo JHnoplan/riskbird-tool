@@ -81,6 +81,9 @@ class AipageCrawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但借来的一枚必须还（空壳会把过验证时借的标签留到收工
+        之后；由来与判据见 cdp_base.CdpSiteCrawler.release_tab）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -101,18 +104,34 @@ class AipageCrawler(CdpSiteCrawler):
             return self._probe_net_fail(e)
         return self._probe_net_word() or self._block_reason or "爱采购仍在限流状态"
 
-    def _fetch(self, url, tries=4, headers=None, guarded=True):
+    def _fetch(self, url, tries=4, headers=None, guarded=True, deep=False):
+        """取一页。`deep=True`＝请求的是**某一家的深链**，不是通道入口：它的被拒只记
+        深链单笔账，不写 `_block_reason`、不钉恢复探测页、不触发整通道冷却
+        （理由与实测数据见 cdp_base.http_block_reason 的 deep 分支）。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
             return "", url
         last = ""
+        deep_refused = ""
         for i in range(max(1, tries)):
             try:
                 r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url)
+                block = self.http_block_reason(r.status_code, r.text, url, deep=deep)
                 if block:
+                    if deep:
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._fetch(url, tries=1, headers=headers,
+                                                guarded=False, deep=deep))
+                        if got is not None:
+                            return got
+                        break
                     # 防采/限流插页：对着它重试只会加重风控，直接交看门狗
                     self._block_reason = block
                     last = f"HTTP {r.status_code}（防采插页）"
@@ -134,8 +153,15 @@ class AipageCrawler(CdpSiteCrawler):
         if guarded and self._block_reason:
             if self.handle_http_block(url):
                 self._block_reason = ""
-                return self._fetch(url, tries=tries, headers=headers, guarded=False)
-        self._note_request_error(last)
+                return self._fetch(url, tries=tries, headers=headers, guarded=False,
+                                   deep=deep)
+        if deep_refused:
+            # 深链被拒：账已在 `_note_deep_block` 按主机记过一行，不刷日志、不进通道账
+            # （口径见 cdp_base._note_fetch_fail）。这段短路必须留在通道等待**之后**：等待
+            # 只在通道级被标记拦停时才发生（探的是入口页、等得到结果），跳过它就会白丢
+            # 后面整批深链——2026-11-15 那 765 秒的病因是把深链当成通道级拦停，不是等待本身。
+            return "", url
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ 爱采购请求失败（{last}）：{url[:80]}")
         return "", url
 
@@ -259,7 +285,7 @@ class AipageCrawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -288,7 +314,8 @@ class AipageCrawler(CdpSiteCrawler):
             return rec
         url = f"{SHOP_URL}?xzhid={sid}&tpath=contact"
         rec["详情URL"] = url
-        html, _ = self._fetch(url)
+        html, _ = self._fetch(url, deep=True)
+        self._keep_detail(html)      # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         data = self._window_data(html)
         if data is None:
             if not html:

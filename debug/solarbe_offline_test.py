@@ -77,7 +77,7 @@ check("已细到行业×地区则接受截断（不再无限展开）", c._expan
 # 于是一片都不入库，一个关键词跑完一家都不产出）
 asked = []
 c._sleep = lambda: None
-def fake_fetch(url, tries=4, ua=None, guarded=True):
+def fake_fetch(url, tries=4, ua=None, guarded=True, deep=False):
     asked.append(url)
     return lst_html if "catid=0&areaid=0&page=1" in url else ""
 c._fetch = fake_fetch
@@ -95,7 +95,7 @@ recs = {}
 for name in ("lucky24", "whqtxny", "renjiangpv", "citicbohai"):
     html = cached(f"contact_{name}_mobile.html")
     stub = {"公司名称": "", "公司ID": name, "所在区域": "", "主营产品": ""}
-    c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=html: _h
+    c._fetch = lambda u, tries=4, ua=None, guarded=True, deep=False, _h=html: _h
     recs[name] = c.crawl_detail(stub)
     c._fetch = SolarbeCrawler._fetch.__get__(c)
 
@@ -133,7 +133,7 @@ body_page = ('<html><body><div class="content bd-t">\n公司名称：刘鑫<br/>
              '公司地址：安康市高新区<br/>\n公司电话：021-50790323<br/>\n'
              '</div><a href="mailto:1@qq.com">发邮件</a>'
              '<a href="tel:021-50790323">拨打</a></body></html>')
-c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=body_page: _h
+c._fetch = lambda u, tries=4, ua=None, guarded=True, deep=False, _h=body_page: _h
 r = c.crawl_detail({"公司名称": "企业商铺", "公司ID": "fhdgkfj235",
                     "所在区域": "陕西安康", "主营产品": ""})
 c._fetch = SolarbeCrawler._fetch.__get__(c)
@@ -144,7 +144,7 @@ check("占位邮箱 1@qq.com 作废（16 家共用同一个号，不是联系方
 check("仅因占位邮箱不算数据：有正文固话仍判成功", r.get("状态") == "成功" and r.get("电话"))
 normal = c._parse_contact(body_page.replace("1@qq.com", "liuxin2020@qq.com"), {})
 check("正常 QQ 邮箱（多位数账号）不误杀", normal.get("邮箱") == "liuxin2020@qq.com")
-c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=body_page: _h
+c._fetch = lambda u, tries=4, ua=None, guarded=True, deep=False, _h=body_page: _h
 r2 = c.crawl_detail({"公司名称": "刘鑫光伏设备", "公司ID": "fhdgkfj235",
                      "所在区域": "", "主营产品": ""})
 c._fetch = SolarbeCrawler._fetch.__get__(c)
@@ -157,13 +157,13 @@ check("裸区号固话补 0", strip_country_code("86-755-89810939") == "0755-898
 
 # ── 6. 异常页与终态 ───────────────────────────────────────────
 stub = {"公司名称": "广东朗嘉光伏", "公司ID": "grandglow24", "所在区域": "", "主营产品": ""}
-c._fetch = lambda u, tries=4, ua=None, guarded=True: ""
+c._fetch = lambda u, tries=4, ua=None, guarded=True, deep=False: ""
 r = c.crawl_detail(dict(stub))
 check("空正文判「详情页导航失败」（可重采）", r.get("状态") == "详情页导航失败")
 check("导航失败属瞬时状态、不写种子库锁死",
       any(m in r["状态"] for m in c.TRANSIENT_MARKS))
 missing = cached("contact_bomo_mobile.html")     # 真实 4212 字节「公司不存在」页
-c._fetch = lambda u, tries=4, ua=None, guarded=True, _h=missing: _h
+c._fetch = lambda u, tries=4, ua=None, guarded=True, deep=False, _h=missing: _h
 r = c.crawl_detail({**stub, "公司ID": "bomo"})
 check("名录已删除的公司判「无联系方式」终态（不占下一轮量）", r.get("状态") == "无联系方式")
 c._fetch = SolarbeCrawler._fetch.__get__(c)

@@ -38,6 +38,14 @@ _SKIP_PATTERNS = [
 ]
 
 
+# 明文 http 不能被浏览器自己升级成 https 再拦掉：升级失败时 Chrome 不抛异常，把这一跳直接取消
+# 并落在 `chrome-error://chromewebdata/`，于是「环境自己拦掉了」在日志里长成「站点不给过」。
+# 由来与同机差分实测见 b2bcollect_build/shared_chrome 那段注释。riskbird 是独立包，import 不到
+# 那一份，所以这里内联**逐字节相同**的副本，由构建前硬门第 31 条（31g）整段对拍三份。
+NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"
+CHROME_NO_UPGRADE_FLAGS = (f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)
+
+
 def shared_profile_dir() -> Path:
     """共享 Chrome 使用的配置目录（含用户真实登录态的副本）"""
     return runtime_paths.legacy_temp_root() / "chrome_debug_profile"
@@ -156,6 +164,9 @@ def ensure_shared_chrome(log, port: int = DUAL_PORT) -> bool:
         "--hide-crash-restore-bubble",
         # 附加模式下 Selenium 无法再传浏览器开关，反自动化检测必须在启动时带上
         "--disable-blink-features=AutomationControlled",
+        # 与 b2bcollect 共享 Chrome 同一枚开关：本工具拉起的浏览器对明文 http 一视同仁，
+        # 不许「某一条路径的浏览器带、另一条不带」——那种差异正是这一族事故的形状（见上面副本）
+        *CHROME_NO_UPGRADE_FLAGS,
         "--disable-infobars",
     ]
     try:

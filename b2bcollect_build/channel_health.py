@@ -27,6 +27,10 @@ import os
 import time
 from pathlib import Path
 
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line, short_reason
+
 import field_evidence as _fe
 
 __all__ = ["LEDGER_FILENAME", "RED_CARD_ROUNDS", "MAX_ROUNDS", "metrics_from",
@@ -125,10 +129,21 @@ def note_from_stats(metric):
     # 读的人只能瞎猜是站点没数据、网络没通还是有人在等登录（2026-11-15 的教训）
     if s.get("page_fail"):
         bits.append(f"取页失败 {s['page_fail']} 页"
-                    + (f"（最后一次：{str(s.get('last_page_error') or '')[:40]}）"
+                    + (f"（最后一次：{short_reason(s.get('last_page_error'), 40)}）"
                        if s.get("last_page_error") else ""))
     if str(s.get("waiting") or "").strip():
         bits.append(f"仍在等{s['waiting']}")
+    # 「无联系方式 N」这一格必须自带是谁的责任：红牌这一行是用户在界面上唯一会读的地方，
+    # 只报总数就会让人以为取号通路坏了（六档处方与由来见 cdp_base._note_no_contact）。
+    # 说词取采集器那个唯一把手 nc_note，不在这里另写一句（否则同一笔账两种说词）。
+    if str(s.get("nc_note") or "").strip():
+        bits.append(f"无联系方式分档：{s['nc_note']}")
+    # 落点不符（导航的那一页与浏览器留下的那一页不是同一页）过去只进 stats()、从不外读：
+    # 它是「把别人的页当这一家」那一类事故的先兆，不念出来就等于没记
+    if s.get("landing"):
+        bits.append("落点不符 " + "、".join(
+            f"{h} {int(v[0])} 次" for h, v in sorted(
+                s["landing"].items(), key=lambda kv: -int(kv[1][0]))))
     return "｜".join(bits) if bits else f"本轮 {metric.get('companies', 0)} 家"
 
 
@@ -147,7 +162,7 @@ def load_ledger(path):
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        return empty, f"{type(e).__name__}: {str(e).splitlines()[0][:80]}"
+        return empty, f"{type(e).__name__}: {first_line(e, 80)}"
     if not isinstance(data, dict) or not isinstance(data.get("zero_streak"), dict):
         return empty, "结构不认识（可能是旧版本或被人手改过）"
     data.setdefault("rounds", [])
@@ -204,7 +219,7 @@ def update_ledger(path, metrics, log=None, round_label=""):
             saved = True
         except Exception as e:
             log(f"⚠ 通道健康台账落盘失败（本轮账仍在，只是下轮接不上连续计数）："
-                f"{type(e).__name__}: {str(e).splitlines()[0][:80]}")
+                f"{type(e).__name__}: {first_line(e, 80)}")
             data["_save_error"] = type(e).__name__
     return {"alerts": alerts, "rounds": len(data.get("rounds") or []),
             "saved": saved, "error": str(data.get("_save_error") or err or "")}

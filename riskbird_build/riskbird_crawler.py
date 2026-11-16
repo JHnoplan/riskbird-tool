@@ -496,7 +496,7 @@ class RiskBirdCrawler:
             result["状态"] = "搜索超时"
         except Exception as e:
             self._log(f"   搜索 '{name}' 异常: {e}")
-            result["状态"] = f"异常: {str(e)[:50]}"
+            result["状态"] = f"异常: {e}"
 
         return result
 

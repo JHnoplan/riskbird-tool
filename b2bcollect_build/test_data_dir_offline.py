@@ -1344,7 +1344,8 @@ def _fn_body_dump(fn):
 
 _cdp_cls = cdp_base.CdpSiteCrawler
 _a16_cls = ali1688_crawler.Ali1688Crawler
-for _fname in ("_page_tail", "_has_any_contact", "_entry_locked", "_seen_store_pending"):
+for _fname in ("_page_tail", "_has_any_contact", "_entry_locked", "_seen_store_pending",
+               "_relevance_revision", "_stale_filtered", "_stale_filtered_keys", "_locked_keys"):
     check(f"14a {_fname} 两边的函数体逐字同构（改一处的说法必须两边一起改）",
           _fn_body_dump(getattr(_cdp_cls, _fname)) is not None
           and _fn_body_dump(getattr(_cdp_cls, _fname))
@@ -1418,7 +1419,7 @@ check("14h 反向对照：旧口径（进过种子库就永不重采）在这张
 _FRAG14 = ("增量库跳过 {self._incremental_skipped} 家(已采过或重试已用尽，未重复访问)",
            "另有 {pend} 家欠补联系人，下轮自动重采",
            # 收尾「取页失败」片段（挂在结束行的那一笔链路账）
-           'f"，取页失败 {self._page_fail} 页（最后一次：{self._last_page_error[:60]}）"',
+           'f"，取页失败 {self._page_fail} 页（最后一次：{short_reason(self._last_page_error, 60)}）"',
            # 「本页一页都没取到」两支出文案：请求层报过错 / 请求层没报错（超末页 404、频控空页）
            'f"  「{kw}」{page_label}【一页都没取到】（请求层没换回页面，"',
            'f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "',

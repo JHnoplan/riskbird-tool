@@ -114,6 +114,9 @@ class B2b168Crawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但借来的一枚必须还（空壳会把过验证时借的标签留到收工
+        之后；由来与判据见 cdp_base.CdpSiteCrawler.release_tab）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -139,12 +142,16 @@ class B2b168Crawler(CdpSiteCrawler):
                 or "八方资源网仍在限流状态")
 
     # ── 裸 HTTP 取页（带重试，网络抖动不伪装成空页）────────────
-    def _fetch(self, method, url, tries=3, guarded=True, **kw):
+    def _fetch(self, method, url, tries=3, guarded=True, deep=False, **kw):
+        """取一页。`deep=True`＝请求的是**某一家的深链**（商铺页/联系页/about），不是
+        通道入口：它的被拒只记深链单笔账，不写 `_block_reason`、不钉恢复探测页、
+        不触发整通道冷却（理由与实测数据见 cdp_base.http_block_reason 的 deep 分支）。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
             return ""
         last = ""
+        deep_refused = ""
         for i in range(max(1, tries)):
             try:
                 # 请求级节流：本站一家公司最多要发 5 个页，旧实现只在「每条记录结束」
@@ -153,8 +160,21 @@ class B2b168Crawler(CdpSiteCrawler):
                 self._pace_before_request()
                 r = self._session.request(method, url, timeout=http_timeout(25), **kw)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url, r.headers)
+                block = self.http_block_reason(r.status_code, r.text, url, r.headers,
+                                               deep=deep)
                 if block:
+                    if deep:
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._fetch(method, url, tries=1, guarded=False,
+                                                deep=deep, **kw))
+                        if got is not None:
+                            return got
+                        break
                     # 防采/限流插页：重试只会加重风控，直接交看门狗（旧实现把它当普通
                     # 失败返空串，列表解 0 家就默默切下一个关键词）
                     self._block_reason = block
@@ -172,8 +192,16 @@ class B2b168Crawler(CdpSiteCrawler):
         if guarded and self._block_reason:
             if self.handle_http_block(url):
                 self._block_reason = ""
-                return self._fetch(method, url, tries=tries, guarded=False, **kw)
-        self._note_request_error(last)
+                return self._fetch(method, url, tries=tries, guarded=False,
+                                   deep=deep, **kw)
+        if deep_refused:
+            # 深链被拒：账已在 `_note_deep_block` 按主机记过一行，这里不刷「请求失败」
+            # 日志、也不进通道入口的取页失败账（否则体检报告会出现「取页失败 0 页｜
+            # 最后一次=HTTP 403」这种自相矛盾的读数——2026-11-15 实机马可波罗正是这形状）。
+            # 必须留在通道等待**之后**：上面那段只在通道级被标记拦停时才等，探的是入口页、
+            # 等得到结果，能让后面整批深链一起复活；跳过那段等待才是真的丢数据。
+            return ""
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ b2b168 请求失败（{last}）：{url[:70]}")
         return ""
 
@@ -262,7 +290,7 @@ class B2b168Crawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -297,11 +325,11 @@ class B2b168Crawler(CdpSiteCrawler):
         rec = self._base_rec(stub)
         host = stub.get("公司ID") or stub.get("memberId") or ""
         url = stub.get("详情URL") or f"https://{host}.b2b168.com/"
-        html = self._fetch("GET", url)
+        html = self._fetch("GET", url, deep=True)
         if not html:
             # 404/瞬时失败：互换 .cn 段再试一次（实测同一主机两种形态只有一种可访）
             alt_url, alt_host = self._alt_host_url(host, url)
-            html = self._fetch("GET", alt_url)
+            html = self._fetch("GET", alt_url, deep=True)
             if html:
                 url, host = alt_url, alt_host
                 rec["公司网址"] = alt_url
@@ -310,6 +338,7 @@ class B2b168Crawler(CdpSiteCrawler):
         if not html:
             rec["状态"] = "详情页导航失败"
             return rec
+        self._keep_detail(html)      # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         data = self._parse_shop(html, stub.get("公司名称", ""), url)
         for k, v in data.items():
             if v and not rec.get(k):
@@ -322,9 +351,10 @@ class B2b168Crawler(CdpSiteCrawler):
         # 明文「联系人：王国民先生 （经理）」+邮箱+地址，实测取回）。
         if not (rec.get("联系人") and rec.get("地址") and (rec.get("邮箱") or rec.get("手机") or rec.get("电话"))):
             for suffix in ("/contact.aspx", "/m/contact.aspx"):
-                page = self._fetch("GET", url.rstrip("/") + suffix, tries=1)
+                page = self._fetch("GET", url.rstrip("/") + suffix, tries=1, deep=True)
                 if not page:
                     continue
+                self._keep_detail(page)   # 补访的联系页更贴近「这一家到底给不给号」
                 more = self._parse_contact_page(page)
                 hit = False
                 for k, v in more.items():
@@ -341,7 +371,7 @@ class B2b168Crawler(CdpSiteCrawler):
         # 商铺首页/home.aspx 都拿不到时，再试一次「关于我们」(home.aspx)：
         # 实机取证该页含「全国统一热线：139…」等首页没有的字段。
         if not (rec.get("联系人") and (rec.get("手机") or rec.get("电话"))):
-            about = self._fetch("GET", url.rstrip("/") + "/home.aspx", tries=1)
+            about = self._fetch("GET", url.rstrip("/") + "/home.aspx", tries=1, deep=True)
             if about:
                 more = self._parse_shop(about, stub.get("公司名称", ""), url, from_about=True)
                 for k, v in more.items():

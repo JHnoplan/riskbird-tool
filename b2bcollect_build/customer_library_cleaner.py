@@ -553,36 +553,61 @@ def make_row(fields: dict, sources: list, stats: dict = None) -> dict:
     }
 
 
-def build_clean_rows(results: list, log=print, waste_sink=None):
+def build_clean_rows(results: list, log=print, waste_sink=None, stats_out=None):
     """把三平台原始结果转换为模板行数据：返回 [{模板列名: 值}] 列表。
     waste_sink：可选回调(list[公司名])。被入库口径剔掉的「四项联系方式全空」
     合并记录的公司名会交给它——b2bcollect 用它把废数据灌进待采集名单交企知道
-    补采（变废为宝），不传则行为与旧版完全一致。"""
+    补采（变废为宝），不传则行为与旧版完全一致。
+    stats_out：可选 dict，把漏斗每一档的数写回去（原始/合并/四项全空按来源归账/补区号）。
+    为什么要有这一格（2026-11-15 实机体检）：报告只能说出「57 条进、7 条出，吞了 50 条」，
+    说不出这 50 条死在哪一档、属于哪一路，于是没人去修真正断掉的那条通路。数本来就在
+    这一层算过一遍，只是只落到了一句日志里——外读一次就有了。"""
     merged, dup = merge_records(results)
-    if waste_sink is not None:
-        waste = []
-        for item in merged:
-            f = item["fields"]
-            mobiles, landlines = split_phones(f.get("电话", ""))
-            if not mobiles and not landlines and not split_emails(f.get("邮箱", "")) \
-                    and not normalize_text(f.get("微信号", "")):
-                name = normalize_text(f.get("公司名", ""))
-                if name:
-                    waste.append(name)
-        if waste:
-            try:
-                waste_sink(waste)
-            except Exception:
-                pass
     stats = {}
     rows = [make_row(item["fields"], item["sources"], stats) for item in merged]
+    # 「四项全空」只按 _has_contact(row) 判：与 filter_import_rows 同一把尺子。
+    # 旧写法在合并记录上另拆一遍电话/邮箱，等于同一件事两把尺子（口径会各自漂移，
+    # 马可波罗那轮「报告说 51 家、漏斗只留 2 家」正是两把尺子各说各话的形状）。
+    waste, no_contact_by_source, no_contact = [], {}, 0
+    for item, row in zip(merged, rows):
+        if _has_contact(row):
+            continue
+        no_contact += 1                 # 行数：与 filter_import_rows 剔掉的条数必须一字不差
+        name = normalize_text(item["fields"].get("公司名", ""))
+        if name:
+            waste.append(name)
+        # 归账按来源：跨平台合并的一行会同时计入它每一个来源（这是**归属分布**，
+        # 不是行数——拿它的合计当剔除数会与 filter_import_rows 对不上，虚报口径分叉）
+        for src in (item["sources"] or ["未知来源"]):
+            no_contact_by_source[src] = no_contact_by_source.get(src, 0) + 1
+    if waste_sink is not None and waste:
+        try:
+            waste_sink(waste)
+        except Exception:
+            pass
+    invalid = len(results) - sum(1 for r in results if is_valid_record(r))
     no_mobile = sum(1 for r in rows if not r["手机号"] and not r["固话"])
     log(f"清洗完成：原始 {len(results)} 条 → 有效入库 {len(rows)} 条"
-        f"（剔除无效 {len(results) - sum(1 for r in results if is_valid_record(r))} 条、"
+        f"（剔除无效 {invalid} 条、"
         f"跨平台合并 {dup} 条、无联系方式 {no_mobile} 条、"
         f"裸号补区号 {stats.get('area_filled', 0)} 个）")
     if stats.get("area_kept"):
         log(f"  ↳ 另有 {stats['area_kept']} 个裸号固话因「同一行区号不唯一」保持原样（不猜区号）")
+    if no_contact:
+        # 分来源点名：某一路整批四项全空＝这一路的取号通路断了，与「数据本来薄」是两件事
+        log(f"  ↳ 四项（手机/固话/邮箱/微信）全空 {no_contact} 条："
+            + "、".join(f"{s} {n} 条" for s, n in
+                        sorted(no_contact_by_source.items(), key=lambda kv: -kv[1]))
+            + "（这些行不会入库，原始表仍全量保留；某一路成批出现先查它的取号通路，"
+              "合并行会同时计入多个来源，所以分项合计可能大于条数）")
+    if stats_out is not None:
+        stats_out.update({
+            "in": len(results), "rows": len(rows), "invalid": invalid, "merged": dup,
+            "no_mobile": no_mobile, "no_contact": no_contact,
+            "no_contact_by_source": dict(no_contact_by_source),
+            "area_filled": stats.get("area_filled", 0),
+            "area_kept": stats.get("area_kept", 0),
+        })
     return rows
 
 
@@ -1353,7 +1378,7 @@ def read_xls_tables(path: str):
     try:
         book = xlrd.open_workbook(path, on_demand=True)
     except Exception as e:
-        raise ValueError(f"旧版 .xls 读不了：{os.path.basename(path)}（{str(e).splitlines()[0][:80]}）\n"
+        raise ValueError(f"旧版 .xls 读不了：{os.path.basename(path)}（{str(e).splitlines()[0]}）\n"
                         f"请用 Excel/WPS 打开后另存为 .xlsx 再导入")
     tables = []
     try:

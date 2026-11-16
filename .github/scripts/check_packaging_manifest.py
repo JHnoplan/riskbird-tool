@@ -131,7 +131,9 @@
  21 之后（21 Qt 退出顺序 / 22 状态文件与 Chrome 配置目录防护 / 23 套件判定与退出码同源 /
      24 离线套件必须被 git 跟踪 / 25 交付链不许写死开发机路径 / 26 TEMP 只许一处口径 /
      27 模块级不许取用未绑定的名字 / 28 shell 必须自己表态 errexit / 29 交付链必须有写在
-     仓库里的行尾立场）：这九条各自的由来与口径写在**它们函数上方**的注释块里——那九条都是
+     仓库里的行尾立场 / 30 失败原因只准一个把手收口 / 31 标签交出的正文必须过页面身份门、
+     且「这一跳根本没加载出来」必须按 Chrome 原话归因（31g 还要证明那枚启动参数真的带上了，
+     而且三条路径上的浏览器带的是同一份）：这十一条各自的由来与口径写在**它们函数上方**的注释块里——那十一条都是
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
 
@@ -151,8 +153,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unicodedata
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -4300,6 +4304,2161 @@ def check_module_name_binding(files=None) -> list:
     return problems
 
 
+# ── 第 30 条：失败原因收成一行，只准一个把手 ─────────────────────────────────
+# 由来（2026-11-16 第八轮实机体检报告 → 第九轮同类查全）：报告里出现过
+# `【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. (con）`
+# ——英文词被切掉半边、右括号还是分型器补的。上一轮把「已分型的原因」收进 short_reason 后
+# 自审发现：当时那条判据（离线 11p）扫的是 `*_crawler.py`，而交付链里另有 **41 处**各自写的
+# `str(e).splitlines()[0][:N]`（界面告警、会话日志、名单通道翻译层、权限自检、健康看板）、
+# `err[:70]`（回执进台账）、`resp.text[:200]`（OSS 的 XML 错误体）。**判据的视野比缺陷小，
+# 就等于没修**——半截词照旧从那些路上出来，而它们恰好是用户最常看到的那几行。
+#
+# 口径（三种合格写法，别的都算缺陷）：
+#   ① 已定性的原因 → `short_reason(原因, 上限)`；
+#   ② 异常/多行文本 → `first_line(异常, 上限)`（先取首行=自然边界，再只在标点/词边界断）；
+#   ③ 接不到把手的地方（另两个独立包、三目录同名拷贝）→ **整行带出**，不做任何按字符数的切。
+# 真源是 b2bcollect_build/text_shape.py；1688 独立包装不进它，在 ali1688_crawler 内联一份
+# 逐字节相同的实现。这一条判六件事，全是结构判据：
+#   30a 交付链的运行时代码里不许再有 `….splitlines()[0][:N]`（①②③ 都不长这样）；
+#       30a-2 也不许「调用完把手又补一刀 `[:N]`」——本轮同类查全抓到的正是这一种：
+#       `riskbird_build/chrome_driver.py` 里 `_short_err(e)` 已经是整行带出，外面却还挂着
+#       `[:90]`，看着像走了口径，实际把边界又劈开。只认把手的名字，不认变量名（避免误报）；
+#   30a-3 不许 `str(异常)[:N]`（**同一族的第三种形状，也是最大的一族：本轮实测 28 处**）。
+#       30a 之所以看不见它，是因为它没有 `splitlines()[0]` 那一跳：`local_scan.py` 八处、
+#       `access_guard.py` 四处、riskbird 那几份采集器都写成 `f"…失败：{str(e)[:60]}"`。
+#       异常里最长的那一段恰恰是尾巴上的 `Session info`/路径，所以这一刀切下来留的是
+#       「看起来完整」的半截词。b2bcollect 那份走 `first_line`（口径②），另两个独立包与
+#       三目录同名拷贝就整行带出（口径③）；
+#   30a-4 不许「读一本已经收过口的原因账，又按字符数切一刀」。现场（2026-11-16 第十一轮
+#       实机报告）：`深链被拒: china.makepolo.com 42 次（… ·仅这一条深链，通道入）`——
+#       记账处写的是 `short_reason(reason, 120)`，渲染处写的是 `str(v[1])[:46]`。30a/30a-2/
+#       30a-3 都认不出这两刀之间的牵连：句子先落进字典，再被循环变量接走。所以这一判要跟着
+#       那一跳走（**按函数作用域**做名字传播：整份文件共用一张名字表会报出 127 处噪声，
+#       噪声到这个量级就等于没有判据），并且给「切的是列表元素个数／非原因的字段」留一张
+#       钉死原文的豁免表——原文一改豁免即失效，免得豁免表长成藏缺陷的抽屉；
+#   30b 把手在位且两份实现（真源 / 1688 内联）**逐字节相同**——比的是**整段**（断点表、
+#       连接符表、`_is_break`、两个函数），只比函数体的话分叉会落在两边都比不到的那几行；
+#   30c 把手的**性质**：任何一句原因、任何一档上限，收口之后 ①切点必须在真正的词边界上
+#       （判据自己带一份分隔符表/连接符表重算，不读把手的常量，也不问「最后一个字是不是
+#       边界」——那会被 rstrip 与不 rstrip 两种写法轮流骗过去）②`【类别】主机:端口｜` 前缀
+#       整段还在 ③括号必成对；两份实现同答；
+#   30d 视野为空不许报绿（和 25/26/27 条同一句：扫描范围断了，"没有不合格"没有含义）。
+#       视野另加 `REASON_RENDER_EXTRA`：实机验收报告的渲染层本体（住在 debug/，却正是
+#       交付前给用户看的那份报告），按目录名把它排除掉就等于「报告那一行永远没人判」。
+REASON_HANDLE = "b2bcollect_build/text_shape.py"
+REASON_MIRRORS = ("ali1688_build/ali1688_crawler.py",)
+# 把手整段在源码里的边界（从断点表那行注释到 `first_line` 的最后一行）。取**整段**而不是
+# 逐个函数：这一族的常量（`_REASON_BREAKS`／`_REASON_JOINERS`）和共用小函数（`_is_break`）
+# 也会被单独改掉，只比两个函数体的话，分叉恰好落在「两边都比不到」的那几行上。
+REASON_BLOCK = ("# 可断的位置", "    return short_reason(s.splitlines()[0], limit)")
+# 全仓「把一句话收成一行」的那几把把手（含第三支口径里各包自带的整行把手）：
+# 它们的返回值**已经**收过口了，再被 `[:N]` 切一刀等于把选好的边界劈开——30a-2 判这个形状。
+REASON_HANDLES = frozenset({"short_reason", "first_line", "_oss_brief", "_short_err",
+                            "_why_short", "_request_error_detail", "request_error_shape",
+                            "probe_block_reason", "http_block_reason"})
+# 30a-3：异常变量的常见名字（`e`/`err`/`exc`/`ex`/`error`/`exception`，带数字后缀也算）。
+# 判的是 `str(这个_name)[:N]` 这个**形状**：把一句异常按字符数切。名字表只这么宽，
+# 是因为 `str(x)[:N]` 用在异常之外的写法在交付链里是 0 处（本轮全量扫过），一旦哪天出现
+# 非异常的 `str(e)`，那条会被豁免表接住并要写明理由，而不是让判据整体改名换姓。
+EXC_NAME_RE = re.compile(r"^(?:e|err|exc|ex|error|exception)\d*$")
+# 30a-4：原因账的键与属性。这些格子里存的**本来就是收口过的一句话**（记账处都走把手），
+# 渲染处再切一刀就是把选好的边界劈开。登记口径：只有「值是一句失败原因」的格子才进来，
+# 数字/名单/计数那些一律不算（算进去就又变成一把按名字乱切的尺）。
+REASON_LEDGER_KEYS = frozenset({
+    "last_page_error", "last_goto_error", "block_reason", "dead_hosts", "deep_block",
+    "landing", "page_error", "nav_error", "load_error", "reason", "_ai_reason",
+    "error", "errs", "read_err", "imp_err", "last_err"})
+REASON_LEDGER_ATTRS = frozenset({"_last_page_error", "_last_goto_error", "_block_reason",
+                                 "_page_error"})
+# 视野里额外必须读到的渲染层：实机验收报告就是交付前用户读的那份报告本体。
+REASON_RENDER_EXTRA = ("debug/platform_live_check.py",)
+# 30a-4 的豁免表：键 = (相对路径, 那一行原文)，值 = 为什么这不是「切一句原因」。
+# 行原文一变，这一条豁免就落空（判据会报「豁免不在原位」）：它不能长成
+# 「把缺陷登记成合法」的抽屉——要么这行还在、理由成立，要么就得重新解释一次。
+REASON_SLICE_EXEMPT = {
+    ("b2bcollect_build/local_scan.py",
+     'on_progress(f"正在识别 {it[\'display\'][:30]}…", len(items), len(files))'):
+        "切的是压缩包里的**文件显示名**（进度条一格的宽度，行尾自带「…」），不是失败原因；"
+        "这一格里 `it` 之所以带原因色，是因为同一个函数里别处从 `reason` 格子取值传给了它",
+    ("b2bcollect_build/parallel_session.py",
+     '+ "、".join(dry[:6]) + ("…" if len(dry) > 6 else "")'):
+        "切的是「一家没出的关键词」这个**列表的元素个数**（取前 6 个词），不是句子的字符数",
+}
+
+
+def _runtime_reason_sources() -> dict:
+    """第 30 条的视野：会被打进包、且会把失败原因念给用户听的那些 .py。
+
+    取三个交付目录的全部 .py，剔掉测试套件（``test_*``）、一次性调试脚本（``debug_*``、
+    ``probe_*``）——它们的话术不进用户眼睛；离线套件里那一族自有对拍（第 ㉓ 节）。
+    例外只有 `REASON_RENDER_EXTRA` 那一组：实机验收报告的渲染层住在 debug/，可它就是
+    交付前给用户看的那份报告本体（第十一轮那行半截词正是从它那里念出来的），
+    所以它必须进视野；读不到就响，不许默默少一份。
+    """
+    out = {}
+    for d in sorted(ROOT.iterdir()):
+        if not (d.is_dir() and d.name.endswith("_build")):
+            continue
+        for p in sorted(d.glob("*.py")):
+            stem = p.stem
+            if stem.startswith("test_") or stem.startswith("debug_") or stem.startswith("probe_"):
+                continue
+            if p.is_file():
+                out[p] = p.read_text(encoding="utf-8", errors="replace")
+    for rel in REASON_RENDER_EXTRA:
+        p = ROOT / rel
+        if p.is_file():
+            out[p] = p.read_text(encoding="utf-8", errors="replace")
+        else:
+            out[p] = ""
+    return out
+
+
+def _is_zero_index(node) -> bool:
+    """这个 Subscript 是不是 `[0]`：**两种解析树都要认**（Python 3.9 起 `[0]` 直接是 Constant，
+    旧的 `ast.Index(value=Constant(0))` 那层壳只剩下历史文档里还有）。
+
+    由来（2026-11-16 本轮夹具的反向对照当场抓到）：判据原来只写 `isinstance(base.slice,
+    ast.Index)`，在 3.13 的解析树上**一个节点都不匹配**，于是 30a 扫完全仓报绿——绿得毫无
+    根据。判据必须能被「旧写法」这条反向对照咬住，否则「没有不合格」只说明判据看不见。
+    """
+    if not isinstance(node, ast.Subscript):
+        return False
+    sl = node.slice
+    if isinstance(sl, ast.Index):                      # ≤3.8 的写法（兼容旧解析树）
+        sl = sl.value
+    return isinstance(sl, ast.Constant) and sl.value == 0
+
+
+def _rel_label(path) -> str:
+    """给报告用的相对路径：夹具喂进来的**仓外/相对**路径也要能印出来。
+
+    原来这句写的是 `path.relative_to(ROOT) if hasattr(path, "relative_to") else path`——
+    `hasattr` 永远为真（Path 一直都有这个方法），所以离线夹具一喂相对路径就当场 ValueError，
+    「判据可被反向对照」这句话在第一次真去喂的时候自己崩了。护栏要挡的是**语义**上的不在仓内。
+    """
+    text = str(path)
+    root = str(ROOT)
+    return text[len(root) + 1:] if text.startswith(root + "/") else text
+
+
+def _slice_of_first_line(tree) -> list:
+    """AST 找出「取首行之后又按字符数切」的那一行：`….splitlines()[0][:N]`。
+
+    为什么盯这个形状而不是变量名：名字里带 err/msg/reason 的切片可能是页面正文、公司名、
+    链接文案（本轮扫到的 10 处就全是），按名字判会把它们报成缺陷；而 `splitlines()[0]`
+    后面紧跟一个数字切片，**只可能**是在收一句失败原因——这正是这一族的形状。
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
+            continue
+        up = node.slice.upper
+        if not (isinstance(up, ast.Constant) and isinstance(up.value, int)):
+            continue
+        base = node.value
+        if (_is_zero_index(base) and isinstance(base.value, ast.Call)
+                and isinstance(base.value.func, ast.Attribute)
+                and base.value.func.attr == "splitlines"):
+            hits.append(node.lineno)
+    return hits
+
+
+def _gate_slice_of_handle(tree) -> list:
+    """第二种形状：**已经收口的一句话又被按字符数切了一刀**（`_short_err(e)[:90]`）。
+
+    30a 那种形状是「自己写截断」，这一种更隐蔽：调用点看起来已经在走把手，紧接着又补
+    `[:90]`——于是把手精心挑出来的那个边界被后面那一刀重新劈开，症状一模一样，而 30a 读不出来。
+    判据只认「被切的那一段是一次对这些名字的调用」，不认变量名：变量名判据在 22g 那一族
+    误报过（名字里带 text/body 的切片大多是正文与公司名），误报的代价是人们把整条门关掉。
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)
+                and node.slice.lower is None
+                and isinstance(node.slice.upper, ast.Constant)
+                and isinstance(node.slice.upper.value, int)):
+            continue
+        base = node.value
+        if isinstance(base, ast.Call):
+            name = base.func.id if isinstance(base.func, ast.Name) else \
+                getattr(base.func, "attr", "")
+            if name in REASON_HANDLES:
+                hits.append(node.lineno)
+    return hits
+
+
+def _int_slice(node) -> bool:
+    """这个 Subscript 是不是一个纯上界的字符切片 `x[:N]`（带 lower/step 的是“取一段”，不是收口）。"""
+    return (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)
+            and node.slice.lower is None
+            and isinstance(node.slice.upper, ast.Constant)
+            and isinstance(node.slice.upper.value, int))
+
+
+def _reads_reason(node, names) -> bool:
+    """这一段表达式是不是在「读一本原因账」：碰到登记的账键字面量、账属性、或已经
+    被认定为原因的名字。只认这三个来源，不认变量名里带 err/msg/reason 的写法（本轮
+    扫到的 10 处那种误报根源就在按名字切）。"""
+    for sub in ast.walk(node):
+        if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                and sub.value in REASON_LEDGER_KEYS):
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr in REASON_LEDGER_ATTRS:
+            return True
+        if isinstance(sub, ast.Name) and sub.id in names:
+            return True
+    return False
+
+
+def _scope_nodes(scope) -> list:
+    """本作用域的节点，**不下钻**嵌套的函数/lambda（那是另一张名字表）。
+
+    为什么按作用域而不是整份文件共用一张：本轮先试过后一种，`r`/`e`/`rec` 这些在某个
+    函数里确实接过原因的短名，会把原因色传染到全仓同一个短名——第一次实跑就报出 127 处，
+    其中真正是缺陷的只 7 处。误报到这个量级，下一条门就会被人关掉。"""
+    out, stack = [], [scope]
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                and n is not scope):
+            continue
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+def _reason_names_of(scope, seed=None) -> set:
+    """本作用域里「装的是一句原因」的名字：从登记的账键/账属性出发，跟着赋值与
+    for/推导式的绑定走（不动点，最多八轮）。`seed` 是从调用点跨进来的形参（见
+    `_reason_param_taint`）。"""
+    names = set(seed or ())
+    binders = [n for n in _scope_nodes(scope)
+               if isinstance(n, (ast.Assign, ast.For, ast.comprehension))]
+    for _ in range(8):
+        grew = False
+        for node in binders:
+            if isinstance(node, ast.Assign):
+                src, dsts = node.value, list(node.targets)
+            else:
+                src, dsts = node.iter, [node.target]
+            if not _reads_reason(src, names):
+                continue
+            for d in dsts:
+                if d is None:
+                    continue
+                for x in ast.walk(d):
+                    if isinstance(x, ast.Name) and x.id not in names:
+                        names.add(x.id)
+                        grew = True
+        if not grew:
+            break
+    return names
+
+
+def _reason_param_taint(tree) -> dict:
+    """把「这是一句原因」的颜色跨过函数边界递一次：{函数名: 被污染的形参名}。
+
+    为什么必须有这一跳：本仓立项那一行里，账在**调用点**（`lines.append(_host_reason_line(
+    "深链被拒", _deep))`），刀在**被调函数**里（`f"…次（{str(v[1])[:46]}）"`）。只按单个
+    作用域算名字的话，被调那个函数的形参永远接不到原因色，于是把渲染处退回旧写法也不会响—
+    —「修好了但门判不出回归」与「没修」对下一个人来说是同一件事。只认本文件里定义过的函数名，
+    不认跨文件调用（那需要全局调用图，而且这一族把把手就住在本文件）。不动点最多八轮。"""
+    fns = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fns.setdefault(n.name, n)
+    taint = {name: set() for name in fns}
+    for _ in range(8):
+        grew = False
+        for caller in fns.values():
+            names = _reason_names_of(caller, taint.get(caller.name))
+            for node in _scope_nodes(caller):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id in fns):
+                    continue
+                callee = fns[node.func.id]
+                args = [a for a in node.args if not isinstance(a, ast.Starred)]
+                aarg = [a.arg for a in callee.args.posonlyargs + callee.args.args
+                        if a.arg != "self"]
+                for i, a in enumerate(args):
+                    if i < len(aarg) and _reads_reason(a, names) and aarg[i] not in taint[callee.name]:
+                        taint[callee.name].add(aarg[i])
+                        grew = True
+                for kw in node.keywords:
+                    if kw.arg is None or not _reads_reason(kw.value, names):
+                        continue
+                    for i, an in enumerate(aarg):
+                        if an == kw.arg and an not in taint[callee.name]:
+                            taint[callee.name].add(an)
+                            grew = True
+        if not grew:
+            break
+    return taint
+
+
+def _slice_of_exception_str(tree) -> list:
+    """30a-3：`str(异常)[:N]`。没有 `splitlines()[0]` 那一跳的同一件事。"""
+    hits = []
+    for node in ast.walk(tree):
+        if not _int_slice(node):
+            continue
+        base = node.value
+        if (isinstance(base, ast.Call) and isinstance(base.func, ast.Name)
+                and base.func.id == "str" and len(base.args) == 1
+                and isinstance(base.args[0], ast.Name)
+                and EXC_NAME_RE.match(base.args[0].id)):
+            hits.append((node.lineno, f"把一句异常按字符数切了一刀（str({base.args[0].id})）"))
+    return hits
+
+
+def _slice_of_reason_ledger(tree) -> list:
+    """30a-4：读原因账的那一刀（含隔着循环变量与隔着函数形参那两跳）。返回 (行号, 命中的格子)。"""
+    scopes = [tree] + [n for n in ast.walk(tree)
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    taint = _reason_param_taint(tree)
+    hits = []
+    for sc in scopes:
+        names = _reason_names_of(sc, taint.get(getattr(sc, "name", "")))
+        for node in _scope_nodes(sc):
+            if not _int_slice(node):
+                continue
+            bad = set()
+            for sub in ast.walk(node.value):
+                if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                        and sub.value in REASON_LEDGER_KEYS):
+                    bad.add(sub.value)
+                elif isinstance(sub, ast.Attribute) and sub.attr in REASON_LEDGER_ATTRS:
+                    bad.add(sub.attr)
+                elif isinstance(sub, ast.Name) and sub.id in names:
+                    bad.add(sub.id)
+            if bad:
+                hits.append((node.lineno, "读一本已经收过口的原因账又按字符数切了一刀（"
+                                          f"碰了 {sorted(bad)}）"))
+    return hits
+
+
+def _extract_reason_block(src: str) -> str:
+    """源码里把手那一段（含首尾标记行）；任一边缺标记就返回哨兵，让对拍必然响。"""
+    start, end = REASON_BLOCK
+    if start not in src or end not in src:
+        return f"（缺标记：start={start in src} end={end in src}）"
+    i = src.index(start)
+    j = src.index(end, i) + len(end)
+    return src[i:j]
+
+
+# 性质判据用的分隔符表／连接符表：判据**自己带一份**，不去读把手里的常量。
+# 不然「把手把断点表改宽成任意字符」这种最坏的改法会连判据一起改掉（判据跟着认为什么都
+# 是边界），这一条门就退化成「代码说自己没问题」。30c 问的是行为，口径必须站在被审代码之外。
+GATE_SEPARATORS = "｜.：，、；)） ·"
+GATE_JOINERS = ".:：０．·"
+
+
+def _wordish(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch in "-_")
+
+
+def _gate_cut_is_boundary(text: str, p: int) -> bool:
+    """在下标 p 处把 text 切成两段：这个切点算不算真正的词边界（判据独立重算）。
+
+    两种写法都要认得：切点**左边**那个字是分隔符（留下 `…timed out.`，下一个字是正文），
+    或切点**右边**那个字是分隔符（`…冷却）｜下一句` 把分隔符让给后半句）。只问其中一边都会
+    误报——把手会 rstrip 掉行尾分隔符，那时最后一个字当然是词字符；它不 rstrip `.` 时，
+    下一个字又当然是正文。真正要问的是「这里本来就该断吗」：分隔符夹在两个词字符中间
+    （`b2b.11467`、`com:443`、`哈利·波特`）劈开的是一个词，不算。
+    """
+    def sep(ch, left, right):
+        if ch not in GATE_SEPARATORS:
+            return False
+        if ch in GATE_JOINERS and _wordish(left) and _wordish(right):
+            return False
+        return True
+
+    left_ch = text[p - 1] if p else ""
+    here = text[p] if p < len(text) else ""
+    right_ch = text[p + 1] if p + 1 < len(text) else ""
+    return sep(left_ch, text[p - 2] if p >= 2 else "", here) or sep(here, left_ch, right_ch)
+
+
+def _reason_property_cases():
+    """把手的性质用例：句子取自本机实机日志与分型器的真实输出形状，不是编的。"""
+    return (
+        "【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. "
+        "(connect timeout=10)",
+        "【被拦停】防采页没等到放行（等人过验证或等 IP 冷却）·仅这一条深链（见上一行）",
+        "HTTPSConnectionPool(host='www.makepolo.com', port=443): Max retries exceeded "
+        "with url: /search/%E9%98%80.html (Caused by SSLError(SSLCertVerificationError(1, "
+        "'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed'))) ",
+        "上传失败 HTTP 403: Code=AccessDenied Message=You have no right to access this "
+        "object because of acl RequestId=652F0A9B1A EC=0003-00000001",
+        "列表页导航失败（【页面未就绪】等不到 https://b2b.11467.com/search 的完整正文）",
+        "Message: unknown error: net::ERR_CONNECTION_TIMED_OUT\n  (Session info: "
+        "chrome=131.0.6778.205); For documentation on this error, please visit: https://",
+        "旧版 .xls 读不了：客户库.xls（XLRDError: Cannot find workbook in OLE2 stream）",
+        "这一个词特别特别特别特别特别特别长中间没有任何标点也没有空格所以任何一档上限都会把它切断",
+    )
+
+
+def check_reason_one_handle(files=None, handle_src=None, mirrors=None) -> list:
+    """失败原因收成一行只准一个把手（第 30 条）。
+
+    `handle_src`／`mirrors` 是给离线夹具留的注入口：30c 那条**性质判据**如果只能读盘上的
+    真源，就没法证明「把断点表改回按字符切一刀」会响——判据不能被反向对照，就等于还没修。
+    """
+    problems = []
+    full_scan = files is None
+    files = _runtime_reason_sources() if full_scan else dict(files)
+    # 「一份都没读到」按内容算而不是按键算：额外登记的渲染层就算读不到也会留一个空字符串键，
+    # 只看 len(files) 的话，三个 *_build 全落空时会反过来撞上「真源不在位」那条——同一次事故，
+    # 但后一句话把「视野断了」说成了「代码丢了」，排查的人会去找回文件而不是看 ROOT。
+    if not any(str(t).strip() for t in files.values()):
+        return ["第 30 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「没有一处自己切原因」这句话没有任何含义"]
+
+    # 30a 形状判据：`….splitlines()[0][:N]`，加上同一件事的另外两种写法（30a-3/30a-4）
+    judged = 0
+    used_exempt = set()
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as e:
+            problems.append(f"{path.name} 解析不过（第 {e.lineno} 行 {e.msg}）：第 30 条读不到"
+                            "这一份的收口写法，按不合格算而不是按「这处没问题」算")
+            continue
+        judged += 1
+        rel = _rel_label(path)
+        for lineno, kind in [(n, "取完首行又按字符数切了一刀") for n in _slice_of_first_line(tree)] + \
+                            [(n, "调完把手又把那句收口结果按字符数切了一刀")
+                             for n in _gate_slice_of_handle(tree)] + \
+                            _slice_of_exception_str(tree) + _slice_of_reason_ledger(tree):
+            raw = text.splitlines()[lineno - 1].strip()
+            # 豁免只对 30a-4 开（那一判是唯一会碰到「切的是列表元素/非原因字段」的），
+            # 且必须连那一行原文一起对上；其余三种形状一刀不豁免。
+            if kind.startswith("读一本") and (rel, raw) in REASON_SLICE_EXEMPT:
+                used_exempt.add((rel, raw))
+                continue
+            line = raw[:120]
+            problems.append(
+                f"{_rel_label(path)} 第 {lineno} 行："
+                f"{kind}：{line}\n"
+                f"   → 半截词比不说更误导（实机读出过 `timed out. (con）`）。三种合格写法：已定性的"
+                f"原因走 `short_reason(原因, 上限)`；异常文本走 `first_line(异常, 上限)`；接不到"
+                f"把手的独立包/同名拷贝就整行带出（把 `[:N]` 删掉，别换一种切法）")
+
+    # 30b 把手在位 + 两份实现同字节
+    if handle_src is None:
+        handle_path = ROOT / REASON_HANDLE
+        if not handle_path.is_file():
+            problems.append(f"真源不在位：{REASON_HANDLE} 读不到——这一族又退回各写各的截断了")
+            return problems
+        handle_src = handle_path.read_text(encoding="utf-8", errors="replace")
+    if mirrors is None:
+        mirrors = {}
+        for rel in REASON_MIRRORS:
+            mirror = ROOT / rel
+            if not mirror.is_file():
+                problems.append(f"内联那份把手的 {rel} 读不到：两份实现无从对拍")
+                continue
+            mirrors[rel] = mirror.read_text(encoding="utf-8", errors="replace")
+    handle_block = _extract_reason_block(handle_src)
+    if handle_block.startswith("（缺标记"):
+        problems.append(f"{REASON_HANDLE} 里取不出把手那一段（边界 {list(REASON_BLOCK)}）："
+                        "判据的取段边界与代码分叉了，改函数名或注释要连 REASON_BLOCK 一起改")
+    ns_handle: dict = {"re": re}
+    try:
+        exec(compile(handle_src, REASON_HANDLE, "exec"), ns_handle)
+    except Exception as e:
+        problems.append(f"{REASON_HANDLE} 加载失败（{type(e).__name__}: {e}）："
+                        "30c 的性质判据没有对照面，这一条等于没跑")
+    # 30c 把手的性质：任何一句原因、任何一档上限，收口后都不许留半截词／丢前缀／孤括号
+    handles = [("真源 " + REASON_HANDLE, ns_handle)]
+    for rel, msrc in mirrors.items():
+        mblock = _extract_reason_block(msrc)
+        if mblock != handle_block:
+            where = ""
+            if not mblock.startswith("（缺标记") and not handle_block.startswith("（缺标记"):
+                for n, (x, y) in enumerate(zip(handle_block.splitlines(),
+                                               mblock.splitlines())):
+                    if x != y:
+                        where = f"（第一段差异：{REASON_HANDLE} 第 {n + 1} 行 ↔ {rel} 第 {n + 1} 行）"
+                        break
+            problems.append(
+                f"{rel} 里内联的那一段与 {REASON_HANDLE} **不是逐字节相同**{where}：\n"
+                f"   → 这一族的纪律是「一句原因只有一种收口」。分叉之后，同一条网络故障在 1688 "
+                f"那条路上念得出完整句子、其它站念半截，而这种差异只有换一种异常文本才会暴露")
+        ns_mirror: dict = {"re": re}
+        # 整段带常量与小函数一起 exec：只取函数体的话，`_is_break` 这类共用助手会当场 NameError
+        try:
+            exec(compile(mblock, rel, "exec"), ns_mirror)
+            handles.append((rel, ns_mirror))
+        except Exception as e:
+            problems.append(f"{rel} 里那份内联把手加载失败（{type(e).__name__}: {e}）："
+                            "它一旦被 import 就带着整条 1688 通道一起崩")
+
+    for text in _reason_property_cases():
+        for limit in (8, 16, 24, 40, 48, 60, 70, 80, 120, 200):
+            outs = []
+            for label, ns in handles:
+                fn = ns.get("short_reason")
+                if not callable(fn):
+                    continue
+                got = fn(text, limit)
+                outs.append(got)
+                # ① 不以半截词收尾：收口留下的那一截必须是原句的**整词前缀**——判据问的是
+                #    「紧跟着下一个字是不是边界」，而不是「最后一个字是不是边界」（把手会把行尾
+                #    那个分隔符 rstrip 掉，那时最后一个字当然是词字符，而词本身完好）。
+                whole = re.sub(r"\s+", " ", str(text)).strip()
+                if got.endswith("…"):
+                    stem = got[:-1]
+                    for op, cl in (("（", "）"), ("(", ")")):
+                        added = max(0, stem.count(cl) - stem.count(op))   # 把手补上的右括号
+                        stem = stem[:len(stem) - added] if added else stem
+                    if not whole.startswith(stem):
+                        problems.append(f"{label} 在 limit={limit} 处改写了原句（收口只会少留，"
+                                        f"不该换字）：{got!r}")
+                    elif 0 < len(stem) < len(whole) and not _gate_cut_is_boundary(whole, len(stem)):
+                        problems.append(f"{label} 在 limit={limit} 处切在词中间："
+                                        f"{got[-24:]!r}｜下一字={whole[len(stem)]!r}")
+                # ② 分过型的句子：`【类别】…｜` 前缀必须整段还在（处方就写在句首）
+                if text.startswith("【") and "｜" in text:
+                    head = text[:text.index("｜") + 1]
+                    if not got.startswith(head):
+                        problems.append(f"{label} 在 limit={limit} 处把前缀 {head!r} 切掉了：{got!r}")
+                # ③ 括号必成对：日志里读到一个孤零零的 `(` 会让人以为是格式而不是内容
+                for op, cl in (("（", "）"), ("(", ")")):
+                    if got.count(op) != got.count(cl):
+                        problems.append(f"{label} 在 limit={limit} 处留下不成对的 {op}：{got!r}")
+            if len(set(outs)) > 1:
+                problems.append(f"两份把手对同一句给出不同收口（limit={limit}）："
+                                f"{[(l, o[:40]) for l, o in zip([h[0] for h in handles], outs)]}")
+
+    if full_scan and judged == 0:
+        problems.append(f"第 30 条一份都没判到（视野里 {len(files)} 份全解析不过）："
+                        "这一条门等于没跑，不许在空集合上报绿")
+    # 视野里额外登记的那几份渲染层，读不到就是少一份判据（少了不会有人注意到，所以要说）
+    if full_scan:
+        for rel in REASON_RENDER_EXTRA:
+            for p, text in files.items():
+                if _rel_label(p) == rel and not text.strip():
+                    problems.append(f"视野里登记的渲染层 {_rel_label(p)} 读不到内容：第 30 条从此判不"
+                                    "到实机报告那一行（上一轮那行半截词就念在这里）")
+        # 豁免表不能只在「命中时」被读：一行的写法被改掉、那条缺陷换了衣服从门里走出去，
+        # 靠这里响一句（否则豁免表会逐年长成一个没人敢删的抽屉）
+        for key, why in sorted(REASON_SLICE_EXEMPT.items()):
+            if key not in used_exempt:
+                problems.append(f"豁免表里这一条已经不在原位：{key[0]} 里找不到整行等于 "
+                                f"{key[1]!r} 的那一行（当时写的理由：{why}）——那一行要么换了"
+                                "写法（得重新解释一次为什么不算切原因），要么已经修成走把手"
+                                "（那这条豁免就该从表里删掉）")
+    return problems
+
+
+# ── 第 31 条：从浏览器标签交出去的那一份正文，必须先证明「这一页就是我要的那一页」 ──
+# 由来（2026-11-16 第九轮实机马可波罗）：借标签跑完 JS 质询壳之后，旧实现只问「那页还是不是壳」，
+# 壳一退掉就把 `_html()` 当成**这一家**的正文交出去。可那枚标签是各家用来的，站方在挑战之后常把
+# 地址落到首页或上一家的商铺——那种页里有公司名、有电话，**只是不是这一家**。字段填到别人头上比
+# 采不到更难被发现：Excel 里每一行都看起来是满的，电话打过去才知道是别家。
+# 随后的同类查全证明这不是马可波罗一处的事，同一个坑在四个站各长了一遍、各防了一半：
+#   · maimaib2b `_fetch_via_tab`：只在「保底重载回哪一页」防了，取回正文那一步没防；
+#   · qihuo11467 `_fetch_via_tab`：只看主机名，同主机下首页与某一家的深链一样算「本站」；
+#   · mic `_fetch_contact_page`：只拒 errordocs/404，被 302 领到别人的 showroom 照样解析；
+#   · gys `_fetch_raw`：`_goto` 只断域名不断路径；
+#   · mic `_fallback_en`：请求的主机名是**猜出来的**子域，落点换了主机就没人认得它是别家。
+# 靠人记是记不住的——第五个站一定会漏，所以这一条上构建前硬门。判据是**数据流**而不是关键字
+# （关键字版会把 `_goto`、能力探针、翻页循环三类合法写法一起误伤，误伤一次的判据下一次就被人
+# 当噪音划掉）：先找出被 `self._html()` 赋过名的变量，再看这个函数的出口有没有把「正文本身」
+# 交出去——`return` 那个变量／裸 `self._html()`，或把它当参数喂给 `_parse*`/`parse_*`/`_extract*`。
+TAB_ID_SOURCE = "b2bcollect_build/cdp_base.py"
+# 三种被认可的「问过身份」的写法：两道门都在基类（`_tab_body_for` 内含 `_tab_page_is`），
+# 以及 `_goto`——它自己导航并回读 location 断言域名，是浏览器原生那条路的身份步。
+TAB_ID_GATES = ("_tab_body_for", "_tab_page_is", "_goto")
+# 身份门真源里必须**只有一个定义**的三个把手（各站再抄一份＝五处五种口径，等于没有门）
+TAB_ID_HANDLES = ("_page_key", "_tab_page_is", "_tab_body_for")
+
+
+def _tab_html_call(node) -> bool:
+    return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+               and c.func.attr == "_html" for c in ast.walk(node))
+
+
+def _tab_body_out(value, tainted) -> bool:
+    """这个 `return` 交出的是**正文本身**吗？裸变量或裸 `self._html()` 才算。
+    包了一层判断（`return bool(self._tab_real_page(self._html()))`）交出去的是真/假，
+    不是某一家的正文——那种能力探针不该被这条判据点名。
+    元组/列表逐个元素看：`return rendered, "browser"` 是这一族最常见的形状（正文 + 来源通道），
+    只看整体形状的判据会把每一站的浏览器腿全部漏掉（本轮自查抓到的第三个盲区）。"""
+    if isinstance(value, (ast.Tuple, ast.List)):
+        return any(_tab_body_out(e, tainted) for e in value.elts)
+    if isinstance(value, ast.Name):
+        return value.id in tainted
+    return (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "_html")
+
+
+def _ast_safe_parse(text):
+    """给 31b 用：坏语法的那一份已经由 31a 单独报过了，这里不能再抛异常把整条门带走。"""
+    try:
+        return ast.parse(text)
+    except SyntaxError:
+        return ast.parse("")
+
+
+def _tab_tainted_names(fn) -> set:
+    """这个函数里有哪些变量**装着浏览器标签正文**（含传播）：
+      ① 直接被 `self._html()` 赋值；
+      ② 被「右边式子里出现过已污染的名字」的那个赋值语句赋值——`body, why = self._tab_body_for(url,
+         body=html)`、`body, why = html, ""`、`x = html[:200]` 都是这一形。
+      不算②的话，把那道门换成 `body = html` 就既去掉了门、又不被清成出口（自查时先发现「判据
+      只认直接从 `_html()` 取值」这一形，等于告诉后来人「想绕过我就多包一层」；再把门摘成
+      `body, why = html, ""` 时出口整条消失、只剩一句过期登记——右边是元组/切片的普通赋值
+      同样是传播，判据不能只认 Call）。
+    迭代到不动点：②可以链式传播（`a = _html()` → `b = f(a)` → `c = g(b)`）。
+    """
+    names = set()
+    for _ in range(4):
+        before = set(names)
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Assign):
+                continue
+            # ① 直接：`html = self._html()`、`html = (self._html() or "")[:N]` 这类混合表达式
+            # ② 间接：右边任何位置出现已污染的名字（Call 的参数、元组元素、切片都算）
+            hit = _tab_html_call(n.value) or any(
+                isinstance(x, ast.Name) and x.id in names for x in ast.walk(n.value))
+            if not hit:
+                continue
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    names |= {e.id for e in t.elts if isinstance(e, ast.Name)}
+        if names == before:
+            break
+    return names
+
+
+def _tab_body_exits(tree) -> list:
+    """列出这个模块里所有「把浏览器标签正文交出去」的函数：`[(名字, 行号, 出口方式, 用过的门)]`。
+
+    这里**不做任何豁免**——豁免是登记表的事（见 `TAB_BODY_EXITS`）。判据只负责把出口清出来，
+    于是新增一条通路的人会撞上一句「不在案」，而不是让判据替他猜「这一处大概不需要门」。
+    前一版在这里直接豁免 `_goto(`，自查时被发现两个盲区：① 深链的身份比域名细，`_goto` 那道
+    域名门**不够**（gys/mic 正是这样漏掉的）；② 只看关键字在不在，把门改成 `if False:` 死代码
+    仍然算有门。所以改成「列全部 + 逐项验声明」。
+    """
+    out = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        if not _tab_html_call(fn):
+            continue
+        body_src = ast.unparse(fn)
+        tainted = _tab_tainted_names(fn)
+        if not tainted and not any(isinstance(n, ast.Return) and _tab_html_call(n)
+                                   for n in ast.walk(fn)):
+            continue
+        how = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Return) and n.value is not None and _tab_body_out(n.value, tainted):
+                how.append("return")
+            if (isinstance(n, ast.Call)
+                    and any(k in (getattr(n.func, "attr", "") or getattr(n.func, "id", ""))
+                            for k in ("_parse", "parse_", "_extract"))
+                    and any(isinstance(x, ast.Name) and x.id in tainted
+                            for a in n.args for x in ast.walk(a))):
+                how.append("parser")
+        if how:
+            gates = [k for k in TAB_ID_GATES if k + "(" in body_src]
+            out.append((fn.name, fn.lineno, "+".join(sorted(set(how))), gates))
+    return out
+
+
+# 在案的出口登记表：每一项写明「这一路的身份门是哪一步」。**多加一项必须同时写下它靠什么认页**，
+# 这就是这一条门的用处——把「这里要不要门」从每次评审现场决定，变成改门脚本时必须写下的在案声明。
+#   _tab_body_for  域名＋路径，再问体积/是不是壳（把正文交出去的标准那道门）；
+#   _tab_page_is   只问地址（正文另有各站判据时用这一档）；
+#   _goto          域名级回读断言——只对**列表/搜索页**够用：那一页的身份就是这次搜索请求的地址，
+#                  落点不符另有基类观测账（`_note_landing_mismatch`），等证据决定是否收紧。
+#                  深链/详情页**不许**登记这一档：同主机下首页与某一家的深链都算「本站」，防不住。
+TAB_BODY_EXITS = {
+    "b2bcollect_build/cdp_base.py": {
+        # 门自己也是「把标签正文交出去」的一处出口：它交出去的那一份靠 `_tab_page_is` 认页。
+        # 把它登记进来而不是豁免掉，是为了让「把 `_tab_page_is` 那一行删掉」这件事在 31a 就响，
+        # 而不是等到某一站撞上串页才发现门已经空转了三轮。
+        "_tab_body_for": "_tab_page_is",
+        "_iter_keyword": "_goto",
+    },
+    "b2bcollect_build/gys_crawler.py": {"_fetch_raw": "_tab_body_for", "_iter_keyword": "_goto"},
+    # 麦麦B2B：它的注释里早就写着「别把别的页当这一页」，但只在保底重载那一步防了；
+    # 现在取正文这一步也过门，所以它是这一族里第一个「声明与实现都在案」的样本。
+    "b2bcollect_build/maimaib2b_crawler.py": {"_fetch_via_tab": "_tab_body_for"},
+    "b2bcollect_build/mic_crawler.py": {"_fetch_contact_page": "_tab_page_is",
+                                        "_fallback_en": "_tab_page_is"},
+    # 顺企网：深链那一路过 `_tab_body_for`；列表页那一路**故意**不过——`search.php` 靠重定向
+    # 拿 SEO 基址，调用方要的就是最终地址（见该函数注释）。两条都在同一个函数里，登记按函数计，
+    # 所以登记的是那道更严的门；列表页那条的豁免理由写在源码里，不靠判据猜。
+    "b2bcollect_build/qihuo11467_crawler.py": {"_fetch_via_tab": "_tab_body_for"},
+}
+# 「这一家」的把手：签名里出现这些参数名，说明这个函数取的是**单家**的页而不是列表页，
+# 域名级门就不够（判据与理由见 _tab_is_per_company）
+TAB_PER_COMPANY_ARGS = frozenset({"rec", "record", "user", "company", "supplier", "deep"})
+
+
+def _text_of(files, rel: str):
+    """按 `_rel_label` 的口径在视野里找一份源码（表里的键是相对路径，视野里的键是 Path）。"""
+    for path, text in files.items():
+        if _rel_label(path) == rel:
+            return text
+    return None
+
+
+# 31c 反向对照：九份夹具都取自真实源码形状，判据必须只对「表与源码对不上」的那些响。
+TAB_ID_CASES = (
+    # (说明, 源码, 在案登记 {函数名: 门}, 期望是否不合格)
+    ("没登记：壳一退掉就把 _html() 当这一家的正文交出去（马可波罗借标签跑壳修前原样）",
+     'class A:\n    def _solve(self, url):\n        if not self._looks_like_challenge_shell'
+     '(self._html()):\n            return self._html()\n        return ""\n', {}, True),
+    ("没登记：把正文交给解析器（顺企网/中国制造网修前原样）",
+     'class A:\n    def _from_tab(self, url, kw):\n        html = self._html()\n'
+     '        self._parse_contact(html, rec)\n        return self.parse_list(html, kw)\n',
+     {}, True),
+    ("登记了元组出口那一形（`return rendered, "
+     "\"browser\"` 也是把正文交出去，只看整体形状的判据会把每一站的浏览器腿全漏掉）",
+     'class A:\n    def _fetch_raw(self, url, deep=False):\n        rendered = self._html()\n'
+     '        return rendered, "browser"\n', {"_fetch_raw": "_tab_body_for"}, True),
+    ("登记的门被删掉了：表说这一步过 _tab_body_for，源码里已经没有了（改代码忘改表不算，"
+     "删了门忘改表更不算）",
+     'class A:\n    def _fetch_via_tab(self, url):\n        body = self._html()\n'
+     '        return body\n', {"_fetch_via_tab": "_tab_body_for"}, True),
+    ("摘门时把正文经元组赋值转手（`body, why = html, \"\"`）：传播只认 Call 的判据会把这条"
+     "出口整条漏掉，表里那一行反过来变成『过期登记』把删门这件事糊过去",
+     'class A:\n    def _fetch_via_tab(self, url, rec):\n        html = self._html()\n'
+     '        body, why = html, ""\n        return body\n', {"_fetch_via_tab": "_tab_body_for"},
+     True),
+    ("摘门时把正文切一刀再交（`part = html[:200]`）：同上一形，转手不等于换了来源",
+     'class A:\n    def _fetch_via_tab(self, url, rec):\n        html = self._html()\n'
+     '        part = html[:200]\n        self._parse_contact(part, rec)\n',
+     {"_fetch_via_tab": "_tab_body_for"}, True),
+    ("深链只登记域名级 _goto：同主机下首页与某一家的深链都算「本站」，这道门防不住串页",
+     'class A:\n    def _fetch_contact_page(self, user, rec):\n        self._goto(url)\n'
+     '        html = self._html()\n        self._parse_contact(html, rec)\n',
+     {"_fetch_contact_page": "_goto"}, True),
+    ("在案且门在位：先过 _tab_body_for 再交正文",
+     'class A:\n    def _fetch_via_tab(self, url):\n        body, why = self._tab_body_for(url)\n'
+     '        return body\n', {"_fetch_via_tab": "_tab_body_for"}, False),
+    ("在案且门在位：深链用 _tab_page_is 只问地址（正文另有各站判据）",
+     'class A:\n    def _fallback_en(self, user, rec):\n        ok, why = self._tab_page_is'
+     '(alt, token=user)\n        html = self._html()\n        self._parse_contact(html, rec)\n',
+     {"_fallback_en": "_tab_page_is"}, False),
+    ("列表页登记 _goto 是合法的：那一页的身份就是这次搜索的地址",
+     'class A:\n    def _iter_keyword(self, kw):\n        self._goto(url, expect_domain="x.com")\n'
+     '        html = self._html()\n        return self.parse_list(html, kw)\n',
+     {"_iter_keyword": "_goto"}, False),
+    ("能力探针不进出口：交出去的是判断不是正文，不该出现在清单里（误伤一次，判据下一次就被人"
+     "当噪音划掉）",
+     'class A:\n    def _tab_page_ok(self, url):\n        return bool(self._tab_real_page'
+     '(self._html() or ""))\n', {}, False),
+)
+
+# 31d 门本身的**行为**夹具：拿真源里那两段重算，地址语义由这里独立列一遍（不读实现的常量，
+# 否则就是拿实现验实现）。`same_host` 那一档是 mic 猜子域那条路专用的，必须正反都在。
+TAB_ID_BEHAVIOUR = (
+    # (当前地址, 要的那一页, token, same_host, 期望, 期望理由片段)
+    ("http://a.example.com/contact_us.html", "http://a.example.com/contact_us.html", "", True,
+     True, ""),
+    ("http://a.example.com/contact_us.html?__jsl_clearance=s%3Dx", "http://a.example.com/"
+     "contact_us.html", "", True, True, ""),           # 站方补的质询令牌不算换页
+    ("http://a.example.com/contact_us.html#tel", "http://a.example.com/contact_us.html", "",
+     True, True, ""),                                    # 锚点不算换页
+    ("http://a.example.com/shop", "http://a.example.com/shop/", "", True, True, ""),
+    ("http://a.example.com/index.html", "http://a.example.com/contact_us.html", "", True,
+     False, "标签落的不是这一页"),                        # 同主机别的路径＝串页
+    ("http://b.example.com/contact_us.html", "http://a.example.com/contact_us.html", "", True,
+     False, "标签不在本站"),                              # 马可波罗：每家一个子域
+    ("", "http://a.example.com/contact_us.html", "", True, False, "标签不在本站"),
+    ("https://www.example.com/shop/ab123-contact-us.html",
+     "https://www.example.com/shop/ab123-contact.html", "ab123", True, True, ""),
+    ("https://www.example.com/shop/zz999-contact.html",
+     "https://www.example.com/shop/ab123-contact.html", "ab123", True, False, "凭据"),
+    ("https://www.example.com/showroom/ab123/", "https://ab123.example.com/", "ab123", False,
+     True, ""),                                          # 猜的子域被领到统一路径：凭据还在
+    ("https://www.example.com/showroom/zz999/", "https://ab123.example.com/", "ab123", False,
+     False, "凭据"),                                     # 换主机≠免检
+    ("https://www.example.com/showroom/ab123/", "https://ab123.example.com/", "", False,
+     False, "标签不在本站"),                              # 没有凭据就不许白放跨主机
+    # 31d 的反向对照：普通串页**不许**被说成「这一跳没加载出来」。那一档的说法是「浏览器根本没
+    # 发出去」，把两种处方（换页 vs 改启动参数）混成一句话，比原来那句更误导。
+    ("https://a.example.com/shop/other.html", "https://a.example.com/shop/mine.html", "", True,
+     False, "标签落的不是这一页"),
+)
+
+# 31e 「这一跳根本没加载出来」那一支的行为夹具：(当前地址, 要的那一页, Chrome 原话,
+# 必须出现, 绝不允许出现)。由来（2026-11-14 实机马可波罗借标签那条腿 0/3）：`Page.navigate`
+# 被拦时**不抛异常**，页面落在 `chrome-error://chromewebdata/`，旧写法只看到「地址不在本站」，
+# 于是「浏览器没把这一跳发出去」在下游一律被说成「站点在拦／这条腿帮不上忙」——方向整个说反，
+# 照着那句话去查的人会去改站点配置，而该改的是共享 Chrome 的启动参数。
+# 每一档的 Chrome 原话都取自本机差分实测（同机两个 Chrome，只差 `--disable-features`）：
+# A 组连 example.com 的明文 http 都被 BLOCKED_BY_CLIENT，B 组全部正常。
+TAB_ID_NAVFAIL = (
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "net::ERR_BLOCKED_BY_CLIENT", "浏览器拦下这一跳", "标签不在本站"),
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "net::ERR_CERT_COMMON_NAME_INVALID", "TLS握手失败", "标签不在本站"),
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "net::ERR_HTTP_RESPONSE_CODE_FAILURE", "站点回了错误状态码", "浏览器拦下这一跳"),
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "net::ERR_TIMED_OUT", "连不上·无应答", "浏览器拦下这一跳"),
+    # 拿不到错误码时**只许陈述事实**：一句「页里没写着错误码」，不许挑一个方向下结论
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "", "页里没写着错误码", "【"),
+    # 认不出的错误码同理：落到【未分型】就照实说未分型，绝不顺手安一个已知方向
+    ("chrome-error://chromewebdata/", "http://a.example.com/contact_us.html",
+     "net::ERR_SOMETHING_NEW", "未分型", "浏览器拦下这一跳"),
+)
+
+# 31f 「导航证据」的结构判据：这一族的每一句话术都必须有**它自己拿得到的证据**撑着。
+# (函数名, 必须出现在源码里的东西, 少了会说什么谎)
+TAB_NAV_RULES = (
+    ("_cdp_navigate", ("Page.navigate", "errorText", "_last_nav_error"),
+     "把 `Page.navigate` 的响应丢掉，「这一跳被浏览器拦下」就再也没有留痕，下游只能猜"),
+    ("_tab_load_failed", ("CHROME_ERROR_URL_MARKS", "tab_load_failed_line"),
+     "错误页的判据与话术各写一份，将来加一档错误页就会有一侧先聋"),
+    ("_solve_js_shell_via_tab", ("_tab_load_failed", "request_error_kind"),
+     "等挑战那段循环不先问「这一跳到底加载出来没有」，就会把没发出去的导航说成挑战跑完了"),
+)
+# 31f-2 结论句的口径：`_solve_js_shell_via_tab` 里所有 `self._log(...)` 都不许出现「跑完了」。
+# 「挑战跑完」这件事**没有任何证据**能证明（能证明的只有：这一页已经不是壳／正文过了身份门／
+# 这一跳根本没加载出来）。写「跑完了」就是把推测当观察念给用户听。
+TAB_NAV_LIE_TOKEN = "跑完了"
+# 名单：哪些函数的**结论句**在这条口径的管辖之内（都是「借标签这条腿」向用户交代结果的地方）。
+# 新增一条同类通路就要把它加进来——加进来的代价是那句话必须改成只陈述观察。
+TAB_NAV_LIE_FNS = ("_solve_js_shell_via_tab", "_deep_shell_retry")
+
+# 31f 的正反夹具：坏形状必须响、现网写法不许响（判据不能被反证就等于还没修）。
+# 第四格是 `strict_names`：只有真源那一遍用严格档（理由见 _tab_nav_evidence_problems 的文档）。
+TAB_NAV_CASES = (
+    ("旧写法：导航响应整个丢掉，errorText 没人接",
+     'class A:\n    def _cdp_navigate(self, url):\n'
+     '        self._send("Page.navigate", {"url": url})\n        return True\n'
+     '    def _tab_load_failed(self):\n        return tab_load_failed_line('
+     'self._current_url(), self._last_nav_error, CHROME_ERROR_URL_MARKS)\n'
+     '    def _solve_js_shell_via_tab(self, url):\n        if self._tab_load_failed():\n'
+     '            return False\n        return bool(request_error_kind(""))\n', True),
+    ("错误页判据被就地重抄一份字面量（把手先聋那一档）",
+     'class A:\n    def _cdp_navigate(self, url):\n'
+     '        r = self._send("Page.navigate", {"url": url})\n'
+     '        self._last_nav_error = r.get("errorText")\n        return True\n'
+     '    def _tab_load_failed(self):\n        if "chrome-error://" not in self._current_url():\n'
+     '            return ""\n        return ""\n'
+     '    def _solve_js_shell_via_tab(self, url):\n        if self._tab_load_failed():\n'
+     '            return False\n        return bool(request_error_kind(""))\n', True),
+    ("等挑战的循环不问「加载出来没有」，直接宣布这条腿的结果",
+     'class A:\n    def _cdp_navigate(self, url):\n'
+     '        r = self._send("Page.navigate", {"url": url})\n'
+     '        self._last_nav_error = r.get("errorText")\n        return True\n'
+     '    def _tab_load_failed(self):\n        return tab_load_failed_line('
+     'self._current_url(), self._last_nav_error, CHROME_ERROR_URL_MARKS)\n'
+     '    def _solve_js_shell_via_tab(self, url):\n        return self._harvest() > 0\n', True),
+    ("结论句把推测当观察：`_log` 里写下「挑战跑完了」",
+     'class A:\n    def _cdp_navigate(self, url):\n'
+     '        r = self._send("Page.navigate", {"url": url})\n'
+     '        self._last_nav_error = r.get("errorText")\n        return True\n'
+     '    def _tab_load_failed(self):\n        return tab_load_failed_line('
+     'self._current_url(), self._last_nav_error, CHROME_ERROR_URL_MARKS)\n'
+     '    def _solve_js_shell_via_tab(self, url):\n'
+     '        if self._tab_load_failed():\n            return False\n'
+     '        self._log("   ⚠ 挑战跑完了，这条腿还是帮不上")\n'
+     '        return bool(request_error_kind(""))\n', True),
+    ("合格形状：三处证据都在、结论句只陈述观察",
+     'class A:\n    def _cdp_navigate(self, url):\n'
+     '        r = self._send("Page.navigate", {"url": url})\n'
+     '        self._last_nav_error = r.get("errorText")\n        return True\n'
+     '    def _tab_load_failed(self):\n        return tab_load_failed_line('
+     'self._current_url(), self._last_nav_error, CHROME_ERROR_URL_MARKS)\n'
+     '    def _solve_js_shell_via_tab(self, url):\n'
+     '        if self._tab_load_failed():\n            return False\n'
+     '        self._log("   ⚠ 标签里那页已经不是质询壳了，这条腿还是帮不上")\n'
+     '        return bool(request_error_kind(""))\n', False),
+)
+
+
+# ── 31g 「这一跳被浏览器自己拦掉」的**环境侧**证据 ────────────────────────────────
+# 31e/31f 管的是「这句话有没有说谎」，管不到「这句谎还有没有必要说」：真正让马可波罗那条借
+# 标签的腿三次全废的是共享 Chrome 少了 `--disable-features=HttpsUpgrades,…`。归因写得再准，
+# 启动参数丢了，用户看到的仍然是「这个站采不到」。所以这一节把**环境**也钉住：
+#   31g-1 feature 清单必须三档齐全——只关 `HttpsUpgrades` 时 `HttpsFirstModeV2`／
+#         `HttpsFirstBalancedMode` 那两条路径仍会升级，症状与「完全没关」一模一样，却更难查
+#         （那枚开关看起来是带上了的）；
+#   31g-2 启动参数必须由**那份常量**拼出来，不许就地重抄字面量：重抄的那份将来加一档 feature
+#         只补到一侧，而两侧分叉恰好就是 31g-1 要防的那件事；
+#   31g-3 那份常量必须真的进启动参数列表（赋给一个没人读的变量＝这一条已经作废）；
+#   31g-4 复用「先前就开着的、没带开关的」旧实例时必须提示一次：不提示，用户看到的就是
+#         「站点像是不给过」，而该做的只是重开一次本工具；
+#   31g-5 内联副本（1688／riskbird 各自是独立包，import 不到真源）与真源**逐字节相同**，
+#         并且各自真的用在自己的启动列表里；
+#   31g-6 被明确否决的那枚 `--ignore-certificate-errors` 不许以**参数**的形态回到交付链：
+#         它把「不强制升级」做成「不校验证书」，等于拿 1688／riskbird 的登录态换一次取页。
+#         只看 AST 里那些会被当参数用的字符串，所以注释里讲「绝不采用」不受这一条管辖——
+#         否则判据会逼人删掉那条最该留下的说明；
+#   31g-7 覆盖面：凡在启动参数列表／Selenium `add_argument` 里配过 Chrome 开关的文件，要么带上
+#         这份开关，要么在豁免表里写下「这个浏览器为什么不必带」；表里每一项都必须仍对应一处
+#         真实启动点（过期豁免顶着名次，下一条同类漏网就会被当成合法的）。
+TAB_ENV_SOURCE = "b2bcollect_build/shared_chrome.py"
+TAB_ENV_MIRRORS = ("ali1688_build/ali1688_crawler.py", "riskbird_build/dual_session.py")
+TAB_ENV_FEATURE_CONST = "NO_HTTPS_UPGRADE_FEATURES"
+TAB_ENV_FLAG_CONST = "CHROME_NO_UPGRADE_FLAGS"
+TAB_ENV_FEATURES = ("HttpsUpgrades", "HttpsFirstModeV2", "HttpsFirstBalancedMode")
+TAB_ENV_REUSE_FN = "ensure_shared_chrome"
+TAB_ENV_PROBE_FN = "missing_no_upgrade_flag"
+TAB_ENV_FORBIDDEN = "--ignore-certificate-errors"
+TAB_ENV_BROWSER_MARKS = ("--remote-debugging-port", "--user-data-dir")
+# 进程管理类的 argv 首元素：这些列表里出现浏览器开关是在**认领旧实例**或**关旧实例**，
+# 不是在配置启动参数（见 _tab_env_launch_lists 的文档）。
+_TAB_ENV_PROC_TOOLS = ("pkill", "kill", "ps", "pgrep", "taskkill", "powershell", "wmic")
+# 豁免表：这些启动点确实不带这份开关。理由写在这里，而不是写在沉默里。
+TAB_ENV_EXEMPT = {
+    "riskbird_build/qizhidao_crawler.py":
+        "Selenium 临时 profile 的兜底会话，只逛企知道（站方强制 https），不按采集数据里的任意"
+        "链接开页：带上它的收益是 0，代价是第四份内联副本",
+    "riskbird_build/riskbird_crawler_v2.py":
+        "同上：只逛 riskbird 本站，https",
+    "riskbird_build/aiqicha_crawler_v2.py":
+        "同上：只逛爱企查，https",
+    "riskbird_build/launch_chrome_manual.py":
+        "一次性手工登录助手，不在采集链路里（要登的平台也是 https）",
+}
+
+
+def _tab_env_assign(text: str, name: str):
+    """模块级 `name = …` 那一行的**原文**（逐字节对拍用）；没有或解析不过则 None。"""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    for st in tree.body:
+        if isinstance(st, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in st.targets):
+            lines = text.splitlines()
+            return "\n".join(lines[st.lineno - 1:st.end_lineno])
+    return None
+
+
+def _tab_env_assign_node(tree, name: str):
+    for st in getattr(tree, "body", []):
+        if isinstance(st, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in st.targets):
+            return st
+    return None
+
+
+def _tab_env_arg_strings(tree) -> list:
+    """会被**当成参数用**的字符串常量：列表/元组成员、调用实参（含 f-string 的固定前缀）。"""
+    out = []
+    for sub in ast.walk(tree):
+        if isinstance(sub, (ast.List, ast.Tuple)):
+            cand = [e.value if isinstance(e, ast.Starred) else e for e in sub.elts]
+        elif isinstance(sub, ast.Call):
+            cand = list(sub.args) + [k.value for k in sub.keywords]
+        else:
+            continue
+        for c in cand:
+            if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                out.append(c.value)
+            elif isinstance(c, ast.JoinedStr):
+                out.append("".join(v.value for v in c.values
+                                   if isinstance(v, ast.Constant)
+                                   and isinstance(v.value, str)))
+    return out
+
+
+def _tab_env_launch_lists(tree) -> list:
+    """这个文件里所有「给 Chrome 配启动参数」的地方。
+
+    两种形状都算：命令行列表/元组（`cmd = [chrome, "--user-data-dir=…", …]`）与 Selenium 的
+    `opts.add_argument("--user-data-dir=…")`。只认第一种的话，Selenium 那条路径对整个覆盖面
+    是隐形的——「同一枚开关只在一条路径上生效」这句正是这一族事故的原话，不能让它靠运气。
+
+    刻意**排掉**进程管理类命令（`pkill -f user-data-dir=…`、`ps`、`taskkill`）：那些列表里
+    出现 `user-data-dir` 只是在**认领已经在跑的实例**，不是配置启动参数。不排掉的话，这一条
+    会把「按目录名匹配旧进程」那些正当写法一路报成缺陷，而报多了就没人再理会这一条。
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):        # Selenium 那一路
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr == "add_argument":
+                vals = []
+                for a in node.args:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        vals.append(a.value)
+                    elif isinstance(a, ast.JoinedStr):
+                        vals.append("".join(v.value for v in a.values
+                                            if isinstance(v, ast.Constant)
+                                            and isinstance(v.value, str)))
+                if any(str(v).startswith(TAB_ENV_BROWSER_MARKS) for v in vals):
+                    hits.append(node)
+            continue
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        first = node.elts[0] if node.elts else None
+        head = (first.value if isinstance(first, ast.Constant) else "") if first is not None else ""
+        if isinstance(head, str) and (head in _TAB_ENV_PROC_TOOLS
+                                      or (head.startswith("/") and head.endswith(("/ps", "/kill",
+                                                                                   "/pkill")))):
+            continue
+        for elt in node.elts:
+            item = elt.value if isinstance(elt, ast.Starred) else elt
+            if isinstance(item, ast.JoinedStr):
+                vals = [v.value for v in item.values
+                        if isinstance(v, ast.Constant) and isinstance(v.value, str)]
+            elif isinstance(item, ast.Constant) and isinstance(item.value, str):
+                vals = [item.value]
+            else:
+                vals = []
+            if any(str(v).startswith(TAB_ENV_BROWSER_MARKS) for v in vals):
+                hits.append(node)
+                break
+    return hits
+
+
+def _tab_env_node_has_flag(node) -> bool:
+    """这一处启动参数里带了那份开关吗（`*NAME,` 与 `NAME,` 两种成员写法都认）。"""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return False
+    for elt in node.elts:
+        tgt = elt.value if isinstance(elt, ast.Starred) else elt
+        if isinstance(tgt, ast.Name) and tgt.id == TAB_ENV_FLAG_CONST:
+            return True
+    return False
+
+
+def _tab_calls_name(node, name: str) -> bool:
+    return any(isinstance(x, ast.Call) and isinstance(x.func, ast.Name)
+               and x.func.id == name for x in ast.walk(node))
+
+
+def _tab_env_gate_problems(files: dict) -> list:
+    """31g 的整轮：真源四步 + 副本逐字节 + 被否决的开关 + 覆盖面与过期豁免。"""
+    problems = []
+    src = _text_of(files, TAB_ENV_SOURCE)
+    if src is None:
+        return [f"{TAB_ENV_SOURCE} 不在视野里：第 31 条这一节没有对照面，"
+                "「环境开关带上了」这句话等于没跑"]
+    src_tree = _ast_safe_parse(src)
+    problems += _tab_chrome_env_problems(TAB_ENV_SOURCE, src, src_tree)
+
+    # 31g-5 内联副本：两行赋值与真源逐字节相同，并且各自真的进自己的启动列表
+    for rel in TAB_ENV_MIRRORS:
+        text = _text_of(files, rel)
+        if text is None:
+            problems.append(f"{rel} 不在视野里：登记着的内联副本读不到，31g-5 这一条等于跳过")
+            continue
+        tree = _ast_safe_parse(text)
+        for name in (TAB_ENV_FEATURE_CONST, TAB_ENV_FLAG_CONST):
+            a, b = _tab_env_assign(src, name), _tab_env_assign(text, name)
+            if a is None or b is None:
+                continue                     # 缺哪一行由 _tab_chrome_env_problems 报，别报两遍
+            if a != b:
+                problems.append(
+                    f"{rel}::{name} 与真源不再逐字节相同：{b[:90]!r} ≠ {a[:90]!r}\n"
+                    "   → 这一族的事故本来就是「同一个环境开关只在一条路径上生效」。副本可以因为"
+                    "打包而存在，但内容必须与真源同一份字节；只比返回值比不出「一侧少一档 feature」")
+        problems += _tab_chrome_env_problems(rel, text, tree, mirrors=True)
+
+    # 31g-6 被明确否决的那枚开关（只看会被当参数用的字符串；注释里讲来历不算）
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        tree = _ast_safe_parse(text)
+        if tree is None:
+            continue
+        for val in _tab_env_arg_strings(tree):
+            if TAB_ENV_FORBIDDEN in val:
+                problems.append(
+                    f"{_rel_label(path)} 把 {TAB_ENV_FORBIDDEN} 当参数交出去了：这一枚把「不强制"
+                    "升级 https」做成「不校验任何证书」，一台带着 1688／riskbird 登录态的浏览器"
+                    "从此对所有站点失去中间人防护——是拿账号安全换一次取页，本轮已明确否决")
+
+    # 31g-7 覆盖面：配过 Chrome 启动参数的地方要么带开关，要么在豁免表里写下理由
+    seen = set()
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        rel = _rel_label(path)
+        tree = _ast_safe_parse(text)
+        if tree is None:
+            continue
+        sites = _tab_env_launch_lists(tree)
+        if not sites:
+            continue
+        seen.add(rel)
+        if any(_tab_env_node_has_flag(n) for n in sites):
+            continue
+        if rel in TAB_ENV_EXEMPT:
+            continue
+        problems.append(
+            f"{rel} 拉起/配置了 Chrome（{TAB_ENV_BROWSER_MARKS}）却没带 "
+            f"*{TAB_ENV_FLAG_CONST}，也不在豁免表里：这条路径上的明文 http 会被浏览器自己拦掉，"
+            "而日志会把它说成「站点不给过」。要么带上，要么在 TAB_ENV_EXEMPT 写清这个浏览器"
+            "为什么不必带——写在表里的代价是必须写下一个理由，这正是这一条门的全部用处")
+    for rel in TAB_ENV_EXEMPT:
+        if rel not in seen and _text_of(files, rel) is not None:
+            problems.append(f"豁免表里的 {rel} 现在已经找不到 Chrome 启动参数列表：这一行作废，"
+                            "请删掉——留着它，下一条同类漏网会顶着它的名次被当成合法的")
+    return problems
+
+
+def _tab_is_log(call) -> bool:
+    """这个调用是不是「往用户眼睛里写一句话」：`log(...)` 或 `self._log(...)`。"""
+    f = call.func
+    return ((isinstance(f, ast.Name) and f.id == "log")
+            or (isinstance(f, ast.Attribute) and f.attr in ("log", "_log")))
+
+
+def _tab_chrome_env_problems(rel: str, text: str, tree, mirrors=False) -> list:
+    """31g：一枚环境开关的四步结构证据（清单齐／由常量拼／真进列表／复用旧实例会说话）。"""
+    problems = []
+    feat = _tab_env_assign_node(tree, TAB_ENV_FEATURE_CONST)
+    flag = _tab_env_assign_node(tree, TAB_ENV_FLAG_CONST)
+    if feat is None:
+        problems.append(f"{rel} 没有模块级 {TAB_ENV_FEATURE_CONST}：这一族的启动参数再也没有"
+                        "单一真源，31g-2 的「由常量拼出来」无从谈起")
+        return problems
+    if flag is None:
+        problems.append(f"{rel} 没有模块级 {TAB_ENV_FLAG_CONST}：清单有了，却没人把它拼成启动"
+                        "参数（下一步必然长成就地重抄字面量）")
+        return problems
+    # 31g-1 三档齐全：按解析出来的字符串自己重算，不读实现里的任何判据
+    got = ({p.strip() for p in feat.value.value.split(",") if p.strip()}
+           if isinstance(feat.value, ast.Constant) and isinstance(feat.value.value, str)
+           else set())
+    if not got:
+        problems.append(f"{rel}::{TAB_ENV_FEATURE_CONST} 不再是字面字符串：31g-1 无法确认三档"
+                        " feature 都在（算出来的值在各份内联副本之间更没法对拍）")
+    elif missing := [f for f in TAB_ENV_FEATURES if f not in got]:
+        problems.append(f"{rel}::{TAB_ENV_FEATURE_CONST} 少了 {missing}：Chrome 有多条把明文"
+                        " http 升成 https 的路径，只关一档时症状与「完全没关」一模一样，"
+                        "而那枚开关看起来是带上了的——比整枚缺失更难查")
+    # 31g-2 由那份常量拼出来
+    if TAB_ENV_FEATURE_CONST not in _mirror_load_names(flag):
+        problems.append(f"{rel}::{TAB_ENV_FLAG_CONST} 没读 {TAB_ENV_FEATURE_CONST}：清单被重抄"
+                        "了一份，将来加一档 feature 只会补到一侧（同一枚开关在两条路径上"
+                        "行为不同）")
+    # 31g-3 真进启动参数列表：**每一处**给 Chrome 配启动参数的地方都要带上
+    sites = _tab_env_launch_lists(tree)
+    if not sites:
+        problems.append(f"{rel} 已经找不到任何 Chrome 启动参数列表：31g-3 没有对照面——常量还在，"
+                        "拉起浏览器的那一处被改名／搬走／删掉了（那条路径再也不会带这份开关）")
+    else:
+        miss = sorted(n.lineno for n in sites if isinstance(n, (ast.List, ast.Tuple))
+                      and not _tab_env_node_has_flag(n))
+        if miss:
+            problems.append(f"{rel} 第 {miss} 行的启动参数列表里没有 *{TAB_ENV_FLAG_CONST}："
+                            "常量在、没人用它，浏览器仍按默认策略把明文 http 升级后拦掉——"
+                            "日志里那句「浏览器拦下这一跳」会变回真的，但那是我们自己的环境在拦，"
+                            "不是站点（一处列表带、另一处不带＝同一个工具两种环境，正是这一族事故）")
+    if mirrors:
+        return problems        # 副本没有「复用旧实例」这一支，问它等于问一段不存在的代码
+    # 31g-4 复用旧实例时那句提示要接线，而且要真的落在提示分支里
+    reuse = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == TAB_ENV_REUSE_FN), None)
+    if reuse is None:
+        problems.append(f"{rel} 没有 {TAB_ENV_REUSE_FN}：「先前就开着的 Chrome 没带这个开关」"
+                        "这一种最常见的现场再也没有人提醒")
+    elif not _tab_calls_name(reuse, TAB_ENV_PROBE_FN):
+        problems.append(f"{rel}::{TAB_ENV_REUSE_FN} 没问 {TAB_ENV_PROBE_FN}()：复用一个没带开关"
+                        "的旧实例时，用户看到的仍是「这个站采不到」，而该做的只是重开一次本工具")
+    else:
+        spoken = any(isinstance(n, ast.If)
+                     and _tab_calls_name(n.test, TAB_ENV_PROBE_FN)
+                     and any(isinstance(x, ast.Call) and _tab_is_log(x)
+                             for st in list(n.body) + list(n.orelse) for x in ast.walk(st))
+                     for n in ast.walk(reuse))
+        if not spoken:
+            problems.append(f"{rel}::{TAB_ENV_REUSE_FN} 问到了却没说：那句话要落在提示分支里"
+                            "（`if …: log(…)`）——只调用一次是给自己记账，不给用户交代")
+    return problems
+
+
+# 31g-8 正反夹具：坏形状必须响、现网写法不许响（这一节审判的是**环境**，判据自己也得被反证）。
+# `_TAB_ENV_GOOD` 就是现网 shared_chrome 的形状缩到最小：四步证据一步不缺。
+_TAB_ENV_GOOD = (
+    'import subprocess\n'
+    'NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"\n'
+    'CHROME_NO_UPGRADE_FLAGS = (f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)\n'
+    '_flag_warned = []\n'
+    'def missing_no_upgrade_flag():\n    return False\n'
+    'class A:\n'
+    '    def _launch_shared_chrome(self, log, port, profile):\n'
+    '        cmd = [self.chrome, f"--remote-debugging-port={port}",\n'
+    '               f"--user-data-dir={profile}", *CHROME_NO_UPGRADE_FLAGS]\n'
+    '        subprocess.Popen(cmd)\n'
+    '    def ensure_shared_chrome(self, log):\n'
+    '        if self.is_alive():\n'
+    '            if missing_no_upgrade_flag() and not _flag_warned:\n'
+    '                _flag_warned.append(1)\n'
+    '                log("⚠ 共享浏览器是先前就开着的，没带这个开关")\n'
+    '            return True\n'
+    '        return self._launch_shared_chrome(log, 9255, self.profile)\n')
+
+
+def _tab_env_kill(s: str, old: str, new: str) -> str:
+    return s.replace(old, new, 1)
+
+
+TAB_ENV_CASES = (
+    # (说明, 源码, 期望出现的缺陷关键词；""＝合格形状，一条都不许响)
+    ("合格形状：清单齐、由常量拼、真进列表、复用旧实例会说话", _TAB_ENV_GOOD, ""),
+    ("三档 feature 只剩一档（另外两条升级路径还在）",
+     _tab_env_kill(_TAB_ENV_GOOD, '"HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"',
+                   '"HttpsUpgrades"'), "少了 ['HttpsFirstModeV2', 'HttpsFirstBalancedMode']"),
+    ("启动参数就地重抄字面量（将来加一档只补到一侧）",
+     _tab_env_kill(_TAB_ENV_GOOD, 'CHROME_NO_UPGRADE_FLAGS = '
+                   '(f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)',
+                   'CHROME_NO_UPGRADE_FLAGS = ("--disable-features=HttpsUpgrades,HttpsFirst'
+                   'ModeV2,HttpsFirstBalancedMode",)'), "没读 NO_HTTPS_UPGRADE_FEATURES"),
+    ("常量在、启动列表里没有它（这一条已经作废）",
+     _tab_env_kill(_TAB_ENV_GOOD, ' *CHROME_NO_UPGRADE_FLAGS]', ']'),
+     "启动参数列表里没有"),
+    ("复用旧实例时根本没问",
+     _tab_env_kill(_TAB_ENV_GOOD, 'if missing_no_upgrade_flag() and not _flag_warned:',
+                   'if not _flag_warned:'), "没问 missing_no_upgrade_flag()"),
+    ("问到了却没说（只给自己记账，不给用户交代）",
+     _tab_env_kill(_TAB_ENV_GOOD, '                _flag_warned.append(1)\n'
+                   '                log("⚠ 共享浏览器是先前就开着的，没带这个开关")\n',
+                   '                _flag_warned.append(1)\n'), "问到了却没说"),
+)
+
+
+def _mirror_load_names(node) -> set:
+    """节点里以**读**的方式出现的名字（含嵌套表达式、f-string、推导式里的）。"""
+    return {n.id for n in ast.walk(node)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+
+def _mirror_local_names(node) -> set:
+    """节点里**自己绑定**的名字：形参、赋值目标、except as、函数内 import、推导式目标、
+    海象、global/nonlocal。自由名字必须把它们减掉，否则每个局部变量都会被当成「模块级依赖」，
+    闭包就把整份源码拖进镜像了（那样还不如直接 import）。"""
+    bound = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.arg):
+            bound.add(n.arg)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            bound.add(n.id)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            bound |= {(a.asname or a.name.split(".")[0]) for a in n.names}
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound |= set(n.names)
+    return bound
+
+
+def _mirror_self_attrs(node) -> set:
+    """这个函数读过的 `self.X`（只算读：写不改变镜像要不要补一份默认值）。"""
+    return {n.attr for n in ast.walk(node)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+            and n.value.id == "self" and isinstance(n.ctx, ast.Load)}
+
+
+# 镜像作用域里**只准**出现标准库和零依赖把手：身份门之所以能在任何一台构建机上跑，靠的就是
+# 它不碰 requests／PyQt6／websocket 那一整套。真源哪天把这些拖进 `_tab_page_is` 的依赖闭包，
+# 这里必须当场响，而不是让构建前检查变成一条 ImportError。
+MIRROR_SAFE_IMPORTS = frozenset({
+    "re", "json", "time", "math", "os", "sys", "random", "string", "base64", "hashlib",
+    "hmac", "uuid", "socket", "struct", "threading", "collections", "datetime", "functools",
+    "itertools", "tempfile", "traceback", "shutil", "subprocess", "pathlib", "urllib",
+    "gzip", "zlib", "binascii", "codecs", "copy", "enum", "typing", "warnings", "bisect",
+})
+# 零依赖把手（第 30 条的真源）：镜像按**真源码**跑一遍，不在这里抄一份断句口径。
+# 名字从 REASON_HANDLE 推出来，不另写一遍——写死一次，将来挪文件就是镜像悄悄少一份依赖。
+MIRROR_HANDLE_MODULE = PurePosixPath(REASON_HANDLE).stem
+# 身份门读的那格「本轮导航为什么没成」在真源里的名字（31e 按这个名字把 Chrome 原话注入镜像；
+# 真源要是改了名，31e 的每一档都会退回「标签不在本站」而当场响）
+TAB_ID_NAV_ATTR = "_last_nav_error"
+# 31e 的镜像里由夹具自己充当的成员：地址那一格。真源用 `_current_url()` 取地址，镜像不能
+# 带着它去读 CDP，所以这一档在 `__init__` 里给死；其余 `self.X` 一律要求真源里能静态取到。
+MIRROR_SYNTHED_MEMBERS = frozenset({"_cur", "_current_url"})
+
+
+def _tab_identity_gate_class(src: str, reason_src: str = ""):
+    """把真源里的身份门（`_page_key` + `_tab_page_is`）连同它**在模块级需要的每一样东西**
+    抠出来，装成一个可独立调用的类。
+
+    为什么抠而不是 import：`cdp_base` 顶部要拉 Qt 与 requests，构建前机器上未必装齐，而这一条
+    判据要**在任何一台跑构建的机器上都能跑**才叫门。为什么必须抠**真源**而不是在这里重写一遍
+    判据：重写的那份永远绿，改坏实现的人不会在这里撞到东西。
+
+    为什么要按**依赖闭包**抠，而不是写死两个函数名（2026-11-16 本轮修归因时撞到的 NameError）：
+    原先只抠 `_page_key`/`_tab_page_is` 两段，实现里新增一个模块级依赖（`tab_load_failed_line`）
+    就让镜像在 exec 出来的第 55 行当场撞死——那既不是门坏了、也不是实现坏了，是**判据跟实现分家**。
+    分家有两种坏法：撞死在构建前（本轮这种，还算响得早），或者更坏的那一种——镜像少一份依赖，
+    行为与真源不同却刚好通过期望表，从此「门改了口径、判据没跟上」再没人知晓。
+    """
+    tree = _ast_safe_parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    if not set(TAB_ID_HANDLES[:2]) <= set(fns):
+        return None, f"{TAB_ID_SOURCE} 里找不到 {TAB_ID_HANDLES[:2]}（门被改名或搬走，判据与代码分叉了）"
+    cls = next((c for c in ast.walk(tree) if isinstance(c, ast.ClassDef)
+                and any(isinstance(m, ast.FunctionDef) and m.name == "_tab_page_is"
+                        for m in c.body)), None)
+    if cls is None:
+        return None, "`_tab_page_is` 已经不在任何类里：身份门被搬出基类，31d 的镜像不知道按什么调它"
+    methods = {m.name: m for m in cls.body if isinstance(m, ast.FunctionDef)}
+    class_attrs = {}
+    for st in cls.body:
+        if isinstance(st, ast.Assign):
+            for t in st.targets:
+                if isinstance(t, ast.Name):
+                    class_attrs.setdefault(t.id, st)
+
+    # ① 类里这一层：从两个把手出发，把读到的 `self.X` 逐个问出处
+    picked, seen, need, stranded = [], set(), list(TAB_ID_HANDLES[:2]), []
+    while need:
+        name = need.pop(0)
+        if name in seen or name in MIRROR_SYNTHED_MEMBERS:
+            continue
+        seen.add(name)
+        fn = methods.get(name)
+        if fn is None:
+            stranded.append(name)
+            continue
+        picked.append(fn)
+        for attr in _mirror_self_attrs(fn):
+            if attr in MIRROR_SYNTHED_MEMBERS:
+                continue
+            if attr in methods:
+                need.append(attr)
+            elif attr not in class_attrs:
+                stranded.append(attr)
+    if stranded:
+        return None, (f"身份门镜像补不出 {sorted(set(stranded))}：`self.X` 既不是 {TAB_ID_SOURCE} "
+                      "类里的方法、也没有**类体里的默认值**。默认值只准写在类上（账目重置有整整"
+                      "三处：切站/续采/新轮各一份，只写进 `__init__` 就会漏掉一处，界面于是读到"
+                      "上一轮留下的旧原因）；要是一段解释只需要地址和错误码，就照 "
+                      "`tab_load_failed_line` 做成模块级函数")
+
+    # ② 模块级这一层：按依赖闭包把真源里用到的每一样东西都带上（谁先谁后按源码行号，
+    #    常量在函数之前定义这件事由源码本身保证，不在这里重排）
+    defs, imports = {}, []
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.ClassDef)):
+            defs.setdefault(st.name, st)
+        elif isinstance(st, ast.Assign):
+            for t in st.targets:
+                if isinstance(t, ast.Name):
+                    defs.setdefault(t.id, st)
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+            defs.setdefault(st.target.id, st)
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            imports.append(st)
+
+    attr_nodes = {}
+    for fn in picked:
+        for attr in _mirror_self_attrs(fn):
+            if attr in class_attrs and attr not in MIRROR_SYNTHED_MEMBERS:
+                attr_nodes[attr] = class_attrs[attr]
+
+    def _free(node):
+        return _mirror_load_names(node) - _mirror_local_names(node) - {"self"}
+
+    mod_nodes, unbound, done_names = [], set(), set()
+    queue = sorted(set(x for node in list(picked) + list(attr_nodes.values())
+                       for x in _free(node)))
+    while queue:
+        name = queue.pop(0)
+        if name in done_names:
+            continue
+        done_names.add(name)
+        node = defs.get(name)
+        if node is None:
+            unbound.add(name)
+            continue
+        mod_nodes.append(node)
+        queue += sorted(x for x in _free(node) if x not in done_names)
+
+    ns = {"urlparse": urlparse}
+    for st in imports:
+        root = ({a.name.split(".")[0] for a in st.names} if isinstance(st, ast.Import)
+                else {(st.module or "").split(".")[0]})
+        if not root <= MIRROR_SAFE_IMPORTS or MIRROR_HANDLE_MODULE in root:
+            continue          # 第三方/包内专属模块**不许**进镜像：那正是这一条要能独立跑的前提
+        try:
+            exec(compile(ast.Module(body=[st], type_ignores=[]),
+                         f"<{TAB_ID_SOURCE} import>", "exec"), ns)
+        except Exception as e:
+            return None, f"镜像里 import {ast.unparse(st)} 失败（{e}）：标准库白名单与真源不同步了"
+    if MIRROR_HANDLE_MODULE in {r for st in imports
+                                for r in ({(st.module or "").split(".")[0]}
+                                          if isinstance(st, ast.ImportFrom) else set())}:
+        if not reason_src:
+            return None, (f"身份门用到了 {REASON_HANDLE} 的把手，但镜像没拿到它的源码："
+                          "断句口径会在 exec 里撞成 unbound name，宁可红也不许拿一份手抄的代替")
+        try:
+            exec(compile(reason_src, f"<{REASON_HANDLE}>", "exec"), ns)
+        except Exception as e:
+            return None, f"把手 {REASON_HANDLE} 的源码在镜像里跑不起来（{e}）"
+
+    still = sorted(x for x in unbound
+                   if x not in ns and x not in MIRROR_SYNTHED_MEMBERS
+                   and not hasattr(builtins, x))
+    if still:
+        return None, (f"身份门的依赖里有镜像取不到的名字 {still}：要么它新拉了一个第三方库"
+                      "（这一条判据必须在不装 requests/Qt 的机器上也能跑，别把重依赖带进 "
+                      "`_tab_page_is` 的闭包），要么它改从别处取值却没留默认值——两种都要在 "
+                      f"{TAB_ID_SOURCE} 里收口，不许在判据这边补一份假的")
+
+    body = ["class _Gate:", "    def __init__(self, cur, **extra):", "        self._cur = cur",
+            "        self.__dict__.update(extra)",
+            "    def _current_url(self):", "        return self._cur"]
+    for node in attr_nodes.values():          # 类里的默认值：从真源带出，不在这儿手写
+        body.append(textwrap.indent(ast.unparse(node), "    "))
+    for fn in sorted(picked, key=lambda n: (n.lineno, n.col_offset)):
+        body.append(textwrap.indent(ast.unparse(fn), "    "))
+    program = [ast.unparse(node) for node in
+               sorted(mod_nodes, key=lambda n: (n.lineno, n.col_offset))] + ["\n".join(body)]
+    exec("\n".join(program), ns)               # noqa: S102 —— 跑的是本仓库自己的源码
+    return ns["_Gate"], ""
+
+
+def _tab_log_texts(fn) -> list:
+    """这个函数里每一句 `self._log(...)` 的**文本片段**（f-string 的常量段也算）。
+    只取 `_log` 的参数：注释与 docstring 里允许出现「挑战跑完了」这种叙述（那是在讲来历），
+    但念给用户听的那一句不允许——它必须只陈述拿得到的证据。"""
+    out = []
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "_log"):
+            continue
+        for arg in list(node.args) + [k.value for k in node.keywords]:
+            out += [c.value for c in ast.walk(arg)
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+    return out
+
+
+def _tab_nav_evidence_problems(rel: str, tree, strict_names=False) -> list:
+    """31f/31f-2：导航证据的三处结构判据 + 结论句口径。只做「东西在不在」，不猜行为。
+
+    `strict_names=True` 只用在**基类那份真源**上：那张名单就是照着它写的，缺一枚说明登记作废。
+    夹具与其它模块走 False——「这一档函数在这个文件里不存在」不该被算成不合格，否则每一枚
+    夹具都得把整份基类抄一遍，而抄出来的那份永远绿。
+    """
+    problems = []
+    by_name = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef):
+            by_name.setdefault(n.name, n)
+    for fname, marks, why in TAB_NAV_RULES:
+        fn = by_name.get(fname)
+        if fn is None:
+            problems.append(f"{rel}::{fname} 不在了：{why}——这句话现在没人替它兜着了")
+            continue
+        src = ast.unparse(fn)
+        for m in marks:
+            if m not in src:
+                problems.append(f"{rel}::{fname} 源码里没有 {m}：{why}")
+    for fname in TAB_NAV_LIE_FNS:
+        fn = by_name.get(fname)
+        if fn is None:
+            if strict_names:
+                problems.append(f"{rel}::{fname} 不在了：31f-2 的结论句名单作废，"
+                                "请连这张表一起改（留着它，将来同名的新句子会白拿这一档信任）")
+            continue
+        for text in _tab_log_texts(fn):
+            if TAB_NAV_LIE_TOKEN in text:
+                problems.append(
+                    f"{rel}::{fname} 有一句 `_log` 写着「{TAB_NAV_LIE_TOKEN}」：{text[:60]!r}\n"
+                    "   → 「挑战跑完」这件事没有任何证据能证明；能证明的只有「这一页已经不是壳」"
+                    "「正文过了身份门」「这一跳根本没加载出来」三种观察。把推测当观察念给用户，"
+                    "下一次真被浏览器拦下导航时，这句话会把方向指反")
+    return problems
+
+
+def _tab_is_per_company(fn) -> bool:
+    """这个函数是不是在取**某一家**的页：签名里出现了「这一家」的把手（记录字典/供应商串/
+    `deep` 旗标）就算。这是判「域名级门够不够」的唯一机械依据——列表页的函数只拿得到关键词
+    （`kw`），它那一页的身份就是这次搜索的地址；而拿着 `rec`/`user`/`deep` 的函数，同主机下
+    首页与上一家的商铺在它眼里必须是**不同的页**（2026-11-16 同类查全：五处漏的都是这一形）。
+    """
+    names = {a.arg for a in list(fn.args.args) + list(fn.args.kwonlyargs)}
+    return bool(names & TAB_PER_COMPANY_ARGS)
+
+
+def _tab_exit_problems(rel: str, tree, row: dict) -> list:
+    """一个模块的「出口清单 ↔ 在案登记」差分。"""
+    problems = []
+    for fn_name, lineno, how, gates in _tab_body_exits(tree):
+        fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                   and n.name == fn_name and n.lineno == lineno), None)
+        if fn_name not in row:
+            problems.append(
+                f"{rel} 第 {lineno} 行 {fn_name}（出口方式 {how}）把浏览器标签里的正文交了出去，"
+                "却不在 TAB_BODY_EXITS 登记里\n"
+                "   → 站方在挑战或 302 之后常把地址落到首页或**上一家**的商铺：那种页里有公司名、"
+                "有电话，只是不是这一家。字段填到别人头上比采不到更难被发现（电话打过去才知道）。"
+                "要放行就在表里写明它靠哪一步认页——加一项必须同时写下门在哪，这一条门的全部用处"
+                "就在这个摩擦上")
+            continue
+        want = row[fn_name]
+        if want not in gates:
+            problems.append(
+                f"{rel}::{fn_name} 登记的身份门是 {want}，源码里却已经找不到这一步"
+                f"（实际用过的：{gates or '没有'}）\n"
+                "   → 交出去的那一份正文已经不再证明过「这一页就是我要的那一页」了。"
+                "改代码要连表一起改；把门删了留着表，比从来没登记过更坏——后面的检查会以为有门")
+        elif want == "_goto" and _tab_is_per_company(fn):
+            problems.append(
+                f"{rel}::{fn_name} 只登记了域名级 `_goto`，但它的签名里带着「这一家」的把手"
+                f"（{sorted(set(a.arg for a in fn.args.args) & TAB_PER_COMPANY_ARGS)}）："
+                "同主机下的首页、上一家的商铺在 `_goto` 眼里都算「本站」，这道门防不住串页\n"
+                "   → 深链/详情页要登记 `_tab_page_is`（只问地址）或 `_tab_body_for`"
+                "（地址＋不是壳＋体积）")
+    return problems
+
+
+def check_tab_body_identity(files=None) -> list:
+    """从浏览器标签交出去的正文必须过页面身份门（第 31 条）。"""
+    problems = []
+    full_scan = files is None
+    files = _runtime_reason_sources() if full_scan else dict(files)
+    if not files:
+        return ["第 31 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「没有一处把标签正文直接交出去」这句话没有任何含义"]
+
+    # 31a 全交付链：把标签正文交出去的出口必须**逐条在案**，且登记的门必须真在源码里
+    judged = 0
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as e:
+            problems.append(f"{path.name} 解析不过（第 {e.lineno} 行 {e.msg}）：第 31 条读不到"
+                            "这一份的取页写法，按不合格算而不是按「这处没问题」算")
+            continue
+        judged += 1
+        problems += _tab_exit_problems(_rel_label(path), tree,
+                                       TAB_BODY_EXITS.get(_rel_label(path), {}))
+
+    # 31a-2 反方向：表里写了、源码里却已经没有的项。两种「已经没有」都要报，因为过期登记会
+    # 顶着它的名次让下一条同类缺陷看起来是合法的：
+    #   · 函数整个不见了（改名/删掉）；
+    #   · 函数还在，但它不再把标签正文交出去了（那条通路被改回裸 HTTP 或换成别的取法，
+    #     门跟着作废——留着一行作废的登记，比没有登记更容易骗过后面的检查）。
+    for rel, row in TAB_BODY_EXITS.items():
+        text = _text_of(files, rel)
+        if text is None:
+            problems.append(f"登记表里的 {rel} 不在视野里：这一条门对它已经失明")
+            continue
+        tree = _ast_safe_parse(text)
+        names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        exits = {e[0] for e in _tab_body_exits(tree)}
+        for fn_name in row:
+            if fn_name not in names:
+                problems.append(f"{rel} 登记着出口 {fn_name}，源码里已经没有这个函数："
+                                "要么它被改名/删掉（表要跟着改，否则下一条同类缺陷会顶用它的名次）")
+            elif fn_name not in exits:
+                problems.append(f"{rel}::{fn_name} 登记了出口（门 {row[fn_name]}），但它现在已经"
+                                "不把浏览器标签里的正文交出去了：这一行登记作废，请删掉——"
+                                "留着它，将来同名的新通路会白拿这一档合法身份")
+
+    # 31b 门的真源只有一份：三个把手在整个视野里各只被定义一次，且都在基类
+    for name in TAB_ID_HANDLES:
+        defs = [str(_rel_label(p)) for p, t in files.items()
+                if any(isinstance(n, ast.FunctionDef) and n.name == name
+                       for n in ast.walk(_ast_safe_parse(t)))]
+        if not defs:
+            problems.append(f"全仓没有 {name}：身份门的真源被删了——各站那些「取回正文」的路此后再"
+                            "没有任何东西拦着串页")
+        elif len(defs) > 1 or defs[0] != TAB_ID_SOURCE:
+            problems.append(f"{name} 有 {len(defs)} 处定义（{defs}），身份门只准在 {TAB_ID_SOURCE} "
+                            "有一份：各站再抄一份就会长成五种口径，那等于没有门")
+
+    # 31c 反向对照：五份不合格形状必须响、四份合法写法不许响（判据不能被反证，就等于还没修）
+    for label, frag, table, want_bad in TAB_ID_CASES:
+        try:
+            got = _tab_exit_problems("夹具", ast.parse(frag), dict(table))
+        except SyntaxError as e:
+            problems.append(f"31c 夹具「{label}」自身解析不过（{e.msg}）：夹具坏了不算判据通过")
+            continue
+        if bool(got) != want_bad:
+            problems.append(
+                f"31c 判据与夹具「{label}」对不上：期望"
+                f"{'响' if want_bad else '不响'}，实得 {got or '不响'}"
+                + ("" if want_bad else "（误伤一次，下一个真漏的人就会被当成噪音放过去）"))
+    # 31c-2 在案的每一项都必须真的在响的那一侧被验过一遍：表里挂着一条没有任何夹具走到的
+    # 门型，等于那道门从没被对拍过。
+    _covered = {g for _l, _f, _t, _w in TAB_ID_CASES for g in _t.values()}
+    _declared = {g for row in TAB_BODY_EXITS.values() for g in row.values()}
+    if _declared - _covered:
+        problems.append(f"登记表用了 {sorted(_declared - _covered)} 这一档门，31c 却没有它的夹具："
+                        "这一档门从未被对拍过，等于没验")
+
+    # 31d 门本身的地址语义：拿真源重算一遍（期望表在这里独立写死，不读实现的常量）
+    src = _text_of(files, TAB_ID_SOURCE)
+    if src is None:
+        problems.append(f"{TAB_ID_SOURCE} 不在视野里：31d 没有对照面，这一条等于没跑")
+    else:
+        gate, err = _tab_identity_gate_class(src, _text_of(files, REASON_HANDLE) or "")
+        if err:
+            problems.append(err)
+        else:
+            for cur, want, token, same_host, exp_ok, exp_why in TAB_ID_BEHAVIOUR:
+                try:
+                    ok, why = gate(cur)._tab_page_is(want, token=token, same_host=same_host)
+                except TypeError as e:
+                    problems.append(f"31d 身份门签名变了（{e}）：调用点与各站夹具都会跟着崩")
+                    break
+                if ok is not exp_ok:
+                    problems.append(f"31d 地址语义不符：标签在 {cur!r}、要 {want!r}"
+                                    f"（token={token!r}, same_host={same_host}）→ 实得 "
+                                    f"{ok}｜{why}，期望 {exp_ok}")
+                elif not exp_ok and exp_why not in (why or ""):
+                    problems.append(f"31d 拒收必须说得出为什么：{cur!r} vs {want!r} 实得 {why!r}，"
+                                    f"期望含 {exp_why!r}（只说「不行」等于把归因推回读日志）")
+            # 31e 「这一跳根本没加载出来」那一支：Chrome 的原话必须被念出来，而且**方向由类别
+            # 给**——同一句「没加载出来」背后是站点回错误码／连不上／浏览器拦三种完全不同的处方。
+            for cur, want, nav, exp_in, exp_not in TAB_ID_NAVFAIL:
+                ok, why = gate(cur, **{TAB_ID_NAV_ATTR: nav})._tab_page_is(want)
+                if ok is not False:
+                    problems.append(f"31e 标签停在 Chrome 错误页却放行了：{cur!r} vs {want!r} → "
+                                    f"{ok}｜{why}（那一页连站点的一个字节都没有，当正文交出就是编造）")
+                    continue
+                if exp_in not in (why or ""):
+                    problems.append(f"31e 归因不符：{cur!r} 带 {nav!r} 实得 {why!r}，期望含 "
+                                    f"{exp_in!r}（Chrome 的原话没被念出来＝这一族的根因又丢了）")
+                elif exp_not and exp_not in (why or ""):
+                    problems.append(f"31e 说反了方向：{nav!r} 那一句里出现了 {exp_not!r}——{why!r}")
+
+        # 31f 导航证据的三处结构判据 + 31f-2 结论句口径（只在基类那份源码上判，且按严格名单）
+        problems += _tab_nav_evidence_problems(TAB_ID_SOURCE, _ast_safe_parse(src),
+                                               strict_names=True)
+        # 31f-3 反向对照：坏形状必须响、现网写法不许响。判据自己也要被反证一次，
+        # 否则「三处证据都在」这句话只是我对源码的印象。
+        for label, frag, want_bad in TAB_NAV_CASES:
+            try:
+                got = _tab_nav_evidence_problems("夹具", ast.parse(frag))
+            except SyntaxError as e:
+                problems.append(f"31f 夹具「{label}」自身解析不过（{e.msg}）：夹具坏了不算判据通过")
+                continue
+            if bool(got) != want_bad:
+                problems.append(
+                    f"31f 判据与夹具「{label}」对不上：期望"
+                    f"{'响' if want_bad else '不响'}，实得 {got or '不响'}"
+                    + ("" if want_bad else "（误伤一次，下一个真漏的人就会被当成噪音放过去）"))
+
+    # 31g 环境侧：这一节管的是「这句谎还有没有必要说」——启动参数没了，归因写得再准，
+    # 用户看到的仍然是「这个站采不到」。整轮含两份内联副本、被否决的那枚开关与覆盖面豁免表。
+    problems += _tab_env_gate_problems(files)
+    for label, frag, want in TAB_ENV_CASES:
+        try:
+            got = _tab_chrome_env_problems("夹具", frag, ast.parse(frag))
+        except SyntaxError as e:
+            problems.append(f"31g 夹具「{label}」自身解析不过（{e.msg}）：夹具坏了不算判据通过")
+            continue
+        if want == "":
+            if got:
+                problems.append(f"31g 判据误伤合格形状「{label}」：{got[:1]}\n"
+                                "   → 误伤一次，下一个真丢开关的人就会被当成噪音放过去")
+        elif not any(want in p for p in got):
+            problems.append(f"31g 判据与夹具「{label}」对不上：期望响出含 {want!r} 的那一条，"
+                            f"实得 {got or '不响'}")
+
+    if full_scan and judged == 0:
+        problems.append(f"第 31 条一份都没判到（视野里 {len(files)} 份全解析不过）："
+                        "这一条门等于没跑，不许在空集合上报绿")
+    return problems
+
+
+# ── 第 32 条：三本「只累加、从不外读」的账，必须各自有唯一把手并被读出来 ──────────────
+# 由来（2026-11-16 第十轮实机，同一个下午现形的三件事）：
+#   ① 世界工厂网「电梯导轨」抓到 10 家、四项口径只剩 4 家，报告按旧口径写「大头连四项联系
+#      方式都没有，先修取号通路再谈换词」。真翻页面，`联系电话` 那一栏写着 `-`（站方已改成
+#      「联系客服登记」才给号）：通路没坏，这句谎把人支使去改本来正确的解析代码。
+#      → 「无联系方式」必须按**是谁的责任**分档（档位与定序只由 cdp_base.NC_KIND_ORDER 定义，
+#        现共六档；「详情不取页」与「漏接把手」必须分两档，否则处方会被开给一个执行不了的站）。
+#   ② 三个 ❌ 全站都只说「该复核的是判定口径」，可复核的人手上没有名单——一句无法执行的处方。
+#      → 砍单必须**记名**（每词每阶段留样本）。
+#   ③ 六份纯 HTTP 站把 `close_browser` 覆写成空壳 `return None`，降级取页时借来的标签一路
+#      留到收工之后（用户的共享 Chrome 里挂着一枚 maimaib2b 的标签没人认领）。
+#      → 借来的标签必须还，空壳覆写必须当场响。
+# 三条都是同一族病：**账在内存里累加，却从不外读**（与通路账 legs、落点账 landing 同族）。
+# 所以本条判的全是结构与同源，不判任何一次实机的运气。
+NC_BLOCK_MARKS = ("CONTACT_SLOT_LABEL_RE", "# ── [NC-BLOCK-END]")
+NC_MIRROR_FILES = ("b2bcollect_build/cdp_base.py", "ali1688_build/ali1688_crawler.py")
+# 32c 分档账在 stats() 里的三格：计数、证据、以及给三处渲染共用的那一句人话
+NC_STATS_KEYS = ("nc_kinds", "nc_evidence", "nc_note")
+# 32c/32d 必须外读这一本账的三处渲染（少一处，那一处就又回到「只看见总数」的老说法）
+NC_READERS = ("b2bcollect_build/cdp_base.py", "ali1688_build/ali1688_crawler.py",
+              "b2bcollect_build/channel_health.py", "debug/platform_live_check.py")
+# 每一处读家的合格形状不一样：两份镜像必须真调把手并把档位念进日志；GUI 红牌那一行
+# 只取现成的 `nc_note`（它不该自己算档位）；体检报告这一处是这本账最大的读家，必须自己
+# 走把手（它在 25i 里还要按档给处方，就地拼一句就与日志长成两种说词）。
+NC_READ_RULES = {"b2bcollect_build/cdp_base.py": ("handle", "无联系方式分档"),
+                 "ali1688_build/ali1688_crawler.py": ("handle", "无联系方式分档"),
+                 "b2bcollect_build/channel_health.py": ("key_or_handle", ""),
+                 "debug/platform_live_check.py": ("handle", "")}
+# 32d 说词只许一个把手：除两份镜像外，任何文件都不许自己拼标签表
+NC_LABEL_OWNERS = NC_MIRROR_FILES
+# 32a「详情页取页」这一层的函数名登记表：b2bcollect 十路都叫 crawl_detail，1688 那一路历史上
+# 叫 `_crawl_company`/`_crawl_shop_company`。名字不同不影响判据，但**漏登记就等于没扫**。
+DETAIL_FETCH_FNS = ("crawl_detail", "_crawl_company", "_crawl_shop_company")
+# 32h 两份镜像里必须同行为的记账把手本体（docstring 可以不一样，行为不许）
+NC_ACCOUNT_FNS = ("_keep_detail", "_note_no_contact")
+# 32b 砍单记账的两个把手，与它们各自必须写入的那本名单
+CUT_NOTE_HANDLES = ("_note_early_skip", "_note_detail_filter")
+CUT_NOTE_BUCKETS = {"_note_early_skip": "kw_early_names",
+                    "_note_detail_filter": "kw_filtered_names"}
+# 32e 标签归还的凭据词：只认**真调用**（自己关会话的 quit/close 也认，只判「什么都没关」的空壳）。
+# 为什么不能拿子串比：`close_browser` 这个名字自己就带着 "close"，而六站覆写的 docstring 里
+# 都写了「…见 cdp_base.CdpSiteCrawler.release_tab」——拿子串判时，把归还那一行摘掉也照样能绿
+# （25h 反向对照抓到的第三个盲区：这一族连方法名与注释都在替它说话）。
+TAB_RELEASE_CALLS = ("release_tab", "close_tab", "_release_verify_tab", "_close_own_tab",
+                     "_close_tab",
+                     "release", "quit", "close", "shutdown", "destroy")
+# 32g 这些函数自己就是「关/归还」的动作：里面 `except …: pass` 会把「没关掉」抹平成
+# 「已经收工」（与 32e 同一族，只是那一头看的是「有没有关」，这一头看的是「关失败说不说」）。
+TAB_RELEASE_FNS = ("close_browser", "release_tab", "_close_tab", "_close_own_tab",
+                   "_release_verify_tab", "close_tab", "quit_browser")
+# 但只按**函数名**发判就等于允许改名绕过（25h 已在 32e 上学过一次：名字与注释都会替它说话）。
+# 所以另立一张「动作表」：函数体里只要出现下面任何一个调用，它就在干「关/归还」这件事，
+# 不管它叫什么（site_adapters 的 `_trim_extra_tabs` 就是这样一枚：真在 close_tab，名字不在表里）。
+TAB_ACTION_CALLS = ("close_tab", "release_tabs", "release_tab", "_close_tab",
+                    "_close_own_tab", "_release_verify_tab", "quit_browser")
+
+
+def _nc_block_of(text: str) -> str:
+    """按标记取镜像段本体（从判据第一行到 [NC-BLOCK-END]）。取不到就交回标记串，让调用方响。"""
+    i = text.find(NC_BLOCK_MARKS[0])
+    j = text.find(NC_BLOCK_MARKS[1])
+    if i < 0 or j < 0:
+        return "（缺标记）"
+    return text[i:j]
+
+
+def _is_abstract_stub(fn) -> bool:
+    """这个方法是基类的模板桩吗（除去 docstring 只剩 raise/pass/...）。
+
+    桩子一页都不取，拿它发罚单就是误伤；而误伤一次，下一个真漏接的人就会被当成噪音放过去
+    （同族教训见 31f 夹具注释）。"""
+    body = [st for st in fn.body
+            if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+                    and isinstance(st.value.value, str))]
+    if not body:
+        return True
+    if len(body) > 1:
+        return False
+    st = body[0]
+    if isinstance(st, ast.Raise):
+        return True
+    return (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+            and st.value.value is Ellipsis) or isinstance(st, ast.Pass)
+
+
+def _nc_read_hits(tree):
+    """这一份到底把分档账读出去了几次：只算**真调用把手**与**真取 stats 键**。
+
+    为什么不能拿子串充数（25h 反向对照当场抓到的第二个盲区）：「无联系方式分档」这六个字
+    在注释与 docstring 里到处都是，拿子串判时把渲染那句改回「无联系方式合计」也照样过关——
+    而用户看到的那一行从此又只剩总数。AST 里没有注释；docstring 倒真的是常量，所以这里
+    把它们一个个标出来排除掉（否则「说词在文档里」依然能冒充「词在日志里」）。
+    """
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = list(getattr(node, "body", []))
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                skip.add(id(body[0].value))
+    calls, keys, words = set(), set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            f = n.func
+            calls.add(f.attr if isinstance(f, ast.Attribute)
+                      else (f.id if isinstance(f, ast.Name) else ""))
+        elif isinstance(n, ast.Attribute) and n.attr in NC_STATS_KEYS:
+            keys.add(n.attr)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            if n.value in NC_STATS_KEYS:
+                keys.add(n.value)
+            if n.value and id(n) not in skip:
+                words.add(n.value)
+    return calls, keys, words
+
+
+def _nc_detail_evidence_problems(label: str, tree):
+    """32a 每一路的详情取页函数必须**要么留证据、要么声明没有证据可留**。
+
+    静默漏接的形态正是本轮实机读到的那个 unknown：站点对着一百家商铺取过页，账上却说
+    「本站没留正文证据」。声明 `NO_DETAIL_EVIDENCE` 也是合格答案（企知道那样详情不取页的站
+    本来就没有单店正文可判），但必须写理由——悄悄不接与诚实声明，在报告里必须长得不一样。
+
+    证据往往不在 `crawl_detail` 自己手里，而在它调下去的那条取页腿（mic 的
+    `_fetch_contact_http`、makepolo 的 `_fetch`）：所以沿**同一个类里的调用闭包**找，不限层数；
+    不跨类猜，偶然同名不算通路。抽象桩不归这一条管（它一页都不取）。
+    """
+    problems = []
+    for cd in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        fns = {}
+        for n in cd.body:
+            if isinstance(n, ast.FunctionDef):
+                fns.setdefault(n.name, n)
+        targets = [fns[name] for name in DETAIL_FETCH_FNS
+                   if name in fns and not _is_abstract_stub(fns[name])]
+        if not targets:
+            continue
+        declared = any(isinstance(st, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "NO_DETAIL_EVIDENCE"
+                               for t in st.targets)
+                       for st in cd.body)
+        for fn in targets:
+            if declared:
+                continue
+            seen, queue, hit = set(), [fn.name], False
+            while queue:
+                cur = queue.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                for c in ast.walk(fns[cur]):
+                    if not isinstance(c, ast.Call):
+                        continue
+                    f = c.func
+                    if not isinstance(f, ast.Attribute):
+                        continue
+                    if f.attr == "_keep_detail":
+                        hit = True
+                    elif f.attr in fns and f.attr not in seen:
+                        queue.append(f.attr)
+            if hit:
+                continue
+            problems.append(
+                f"{label} 的 {cd.name}.{fn.name}（第 {fn.lineno} 行）取了详情页却没留证据（"
+                f"沿调用闭包查了 {len(seen)} 个方法：{'、'.join(sorted(seen))}）："
+                f"收尾那一行只能说「本站没留正文证据（判不了）」，站方没给与我们没解析到分不开"
+                f"→ 取到正文处调 `self._keep_detail(html)`；确实没有单店正文可判就在类里声明"
+                f" `NO_DETAIL_EVIDENCE = \"理由\"`")
+    return problems
+
+
+def _nc_cut_arg_problems(label: str, tree):
+    """32b 砍单记账的调用点必须把公司名传进去（把手本体除外，它就在那里写名单）。"""
+    problems = []
+    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and f.attr in CUT_NOTE_HANDLES):
+            continue
+        if len(call.args) >= 2 or any(k.arg == "name" for k in call.keywords):
+            continue
+        problems.append(
+            f"{label} 第 {call.lineno} 行：`{f.attr}(kw)` 没把公司名传进去——只有一本计数时，"
+            f"报告只能说「该复核判定口径」，而复核的人手上没有名单（2026-11-16 三个 ❌ 全站都"
+            f"是这句话，谁都没去看砍掉的究竟是谁）→ 加第二个实参，样本进 {CUT_NOTE_BUCKETS[f.attr]}")
+    return problems
+
+
+def _nc_call_names(node) -> list:
+    """这个节点里出现过的**被调用者名字**（属性调用取尾名，裸调用取名）。"""
+    out = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            f = n.func
+            out.append(f.attr if isinstance(f, ast.Attribute)
+                       else (f.id if isinstance(f, ast.Name) else ""))
+    return out
+
+
+def _release_actions_in(node) -> list:
+    """这个节点里出现过的「关/归还」动作（**按动作认，不按名字认**）。
+
+    只按函数名登记表发判，改个名（或把归还动作抽到一个新 helper 里）就从判据视野里消失了，
+    那与 32e 曾经「方法名与 docstring 替它说话」是同一个盲区。两个形状算数：
+      · 直接调 TAB_ACTION_CALLS 里那一个名字（`sc.close_tab(...)`/`self.release_tab(...)`）；
+      · 对 driver 型对象调 `close()`/`quit()`（Selenium 那一侧的关标签就是这个写法）。
+    反过来，`f.close()`（文件）、`resp.close()`（响应）不会被算进来：这一条误伤一次，
+    下一个真静默的人就会被当成噪音放过去。"""
+    out = []
+    stmts = node if isinstance(node, (list, tuple)) else [node]
+    for n in [c for st in stmts for c in ast.walk(st)]:
+        if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+            continue
+        attr = n.func.attr
+        if attr in TAB_ACTION_CALLS:
+            out.append(attr)
+            continue
+        if attr in ("close", "quit"):
+            base = n.func.value
+            names = []
+            while isinstance(base, ast.Attribute):
+                names.append(base.attr)
+                base = base.value
+            if isinstance(base, ast.Name):
+                names.append(base.id)
+            if any(x and ("driver" in x or x == "chrome") for x in names):
+                out.append(attr)
+                continue
+            if isinstance(base, ast.Attribute) and "driver" in (base.attr or ""):
+                out.append(attr)
+    return out
+
+
+def _does_tab_release(fn) -> bool:
+    """这个函数整体在不在干「关/归还」这件事（32g 用它选扫描范围）。"""
+    return bool(_release_actions_in(fn))
+
+
+def _silent_release_excepts(fn, whole_fn_is_release: bool = False) -> list:
+    """这个函数里那些**把归还动作包在 try 本体、except 却只 pass** 的行号
+    （32e/32g 共用同一份判据本体）。
+
+    为什么要钉在「这一格 try 负责了什么」上（同一类误伤在本轮现过一次形）：
+    `_goto_homepage_verified` 这类函数什么都做一点，只在收尾 finally 里还标签；
+    若只看「函数里有没有 pass-only 的 except」，就会把与归还无关的那几格也开罚单，
+    而罚单一旦混进无关项，真正该修的静默就被当成噪音放过去了。
+
+    `whole_fn_is_release=True` 给的是「这个函数自己就叫关/归还」（close_browser /
+    close_tab / _close_own_tab 这一族）：它整个职责就是这件事，每一格 pass-only
+    都在抹平它自己的失败——拿「try 本体得含归还调用」去要求它，会漏掉**真正的
+    最底层自己吞异常**那一形（25h 反向对照当场抓到了这一形：shared_chrome.close_tab
+    被改回 `except: pass` 后判据一声不响，而上层整条链的「关失败必须开口」全成死分支）。
+
+    除了 pass 与孤零零一行字符串，什么语句都算「干了点事」：这一条故意写得保守，只拦
+    「静默把失败抹平」那一种形状，不把重试、赋值一并当成漏报。"""
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Try):
+            continue
+        if not whole_fn_is_release and not _release_actions_in(node.body):
+            continue          # 这一格负责的不是「关/归还」，不归本条管
+        for h in node.handlers:
+            if all(isinstance(s, ast.Pass)
+                   or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+                   for s in h.body):
+                out.append(h.lineno)
+    return out
+
+
+def _tab_release_problems(label: str, tree):
+    """32e 覆写了 close_browser 就必须真的关点东西（空壳＝借来的标签没人认领）。"""
+    problems = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+               and n.name == "close_browser"):
+        body = [st for st in fn.body
+                if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+                        and isinstance(st.value.value, str))]
+        shell_only = all(isinstance(st, (ast.Pass, ast.Return))
+                         and (not isinstance(st, ast.Return)
+                              or st.value is None
+                              or (isinstance(st.value, ast.Constant) and st.value.value is None))
+                         for st in body)
+        if shell_only:
+            problems.append(
+                f"{label} 第 {fn.lineno} 行的 `close_browser` 是空壳：纯 HTTP 站进入降级取页"
+                f"模式后会一路握着借来的标签（2026-11-16 实机：用户的共享 Chrome 里挂着一枚 "
+                f"maimaib2b 的商铺页没人认领）→ 收工前调 `self.release_tab(\"收工\")`")
+            continue
+        hit = [w for w in _nc_call_names(fn) if w in TAB_RELEASE_CALLS]
+        if not hit:
+            problems.append(
+                f"{label} 第 {fn.lineno} 行的 `close_browser` 没调用任何归还动作"
+                f"（{'/'.join(TAB_RELEASE_CALLS[:4])} 之一）：这一族的『关』必须落在硬事实上，"
+                f"不能只改一个标志位；docstring 里提一句把手名也不算还")
+            continue
+        # 32g 关失败不许被 `except …: pass` 抹平：那一格里必须有一句人话（连类名也好）
+        # close_browser 自己就是收工本体，按整函数算（不要求每一格 try 都直接含归还调用）
+        for _ln25 in _silent_release_excepts(fn, True):
+            problems.append(
+                f"{label} 第 {_ln25} 行的 `except` 里只有 pass：这一族是「关/归还」本体，"
+                f"抹平失败就是把「共享 Chrome 里还挂着这一枚标签」说成「已经收工」"
+                f"→ 至少打一句「{fn.name} 没成功（类名）」并告诉用户在哪里手动收")
+    return problems
+
+
+def _tab_silent_release_problems(label: str, tree):
+    """32g 不覆写 close_browser 的站也得过这一问：只要函数在干「关/归还」，
+    里面 `except …: pass` 都算静默失败（判据本体在 _silent_release_excepts 里同一段）。"""
+    problems = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+               and n.name != "close_browser"      # 那一枚由 _tab_release_problems 统一判，不报两遍
+               and (n.name in TAB_RELEASE_FNS or _does_tab_release(n))):
+        # 名字在登记表里的＝它自己就是归还本体，整函数算；只被动作认出来的
+        # 那种（顺带干别的活的），只算包着归还调用的那几格 try，否则就是误伤
+        for _ln25 in _silent_release_excepts(fn, fn.name in TAB_RELEASE_FNS):
+            tag = "" if fn.name in TAB_RELEASE_FNS else "（按动作认出它在关标签，不看名字）"
+            problems.append(
+                f"{label} 第 {_ln25} 行的 `{fn.name}` 里 except 只有 pass{tag}：归还失败被"
+                f"抹平成「已经收工」（与 32e 同一族：那一头看「有没有关」，这一头看「关失败说不说」）")
+    return problems
+
+
+def _nc_fn_core(fn):
+    """把手本体的**行为指纹**：去掉 docstring 后把函数体还原成文本比对。
+    不拿整段字面文本对拍是因为两份镜像的注释本来就该写得不一样（一份在基类、一份在
+    独立交付包，读者不同）；要钉的是语句序列，不是注释。"""
+    body = list(fn.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+
+def check_no_contact_accountability(files=None, texts=None) -> list:
+    """无联系方式责任分档 + 砍单记名 + 借标签归还（第 32 条）。
+
+    `files`／`texts` 是给离线夹具留的注入口：每一条判据里凡是「性质判据」都必须能被反向对照
+    （把真源改回修复前的样子，判据要响），否则这一条只是今天对了。
+    """
+    problems = []
+    files = _runtime_reason_sources() if files is None else dict(files)
+    if not files:
+        return ["第 32 条一份源码都没读到（三个 *_build 目录全落空）：视野断了的时候，"
+                "「每一路都留了证据」这句话没有任何含义"]
+    # 渲染层不在 *_build 下（debug/ 里的体检器是这一本账最大的读家），单独收一份视野
+    if texts is None:
+        texts = {}
+        for rel in NC_READERS:
+            fp = ROOT / rel
+            texts[rel] = (fp.read_text(encoding="utf-8", errors="replace")
+                          if fp.is_file() else "")
+    else:
+        texts = dict(texts)
+
+    # 32a 每一路的详情取页必须留证据（或诚实声明没有证据）
+    judged = 0
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as e:
+            problems.append(f"{_rel_label(path)} 解析不过（第 {e.lineno} 行 {e.msg}）：第 32 条"
+                            "读不到这一份的写法，按不合格算而不是按「这处没问题」算")
+            continue
+        judged += 1
+        problems += _nc_detail_evidence_problems(_rel_label(path), tree)
+        problems += _nc_cut_arg_problems(_rel_label(path), tree)
+        problems += _tab_release_problems(_rel_label(path), tree)
+        problems += _tab_silent_release_problems(_rel_label(path), tree)
+    if judged == 0:
+        problems.append(f"第 32 条扫了 0 份源码（视野里 {len(files)} 项全解析失败）：这一条等于没跑")
+
+    # 32b 把手本体必须真的写名单：只 += 计数不记名的把手，等于把这一族重新变成一句话
+    base = texts.get(NC_MIRROR_FILES[0]) or _text_of(files, NC_MIRROR_FILES[0]) or ""
+    for handle, bucket in CUT_NOTE_BUCKETS.items():
+        if f"self._cut_sample(self.{bucket}" not in base:
+            problems.append(f"cdp_base.py 的 `{handle}` 没把名单写进 `{bucket}`："
+                            "调用点传了名字也没用，样本在半路被丢掉")
+
+    # 32c 分档账必须被外读：stats() 三格 + 收尾那一句 + 四处渲染
+    # 查的是 `"nc_note":` 这一格**字典键的写法**而不是子串：只比名字时把键改叫
+    # `nc_note_x` 也能过关（25h 的反向对照当场抓到这个盲区——改名就是丢一格，而丢的那一格
+    # 正是界面与体检器共用的那一句人话）。
+    for key in NC_STATS_KEYS:
+        if f'"{key}":' not in base:
+            problems.append(f"cdp_base.py 的 stats() 没透出 `{key}`：这本账进不了界面与体检器"
+                            "（「只累加、从不外读」正是通路账那一族的原病）")
+    for rel in NC_READERS:
+        t = texts.get(rel) or ""
+        mode, phrase = NC_READ_RULES[rel]
+        try:
+            tree = ast.parse(t)
+        except SyntaxError as e:
+            problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：这一处读不到，"
+                            "按不合格算而不是按「这一处没问题」算")
+            continue
+        calls, keys, words = _nc_read_hits(tree)
+        if "nc_kinds_text" not in calls and (mode == "handle" or not keys):
+            problems.append(
+                f"{rel} 没把分档账读出去（既没真调 `nc_kinds_text`"
+                + ("" if mode == "handle" else "、也没取 stats() 里那三格键")
+                + f"）：这一处看见的还是那句没有证据的「先修取号通路」（注释里写了不算："
+                  f"注释进不了用户的眼睛，却能把子串判据哄成绿）")
+        if phrase and not any(phrase in w for w in words):
+            problems.append(f"{rel} 的收尾账目行没念「{phrase}」：用户那一行日志还是只有一个"
+                            "「无联系方式 N」的总数，各档处方又合回一句模棱两可的话")
+
+    # 32d 说词只许一个把手：除两份镜像外不许出现标签表本体
+    for path, text in sorted(files.items(), key=lambda kv: str(kv[0])):
+        rel = _rel_label(path)
+        if rel in NC_LABEL_OWNERS:
+            continue
+        if "NC_KIND_LABEL" in text or "NC_KIND_ORDER" in text:
+            problems.append(f"{rel} 自己抄了一份分档标签表：同一笔账两种说词时，"
+                            f"「谁的责任」这句话就没有唯一答案（唯一真源在 {NC_MIRROR_FILES[0]}）")
+
+    # 32e 借来的标签必须还（见上 _tab_release_problems，已逐份扫过）
+    # 这一问要的是「把手函数真的存在」，所以按解析树取函数名**精确**比对，不拿子串充数：
+    # `def release_tab` 这一子串会被 `def release_tab_x` 那种改名后缀哄成绿（AR 反向对照抓到）——
+    # 改名之后每一处 `self.release_tab(...)` 都会 AttributeError，而判据还在说「唯一入口在」。
+    try:
+        _base_tree = ast.parse(base)
+    except SyntaxError as e:
+        _base_tree = None
+        problems.append(f"{NC_MIRROR_FILES[0]} 解析不过（第 {e.lineno} 行 {e.msg}）：这一条读不"
+                        "到把手本体，按不合格算而不是按「入口还在」算")
+    if _base_tree is not None and "release_tab" not in {
+            n.name for n in ast.walk(_base_tree) if isinstance(n, ast.FunctionDef)}:
+        problems.append(f"{NC_MIRROR_FILES[0]} 里没有 `release_tab` 把手：归还动作没有唯一入口，"
+                        "各站会各写一份关标签（而「关失败」最容易在各份里被 except: pass 抹平）"
+                        "；把手改名要同时改这一条，否则上层每一处调用都是死的而判据看不见")
+
+    # 32f 两份镜像逐字节对拍：1688 是独立交付包、不能 import，所以内联一份拷贝
+    blocks = {}
+    for rel in NC_MIRROR_FILES:
+        t = texts.get(rel) or _text_of(files, rel) or ""
+        blk = _nc_block_of(t)
+        if blk.startswith("（缺标记"):
+            problems.append(f"{rel} 取不出分档判据那一段（标记 {NC_BLOCK_MARKS}）："
+                            "改判据要连标记一起改，否则这一条对不上任何一边")
+        blocks[rel] = blk
+    if not any(b.startswith("（缺标记") for b in blocks.values()):
+        a, b = (blocks[NC_MIRROR_FILES[0]], blocks[NC_MIRROR_FILES[1]])
+        if a != b:
+            for n, (x, y) in enumerate(zip(a.splitlines(), b.splitlines())):
+                if x != y:
+                    problems.append(
+                        f"两份分档判据从第 {n + 1} 行开始分叉（{NC_MIRROR_FILES[0]} ↔ "
+                        f"{NC_MIRROR_FILES[1]}）：{x.strip()[:60]} ↔ {y.strip()[:60]}")
+                    break
+            else:
+                problems.append(f"两份分档判据长度不同（{len(a)} ↔ {len(b)}）：一边多了几档判断")
+
+    # 32h 两份镜像的**记账把手本体**必须同行为：NC-BLOCK 只圈住判据（常量与纯函数），
+    # 而「声明过详情不取页的站记 no_page、没声明的记 unknown」这一分叉住在方法里。
+    # 方法不在对拍范围内时，只改 cdp_base 一侧不会有人响，1688 那一路就悄悄退回
+    # 「把已声明的设计边界说成忘了接把手」（本轮刚消灭的那张假处方）。
+    _mh = {}
+    for rel in NC_MIRROR_FILES:
+        t = texts.get(rel) or _text_of(files, rel) or ""
+        try:
+            _tree = ast.parse(t)
+        except SyntaxError as e:
+            problems.append(f"{rel} 解析不过（第 {e.lineno} 行 {e.msg}）：这一处读不到记账把手，"
+                            "按不合格算而不是按「两边都读不到就算一致」算")
+            _mh[rel] = {}
+            continue
+        got = {}
+        for n in ast.walk(_tree):
+            if not (isinstance(n, ast.FunctionDef) and n.name in NC_ACCOUNT_FNS):
+                continue
+            if n.name in got:
+                problems.append(f"{rel} 里 {n.name} 出现了两次（第 {got[n.name].lineno} 行与第 "
+                                f"{n.lineno} 行）：两份把手谁生效没人说得上（与 NC_READ_RULES "
+                                "那一处同一个道理）")
+            got.setdefault(n.name, n)
+        _miss = [m for m in NC_ACCOUNT_FNS if m not in got]
+        if _miss:
+            problems.append(f"{rel} 没有记账把手 {'、'.join(_miss)}：分档账在这一路没人记，"
+                            "这一份的 stats() 就只能永远交白卷")
+        _mh[rel] = got
+    if all(_mh.get(r) for r in NC_MIRROR_FILES) and len(NC_MIRROR_FILES) == 2:
+        for m in NC_ACCOUNT_FNS:
+            fa, fb = _mh[NC_MIRROR_FILES[0]].get(m), _mh[NC_MIRROR_FILES[1]].get(m)
+            if not (fa and fb):
+                continue
+            ca, cb = _nc_fn_core(fa), _nc_fn_core(fb)
+            if ca != cb:
+                problems.append(
+                    f"记账把手 {m} 在两份镜像里行为不同（{NC_MIRROR_FILES[0]} 第 {fa.lineno} 行 ↔ "
+                    f"{NC_MIRROR_FILES[1]} 第 {fb.lineno} 行）：同一笔账在 1688 包里会给出"
+                    f"另一种归因。修前一边={ca.splitlines()[:2]} 修后一边={cb.splitlines()[:2]}")
+    return problems
+
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -4674,6 +6833,51 @@ def main(argv=None) -> int:
         print("✅ 名字取用早于绑定：交付链每份 .py 的模块级都只取用当场已绑定的名字"
               "（import 都在使用点之前，没有从未定义过的名字）")
 
+    reason_handle = check_reason_one_handle()
+    if reason_handle:
+        bad += 1
+        print("❌ 失败原因被各处自己按字符数切了一刀（半截词比不说更误导：读到一半的人会照着"
+              "那半截去查，而「该怎么处置」写在句首）：")
+        for p in reason_handle:
+            print(f"   · {p}")
+            print(f"::error::原因收口把手：{p}")
+    else:
+        print("✅ 原因收口把手：交付链的运行时代码没有一处再自己 `splitlines()[0][:N]`，"
+              "也没有一处调完把手又对那句收口结果补一刀 `[:N]`，"
+              f"真源 {REASON_HANDLE} 与 {'、'.join(REASON_MIRRORS)} 那份逐字节相同，"
+              "任何一句原因在任何一档上限下都不留半截词／不丢【类别】前缀／不带孤括号")
+
+    tab_gate = check_tab_body_identity()
+    if tab_gate:
+        bad += 1
+        print("❌ 从浏览器标签交出去的正文没问过「这一页是不是我要的那一页」（串页假数据：字段"
+              "填到别人头上，比采不到更难被发现）：")
+        for p in tab_gate:
+            print(f"   · {p}")
+            print(f"::error::标签正文身份门：{p}")
+    else:
+        print("✅ 标签正文身份门：交付链把浏览器标签正文交出去的每一处出口都在案并验到了它登记的"
+              f"那道门（门只有一份真源 {TAB_ID_SOURCE}；{len(TAB_ID_CASES)} 份门型夹具、"
+              f"{len(TAB_ID_BEHAVIOUR)} 档地址语义、{len(TAB_ID_NAVFAIL)} 档「这一跳没加载出来」"
+              f"的归因、{len(TAB_NAV_CASES)} 份导航证据夹具、{len(TAB_ENV_CASES)} 份环境开关夹具"
+              f"（另含 {len(TAB_ENV_MIRRORS)} 份内联副本逐字节对拍、{len(TAB_ENV_EXEMPT)} 条带理由"
+              f"的 Chrome 启动点豁免），在 31c~31g 反向对照里对拍过）")
+
+    nc_gate = check_no_contact_accountability()
+    if nc_gate:
+        bad += 1
+        print("❌ 「无联系方式」这本账又变回只有一个总数（分不清是站方没给、站方藏着、还是我们"
+              "一条也没抽走），或砍掉的名单、借来的标签没人记账：")
+        for p in nc_gate:
+            print(f"   · {p}")
+            print(f"::error::无联系方式责任分档：{p}")
+    else:
+        print("✅ 无联系方式责任分档：每一路详情取页都留了正文证据（或带理由声明没有可留的证据），"
+              "砍单两个把手都记名、分档三格都被 stats() 透出并被四处渲染读到（说词只有"
+              f" `nc_kinds_text` 一个把手），借来的标签收工前都走 `release_tab` 归还，"
+              f"两份镜像的判据段逐字节相同、记账把手（{'、'.join(NC_ACCOUNT_FNS)}）行为指纹相同"
+              f"（{NC_MIRROR_FILES[0]} ↔ {NC_MIRROR_FILES[1]}）")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -4708,6 +6912,8 @@ def main(argv=None) -> int:
           "Qt 入口与离屏套件都按「窗口先于 QApplication」收尾、"
           "离线套件的判定与退出码同源、批跑清单里的套件都在提交里、交付链没有开发机绝对路径、"
           "临时目录只在同口径的那一处被读、模块级没有取用早于绑定的名字、"
+          "失败原因只按一个把手收口（半截词／丢前缀／孤括号都算不合格）、"
+          "从浏览器标签交出去的正文都先过了页面身份门（串页假数据算不合格）、"
           "代码声明的状态文件都没被跟踪也没漏出 ignore、"
           "注释里每一句指路节号都走得通")
     return 0

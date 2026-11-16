@@ -55,6 +55,9 @@ progress.json
 *_run.log
 debug/regression_logs/
 debug/fixtures/
+# 实机体检沙箱：真客户数据 + 抓回来的页面，一次跑就是一份，绝不入库
+# （platform_live_check.py 的落点，历史上只靠「别 add 它」的自觉，没有挡）
+debug/_live_sandbox/
 tmp/
 
 # ── 一次性调试抓图/抓页（体积大、可重抓；正式模板目录 *_templates/ 不在其列）──

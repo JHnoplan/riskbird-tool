@@ -15,6 +15,9 @@ import time
 import traceback
 from datetime import datetime
 from typing import List, NamedTuple, Optional
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QPoint
 from PyQt5.QtGui import QFont, QColor, QCursor
@@ -3148,7 +3151,7 @@ class ScanWorker(QThread):
                     pool_index = PoolIndex()
                 except Exception as e:
                     pool_index = None
-                    pool_note = f"本次不做池内比对：{str(e)[:60]}"
+                    pool_note = f"本次不做池内比对：{first_line(e, 60)}"
             else:
                 pool_note = "本地总表缓存尚未建立，本次不做池内比对"
             items, stats = scan_all(

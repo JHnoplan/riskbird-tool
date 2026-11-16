@@ -212,7 +212,7 @@ class AiQiChaCrawlerV2:
             resp = self._send_command(ws, "Network.getCookies",
                                       {"urls": ["https://aiqicha.baidu.com"]})
         except Exception as e:
-            return "unknown", f"读取 Cookie 失败：{str(e)[:60]}"
+            return "unknown", f"读取 Cookie 失败：{e}"
         cookies = (resp.get("result") or {}).get("cookies")
         if cookies is None:
             return "unknown", "读取 Cookie 无返回"
@@ -398,11 +398,16 @@ class AiQiChaCrawlerV2:
         return None
     
     def _close_tab(self, ws_url):
-        """关闭标签页"""
+        """关闭标签页。**关失败必须开口**：旧写法 `except Exception: pass` 会把
+        「共享 Chrome 里还挂着这一枚」抹平成「已经收工」（与 cdp_base.release_tab 同一族纪律）。
+        返回是否真的关掉，调用方据此决定要不要再说一句。"""
         try:
             self._send_command(ws_url, "Target.closeTarget", {})
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            self._log(f"⚠ 归还标签没成功（{type(e).__name__}）——共享 Chrome 里还挂着本站那一枚"
+                      f"标签，请手动关掉（不影响已采数据）")
+            return False
     
     def _input_text(self, ws_url, text):
         """输入文本（模拟键盘输入以触发 Vue 事件）"""
@@ -608,16 +613,22 @@ class AiQiChaCrawlerV2:
             return False
     
     def close_browser(self):
-        """关闭浏览器（CDP 模式下不关闭，由用户手动关闭）"""
+        """关闭浏览器（CDP 模式下不关会话，但自己那一枚标签必须收掉）"""
         if self.attach_mode and self.pin_tab_id:
             # 双标签并行：只关自己独占的标签，共享浏览器留给另一个会话
+            # 先把标签 id 取在手里再复位：那一枚没关掉时要能点名（账上只写「关过了」等于没说）
+            tab = self.pin_tab_id
+            self.pin_tab_id = None
             try:
                 ws = self._get_ws_url()
                 if ws:
                     self._close_tab(ws)
-            except Exception:
-                pass
-            self.pin_tab_id = None
+                else:
+                    self._log(f"⚠ 收工拿不到标签 {tab} 的 websocket 地址——共享 Chrome 里还挂着"
+                              f"这一枚标签，请手动关掉（不影响已采数据）")
+            except Exception as e:
+                self._log(f"⚠ 收工归还标签 {tab} 没成功（{type(e).__name__}）——共享 Chrome 里还"
+                          f"挂着这一枚标签，请手动关掉（不影响已采数据）")
     
     def _is_session_alive(self) -> bool:
         """检查会话是否存活"""

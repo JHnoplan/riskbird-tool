@@ -137,6 +137,9 @@ class SolarbeCrawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但借来的一枚必须还（空壳会把过验证时借的标签留到收工
+        之后；由来与判据见 cdp_base.CdpSiteCrawler.release_tab）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -185,7 +188,7 @@ class SolarbeCrawler(CdpSiteCrawler):
             return False
 
     # ── 裸 HTTP 取页 ───────────────────────────────────────────
-    def _fetch(self, url, tries=4, ua=None, guarded=True):
+    def _fetch(self, url, tries=4, ua=None, guarded=True, deep=False):
         """桌面/手机两套 UA 共用一条会话：详情靠手机 UA 才拿得到明文联系方式。
     
         200 但正文小于 MIN_PAGE_CHARS 有两种完全不同的成因，处置也必须分开：
@@ -196,12 +199,17 @@ class SolarbeCrawler(CdpSiteCrawler):
         （tries=3 ⇒ 一家死页自己就能把计数顶到 3），当场升格成「IP 级限流」触发熔断。
         现在改成：一条 URL 只记一笔，并用 _control_ok() 实测定性——对照页正常就把这一页
         记进 _blank_urls（以后零请求直接跳过），对照页也不行才交看门狗等冷却。
-        两种情况都不静默把「拿不到页」当成「这一家没数据」。"""
+        两种情况都不静默把「拿不到页」当成「这一家没数据」。
+
+        `deep=True`＝请求的是**某一家的深链**：它的状态码级被拒只记深链单笔账，不写
+        `_block_reason`、不把恢复探测钉在那条深链上（口径与实测数据见 cdp_base._note_fetch_fail）。
+        空白页那条支路仍然由 _control_ok() 对照探针定性——它本来就是「按资源 vs 按出口」的判据。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
             return ""
         last = ""
+        deep_refused = ""
         self._last_blank_page = False
         if url in self._blank_urls:
             self._last_blank_page = True
@@ -213,8 +221,21 @@ class SolarbeCrawler(CdpSiteCrawler):
                 headers = {"User-Agent": ua} if ua else None
                 r = self._session.get(url, timeout=http_timeout(25), headers=headers)
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url, r.headers)
+                block = self.http_block_reason(r.status_code, r.text, url, r.headers,
+                                               deep=deep)
                 if block:
+                    if deep:
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._fetch(url, tries=1, ua=ua, guarded=False,
+                                                deep=deep))
+                        if got is not None:
+                            return got
+                        break
                     self._block_reason = block
                     last = f"HTTP {r.status_code}（防采插页）"
                     break
@@ -251,8 +272,14 @@ class SolarbeCrawler(CdpSiteCrawler):
             if self.handle_http_block(url):
                 self._block_reason = ""
                 self._empty_streak = 0
-                return self._fetch(url, tries=tries, ua=ua, guarded=False)
-        self._note_request_error(last)
+                return self._fetch(url, tries=tries, ua=ua, guarded=False, deep=deep)
+        if deep_refused:
+            # 深链被拒：账已在 `_note_deep_block` 按主机记过一行，不刷日志、不进通道账
+            # （口径见 cdp_base._note_fetch_fail；本页确实没拿到，调用方按导航失败处理）。
+            # 这段短路必须留在通道等待**之后**：等待只在通道级被标记拦停时才发生（探的是
+            # 入口页、等得到结果），跳过它就会白丢后面整批深链。
+            return ""
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ 索比光伏网请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -370,7 +397,7 @@ class SolarbeCrawler(CdpSiteCrawler):
                     # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                     if not self.is_relevant(kw, self.stub_relevance_text(e)):
                         skipped += 1
-                        self._early_skipped += 1
+                        self._note_early_skip(kw, e["公司名称"])
                         self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                         self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                                "公司名称": e["公司名称"], "memberId": mid})
@@ -412,7 +439,7 @@ class SolarbeCrawler(CdpSiteCrawler):
             return rec
         url = f"http://company.solarbe.com/{slug}/contact/"
         rec["详情URL"] = url
-        html = self._fetch(url, tries=3, ua=_UA_MOBILE)
+        html = self._fetch(url, tries=3, ua=_UA_MOBILE, deep=True)
         if not html:
             # 空页分两种：这一家本身就是空的（终态，别再占下一轮的量）/ 拿不到页（瞬时，下轮重采）
             rec["状态"] = ("无联系方式(商铺已清空)" if self._last_blank_page
@@ -422,6 +449,7 @@ class SolarbeCrawler(CdpSiteCrawler):
             # 名录里已删除/改名的公司：终态，别再拿它占下一轮的采集量
             rec["状态"] = "无联系方式"
             return rec
+        self._keep_detail(html)      # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         parsed = self._parse_contact(html, stub)
         for k, v in parsed.items():
             if v and not rec.get(k):

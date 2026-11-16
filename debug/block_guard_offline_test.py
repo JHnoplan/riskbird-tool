@@ -324,7 +324,7 @@ watch(q3)
 q3._session = FakeSession([QIHUO_429])
 q3.handle_http_block = lambda url="", reason="": False
 q3._tab_page_ok = lambda: True
-q3._fetch_via_tab = lambda url: ("<html>标签渲染的正常页 " * 300, url)
+q3._fetch_via_tab = lambda url, deep=False: ("<html>标签渲染的正常页 " * 300, url)
 html3, u3 = q3._fetch(QIHUO_429.url, tries=1)
 check("HTTP 等不到恢复但浏览器能开→降级取页继续采（不清 Cookie 也不空转）", len(html3) > 3000)
 check("降级模式被置位（后续页面走标签，且定期探 HTTP 恢复）", q3._browser_fallback is True)
@@ -333,7 +333,7 @@ check("降级模式被置位（后续页面走标签，且定期探 HTTP 恢复�
 gg = GysCrawler()
 watch(gg)
 fetched = []
-gg._fetch_raw = lambda url: (fetched.append(url) or ("", ""))
+gg._fetch_raw = lambda url, deep=False: (fetched.append(url) or ("", ""))
 gg._gys_blocked = lambda: True
 retried = []
 gg.handle_http_block = lambda url="", reason="": (retried.append(url) or False)

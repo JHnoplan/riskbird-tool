@@ -124,10 +124,33 @@ import province_filter as _pf
 HOME_URL = "http://cn.makepolo.com/"
 SEARCH_URL = "http://caigou.makepolo.com/spc_new.php?search_flag=2&q={kw}&pg={page}"
 SHOP_URL = "http://{slug}.cn.makepolo.com/contact_us.html"
+# 商铺首页：contact_us 不通时的第二条腿。**注释旧版写着「两页的壳同构，不需要另写判据」——那句是错的**，
+# 2026-11-15 实机留档取证：首页是 block2 壳（<span class="block2">手机：</span><span class="block2" …>
+# <em class="yellow_left_mobile_cpc"><img src="/purchase/buildStringToimg2.php?…&fei=1&en_corpid=…">），
+# 标签带 class、值落在紧接其后的那一个 span 里，码图还是 buildStringToimg**2**.php 那一族。
+# 旧 _FIELD_RE/_CONTACT_SCOPE_RE 只认不带属性的 <span>、旧 _CODE_RE 的 `\.php` 又被那个 2 顶开，
+# 于是这一跳 200 拿回来却一个字段、一张码图原料都读不出——「号在图里」被记成「这家没联系方式」。
+# 现在这两套判据按上面的实机形状都放宽了（放宽只多认形状，不新认语义，contact_us 那两种旧模板原样命中）。
+SHOP_HOME_URL = "http://{slug}.cn.makepolo.com/"
+SHOP_HOST = "http://{slug}.cn.makepolo.com"
 IMG_URL = "http://{slug}.cn.makepolo.com/purchase/buildStringToimg.php?t_page={style}&phone={token}"
+# 商铺自己的产品中心页：列表卡那几个产品 id 都没给明文手机时的**第三条取号腿**。
+# 2026-11-15 实机依据：njyuantai01 这一家列表卡带的 id 回的是 25258 字节通用壳（连「公司名片」
+# 块都没有），而这一页 200 且列着本店 20 个在架产品，取第一个 id 去产品页即得全量名片
+# （手机 13675360858 / 张艳美 / 0536-2105088）——所以「id 不行」不等于「店不行」。
+SHOP_PRODUCT_LIST_URL = "http://{slug}.cn.makepolo.com/companyProduct.html"
 # 产品详情页（站方主域）：实测这一页把**手机号明文**写在「公司名片」里，而商铺页 contact_us
 # 把同一个号藏成图片码。列表卡就带 proid，所以这一页是一跳可达的免费明文源。
-PRODUCT_URL = "https://china.makepolo.com/product-detail/{pid}.html"
+#
+# 【为什么是 http 而不是 https】2026-11-15 实机取证：
+#   ① 搜索结果页里站方自己给的产品链接就写成 `http://china.makepolo.com/product-detail/….html`；
+#   ② 这一台主机在 https:443 上吐的是**火山引擎 WAF 的默认证书** `CN=*.volcwaf001.com`
+#      （SAN 只有 *.volcwaf001.com / volcwaf001.com），对 china.makepolo.com 是 hostname mismatch，
+#      每一次 https 请求都在 TLS 阶段就抛 SSLError——不是站点在拦，是我们自己把主通路
+#      （明文手机唯一来源）整条掐了，且旧写法把这一下记成「导航失败」，界面上只看到「详情失败」。
+#   证书用不校验的方式握手是通的（TLSv1.3 协商正常），说明是**站点侧证书装错**而不是网络不通；
+#   校验本来就不该关（关了就是把中间人风险换成便利），而站方自己指的 http 这条路既通又给全量数据。
+PRODUCT_URL = "http://china.makepolo.com/product-detail/{pid}.html"
 
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -135,23 +158,48 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 # 产品卡：区域 + 公司名 + 商铺子域 + 主营（三链接并列：首页 / companyProduct / contact_us）
 _CARD_RE = re.compile(
     r'class="s_product_contact[^"]*">(.*?)</div>', re.S)
+# 【列表项整块】2026-11-16 实机取证（马可波罗 51 家里 50 家「手机/固话/邮箱/微信」四项全空）：
+# 站方已经把产品 id 从「contact_us.html?proid=…」挪到了**产品标题链接**
+# `//china.makepolo.com/product-detail/<id>.html`，它落在 `s_product_item` 块的上半区，
+# 而本文件过去只遍历 `s_product_contact` 那一小段——于是 proid 恒空，「产品页明文手机」这条
+# docstring 里写着「实测最硬的一条通路」的腿整轮**一次请求都没发过**，且账上没有一行说过
+# 这件事（`src_count` 只累加、从没被打出来过）。所以这里按整块取：产品 id 与联系块同属一家。
+# `_CARD_RE` 仍留着：公司名/主营/属地照旧从联系块里取，口径与旧版一字不动（少改一处是一处）。
+_ITEM_RE = re.compile(r'class="s_product_item[^"]*">(.*?)(?=<div class="s_product_item|\Z)',
+                      re.S)
 _CITY_RE = re.compile(r"\[([\u4e00-\u9fa5A-Za-z ]{2,20})\]")
 _SHOP_RE = re.compile(r"http://([\w\-]+)\.cn\.makepolo\.com/")
 _NAME_RE = re.compile(r'cn\.makepolo\.com/"[^>]*>\s*([^<]{4,60}?)\s*</a>')
 _PROD_RE = re.compile(r'companyProduct\.html"[^>]*>\s*([^<]{4,300}?)\s*</a>')
 # 列表卡里就带产品 id（contact_us.html?proid=…）：拿着它就能一跳跳到写了明文手机的产品页
 _PROID_RE = re.compile(r'(?:contact_us\.html\?proid=|product-detail/)(\d{9,14})')
-# 号码图片码：通道名(t_page) 与密文 token 都在 URL 里，token 长度直接给出号码字符数
-_CODE_RE = re.compile(r'buildStringToimg\.php\?t_page=(\w+)&phone=([^"\'\s&]+)')
-# 【码图归属本店判据①】挂在「手机/电话/联系电话」标签作用域里的码图＝本店登记联系方式。
+# 号码图片码：通道名(t_page) 与密文 token 都在 URL 里，token 长度直接给出号码字符数。
+# `buildStringToimg2?\.php` 里的 `2?` 是 2026-11-15 实机补的：商铺首页 block2 壳挂的是
+# buildStringToimg**2**.php（多两个参数 fei=1|2 与 en_corpid=<每店一份的密文>），旧写法
+# `buildStringToimg\.php` 正好被那个 2 顶开，整页码图一张都不认（通路账上的「码图 0 次」就是这么来的）。
+_CODE_RE = re.compile(r'buildStringToimg2?\.php\?t_page=(\w+)&phone=([^"\'\s&]+)')
+# 码图的**整条 src**：请求时必须照页面上写的来（含 fei/en_corpid），少一个参数站方就给 0 字节。
+_CODE_SRC_RE = re.compile(r'(?:src|data-src|data-original)\s*=\s*["\']'
+                          r'([^"\'\s]*buildStringToimg2?\.php\?[^"\'\s]*)["\']', re.I)
+# 产品中心页里的自家产品 id：两种形状都认（列表卡给 china.makepolo.com/product-detail/<id>.html，
+# 商铺自家给 {slug}.cn.makepolo.com/product/<id>.html）。
+_CP_PID_RE = re.compile(r'/product(?:-detail)?/(\d{9,14})\.html')
+# 【码图归属本店判据①】挂在「手机/电话/固定电话/联系电话」标签作用域里的码图＝本店登记联系方式。
 # 用字段语义而不是区块类名划线，是因为实测里同一份号码会同时出现在好几个容器
-# （connect_msg 的「手机：」、弹窗「供应商：」、cont_num_box2 的「联系电话」框），
-# 而推广块 cont_num_box2 装的偏偏也可能是本店号——按类名黑白名单必错。
+# （connect_msg 的「手机：」、弹窗「供应商：」、cont_num_box2 的「联系电话」框、首页 block2 的
+# 「yellow_left_mobile_cpc」），而推广块 cont_num_box2 装的偏偏也可能是本店号——按类名黑白名单必错。
+# `_SPAN_OPEN` 允许标签带属性、并允许值落在紧接其后的那一个 span/li 里（首页 block2 就是这么写的）；
+# 只多跨**一层开标签**，所以空值栏仍停在它自己的闭标签上，不会把下一栏的值串过来。
+_SPAN_OPEN = r"(?:<span[^>]*>|<li[^>]*>)"
+_SPAN_NEXT = r"(?:</span>\s*(?:<br\s*/?>\s*)?" + _SPAN_OPEN + r"|\s*)"
 _CONTACT_SCOPE_RE = re.compile(
-    r"(?:<span>|<li>)\s*(?:手机|电话|联系电话)\s*[：:]\s*(.*?)\s*(?:</span>|</li>)", re.S)
-# 明文字段：A 型在 <span>、B 型在 <li>，一并抓（标签词按两种模板的写法列全）
-_FIELD_RE = re.compile(r"(?:<span>|<li>)\s*(联系人|联系电话|电话|手机|传真|Email|邮箱|"
-                       r"公司地址|地址|邮政编码|QQ)\s*[：:]\s*(.*?)\s*(?:</span>|</li>)", re.S)
+    _SPAN_OPEN + r"\s*(?:手机|电话|固定电话|联系电话)\s*[：:]\s*" + _SPAN_NEXT +
+    r"(.*?)\s*(?:</span>|</li>)", re.S)
+# 明文字段：A 型值在同一条 span、B 型在 <li>、首页 block2 型值在紧接其后的 span，三种一并抓
+# （标签词按三种模板的写法列全）
+_FIELD_RE = re.compile(_SPAN_OPEN + r"\s*(联系人|联系电话|电话|手机|固定电话|传真|Email|邮箱|"
+                       r"公司地址|地址|邮政编码|QQ)\s*[：:]\s*" + _SPAN_NEXT +
+                       r"(.*?)\s*(?:</span>|</li>)", re.S)
 _META_RE = re.compile(r'<meta\s+content="([^"]{20,400}?)"\s+name="description"', re.S)
 
 # ── 产品详情页的「公司名片」：手机号明文就写在这里，而且同一张卡里自带归属自证 ──
@@ -172,6 +220,13 @@ _PD_FAX_RE = re.compile(r"<span>传</span>真\s*[:：]\s*(?:&nbsp;|\s)*([\d\-+()
 _PD_ADDR_RE = re.compile(r"<span>地</span>址\s*[:：]\s*(?:&nbsp;|\s)*([^<]{6,90})")
 _PD_NAME_RE = re.compile(r'<p class="n">([^<]{2,20})</p>\s*<p class="p">\s*(1[3-9]\d{9})?\s*</p>')
 _TAG_RE = re.compile(r"<[^>]+>")
+# HTML 注释里的东西页面上不展示，一律不算联系方式（与 _in_comment 对码图的处置同一条理由）：
+# 实测商铺首页在码图旁边并排写着 `<!-- <em class="show_sub_cpc_fixphone">025-****1400</em>-->`
+# 这类「站方自己掩好位等填」的残留，跨栏取值一放宽就会被读进字段文本里。
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# 字段值里挂着的码图整段摘掉（连 `&fei=…&en_corpid=…` 的尾巴一起）：`_CODE_RE` 的字符类
+# 在 & 处就停了，只摘掉前半段会把参数留在文本里，看着就像一栏有值。
+_CODE_STRIP_RE = re.compile(r"buildStringToimg2?\.php\?[^\s\"'<>]*")
 # 站方模板假值（实测库里出现，入库就是空号/客服号）
 _FAKE_NUMBERS = {"17368614555", "400-000-0000", "13800138000"}
 _FAKE_MAILS = ("makepolo.com", "makepolo.cn")
@@ -308,6 +363,12 @@ class MakepoloCrawler(CdpSiteCrawler):
     # 同店其它产品页最多试几个（_pd_alternates）：实测 48% 的店在列表里就有 2 个以上
     # 产品 id，试两个还拿不到基本就是整店没登记手机，再打只会白耗流量。
     PD_ALT_TRIES = 2
+    # 第三条腿（_shop_product_alternates）的成本闸：一店最多取几个自家产品 id、
+    # 一轮最多为几家走这条路。取 2 个 id 与 PD_ALT_TRIES 同档（实测第一个就出货的占多数）；
+    # 上限 20 家的依据是「一条不通的腿不该吃掉整轮预算」——一店这一跳是 1 + 2 个请求，
+    # 20 家 ≈ 60 个请求，与一店三张码图的探测量同级，超出后只在日志里说一次。
+    CP_PID_TRIES = 2
+    CP_SHOP_CAP = 20
 
     def __init__(self, port=9255):
         super().__init__(port)
@@ -320,8 +381,18 @@ class MakepoloCrawler(CdpSiteCrawler):
         self._img_off = False
         self._num_shops = {}          # 号码 → 见过它的店铺集合（跨店公共号哨兵用）
         self._last_status = 0         # 最近一次 _fetch 的 HTTP 状态码（用来区分 439 死铺与导航失败）
-        # 号码通路账目（结束日志用，让用户看见「手机号是从哪几条路拿到的」）
+        # 号码通路账目（结束日志用，让用户看见「手机号是从哪几条路拿到的」）。
+        # 键 = **号码来源**而不是抓取路径：三条产品页路径（列表卡 id / 同店其它 id / 自家产品中心
+        # id）拿到的都是同一种「产品页公司名片」明文号，混进一个键才不加戏；第三条腿自己走了几家、
+        # 出货几家另记在 _cp_shops/_cp_hits（渲染见 stats()["cp_leg"]），免得同一个号被两条腿各记一次。
         self.src_count = {"产品页": 0, "码图": 0, "子域": 0, "邮箱前缀": 0, "明文": 0}
+        self._cp_shops = 0            # 第三条腿为几家发过产品中心页这一跳
+        self._cp_hits = 0             # 其中靠它拿到明文手机的家数
+        # 通路「有没有原料」的账（口径见 _leg_warn / stats）：认出的卡数、其中带产品 id 的张数、
+        # 已经开口说过的取证句（同一句一轮只说一次）
+        self._leg_cards = 0
+        self._leg_pid = 0
+        self._leg_said = set()
 
     def _new_session(self):
         s = requests.Session()
@@ -338,7 +409,33 @@ class MakepoloCrawler(CdpSiteCrawler):
         self._img_dead = 0
         self._img_off = False
         self.src_count = {"产品页": 0, "码图": 0, "子域": 0, "邮箱前缀": 0, "明文": 0}
+        self._cp_shops = 0
+        self._cp_hits = 0
+        self._leg_cards = 0
+        self._leg_pid = 0
+        self._leg_said = set()
         return True
+
+    def _leg_warn(self, why):
+        """「某条通路这一次一根原料都没拿到」那一类话只说一次（每页都会调 parse_list，
+        逐页播报会把这一句刷成屏，而刷屏的结局是没人读——与 `_note_deep_block` 同一族纪律）。"""
+        if why not in self._leg_said:
+            self._leg_said.add(why)
+            self._log(f"  ⚠ 通路取证：{why}")
+
+    def stats(self):
+        """基类账目 + 本站独有的「号码是从哪条腿来的」与「这条腿有没有原料」。
+        上一轮就是缺这一格：产品页那条腿整轮 0 次、`src_count` 只累加从不外读，
+        于是「51 家 50 家四项全空」在账上长得跟「平台就是不给号码」一模一样。"""
+        st = super().stats()
+        st["legs"] = dict(self.src_count)
+        st["leg_pid_raw"] = f"{self._leg_pid}/{self._leg_cards}"
+        # 第三条腿的账（走了几家 / 靠它出货几家）：这一条 0 次调用意味着「列表卡给的 id
+        # 全不给看」的店本轮只能靠码图，那是诊断信息而不是号码来源，所以不并进 legs。
+        # 一家都没走过时不给键——渲染层拿不到就不显示，避免在别的站上凭空多一段空账。
+        if self._cp_shops:
+            st["cp_leg"] = f"自家产品中心 {self._cp_hits}/{self._cp_shops} 家"
+        return st
 
     # ── 旁路浏览器：本站不占用标签 ────────────────────────────
     def start_browser(self, headed=True):
@@ -348,6 +445,9 @@ class MakepoloCrawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但借来的一枚必须还（空壳会把为跑完 JS 质询壳而借的标签留到
+        收工之后；由来与判据见 cdp_base.CdpSiteCrawler.release_tab）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
@@ -383,12 +483,16 @@ class MakepoloCrawler(CdpSiteCrawler):
         except Exception:
             return r.text or ""
 
-    def _fetch(self, url, enc="utf-8", tries=3, guarded=True, referer=""):
+    def _fetch(self, url, enc="utf-8", tries=3, guarded=True, referer="", deep=False):
+        """取一页。`deep=True`＝请求的是**某一家的深链**（产品页/联系页/商铺首页），
+        不是通道入口：它的被拒只记深链单笔账，不写 `_block_reason`、不钉恢复探测页、
+        不触发整通道冷却。理由与实测数据见 cdp_base.http_block_reason 的 deep 分支。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
             return ""
         last = ""
+        deep_refused = ""         # 非空＝这一跳是被拒的深链（原因），见循环内 deep 分支
         self._last_status = 0
         for i in range(max(1, tries)):
             try:
@@ -398,8 +502,22 @@ class MakepoloCrawler(CdpSiteCrawler):
                 self._mark_activity()
                 self._last_status = r.status_code
                 text = self._decode(r, enc)
-                block = self.http_block_reason(r.status_code, text, url, r.headers)
+                block = self.http_block_reason(r.status_code, text, url, r.headers, deep=deep)
                 if block:
+                    if deep:
+                        self._note_deep_block(url, block)
+                        deep_refused = block
+                        # 200·JS 质询壳是这里唯一「机器自己就能解」的一档：借一枚标签把那段
+                        # JS 跑完、抄回通行证，再重试这一跳（403/439 那种资源级被拒开标签也
+                        # 没用，白烧一个标签）。判据、预算、成败口径都在基类那把手里（理由
+                        # 见 cdp_base._deep_shell_retry），本站只负责「再取一次」怎么取。
+                        got = self._deep_shell_retry(
+                            url, r.status_code, text,
+                            lambda: self._fetch(url, enc=enc, tries=1, guarded=False,
+                                                referer=referer, deep=deep))
+                        if got is not None:
+                            return got
+                        break
                     self._block_reason = block
                     last = f"HTTP {r.status_code}（防采插页）"
                     break
@@ -423,8 +541,20 @@ class MakepoloCrawler(CdpSiteCrawler):
         if guarded and self._block_reason:
             if self.handle_http_block(url):
                 self._block_reason = ""
-                return self._fetch(url, enc=enc, tries=tries, guarded=False, referer=referer)
-        self._note_request_error(last)
+                return self._fetch(url, enc=enc, tries=tries, guarded=False,
+                                   referer=referer, deep=deep)
+        # 深链的**状态码级**被拒：只记深链那一本账，不进通道入口的「取页失败」账，也不在
+        # 这里刷日志（`_note_deep_block` 首次已在主机级打过一行，逐家再打会把整轮日志刷满
+        # 同一句话）。2026-11-15 实机马可波罗 contact_us 大面积 403：旧写法既写
+        # `_block_reason` 又把探测页钉在那条永远 403 的深链上，恢复探测打不通、整条通道
+        # 白等 765 秒。分账之后深链自己不再触发等待；上面那段等待只在**通道级**确实被
+        # 标记拦停时发生——那种等待探的是入口页、等得到结果，能让后面整批深链一起复活，
+        # 所以这一段短路必须留在等待**之后**（跳过等待才是真的丢数据）。
+        if deep_refused:
+            return ""
+        # 深链被拒**之外**的失败照旧记：连不上是主机的属性，与请求哪一页无关，
+        # 该累计连击、该拉黑就拉黑（口径见 cdp_base._note_fetch_fail）。
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ 马可波罗请求失败（{last}）：{url[:80]}")
         return ""
 
@@ -452,35 +582,49 @@ class MakepoloCrawler(CdpSiteCrawler):
         「刀片,刀夹,其他机床附件,刀杆,夹头」、另一张写「其他通用五金配件,钻头,螺母,铣刀」），
         而翻页时首卡先被标记已见、后面的卡直接跳过——只看首卡判相关就会把真同行误杀。"""
         out, idx = [], {}
-        for chunk in _CARD_RE.findall(html or ""):
-            sm = _SHOP_RE.search(chunk)
+        # 整块优先；站方模板又改了、整块认不出来时退回旧的「联系块」遍历——退回必须当场
+        # 说出来，因为旧形状里取不到产品 id，那条腿等于没原料（见 _ITEM_RE 的实机取证）。
+        chunks = _ITEM_RE.findall(html or "")
+        if not chunks:
+            chunks = [c for c in _CARD_RE.findall(html or "")]
+            if chunks:
+                self._leg_warn("列表项整块认不出来，已退回旧的「联系块」取法"
+                               "（这种形状下产品 id 取不到，明文手机那条腿没原料）")
+        for chunk in chunks:
+            seg_m = _CARD_RE.search(chunk)
+            seg = seg_m.group(1) if seg_m else chunk
+            sm = _SHOP_RE.search(seg) or _SHOP_RE.search(chunk)
             if not sm:
                 continue
             slug = sm.group(1).lower()
-            pidm = _PROID_RE.search(chunk)
-            pm = _PROD_RE.search(chunk)
+            pids = _PROID_RE.findall(chunk)
+            self._leg_cards += 1
+            if pids:
+                self._leg_pid += 1
+            pm = _PROD_RE.search(seg)
             prod = clean_text(pm.group(1)) if pm else ""
             if slug in idx:
                 e = out[idx[slug]]
-                alt = pidm.group(1) if pidm else ""
-                if alt and alt != e["产品ID"] and alt not in e["备选产品ID"]:
-                    e["备选产品ID"].append(alt)
+                # 同店多卡：除首卡那个号以外的产品 id 都收进备选，供 `_pd_alternates` 换页重试
+                for alt in pids:
+                    if alt and alt != e["产品ID"] and alt not in e["备选产品ID"]:
+                        e["备选产品ID"].append(alt)
                 if prod and prod not in e["主营全文"]:
                     e["主营全文"] = (e["主营全文"] + " " + prod)[:600]
                 continue
-            nm = _NAME_RE.search(chunk)
+            nm = _NAME_RE.search(seg)
             name = clean_text(nm.group(1)) if nm else ""
             if len(name) < 4:
                 continue
             if any(x in name for x in ("首页", "登录", "注册", "更多", "下一页")):
                 continue
-            cm = _CITY_RE.search(chunk)
+            cm = _CITY_RE.search(seg)
             idx[slug] = len(out)
             out.append({
                 "公司名称": name[:60],
                 "公司ID": slug,
                 "memberId": slug,
-                "产品ID": pidm.group(1) if pidm else "",
+                "产品ID": pids[0] if pids else "",
                 "备选产品ID": [],
                 "公司网址": f"http://{slug}.cn.makepolo.com/",
                 "详情URL": SHOP_URL.format(slug=slug),
@@ -491,6 +635,13 @@ class MakepoloCrawler(CdpSiteCrawler):
                 "所在区域": re.sub(r"\s+", " ", cm.group(1)).strip()[:30] if cm else "",
                 "标题": name[:80],
             })
+        # 整轮都没拿到产品 id＝产品页那条腿一根原料都没有（与「腿通了但这家不给看」是两件事：
+        # 后者在 deep_block 账里，前者只有这一格说得出）。不响这一句的话，「50 家四项全空」
+        # 就只能被读成「平台不给号码」，正是上一轮缺的那句。
+        if self._leg_cards and not self._leg_pid:
+            self._leg_warn(f"列表 {self._leg_cards} 张卡一张都没带产品 id，"
+                           "「产品页明文手机」这条腿本轮没原料（多半是站方又改了列表模板），"
+                           "号码只剩联系页/商铺首页的码图一条路")
         return out
 
     def stub_relevance_text(self, stub):
@@ -556,7 +707,7 @@ class MakepoloCrawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -599,9 +750,15 @@ class MakepoloCrawler(CdpSiteCrawler):
         return page.rfind("<!--", 0, idx) > page.rfind("-->", 0, idx)
 
     def _shop_code_tokens(self, page, slug):
-        """返回本页属于本店的码图 [(style, token)]，按页面出现顺序去重。
+        """返回本页属于本店的码图 [(style, token, 页面原样 src)]，按页面出现顺序去重。
 
-        为何必须做这一步（实机串号取证，2026-11-04）：
+        第三个元素是**页面上写着的那条 URL**（2026-11-15 实机补）：商铺首页 block2 壳挂的是
+        `buildStringToimg2.php?t_page=y_left&phone=<token>&fei=1&en_corpid=<每店一份的密文>`，
+        站方按 en_corpid 判店，重建 URL 只会把这两个参数丢掉、换回 0 字节正文——通路账上的
+        「码图 0 次」有一半是这么来的。取不到 src（token 只出现在 JS 字符串里）时回空串，
+        由 `grab` 退回旧的 IMG_URL 重建法。
+
+        为何必须做归属这一步（实机串号取证，2026-11-04）：
           长沙东方工业泵厂(csdfgyb123) 与 智恒厦门微电子(51chinasensor) 页面里的
           「联 系商家」弹窗(phone_mask_list) 各挂 3 张码图，文案一字不差
           （进口配件 / 进口品牌现货 / 现货微信同步），其中两张识别结果完全相同：
@@ -625,6 +782,12 @@ class MakepoloCrawler(CdpSiteCrawler):
         for seg in _CONTACT_SCOPE_RE.findall(page):
             for style, tok in _CODE_RE.findall(seg):
                 owned.add((style, tok))
+        # (style, token) → 页面上原样写着的那条 src（同一张号多处出现时保留第一条 img）
+        src_of = {}
+        for src in _CODE_SRC_RE.findall(page):
+            m = _CODE_RE.search(src)
+            if m:
+                src_of.setdefault((m.group(1), m.group(2)), src)
         out, seen = [], set()
         for m in _CODE_RE.finditer(page):
             key = (m.group(1), m.group(2))
@@ -635,7 +798,7 @@ class MakepoloCrawler(CdpSiteCrawler):
             if key not in owned and own not in page[max(0, m.start() - 1500):m.start() + 400].lower():
                 continue                       # 既不属本店联系栏，也不在本店子域卡片里 → 推广位
             seen.add(key)
-            out.append(key)
+            out.append((key[0], key[1], src_of.get(key, "")))
         return out
 
     # ── 号码图片码：整店一次批量取，一轮不成再补一轮 ────────────
@@ -644,7 +807,10 @@ class MakepoloCrawler(CdpSiteCrawler):
         0 字节空正文＝站方不放图（这家店没开、或图片服务当前不给）。
         两阶段取法（常量里有实测数据）：先探测前两张，命中就把这一家其余全取；
         探测不中只再补一张——出图是按店的，在不出图的店上多打毫无意义。
-        候选列表已经过归属过滤（见 _shop_code_tokens），不会把 CPC 广告主的号读成本店手机。"""
+        候选列表已经过归属过滤（见 _shop_code_tokens），不会把 CPC 广告主的号读成本店手机。
+        `shop_url` 传**这张页面真正来自的那条 URL**：取图要用它做 base 把页面上写着的
+        相对 src（`/purchase/buildStringToimg2.php?…&fei=…&en_corpid=…`）拼成绝对地址，
+        换成重建的 URL 就会丢参数、拿 0 字节（2026-11-15 实机）。"""
         codes = self._shop_code_tokens(page, slug)   # 同一号码在页上常出现两处，且要排除推广位
         if not codes:
             return [], []
@@ -652,22 +818,43 @@ class MakepoloCrawler(CdpSiteCrawler):
             return [], []
         mobiles, tels = [], []
         got_png = [0]
+        img_last = ""          # 最近一张没拿到 PNG 的**原因**（停用那句日志要带上它）
 
-        def grab(style, token):
+        def grab(style, token, src):
             """返回 None＝这一张没拿到 PNG；返回空串＝拿到了图但读不出可信号码。"""
-            url = IMG_URL.format(slug=slug, style=style, token=token)
+            nonlocal img_last
+            # 页面原样 URL 优先（含 fei/en_corpid）；页上只留了 token、没留 src 的少数形状
+            # 才退回旧的整条重建，至少不比原版差
+            url = urljoin(shop_url or SHOP_HOST.format(slug=slug), src) if src else \
+                IMG_URL.format(slug=slug, style=style, token=token)
             # 图片码是按店的子域取的，熔断账也就按这一台店记（口径见 cdp_base._skip_dead_host）：
             # 连不上与「这家没开图」是两件事，但两者的处置一样——别再为这一家付连接超时
             if self._skip_dead_host(url):
+                img_last = "主机已熔断（本轮不再为它付连接超时）"
                 return None
             body = b""
+            status = 0
             try:
                 r = self._session.get(url, timeout=http_timeout(20), headers={"Referer": shop_url})
                 self._mark_activity()
+                status = r.status_code
                 body = r.content or b""
-            except Exception:
-                body = b""
+            except Exception as e:
+                # 旧写法 `except: body=b""` 把死因整条吞掉：30 家之后停用图片码通路时，
+                # 用户只看到「连续 30 家都不放号码图」，而真凶可能是本机 DNS／连不上
+                # ——那两条处方完全不同（前者是站方不放，后者是换网络）
+                img_last = self._shape_request_error(e)
+                return None
             if body[:4] != b"\x89PNG":
+                # 深链账：这张码图被拒是**这一家/这条路**的属性，不写通道级 _block_reason
+                # （口径见 cdp_base.http_block_reason 的 deep 分支）
+                why = self.http_block_reason(status, body[:2000].decode("utf-8", "ignore"),
+                                             url, deep=True)
+                if why:
+                    self._note_deep_block(url, why)
+                    img_last = why
+                else:
+                    img_last = f"HTTP {status}，正文 {len(body)} 字节不是 PNG"
                 return None
             got_png[0] += 1
             n = expected_chars(token)
@@ -677,9 +864,9 @@ class MakepoloCrawler(CdpSiteCrawler):
 
         def take(batch):
             hit = False
-            for style, token in batch:
+            for style, token, src in batch:
                 self._pace_before_request()
-                num = grab(style, token)
+                num = grab(style, token, src)
                 if num is None:
                     continue
                 hit = True
@@ -700,8 +887,11 @@ class MakepoloCrawler(CdpSiteCrawler):
             self._img_dead += 1
             if self._img_dead >= self.IMG_DEAD_STREAK:
                 self._img_off = True
+                # 带上最后一次死因：「站方不放图」与「本机连不上/被拒」是两条不同的处方，
+                # 只说前者会让人去查站点，只说后者会让人去查网络
                 self._log("  ⛔ 马可波罗连续 %d 家都不放号码图：本轮停用图片码通路"
-                          "（只取明文/子域/邮箱前缀），不再白耗请求" % self._img_dead)
+                          "（只取明文/子域/邮箱前缀），不再白耗请求；最后一次：%s"
+                          % (self._img_dead, img_last or "无明确原因（多为站方不放图）"))
         else:
             self._img_dead = 0
         return mobiles, tels
@@ -729,11 +919,57 @@ class MakepoloCrawler(CdpSiteCrawler):
         只补空缺字段，已有的值不覆盖；归属仍然按本店子域自证（见 _parse_product_page）。"""
         for alt in (stub.get("备选产品ID") or [])[:self.PD_ALT_TRIES]:
             cand = self._parse_product_page(
-                self._fetch(PRODUCT_URL.format(pid=alt), enc="utf-8", referer=HOME_URL), slug)
+                self._fetch(PRODUCT_URL.format(pid=alt), enc="utf-8", referer=HOME_URL,
+                            deep=True), slug)
             for k, v in (cand or {}).items():
                 if not pd.get(k):
                     pd[k] = v
             if pd.get("手机"):
+                break
+        return pd
+
+    def _shop_product_alternates(self, slug, pd):
+        """列表卡那几个产品 id 都没给明文手机时，从**这家自己的产品中心页**再取 id 试。
+
+        实测依据（2026-11-15 留档取证，不是猜的）：
+          ① 列表卡带的 id 有相当一部分指向已下架/推广位的产品页——那一跳回 200，
+             正文却是同一份 25258 字节的通用壳、连「公司名片」块都没有
+             （genesisworks / jndsmygs / chaoqiangqp 三家都是这样；同一时刻同店另一个
+             id 却给全量名片，所以问题在 id 不在店）；
+          ② 同店 `{slug}.cn.makepolo.com/companyProduct.html` 200 且自家产品成串
+             （njyuantai01 一例 20 个 id：/product/101104014473.html…），拿它第一个 id
+             去产品页即得 手机 13675360858、联系人、电话、地址全量名片。
+        成本闸：这一跳只在「前两条产品页腿都没出货」时才发，一店最多取 CP_PID_TRIES 个 id，
+        一轮最多为 CP_SHOP_CAP 家走这条路（超出就只说一次，绝不悄悄烧预算）。
+        归属仍然按名片里的子域自证（见 _parse_product_page），不因为 id 来自本店页面就免检。"""
+        if self._cp_shops >= self.CP_SHOP_CAP:
+            self._leg_warn(f"自家产品中心页这条腿本轮已走完 {self._cp_shops} 家"
+                           f"（上限 {self.CP_SHOP_CAP} 家），后面的店不再多打，只走码图")
+            return pd
+        self._cp_shops += 1
+        list_url = SHOP_PRODUCT_LIST_URL.format(slug=slug)
+        page = self._fetch(list_url, enc="utf-8",
+                           referer=SHOP_HOME_URL.format(slug=slug), deep=True)
+        if not page:
+            return pd
+        pids = list(dict.fromkeys(_CP_PID_RE.findall(page)))
+        if not pids:
+            # 200 但一个 id 都没列出＝站方把产品中心页也换成 JS 注水了，
+            # 这一条腿从此没原料（与「腿通了但这家不给看」是两件事，必须开口说）
+            self._leg_warn("产品中心页 200 却没列出一个自家产品 id，"
+                           "「自家产品页」这条腿本轮没原料（多半是站方改成 JS 注水）")
+            return pd
+        for pid in pids[:self.CP_PID_TRIES]:
+            cand = self._parse_product_page(
+                self._fetch(PRODUCT_URL.format(pid=pid), enc="utf-8", referer=list_url,
+                            deep=True), slug)
+            for k, v in (cand or {}).items():
+                if not pd.get(k):
+                    pd[k] = v
+            if cand.get("手机"):
+                # 出货记在 _cp_hits（渲染成 stats()["cp_leg"]），号码来源仍然算「产品页」那一格：
+                # 三条路径取回的是同一种名片，分开计会让一条号码在账上出现两次
+                self._cp_hits += 1
                 break
         return pd
 
@@ -766,6 +1002,31 @@ class MakepoloCrawler(CdpSiteCrawler):
         return out
 
     # ── 详情：contact_us（UTF-8）→ 明文 + 码图 + 三条免 OCR 通路 ──
+    def _refuse_why(self, legs):
+        """两条页腿都没拿回正文时，把它们各自的**真实**死因凑成一句话。
+
+        2026-11-15 实机教训：这一句旧写法硬写着「都不给看（403）」，而商铺首页后来回的是
+        HTTP 200 + 14KB 火山引擎 WAF 人机验证壳——照那句去查路径的人永远查不到真凶。
+        原因优先取深链账里那一句（`http_block_reason` 真看过响应体，比状态码懂得多），
+        账上没有才退回状态码，两个都没有就说「空响应」，绝不编一个原因上去。
+        ⚠ 取值必须**按 URL** 查（`_deep_block_why`），不能按主机查：同一家主机下
+        contact_us.html 的 403 和商铺首页的 200 质询壳是两条不同的死因，主机账只留最后一条，
+        拿它配状态码就会给 403 那一腿印上壳的原因（2026-11-16 实机就是这个假话）。"""
+        seg = []
+        for name, u, code in legs:
+            if not u:
+                continue
+            why = self._deep_block_why(u)
+            if not code:
+                seg.append(f"{name}空响应")
+            elif why.startswith(f"HTTP {code}") or why.startswith(f"站点返回 HTTP {code}"):
+                seg.append(f"{name} {why}")          # 状态码级被拒：那句话里已经带码了
+            elif why:
+                seg.append(f"{name} HTTP {code}（{self._why_short(why)}）")
+            else:
+                seg.append(f"{name} HTTP {code}")
+        return "、".join(seg) or "两条页腿都没发出请求"
+
     def crawl_detail(self, stub):
         rec = self._base_rec(stub)
         slug = stub.get("公司ID") or stub.get("memberId") or ""
@@ -778,15 +1039,44 @@ class MakepoloCrawler(CdpSiteCrawler):
         pid = str(stub.get("产品ID") or "")
         self._last_status = 0        # 没有 proid 就根本不发这一跳，清掉上一家的残留值
         pd = self._parse_product_page(
-            self._fetch(PRODUCT_URL.format(pid=pid), enc="utf-8", referer=HOME_URL) if pid else "",
+            self._fetch(PRODUCT_URL.format(pid=pid), enc="utf-8", referer=HOME_URL,
+                        deep=True) if pid else "",
             slug)
         prod_status = self._last_status
-        page = self._fetch(url, enc="utf-8", referer=stub.get("公司网址", HOME_URL))
+        page = self._fetch(url, enc="utf-8", referer=stub.get("公司网址", HOME_URL), deep=True)
         shop_status = self._last_status
+        # 联系页不给看时换**商铺首页**这条腿（2026-11-15 实机：contact_us 大面积 403，
+        # 而同期商铺首页基本全 200）。这一跳只在联系页空了才发，所以放行正常的店不会多花请求；
+        # 状态码取这一跳自己的（商铺首页 439 同样是「整店不给看」）。
+        # 旧注释在这里写着「首页与联系页字段壳同构、_FIELD_RE 原样能用」——那句是错的，
+        # 首页是 block2 壳（标签带 class、值落在下一条 span、码图是 buildStringToimg2.php），
+        # 判据没跟上时这一跳拿回 44KB 却读不出一个字段，等于白取（取证与修法见 SHOP_HOME_URL 上方）。
+        home_status = 0
+        home = ""
+        page_url = url          # `page` 真正来自哪条 URL（取码图时要拿它当 base 拼相对 src）
+        if not page:
+            home = SHOP_HOME_URL.format(slug=slug)
+            alt = self._fetch(home, enc="utf-8", referer=HOME_URL, deep=True)
+            home_status = self._last_status
+            if alt:
+                # 这句在换状态码**之前**打：要说的是「联系页那一跳为什么没用」，
+                # 换成商铺首页的 200 就成了废话。原因走 `_refuse_why`（旧写法只印状态码，
+                # 商铺首页回 200 + 验证壳那一档就会打成「联系页没给到（200）」，读的人一头雾水）
+                why = self._refuse_why((("联系页", url, shop_status),))
+                self._log(f"  · 改用商铺首页取字段：{why}")
+                page, shop_status, page_url = alt, self._last_status, home
+                rec["详情URL"] = home
+        # 分档证据只取这一家自己的那一页（联系页或商铺首页）：产品页是全站推荐位，
+        # 号码可能是别家公司的，拿它当「这一页到底给不给号」的证据就是说谎（同 _keep_detail）
+        self._keep_detail(page)
         # 首卡那个产品页没给明文手机：先换同店其它产品页再试（比图片码便宜且更可信，
         # 而且拿到底下就不用花那几个取图请求）。只有产品页那一跳没给手机的店才会多打这 1~2 下。
         if not pd.get("手机"):
             pd = self._pd_alternates(stub, slug, pd)
+        # 列表卡那几个 id 还是没给手机：换**这家自己的产品中心页**上的 id（第三条腿，理由与
+        # 实测数据见 _shop_product_alternates 的 docstring）。仍然没给才去花图片码的请求。
+        if not pd.get("手机"):
+            pd = self._shop_product_alternates(slug, pd)
         if not page and not pd:
             # 两页都空才算没拿到数据。实测有商铺页直接回 439（shop135637108916827 就是）而
             # 产品页名片完整的店：拿产品页那一跳的明文手机照样能成单，不该整条丢掉。
@@ -797,14 +1087,33 @@ class MakepoloCrawler(CdpSiteCrawler):
             # 单独状态：① 用户日志里看得懂；② 它会进种子库（重试两次后锁定），
             # 不会像「导航失败」那样每轮重新白烧两个请求。真正的网络异常仍归导航失败，
             # 下一轮重采。
-            dead = (prod_status in (404, 439) or shop_status in (404, 439))
+            dead = (prod_status in (404, 439) or shop_status in (404, 439)
+                    or home_status in (404, 439))
+            # 「两条页腿都没正文」和 439 不一样，**不**并进 dead：403 在本站是**按路径**
+            # 生效的（同一时刻 contact_us 大面积 403、商铺首页 12/12 全 200），按店锁进
+            # 种子库等于用一条路径的开关去判一整家商铺下架，误伤不可逆。让它留在
+            # 「导航失败」里下一轮重采，代价只是每轮多两个请求。
+            # 这一句从「只在 403 时才说」放宽成「凡是判成可重试就说一次」：2026-11-15 实机里
+            # 商铺首页回 200 + WAF 验证壳时也判可重试，但状态码不是 403、旧条件不成立，
+            # 于是账上只剩一句干巴巴的「导航失败」，没人知道那一页其实是站方在做人机质询。
+            if not dead:
+                why = self._refuse_why((("联系页", url, shop_status),
+                                        ("商铺首页", home, home_status)))
+                self._log(f"  · 两条页腿都没拿到正文（{why}），按可重试处理（不锁库）")
             rec["状态"] = "商铺已关闭(站方不给看)" if dead else "详情页导航失败"
             return rec
         fields = {}
-        for k, v in _FIELD_RE.findall(page):
+        # 先剥 HTML 注释再取字段：商铺首页在码图旁边并排写着 `<!-- <em class=
+        # "show_sub_cpc_fixphone">025-****1400</em>-->` 这种「站方自己掩好位等填」的残留
+        # （实测那串掩码与产品页明文 025-85551400 对得上，说明确实是本店那一栏）。
+        # 值跨到下一条 span 的判据一放宽，这种注释就会被读进字段里——页面上根本不展示的东西
+        # 不能当联系方式（与 _in_comment 处置码图同一条理由）。
+        for k, v in _FIELD_RE.findall(_COMMENT_RE.sub(" ", page or "")):
             v = clean_text(v)      # 实体残留/标签/正规实体/空白一并收拢（见 clean_text）
-            # 码图占位（A/B 两型都把 <img> 夹在字段里）对明文通路没有意义，直接丢掉
-            v = _CODE_RE.sub("", v).strip(" ：:|/")
+            # 码图占位（A/B 两型与首页 block2 型都把 <img> 夹在字段里）对明文通路没有意义，
+            # 整段摘掉：`_CODE_RE` 的字符类在 & 处就停了，只摘前半段会把 `fei=1&en_corpid=…`
+            # 留在文本里，看着就像「这一栏有值」
+            v = _CODE_STRIP_RE.sub("", v).strip(" ：:|/")
             if v and (k not in fields or not fields[k]):
                 fields[k] = v[:120]
         meta = _META_RE.search(page)
@@ -855,9 +1164,11 @@ class MakepoloCrawler(CdpSiteCrawler):
             tels.append(pdt)
             self.src_count["产品页"] += 1
         # 产品页没给手机才花图片码的请求（一店最多探测两张 + 补一张）：
-        # 产品页覆盖率高且一跳到号，把它当首选是为了少打图片接口——少打就是提速＋防封
+        # 产品页覆盖率高且一跳到号，把它当首选是为了少打图片接口——少打就是提速＋防封。
+        # 传 `page_url`（这张页面真正来自的那条 URL）而不是固定 contact_us：页面上的码图
+        # 是相对地址，base 取错一跳，fei/en_corpid 就跟着一起错，站方回 0 字节。
         if not mobiles:
-            cm, ct = self._codes(slug, page, url)
+            cm, ct = self._codes(slug, page, page_url)
             mobiles += cm
             tels += ct
         tels = [t for t in tels if not (fax_digits and re.sub(r"\D", "", t) == fax_digits)]

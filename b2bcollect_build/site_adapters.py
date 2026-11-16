@@ -67,6 +67,9 @@ import shared_chrome as _sc                 # noqa: F401
 import province_filter as _pf               # 属地判定词表（1688/企知道通道的省份核验用）
 import tool_config as _tc                   # 落点口径本体（.app 形态判定只许问一处）
 import cdp_base                             # 数据落点只有一份实现，在本模块里也是它定的
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line, short_reason
 
 for _p in (str(_ROOT / "ali1688_build"), str(_ROOT / "riskbird_build")):
     if _p not in sys.path:
@@ -147,7 +150,7 @@ ADAPTER_ERRORS: Dict[str, str] = {}
 
 def _adapter_fail(name: str, exc: BaseException) -> str:
     """记下适配器加载失败原因并返回那句短文案（打印与登记共用一份，不分叉）。"""
-    short = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+    short = first_line(exc, 160) if str(exc) else type(exc).__name__
     ADAPTER_ERRORS[name] = f"{type(exc).__name__}: {short}"
     return short
 
@@ -372,7 +375,7 @@ def _pf_admit(crawler, result, err=""):
     if verdict == "miss":
         crawler._pf_dropped += 1
         crawler._log(f"🗺 [{pv_display}] {crawler.PLATFORM_NAME}查回的工商登记地址不属目标省份、"
-                     f"不入库：{short}（{text.strip()[:36]}）")
+                     f"不入库：{short}（{short_reason(text, 36)}）")
     else:
         crawler._pf_unknown += 1
         crawler._log(f"🗺 [{pv_display}] 工商地址也判不出属地、保守不入库：{short}")
@@ -480,7 +483,7 @@ if HAS_1688:
             if verdict == "miss":
                 self._pf_dropped += 1
                 self._log(f"🗺 [{pv_display}] 站方 province 参数没筛住、本地按地址拦下："
-                          f"{name}（{text.strip()[:36]}）")
+                          f"{name}（{short_reason(text, 36)}）")
                 return None
             self._pf_unknown += 1
             self._log(f"🗺 [{pv_display}] 页面与公司名都没写省份、无法确认，不入库：{name}")
@@ -522,7 +525,7 @@ if HAS_1688:
                 try:
                     self.driver = self._attach()
                 except Exception as e:
-                    self._log(f"❌ 1688 附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                    self._log(f"❌ 1688 附加共享浏览器失败：{first_line(e, 140)}")
                     self.driver = None
                     return False
                 self._log("✅ 1688 已附加到共享浏览器")
@@ -558,7 +561,10 @@ if HAS_1688:
             底层是 CDP Target.activateTarget——会把共享窗口的可见标签切到那个页。
             因为它在每次 _goto 后都被调，多个 Selenium 会话并行时可见标签就在
             每次翻页/进详情后疯狂跳动（用户看到的“标签不停切换”主因）。
-            改走 CDP /json/list 只读 URL、/json/close 关闭，全程不激活任何标签。"""
+            改走 CDP /json/list 只读 URL、/json/close 关闭，全程不激活任何标签。
+
+            没剪掉的那几枚必须开口（第 32g 条）：旧写法一层 `except …: pass` 把整个
+            清理动作抹平，堆在窗口里的标签就成了「没人认领的孤儿」，下一轮只能另开。"""
             try:
                 import shared_chrome as sc
                 own = getattr(self, "_tab", None)
@@ -569,12 +575,21 @@ if HAS_1688:
                 # 句柄与 target id 对不上（异常情形）：宁可不剪也不误关自己的标签
                 if own not in ids:
                     return
+                stuck = []
                 for t in targets:
                     tid = t.get("id")
                     if tid and tid != own and "1688.com" in (t.get("url") or ""):
-                        sc.close_tab(self.debug_port, tid)
-            except Exception:
-                pass
+                        reason = sc.close_tab(self.debug_port, tid)
+                        if reason:
+                            stuck.append(reason)
+                if stuck:
+                    self._log(f"⚠ 有 {len(stuck)} 枚 1688 的多余标签没关掉（最后原因："
+                              f"{short_reason(stuck[-1], 60)}）——不影响已采数据，"
+                              f"可在浏览器里手动收")
+            except Exception as e:
+                self._log(f"⚠ 清理 1688 多余标签这一步没跑成："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——弹出的新标签可能留着，不影响已采数据")
 
         def close_browser(self):
             """只关自己的标签，共享 Chrome 留给其它通道（基类 driver.quit 虽不杀
@@ -584,7 +599,10 @@ if HAS_1688:
             chromedriver 附加会报「session not created: cannot connect to chrome」
             或直接挂住（浏览器本体活得好好的）。收尾把唯一一个标签也关掉，等于给
             下一轮（以及企知道/风鸟/爱企查三路）留了一个必踩的坑。留着这一个标签
-            零副作用：不占域名、不动别人的标签，附加侧另有补开标签的兜底。"""
+            零副作用：不占域名、不动别人的标签，附加侧另有补开标签的兜底。
+
+            两层失败各自开口（第 32g 条）：会话没关掉、chromedriver 没断开，都会直接影
+            响下一轮「能不能附上去」，静默 pass 只能把事故推到下一轮去重新发生。"""
             try:
                 if self.driver is not None and getattr(self, "_tab", None):
                     handles = self.driver.window_handles
@@ -592,13 +610,17 @@ if HAS_1688:
                         if self.driver.current_window_handle != self._tab:
                             self.driver.switch_to.window(self._tab)
                         self.driver.close()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"⚠ {self.PLATFORM_NAME} 归还本站标签没成功："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——共享 Chrome 里可能还挂着它，请手动关掉（不影响已采数据）")
             try:
                 if self.driver is not None:
-                    self.driver.quit()     # 附加模式下只结束 chromedriver 会话
-            except Exception:
-                pass
+                    self.driver.quit()     # 附加模式下只结束本 chromedriver 会话
+            except Exception as e:
+                self._log(f"⚠ {self.PLATFORM_NAME} 结束 chromedriver 会话没成功："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——若下一轮打不开浏览器，请手动关掉 Chrome 窗口再试")
             self.driver = None
             self._tab = None
 
@@ -654,6 +676,11 @@ if HAS_1688:
                     failed += 1
             return {"pages": self.stat_pages, "listed": self.stat_listed, "ok": ok,
                     "early": self._early_skipped, "filtered": self._filtered_count,
+                    # 逐词相关性砍单账：与 cdp_base.stats() 同两把键，体检器一套判据吃十路
+                    # （缺一格就把「闸门砍光这一词」报成「平台没货」，见第 ⑭ 节）
+                    "kw_filtered": dict(self.kw_filtered), "kw_early": dict(self.kw_early),
+                    # 判定规则更新后本轮重判的旧「类目不符」家数（与 cdp_base 同键）
+                    "rel_refilter": self._rel_refilter,
                     "no_contact": no_contact, "failed": failed, "got": len(self.results),
                     "page_fail": self._page_fail,
                     "last_page_error": self._last_page_error,
@@ -671,6 +698,9 @@ if HAS_1688:
             self._pf_unknown = 0
             self._filtered_count = 0
             self._early_skipped = 0
+            self.kw_filtered = {}
+            self.kw_early = {}
+            self._rel_refilter = 0
             # 链路账与等人账同 cdp_base.reset_run_state 口径：跨轮不清会让上一轮的网络
             # 故障冒充本轮的归因，界面在本轮早已正常时继续喊「等你登录」
             self._page_fail = 0
@@ -684,14 +714,10 @@ if HAS_1688:
             return True
 
         def clear_seen_store(self):
-            self._seen_store = {}
-            self._seen_members = set()
-            try:
-                if self._seen_store_path.exists():
-                    self._seen_store_path.unlink()
-            except Exception:
-                pass
-            return True
+            # 与关键词站共用 cdp_base.reset_seen_store 这一把尺子：本路不继承
+            # CdpSiteCrawler，过去在这里另写了一份（那份清了 _seen_members，基类那一份
+            # 没清），两路「清空种子库」的实际效果并不一样。
+            return cdp_base.reset_seen_store(self, self._seen_store_path) == ""
 
 
 if HAS_QZD:
@@ -759,7 +785,7 @@ if HAS_QZD:
             try:
                 self.start_browser(headed=True, attach_port=self.attach_port)
             except Exception as e:
-                self._log(f"❌ 企知道附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                self._log(f"❌ 企知道附加共享浏览器失败：{first_line(e, 140)}")
                 # 建会话成功、后面的步骤（新开独占标签 / 导航首页）才失败时，driver
                 # 已经挂在 self 上了：只把引用抹掉等于把那份 chromedriver 丢给 GC，
                 # 而这一带是看门狗会反复重试的地方（每重试一次漏一个进程）。close_tab
@@ -791,8 +817,8 @@ if HAS_QZD:
             err = str((result or {}).get("错误") or "").strip()
             if err:
                 if (result or {}).get("可重采"):
-                    return OUTCOME_RETRY, err[:70]
-                return OUTCOME_MISSING, err[:70]
+                    return OUTCOME_RETRY, short_reason(err, 70)
+                return OUTCOME_MISSING, short_reason(err, 70)
             if _shell_check(result):
                 return OUTCOME_SHELL, "详情字段全空（多为登录态失效）"
             return OUTCOME_HIT, ""
@@ -879,16 +905,21 @@ if HAS_QZD:
             return True     # 企知道无种子库（防重复由 PendingCompanyList 三台账负责）
 
         def close_tab(self):
-            """收工时只关自己的独占窗口，共享 Chrome 保持运行。"""
-            try:
-                self._close_own_tab()
-            except Exception:
-                pass
+            """收工时只关自己的独占窗口，共享 Chrome 保持运行。
+
+            `_close_own_tab` 现在把「没关掉」的原因**交回给调用方**：它自己一声不出时，
+            下面那句「归还失败必须开口」永远走不到（第 32g 条）。"""
+            stuck = self._close_own_tab() or ""
+            if stuck:
+                self._log(f"⚠ {self.PLATFORM_NAME} 归还本站标签没成功：{short_reason(stuck, 60)}"
+                          f"——共享 Chrome 里可能还挂着它，请手动关掉（不影响已采数据）")
             try:
                 if self.driver is not None:
                     self.driver.quit()     # 附加模式：只结束本 chromedriver 会话
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"⚠ {self.PLATFORM_NAME} 结束 chromedriver 会话没成功："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——若下一轮打不开浏览器，请手动关掉 Chrome 窗口再试")
             self.driver = None
             self._own_handle = None
 
@@ -983,7 +1014,7 @@ class _ListChannelBase:
                                (self.RETRY_STATUS_WORDS, OUTCOME_RETRY),
                                (self.MISSING_STATUS_WORDS, OUTCOME_MISSING)):
             if any(w in text for w in words):
-                return outcome, text[:70]
+                return outcome, short_reason(text, 70)
         if _shell_check(result):
             return OUTCOME_SHELL, "详情字段全空（多为登录态失效）"
         return OUTCOME_HIT, ""
@@ -1139,18 +1170,27 @@ if HAS_RB:
 
         def _close_own_tab(self):
             """只关自己的标签，共享 Chrome 与别人的标签一个都不碰。
+            返回 ""＝已还完或没东西可还；否则交回一句失败原因给调用方开口。
 
             手上只剩这一个标签时不关：调试端口上 page target 归零后 chromedriver
-            附加会失败或挂住（2026-11-14 实机），下一轮和另外两路名单通道都得踩。"""
+            附加会失败或挂住（2026-11-14 实机），下一轮和另外两路名单通道都得踩。
+
+            为什么不就地 `except …: pass`：这一枚是名单通道真正的「归还」最底层，
+            上面三条腿（收工/复位/启动失败回退）都靠它报事实（第 32g 条）。"""
             try:
-                if self.driver is not None and self._own_handle:
-                    handles = self.driver.window_handles
-                    if self._own_handle in handles and len(handles) > 1:
-                        if self.driver.current_window_handle != self._own_handle:
-                            self.driver.switch_to.window(self._own_handle)
-                        self.driver.close()
-            except Exception:
-                pass
+                if self.driver is None or not self._own_handle:
+                    return ""
+                handles = self.driver.window_handles
+                if self._own_handle not in handles:
+                    return ""              # 已经不在了，等于还完了
+                if len(handles) <= 1:
+                    return ""              # 只剩这一枚：故意不关（理由见上）
+                if self.driver.current_window_handle != self._own_handle:
+                    self.driver.switch_to.window(self._own_handle)
+                self.driver.close()
+                return ""
+            except Exception as e:
+                return f"{type(e).__name__}: {first_line(e, 60)}"
 
         def start_browser(self, headed: bool = True, attach_port: int = None):
             """附加到共享 Chrome 并开一个独占标签（覆写基类的 pkill + 独占实例）。"""
@@ -1170,7 +1210,7 @@ if HAS_RB:
                     # 驱动查找/回退逻辑与 riskbird_build 保持同一套）
                     self.driver = _rb_mod.chrome_driver.create(opts, self._log, ports=[port])
                 except Exception as e:
-                    self._log(f"❌ 风鸟附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                    self._log(f"❌ 风鸟附加共享浏览器失败：{first_line(e, 140)}")
                     self.driver = None
                     return False
                 self.attach_port = port
@@ -1179,7 +1219,7 @@ if HAS_RB:
                     self.driver.switch_to.new_window(self._own_window_type)
                     self._own_handle = self.driver.current_window_handle
                 except Exception as e:
-                    self._log(f"❌ 风鸟开独占标签失败：{str(e).splitlines()[0][:120]}")
+                    self._log(f"❌ 风鸟开独占标签失败：{first_line(e, 120)}")
                     # 刚建好的会话不能一丢了事：driver 引用断了之后只剩 GC 替我们收
                     # chromedriver（见 chrome_driver 顶部那段），这条分支又常在浏览器
                     # 正忙时连续走几次。这里不发 quit（共享浏览器不能由我们替它关），
@@ -1233,12 +1273,19 @@ if HAS_RB:
         def _restart_browser(self, headed: bool = True):
             """会话崩溃时的复位：基类版本会重走 pkill 全部 Chrome，这里只重建自己的标签。"""
             self._log("⚠️ 风鸟浏览器会话已断开，正在复位自己的标签…")
-            self._close_own_tab()
+            stuck = self._close_own_tab() or ""
+            if stuck:
+                self._log(f"⚠ 复位前归还本站标签没成功：{short_reason(stuck, 60)}"
+                          f"——共享 Chrome 里可能还挂着旧的那一枚")
             try:
                 if self.driver is not None:
                     self.driver.quit()     # 附加模式：只结束本 chromedriver 会话
-            except Exception:
-                pass
+            except Exception as e:
+                # 旧会话没断干净就开始新建，下一轮很容易「session not created」：
+                # 这一句就是那条因果链的开头，不许抹（第 32g 条）
+                self._log(f"⚠ 风鸟结束旧 chromedriver 会话没成功："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——若复位后仍打不开，请手动关掉 Chrome 再试")
             self.driver = None
             self._own_handle = None
             time.sleep(2)
@@ -1303,12 +1350,17 @@ if HAS_RB:
             return super().search_company(name)
 
         def close_tab(self):
-            self._close_own_tab()
+            stuck = self._close_own_tab() or ""
+            if stuck:
+                self._log(f"⚠ {self.PLATFORM_NAME} 归还本站标签没成功：{short_reason(stuck, 60)}"
+                          f"——共享 Chrome 里可能还挂着它，请手动关掉（不影响已采数据）")
             try:
                 if self.driver is not None:
                     self.driver.quit()
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"⚠ {self.PLATFORM_NAME} 结束 chromedriver 会话没成功："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——若下一轮打不开浏览器，请手动关掉 Chrome 窗口再试")
             self.driver = None
             self._own_handle = None
 
@@ -1460,7 +1512,7 @@ if HAS_AQC:
             try:
                 return bool(self.start_browser(headed=True, attach=True))
             except Exception as e:
-                self._log(f"❌ 爱企查附加共享浏览器失败：{str(e).splitlines()[0][:140]}")
+                self._log(f"❌ 爱企查附加共享浏览器失败：{first_line(e, 140)}")
                 return False
 
         def is_attached(self):
@@ -1500,8 +1552,12 @@ if HAS_AQC:
         def close_tab(self):
             try:
                 self.close_browser()     # attach_mode 下只关自己那一个标签
-            except Exception:
-                pass
+            except Exception as e:
+                # 里层已经会报具体哪一枚没关掉，这里只补一句「整条收工腿断了」：
+                # 两本账各说各的，不许拿 pass 把失败扮成收工（第 32g 条）
+                self._log(f"⚠ {getattr(self, 'PLATFORM_NAME', '爱企查')} 收工归还标签这一步没跑成："
+                          f"{short_reason(first_line(e, 80), 60)}"
+                          f"——共享 Chrome 里可能还挂着本站标签，请手动关掉（不影响已采数据）")
             self.pin_tab_id = None
 
         # ── 账目 / 清洗 ───────────────────────────────────────

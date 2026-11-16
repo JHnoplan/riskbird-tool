@@ -21,6 +21,9 @@ import time
 from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
+# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
+# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
+from text_shape import first_line, short_reason
 
 try:
     from data_pool import normalize_company_name
@@ -1192,7 +1195,7 @@ class CompanyMatcher:
                         for i, r in enumerate(reranked[:min(5, len(reranked))], 1):
                             company = r.get("company", "")[:30]
                             relationship = r.get("_ai_relationship", "")
-                            reason = r.get("_ai_reason", "")[:50]
+                            reason = short_reason(r.get("_ai_reason", ""), 50)
                             score = r.get("_score", 0)
                             
                             # 用通俗易懂的方式展示关系
@@ -1305,7 +1308,7 @@ class CompanyMatcher:
             ai_results = self._call_deepseek(prompt)
         except Exception as e:
             if progress_cb:
-                progress_cb(f"⚠️ AI 分析失败，使用本地结果: {str(e)[:50]}")
+                progress_cb(f"⚠️ AI 分析失败，使用本地结果: {first_line(e, 50)}")
             return candidates[:top_k]
         if not ai_results:
             return candidates[:top_k]
@@ -1319,7 +1322,7 @@ class CompanyMatcher:
                 for i, ai_item in enumerate(ai_results[:3], 1):
                     company = ai_item.get("company", "")[:25]
                     score = ai_item.get("score", 0)
-                    reason = ai_item.get("reason", "")[:40]
+                    reason = short_reason(ai_item.get("reason", ""), 40)
                     relationship = ai_item.get("relationship", "")
                     progress_cb(f"   {i}. {company} ({score}分)")
                     if relationship:

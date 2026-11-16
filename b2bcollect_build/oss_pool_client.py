@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+# 失败原因收成一行只准一个把手（真源 text_shape.py，零依赖）。
+from text_shape import short_reason
+
 # ── 异常 ──────────────────────────────────────────────────────────────────────
 
 class OSSPoolError(Exception):
@@ -60,6 +63,35 @@ class OSSTransportError(OSSPoolError):
     def __init__(self, message: str, permanent: bool = False):
         super().__init__(message)
         self.permanent = bool(permanent)
+
+
+def _oss_brief(body) -> str:
+    """OSS 返回的错误体 → 一句能照着处置的话。
+
+    由来（第 ㉓ 族同类查全）：这一带六处都写的是 ``resp.text[:200]``。OSS 的错误体是
+    XML（``<?xml ...?><Error><Code>AccessDenied</Code><Message>...</Message>...``），
+    按**字符数**切出来的结果是 ``<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Error><Code>AccessDe`` ——半截标签，既没有结论也没有方向，比不写更费时间。
+    结构化字段本来就在体里，所以这里不截断而是**取值**：Code + Message；不是 XML
+    （网关 HTML 错误页、空体）才退回按标点断句的一行。
+    """
+    text = str(body or "").strip()
+    if not text:
+        return "（空响应体）"
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        return short_reason(text, 200)
+    fields = {}
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag in ("Code", "Message", "RequestId", "EC") and (node.text or "").strip():
+            fields.setdefault(tag, node.text.strip())
+    if not fields:
+        return short_reason(text, 200)
+    brief = " ".join(f"{k}={fields[k]}" for k in ("Code", "Message", "RequestId", "EC")
+                     if k in fields)
+    return short_reason(brief, 200)
 
 
 # ── 密钥解析 ──────────────────────────────────────────────────────────────────
@@ -435,7 +467,7 @@ class OSSPoolClient:
                           timeout=(_CONNECT_TIMEOUT_S, read_to))
         if resp.status_code in (200, 201):
             return resp.headers.get("ETag", "")
-        raise OSSPoolError(f"上传失败 HTTP {resp.status_code}: {resp.text[:200]}")
+        raise OSSPoolError(f"上传失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}")
 
     # ── 下载 JSON ──
 
@@ -461,7 +493,7 @@ class OSSPoolClient:
                 return resp.json(), resp.headers.get("ETag", "")
             except json.JSONDecodeError as e:
                 raise OSSPoolError(f"JSON 解析失败: {e}")
-        raise OSSPoolError(f"下载失败 HTTP {resp.status_code}: {resp.text[:200]}")
+        raise OSSPoolError(f"下载失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}")
 
     # ── 列出 key ──
 
@@ -494,7 +526,7 @@ class OSSPoolClient:
                               params=params, timeout=30)
             if resp.status_code != 200:
                 raise OSSPoolError(
-                    f"列出 key 失败 HTTP {resp.status_code}: {resp.text[:200]}"
+                    f"列出 key 失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}"
                 )
 
             # 解析 XML
@@ -532,7 +564,7 @@ class OSSPoolClient:
             return ""
         if resp.status_code != 200:
             raise OSSPoolError(
-                f"HEAD 失败 HTTP {resp.status_code}: {resp.text[:200]}"
+                f"HEAD 失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}"
             )
         return resp.headers.get("ETag", "")
 
@@ -551,7 +583,7 @@ class OSSPoolClient:
                           what="删除对象", timeout=15)
         if resp.status_code not in (200, 204):
             raise OSSPoolError(
-                f"删除失败 HTTP {resp.status_code}: {resp.text[:200]}"
+                f"删除失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}"
             )
 
     def copy_key(self, source_key: str, target_key: str,
@@ -587,7 +619,7 @@ class OSSPoolClient:
                           timeout=(_CONNECT_TIMEOUT_S, timeout))
         if resp.status_code not in (200, 201):
             raise OSSPoolError(
-                f"复制失败 HTTP {resp.status_code}: {resp.text[:200]}"
+                f"复制失败 HTTP {resp.status_code}: {_oss_brief(resp.text)}"
             )
         return resp.headers.get("ETag", "")
 

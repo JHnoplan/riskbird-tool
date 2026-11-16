@@ -196,6 +196,7 @@ import edition as _ed                                          # noqa: E402
 import access_guard as ag                                      # noqa: E402
 import tool_config as tc                                       # noqa: E402
 import oss_pool_client as oss                                  # noqa: E402
+import text_shape                                              # noqa: E402  第 30 条把手真源
 import deepseek_expander as dse                                # noqa: E402
 from access_guard import AccessGuard                           # noqa: E402
 from oss_pool_client import (OSSPoolError, OSSCredentialError,    # noqa: E402
@@ -9383,6 +9384,732 @@ def test_forensic_job_log_channel_gate():
                                        "其余四道门在它身上全是空的）")
 
 
+def test_reason_one_handle_gate():
+    print("\n═══ AO. 失败原因只准一个把手：第 30 条硬门要有牙（**包括判据自己**）═══")
+    # 由来（2026-11-16 同类查全）：实机报告里念出过 `【连不上·无应答】b2b.11467.com:443｜
+    # Connection to b2b.11467.com timed out. (con）`——半截词＋补完又被剪的右括号。这一族在
+    # 交付链里有 41 处各写各的截断，收进一个把手之后，第 30 条负责「下一个人在这里再写一刀」
+    # 时当场被拦住。
+    # 本节最要紧的一格是 4)：门最初那版形状判据只认 `ast.Index`，而 Python 3.9 起的解析树里
+    # `[0]` 直接是 Constant——**一条也匹配不上，于是全仓报绿**。绿得毫无根据的门比没有门更贵：
+    # 它让下一个人以为自己已经被人管住了。所以每一条判据都要喂一份「改回旧写法」的字节，
+    # 看它是不是真的响在这一份上。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    _rs = gate._runtime_reason_sources()
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    _assert(callable(getattr(gate, "check_reason_one_handle", None)),
+            "硬门模块里有第 30 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("reason_handle = check_reason_one_handle()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 30 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1200],
+            "第 30 条报出来的问题要并进不合格计数（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::原因收口把手" in gate_src[_at:_at + 1200],
+            "云端 annotation 要能直接照做：写明缺的是收口把手，不是「重跑一次」")
+    _assert_eq(gate.REASON_HANDLE, "b2bcollect_build/text_shape.py",
+               "真源的文件名要说死：换到别处就等于又开一份实现")
+
+    # ── 2) 视野：上一轮漏掉的那几份必须在这一条的范围里（视野比缺陷小＝等于没修）──
+    for rel in ("b2bcollect_build/text_shape.py", "b2bcollect_build/cdp_base.py",
+                "b2bcollect_build/b2bcollect_gui.py", "b2bcollect_build/parallel_session.py",
+                "b2bcollect_build/site_adapters.py", "b2bcollect_build/access_guard.py",
+                "b2bcollect_build/channel_health.py", "b2bcollect_build/local_scan.py",
+                "b2bcollect_build/oss_pool_client.py", "ali1688_build/ali1688_crawler.py",
+                "riskbird_build/chrome_driver.py"):
+        _assert(any(str(k).endswith(rel) for k in _rs),
+                f"{rel} 在第 30 条的视野里（上一轮 11p 只扫 *_crawler.py，这十份一刀没动）")
+    _assert_eq([str(k) for k in _rs if Path(k).name.startswith(("test_", "debug_", "probe_"))],
+               [], "测试/一次性脚本不进这条门的视野：它们的话术不会被念给用户听")
+
+    # ── 3) 判一（30a 形状）：旧写法喂进去必须响，且三种历史形状各响一次 ──
+    def _shape_problems(name, body):
+        got = gate.check_reason_one_handle(files={_REPO / "b2bcollect_build" / name: body})
+        return [p for p in got if "按字符数切了一刀" in p]
+
+    _OLD_SHAPES = (
+        ("gui 告警那一档（异常取首行又切 120）",
+         "def f(e):\n    x = str(e).splitlines()[0][:120]\n    return x\n", "取完首行"),
+        ("会话日志那一档（[:70]）",
+         "def f(e):\n    return str(e).splitlines()[0][:70]\n", "取完首行"),
+        ("把手结果又被补一刀（[:90]，本轮实测的漏网形状）",
+         "def f(e):\n    return _short_err(e)[:90]\n", "调完把手"),
+        ("收口函数再被切（[:40]）",
+         "def f(why):\n    return short_reason(why, 70)[:40]\n", "调完把手"),
+    )
+    for label, body, kind in _OLD_SHAPES:
+        _got = _shape_problems("zz_shape_a.py", body)
+        _assert_eq(len(_got), 1, f"{label}：喂进去必须响一条（不响＝这条判据在 3.13 的解析树上是空壳）")
+        if _got:
+            _assert(kind in _got[0], f"{label}：响的话要指明是哪一种形状（实际={_got[0][:150]}）")
+
+    # 反向的另一半：走把手的写法、以及本来就该限宽的公司名/URL 切片都不许误响。
+    _false = _shape_problems(
+        "zz_shape_b.py",
+        "def f(e, why, rec):\n"
+        "    a = short_reason(why, 70)\n"
+        "    b = first_line(e, 140)\n"
+        "    c = rec['公司名称'][:24]\n"
+        "    d = url[:80]\n"
+        "    return a, b, c, d\n")
+    _assert_eq(_false, [], f"合格写法不许误响（误响的代价是人们把整条门关掉，实际={_false[:1]}）")
+
+    # ── 4) 判二（30b 两份同字节）：内联那份被改动必须响，改回去又不响 ──
+    _mirror_rel = gate.REASON_MIRRORS[0]
+    _mirror_real = str(_rs[[k for k in _rs if str(k).endswith(_mirror_rel)][0]])
+    _drift = _mirror_real.replace('_REASON_BREAKS = "｜.：，、；)） ·"',
+                                  '_REASON_BREAKS = "｜.：，、；)）"', 1)
+    _assert(_drift != _mirror_real,
+            "夹具没能把镜像的断点表改短（真源那一行换了写法，这一格要跟着换，不能悄悄空跑）")
+    _got = gate.check_reason_one_handle(
+        files=_rs, mirrors={_mirror_rel: _drift})
+    _assert(any("不是逐字节相同" in p and _mirror_rel in p for p in _got),
+            f"内联那份的断点表被改短必须响（实际={_got[:1]}）")
+    _assert_eq([p for p in gate.check_reason_one_handle(
+        files=_rs, mirrors={_mirror_rel: _mirror_real}) if "不是逐字节相同" in p], [],
+        "同一份字节喂回去不许响（响了说明判的是文件名而不是内容）")
+
+    # ── 5) 判三（30c 性质）：把把手换成三种「看起来还在收口」的坏实现，每种都要被抓住 ──
+    _NAIVE = '''import re
+_REASON_BREAKS = "｜.：，、；)） ·"
+def short_reason(text, limit=60):
+    s = re.sub(r"\\s+", " ", str(text or "")).strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+def first_line(text, limit=120):
+    s = str(text or "").strip()
+    return "" if not s else short_reason(s.splitlines()[0], limit)
+'''
+    _NOHEAD = '''import re
+_REASON_BREAKS = "｜.：，、；)） ·"
+def _is_break(s, k):
+    return s[k - 1] in _REASON_BREAKS
+def short_reason(text, limit=60):
+    s = re.sub(r"\\s+", " ", str(text or "")).strip()
+    if len(s) <= limit:
+        return s
+    stop = -1
+    for k in range(1, limit + 1):
+        if _is_break(s, k):
+            stop = k
+    return (s[:stop] + "…") if stop > 0 else (s[:limit] + "…")
+def first_line(text, limit=120):
+    s = str(text or "").strip()
+    return "" if not s else short_reason(s.splitlines()[0], limit)
+'''
+    _NOPAREN = '''import re
+_REASON_BREAKS = "｜.：，、；)） ·"
+def _is_break(s, k):
+    return s[k - 1] in _REASON_BREAKS
+def short_reason(text, limit=60):
+    s = re.sub(r"\\s+", " ", str(text or "")).strip()
+    if len(s) <= limit:
+        return s
+    head = 0
+    if s.startswith("【"):
+        i = s.find("｜")
+        if 0 < i:
+            head = i + 1
+    stop = -1
+    for k in range(head + 1, limit + 1):
+        if _is_break(s, k):
+            stop = k
+    return (s[:stop] + "…") if stop > 0 else (s + "…")
+def first_line(text, limit=120):
+    s = str(text or "").strip()
+    return "" if not s else short_reason(s.splitlines()[0], limit)
+'''
+    for label, mutant, need in (
+            ("按字符数一刀切（旧写法的原样）", _NAIVE, "切在词中间"),
+            ("断句照做、但不整段留住【类别】前缀", _NOHEAD, "把前缀"),
+            ("断句照做、括号不成对也上日志", _NOPAREN, "不成对")):
+        _got = gate.check_reason_one_handle(files=_rs, handle_src=mutant, mirrors={})
+        _assert(any(need in p for p in _got),
+                f"把手换成「{label}」必须被性质判据抓住（要看到含「{need}」的那条，"
+                f"实际={_got[:2]}）")
+        # 变异本身要真的改到了行为：同一句真异常，坏把手确实长出一句好把手不会长的话。
+        _ns = {"re": re}
+        exec(compile(mutant, "fx_" + need, "exec"), _ns)
+        _bad_out = _ns["short_reason"](
+            "【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. "
+            "(connect timeout=10)", 70)
+        _assert(_bad_out != text_shape.short_reason(
+            "【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. "
+            "(connect timeout=10)", 70),
+            f"{label}：夹具没造出差别（那这一格的「响」只是碰巧，实际={_bad_out!r}）")
+
+    # ── 6) 判四（30d 空视野）：视野断了不许报绿 ──
+    _assert(any("一份源码都没读到" in p for p in gate.check_reason_one_handle(files={})),
+            "视野为空时报的是「没有含义」而不是合格（空集合上的绿最容易被当成修完了）")
+    _tmpO = Path(tempfile.mkdtemp(prefix="ao_empty_scope_"))
+    try:
+        with _patch(gate, "ROOT", _tmpO):
+            _got = gate.check_reason_one_handle()
+        _assert(any("第 30 条" in p for p in _got),
+                f"三个 *_build 目录都不在位时必须响（实际={_got[:1]}）")
+    finally:
+        shutil.rmtree(_tmpO, ignore_errors=True)
+    # 解析不过的源码按不合格算，不能按「这一份没问题」算（与第 27 条同一句口径）。
+    _got = gate.check_reason_one_handle(files={_REPO / "b2bcollect_build/zz_broken.py":
+                                               "def f(:\n"})
+    _assert(any("解析不过" in p for p in _got),
+            f"语法坏掉的运行时代码要响成一条缺陷（实际={_got[:1]}）")
+
+    # ── 7) 真仓库今天：这一条门在交付链上一次都不许响（夹具全绿不代表今天也绿）──
+    _today = gate.check_reason_one_handle()
+    _assert_eq(_today, [], f"第 30 条今天必须真绿：交付链里既没有自己切的写法，两份把手也同字节"
+                           f"（实际={_today[:2]}）")
+
+    # ── 8) 本段新增两判（30a-3 裸 `str(异常)[:N]`、28 处一族；30a-4 读原因账又切一刀）──
+    #    这一格的夹具全部**改真树的字节**而不是造合成代码：合成样本只能证明判据认得
+    #    想得到的形状，证明不了「今天已经修好的那几处」从此还有人看着。
+    #    其中第一行就是本段立项那一行：第十一轮实机报告念出过
+    #    `深链被拒: china.makepolo.com 42 次（… 仅这一条深链，通道入）`。
+    _RETIRE = (
+        ("实机报告的渲染层（立项那一行）", "debug/platform_live_check.py",
+         "short_reason(v[1], limit)", "str(v[1])[:46]", "读一本"),
+        ("健康牌上最后一次取页失败", "b2bcollect_build/channel_health.py",
+         "short_reason(s.get('last_page_error'), 40)",
+         "str(s.get('last_page_error'))[:40]", "读一本"),
+        ("本地压缩包展开失败", "b2bcollect_build/local_scan.py",
+         'f"展开时出错：{first_line(e, 80)}"', 'f"展开时出错：{str(e)[:80]}"', "str(e)"),
+    )
+    for _label, _rel, _now, _old, _need in _RETIRE:
+        _k = next((k for k in _rs if str(k).endswith(_rel)), None)
+        _assert(_k is not None, f"{_rel} 在第 30 条视野里（读不到就没法做这一格的对照）")
+        if _k is None:
+            continue
+        _body = str(_rs[_k])
+        _assert_eq(_body.count(_now), 1,
+                   f"{_label}：现写法片段在真树上应恰好一处（片段漂了＝这一格在空跑）")
+        _got = [p for p in gate.check_reason_one_handle(
+            files={**_rs, _k: _body.replace(_now, _old, 1)}) if "按字符数切了一刀" in p]
+        _assert_eq(len(_got), 1, f"{_label}：退回旧写法必须响一条（实际={_got[:1]}）")
+        if _got:
+            _assert(_need in _got[0], f"{_label}：响的话要点名哪一种形状（实际={_got[0][:160]}）")
+
+    # ── 9) 豁免表也要被审：钉原文、换衣服必响、抽掉必报两处（否则表会长成没人敢删的抽屉）──
+    _ex = sorted(gate.REASON_SLICE_EXEMPT.items())
+    _assert_eq(len(_ex), 2, "今天挂在豁免表上的「切的不是原因」恰好两处（数目变了要重新解释每一条）")
+    _arel, _aline = _ex[0][0]
+    _ak = next((k for k in _rs if str(k).endswith(_arel)), None)
+    _assert(_ak is not None and str(_rs[_ak]).count(_aline) == 1,
+            f"豁免表里那一条必须仍在真树原位：{_arel}")
+    _mut = re.sub(r"\[:\d+\]", "[:99]", _aline, count=1)
+    _assert(_mut != _aline, "夹具没能把那一行的上限改掉（这一格就会空跑）")
+    with _patch(gate, "_runtime_reason_sources",
+                lambda: {**_rs, _ak: str(_rs[_ak]).replace(_aline, _mut, 1)}):
+        _got = gate.check_reason_one_handle()
+    _assert(any("不在原位" in p for p in _got),
+            f"豁免那一行换了衣服必须响「已不在原位」（不响＝表只被读一次，往后再没人管）：{_got[:1]}")
+    _assert(any("按字符数切了一刀" in p for p in _got),
+            "同一行还要作为缺陷本体被点名，不能只报表过期（只报表＝下一个人只会删表不会改代码）")
+
+    # ── 10) 视野里额外登记的渲染层：读不到要响，不能当成「这一行不存在」默默过去 ──
+    _rk = next((k for k in _rs if str(k).endswith("debug/platform_live_check.py")), None)
+    _assert(_rk is not None, "实机报告的渲染层在第 30 条视野里（按目录名把 debug/ 排除掉，"
+                             "那一行就永远没人判——上一轮的绿正是这样过的）")
+    if _rk is not None:
+        with _patch(gate, "_runtime_reason_sources", lambda: {**_rs, _rk: ""}):
+            _got = gate.check_reason_one_handle()
+        _assert(any("读不到内容" in p for p in _got),
+                f"渲染层被读空时必须响（实际={_got[:1]}）")
+
+
+def test_tab_body_identity_gate():
+    print("\n═══ AP. 标签正文身份门：第 31 条硬门要有牙（十处摘门逐条必须响，含把门掏空）═══")
+    # 由来（2026-11-15 第九轮实机马可波罗 + 随后的同类查全）：「借浏览器标签取回的那一页」在
+    # 五个站各长了一遍，五处各防了不同的东西（麦麦只防重载回哪一页、顺企网只看主机名、MIC 只拒
+    # errordocs、gys 只断域名、马可波罗那条腿干脆把已经跑完挑战的标签扔掉）。串页假数据比采不到
+    # 更难发现——电话打过去才知道填错了人。这一条门的用处就是把「这里要不要问一句身份」从每次
+    # 现场评审变成改代码时必须在 TAB_BODY_EXITS 写下的在案声明。
+    # 本节最要紧的是 4)：这一条门的判据在开发过程中被自己的自查翻出过四个盲区（关键字豁免、
+    # 域名级门对深链不够、看不见元组出口、污点不跨转手传播）。每一个都是「门报绿而缺陷还在」。
+    # 所以这里不喂好话，只喂把已修好的门逐处退回修复前的字节：响不出来的那一格就是下一个盲区。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+    _rs = gate._runtime_reason_sources()
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    _assert(callable(getattr(gate, "check_tab_body_identity", None)),
+            "硬门模块里有第 31 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("tab_gate = check_tab_body_identity()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 31 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 1600],
+            "第 31 条报出来的问题要并进不合格计数（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::标签正文身份门：" in gate_src[_at:_at + 1600],
+            "云端 annotation 要能直接照做：写明缺的是身份门/在案登记，不是「重跑一次」")
+    _assert_eq(gate.TAB_ID_SOURCE, "b2bcollect_build/cdp_base.py",
+               "身份门的真源文件名要说死：换到别处就等于又开一份实现")
+
+    # ── 2) 登记表自己也要能被审：登记的每一份源码必须在视野里，登记的每一档门必须有夹具 ──
+    for _rel, _row in gate.TAB_BODY_EXITS.items():
+        _assert(any(str(k).endswith(_rel) for k in _rs),
+                f"{_rel} 在第 31 条的视野里（登记表挂着它、门脚本却读不到它＝这一条对它失明）")
+        for _fn, _g in _row.items():
+            _assert(_g in gate.TAB_ID_GATES,
+                    f"{_rel}::{_fn} 登记的门 {_g} 不是认可的那三档之一（表里写一个不存在的手势，"
+                    "等于给这条出口发了张空白通行证）")
+    _declared = {g for _r in gate.TAB_BODY_EXITS.values() for g in _r.values()}
+    _covered = {g for _l, _f, _t, _w in gate.TAB_ID_CASES for g in _t.values()}
+    _assert_eq(sorted(_declared - _covered), [],
+               "登记表用到的每一档门都要有 31c 夹具对拍过（没对拍过的门型＝从没验过的门）")
+
+    # ── 3) 今天的真树：这一条门在交付链上一次都不许响（夹具全绿不代表今天也绿）──
+    _today = gate.check_tab_body_identity()
+    _assert_eq(_today, [], f"第 31 条今天必须真绿（实际={_today[:2]}）")
+
+    # ── 4) 十处摘门逐条必须响。锚点不在源码里＝夹具过期，这一格不许空跑 ──
+    def _mutate(fname_end, old, new, need, label):
+        keys = [k for k in _rs if str(k).endswith(fname_end)]
+        _assert_eq(len(keys), 1, f"{label}：视野里 {fname_end} 应该有且只有一份（实得 {len(keys)}）")
+        if len(keys) != 1:
+            return
+        key = keys[0]
+        _assert(old in _rs[key], f"{label}：夹具锚点已经不在源码里（真写法改了而夹具没跟着改，"
+                                 "这一格就变成空跑——报绿的是夹具而不是代码）")
+        if old not in _rs[key]:
+            return
+        files = dict(_rs)
+        files[key] = _rs[key].replace(old, new, 1)
+        _assert(files[key] != _rs[key], f"{label}：替换没产生任何差别（这一格喂进去的是原件）")
+        got = [p for p in gate.check_tab_body_identity(files=files) if p not in _today]
+        _assert(got, f"{label}：把已修好的门退回修前原样，第 31 条却没响——判据在这一形上有盲区")
+        if got:
+            _assert(need in got[0], f"{label}：响的话要念得出是哪一处（要含「{need}」，"
+                                    f"实际={got[0][:170]}）")
+
+    # ①②③④ 四处「把调用点的那道门摘掉」——四个站各有各的摘法，全是本轮真实修过的形状
+    _mutate("gys_crawler.py",
+            '                if deep:\n                    body, why = self._tab_body_for'
+            '(url, body=rendered)',
+            '                if False:\n                    body, why = "", ""',
+            "源码里却已经找不到", "gys 深链那道门摘掉（退回「_goto 只断域名」）")
+    _mutate("mic_crawler.py",
+            "            ok, why = self._tab_page_is(alt, token=user, same_host=False)",
+            '            ok, why = True, ""',
+            "源码里却已经找不到", "mic 英文兜底摘门（退回「子域是猜的却谁都不问」）")
+    _mutate("mic_crawler.py", "        ok, why = self._tab_page_is(url, token=user)",
+            '        ok, why = True, ""',
+            "源码里却已经找不到", "mic 联系页摘门（退回「只要不是 errordocs 就交出去」）")
+    _mutate("maimaib2b_crawler.py",
+            "                body, why = self._tab_body_for(url, body=html)",
+            '                body, why = html, ""',
+            "源码里却已经找不到", "麦麦摘门（正文经元组转手直接交出：钉「污点传播只认 Call」那个盲区）")
+    # ⑤ 表写错：深链那一档登记成域名级门
+    _mutate("cdp_base.py", "    def _iter_keyword(self, kw):",
+            "    def _iter_keyword(self, kw, rec=None):",
+            "只登记了域名级", "列表页函数开始拿「这一家」的把手（域名级门就不够了）")
+    # ⑥ 新增一条通路却没人写过门
+    _mutate("mic_crawler.py", "    def _fallback_en(self, user, host, rec):",
+            "    def _another_tab_exit(self, url, rec):\n        html = self._html()\n"
+            "        self._parse_contact(html, rec)\n\n"
+            "    def _fallback_en(self, user, host, rec):",
+            "不在 TAB_BODY_EXITS 登记里", "全交付链多出一条没人管的出口")
+    # ⑦ 门的真源被改名/搬走
+    _mutate("cdp_base.py", "    def _tab_page_is(self, want_url",
+            "    def _tab_page_is_v2(self, want_url",
+            "身份门的真源被删了", "门被改名（各站调用点会一起崩，但门要先自己发现）")
+    # ⑧ 登记过期：那条腿不再读标签了，表里还占着一个名次
+    _mutate("gys_crawler.py", "            rendered = self._html()", '            rendered = ""',
+            "这一行登记作废", "浏览器那条腿整个不再读标签正文（过期登记要响，"
+                             "否则下一条同类缺陷会顶用它的名次）")
+    # ⑨ 门被掏空：地址语义不再拦跨主机——31d 的行为夹具必须拦住
+    _mutate("cdp_base.py",
+            '        if key_cur[0] != key_want[0] and (token == "" or same_host):',
+            "        if False:",
+            "31d", "门还在、里面那一步被掏空（只查在不在＝门可以随便长个样子骗过静态判据）")
+    # ⑩ `_tab_body_for` 自己不过身份门
+    _mutate("cdp_base.py",
+            "        ok, why = self._tab_page_is(want_url, token=token, same_host=same_host)",
+            '        ok, why = True, ""',
+            "源码里却已经找不到", "门自己把里面那道问地址的步摘掉（登记与源码分叉）")
+
+    # ── 5) 空视野不许绿（与第 27/30 条同一句口径）──
+    _assert(any("一份源码都没读到" in p for p in gate.check_tab_body_identity(files={})),
+            "视野为空时报的是「这句话没有含义」而不是合格")
+    _tmpP = Path(tempfile.mkdtemp(prefix="ap_empty_scope_"))
+    try:
+        with _patch(gate, "ROOT", _tmpP):
+            _got = gate.check_tab_body_identity()
+        _assert(any("第 31 条" in p for p in _got),
+                f"三个 *_build 目录都不在位时必须响（实际={_got[:1]}）")
+    finally:
+        shutil.rmtree(_tmpP, ignore_errors=True)
+    _got = gate.check_tab_body_identity(files={_REPO / "b2bcollect_build/zz_broken.py": "def f(:\n"})
+    _assert(any("解析不过" in p for p in _got),
+            f"语法坏掉的运行时代码要响成一条缺陷（实际={_got[:1]}）")
+
+
+def test_nav_evidence_gate():
+    print("\n═══ AQ. 导航证据与环境开关：31e~31g 逐处退回修前原样（15 处必须响）═══")
+    # 由来（2026-11-14 实机马可波罗「借浏览器标签把 JS 质询壳跑完」那条腿 0/3）：拦住我们的
+    # 不是站点，是共享 Chrome 的 HTTPS-First 自动升级——`Page.navigate` **不抛异常**，把 Chrome
+    # 的原话放在响应的 `errorText` 里，页面落在 `chrome-error://chromewebdata/`。旧写法把整份
+    # 响应丢掉了，于是「我们自己的浏览器没把这一跳发出去」在下游一律长成「站点不给过」：
+    # 方向整个说反，照着那句话去查的人会去改站点，而该改的是启动参数。
+    # 这一节审两件事，缺一件都只是把问题挪了个地方：
+    #   ① 这句话**还有没有必要说**（31g）：那枚 `--disable-features=HttpsUpgrades,…` 是不是
+    #      真进了启动参数列表，而且三条拉起浏览器的路径（b2bcollect / 1688 / riskbird）带的是
+    #      **同一份**；被明确否决的 `--ignore-certificate-errors` 不许以参数形态回来；
+    #   ② 这句话**有没有证据**（31e/31f）：导航响应、错误页判据、结论句口径，任何一处退回
+    #      修前原样都必须响。
+    # 与 AP 同一句话：这一族的判据是边修边长出来的，不喂「退回修前字节」就等于没验。
+    gate = _manifest_gate()
+    _rs = gate._runtime_reason_sources()
+    _today = gate.check_tab_body_identity(files=dict(_rs))
+    _assert_eq(_today, [], f"第 31 条（含 31e/31f/31g）今天必须真绿（实际={_today[:2]}）")
+
+    def _m(fname_end, old, new, need, label):
+        """把一处已修好的写法退回修前原样：第 31 条必须响，而且要念得出是哪一处。
+
+        这里问的是「那一条在不在」而不是「第一条是不是它」：31g 的按处判据与按覆盖面判据
+        会对同一个改动一起响（少了开关既是这一处的问题，也让这份文件在覆盖面那节失格），
+        把它们排成一个顺序再断言第一条，等于把「多重报告」这条口径自己钉死成单重。
+        """
+        keys = [k for k in _rs if str(k).endswith(fname_end)]
+        _assert_eq(len(keys), 1, f"{label}：视野里 {fname_end} 应该有且只有一份（实得 {len(keys)}）")
+        if len(keys) != 1:
+            return
+        key = keys[0]
+        _assert(old in _rs[key], f"{label}：夹具锚点已经不在源码里（真写法改了而夹具没跟着改，"
+                                 "这一格就变成空跑——报绿的是夹具而不是代码）")
+        if old not in _rs[key]:
+            return
+        files = dict(_rs)
+        files[key] = _rs[key].replace(old, new, 1)
+        _assert(files[key] != _rs[key], f"{label}：替换没产生任何差别（这一格喂进去的是原件）")
+        got = [p for p in gate.check_tab_body_identity(files=files) if p not in _today]
+        _assert(got, f"{label}：把已修好的写法退回修前原样，第 31 条却没响——判据在这一形上有盲区")
+        _assert(any(need in p for p in got),
+                f"{label}：响的话要念得出是哪一处（要含「{need}」，实际={got[:2]}）")
+
+    # ── 1) 31f 结构证据：三处各退一步，每一处都必须响 ──
+    _m("cdp_base.py",
+       '            err = str(((resp or {}).get("result") or {}).get("errorText") or "").strip()',
+       '            err = ""',
+       "源码里没有 errorText",
+       "31f：导航响应里那句 Chrome 原话又被丢掉了（「这一跳被浏览器拦下」重新变成没人留痕）")
+    _m("cdp_base.py",
+       '        if not any(m in cur for m in CHROME_ERROR_URL_MARKS):\n'
+       '            return ""                      # 先按地址筛掉，免得每页多读一次整页 HTML',
+       '        if "chrome-error://" not in cur:\n            return ""',
+       "CHROME_ERROR_URL_MARKS",
+       "31f：错误页判据被就地重抄一份字面量（将来加一档错误页，把手先聋掉）")
+    _m("cdp_base.py",
+       '        self._log("   ⚠ 标签里那页已经不是质询壳了，这条腿却还是帮不上',
+       '        self._log("   ⚠ 挑战跑完了，这条腿还是帮不上',
+       "跑完了",
+       "31f-2：结论句又把推测当观察念给用户（那一跳根本没发出去时，这句话把方向指反）")
+
+    # ── 2) 31e 行为：门还站着，但它已经不念 Chrome 的原话 ──
+    _m("cdp_base.py",
+       "            return False, (tab_load_failed_line(cur, self._last_nav_error) or",
+       '            return False, ("" or',
+       "31e 归因不符",
+       "31e：地址语义没坏、门也在，可「这一跳没加载出来」六档归因重新退回那句「标签不在本站」")
+
+    # ── 3) 镜像闭包与实现分家：实现新拉一个名字，判据要报成一条缺陷而不是一栈 ──
+    _m("cdp_base.py",
+       "        key_cur = self._page_key(cur)",
+       "        key_cur = self._page_key(cur) or _TAB_ID_NEVER_DEFINED",
+       "镜像取不到的名字",
+       "31d：身份门多了一个模块级依赖，镜像（按依赖闭包从真源抠）补不出来时必须说得出方向")
+
+    # ── 4) 31g 环境侧：那枚开关的每一格 ──
+    _m("shared_chrome.py",
+       'NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"',
+       'NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades"',
+       "少了 ['HttpsFirstModeV2', 'HttpsFirstBalancedMode']",
+       "31g-1：三档升级路径只关一档（症状与完全没关一模一样，而那枚开关看起来是带上了的）")
+    _m("shared_chrome.py",
+       'CHROME_NO_UPGRADE_FLAGS = (f"--disable-features={NO_HTTPS_UPGRADE_FEATURES}",)',
+       'CHROME_NO_UPGRADE_FLAGS = ("--disable-features=HttpsUpgrades,HttpsFirstModeV2,'
+       'HttpsFirstBalancedMode",)',
+       "没读 NO_HTTPS_UPGRADE_FEATURES",
+       "31g-2：启动参数就地重抄字面量（将来加一档只补到一侧，两份从此分叉）")
+    _m("shared_chrome.py", "        *CHROME_NO_UPGRADE_FLAGS,\n", "",
+       "启动参数列表里没有",
+       "31g-3：常量在、没人用它（这一条门整个作废，浏览器照旧把明文 http 升级后拦掉）")
+    _m("shared_chrome.py",
+       "        if missing_no_upgrade_flag() and not _flag_warned:",
+       "        if not _flag_warned:",
+       "没问 missing_no_upgrade_flag()",
+       "31g-4：复用一个没带开关的旧实例时再也没人提醒（用户看到的仍是「这个站采不到」）")
+    _m("shared_chrome.py",
+       '            log("⚠ 共享浏览器是先前就开着的，没带「不强制升级 https」的开关：明文 http 的"\n'
+       '                "商铺页/详情页会被浏览器拦在加载之前（不是站点在拦）。退出本工具再重新打开"\n'
+       '                "即可自动带上，之后无需再做别的")',
+       "            _flag_warned.append(2)",
+       "问到了却没说",
+       "31g-4：调用了把手却把那句话删了（只给自己记账，不给用户交代）")
+    _m("shared_chrome.py",
+       "        *CHROME_NO_UPGRADE_FLAGS,\n",
+       '        *CHROME_NO_UPGRADE_FLAGS,\n        "--ignore-certificate-errors",\n',
+       "当参数交出去了",
+       "31g-6：被明确否决的那枚开关回来了（拿 1688／riskbird 登录态的中间人防护换一次取页）")
+    _m("ali1688_crawler.py",
+       'NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode"',
+       'NO_HTTPS_UPGRADE_FEATURES = "HttpsUpgrades,HttpsFirstModeV2"',
+       "与真源不再逐字节相同",
+       "31g-5：1688 那份内联副本少一档 feature（同机两个 Chrome 只差一枚开关的差分，"
+            "这回差在两条路径之间）")
+    _m("dual_session.py", "        *CHROME_NO_UPGRADE_FLAGS,\n", "",
+       "启动参数列表里没有",
+       "31g-3/5：riskbird 那份副本抄来了却没进自己的启动列表——「同一个环境开关只在一条路径"
+            "上生效」正是这一族事故的原话")
+
+    # ── 5) 覆盖面：新冒出一条没人管的浏览器路径 / 过期豁免 ──
+    files = dict(_rs)
+    files[_REPO / "b2bcollect_build/zz_new_browser.py"] = (
+        'import subprocess\n'
+        'def launch(profile, port):\n'
+        '    cmd = ["chrome", f"--remote-debugging-port={port}", f"--user-data-dir={profile}"]\n'
+        '    subprocess.Popen(cmd)\n')
+    got = [p for p in gate.check_tab_body_identity(files=files) if p not in _today]
+    _assert(any("也不在豁免表里" in p for p in got),
+            f"31g-7：多出一条配了 Chrome 却没带开关、也没登记的路径时必须响（实际={got[:2]}）")
+    _assert(any("zz_new_browser" in p for p in got),
+            "31g-7：那句话要念得出是哪一份文件（只说「有一条漏了」等于把排查推回读源码）")
+    _m("qizhidao_crawler.py",
+       'opts.add_argument(f"--user-data-dir={temp_profile}")',
+       'opts.add_argument(f"--profile-dir-clone={temp_profile}")',
+       "这一行作废",
+       "31g-7：豁免表里那一行对应的启动点已经没了，还留着它——下一条同类漏网会顶着它的名次"
+       "被当成合法的")
+
+    # ── 6) 登记表自己：每一项都要有理由，视野断了不许绿 ──
+    _assert(any(str(k).endswith(gate.TAB_ENV_SOURCE) for k in _rs),
+            f"{gate.TAB_ENV_SOURCE} 在第 31 条的视野里（31g 的对照面读不到＝这一节等于没跑）")
+    for _rel in gate.TAB_ENV_MIRRORS:
+        _assert(any(str(k).endswith(_rel) for k in _rs),
+                f"{_rel} 登记为内联副本，却在视野里读不到：31g-5 这一条被静默跳过")
+    for _rel, _why in gate.TAB_ENV_EXEMPT.items():
+        _assert(len(str(_why)) >= 12,
+                f"{_rel} 的豁免理由太短（{_why!r}）：这一张表的唯一用处就是逼着写下一个理由，"
+                "空转的理由＝没有登记")
+    _assert(not any(gate.TAB_ENV_FORBIDDEN in v
+                    for _rel, _why in gate.TAB_ENV_EXEMPT.items() for v in (_why,)),
+            "豁免理由里也不许出现那枚被否决的开关（理由讲成处方，下一条就会照抄）")
+    _assert_eq(gate.TAB_ENV_FEATURES,
+               ("HttpsUpgrades", "HttpsFirstModeV2", "HttpsFirstBalancedMode"),
+               "三档升级路径的名单要说死：少一档就是 31g-1 从此不响")
+    _assert(any("一份源码都没读到" in p for p in gate.check_tab_body_identity(files={})),
+            "视野为空时报的是「这句话没有含义」而不是合格")
+
+
+def test_no_contact_accountability_gate():
+    print("\n═══ AR. 无联系方式分档／砍单记名／标签归还：第 32 条逐处退回修前原样（必须响）═══")
+    # 由来（2026-11-16 第九、十轮实机收报）：三本账的共同形状是「在内存里累加、从不外读」——
+    #   ① 四项全空一律被归给「先修取号通路」，而世界工厂网那一页 `联系电话` 明写 `-`（站方
+    #      自己没登）、马可波罗那一页要「联系客服登记」（站方藏着）：说词把人支使去改本来
+    #      正确的解析代码，改一次就引入一批假数据；
+    #   ② 三个 ❌ 全站都只说「该复核判定口径」，可复核的人手上没有名单——处方不可执行；
+    #   ③ 六站把 close_browser 覆写成空壳，降级取页借来的标签一路握到收工之后，用户的共享
+    #      Chrome 里挂着枚没人认领的商铺页，而日志一句没说。
+    # 这一节只审一件事：**判据是不是真的在管事**。第 32 条是边修边长出来的（32a~32g 七问），
+    # 不喂「退回修前的字节」就等于没验——AP／AQ 两次都是这样把判据自己的盲区逼出来的：
+    # 子串判据会被注释与 docstring 哄成绿、方法名会替空壳说话、只按函数名登记会被改名绕过。
+    gate = _manifest_gate()
+    _rs = gate._runtime_reason_sources()
+    _tx = {rel: (_REPO / rel).read_text(encoding="utf-8", errors="replace")
+           for rel in gate.NC_READERS}
+    _today = gate.check_no_contact_accountability(dict(_rs), dict(_tx))
+    _assert_eq(_today, [], f"第 32 条今天必须真绿（实际={_today[:2]}）")
+
+    def _m(fname_end, old, new, need, label, cnt=1):
+        """把一处已修好的写法退回修前原样：第 32 条必须响，而且要念得出是哪一处。
+
+        两条通道**哪里有锚点就改哪里**（而不是二选一）：两份镜像同时在 files 与 texts
+        里——32f 读的是 texts，只改 files 时这一格会静默不响，报绿的是夹具而不是代码。
+        渲染层（debug/ 里的体检器）只在 texts 里：只喂 files 同样不响。
+        判据自己有两条读法，夹具就必须两条都喂。"""
+        files, texts, done = dict(_rs), dict(_tx), 0
+        for k in [x for x in _rs if str(x).endswith(fname_end)]:
+            if old in _rs[k]:
+                files[k] = _rs[k].replace(old, new, cnt)
+                done += 1
+        for k in [x for x in _tx if x.endswith(fname_end)]:
+            if old in _tx[k]:
+                texts[k] = _tx[k].replace(old, new, cnt)
+                done += 1
+        _assert(done, f"{label}：{fname_end} 在两条通道的哪一份里都对不上这个锚点"
+                      "（真写法改了而夹具还在替旧代码作证，这一格就变成空跑）")
+        if not done:
+            return
+        _assert(files != _rs or texts != _tx, f"{label}：替换没产生任何差别（喂进去的是原件）")
+        got = [p for p in gate.check_no_contact_accountability(files, texts) if p not in _today]
+        _assert(got, f"{label}：把已修好的写法退回修前原样，第 32 条却没响——判据在这一形上有盲区")
+        _assert(any(need in p for p in got),
+                f"{label}：响的话要念得出是哪一处（要含「{need}」，实际={got[:2]}）")
+
+    def _syn(src, want_fire, label):
+        """合成形状：只拦「说谎的那一种」，不拦「怎么说谎的形状」——正反两面都要喂。"""
+        files = dict(_rs)
+        files[_REPO / "b2bcollect_build/zz_fixture_ar_crawler.py"] = src
+        got = [p for p in gate.check_no_contact_accountability(files, dict(_tx))
+               if "zz_fixture_ar" in p]
+        _assert(bool(got) is want_fire,
+                f"{label}：期望{'响' if want_fire else '不响'}，实际={got[:1]}")
+
+    # ── 1) 32a 证据：详情取页不留正文，分档就只能说「没证据」，谁的责任立刻分不开 ──
+    _m("aipage_crawler.py", "self._keep_detail(", "self._keep_detail_x(",
+       "取了详情页却没留证据", "32a：把 aipage 那一路的证据摘掉")
+    # mic 有两条取页腿（裸 HTTP `_fetch_contact_http` + 浏览器 `_fetch_contact_page`），
+    # 32a 沿调用闭包找证据，所以修前原样是**两条一起抹掉**（只抹一条时闭包另一条还留着）。
+    # 这一格同下面那条「只抹一条不许响」一起把口径钉住：32a 判的是「这一路到底能不能
+    # 分档」，不是「每一取页腿都得留正文」——后者会把正当理由判成漏（mic 的 `_fallback_en`
+    # 取的是英文子域页，拿它当证据会把「我们没看中文栏」误报成「这一页没中文联系方式栏」）。
+    _m("mic_crawler.py", "self._keep_detail(", "self._keep_detail_x(",
+       "取了详情页却没留证据", "32a：mic 两条取页腿一起退回不留证据", -1)
+
+    # 口径边界也要作证：只抹一条腿时这一条**不许响**（不是盲区，是本条定的范围）。
+    _half = dict(_rs)
+    for _k in [x for x in _rs if str(x).endswith("mic_crawler.py")]:
+        _half[_k] = _rs[_k].replace("            self._keep_detail(r.text)", "            pass", 1)
+    _assert(_half != _rs, "32a 的边界夹具连 mic 那一格 HTTP 腿都没找到"
+                  "（真写法改了而夹具还在替旧代码作证）")
+    _assert_eq([p for p in gate.check_no_contact_accountability(_half, dict(_tx))
+                if "mic_crawler" in p and "取了详情页" in p], [],
+               "只抹一条腿时不许响：这是 32a 定的口径边界（按闭包判能不能分档），"
+               "而不是「每一取页腿都得留正文」；谁要把判据收紧到逐腿，就得先回答英文页那一形")
+
+    # ── 2) 32b 记名：只有一本计数时，「该复核判定口径」是一句无法执行的处方 ──
+    _m("cdp_base.py", 'self._note_early_skip(kw, e.get("公司名称", ""))',
+       "self._note_early_skip(kw)", "没把公司名传进去", "32b：早过滤那一刀又不记名")
+    _m("cdp_base.py", "self._cut_sample(self.kw_early_names, kw, name)", "pass",
+       "没把名单写进", "32b：调用点传了名字、把手本体半路丢掉")
+
+    # ── 3) 32c 外读：账只累加不外读，正是通路账那一族的原病 ──
+    _m("cdp_base.py", '"nc_note": nc_kinds_text(', '"nc_note_x": nc_kinds_text(',
+       "没透出 `nc_note`", "32c：stats() 里把人话那一格改个名（界面与体检器一起取不到）")
+    _m("cdp_base.py", "｜无联系方式分档：", "｜无联系方式合计：",
+       "没念「无联系方式分档」", "32c：收尾那一行退回只报总数")
+    # 红牌这一行退回「只报总数」那一形：把读取那两行整体抹掉，但把旧注释留在原地——
+    # 注释里句句都写着 nc_note，拿子串判据时这一格能静默过关（而 AST 里没有注释）。
+    _m("channel_health.py",
+       '''    if str(s.get("nc_note") or "").strip():
+        bits.append(f"无联系方式分档：{s['nc_note']}")
+''', "",
+       "没把分档账读出去", "32c：GUI 红牌那一行不再读这本账")
+    _m("platform_live_check.py", "nc_kinds_text", "nc_say_it_my_way",
+       "没把分档账读出去", "32c：体检报告自己拼说词（import 与调用点一起摘才算不读）", -1)
+
+    # ── 4) 32d/32e 唯一把手与归还本体 ──
+    _syn("NC_KIND_ORDER = ('miss',)\nclass A:\n    def crawl_detail(self, s):\n"
+         "        return self._keep_detail(self._html())\n", True,
+         "32d：第二份分档标签表出现了（两种说词时「谁的责任」没唯一答案）")
+    _m("cdp_base.py", "    def release_tab(self, why=\"\"):", "    def release_tab_x(self, why=\"\"):",
+       "没有 `release_tab` 把手", "32e：归还把手被改名（子串判据会被后缀哄成绿）")
+    _m("makepolo_crawler.py", '        self.release_tab("收工")\n        return None\n',
+       "        return None\n", "是空壳", "32e：close_browser 又退成只有一行 return 的空壳")
+    _m("makepolo_crawler.py", 'self.release_tab("收工")', "self._borrowed_tab = False",
+       "没调用任何归还动作", "32e：close_browser 里改成只置一个标志位")
+
+    # ── 5) 32f 两份镜像：1688 是独立包不能 import，只能内联一份拷贝 ──
+    _m("ali1688_crawler.py", "站方藏着（点击查看", "站方藏着呢（点击查看",
+       "开始分叉", "32f：两份镜像只改一个字（1688 那一包不会自己报分叉）")
+    _m("ali1688_crawler.py", "# ── [NC-BLOCK-END]", "# ── [NC-BLOCK-EDN]",
+       "取不出分档判据那一段", "32f：镜像标记被改名（对拍两边都抓不到，必须响而不是默默相等）")
+
+    # ── 6) 32g 关失败不许被抹平：本轮实机抓到 18 处，全靠这一问自己看得见 ──
+    _m("shared_chrome.py",
+       '    except Exception as e:\n        return f"关闭请求没送达（{type(e).__name__}）：'
+       '{first_line(e, 80)}"',
+       "    except Exception:\n        pass",
+       "里 except 只有 pass", "32g：最底层重新吞掉失败（上层每一句「关失败必须开口」都变死分支）")
+    _m("site_adapters.py",
+       '            except Exception as e:\n'
+       '                self._log(f"⚠ {self.PLATFORM_NAME} 结束 chromedriver 会话没成功："\n'
+       '                          f"{short_reason(first_line(e, 80), 60)}"\n'
+       '                          f"——若下一轮打不开浏览器，请手动关掉 Chrome 窗口再试")\n',
+       "            except Exception:\n                pass\n",
+       "里只有 pass", "32g：适配器收工那一腿又静默（会话没断开直接影响下一轮附加）")
+    _m("ali1688_crawler.py",
+       '                except Exception as e:\n'
+       '                    # 不能吞：quit 没成功等于会话还挂着，下一轮 _attach 就可能\n'
+       '                    # 「session not created」；只说一句失败在哪，比事后猜强（第 32g 条）\n'
+       '                    self._log(f"⚠ 收工结束浏览器会话没成功（Ali1688Crawler）："\n'
+       '                              f"{short_reason(first_line(e, 80), 60)}"\n'
+       '                              f"——若下次打不开浏览器，请手动关掉所有 Chrome 窗口再试")\n',
+       "                except Exception:\n                    pass\n",
+       "里只有 pass", "32g：1688 独立包的 quit 兜底又吞回去")
+
+    # ── 7) 形状的正反两面：误伤一次，下一个真漏的人就会被当成噪音放过去 ──
+    _syn("class A:\n    def crawl_detail(self, s):\n        \"\"\"子类实现。\"\"\"\n"
+         "        raise NotImplementedError\n", False, "32a：基类模板桩（它一页都不取）")
+    _syn("class A:\n    def crawl_detail(self, s):\n        return self._parse(self._html())\n",
+         True, "32a：具体实现取了页却没留证据")
+    _syn("class A:\n    def crawl_detail(self, s):\n        return self._one()\n"
+         "    def _one(self):\n        return self._keep_detail(self._html())\n", False,
+         "32a：证据在它调下去的第二条腿里（沿调用闭包找）")
+    _syn('class A:\n    NO_DETAIL_EVIDENCE = "详情不取页"\n'
+         "    def crawl_detail(self, s):\n        return {}\n", False,
+         "32a：确实没有单店正文可判，但写了理由（诚实声明也是合格答案）")
+    _syn("class A:\n    def tidy_up(self):\n        try:\n            self._close_own_tab()\n"
+         "        except Exception:\n            pass\n", True,
+         "32g：归还动作换了名字（只按函数名登记表发判时这一形就能逃掉）")
+    _syn("class A:\n    def _nav(self):\n        try:\n            self.driver.close()\n"
+         "        except Exception:\n            pass\n", True, "32g：Selenium 写法 driver.close() 被吞")
+    _syn("class A:\n    def _read_cfg(self):\n        try:\n            f = open('x')\n"
+         "            f.close()\n        except Exception:\n            pass\n", False,
+         "32g：文件的 f.close() 不是关标签（误伤就会把真漏当噪音）")
+    _syn("class A:\n    def _nav(self):\n        try:\n            self.driver.get('u')\n"
+         "        except Exception:\n            pass\n        finally:\n"
+         "            self._close_own_tab()\n", False,
+         "32g：归还放在 finally、except 只包导航（那一格不负责关标签）")
+
+    # ── 8) 视野断了不许绿 ──
+    _assert(any("一份源码都没读到" in p
+                for p in gate.check_no_contact_accountability({}, {})),
+            "32：视野为空时报的是「这句话没有含义」而不是合格")
+    _assert(any(rel in gate.NC_READERS for rel in gate.NC_MIRROR_FILES)
+            and len(gate.NC_READERS) == 4,
+            "32c 的四处读家登记表要说死（少一处渲染＝那一处又只看得到总数）")
+    # 分档定序取的是**源码里那一段常量**而不是 import 进来的值：门禁进程里交付链模块
+    # 不一定导得动，而这一格要防的正是「文件被改坏」，不是「运行期运气」。
+    _base_src = [v for k, v in _rs.items() if str(k).endswith("cdp_base.py")]
+    _assert(bool(_base_src), "分档定序这一格连 cdp_base.py 都没读到：视野断了不许假绿")
+    if not _base_src:
+        return
+    _ord_tree = ast.parse(_base_src[0])
+    _order = None
+    _labvals = None
+    for _n in _ord_tree.body:
+        if not (isinstance(_n, ast.Assign) and len(_n.targets) == 1):
+            continue
+        _nm = getattr(_n.targets[0], "id", "")
+        if _nm == "NC_KIND_ORDER":
+            _order = tuple(getattr(_e, "value", None) for _e in _n.value.elts)
+        elif _nm == "NC_KIND_LABEL":
+            _labvals = {getattr(_k, "value", None): _v.value
+                        for _k, _v in zip(_n.value.keys, _n.value.values)
+                        if isinstance(_v, ast.Constant) and isinstance(_v.value, str)}
+    _assert(_order is not None and _labvals is not None,
+            "分档定序/分档说词这两段常量在 cdp_base 顶层取不到：视野断了不许假绿")
+    if _order is None or _labvals is None:
+        return
+    # 不钉「一共几档」而钉性质：钉数字的话，新增一档的人会把这格和源码一起改掉（那等于
+    # 没有门）；真正会出事故的是两件事：定了档却说不出人话，以及「先认自己的锅」这一序被排错。
+    _assert_eq(set(_order), set(_labvals),
+               "定序表与说词表必须是同一批档位（多出来的那一档渲染时只能念档位本名，"
+               "少掉的那一档会在账上静默失踪）")
+    _assert(len(set(_order)) == len(_order), "定序表里同一档出现两次：账会被重复念")
+    _assert(_order[:2] == ("miss", "unknown"),
+            "分档定序要说死：把 miss 挪出第一位，「先认我们自己的锅」这条就作废")
+    _station = [k for k in _order if k in ("hidden", "blank", "no_slot")]
+    _assert(len(_station) == 3 and "no_page" in _order
+            and _order.index("no_page") < min(_order.index(k) for k in _station),
+            "设计边界那一档（本站详情不取页）必须排在站方三档之前，否则读的人第一眼"
+            "看到的又是「不是缺陷」（实际序=" + str(_order) + "）")
+    _assert("no_page" in _labvals and "unknown" in _labvals
+            and "_keep_detail" in _labvals["unknown"]
+            and "_keep_detail" not in _labvals["no_page"],
+            "两档「拿不到证据」的说词不许合成一句：unknown 要接把手、no_page 不许接把手"
+            "（把已声明详情不取页的站说成「忘了接」，开的是一张执行不了的假处方）")
+
+
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -9411,6 +10138,10 @@ SECTIONS = (
     test_shell_errexit_posture_gate,
     test_line_ending_stance_gate,
     test_forensic_job_log_channel_gate,
+    test_reason_one_handle_gate,
+    test_tab_body_identity_gate,
+    test_nav_evidence_gate,
+    test_no_contact_accountability_gate,
 )
 
 

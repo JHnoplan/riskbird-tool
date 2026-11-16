@@ -65,7 +65,7 @@ from cdp_base import (CdpSiteCrawler, PHONE_MOBILE_RE, PHONE_TEL_RE,
                       parse_contact_field, is_placeholder_number, dept_only, compose_position,
                       strip_name_marketing_tail, strip_country_code, HONORIFIC_ONLY_RE)
 # 裸 HTTP 超时统一取值（连接/读数拆开，由来见 cdp_base.http_timeout 上方）
-from cdp_base import http_timeout
+from cdp_base import http_timeout, short_reason
 
 HOME_URL = "https://www.globalimporter.net/"
 SEARCH_URL = "https://www.globalimporter.net/search_company.asp?keyword={kw}&curpage={page}"
@@ -107,6 +107,12 @@ _TAG_RE = re.compile(r"<[^>]+>")
 class GiCrawler(CdpSiteCrawler):
     PLATFORM_NAME = "跨国采购网"
     PLATFORM_SLUG = "globalimporter"
+    # 详情是一次纯本地组装（列表页已把联系人/电话明文给全，本站详情吃 IP 配额），没有单店
+    # 正文可判「无联系方式是谁的责任」——这句话必须声明出来：否则第 32 条硬门会把它当
+    # 「忘了接 _keep_detail」响；而分档读数会诚实地报 no_page（本站的设计边界）+ 这句理由，
+    # 而不是报 unknown（把手漏接）：两者的处方相反，给这一站写「先接 _keep_detail」是一句
+    # 执行不了的假处方（详情要吃 IP 配额，正是当初不取页的理由）。
+    NO_DETAIL_EVIDENCE = "本站详情不取页（列表页明文组装），没有单店正文可判分档"
     BASE_URL = HOME_URL
     HOME_DOMAIN = "globalimporter.net"
     NEEDS_BROWSER = False           # 纯 HTTP：首页拿 Cookie，之后全靠 requests
@@ -182,13 +188,22 @@ class GiCrawler(CdpSiteCrawler):
         return True
 
     def close_browser(self):
+        """本站不常驻标签，但借来的一枚必须还（空壳会把过验证时借的标签留到收工
+        之后；由来与判据见 cdp_base.CdpSiteCrawler.release_tab）。"""
+        self.release_tab("收工")
         return None
 
     def _is_session_alive(self):
         return True
 
-    def http_block_reason(self, status, html="", url="", headers=None):
+    def http_block_reason(self, status, html="", url="", headers=None, deep=False):
         """先走基类（状态码 + 小体积 + 插页词），再补一道本站专用的全文扫。
+
+        `deep` 原样透传给基类，专用那一支也照同一口径：深链被拒不钉恢复探测页。
+        ⚠ 本站目前**不产生深链请求**——详情是一次纯本地组装（见 crawl_detail），
+        列表页已给全部明文字段，因为详情/内容页吃的是 IP 配额（超了直接 2 小时冷却）。
+        所以「深链账 vs 通道账」这道分账在本站今天用不上；留通透传是为了基类加参数时
+        这里不会悄悄失联（签名对拍见 test_block_triage_offline 第 ⑬ 节）。
 
         为什么要补：安全狗的 IP 拦截页正文 5140 字节，基类那条「体积 < 3000 才去比对页词」
         的门槛把它放过去了，而它的话术与基类词表差一个字（请求/访问过于频繁），于是整页被
@@ -197,7 +212,7 @@ class GiCrawler(CdpSiteCrawler):
         这几个短语只可能出现在拦截页上（真实列表页是 B2B 条目，不会写「已被网站管理员设置
         拦截」），所以本站不看体积也扫；归到 ip 处置（站方原话就是 IP 访问频繁，页面上
         没有可点的验证）。"""
-        reason = super().http_block_reason(status, html, url, headers)
+        reason = super().http_block_reason(status, html, url, headers, deep=deep)
         if reason:
             # 配额页（那句「网站已启用防采集功能…」，实测 275 字）体积够小，命中的是
             # 基类那条按体积比对页词的分支，分到的层同样是 ip。但基类话术不带等待预期，
@@ -208,7 +223,7 @@ class GiCrawler(CdpSiteCrawler):
             return reason
         hit = next((m for m in _BLOCK_PAGE_MARKS if m in (html or "")), "")
         if hit:
-            if url:
+            if url and not deep:
                 self._block_probe_url = url
             self._block_kind = "ip"
             return f"防采插页（{hit}）·站方要求约 2 小时后再浏览"
@@ -273,7 +288,7 @@ class GiCrawler(CdpSiteCrawler):
             # 原样截断既砍掉了决定方向的 `(Caused by …)`，也让主机熔断拿不到这次连击——
             # 于是整轮每个关键词都重新付一遍 3 个请求的连接超时（口径见 cdp_base._note_request_error）。
             self._note_request_error(e)
-            self._log(f"  ⚠ 跨国采购网首页会话引导失败（{self._last_page_error[:70]}）")
+            self._log(f"  ⚠ 跨国采购网首页会话引导失败（{short_reason(self._last_page_error, 70)}）")
             self._booted = False
             return False
 
@@ -553,7 +568,7 @@ class GiCrawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})

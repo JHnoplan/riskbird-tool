@@ -1076,8 +1076,18 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.question(self, "确认", "确定清空历史种子库？清空后将对同一批关键词从头重采。") \
                 == QMessageBox.Yes:
-            self.crawler.clear_seen_store()
-            QMessageBox.information(self, "完成", "历史种子库已清空。")
+            ok = self.crawler.clear_seen_store()
+            # 清没清成要按事实说：unlink 失败（只读卷/权限/被占）过去也被吞掉并照样弹
+            # 「已清空」，用户下一轮看到的还是「命中即跳过 0 家」——那与「采不到数据」
+            # 是同一个症状，却比它更难查（账上没痕迹）。原因串见 crawler._seed_clear_error。
+            if ok:
+                QMessageBox.information(self, "完成", "历史种子库已清空。")
+            else:
+                QMessageBox.warning(
+                    self, "没清成",
+                    "历史种子库没有清掉，下一轮仍会「命中即跳过」：\n"
+                    + str(getattr(self.crawler, "_seed_clear_error", "") or "未记录原因")
+                    + "\n\n已采集到的数据不受影响；请检查数据目录是否可写后再清一次。")
 
     def _on_start(self):
         if not self.keywords:

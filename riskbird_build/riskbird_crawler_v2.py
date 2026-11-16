@@ -259,7 +259,7 @@ class RiskBirdCrawlerV2:
                 time.sleep(2)
             names = [c.get("name") for c in (self.driver.get_cookies() or [])]
         except Exception as e:
-            return "unknown", f"读取 Cookie 失败：{str(e)[:60]}"
+            return "unknown", f"读取 Cookie 失败：{e}"
         return block_guard.login_state(names, self.PLATFORM_LABEL)
 
     def _gate(self):
@@ -453,16 +453,21 @@ class RiskBirdCrawlerV2:
             # 1. 只保留第一个标签页，关闭其余（hao123 等启动页可能在多余标签）
             handles = self.driver.window_handles
             if len(handles) > 1:
+                stuck = 0
                 for h in handles[1:]:
                     try:
                         self.driver.switch_to.window(h)
                         self.driver.close()
                     except Exception:
-                        pass
+                        # 剪不干净的标签堆在窗口里，下一轮就是「莫名多一个页」（第 32g 条）
+                        stuck += 1
                 try:
                     self.driver.switch_to.window(handles[0])
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log(f"  ⚠ 切回主标签没成功（{type(e).__name__}）"
+                              f"——多余标签可能还开着，请手动确认活动标签")
+                if stuck:
+                    self._log(f"  ⚠ 有 {stuck} 枚多余标签没关掉，请手动确认窗口数量")
 
             # 2. 导航并验证（最多 3 次）
             domain = self.BASE_URL.split("//")[-1].split("/")[0]
@@ -729,7 +734,7 @@ class RiskBirdCrawlerV2:
                     else:
                         result["状态"] = f"失败: 会话异常且无法恢复"
                 else:
-                    result["状态"] = f"失败: {str(e)[:50]}"
+                    result["状态"] = f"失败: {e}"
                     break
 
         # 兜底：全字段为空且无状态 → 记为未找到，不得以空行混入采集结果
@@ -1084,7 +1089,7 @@ class RiskBirdCrawlerV2:
                 self.search_calls += 1
             except Exception as e:
                 timeout_hit = True
-                self._log(f"  列表页导航异常(第{rnd+1}次): {str(e)[:60]}")
+                self._log(f"  列表页导航异常(第{rnd+1}次): {e}")
 
             cards, wall, throttled, fuzzy, stale = [], False, False, False, False
             for i in range(16):  # 最多等约 10 秒
@@ -1185,7 +1190,7 @@ class RiskBirdCrawlerV2:
         try:
             lst = self._extract_suggest_list(self._fast_search(name)) or []
         except Exception as e:
-            self._log(f"  补全接口降级异常: {str(e)[:60]}")
+            self._log(f"  补全接口降级异常: {e}")
             return False, "", ""
         for item in lst:
             if not isinstance(item, dict):
@@ -1321,7 +1326,7 @@ class RiskBirdCrawlerV2:
         try:
             raw = self.driver.execute_async_script(js, self.FAST_SEARCH_API, name)
         except Exception as e:
-            self._log(f"  补全接口调用异常: {str(e)[:70]}")
+            self._log(f"  补全接口调用异常: {e}")
             return None
         if not isinstance(raw, str) or raw.startswith("ERR|") or "|" not in raw:
             self._log(f"  补全接口无响应: {str(raw)[:70]}")

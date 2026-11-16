@@ -159,6 +159,7 @@ fi
   --hidden-import website_contact --hidden-import perf_governor \
   --hidden-import field_evidence --hidden-import enrich_waterfall \
   --hidden-import lead_scoring --hidden-import channel_health \
+  --hidden-import text_shape \
   --add-data "config.json:." --add-data "mk_phone_font.json:." \
   --add-data "../enf_clean:enf_clean" \
   --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" \

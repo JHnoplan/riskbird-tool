@@ -39,6 +39,9 @@ from oss_pool_client import OSSPoolClient, OSSPoolError
 # 函数、不自己判档位——路径策略只许有一份，两个模块各判一次迟早对不上。
 # 与 GUI 一样硬导入：档位模块缺失就必须当场炸，不许退成 pro 把内部功能发出去。
 import edition
+# 失败原因收成一行只准一个把手（第 30 条）：剔除台账里的 `reason` 会被念给人听，
+# 按字符数切一刀就长成半截词。text_shape 只依赖标准库，硬导入不会把别的东西拖进来。
+from text_shape import short_reason
 
 # 智能去重引擎（可选依赖：打包态可能找不到）
 try:
@@ -829,7 +832,7 @@ class DataPoolManager:
             entries.append({
                 "company": nm,
                 "company_norm": norm,
-                "reason": str(reason or "").strip()[:200],
+                "reason": short_reason(reason, 200),   # 台账里这句话会被念给人听：只准一个把手收口
                 "actor": self.username,
                 "time": datetime.now().isoformat(timespec="seconds"),
             })

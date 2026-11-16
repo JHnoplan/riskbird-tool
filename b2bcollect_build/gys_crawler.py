@@ -292,7 +292,7 @@ class GysCrawler(CdpSiteCrawler):
                 # 砍掉的**只按「关键词#主体」标记**，不占全局已见：相关性是「对这个关键词」的判定，同一家对 A 词不符、对 B 词可能正是目标（实机砍掉的名单里就有真同行）。
                 if not self.is_relevant(kw, self.stub_relevance_text(e)):
                     skipped += 1
-                    self._early_skipped += 1
+                    self._note_early_skip(kw, e["公司名称"])
                     self._seen_members.add(f"{self.PLATFORM_SLUG}:{kw}#{mid}")
                     self._commit_to_store({"状态": "类目不符(已过滤)", "关键词": kw,
                                            "公司名称": e["公司名称"], "memberId": mid})
@@ -323,11 +323,13 @@ class GysCrawler(CdpSiteCrawler):
         t = self._eval("document.title") or ""
         return any(m in t for m in self.ABNORMAL_TITLE_MARKS)
 
-    def _http_get(self, url, tries=2):
+    def _http_get(self, url, tries=2, deep=False):
         """纯 HTTP 取 gys 静态子域页（实测未被限流时商铺页/联系页都能直取，
         比浏览器快且不占标签）。只识浏览器 UA + 低频，失败返回空串由调用方回退浏览器，
         绝不把网络抖动当「无数据」；连续失败则放弃快路（见 _http_disabled）。
-        防采/限流插页（520 等）单独记账：不重试、不当普通失败，交看门狗。"""
+        防采/限流插页（520 等）单独记账：不重试、不当普通失败，交看门狗。
+        `deep=True`＝取的是某一家的深链：它的被拒只记深链单笔账、不钉探测页，
+        调用方照旧回退浏览器（理由见 cdp_base.http_block_reason 的 deep 分支）。"""
         # 主机级熔断（口径与由来见 cdp_base._skip_dead_host）：这一台已经连续两次连不上，
         # 本轮不再为它付整轮连接超时——跳过之后由翻页层照「一页都没取到」归因，不谎报「无数据」
         if self._skip_dead_host(url):
@@ -339,8 +341,19 @@ class GysCrawler(CdpSiteCrawler):
             try:
                 r = requests.get(url, headers=GYS_HTTP_HEADERS, timeout=http_timeout(25))
                 self._mark_activity()
-                block = self.http_block_reason(r.status_code, r.text, url)
+                block = self.http_block_reason(r.status_code, r.text, url, deep=deep)
                 if block:
+                    if deep:
+                        # 这一家不给看 ≠ 整条通道被拦：只记深链账，交回调用方走浏览器
+                        self._note_deep_block(url, block)
+                        # 200·JS 质询壳：借标签把挑战跑完再取一次这一条（判据/预算/成败口径
+                        # 都在 cdp_base._deep_shell_retry，这条腿七站同形状，抄七遍必分叉）
+                        got = self._deep_shell_retry(
+                            url, r.status_code, r.text,
+                            lambda: self._http_get(url, tries=1, deep=deep))
+                        if got is not None:
+                            return got
+                        return ""
                     self._block_reason = block
                     return ""
                 if r.status_code == 200 and r.text:
@@ -359,47 +372,78 @@ class GysCrawler(CdpSiteCrawler):
             self._log("  ⚠ gys 连续取页失败，本轮改走浏览器渲染（不再走纯 HTTP）")
         # 这一路以前只打日志、不记账：日志会被 tail 截掉，而界面与体检器问的是 stats()。
         # 不记这一笔，gys 整轮 0 家时「链路没通」与「真的没有公司」在账上长得一模一样。
-        self._note_request_error(last)
+        # 深链的连接类死法照记、状态码级被拒不记（口径见 cdp_base._note_fetch_fail）。
+        self._note_fetch_fail(last, deep)
         self._log(f"  ⚠ gys HTTP 取页失败（{last}）：{url[:70]}")
         return ""
 
     @staticmethod
     def _html_abnormal(html):
-        """HTTP 取回的页是否限流插页/空壳：标题命中异常词，或体积远小于正常商铺页。"""
+        """HTTP 取回的页是否限流插页/空壳：标题命中异常词，或体积远小于正常商铺页。
+        ⚠ 体积这一条只看「太薄」，看不到「太大的人机验证壳」：站方回 200 + 十几 KB 的 WAF
+        质询壳时，旧判据当成正常页交给 parse_list，解析出 0 家 → 界面写成「这家没联系方式」
+        （2026-11-15 马可波罗实机立下的同族缺陷，签名判据见 cdp_base._looks_like_challenge_shell）。"""
         if not html or len(html) < 3000:
+            return True
+        if GysCrawler._looks_like_challenge_shell(html):
             return True
         m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
         t = (m.group(1) if m else "").strip()
         return any(x in t for x in GysCrawler.ABNORMAL_TITLE_MARKS) \
             or any(x in t for x in ("访问异常", "安全验证", "禁止访问"))
 
-    def _fetch_raw(self, url):
-        """取一页 gys 内容（不过看门狗）：HTTP 优先，被拦/失败再回退共享 Chrome。"""
-        html = self._http_get(url)
+    def _fetch_raw(self, url, deep=False):
+        """取一页 gys 内容（不过看门狗）：HTTP 优先，被拦/失败再回退共享 Chrome。
+        `deep=True` 时浏览器渲染出的插页也只记深链账，不写通道级 `_block_reason`
+        ——通道级判定留给列表页那一跳（见 crawl 里的 SEARCH_HOME 分支）。"""
+        html = self._http_get(url, deep=deep)
         if html and not self._html_abnormal(html):
             self._block_reason = ""
             return html, "http"
         if self._goto(url, expect_domain="gys.cn") and not self._is_abnormal_page():
             rendered = self._html()
             if rendered and len(rendered) >= 1500:
+                # `_goto` 只断言了域名，不断言路径：浏览器把 302 一路跟到底时，落点可能是
+                # 首页或上一家的商铺——那种页照样 200、照样有正文，于是别人的联系方式被写进
+                # 这一家头上（串页假数据）。深链必须证明「这就是这一页」才交货；列表页留给
+                # 上面的站点判据（关键词结果页靠的是搜索地址本身，不在这里改判据）。
+                if deep:
+                    body, why = self._tab_body_for(url, body=rendered)
+                    if not body:
+                        self._note_deep_block(url, f"浏览器落点不是这一家（{why}）")
+                        return "", ""
+                    self._block_reason = ""
+                    return body, "browser"
                 self._block_reason = ""
                 return rendered, "browser"
         if self._is_abnormal_page():
+            if deep:
+                # 某一家的商铺/联系页渲染出插页：只记这一家的账。旧写法把它升级成通道级
+                # 拦停并钉住探测页，于是恢复探测反复打这一条被拒的深链（同族缺陷，
+                # 见 cdp_base.http_block_reason 的 deep 分支与 2026-11-15 实机马可波罗取证）
+                self._note_deep_block(url, "深链渲染出防采插页（浏览器同样不给看）")
+                return "", ""
             # 浏览器渲染也停在插页：记下原因，让上层知道这不是「这家没数据」
             self._block_reason = self._block_reason or "供应商网插页/验证（浏览器渲染同样被拦）"
             self._block_probe_url = url
         return "", ""
 
-    def _fetch_page(self, url):
+    def _fetch_page(self, url, deep=False):
         """取一页 gys 内容，被拦时交给防采看门狗：弹提醒、等人工过验证/IP 冷却，
         探到恢复后自动重试同一 URL。旧实现只是返空→记一条「详情页访问异常(待重试)」
-        就往下跑，验证码根本不弹提醒，整轮就耗在插页里空转。"""
-        html, src = self._fetch_raw(url)
+        就往下跑，验证码根本不弹提醒，整轮就耗在插页里空转。
+        `deep=True`＝某一家的深链：它自己的被拒已在 `_fetch_raw` 记进深链账，**不为它**
+        整通道等放行（否则恢复探测会被钉在一条永远被拒的深链上，见 stats()["deep_block"]）。
+        但通道级拦停仍然照旧处理——那种情况下 `_block_reason` 是列表页那一跳写下的，
+        探测地址也是入口页，等得到结果。"""
+        html, src = self._fetch_raw(url, deep=deep)
         if html:
             return html, src
-        if self._gys_blocked():
+        # 通道级原因优先（它只可能由非深链调用写下）；深链自己不参与「标签当前页」判据，
+        # 因为刚渲染过的那一家插页会把整通道读成被拦
+        if self._block_reason or (not deep and self._gys_blocked()):
             if self.handle_http_block(url):
-                html, src = self._fetch_raw(url)
+                html, src = self._fetch_raw(url, deep=deep)
                 if html:
                     return html, src
             else:
@@ -410,11 +454,12 @@ class GysCrawler(CdpSiteCrawler):
         rec = self._base_rec(stub)
         sub = stub.get("公司ID") or stub.get("memberId")
         url = stub.get("详情URL") or f"https://{sub}.gys.cn/"
-        html, _src = self._fetch_page(url)
+        html, _src = self._fetch_page(url, deep=True)
         if not html:
             # 非终态（含「异常/失败」）：不入种子库，换关键词/下次重跑自动补采
             rec["状态"] = "详情页访问异常(待重试)"
             return rec
+        self._keep_detail(html)      # 留给「无联系方式」分档（见 cdp_base._note_no_contact）
         data = self._parse_company_page(html, sub)
         self._merge_rec(rec, data)
         # 详情页标题里的公司名更规范，优先覆盖列表锚文本
@@ -425,8 +470,9 @@ class GysCrawler(CdpSiteCrawler):
         if not (rec.get("联系人") and (rec.get("电话") or rec.get("手机") or rec.get("邮箱"))):
             alt = self._find_contact_url(html, sub) or f"https://{sub}.gys.cn/contact-information/"
             self._sleep()
-            more_html, _ = self._fetch_page(alt)
+            more_html, _ = self._fetch_page(alt, deep=True)
             if more_html:
+                self._keep_detail(more_html)   # 补访的联系页是最后看过的那一页
                 more = self._parse_company_page(more_html, sub)
                 self._merge_rec(rec, more)
                 if rec.get("联系人") or rec.get("邮箱"):

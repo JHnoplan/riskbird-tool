@@ -36,7 +36,7 @@ check("同名多子域按公司名去重（山东北华电源只留一家）",
 
 # 2) 分页拼址：search.php 301 的 SEO 基址 → -pnN.htm
 seen_urls = []
-def fake_fetch(url, tries=4, allow_redirects=True):
+def fake_fetch(url, tries=4, allow_redirects=True, deep=False):
     seen_urls.append(url)
     return ("<a href='//yangzhou0117547.11467.com'>扬州某某照明有限公司</a>",
             "https://b2b.11467.com/search/-abc123.htm")
