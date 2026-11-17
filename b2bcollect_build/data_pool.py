@@ -20,6 +20,7 @@
 import getpass
 import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -560,6 +561,10 @@ class DataPoolManager:
     # 单个上传对象记录数上限（约 9MB JSON）：超过就分片，
     # 弱网下失败只重传单片而不是整批几十 MB 重来
     SHARD_RECORD_LIMIT = 20000
+
+    # 多片并发上传的 worker 数（对标 S3 TransferManager 的分块并发）：
+    # 每个 worker 独占一个 OSS client；片数不足时按片数收缩，单片不走并发
+    UPLOAD_WORKERS = 4
 
     # 剔除标记（删除向量）对象前缀：与 users/ 并列的一等公民目录，
     # 每个用户只写自己的分片，读取端全量消费（见 TOMBSTONE_PREFIX 注释）
@@ -1164,15 +1169,8 @@ class DataPoolManager:
         shards = [records[i:i + limit] for i in range(0, len(records), limit)]
         total = len(shards)
 
-        filenames: List[str] = []
-        for idx, shard in enumerate(shards, start=1):
-            part = f"_p{idx}of{total}" if total > 1 else ""
-            filename = f"upload_{ts}_{batch}{part}{suffix}.json"
-            key = f"users/{self.username}/{filename}"
-            if progress_callback and total > 1:
-                progress_callback(f"正在上传第 {idx}/{total} 批"
-                                  f"（{len(shard)} 条）…")
-            payload = {
+        def _payload(idx: int, shard: list) -> dict:
+            return {
                 "username": self.username,
                 "timestamp": now.isoformat(timespec="seconds"),
                 "record_count": len(shard),
@@ -1180,10 +1178,70 @@ class DataPoolManager:
                 "shard_count": total,
                 "records": shard,
             }
+
+        filenames: List[str] = []
+        if total == 1:
+            # 单片走原路径：PUT 进度直传 client（单片没有「第 x/n 批」可报）
+            filename = f"upload_{ts}_{batch}{suffix}.json"
+            key = f"users/{self.username}/{filename}"
             self.oss.upload_json_atomic(
-                key, payload,
-                progress_callback=None if total > 1 else progress_callback)
+                key, _payload(1, shards[0]), progress_callback=progress_callback)
             filenames.append(filename)
+        else:
+            # 多片并发（对标 S3 TransferManager 的分块并发上传）：
+            # · 有界线程池：并发度 UPLOAD_WORKERS，片数不足自动收缩；
+            # · 每个 worker 独占一个 OSS client——requests.Session 没有
+            #   线程安全保证（官方文档明示），共享 client 并发发请求可能串包；
+            #   client 经队列分发，同一时刻每把至多一个任务在用；
+            # · 单片重试唯一实现在 client._send（瞬时故障退避），这里不叠加
+            #   第二层重试（两层重试在弱网下就是重试风暴）；
+            # · 结果按分片号装配而非完成序——filenames[0] 必须是第 1 片，
+            #   返回的 label 与 meta 统计才不随网络时序漂。
+            if progress_callback:
+                progress_callback(f"共 {total} 批（{len(records)} 条），"
+                                  f"{min(self.UPLOAD_WORKERS, total)} 线程并发上传…")
+            workers = min(self.UPLOAD_WORKERS, total)
+            client_q = queue.Queue()
+            for _ in range(workers):
+                client_q.put(self.oss.clone_for_thread())
+            results: Dict[int, str] = {}
+            errors: Dict[int, Exception] = {}
+            lock = threading.Lock()
+
+            def _upload_one(idx: int, shard: list):
+                part = f"_p{idx}of{total}"
+                filename = f"upload_{ts}_{batch}{part}{suffix}.json"
+                key = f"users/{self.username}/{filename}"
+                client = client_q.get()
+                try:
+                    client.upload_json_atomic(key, _payload(idx, shard))
+                except Exception as e:
+                    with lock:
+                        errors[idx] = e
+                    return
+                finally:
+                    client_q.put(client)
+                with lock:
+                    results[idx] = filename
+                    done_n = len(results)
+                if progress_callback:
+                    progress_callback(f"已上传 {done_n}/{total} 批…")
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_upload_one, idx, shard)
+                           for idx, shard in enumerate(shards, start=1)]
+                for f in futures:
+                    f.result()  # 失败已记入 errors；这里兜住意外异常并等待收尾
+            if errors:
+                idx0 = min(errors)
+                raise OSSPoolError(
+                    f"{total} 批中有 {len(errors)} 批上传失败"
+                    f"（{'、'.join(f'第{i}批' for i in sorted(errors))}）；"
+                    f"首个失败（第 {idx0} 批）：{errors[idx0]}")
+            filenames = [results[i] for i in sorted(results)]
+            if len(filenames) != total:      # 兜底：绝不允许静默丢片
+                raise OSSPoolError(
+                    f"上传结果不完整：{total} 批只确认了 {len(filenames)} 批")
 
         label = (filenames[0] if total == 1
                  else f"{filenames[0]} 等 {total} 个文件")

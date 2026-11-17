@@ -82,7 +82,20 @@ from data_pool import (IMPORT_EXCEL_EXTS, IMPORT_ARCHIVE_EXTS,
 
 # 默认扫描根目录：用户真正放数据的三个地方。整卷扫 ``/`` 会把系统卷、网络挂载、
 # Time Machine 本地快照都拖进来，收益为零且随时卡死。
+# 微信聊天文件目录（收发的表格/压缩包常年堆在那里）在 default_roots 里按
+# WECHAT_ROOT_CANDIDATES 探测追加，不写进这个元组——它在 Library 深处，
+# 路径与系统/微信版本相关，跟「按名字拼 home」的这三个不是一回事。
 DEFAULT_ROOT_NAMES = ("Desktop", "Documents", "Downloads")
+
+# 微信聊天文件的落盘位置（收发的表格/压缩包常年堆在这里，全盘扫描必须看得见）：
+# 三处候选都探测，但只追加「不被默认根覆盖」的——Documents 下的两处天然被
+# Documents 根覆盖，重复加只会把同一批文件扫两遍，台账去重救不了扫描时长。
+WECHAT_ROOT_CANDIDATES = (
+    "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files",
+    "Documents/WeChat Files",
+    "Documents/xwechat_files",
+)
+WECHAT_ROOT_DISPLAY = "微信聊天文件"    # 界面显示名：basename 对用户毫无信息量
 
 MAX_DEPTH = 8                       # 实测有效数据都在 6 层以内
 MAX_FILE_BYTES = 64 * 1024 * 1024   # 更大的表基本是日志/图片型工作簿（16MB 的
@@ -197,10 +210,28 @@ _EMPTY_SHEET_RE = re.compile(r"没有读到任何工作表|没有数据行|没�
 
 
 def default_roots() -> List[str]:
-    """默认扫描根目录（只返回真实存在的）。"""
+    """默认扫描根目录（只返回真实存在的；微信目录存在且没被覆盖才追加）。"""
     home = Path.home()
-    return [str(home / n) for n in DEFAULT_ROOT_NAMES
-            if (home / n).is_dir()]
+    roots = [str(home / n) for n in DEFAULT_ROOT_NAMES
+             if (home / n).is_dir()]
+    for cand in WECHAT_ROOT_CANDIDATES:
+        p = home / cand
+        if not p.is_dir():
+            continue
+        sp = str(p)
+        if any(sp.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            continue          # 已被某个根的子路径覆盖：不重复扫
+        roots.append(sp)
+    return roots
+
+
+def root_display_name(root: str) -> str:
+    """扫描根的界面显示名：微信目录换成「微信聊天文件」，其余显示目录名。"""
+    home = Path.home()
+    for cand in WECHAT_ROOT_CANDIDATES:
+        if root == str(home / cand):
+            return WECHAT_ROOT_DISPLAY
+    return os.path.basename(root.rstrip("/\\")) or root
 
 
 def _forbidden_dirs() -> List[str]:

@@ -383,6 +383,17 @@ class OSSPoolClient:
         self._session = requests.Session()
         self._session.headers["User-Agent"] = "B2BCollect-Pool/1.0"
 
+    def clone_for_thread(self) -> "OSSPoolClient":
+        """为并发上传 worker 构建配置相同、Session 独立的新 client。
+
+        requests.Session 没有线程安全保证（官方文档明示），分片并发上传时
+        每个 worker 必须独占一个 client；ak 直接传参复制，不重新走
+        resolve_credentials（避免每个 worker 重复读盘探环境）。
+        """
+        return OSSPoolClient(bucket=self.bucket, endpoint=self.endpoint,
+                             prefix=self.prefix,
+                             ak_id=self._ak_id, ak_secret=self._ak_secret)
+
     # ── 内部：构造带签名的请求头 ──
 
     def _auth_headers(self, method: str, key: str,

@@ -35,7 +35,7 @@ try:
     from data_pool import (DataPoolManager, normalize_company_name, EXPORT_HEADER,
                            record_region)
     from data_pool import _CN_PROVINCES as CN_PROVINCES
-    from pool_matcher import CompanyMatcher
+    from pool_matcher import CompanyMatcher, detect_industry
     from mapping_recommender import MappingRecommender
     from audit_logger import get_audit_logger
     _HAS_POOL = True
@@ -594,6 +594,10 @@ class SearchWorker(QThread):
     # 进精排集合的候选上限：BM25 决定谁进来，最终顺序由精排决定
     RECALL_CAP = 3000
 
+    # 行业裁剪的最小池量：行业切片命中低于 max(它, max_results) 就放弃裁剪、
+    # 回退全库——分区裁剪只在候选量足够大时才划算，小切片硬裁会把上下游裁没
+    PRUNE_MIN_FLOOR = 50
+
     def __init__(self, query: str, master: list, use_deepseek: bool = False,
                  candidate_indices=None, max_results: int = 100,
                  mgr=None, regions=None, filters=None):
@@ -608,26 +612,60 @@ class SearchWorker(QThread):
         self.filters = filters or {}
 
     def _recall(self):
-        """取精排用的候选集，返回 (记录列表, 召回来源说明, RecallCounts)。
+        """取精排用的候选集，返回 (记录列表, 召回来源说明, RecallCounts, 行业说明)。
 
         粗筛数与范围总数是两个必须分开报的数字（见 RecallCounts）：前者是本次
         关键词在视图里命中的候选条数，后者是不看关键词的范围内总数。只拿前者当
         「池内共 N 条」显示，用户会以为池里全是同一家公司。
         两个数都取封顶值：百万级里精确 count 宽词要 2 秒，而界面只需要知道
         「量大到可以忽略精排截断的影响」还是「就这么多」。
+
+        行业裁剪（第 4 个返回值 = 说明文案，由做出决定的地方就地生成）：查询词
+        识别出行业、用户没手动选行业、又不是在搜公司名时，把 industry 谓词下压
+        进 SQL——即「先定位行业池再查」的逻辑分区，不需要物理分池。两处豁免：
+        公司名搜索要跨行业找上下游；手动选了行业则尊重显式选择。行业切片命中
+        不足 max(PRUNE_MIN_FLOOR, max_results) 时回退全库重查并如实说明。
+        裁剪只做在 Gold 视图路径上：索引/全表路径没有便宜的精确计数，硬过滤
+        必漏检（找不到下游就回不来），那条路一行行业说明都不发。
         """
         if self.mgr is None:
-            return self.master, "", RecallCounts()
+            return self.master, "", RecallCounts(), ""
+        flt = self.filters
+        prune_note = ""
+        try:
+            industry = detect_industry(self.query)
+        except Exception:
+            industry = None
+        if (industry and not self.filters.get("industry")
+                and not CompanyMatcher._looks_like_company_name(self.query)):
+            prune = dict(self.filters)
+            prune["industry"] = industry
+            try:
+                pruned = self.mgr.search_candidates(self.query, self.regions,
+                                                    prune,
+                                                    limit=self.RECALL_CAP)
+            except Exception:
+                pruned = None
+            if pruned is not None:
+                if len(pruned) >= max(self.PRUNE_MIN_FLOOR, self.max_results):
+                    counts = _counts_of(self.mgr, self.query, self.regions,
+                                        prune)
+                    return (pruned, "检索视图", counts,
+                            f"🏭 识别到行业「{industry}」，已在行业池内检索")
+                # 切片装不下本次要的量：回退文案先备好，等全库重查真正成功再发出
+                prune_note = (f"🏭 识别到行业「{industry}」，但行业池内候选只有 "
+                              f"{len(pruned)} 条，范围太小，已回退全库检索")
         # 1) Gold 物化视图：全文 + 国内外分区 + 筛选全部在 SQL 里下压
         try:
             records = self.mgr.search_candidates(self.query, self.regions,
-                                                 self.filters,
+                                                 flt,
                                                  limit=self.RECALL_CAP)
         except Exception:
             records = None
         if records is not None:
             return (records, "检索视图",
-                    _counts_of(self.mgr, self.query, self.regions, self.filters))
+                    _counts_of(self.mgr, self.query, self.regions, flt),
+                    prune_note)
         # 2) 磁盘倒排索引（视图还没建好时用它，索引解析在本线程完成）
         if self.candidate_indices is None:
             try:
@@ -635,14 +673,17 @@ class SearchWorker(QThread):
             except Exception:
                 self.candidate_indices = None
         if self.candidate_indices:
-            return self.master, "关键词索引", RecallCounts()
-        return self.master, "全表扫描", RecallCounts()
+            return self.master, "关键词索引", RecallCounts(), ""
+        return self.master, "全表扫描", RecallCounts(), ""
 
     def run(self):
         try:
             matcher = CompanyMatcher()
             # 两种模式都先召回：AI 模式的产业链分析同样只在候选里做
-            scope, recall, counts = self._recall()
+            scope, recall, counts, ind_note = self._recall()
+            # 行业说明先于召回说明：前者说「范围被怎样收窄」，后者是收窄后的粗筛数
+            if ind_note:
+                self.progress.emit(ind_note)
             note = _recall_note(recall, len(scope), counts, cap=self.RECALL_CAP)
             if note:
                 self.progress.emit(note)
@@ -3357,11 +3398,11 @@ class LocalScanDialog(QDialog):
         self.btn_upload.setEnabled(False)
         self.btn_cancel_scan.setEnabled(True)
         try:
-            from local_scan import default_roots, accepted_types_text  # noqa: F401
+            from local_scan import (default_roots, accepted_types_text,
+                                    root_display_name)  # noqa: F401
             shown = self._roots if self._roots else default_roots()
             self.roots_lbl.setText(
-                "扫描范围：" + "、".join(os.path.basename(r.rstrip("/")) or r
-                                          for r in shown)
+                "扫描范围：" + "、".join(root_display_name(r) for r in shown)
                 + "（自动跳过虚拟环境、系统目录与 Office 临时锁文件；认 "
                   + accepted_types_text() + "，压缩包里的表格会被解出来一起判）")
         except Exception:
