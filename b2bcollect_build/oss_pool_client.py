@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 
@@ -606,7 +607,12 @@ class OSSPoolClient:
         src_full = f"{self.prefix}/{source_key}" if not source_key.startswith(self.prefix) else source_key
         tgt_full = f"{self.prefix}/{target_key}" if not target_key.startswith(self.prefix) else target_key
 
-        copy_source = f"/{self.bucket}/{src_full}"
+        # header 值只能 latin-1：key 里的中文（如 tag「全盘扫描」）必须
+        # percent-encode，否则 requests 发头时抛 UnicodeEncodeError（2026-11-17
+        # 全盘扫描实机 87 批全军覆没的根因）。签名串用同一个编码后的值——
+        # OSS 对收到的 header 原文验签，二者必须逐字节一致；服务端拿到后
+        # 解码还原出真实对象 key。safe="/" 保留路径分隔符。
+        copy_source = quote(f"/{self.bucket}/{src_full}", safe="/")
         resource = f"/{self.bucket}/{tgt_full}"
 
         def _copy_headers() -> Dict[str, str]:

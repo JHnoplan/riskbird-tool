@@ -11,6 +11,9 @@
      worker 数收缩、client 独占、按分片号装配、单片路径不变、失败聚合
   4. 微信扫描根（default_roots）：
      三处探测、被默认根覆盖不重复加、显示名「微信聊天文件」
+  5. 复制源 header 纯 ASCII（copy_key，2026-11-17 全盘扫描实机缺陷）：
+     中文 tag 的 key 进 x-oss-copy-source 必须 percent-encode，
+     签名串与发送的 header 逐字节一致
 
 运行：cd b2bcollect_build && python test_scan_upload_offline.py
 """
@@ -371,6 +374,56 @@ def test_wechat_scan_root():
     _assert(all(os.path.isdir(r) for r in roots), "返回的每个根都真实存在")
 
 
+# ── 5. 复制源 header 纯 ASCII（2026-11-17 全盘扫描实机缺陷）────────────────────
+
+def test_copy_source_header_ascii():
+    print("\n═══ 5. 复制源 header 纯 ASCII（中文 tag 不炸） ═══")
+    from urllib.parse import unquote
+
+    from oss_pool_client import OSSPoolClient
+    c = OSSPoolClient(bucket="bkt", endpoint="example.aliyuncs.com",
+                      prefix="0817/pool", ak_id="id", ak_secret="sec")
+    captured = {}
+
+    def fake_send(method, url, headers_factory, what="", timeout=None):
+        captured["headers"] = dict(headers_factory())
+        return types.SimpleNamespace(status_code=200,
+                                     headers={"ETag": "T"},
+                                     text="", json=lambda: {})
+
+    orig_send = c._send
+    c._send = fake_send
+    try:
+        c.copy_key("u/upload_1_p1of87_全盘扫描.json", "u/x.json")
+    finally:
+        c._send = orig_send
+
+    src = captured["headers"]["x-oss-copy-source"]
+    try:
+        src.encode("latin-1")
+        ok = True
+    except UnicodeEncodeError:
+        ok = False
+    _assert(ok, "复制源 header 可 latin-1 编码（HTTP 头硬约束）", repr(src))
+    _assert("全盘扫描" not in src and "%" in src,
+            "中文 key 已 percent-encode", repr(src))
+    _assert(unquote(src) == "/bkt/0817/pool/u/upload_1_p1of87_全盘扫描.json",
+            "解码还原等于真实源对象路径", unquote(src))
+
+    # 签名串用与发送 header 完全相同的值（OSS 对 header 原文验签）
+    import base64 as _b64
+    import hashlib as _h
+    import hmac as _hmac
+    date = captured["headers"]["Date"]
+    sts = (f"PUT\n\n\n{date}\n"
+           f"x-oss-copy-source:{src}\n/bkt/0817/pool/u/x.json")
+    expect = _b64.b64encode(_hmac.new(
+        b"sec", sts.encode("utf-8"), _h.sha1).digest()).decode()
+    _assert(captured["headers"]["Authorization"] == f"OSS id:{expect}",
+            "签名串与发送的 header 逐字节一致（验签口径）",
+            captured["headers"]["Authorization"])
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -378,6 +431,7 @@ if __name__ == "__main__":
     test_search_industry_pruning()
     test_sharded_concurrent_upload()
     test_wechat_scan_root()
+    test_copy_source_header_ascii()
 
     print("\n" + "=" * 60)
     total = _passed + _failed
