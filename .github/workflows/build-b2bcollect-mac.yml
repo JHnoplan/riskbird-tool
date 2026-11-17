@@ -222,3 +222,11 @@ jobs:
       with:
         name: B2bCollectTool-Mac
         path: B2bCollectTool_Mac_arm64.zip
+
+    - name: Publish to fixed OSS download links
+      # 固定直链机制（与 Windows 侧同一句）：链接永久不变，每次打包覆盖同
+      # 一个 key；脚本匿名 HEAD 自校验不过则本步红。
+      env:
+        OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      run: python3 .github/scripts/upload_release_to_oss.py B2bCollectTool_Mac_arm64.zip

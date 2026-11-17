@@ -471,3 +471,12 @@ jobs:
           b2bcollect_build/B2bCollectToolSetup.exe
           b2bcollect_build/B2bCollectTool_Win_portable.zip
         if-no-files-found: error
+
+    - name: Publish to fixed OSS download links
+      # 固定直链机制（2026-11-17 用户拍板）：三份制品的下载链接永久不变，
+      # 每次打包成功就覆盖同一批 key；上传后脚本用匿名 HEAD 自校验，
+      # 不过门则本步红（GitHub 制品已在上面上传，不损失回退通道）。
+      env:
+        OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      run: python .github/scripts/upload_release_to_oss.py b2bcollect_build/B2bCollectToolSetup.exe b2bcollect_build/B2bCollectTool_Win_portable.zip
