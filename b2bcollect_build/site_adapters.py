@@ -1473,7 +1473,7 @@ if HAS_AQC:
             except Exception:
                 bws = None
             if bws:
-                for params in ({"url": self.BASE_URL}, {"url": self.BASE_URL, "newWindow": True}):
+                for params in ({"url": self.HOME_URL}, {"url": self.HOME_URL, "newWindow": True}):
                     try:
                         r = self._send_command(bws, "Target.createTarget", params)
                         target_id = (r.get("result") or {}).get("targetId")
@@ -1491,9 +1491,11 @@ if HAS_AQC:
                     ws = self._get_ws_url()
                     cur = self._execute_js(ws, "(function() { return window.location.href; })()") if ws else ""
                     if cur and "aiqicha" in str(cur):
+                        # 定性交给基类那一份（_confirm_open）：本站「地址对上了却被
+                        # 站点拒了」是一类真实存在的形态，两份实现里只修一份就是
+                        # 让另一个产物继续顶着「静默烧名单」复发
                         self._wait_page_hydrated(ws, 15)
-                        self._log("爱企查页面已打开")
-                        return True
+                        return self._confirm_open(ws)
                 except Exception:
                     pass
             self._log("⚠ 爱企查页面未确认打开，将继续尝试")
@@ -1545,21 +1547,24 @@ if HAS_AQC:
         # ＋「⏱ 拦截已持续 10 分钟以上无人处理」）。节奏改由实例属性
         # block_probe_interval / block_heal_every 统一设定，走基类一条实现。
 
-        def _wait_unblock(self, reason, max_wait=None):
+        def _wait_unblock(self, reason, max_wait=None, **kw):
             """通道顶部撞墙的限时等待：与另两路同一口径（block_wait_limit 秒）。
-
+        
             返回 False 不代表放弃这一家，而是交给编排层的持续监测
-            （parallel_session._watch_block_cleared：零采集请求、每 15 秒只读探测、
+            （parallel_session._watch_block_cleared：零采集请求、每 15 秒只读探 测、
             不刷新页面，用户过完验证自动接着采这一家）。不在这里死等 30 分钟，
             是为了让「已盯 N 分钟」的心跳和轮次记账只长在一个地方。
             **绝不允许**写成 ``return self._wait_unblock_limited(...)``：基类
             _wait_unblock_limited 会回调 self._wait_unblock，子类再覆写回去就是
             2026-11-11 实机 RecursionError 的根因。limited 那套只服务 search_company
             内部撞墙（带 block_wait_limit 与名单移交语义），与这里是两条独立入口。
-            """
+            **kw（interval/ready/heal…）必须透传：search_company 内部走 _detail_via_search
+            时会带 ``interval=`` ``ready=`` 撞墙等待（能力探针+只读节奏），旧签名把它们
+            砸成 TypeError，每家必炸、反复回队首直到连续 4 家休眠（2026-11-17 实机
+            「上海打捞局」一家卡死 10 分钟的根因）。顶部入口不传这些参数，行为不变。"""
             cap = int(getattr(self, "block_wait_limit", 600) or 600)
             with _human_wait(self, reason):
-                return bool(super()._wait_unblock(reason, min(int(max_wait or cap), cap)))
+                return bool(super()._wait_unblock(reason, min(int(max_wait or cap), cap), **kw))
 
         def close_tab(self):
             try:

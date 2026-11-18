@@ -34,11 +34,16 @@ import re
 
 DEFAULT_OUTPUT_NAME = "清洗后客户库入库数据.xlsx"
 
-# 模板表头兜底（A-I 外呼块 / J-R 备注块），运行时优先读模板真实表头
-FALLBACK_HEADER = [
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "外呼备注",
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "备注",
-]
+# 模板表头兜底：**没找到模板文件时**用这一份。它必须逐字等于入库接口的 9 列契约
+# （同目录 yzd_client.IMPORT_HEADERS；ali1688_build / riskbird_build 那两份副本同口径）。
+# 2026-11-17 整轮产出实机改口径：旧版本这里写着 18 列（A-I 外呼块 + J-R 备注块），于是
+# 本机没有模板文件时，交付的 `清洗后入库数据.xlsx` 与 `国内只留手机号.xlsx` 两张表都是
+# 同一组 9 列重复两遍、内容逐格相同——那是「替客户臆造表结构」：双块只在**真模板**里存在
+# （读到了照旧按模板双块填，`read_template_layout` 那条路径一行没改），没读到就该退回接口
+# 那一档最少列。对用户而言这就是「数据乱」的第一印象，而且重复列还会把下游按列名取数的
+# 脚本直接带崩（同名列后一个盖前一个）。
+FALLBACK_HEADER = ["客户名称", "企业名称", "岗位", "手机号", "固话",
+                  "邮箱", "微信号", "数据来源", "备注"]
 
 # 采集字段 → 模板列的取值优先级
 # 「联系人/岗位/微信号/备注」只在外部数据智能清洗时才会出现（三个平台的采集结果里
@@ -643,8 +648,9 @@ def locate_template(start_dirs=None) -> str:
 def read_template_layout(template_path: str, log=print):
     """读取模板表头，返回 (外呼块列索引, 备注块列索引, 完整表头)。
 
-    列名在模板里出现两次（A-I 与 J-R），按出现顺序区分两块。
-    找不到模板时使用内置表头兜底。
+    列名在模板里出现两次（A-I 与 J-R）时按出现顺序区分两块。
+    找不到模板时使用内置表头兜底（＝接口 9 列，不成双）：这一句必须说出来，否则
+    「为什么这次的交付表只有 9 列」与「为什么上次有 18 列」就成了一笔说不清的账。
     """
     header = list(FALLBACK_HEADER)
     if template_path:
@@ -657,6 +663,9 @@ def read_template_layout(template_path: str, log=print):
                 log(f"已读取入库模板表头：{os.path.basename(template_path)}（{len(header)} 列）")
         except Exception as e:
             log(f"⚠ 读取模板失败，改用内置表头：{e}")
+    else:
+        log(f"ℹ 本轮没找到入库模板文件（客户库数据导入模板*.xlsx），按接口那 9 列输出："
+            f"{'、'.join(header)}（需要双块模板格式就把模板放进 Downloads/Desktop/Documents 重跑）")
 
     pos = {}
     for idx, col in enumerate(header):
@@ -711,7 +720,7 @@ def _reuse_body_style(ws, align, border, at=(2, 1)):
 
 
 def write_clean_excel(rows: list, filepath: str, template_path: str = "", log=print):
-    """按模板列结构写出清洗后的入库数据 Excel（两块列头均填充，保证入库兼容）。"""
+    """按模板列结构写出清洗后的入库数据 Excel（模板里有双块就两块都填，单块就只填一块）。"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 

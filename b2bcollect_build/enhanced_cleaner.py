@@ -39,17 +39,16 @@ from enf_clean.normalize import (
 )
 from enf_clean.phone import Audit, parse_phone_cell
 
-# ── 复用现有清洗管线（列匹配 / 合并 / 模板行构建）──
+# ── 复用现有清洗管线（列匹配 / 合并 / 模板行构建 / 入库表列结构与样式）──
 import customer_library_cleaner as _cleaner
+# 这里不再 import openpyxl 的 Workbook/样式类：入库表的表头、列宽、字体、框线全在
+# `write_clean_excel` 那一份里，自己再拼一遍就是「同一个工具两种列数」的起点。
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
-
-# 18 列双区块表头（与《客户库数据导入模板》完全一致）
-HEADER = [
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "外呼备注",
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "备注",
-]
+# 入库表的列结构只有一份真源：`customer_library_cleaner.write_clean_excel`
+# （找到客户模板就按模板出 A-I 外呼块 + J-R 备注块，没找到就按接口那 9 列）。
+# 2026-11-18 删掉本文件自己抄的那份 18 列常量：它把同组 9 列无条件写两遍，
+# 与《清洗后入库数据》在同样环境下的列数直接对不上（用户原话「导出不需要多余栏」），
+# 而同名列在下游按列名取数时后一个盖前一个。门禁见 test_external_clean_offline 的 E 段。
 
 # 中国手机号正则（与 yzd_client.PHONE_RE 同一口径）
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
@@ -241,13 +240,18 @@ def _safe_str(val):
 #  主入口
 # ─────────────────────────────────────────────────────────────────────────────
 
-def enhanced_clean_three_files(paths, output_dir, log=print):
+def enhanced_clean_three_files(paths, output_dir, log=print, template_path=None):
     """外部数据文件 → 列匹配 → 合并 → libphonenumber 深度清洗 → 三文件输出。
 
     返回 (result_dict, report_list)：
       result_dict: {"国内": (path, count), "国内只留手机号": (path, count), "国外": (path, count)}
       report_list: 与 clean_external_records 同格式的逐表报告
+
+    `template_path` 只在这里定一次位（三份文件必须同一套列结构，一份有双块一份没双块
+    比三份都少一栏更难解释）；不传就按导出、自动保存那同一套规则找客户模板。
     """
+    if template_path is None:
+        template_path = _cleaner.locate_template([output_dir, os.path.expanduser("~/Downloads")])
     # ── 1) 现有管线：读文件 + 智能列匹配 + 记录归一化 ──
     records, report = _cleaner.clean_external_records(paths, log=log)
     bad = [r for r in report if r.get("error")]
@@ -389,7 +393,7 @@ def enhanced_clean_three_files(paths, output_dir, log=print):
         ("国外", foreign_rows, "国外"),
     ]:
         path = os.path.join(output_dir, f"清洗后_{suffix}_{stamp}.xlsx")
-        _write_xlsx(rows, path, log)
+        _write_xlsx(rows, path, log, template_path=template_path)
         result[label] = (path, len(rows))
 
     # ── 5) 汇总日志 ──
@@ -408,59 +412,24 @@ def enhanced_clean_three_files(paths, output_dir, log=print):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Excel 写出（与现有 write_clean_excel 同一格式风格）
+#  Excel 写出（列结构与样式全部委托 write_clean_excel，本文件不再自己拼表头）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _write_xlsx(rows, filepath, log=print):
-    """写出分类后的 Excel 文件，18 列双区块结构。"""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "客户库"
+def _write_xlsx(rows, filepath, log=print, template_path=None):
+    """把分类后的行写成入库表：列结构走 `write_clean_excel` 那一份真源。
 
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    thin = Border(*[Side(style="thin")] * 4)
-
-    ws.append(HEADER)
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin
-
-    widths = {
-        "A": 16, "B": 34, "C": 12, "D": 24, "E": 24, "F": 30,
-        "G": 12, "H": 16, "I": 44,
-        "J": 16, "K": 34, "L": 12, "M": 24, "N": 24, "O": 30,
-        "P": 12, "Q": 16, "R": 44,
-    }
-    for col_letter, w in widths.items():
-        ws.column_dimensions[col_letter].width = w
-    ws.row_dimensions[1].height = 24
-    ws.freeze_panes = "A2"
-
-    for row in rows:
-        block = [
-            row.get("客户名称") or None,
-            row.get("企业名称", ""),
-            row.get("岗位") or None,
-            row.get("手机号") or None,
-            row.get("固话") or None,
-            row.get("邮箱") or None,
-            row.get("微信号") or None,
-            row.get("数据来源", ""),
-            row.get("外呼备注") or None,
-        ]
-        ws.append(block + block)
-
-    for r in range(2, ws.max_row + 1):
-        for c in range(1, len(HEADER) + 1):
-            ws.cell(row=r, column=c).alignment = Alignment(vertical="top", wrap_text=True)
-            ws.cell(row=r, column=c).border = thin
-
+    旧实现自己拿 `block + block` 把同组 9 列写两遍（还配了一份 18 列常量当“模板口径”），
+    于是增强清洗的三份文件在没有客户模板的机器上比《清洗后入库数据》多出一整块重复栏——
+    同一个工具的两个出口对同一件事给出两种列数，用户只会读到「数据乱」。
+    `template_path=None` 表示按同一套查找规则现场定位（与导出、自动保存同口径）；
+    传空串则强制走接口 9 列（离线用例要的是确定的列数）。
+    """
+    if template_path is None:
+        template_path = _cleaner.locate_template([os.path.dirname(os.path.abspath(filepath)),
+                                                  os.path.expanduser("~/Downloads")])
     tmp = filepath + ".tmp"
-    wb.save(tmp)
-    os.replace(tmp, filepath)
+    _cleaner.write_clean_excel(rows, tmp, template_path=template_path, log=lambda m: None)
+    os.replace(tmp, filepath)   # 先写临时文件再改名：中途失败不许留下半张入库表
     log(f"  📄 {os.path.basename(filepath)}（{len(rows)} 条）")
 
 

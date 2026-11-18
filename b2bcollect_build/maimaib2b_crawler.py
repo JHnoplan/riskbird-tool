@@ -516,6 +516,7 @@ class Maimaib2bCrawler(CdpSiteCrawler):
         「0 家成功」（2026-11-02 实机复现：每个关键词空转 80 秒、一家不产出、日志一句话没有）。
         其余记账口径（去重键、早过滤、stat_*）与基类逐字对齐，别改出第二套统计。"""
         empty = stale = 0
+        prev_ids = None
         page = 0
         while not self._stop_requested:
             page += 1
@@ -545,8 +546,11 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 continue
             empty = 0
             new = skipped = seen = 0
+            ids = set()
             for e in entries:
                 mid = str(e.get("公司ID") or e.get("memberId") or "")
+                if mid:
+                    ids.add(mid)   # 集合差分的原料就取这里：与去重同一个主体标识，不留第二口径
                 key = f"{self.PLATFORM_SLUG}:{mid}"
                 name = self._norm_name(e["公司名称"])
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
@@ -571,10 +575,18 @@ class Maimaib2bCrawler(CdpSiteCrawler):
                 yield e
             tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 条，新增 {new} 家{tail}")
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                self._log(f"  「{kw}」第 {page} 页与上一页是「同一批条目」（重合 {rate:.0%}）："
+                          f"翻页参数没生效，这一词只能取到第一页（不是「公司池枯竭」，"
+                          f"也不是「本站没数据」），停止翻页")
+                return
             if new == 0:
                 stale += 1
                 if stale >= 2:
-                    self._log(f"  「{kw}」连续 {stale} 页无新增，公司池已枯竭")
+                    self._log(f"  「{kw}」连续 {stale} 页无新增（各页条目内容不同，"
+                              f"但都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale = 0

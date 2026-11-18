@@ -1221,7 +1221,10 @@ class AutoSaveWorker(QThread):
         os.replace(tmp, str(path))
 
     def _write_cn_mobile_file(self, path, rows, clean_rows=None):
-        """清洗 → 过滤中国手机号 → 写 18 列模板 Excel，返回写入行数。
+        """清洗 → 过滤中国手机号 → 按入库模板列结构写 Excel，返回写入行数。
+
+        列数不写死：找到客户模板就按模板出（A-I 外呼块 + J-R 备注块），没找到就按
+        接口那 9 列出（与《清洗后入库数据》同一份 `write_clean_excel`，两份表永远同构）。
 
         与「清洗数据」三份文件中的「国内只留手机号」同一口径，
         自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。
@@ -3231,9 +3234,10 @@ class MainWindow(QMainWindow):
                 "brand": "由英文商号、店铺子域拼出候选域名 → 抓回来还得过归属核验才认",
                 # 最后一级**不点平台名**：这一档在丐版/受限账号上也可见（它是数据口径开关），
                 # 而 tooltip 里写出「风鸟/爱企查」就等于按钮藏住了、话没藏住——edition 的
-                # 「文案交底扫描」判的正是这一类。说的是同一件事，只是换成层级自己的名字。
-                "registry": "前面几级都接不上 → 把还缺的家数投进现成的工商核验待采名单，"
-                            "那一轮补采会顺路带上"}
+                # 「文案交底扫描」判的正是这一类。说的是同一件事，只是换成层级自己的名字
+                # （名字也从注册表取：本文件开头那句「层级名都从这里取」不许只在数字上成立）。
+                "registry": f"前面几级都接不上 → 把还缺的家数投进现成的{_fe.TIER_LABEL['registry']}待采名单，"
+                            f"那一轮补采会顺路带上"}
         _wfl = "\n".join(
             f"{_wf.stage_mark(s)}：{_wfg[s]}" + ("。" if s == _wf.STAGES[-1] else "；")
             for s in _wf.STAGES)
@@ -3278,11 +3282,11 @@ class MainWindow(QMainWindow):
             f"判过期看「最后核验时间」那一列，不是看采集时间："
             f"手机 {_fe.TTL_DAYS['手机']} 天、电话 {_fe.TTL_DAYS['电话']} 天、"
             f"邮箱 {_fe.TTL_DAYS['邮箱']} 天；\n"
-            f"工商核验的号放宽到 {_fe.TTL_TIER_FACTOR['registry']} 倍（登记信息改得慢），"
-            f"平台自带的收紧到 {_fe.TTL_TIER_FACTOR['source']} 倍。\n"
+            f"{_fe.TIER_LABEL['registry']}的号放宽到 {_fe.TTL_TIER_FACTOR['registry']} 倍（登记信息改得慢），"
+            f"{_fe.TIER_LABEL['source']}的收紧到 {_fe.TTL_TIER_FACTOR['source']} 倍。\n"
             "· 从没记过核验时间的老行一律算到期、本轮重问——读成「还新」等于这功能永远不生效；\n"
             "· 重问到同一个号也会刷新时间戳：不刷新的话那一行每轮都被重问，是拿预算原地打转；\n"
-            "· 电话手机邮箱已经齐且达到官网直采以上可信度的行，命中即停，不重问。\n"
+            f"· 电话手机邮箱已经齐且达到{_fe.TIER_LABEL['site']}以上可信度的行，命中即停，不重问。\n"
             "什么时候该开：手里是一份要长期跟进的客户资产；一次性拉新名单不必开，白烧请求。")
         self.chk_reverify.toggled.connect(self._set_reverify)
         hp3.addWidget(self.chk_reverify)
@@ -3682,7 +3686,7 @@ class MainWindow(QMainWindow):
         s.blocked_signal.connect(self._on_blocked)
         s.block_cleared_signal.connect(self._on_block_cleared)
         if hasattr(s, "login_required_signal"):
-            s.login_required_signal.connect(lambda m: self._on_log("🔐 " + m))
+            s.login_required_signal.connect(self._on_login_required)
         self.btn_file.clicked.connect(self._on_import_file)
         self.btn_parse.clicked.connect(self._on_parse)
         self.btn_smart.clicked.connect(self._on_smart_parse)
@@ -3901,6 +3905,25 @@ class MainWindow(QMainWindow):
         elif link == "#app-relocate":
             self._offer_app_relocation()
         # 其余未知动作静默忽略：横幅文案由别处拼装，将来加新链接不该在这里炸界面
+
+    def _on_login_required(self, msg):
+        """某站开局说「这个 Chrome 里没登录」：横幅常显直到登录完成。
+
+        为什么不弹窗（旧实现只打一行日志，用户根本看不见；中间考虑过弹窗又放弃）：
+        登录是用户去 Chrome 里主动做的事，弹窗抢焦点只会叠出一堆「知道了」；
+        横幅常显＋日志逐分钟报等待进度，用户抬头就能看到还欠哪一步。
+        等待期间计时同样不算采集耗时（与被拦等人工同一口径）；登录完成后爬虫发
+        解除信号，横幅与计时当场收账（见 _on_block_cleared），不必等本轮结束。"""
+        # 2026-11-18 扫同一族时改回 `_on_log`：这里原来写的是 `self._log(...)`，而 MainWindow
+        # 整条 MRO 上没这个方法（全文件 143 处都走 _on_log，只这一处例外）。后果不是「少一行
+        # 日志」：这一句在 _show_banner 之前抛 AttributeError，Qt 槽里的异常不会中断别的调度，
+        # 于是「这个平台欠登录」那条常显横幅根本弹不出来，用户只看见它一直不动。
+        self._on_log("🔐 " + (msg or ""))
+        self._show_banner(
+            f"🔐 {msg or '需要登录'}——去 Chrome 窗口里登录一次，登录后自动继续；"
+            f"一直不登录的话，这个平台本轮会跳过（不烧请求不喂风控）。",
+            "#fff3cd", "#664d03")
+        self._hold_timer(True)
 
     def _on_blocked(self, reason):
         """被拦：醒目横幅 + 独立弹窗提醒 + 接管计时（等待不计入采集耗时）。
@@ -5568,7 +5591,7 @@ class MainWindow(QMainWindow):
                 self.chk_waterfall.setChecked(False)
                 self.chk_waterfall.blockSignals(False)
             self._on_log("⚠ 瀑布补全开不了：它跑在「采集后回采官网联系方式」那一轮里，"
-                         "而那条没勾上；请先勾那条再来勾这条（只勾那条＝只做官网直采一跳的老行为）")
+                         f"而那条没勾上；请先勾那条再来勾这条（只勾那条＝只做{_fe.TIER_LABEL['site']}一跳的老行为）")
             QMessageBox.information(
                 self, "暂时开不了瀑布补全",
                 "「多源瀑布补全」不是单独跑一轮，它是把「采集后回采官网联系方式」那一轮\n"
@@ -5994,13 +6017,17 @@ class MainWindow(QMainWindow):
             self._on_log(f"⚠ 采集进度保存失败（不影响本次数据）：{first_line(e, 100)}")
         self._register_task(status)
 
-    def _restore_site_checks(self, sites):
+    def _restore_site_checks(self, sites, reset_1688=False):
         """按任务快照恢复「③ 采集平台」勾选态：这是**程序在恢复状态**，不是用户点了勾选框。
 
         1688 的 toggled 上挂着「先去登录」模态弹窗，恢复期间必须屏蔽信号：否则每次启动
         接着上次任务都会被顺手弹一次（用户什么都没点就被打断），而自动化/offscreen 下这个
         模态框会永久卡住整个回填流程（实测启动停在 _restore_task 里出不来）。
         空 sites 保持界面现状不动（老任务快照没记站点时不能把平台全关掉）。
+        reset_1688=True（启动静默回填）时 1688 一律回到默认不勾：它是需登录、验证码
+        高发的高摩擦站（Windows 实机：计数 0、反复弹验证码），静默恢复带上它等于用户
+        一开工具就带着一个采不动还老打断人的平台跑。用户在历史任务里显式点「接着采」
+        则尊重快照——显式意图优先于默认态（silent=False 不走重置）。
         """
         if not sites:
             return
@@ -6009,9 +6036,16 @@ class MainWindow(QMainWindow):
         try:
             for slug, chk in self.site_checks.items():
                 chk.setChecked(slug in sites)
+            if reset_1688 and "1688" in self.site_checks:
+                self.site_checks["1688"].setChecked(False)
         finally:
             for _chk in self.site_checks.values():
                 _chk.blockSignals(False)
+        # 文案就地发出（信号已解屏蔽）：上次勾了 1688 而启动没带上它，必须说一声，
+        # 否则用户会以为恢复丢了功能——其实是特意不自动带高摩擦平台。
+        if reset_1688 and "1688" in (sites or []):
+            self._on_log("ℹ 上次任务勾了 1688，启动时不自动带上（需登录且验证码高发，"
+                         "开着只会空转打断采集）；要用请在「③ 采集平台」里手动勾选")
 
     def _reconcile_stale_running(self):
         """启动对账：把上一次进程遗留的「采集中」改记为「已中断」。
@@ -6120,7 +6154,9 @@ class MainWindow(QMainWindow):
         self._kw_expanded_text = chr(10).join(kws)
 
         sites = [s for s in ((data.get("sites") or task.get("sites") or [])) if s in self.site_checks]
-        self._restore_site_checks(sites)
+        # 启动静默回填（silent=True）时 1688 重置回默认不勾；历史任务显式「接着采」
+        # （silent=False）尊重快照原样恢复。
+        self._restore_site_checks(sites, reset_1688=silent)
         self._apply_params(task.get("params") or {})
 
         resumed = self.session.apply_progress() if data else 0

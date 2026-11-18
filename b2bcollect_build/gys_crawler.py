@@ -245,6 +245,7 @@ class GysCrawler(CdpSiteCrawler):
             return
         self._log(f"  「{kw}」结果页：{base}")
         empty = stale = 0
+        prev_ids = None
         page = 1
         while not self._stop_requested and (self.max_pages <= 0 or page <= self.max_pages):
             while self._pause_requested and not self._stop_requested:
@@ -280,8 +281,11 @@ class GysCrawler(CdpSiteCrawler):
             else:
                 empty = 0
             new = skipped = seen = 0
+            ids = set()
             for e in entries:
                 mid = e["公司ID"]
+                if mid:
+                    ids.add(mid)   # 集合差分的原料就取这里：与去重同一个主体标识，不留第二口径
                 key = f"{self.PLATFORM_SLUG}:{mid}"
                 name = self._norm_name(e["公司名称"])
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
@@ -305,14 +309,23 @@ class GysCrawler(CdpSiteCrawler):
                 yield e
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 家，新增 {new}"
                       + self._page_tail(skipped, seen))
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                # 翻页参数没生效（每页取回同一批公司）与「这一词真的没货」长得一模一样，
+                # 而处方相反（前者修 URL，后者换词）；旧写法直接 return，一句归因都不留。
+                self._log(f"  「{kw}」第 {page} 页与上一页是「同一批条目」（重合 {rate:.0%}）："
+                          f"翻页参数没生效，这一词只能取到第一页（不是「本站没数据」），停止翻页")
+                return
             if new == 0:
                 stale += 1
                 if stale >= 1:
+                    self._log(f"  「{kw}」第 {page} 页无新增（条目都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale = 0
             # 有更大页码的分页链接才继续（正则兼容 ?p=/&p=/;p= 等写法，
-            # 比子串判据健壮；主保护仍是上面「新增 0 家即枯竭」的内容型早停）。
+            # 比子串判据健壮；主保护仍是上面「新增 0 家」那一刀的内容型早停）。
             if not any(int(n) > page for n in re.findall(r'[?&;]p=(\d+)', html)):
                 return
             page += 1

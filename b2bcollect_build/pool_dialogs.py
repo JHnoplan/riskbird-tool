@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -19,7 +20,8 @@ from typing import List, NamedTuple, Optional
 # 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
 from text_shape import first_line
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QPoint
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QSize, QPropertyAnimation,
+                          QEasingCurve, QPoint, QTimer)
 from PyQt5.QtGui import QFont, QColor, QCursor
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -33,7 +35,9 @@ from PyQt5.QtWidgets import (
 try:
     from oss_pool_client import OSSPoolClient, OSSPoolError
     from data_pool import (DataPoolManager, normalize_company_name, EXPORT_HEADER,
-                           record_region)
+                           record_region, clean_person_name, clean_phone_values,
+                           clean_email_values, clean_website_value,
+                           clean_address_value, clean_products_value)
     from data_pool import _CN_PROVINCES as CN_PROVINCES
     from pool_matcher import CompanyMatcher, detect_industry
     from mapping_recommender import MappingRecommender
@@ -429,6 +433,53 @@ def _recall_note(recall: str, scope_n: int,
 #  后台线程
 # ─────────────────────────────────────────────────────────────────────────────
 
+# 运行中的后台线程自持引用。对话框关闭后 QThread 的 Python 对象被回收而线程
+# 还在跑，Qt 会直接 abort（「QThread: Destroyed while thread is still running」）。
+# 本文件已经为此手工处理过几处（SyncDialog.done / LocalScanDialog._shutdown_worker），
+# 但「关掉窗口就再没人等它」的路径不该靠每个对话框自觉：这里统一挂住。
+_RUNNING_WORKERS = set()
+
+
+class WorkerBase(QThread):
+    """后台线程底座：界面随时可能先走，线程必须自己保证不弄崩进程。
+
+    只多了两件小事，线程体本身（_body）写法和原来完全一致：
+      1. 运行期间把对象挂进 _RUNNING_WORKERS，结束即摘——界面已经关了也不会
+         被提前 GC；
+      2. cancel() 置标志，各线程在**阶段边界**自查（绝不在 SQL 事务中途硬切，
+         那会把视图重建整个回滚）；置了标志后界面不再需要结果，但数据该
+         写完还是要写完。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return bool(self._cancelled)
+
+    def run(self):
+        _RUNNING_WORKERS.add(self)
+        try:
+            self._body()
+        except RuntimeError as e:
+            # 界面先走、线程后完：PyQt 往已销毁的接收者发消息招 RuntimeError。
+            # 这一条必须接住：run() 里没接住的 Python 异常在 QThread 上会直接
+            # qFatal——表现为「关掉窗口整个工具闪退」，而数据本身一点问题都没有。
+            # 重活后置（见 _after_first_paint）之后这种时序变成了常态而不是偶然。
+            import logging
+            logging.getLogger(__name__).warning(
+                "后台线程收尾时界面已销毁，结果不再递送：%s", e)
+        finally:
+            _RUNNING_WORKERS.discard(self)
+
+    def _body(self):
+        raise NotImplementedError
+
+
 class SyncWorker(QThread):
     """后台上传线程。"""
     progress = pyqtSignal(str, str)   # (main_text, detail_text)
@@ -470,7 +521,7 @@ class SyncWorker(QThread):
             self.finished.emit(False, f"上传失败: {e}")
 
 
-class LoadMasterWorker(QThread):
+class LoadMasterWorker(WorkerBase):
     """后台加载总表线程（复用对话框持有的同一实例，保证索引/总表同源）。
 
     大厂秒开思想（Google Drive / Dropbox）：
@@ -479,13 +530,22 @@ class LoadMasterWorker(QThread):
       3. 统计信息从本地缓存计算（零网络延迟）
     """
     progress = pyqtSignal(str)               # 阶段进度文案
-    finished = pyqtSignal(bool, list, str)  # (success, master, message)
-    refreshed = pyqtSignal(list, str)       # 后台刷新完成 (master, message)
+    # 载荷是总表，但**懒采纳下它是 LazyMaster**（不是 list）：信号类型写成 list
+    # 时 PyQt 会试着把它转成序列，而「转成序列」正是那句会把 6.2GB 读回来的话——
+    # 秒开路径当场被自己抵消。类型标成 object，原样递过去，谁要用再物化。
+    finished = pyqtSignal(bool, object, str)  # (success, master, message)
+    refreshed = pyqtSignal(object, str)       # 后台刷新完成 (master, message)
+    # 内存闸门拦下整理解释时的「要不要现在硬做一次」：线程自己不能弹窗
+    # （非 GUI 线程），只能把原因递出去由界面问用户。
+    consent_needed = pyqtSignal(str)
 
-    def __init__(self, force_refresh: bool = False, mgr=None):
+    def __init__(self, force_refresh: bool = False, mgr=None,
+                 force_full_load: bool = False):
         super().__init__()
         self.mgr = mgr or DataPoolManager()
         self.force_refresh = force_refresh
+        # 用户已经点过「现在就整理」：越过内存闸门再跑一次
+        self.force_full_load = force_full_load
         self._view_pct = -1                 # 上次播报的整理进度（同百分比不重复发）
 
     def _emit_view_progress(self, done: int, total: int):
@@ -513,7 +573,78 @@ class LoadMasterWorker(QThread):
         except Exception:
             return False
 
-    def run(self):
+    def _load_failed(self, mgr, err: str) -> None:
+        """总表拿不到时的统一收尾（把归因说清，不拿「加载失败」敷衍）。"""
+        note = str(err or "")
+        cache_err = str(getattr(mgr, "_last_cache_error", "") or "")
+        if cache_err and cache_err not in note:
+            note = f"{note}｜{cache_err}" if note else cache_err
+        self.finished.emit(False, [], note or "数据池本地缓存与远端都不可用")
+
+    def _stats_msg(self, mgr, master, view_ok: bool, synced: bool = False) -> str:
+        """状态行文案：条数/上传者/加速情况全部从视图或本地统计派生，零物化。
+
+        「总表 N 家公司」的 N 在秒开路径下来自身份令牌里的条数（没读盘也能
+        如实回答）；加速情况必须区分「已经就绪」与「本轮没就绪、改用较慢的
+        方式」，而且被内存闸门拦下的那轮必须把原因说出来——静默地让用户以为
+        数据已经同步到最新，比慢更坑。
+        """
+        stats = mgr.get_master_stats()
+        head = "总表 {:,} 家".format(len(master))
+        if synced:
+            head += "（已同步）"
+        msg = (f"{head}公司\n"
+               f"数据来自 {stats.get('users', 0)} 位用户，"
+               f"共 {stats.get('total_uploads', 0)} 条原始记录")
+        rn = _reach_note(mgr)
+        if rn:
+            msg += "\n" + rn
+        if view_ok:
+            msg += "\n搜索加速已就绪：几百万条也能秒出结果"
+        else:
+            msg += "\n本次改用较慢的方式查找（结果范围完全一样），后台会自行加速"
+        note = mgr.pending_sync_note() if hasattr(mgr, "pending_sync_note") else ""
+        if note:
+            msg += "\n" + note
+        return msg
+
+    def _after_first_paint(self, mgr, has_local: bool) -> None:
+        """界面已经可用之后的后台活：远端增量同步 + 加速数据对齐。
+
+        这一段必须后置：它就是「打开搜索框慢」的真正源头（全量重建十万条
+        量级实测 144s），而它做完之前界面早就可以搜索了。把它摆在
+        finished 之前，等于拿一个可以后台做的动作去阻塞整个对话框的首屏。
+
+        代价必须承认：这段现在可以在用户关掉窗口之后还在跑，所以每个阶段
+        边界都先看一眼取消标志，不再往界面发消息（视图事务本身不能中途
+        硬切，切了就是把整次重建回滚）。
+        """
+        if not (has_local and not self.force_refresh):
+            return
+        if self.is_cancelled():
+            return
+        self.progress.emit("正在同步远端数据（界面已经可用）…")
+        try:
+            new_master = mgr.refresh_from_oss()
+        except Exception:
+            new_master = None      # 后台同步失败静默忽略，不影响已展示的数据
+        if self.is_cancelled():
+            return
+        # 加速数据必须跟着新总表走：同步后不重建，「已同步」的数据就检索不到
+        view_ok = self._sync_view(mgr)
+        note = mgr.pending_sync_note()
+        if new_master is None and not note:
+            return                 # 没新数据也没被拦下：界面无需刷新
+        if self.is_cancelled():
+            return
+        shown = new_master if new_master is not None else mgr._master_cache
+        try:
+            self.refreshed.emit(shown,
+                                self._stats_msg(mgr, shown, view_ok, synced=True))
+        except RuntimeError:
+            pass                   # 界面对象已经销毁：结果不再有人要，安静收尾
+
+    def _body(self):
         try:
             self.progress.emit("正在加载数据池…")
             self._do_load()
@@ -521,63 +652,65 @@ class LoadMasterWorker(QThread):
             self.finished.emit(False, [], f"加载数据池失败: {e}")
 
     def _do_load(self):
-        """秒开加载：本地缓存立即返回 + 后台静默同步。"""
+        """秒开加载：本地缓存立即返回 + 后台静默同步。
+
+        两条路径的分界就一个问题：**视图与磁盘缓存同源吗**。
+          · 同源（绝大多数情况）→ 总表一行都不解析，直接交付可用界面，
+            同步/对齐全部后置（见 data_pool 模块头的三段身份链注释）
+          · 不同源 / 首次无缓存 → 才是原来那套「解析总表 + 必要时重建视图」，
+            此时重建确实得拿新总表手做，所以压在 finished 之前，
+            但文案要说得出在做什么、为什么绕不开
+        """
         mgr = self.mgr
-        # 检查本地缓存状态
-        has_local = (mgr._cache_dir / "master.json").exists()
+        has_local = mgr.has_local_cache()
         if has_local:
-            self.progress.emit("正在加载本地缓存…")
+            self.progress.emit("正在检查本地数据池…")
         else:
             self.progress.emit("首次加载，正在从远端拉取数据…")
 
-        # 核心：get_merged_master 有本地缓存时秒返回（不等 OSS）
-        master = mgr.get_merged_master(force_refresh=self.force_refresh)
+        # 核心：get_merged_master 有可用本地缓存时秒返回（不等 OSS，也不读总表）。
+        # 全量重建（首次/缓存作废）时把下载/合并/建索引各阶段进展报给界面，
+        # 用户看到的是进度而不是黑盒等待（体感性能大厂第一课：Perceived Performance）。
+        try:
+            master = mgr.get_merged_master(
+                force_refresh=self.force_refresh,
+                progress_cb=lambda s: self.progress.emit(s),
+                force_full_load=self.force_full_load,
+            )
+        except MemoryError as e:
+            # 闸门拦下不等于失败：本机内存不够把全表读进来，但这一次读进来
+            # 就能落地身份令牌、以后每一轮都不再需要。所以这里把决定权交给
+            # 用户（机器是他的，代价说清了就该他拍板）：线程不能弹窗，只发
+            # consent_needed 把原话递到界面。已经同意过还失败，才是真失败。
+            if self.force_full_load:
+                self._load_failed(mgr, f"整理数据时内存仍然不够: {e}")
+                return
+            self.consent_needed.emit(str(e))
+            return
+        except Exception as e:
+            self._load_failed(mgr, f"数据池加载失败: {e}")
+            return
 
-        # Gold 物化视图在后台线程与本线程内构建/校验：
-        # 已对齐时 is_current 只读一次元数据（毫秒级），真正重建只发生在
-        # 首次或数据变更时。放在这里而不是搜索路径，点击「搜索」才可能不卡。
-        self.progress.emit("正在整理数据以便快速搜索…")
+        if mgr.store_ready() and mgr.master_is_lazy():
+            # 秒开路径：先交付，后台再同步。这一分支上「整理数据」根本不需要做
+            # （视图已经与磁盘缓存同源），过去却把它当成开框的固定仪式。
+            self.finished.emit(True, master,
+                               self._stats_msg(mgr, master, True))
+            self._after_first_paint(mgr, has_local)
+            return
+
+        # 慢路径：只有「总表已经读进内存」或「真的需要先对齐视图」才走到这里
+        # （首次使用无缓存 / 判据升级作废 / 令牌与视图不同源）。
+        # Gold 物化视图在本线程内构建/校验：已对齐时 is_current 只读一次
+        # 元数据（毫秒级），真正重建只发生在首次或数据变更时。
+        if not mgr.store_ready():
+            self.progress.emit("正在整理数据以便快速搜索…")
         view_ok = self._sync_view(mgr)
-
-        # 统计从本地缓存计算（零网络延迟）
-        stats = mgr.get_master_stats()
-        msg = (
-            f"总表 {len(master)} 家公司\n"
-            f"数据来自 {stats.get('users', 0)} 位用户，"
-            f"共 {stats.get('total_uploads', 0)} 条原始记录"
-        )
-        _rn = _reach_note(mgr)
-        if _rn:
-            msg += "\n" + _rn
-        if view_ok:
-            msg += "\n搜索加速已就绪：几百万条也能秒出结果"
-        else:
-            msg += "\n本次改用较慢的方式查找（结果范围完全一样），后台会自行加速"
-        self.finished.emit(True, master, msg)
-
-        # 后台静默同步（有新数据才刷新 UI）
-        if has_local and not self.force_refresh:
-            self.progress.emit("正在同步远端数据…")
-            try:
-                new_master = mgr.refresh_from_oss()
-                if new_master is not None:
-                    # 加速数据必须跟着新总表走：同步后不重建，「已同步」的数据就检索不到
-                    self._sync_view(mgr)
-                    new_stats = mgr.get_master_stats()
-                    new_msg = (
-                        f"总表 {len(new_master)} 家公司（已同步）\n"
-                        f"数据来自 {new_stats.get('users', 0)} 位用户，"
-                        f"共 {new_stats.get('total_uploads', 0)} 条原始记录"
-                    )
-                    _rn2 = _reach_note(mgr)
-                    if _rn2:
-                        new_msg += "\n" + _rn2
-                    self.refreshed.emit(new_master, new_msg)
-            except Exception:
-                pass  # 后台同步失败静默忽略，不影响已展示的数据
+        self.finished.emit(True, master, self._stats_msg(mgr, master, view_ok))
+        self._after_first_paint(mgr, has_local)
 
 
-class SearchWorker(QThread):
+class SearchWorker(WorkerBase):
     """后台搜索线程（召回在 Gold 物化视图，精排在 CompanyMatcher）。
 
     两级检索是搜索引擎的标准形态，也是百万级唯一扛得住的形态：
@@ -611,6 +744,24 @@ class SearchWorker(QThread):
         self.regions = regions or []
         self.filters = filters or {}
 
+    def _scope_records(self):
+        """回退到「整张总表」取候选时的统一入口（懒采纳下先看内存够不够）。
+
+        视图坏了才能走到这里，而懒采纳下总表只是个代理：逐条取它就是那句
+        把 6.2GB 读回来的话。8GB 的机器上这不是「慢一点」而是整机换页僵住：
+        用户既搜不到结果，也干不了别的。内存不够时就地失败并把原因说清
+        （包括「本轮为什么绕不开它」），绝不静默硬扛。
+        """
+        mgr = self.mgr
+        if mgr is None or not getattr(mgr, "master_is_lazy", lambda: False)():
+            return self.master
+        room, why = mgr.master_memory_room()
+        if not room:
+            raise MemoryError(f"检索视图本轮不可用，而改用完整数据逐条查找要把整张"
+                              f"总表读进内存——{why}。数据一条没丢，请关掉一些占用内存的"
+                              f"程序后重试，或等后台把检索视图重新整理好")
+        return mgr.materialize_master()
+
     def _recall(self):
         """取精排用的候选集，返回 (记录列表, 召回来源说明, RecallCounts, 行业说明)。
 
@@ -629,7 +780,7 @@ class SearchWorker(QThread):
         必漏检（找不到下游就回不来），那条路一行行业说明都不发。
         """
         if self.mgr is None:
-            return self.master, "", RecallCounts(), ""
+            return self._scope_records(), "", RecallCounts(), ""
         flt = self.filters
         prune_note = ""
         try:
@@ -666,17 +817,19 @@ class SearchWorker(QThread):
             return (records, "检索视图",
                     _counts_of(self.mgr, self.query, self.regions, flt),
                     prune_note)
-        # 2) 磁盘倒排索引（视图还没建好时用它，索引解析在本线程完成）
+        # 2)3) 视图拿不到才逐级回退到「整张总表」：懒态下这一步代价极高，
+        # 必须过 _scope_records（内存不够就如实失败，不把机器拖死）
         if self.candidate_indices is None:
             try:
                 self.candidate_indices = self.mgr.search_by_index(self.query)
             except Exception:
                 self.candidate_indices = None
+        scope = self._scope_records()
         if self.candidate_indices:
-            return self.master, "关键词索引", RecallCounts(), ""
-        return self.master, "全表扫描", RecallCounts(), ""
+            return scope, "关键词索引", RecallCounts(), ""
+        return scope, "全表扫描", RecallCounts(), ""
 
-    def run(self):
+    def _body(self):
         try:
             matcher = CompanyMatcher()
             # 两种模式都先召回：AI 模式的产业链分析同样只在候选里做
@@ -704,7 +857,7 @@ class SearchWorker(QThread):
                 self.progress.emit(f"🔍 开始搜索「{self.query}」...")
                 if recall == "关键词索引":
                     results = matcher.search_with_index(
-                        self.query, self.master, self.candidate_indices,
+                        self.query, scope, self.candidate_indices,
                         top_k=self.max_results,
                         progress_cb=lambda msg: self.progress.emit(msg),
                     )
@@ -721,7 +874,13 @@ class SearchWorker(QThread):
                 results = CompanyMatcher.apply_filters(results, self.filters)
             message = f"{method}：找到 {len(results)} 条相关结果"
             message += _scope_note(counts, len(results))
+            # 总池规模随每次搜索结论出现：用户不必点开概览也知道池子有多大
+            message += f"｜数据池共 {len(self.master):,} 家"
             self.finished.emit(True, results, message)
+        except MemoryError as e:
+            # 内存闸门拦下的回退：这不是「搜索出错」而是「本轮真的跑不动」，
+            # 文案必须把可行动的那一句说出来
+            self.finished.emit(False, [], str(e))
         except Exception as e:
             self.finished.emit(False, [], f"搜索失败: {e}")
 
@@ -730,7 +889,7 @@ class SearchWorker(QThread):
 #  同步上传对话框
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RecommendWorker(QThread):
+class RecommendWorker(WorkerBase):
     """后台推荐线程：候选召回走 Gold 视图，打分只在候选里做。
 
     修掉的是「一点推荐就白屏」：旧实现直接在 **UI 主线程**上对整张总表逐条
@@ -796,6 +955,18 @@ class RecommendWorker(QThread):
                 or str(seed.get("company") or "").strip())
         return term, filters, ("" if term else "目标公司没有产品/公司名称可用于相似度匹配")
 
+    def _scope_records(self):
+        """回退到「整张总表」取候选的统一入口（与 SearchWorker 同一条闸门）。"""
+        mgr = self.mgr
+        if mgr is None or not getattr(mgr, "master_is_lazy", lambda: False)():
+            return self.master
+        room, why = mgr.master_memory_room()
+        if not room:
+            raise MemoryError(f"检索视图本轮不可用，而推荐要把整张总表读进内存"
+                              f"逐条打分——{why}。请关掉一些占用内存的程序后重试，"
+                              f"或等后台把检索视图重新整理好")
+        return mgr.materialize_master()
+
     def _recall(self, query: str, filters: dict):
         """返回 (候选记录列表, 召回来源, RecallCounts)。
 
@@ -817,12 +988,13 @@ class RecommendWorker(QThread):
                 except Exception:
                     idx = None
                 if idx:
-                    n = len(self.master)
-                    return ([self.master[i] for i in idx if 0 <= i < n],
+                    scope = self._scope_records()
+                    n = len(scope)
+                    return ([scope[i] for i in idx if 0 <= i < n],
                             "关键词索引", RecallCounts())
-        return self.master, "全表扫描", RecallCounts()
+        return self._scope_records(), "全表扫描", RecallCounts()
 
-    def run(self):
+    def _body(self):
         try:
             from recommend_engine import RecommendEngine
         except Exception as e:                       # 打包态缺模块要如实说
@@ -852,6 +1024,8 @@ class RecommendWorker(QThread):
             message = (f"{title}：{len(results)} 家"
                        + _scope_note(counts, len(results), unit="家"))
             self.finished.emit(True, results, message)
+        except MemoryError as e:
+            self.finished.emit(False, [], str(e))
         except Exception as e:
             self.finished.emit(False, [], f"推荐失败: {e}")
 
@@ -1169,6 +1343,74 @@ class SyncDialog(QDialog):
 #  带自动补全的搜索输入框
 # ─────────────────────────────────────────────────────────────────────────────
 
+# 建议去抖时长：低于它会把同一个字拆成两次查询，高于它用户会觉得建议反应用户
+# 迟钝。220ms 是这一带的通行取值（与浏览器 devtools 搜索框同一量级）。
+_SUGGEST_DEBOUNCE_MS = 220
+
+
+class SuggestWorker(QThread):
+    """搜索建议的常驻召回线程：一个搜索框只起一条，且只留最新一次请求。
+
+    为什么不能在主线程里直接算：视图召回热态几十毫秒、冷态（第一次翻 1.7GB
+    索引）能到秒级，而它是**每次按键**都要跑的动作——压在按键路径上就是
+    打字卡壳，而搜索框卡顿比结果慢更让人烦躁。
+    为什么不能每个字新建一个 QThread：每条线程都要开一条 SQLite 连接
+    （64MB 页缓存 + 256MB mmap），打字几秒能攒出几十个用完即弃的连接。
+    形态照搬 Google / Bing 搜索框：输入去抖 + 只保留最后一次请求 + 结果回来
+    先核对「用户现在输入的还是不是这句」，过期结果直接丢。
+    """
+    resultsReady = pyqtSignal(str, list)      # (本次文案, 建议列表)
+
+    def __init__(self, suggester=None, master=None, mgr=None, parent=None):
+        super().__init__(parent)
+        self._cond = threading.Condition()
+        self._pending = None
+        self._quit = False
+        self._suggester = suggester
+        self._master = master if master is not None else []
+        self._mgr = mgr
+
+    def set_data(self, suggester, master, mgr):
+        """总表/管理器换了（后台同步完成）也要能跟上，线程不重建。"""
+        with self._cond:
+            self._suggester = suggester
+            self._master = master if master is not None else []
+            self._mgr = mgr
+
+    def request(self, text: str):
+        with self._cond:
+            # 只留最新：旧请求还没开始就被覆盖，已经在跑的则跑完发现过期而丢掉
+            self._pending = text
+            self._cond.notify_all()
+
+    def shutdown(self):
+        with self._cond:
+            self._quit = True
+            self._cond.notify_all()
+        # 等它收尾：QThread 对象在运行时被销毁会直接崩掉整个进程
+        self.wait(5000)
+
+    def run(self):
+        while True:
+            with self._cond:
+                while self._pending is None and not self._quit:
+                    self._cond.wait(0.5)
+                if self._quit:
+                    return
+                text, self._pending = self._pending, None
+            if self._suggester is None:
+                continue
+            # 召回优先交给视图（全库、零物化）；没视图时 get_suggestions 自己
+            # 退回总表，而懒态下我们根本不会把总表递过来（见 SuggestLineEdit）
+            view = getattr(self._mgr, "store_suggest", None) if self._mgr else None
+            try:
+                items = self._suggester.get_suggestions(
+                    text, self._master, view_suggest=view)
+            except Exception:
+                items = []
+            self.resultsReady.emit(text, items)
+
+
 class SuggestLineEdit(QWidget):
     """带下拉建议列表的搜索输入框（参考 Google / 百度搜索框）。
 
@@ -1208,11 +1450,36 @@ class SuggestLineEdit(QWidget):
 
         self._suggester = None
         self._master = []
+        self._mgr = None
+        # 去抖 + 常驻召回线程：建议是「停手后才能算」的动作，不是每个字都要算
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(_SUGGEST_DEBOUNCE_MS)
+        self._timer.timeout.connect(self._request_now)
+        self._worker = SuggestWorker(parent=self)
+        self._worker.resultsReady.connect(self._on_results)
 
-    def set_data(self, suggester, master: list):
-        """设置建议引擎和数据池。"""
+    def set_data(self, suggester, master, mgr=None):
+        """设置建议引擎、总表与数据池管理器。
+
+        懒采纳状态下**不把总表递给后台线程**：那种时候 master 只是个代理，
+        取它任何一个元素都会把 6.2GB 读回来，而建议只是锦上添花，不值得拿
+        整个机器的内存去换。递空表进去后 search_suggest 只用历史与同义词，
+        视图召回（全库、零物化）仍是首选路径。
+        """
         self._suggester = suggester
-        self._master = master
+        self._mgr = mgr
+        lazy = bool(mgr is not None
+                    and getattr(mgr, "master_is_lazy", lambda: False)())
+        safe_master = [] if lazy else (master if master is not None else [])
+        self._master = safe_master
+        self._worker.set_data(suggester, safe_master, mgr)
+
+    def shutdown(self):
+        """对话框关闭前收掉建议线程（QThread 运行中被销毁会直接崩进程）。"""
+        self._timer.stop()
+        if self._worker.isRunning():
+            self._worker.shutdown()
 
     def text(self) -> str:
         return self.input.text()
@@ -1224,12 +1491,30 @@ class SuggestLineEdit(QWidget):
         self.input.setFocus()
 
     def _on_text_changed(self, text: str):
-        """输入变化时更新建议列表。"""
+        """输入变化：重新计去抖，停手后才真的去问索引。"""
         text = text.strip()
         if not self._suggester or len(text) < 2:
+            self._timer.stop()
             self.list_widget.setVisible(False)
             return
-        suggestions = self._suggester.get_suggestions(text, self._master)
+        self._timer.start()          # 连续打字只会查最后一次
+
+    def _request_now(self):
+        """去抖定时器到点：把当前输入交给后台线程。"""
+        text = self.input.text().strip()
+        if not self._suggester or len(text) < 2:
+            return
+        if not self._worker.isRunning():
+            try:
+                self._worker.start()
+            except RuntimeError:
+                return               # 控件已经在销毁路径上，不再起新线程
+        self._worker.request(text)
+
+    def _on_results(self, text: str, suggestions: list):
+        """后台结果回来：先验过期，再渲染。"""
+        if text != self.input.text().strip():
+            return                   # 用户已经改口令：旧结果直接丢
         if not suggestions:
             self.list_widget.setVisible(False)
             return
@@ -1300,6 +1585,9 @@ class SearchDialog(QDialog):
         self._load_worker = None
         self._search_worker = None
         self._recommend_worker = None   # 推荐走后台线程，界面不再被全表打分冻住
+        # 内存闸门只问一次（见 _on_consent_needed）：同一个对话框里反复弹
+        # 同一条「内存不够」是骚扰；重新打开对话框会再问，就是改主意的入口
+        self._consent_asked = False
         self._last_use_deepseek = False  # 筛选重检时沿用上一次的模式，未搜索过则为本地搜索
         self._current_query = ""         # 本次结果对应的关键词（概览/导出/审计共用）
         # 持久数据池管理器：加载总表与搜索定位候选共用同一实例，
@@ -1379,6 +1667,12 @@ class SearchDialog(QDialog):
         opts_row.addWidget(self.chk_mask)
 
         opts_row.addStretch()
+
+        # 总池规模常驻可见：对齐主流搜索「共 N 件商品」的打开即见原则，
+        # 不用点开数据概览就知道池子有多大（加载完成后由 _on_master_loaded 更新）
+        self.lbl_pool_total = QLabel("数据池：加载中…")
+        self.lbl_pool_total.setStyleSheet("color: #888; font-size: 11px;")
+        opts_row.addWidget(self.lbl_pool_total)
         lay.addLayout(opts_row)
 
         # ── 高级筛选面板（可折叠，默认收起） ──
@@ -1650,28 +1944,81 @@ class SearchDialog(QDialog):
 
     # ── 加载总表 ──
 
-    def _load_master(self):
+    def _load_master(self, force_full_load: bool = False):
         # 秒开加载：本地缓存立即返回 + 后台静默同步
+        # force_full_load 只在用户在闸门提示里点过「现在就整理」之后才是 True：
+        # 它越过的仅是内存闸门这一道保护，刷新/采纳/建视图的逻辑一行没变。
+        #
+        # 这里直接把 self._load_worker 换掉是安全的：WorkerBase.run 期间会把
+        # 自己挂进 _RUNNING_WORKERS，旧线程还在收尾时引用不会断——否则会
+        # 「QThread 对象在运行时被销毁」当场崩进程（老代码就是这样）。
         self._load_worker = LoadMasterWorker(
-            force_refresh=False, mgr=self._pool_mgr
+            force_refresh=False, mgr=self._pool_mgr,
+            force_full_load=force_full_load
         )
-        self._load_worker.progress.connect(
-            lambda msg: self.status_lbl.setText(msg)
-        )
+        # 进度槽必须是绑定方法而不是 lambda：lambda 没有接收者对象，关窗时
+        # disconnect(self) 根本断不掉它，后台随后一次 setText 就会打到已经
+        # 销毁的 status_lbl 上（表现就是「关掉搜索框整个工具闪退」）。
+        self._load_worker.progress.connect(self._on_load_progress)
         self._load_worker.finished.connect(self._on_master_loaded)
         self._load_worker.refreshed.connect(self._on_refreshed)
+        self._load_worker.consent_needed.connect(self._on_consent_needed)
         self._load_worker.start()
 
-    def _on_master_loaded(self, success: bool, master: list, message: str):
+    def _on_load_progress(self, msg: str):
+        self.status_lbl.setText(msg)
+
+    def _on_consent_needed(self, reason: str):
+        """内存闸门拦下「整理加速数据」时，要不要现在就硬做一次由用户拍板。
+
+        为什么必须问而不是静默跳过：闸门拦下后本轮**没有**轻内存的数据出路
+        ——视图身份没被证明同源，拿未证明同源的视图当新数据是静默错误（宁可
+        慢不可错），而只有本机内存状态才知道该不该冒险。代价由机主承担，
+        决定权就该给他，而且要把「只做一次」这个关键点说清。
+        """
+        if self._consent_asked:
+            return
+        self._consent_asked = True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("需要整理一次本地数据")
+        box.setText(
+            "为了做到「打开就秒出结果」，本地需要一份和总表对齐过的加速数据。\n"
+            "整理这一步比较吃内存，你这台机器现在的情况是：\n\n"
+            f"{reason}\n\n"
+            "・现在就整理：只做第一次，之后每次打开都是秒开（期间内存会比较紧，\n"
+            "　　建议先关掉浏览器等大程序）。\n"
+            "・先不整理：数据一条都不会丢，但本轮不显示结果，每次重新打开这个\n"
+            "　　窗口都会再问一次。"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("现在就整理一次")
+        box.button(QMessageBox.No).setText("先不整理")
+        if box.exec() == QMessageBox.Yes:
+            self._on_load_progress("正在整理数据（只做一次，之后都是秒开）…")
+            self._load_master(force_full_load=True)
+            return
+        # 选了「先不整理」：走统一的失败渲染，把闸门原话如实显示出来。
+        # 绝不能装成「加载成功 0 家」——那会让用户以为池里没数据。
+        self._on_master_loaded(
+            False, [],
+            "本机内存不够整理加速数据，本轮未加载（数据没有任何丢失）。\n"
+            "关掉一些占内存的程序后重新打开本窗口，会再问一次是否整理。"
+            f"\n\n闸门原话：{reason}")
+
+    def _on_master_loaded(self, success: bool, master, message: str):
         if success:
             self._master = master
             self._all_results = None  # 筛选前原始结果
             self._populate_region_combo()  # 填充筛选面板的地区下拉
-            # 设置搜索建议数据
+            # 设置搜索建议数据（连同 mgr 一起递：补全优先由视图召回，不碰总表）
             if _HAS_SUGGEST and hasattr(self.search_input, 'set_data'):
                 suggester = get_search_suggester()
-                self.search_input.set_data(suggester, master)
+                self.search_input.set_data(suggester, master, mgr=self._pool_mgr)
             self.status_lbl.setText(message)
+            self.lbl_pool_total.setText(f"数据池共 {len(master):,} 家")
+            self.lbl_pool_total.setStyleSheet(
+                "color: #4caf50; font-size: 11px; font-weight: bold;")
             self.status_lbl.setStyleSheet(
                 "color: #4caf50; font-weight: bold; padding: 6px 0; "
                 "background: #1b3a1b; border-radius: 4px;"
@@ -1699,10 +2046,22 @@ class SearchDialog(QDialog):
                 f"{message}\n\n请检查网络连接后重试。"
             )
 
-    def _on_refreshed(self, master: list, message: str):
+    def _on_refreshed(self, master, message: str):
         """后台同步完成：有新数据时更新 UI 并 Toast 通知。"""
         self._master = master
+        # 建议引擎的数据源要跟着换：同步后的新视图才能查到刚上传的公司
+        if _HAS_SUGGEST and hasattr(self.search_input, 'set_data'):
+            try:
+                self.search_input.set_data(get_search_suggester(), master,
+                                           mgr=self._pool_mgr)
+            except Exception:
+                pass
+        # 地区选项也要重填：首轮可能因为视图未就绪只能给静态清单
+        self._populate_region_combo()
         self.status_lbl.setText(message)
+        self.lbl_pool_total.setText(f"数据池共 {len(master):,} 家")
+        self.lbl_pool_total.setStyleSheet(
+            "color: #42a5f5; font-size: 11px; font-weight: bold;")
         self.status_lbl.setStyleSheet(
             "color: #42a5f5; font-weight: bold; padding: 6px 0; "
             "background: #1a2a3a; border-radius: 4px;"
@@ -1871,16 +2230,25 @@ class SearchDialog(QDialog):
                 used_view = False
         if not used_view:
             # 回退：静态行政区划清单（补齐旧清单缺的西藏/青海/内蒙古/宁夏/
-            # 新疆/香港/澳门/台湾），只在地址里出现时列出
-            for rec in self._master:
-                addr = str(rec.get("address", ""))
-                country = str(rec.get("country", "")).strip()
-                for province in CN_PROVINCES:
-                    if province in addr:
-                        regions.add(province)
-                        break
-                if country and country not in ("中国", ""):
-                    regions.add(country)
+            # 新疆/香港/澳门/台湾）。
+            # 旧实现在这里整表扫内存总表“只列地址里真出现过的省”，但懒采纳下
+            # 那一句就是把 6.2GB 读回来的那一句：为一个下拉框的选项长短付整个
+            # 机器的内存，完全不值。视图就绪时上面已经拿到真实分布（绝大多数
+            # 情况），走到这里只能说“加速还没就绪”，那就给全量静态清单：多选
+            # 几个选项不会错，选了筛不到也只是空结果，而且后台同步完会重填。
+            if self._pool_mgr is not None and \
+                    getattr(self._pool_mgr, "master_is_lazy", lambda: False)():
+                regions = {p for p in CN_PROVINCES if p}
+            else:
+                for rec in (self._master or []):
+                    addr = str(rec.get("address", ""))
+                    country = str(rec.get("country", "")).strip()
+                    for province in CN_PROVINCES:
+                        if province in addr:
+                            regions.add(province)
+                            break
+                    if country and country not in ("中国", ""):
+                        regions.add(country)
         # 清空并重新填充
         self.combo_region.blockSignals(True)
         self.combo_region.clear()
@@ -2575,15 +2943,30 @@ class SearchDialog(QDialog):
 
     @staticmethod
     def _export_to_excel(records: list, filepath: str, scope_label: str = ""):
-        """导出为 12 列标准 schema（11 个必选字段 + 数据来源，上传/导出统一口径）。
+        """导出为 11 列客户交付 schema（11 个必选字段，不含「数据来源」——
+        追溯信息只在池内与上传 schema 里保留，客户文件不需要也不该看到）。。
 
-        scope_label（全部/国内/国外）只写进工作表名与文档属性，**不动列结构**，
-        保证客户库模板列映射不变；打开文件就能看到本次导出口径。
+        scope_label（全部/国内/国外）只写进工作表名与文档属性，**不动列结构**；
+        打开文件就能看到本次导出口径。
+
+        交付前逐列清洗（只清高置信度脏值，宁缺毋滥，不猜不误杀）：采集端把
+        上下文串/文件名/来源链写进业务字段的历史存量，在导出口统一拦住——
+        联系人尾缀「详细」、手机号碎片「姓 名」、验证码文本进邮箱、官网列
+        「官网:x|地址:y|主营:z」混合串、来源名/导入文件名当主营。
         """
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
 
-        HEADER = EXPORT_HEADER  # 11 个标准化字段
+        HEADER = [h for h in EXPORT_HEADER if h != "数据来源"]  # 11 列交付口径
+        # 逐列清洗用 data_pool 公开实现（与入库前清洗同一套，口径不漂移）：
+        # 联系人尾缀「详细」、号码碎片「姓 名」、邮箱格式硬闸、官网/地址混合串、
+        # 来源名/文件名/展会名当主营——单份实现三消费方（入库/导出/未来链路）。
+        clean_name = clean_person_name
+        clean_nums = clean_phone_values
+        clean_emails = clean_email_values
+        clean_website = clean_website_value
+        clean_address = clean_address_value
+        clean_products = clean_products_value
 
         wb = Workbook()
         ws = wb.active
@@ -2621,21 +3004,25 @@ class SearchDialog(QDialog):
             phones_col = [p for p in all_nums if _is_mobile(p)]
             landline_col = [p for p in all_nums if p not in phones_col]
 
-            ws.cell(row=row_idx, column=1, value=contact.get("name", ""))
+            source = rec.get("source", "")
+            country = (rec.get("country") or "").strip()
+            if scope_label == "国内":
+                country = "中国"   # CN/China/空 在国内导出统一为一个口径
+
+            ws.cell(row=row_idx, column=1, value=clean_name(contact.get("name", "")))
             ws.cell(row=row_idx, column=2, value=contact.get("title", ""))
             ws.cell(row=row_idx, column=3, value=rec.get("company", ""))
-            ws.cell(row=row_idx, column=4, value=",".join(phones_col[:3]))
-            ws.cell(row=row_idx, column=5, value=",".join(rec.get("emails", [])[:3]))
-            ws.cell(row=row_idx, column=6, value=",".join(landline_col[:3]))
-            ws.cell(row=row_idx, column=7, value=rec.get("website", ""))
-            ws.cell(row=row_idx, column=8, value=rec.get("products", ""))
+            ws.cell(row=row_idx, column=4, value=",".join(clean_nums(phones_col)[:3]))
+            ws.cell(row=row_idx, column=5, value=",".join(clean_emails(rec.get("emails", []))[:3]))
+            ws.cell(row=row_idx, column=6, value=",".join(clean_nums(landline_col)[:3]))
+            ws.cell(row=row_idx, column=7, value=clean_website(rec.get("website", "")))
+            ws.cell(row=row_idx, column=8, value=clean_products(rec.get("products", ""), source))
             ws.cell(row=row_idx, column=9, value=rec.get("industry", ""))
-            ws.cell(row=row_idx, column=10, value=rec.get("address", ""))
-            ws.cell(row=row_idx, column=11, value=rec.get("country", ""))
-            ws.cell(row=row_idx, column=12, value=rec.get("source", ""))
+            ws.cell(row=row_idx, column=10, value=clean_address(rec.get("address", "")))
+            ws.cell(row=row_idx, column=11, value=country)
 
-        # 列宽（与 EXPORT_HEADER 12 列对应）
-        widths = [12, 12, 25, 20, 25, 18, 20, 25, 12, 30, 10, 20]
+        # 列宽（与 11 列交付口径对应）
+        widths = [12, 12, 25, 20, 25, 18, 20, 25, 12, 30, 10]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
 
@@ -2649,18 +3036,55 @@ class SearchDialog(QDialog):
     # 同一纪律）。加载/搜索/推荐三个线程一起收，缺一个都可能在关闭时闪退。
 
     def _shutdown_workers(self):
+        # 顺序固定：置取消 → 断信号 → 等收尾 → 最后收建议线程。
+        #  1) cancel() 只置标志，各线程在阶段边界自查，不碰 SQL 事务中途；
+        #  2) 四类信号全断：线程可能已经取到 self 的绑定方法、正要 emit。
+        #     WorkerBase 接住 RuntimeError 是兜底，不该当成常规路径；
+        #  3) wait 超时**绝不 terminate**：视图重建是一个 SQLite 事务，硬切
+        #     会把整次重建回滚，用户下次打开还要从头再来一遍；
+        #  4) 建议线程是常驻的且 parent=self：它跟着父对象析构而线程还在跑
+        #     会直接 abort 掉整个进程，必须先停掉。
         for worker in (self._load_worker, self._search_worker, self._recommend_worker):
-            if worker is None or not worker.isRunning():
+            if worker is None:
                 continue
             try:
-                worker.finished.disconnect(self)
-            except TypeError:
-                pass
-            worker.wait(3000)
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                for name in ("progress", "finished", "refreshed", "consent_needed"):
+                    sig = getattr(worker, name, None)
+                    if sig is not None:
+                        sig.disconnect(self)
+            except (TypeError, RuntimeError):
+                pass                 # 没连过/已断开：本来就是期望状态
+            # wait 只在对象真是 QThread 时调：这段处在「关窗必经路径」上，任何
+            # 一句抛异常都会把关闭流程打断在 QDialog.done 里——正好是要根治的
+            # 那类「关窗时未捕获异常 → 整个工具闪退」。降级桩/非线程占位都不
+            # 得把关闭路径弄坏。
+            wait = getattr(worker, "wait", None)
+            if callable(wait):
+                wait(1500)
+        try:
+            if hasattr(self.search_input, "shutdown"):
+                self.search_input.shutdown()
+        except RuntimeError:
+            pass
 
     def reject(self):
         self._shutdown_workers()
         super().reject()
+
+    def done(self, result):
+        """所有关闭路径的必经点：在此收一次后台线程。
+
+        accept() / reject() / 外部直接 dlg.done(0) 最终都汇到这一函数，而
+        closeEvent 只盖住「点 X / close()」那一条。上一版只在 reject/closeEvent
+        里收线程，于是任何走 accept() 或外部调 done() 的关闭都绕过了收尾——
+        线程还在跑而对话框先析构，表现就是关窗后整个工具闪退。收在这儿
+        不排斥另外两条：它们调 super() 时仍会回到这里，_shutdown_workers 已
+        经是幂等的（断过的信号再断只报错分支被接住）。
+        """
+        self._shutdown_workers()
+        super().done(result)
 
     def closeEvent(self, event):
         self._shutdown_workers()
@@ -3184,12 +3608,20 @@ class ScanWorker(QThread):
             # 的「有缓存秒开」不变量用错了地方。没缓存就不比对，照常勾选、照常上传：
             # 宁可多传一份重复内容（读取端按公司名归并，幂等），
             # 也绝不因为索引缺失而漏掉任何一个文件。
-            cached = os.path.join(DataPoolManager._default_cache_dir(),
-                                  "master.json")
-            if os.path.exists(cached):
+            # 判据必须走 has_local_cache()：写盘时 pkl 是主格式且写完即删 json，
+            # 上一版硬编码 master.json 存在性，于是升级过的机器上这个条件**恒为
+            # 假**：池内比对静默不执行，还理直气壮地报「本地总表缓存尚未建立」。
+            # 恒假判据和没有判据一样糟，只是不报错（同一类错已在令牌的
+            # `0 or -1` 上坑过一次，这里别再犯）。
+            mgr = DataPoolManager() if _HAS_POOL else None
+            if mgr is None:
+                pool_note = "数据池模块不可用，本次不做池内比对"
+            elif mgr.has_local_cache():
                 self.progress.emit("正在准备数据池比对…", 0, 0)
                 try:
-                    pool_index = PoolIndex()
+                    # 把同一个 mgr 递下去：它已经解析过缓存目录，而且可能已经
+                    # 握着可读的 Gold 视图；再 new 一个就是两套口径两条连接
+                    pool_index = PoolIndex(mgr)
                 except Exception as e:
                     pool_index = None
                     pool_note = f"本次不做池内比对：{first_line(e, 60)}"
@@ -3907,6 +4339,11 @@ class PoolTombstoneDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             hits = self._mgr.find_for_tombstone(kw, limit=300)
+            # 说明必须在同一次调用里取（而不是自己再看一眼视图状态）：“这次到底
+            # 比对成没比对成”是 find_for_tombstone 内部做的决定，到界面再推一遍
+            # 就是两套口径（store_ready 为真但 find_by_name 报错时两者就会分叉）
+            note_fn = getattr(self._mgr, "tombstone_find_note", None)
+            find_note = str(note_fn() if callable(note_fn) else "")
         finally:
             QApplication.restoreOverrideCursor()
         self._hits = hits
@@ -3939,7 +4376,17 @@ class PoolTombstoneDialog(QDialog):
         self.status_lbl.setText(
             f"关键字「{kw}」命中 {len(hits)} 家"
             + ("（只显示前 300 家，换更长的关键字缩小范围）" if len(hits) >= 300 else "")
-            + "，勾上要剔除的行")
+            + "，勾上要剔除的行"
+            + (f"｜⚠ {find_note}" if find_note else ""))
+        if not hits and find_note:
+            # 把「没比对成」与「没找到」分成两句说：后者提用户换关键字重试，
+            # 前者必须明确阻止重复打标——剔除标记只追加、不可撤回，同一个企业
+            # 留下两条原因不同的记录，比查不到难收拾得多。
+            QMessageBox.warning(
+                self, "这一半没能比对",
+                f"关键字「{kw}」这次没能在在册企业里比对：\n{find_note}\n\n"
+                "请先不要重复打剔除标记（已打过的不受影响），等检索视图恢复后再查。")
+            return
         if not hits:
             QMessageBox.information(
                 self, "没找到",
@@ -4023,13 +4470,20 @@ class PoolTombstoneDialog(QDialog):
         except Exception:
             pass
         main_win = self.parent()
+        # 「本机总表去掉 0 条」有两种完全不同的原因：一种是一格都没剔到（正常），
+        # 一种是内存闸门拦下了重洗（滞后）。只报数字不报原因，用户读到的意思
+        # 是「按钮没起作用」，于是会反复点同一个按钮——同一件事的两种结局必须
+        # 有两种文案（数据已安全写入远端这一点两版都一样，不能让人怀疑丢数据）。
+        defer = str(res.get("defer_note") or "")
         if main_win is not None:
             _show_toast(main_win,
                         f"🗑 已剔除 {res.get('marked')} 家（本机总表去掉 "
-                        f"{res.get('removed')} 条）", 'success')
+                        f"{res.get('removed')} 条）" + (f"\n{defer}" if defer else ""),
+                        'warning' if defer else 'success')
         self.status_lbl.setText(
             f"已写剔除标记：{res.get('filename')}｜本机总表去掉 {res.get('removed')} 条。"
-            "同事们的下一次同步会自动跳过这些企业。")
+            "同事们的下一次同步会自动跳过这些企业。"
+            + (f" {defer}" if defer else ""))
         self._on_find()   # 重新查一遍，让「已剔」列即时反映最新状态
 
     def _on_show_marked(self):

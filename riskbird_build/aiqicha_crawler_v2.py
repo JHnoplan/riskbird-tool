@@ -75,6 +75,11 @@ class AiQiChaCrawlerV2:
     """爱企查爬虫 - 基于 CDP 直接通信"""
     
     BASE_URL = "https://aiqicha.baidu.com"
+    # 开首页统一用这一份（带尾斜杠）。理由不是好看：页面内 JS 导航早就写的
+    # 'https://aiqicha.baidu.com/'，而建标签/Page.navigate 用的是不带斜杠的
+    # BASE_URL——同一站两种写法，站侧对根路径与空路径完全可能给不同响应。
+    # 用户 2026-11-18 提的「换个链接试试」命中正是这一格，现在两处同一口径。
+    HOME_URL = BASE_URL + "/"
     SEARCH_URL = "https://aiqicha.baidu.com/s?q={}"
     DETAIL_URL = "https://aiqicha.baidu.com/company_detail_{}"
     PLATFORM_LABEL = "爱企查"
@@ -129,6 +134,9 @@ class AiQiChaCrawlerV2:
         self.diag_dir = None
         self._unknown_streak = 0        # 连续抽不出结果条目的次数
         self._evidence_dumped = False   # 一次运行只存一份证据，别堆文件
+        # 「浏览器被站点拒」的现场证据同样只存一份（与上面那份互不影响：
+        # 共用一个标志会让先发生的那一种把后一种的取证吞掉）
+        self._reject_evidence_dumped = False
         self._cooldown_until = 0.0      # 被拦过之后的降速截止时刻
     
     def _log(self, msg: str):
@@ -366,7 +374,7 @@ class AiQiChaCrawlerV2:
             result = self._send_command(
                 self._get_ws_url(),
                 "Target.createTarget",
-                {"url": self.BASE_URL}
+                {"url": self.HOME_URL}
             )
             target_id = result.get("result", {}).get("targetId")
             if not target_id:
@@ -400,15 +408,104 @@ class AiQiChaCrawlerV2:
     def _close_tab(self, ws_url):
         """关闭标签页。**关失败必须开口**：旧写法 `except Exception: pass` 会把
         「共享 Chrome 里还挂着这一枚」抹平成「已经收工」（与 cdp_base.release_tab 同一族纪律）。
-        返回是否真的关掉，调用方据此决定要不要再说一句。"""
+        返回是否真的关掉，调用方据此决定要不要再说一句。
+
+        2026-11-18 真机订正两处（都是「拿没报错冒充做成过」这个形状）：
+          ① params 原来传的是空字典，而 Target.closeTarget 要的是 targetId：Chrome
+             回了一个 error，但 `_send_command` 只把原始响应递出来、不抛异常，于是这句
+             `return True` 是假的——实机跑两轮就在共享 Chrome 里攒下两枚没人认领的爱企查
+             标签。现在从 ws 地址本身取那一枚的 id（命令本来就是发给它的），比
+             `pin_tab_id` 可靠：close_browser 在调它之前已经把 pin_tab_id 复位了。
+          ② 发完命令不算完，拿标签列表复验一次：还在就照实说没关掉。
+        """
+        tid = str(ws_url or "").rsplit("/", 1)[-1] or str(self.pin_tab_id or "")
         try:
-            self._send_command(ws_url, "Target.closeTarget", {})
-            return True
+            self._send_command(ws_url, "Target.closeTarget", {"targetId": tid})
         except Exception as e:
-            self._log(f"⚠ 归还标签没成功（{type(e).__name__}）——共享 Chrome 里还挂着本站那一枚"
+            # 整行带出，不按字符数切一刀（打包硬门第 30 条：本交付包接不到那支把手）
+            self._log(f"⚠ 归还标签没成功（{type(e).__name__}: {e}）——共享 Chrome 里还挂着本站那一枚"
                       f"标签，请手动关掉（不影响已采数据）")
             return False
+        if not tid:
+            self._log("⚠ 归还标签时拿不到 targetId（ws 地址与 pin_tab_id 都是空的）——"
+                      "本站那一枚标签还在共享 Chrome 里，请手动关掉（不影响已采数据）")
+            return False
+        unread = 0
+        for _ in range(3):
+            time.sleep(1)
+            try:
+                tabs_now = self._get_tabs()
+            except Exception as e:
+                # 读不到标签列表既不等于「关掉了」，也不等于「没关掉」：先记下这是第几次，
+                # 最后一句按「确实还在列表里」与「无从确认」两种原因分开说（32g：这一格
+                # 静默 pass 就是拿「没报错」冒充「已经收工」）。
+                unread += 1
+                self._log(f"  复验时读不到标签列表（{type(e).__name__}），再试一次")
+                continue
+            if not any(str(t.get("id") or "") == tid for t in tabs_now):
+                return True
+        if unread == 3:
+            self._log(f"⚠ 说过要归还标签，但三次都读不到标签列表，没法确认那一枚（{tid[:8]}）"
+                      "是否已经离开共享 Chrome——请在浏览器里看一眼本站标签还在不在，"
+                      "在就手动关掉（不影响已采数据）")
+            return False
+        self._log(f"⚠ 说过要归还标签但没关掉（{tid[:8]} 还在标签列表里）——共享 Chrome 里"
+                  "还挂着本站那一枚标签，请手动关掉（不影响已采数据）")
+        return False
     
+    @staticmethod
+    def _host_of(url) -> str:
+        """取地址的主机名（去掉 www. 前缀），供导航后复验「是否真的落到了目标站点」。
+
+        不用 lstrip('w.') 那种按字符剥离的写法：那会把 baidu.com 这类没有 www 的
+        域名首字母也吃掉。也不用 endswith 比域名：aiqicha.baidu.com 是 baidu.com 的
+        子域，从属于「跳板失败还停在爱企查」这个正好要抓的场景，必须精确相等才算落地。
+        """
+        s = str(url or "").strip().lower()
+        if "//" in s:
+            s = s.split("//", 1)[-1]
+        s = s.split("/", 1)[0].split("?", 1)[0]
+        return s[4:] if s.startswith("www.") else s
+
+    def _navigate(self, ws_url, url, wait: int = 8) -> bool:
+        """把这个标签导航到 url，并回读地址复验是否真的落地。
+
+        2026-11-18 真机补：这支方法本来就缺——类里有三处在写 `self._navigate(...)`
+        （登录、导航到爱企查、拒绝页跳板），本类却从来没有它，走到就是 AttributeError。
+        跳板那处被尾部静默 except 吞成 False，于是百度退路一次也没真的试过，界面还照
+        False 对用户说「退路无效」；登录那两处则是直接抛给调用方。
+
+        为什么不能发完命令就算成：`_send_command` 只把 CDP 原始响应递出来、不对 error
+        字段抛异常，「没报错」和「页面到了」是两件事（关标签那处刚在同一台机器上验证了
+        这个区别）。所以这里以回读的 location.href 为准，落不下就当场把期望与实际说出来。
+        """
+        want = self._host_of(url)
+        try:
+            self._send_command(ws_url, "Page.navigate", {"url": url})
+        except Exception as e:
+            # 整行带出，不按字符数切一刀（打包硬门第 30 条：本交付包接不到那支把手）
+            self._log(f"  导航命令没发出去（{type(e).__name__}: {e}），目标地址 {url}")
+            return False
+        cur = ""
+        for _ in range(max(1, int(wait))):
+            time.sleep(1)
+            try:
+                cur = str(self._execute_js(
+                    ws_url, "(function(){return window.location.href;})()") or "")
+            except Exception:
+                cur = ""                       # 读不到不等于落上了，继续等下一轮
+            if want and self._host_of(cur) == want:
+                # 地址对上了再等文档就绪，否则紧接着取 DOM 会取到半成品
+                for _ in range(6):
+                    if self._execute_js(ws_url,
+                                        "(function(){return document.readyState;})()") == "complete":
+                        return True
+                    time.sleep(0.5)
+                self._log(f"  地址已到 {want}，但文档 3 秒内没报 complete（继续跑，页面可能偏慢）")
+                return True
+        self._log(f"  导航后回读的不是目标地址：期望 {want or url}，实际 {cur or '读不到'}")
+        return False
+
     def _input_text(self, ws_url, text):
         """输入文本（模拟键盘输入以触发 Vue 事件）"""
         for char in text:
@@ -525,10 +622,13 @@ class AiQiChaCrawlerV2:
         with self._browser_lock:
             if attach:
                 self.attach_mode = True
+                # 「端口有响应但一个页面都没有」不等于「附加不上」：开新标签走的是
+                # browser 级 WS（/json/version 那条），零页面时照样能建。上一版把空列表
+                # 当失败，于是 attach() 先刚用 is_alive 确认过端口活着、这里立刻回一句
+                # 「调试端口未就绪」（两句互相打脸），用户侧表现就是「Chrome 起来了
+                # 却没有页面」。现在只有真的连不上才判失败。
                 try:
-                    if not self._get_tabs():
-                        self._log("❌ 共享浏览器调试端口未就绪，无法附加")
-                        return False
+                    self._get_tabs()
                 except Exception:
                     self._log("❌ 共享浏览器调试端口连不上，无法附加")
                     return False
@@ -694,7 +794,7 @@ class AiQiChaCrawlerV2:
             ws_url = self._get_ws_url("aiqicha.baidu.com")
         
         if ws_url:
-            self._navigate(ws_url, "https://aiqicha.baidu.com")
+            self._navigate(ws_url, self.HOME_URL)
             self._log("请在浏览器中完成登录")
             time.sleep(5)
             return self._check_login_status()
@@ -708,7 +808,7 @@ class AiQiChaCrawlerV2:
             return
         
         ws_url = tabs[0].get("webSocketDebuggerUrl")
-        self._navigate(ws_url, self.BASE_URL)
+        self._navigate(ws_url, self.HOME_URL)
         time.sleep(5)
     
     def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = None,
@@ -996,6 +1096,30 @@ class AiQiChaCrawlerV2:
                             pid = '@' + (re3.test(abs) ? abs.slice(abs.indexOf('/', 8)) : href);
                         }
                         out.c.push([pid, tx.slice(0, 60)]);
+                    }
+                }
+                if (!out.c.length) {
+                    // 第三层（2026-11-17 实机实锤）：结果卡片改版后不再渲染成 <a href>，
+                    // 结构化数据全在 SSR JSON blob 里（"resultList":[{"pid":"..",
+                    // "titleName":".."}]），DOM 两层全部落空会把有结果的页判成 pending，
+                    // 于是每家烧 900 秒长等。blob 层逐项 split 配对（pid+titleName 同项），
+                    // 注①上限必须 500：HTML 里中文以 unicode 转义形态存储（每字 6 字符），
+                    // 80 上限会把 ≥14 字的公司名全漏掉（2026-11-17 实机错位教训）。
+                    var hblob = document.documentElement.innerHTML || '';
+                    var at = hblob.indexOf('"resultList"');
+                    if (at >= 0) {
+                        var zone = hblob.slice(at, at + 80000);
+                        var items = zone.split('{"pid":"');
+                        for (var bi = 1; bi < items.length && out.c.length < 12; bi++) {
+                            var seg = items[bi];
+                            var bp = (seg.match(/^(\\d{8,20})/) || [])[1] || '';
+                            if (!bp) continue;
+                            var bnm = (seg.match(/"titleName":"([^"]{2,500})"/) || [])[1] || '';
+                            var bok = true;
+                            try { bnm = JSON.parse('"' + bnm + '"'); } catch (be) { bok = false; }
+                            if (!bok || !bnm) continue;
+                            out.c.push([bp, String(bnm).replace(/\\s+/g, ' ').slice(0, 60)]);
+                        }
                     }
                 }
                 if (/没有找到相关|无搜索结果|未找到相关|暂无匹配|相关的公司信息/.test(b)) out.none = 1;
@@ -1442,7 +1566,7 @@ class AiQiChaCrawlerV2:
         except Exception:
             browser_ws = None
         if browser_ws:
-            for params in ({"url": self.BASE_URL, "newWindow": True}, {"url": self.BASE_URL}):
+            for params in ({"url": self.HOME_URL, "newWindow": True}, {"url": self.HOME_URL}):
                 try:
                     r = self._send_command(browser_ws, "Target.createTarget", params)
                     target_id = (r.get("result") or {}).get("targetId")
@@ -1469,12 +1593,138 @@ class AiQiChaCrawlerV2:
                 if cur and "aiqicha" in str(cur):
                     # 光看 URL 不够：组件未挂载就采集会直接失败，等它真正可交互
                     self._wait_page_hydrated(ws, 15)
-                    self._log("爱企查页面已打开")
-                    return True
+                    return self._confirm_open(ws)
             except Exception:
                 pass
         self._log("⚠ 爱企查页面未确认打开，将继续尝试")
         return True
+
+    # ── 站点拒绝浏览器：定性 → 留证 → 跳板退路 ──────────────────────
+    BAIDU_HOP_URL = "https://www.baidu.com/"
+
+    def _confirm_open(self, ws_url) -> bool:
+        """地址对上了不等于这个页面能用：先过一遍拦截判据再报「已打开」（实机）。
+
+        为什么必须单独定性：拒绝页的地址仍是 aiqicha.baidu.com、标题常为空、
+        正文只有一句提示，原有的 URL/标题/短正文三层判据一条都不命中，于是它被
+        当成「页面正常但没数据」，名单会被静默烧成一片「查不到」。
+
+        为什么始终返回 True：标签确实建好了、也是活的，报「附加
+        失败」反而不准（而且会让 open_own_tab 的调用方重复再开一个标签）；真正的
+        处置在采集循环里——那里每一家都过同一个 _detect_block，现在这一类已经有
+        了自己的归因，会走限时让路而不是当成查不到。
+        """
+        try:
+            reason = self._detect_block(ws_url) or ""
+        except Exception:
+            reason = ""
+        if not reason:
+            self._log("爱企查页面已打开")
+            return True
+        if not block_guard.is_browser_reject(reason):
+            # 验证页一类：这里不下结论，交回采集循环里的等人工/限时让路
+            self._log(f"⚠ 爱企查页面当前被拦：{reason}")
+            return True
+        self._log(f"⚠ 爱企查页面被站点拒绝：{reason}")
+        self._dump_reject_evidence(ws_url, reason)
+        if self._hop_via_baidu(ws_url) and not (self._detect_block(ws_url) or ""):
+            self._log("✅ 改从百度页面跳进来后页面正常（这条退路本轮生效）")
+            return True
+        self._log("  跳板退路无效：这类提示页里没有可点的验证框，等人工等不出结果。\n"
+                  "  请在浏览器里手动刷新这一个标签一次；仍被拒就是站侧对本机浏览器/网络的\n"
+                  "  判定，本路会限时让路给其他平台，名单不会被烧成「查不到」")
+        return True
+
+    def _hop_via_baidu(self, ws_url) -> bool:
+        """退路：先从百度页面里跳入爱企查（用户 2026-11-18 提的办法）。
+
+        为什么这一跳可能与直接打开不同：CDP 建标签等于「地址栏直接敲进去」，
+        请求里没有 Referer，sec-fetch-site 是 none；从一个百度页面里用
+        `location.href` 跳过去，来源关系变成 cross-site、Referer 是 baidu.com。
+        站侧的浏览器/来源判定对这两者的处理未必一样。
+        为什么只在拒绝页出现时试一次：正常路径多这一跳就是白等两三秒，还会把
+        用户眼前的页面闪一下。
+        """
+        try:
+            # 第一跳用 _navigate 把百度直接装进这个标签：这一跳只是「先有个来源页」，
+            # 怎么进去都行。2026-11-18 真机发现这里原来写的是 `self._navigate(...)`，而本类
+            # 当时根本没有这个方法——第一步就 AttributeError，被尾部那个静默 except 吞成
+            # False，于是「百度跳板」这条退路从来没真的试过一次，界面却照 False 对用户说
+            # 「退路无效，请手动刷新」。现在方法补上了，两种 False 也分开说清。
+            if not self._navigate(ws_url, self.BAIDU_HOP_URL):
+                self._log("  跳板第一跳没落到百度页面，这一条退路到此为止（原因见上一行）")
+                return False
+            # 第二跳必须由百度页面自己发起（改 location.href），这一跳用 _navigate 等于白做：
+            # CDP 导航等同于地址栏直接敲，请求里没有 Referer，来源判定也就没被改变。
+            self._execute_js(ws_url,
+                             "(function(){window.location.href=%r;})()"
+                             % self.HOME_URL)
+            cur = ""
+            for _ in range(12):
+                time.sleep(1)
+                cur = str(self._execute_js(ws_url,
+                                           "(function(){return window.location.href;})()") or "")
+                if "aiqicha" in cur:
+                    self._wait_page_hydrated(ws_url, 15)
+                    return True
+            # 到点仍没落回爱企查：把当前地址说出来——「慢」与「根本没跳成」是两件事，
+            # 前者等一等就好，后者要换做法，混为一谈就是误导。
+            self._log(f"  跳板后 12 秒内没回到爱企查（当前地址：{cur or '读不到'}）")
+            return False
+        except Exception as e:
+            # 整行带出，不按字符数切一刀（打包硬门第 30 条：本交付包接不到那支把手）
+            self._log(f"  跳板这一跳本身出错（{type(e).__name__}: {e}）")
+            return False
+
+    def _dump_reject_evidence(self, ws_url, reason: str) -> str:
+        """把拒绝页现场存下来（截图 + URL/标题/UA/正文）。
+
+        这个现象只在「一瞬间」出现，手工截不到、日志里又没内容，不留证下一轮
+        就只剩猜。落点沿用既有那套：界面设了会话目录就进会话目录，否则进数据
+        目录（与「结果页证据」同一处，别开第二个黑洞）。一次运行只存一份。
+        """
+        if self._reject_evidence_dumped:
+            return ""
+        self._reject_evidence_dumped = True
+        base = Path(self.diag_dir) if self.diag_dir else self._data_dir
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = base / f"爱企查_浏览器被拒证据_{stamp}"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._log(f"  ⚠ 留证目录建不出来（{type(e).__name__}），现场没存下来")
+            return ""
+        try:
+            info = self._execute_js(ws_url, (
+                "(function(){var b=document.body?(document.body.innerText||''):'';"
+                "return JSON.stringify({u:location.href,t:document.title,"
+                "ua:navigator.userAgent,r:document.referrer,l:b.length,h:b.slice(0,2000)});})()"))
+            try:
+                d = json.loads(info) if info else {}
+            except Exception:
+                d = {}
+            text = (
+                f"时间: {stamp}\n结论: {reason}\n地址: {d.get('u')}\n"
+                f"标题: {d.get('t')}\n来源: {d.get('r') or '（无 Referer）'}\n"
+                f"UA: {d.get('ua')}\n正文字数: {d.get('l')}\n"
+                f"———————— 正文开头 2000 字 ————————\n{d.get('h') or ''}\n"
+                f"———————— 页面 HTML 开头 ————————\n"
+                f"{str(self._execute_js(ws_url, '(function(){return document.documentElement.outerHTML;})()') or '')[:20000]}\n")
+            (stem.with_suffix(".txt")).write_text(text, encoding="utf-8")
+            shot = self._send_command(ws_url, "Page.captureScreenshot", {"format": "png"})
+            data = (shot.get("result") or {}).get("data")
+            if data:
+                import base64
+                stem.with_suffix(".png").write_bytes(base64.b64decode(data))
+            self._log(f"  已留现场证据：{stem.name}（.txt/.png）")
+            return str(stem)
+        except Exception as e:
+            # 整行带出，不按字符数切一刀（打包硬门第 30 条）：这个交付包接不到
+            # b2bcollect_build/text_shape.py 那支把手（全仓只允许两份实现），而换个姿势切
+            # （split('|')[0]、只留第一句）切的还是同一句话。留证失败这条日志的本职是告诉
+            # 人「现场没留下来」，把它切半反而让人误以为证据写成功了。
+            self._log(f"  ⚠ 留证没写成功：{type(e).__name__}: {e}")
+            return ""
 
     def _get_or_create_homepage_tab(self):
         """获取或创建爱企查首页标签页（复用现有，避免重复打开）"""

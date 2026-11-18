@@ -48,6 +48,36 @@ BLOCK_TITLE_MARKERS = ("百度安全验证", "安全验证", "身份核实", "�
 BLOCK_BODY_MARKERS = ("请关闭浏览器的调试窗口", "访问过于频繁", "滑动验证", "拖动滑块")
 SHORT_BODY_LIMIT = 600
 
+# 站点把当前浏览器拒了（2026-11-18 用户实机：爱企查页面打开一瞬间提示「不能使用此
+# 浏览器」）。这一类必须和风控验证页**分开归因**，因为两者的处置完全不同：
+# 验证页是「人工过一下就通」，而拒绝页里根本没有可点的东西——把它当成验证页
+# 等人工，就是拿半小时等一个永不会出现的输入框；把它当成「页面正常但没数据」，
+# 名单会被静默烧成一片「查不到」（就是本轮用户看到的现象）。
+# 文案不敢上全文匹配：企业站的帮助区/页脚本来就常写「建议使用 Chrome」，
+# 所以沿用同一族防误伤约束——只对「短到像插页」的页面生效。
+BROWSER_REJECT_MARKERS = (
+    "不能使用此浏览器", "不能使用该浏览器", "无法使用此浏览器", "无法使用该浏览器",
+    "不支持此浏览器", "不支持该浏览器", "此浏览器不支持", "该浏览器不支持",
+    "暂不支持此浏览器", "暂不支持该浏览器", "请使用其他浏览器", "请更换浏览器",
+    "浏览器版本过低", "请升级浏览器", "请更换为 Chrome", "请更换为Chrome",
+)
+# 拒绝页是一整页提示，比风控插页宽一档；上限仍远小于正常页面（几 KB 起步）
+REJECT_BODY_LIMIT = 2000
+# 结论字符串只在这里写一次：调用方要比就比 is_browser_reject()，绝不允许自己
+# 复述这句中文——文案一改，那些就地比对的地方会静默变成恒假（同一族错本
+# 文件已经踩过：全文匹配、按控件文字豁免）。
+BROWSER_REJECT_REASON = "站点拒绝了当前浏览器（提示不能使用此浏览器一类文案，不是验证码）"
+
+
+def is_browser_reject(reason) -> bool:
+    """这一条拦截原因是不是「浏览器被站点拒了」。
+
+    分开回话的理由很实际：验证页该等人工，拒绝页里根本没有可点的
+    东西——拿等人工的时长去等一个永不会出现的输入框，不如直接给人
+    能动手的下一步。两者用同一套中文文案区分不可靠，所以判据只认常量。
+    """
+    return str(reason or "") == BROWSER_REJECT_REASON
+
 
 def _match(url: str, title: str, body_len: int, body_head: str, extra_markers=None):
     url = (url or "").lower()
@@ -57,6 +87,10 @@ def _match(url: str, title: str, body_len: int, body_head: str, extra_markers=No
     if any(m in title for m in BLOCK_TITLE_MARKERS):
         return f"当前页面是验证页：{title[:24]}"
     head = body_head or ""
+    # 拒绝类排在风控类之前：两类的下一步不一样，先给出可执行的那句
+    if (body_len is not None and body_len <= REJECT_BODY_LIMIT
+            and any(m in head for m in BROWSER_REJECT_MARKERS)):
+        return BROWSER_REJECT_REASON
     markers = tuple(BLOCK_BODY_MARKERS) + tuple(extra_markers or ())
     if body_len is not None and body_len < SHORT_BODY_LIMIT and any(m in head for m in markers):
         return "页面被平台风控拦截（提示关闭调试窗口/访问频繁）"
@@ -102,6 +136,53 @@ def detect_cdp(execute_js, extra_markers=None):
         return ""
     return _match(str(info.get("u") or ""), str(info.get("t") or ""),
                   info.get("l"), str(info.get("h") or ""), extra_markers)
+
+
+# ── 第 4 层：可见弹层探测（2026-11-17 企知道实机实锤）───────────────────────
+# 企知道上线了腾讯验证码弹层（tencent-captcha-dy）：它是 **DOM overlay**——URL 不跳、
+# 标题不变、弹层后面照常渲染着正常搜索结果页（正文 1121 字），原有三层判据
+# （URL/标题/极短正文）全部漏过，于是弹层挡住的结果页被当成「平台真查不到」，
+# 一轮名单 175 家被当成「查不到」丢弃（实机 09:14 账目：183 家仅成功 8 家）。
+# 防误伤三约束（与 ali1688 overlay 修复同一族经验）：
+#   1) 只认**精确容器 class**（tencent-captcha-dy__warp / __full-header），绝不文本
+#      contains——常驻脚本引用/样式表里天然含验证字样，全文匹配等于每页必报；
+#   2) 必须查**可见性**（getClientRects 非空 + 尺寸闸 100×50）——隐藏的空容器不算；
+#   3) 由调用方按站启用（企知道/风鸟/爱企查三站），不进全局 _match。
+CAPTCHA_OVERLAY_JS = (
+    "(function(){"
+    "var sels=['.tencent-captcha-dy__warp','.tencent-captcha-dy__full-header',"
+    "'[class*=\"tencent-captcha-dy\"]'];"
+    "for (var i=0;i<sels.length;i++){"
+    "  var els=document.querySelectorAll(sels[i]);"
+    "  for (var j=0;j<els.length;j++){"
+    "    var e=els[j];"
+    "    var r=e.getClientRects();"
+    "    if (r && r.length && e.offsetWidth>=100 && e.offsetHeight>=50)"
+    "      return '腾讯安全验证弹层（请在浏览器里完成验证）';"
+    "  }"
+    "}"
+    "return '';})()"
+)
+
+
+def detect_overlay_selenium(driver):
+    """Selenium 会话的可见验证弹层探测：命中返回原因串，无弹层返回空串。"""
+    if driver is None:
+        return ""
+    try:
+        return str(driver.execute_script(CAPTCHA_OVERLAY_JS) or "")
+    except Exception:
+        return ""
+
+
+def detect_overlay_cdp(execute_js):
+    """CDP 会话的可见验证弹层探测：execute_js 传本爬虫的 JS 执行方法。"""
+    if execute_js is None:
+        return ""
+    try:
+        return str(execute_js(CAPTCHA_OVERLAY_JS) or "")
+    except Exception:
+        return ""
 
 
 def wait_unblock(reason, log, emit_blocked, is_stopped, probe,

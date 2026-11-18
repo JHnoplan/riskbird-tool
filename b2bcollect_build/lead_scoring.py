@@ -368,7 +368,10 @@ def caliber_lines():
     lines.append(f"过期折扣：已过字段 TTL 的可信分按 {int(STALE_FACTOR * 100)}% 计，"
                  f"且一律不得判为{TIER_WORK}（TTL：手机 {_fe.TTL_DAYS['手机']} 天、"
                  f"电话 {_fe.TTL_DAYS['电话']} 天、邮箱 {_fe.TTL_DAYS['邮箱']} 天，"
-                 f"工商核验 ×{_fe.TTL_TIER_FACTOR['registry']}、平台自带 ×{_fe.TTL_TIER_FACTOR['source']}）。")
+                 # 层级名同样从注册表取（上面那段逐档说明就是照着 TIERS 渲的）：这里手抄一份，
+                 # 改命名时同一页纸上会同时出现新旧两个叫法。
+                 f"{_fe.TIER_LABEL['registry']} ×{_fe.TTL_TIER_FACTOR['registry']}、"
+                 f"{_fe.TIER_LABEL['source']} ×{_fe.TTL_TIER_FACTOR['source']}）。")
     lines.append("同主体多行会合成一条线索：电话/手机/邮箱取并集（英文逗号去重），"
                  "每个字段的可信层取「该行集合里最高那一档」，出处一并带过来。")
     lines.append("采集时间认不出来的行按「未知」给 0 新鲜分（宁可少排不可误排为可立即外呼）。")

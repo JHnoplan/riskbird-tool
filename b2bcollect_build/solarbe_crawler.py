@@ -379,6 +379,13 @@ class SolarbeCrawler(CdpSiteCrawler):
                         # 切片第 1 页就一页真数据都没有：这才是「本站没有这家公司」
                         self._log(self._no_result_line(
                             kw, f"行业{catid or '不限'}/地区{areaid or '不限'} 第 {page} 页", html))
+                    elif sig:
+                        # 实测本站第 7 页起复制第 6 页：这一刀是「列表只到上一页为止」，
+                        # 不是「公司池枯竭」、也不是「这个切片没公司」。旧写法静默 break，
+                        # 日志里只留上一页那句「新增 0」，三种成因在账上长得一模一样。
+                        self._log(f"  「{kw}」行业{catid or '不限'}/地区{areaid or '不限'}"
+                                  f" 第 {page} 页与上一页是「同一批条目」：列表只到上一页为止"
+                                  f"（不是「公司池枯竭」，也不是「本站没数据」），停止翻页")
                     break
                 prev_sig = sig
                 total = max(total, self.slice_total(html))

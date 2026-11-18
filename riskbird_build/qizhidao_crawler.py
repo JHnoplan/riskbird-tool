@@ -153,10 +153,17 @@ class QiZhiDaoCrawler:
                 pass
 
     def _detect_block(self):
-        """只看自己这个窗口当前的页面是不是验证页"""
+        """只看自己这个窗口当前的页面是不是验证页
+
+        第 4 层（2026-11-17）：腾讯验证码弹层是 DOM overlay——URL/标题/正文长度都不变，
+        原三层判据全漏，弹层挡住的搜索结果被当成「真查不到」丢弃（实机一轮 175 家被丢）。
+        这里叠加可见弹层探测，命中即拦截语义：原地等人工过验证，绝不记「查不到」。"""
         if self.driver is None:
             return ""
-        return block_guard.detect_selenium(self.driver)
+        reason = block_guard.detect_selenium(self.driver)
+        if reason:
+            return reason
+        return block_guard.detect_overlay_selenium(self.driver)
 
     def _wait_unblock(self, reason: str, max_wait: int = 1800, interval: int = None) -> bool:
         """被拦截时原地等人工验证，不推进名单、不写入空记录
@@ -911,6 +918,28 @@ class QiZhiDaoCrawler:
                 if hash_match:
                     self._log(f"  ✅ 备用方案: 从搜索页获取hash（{len(result_links)} 个结果）")
                     return hash_match.group(1)
+
+            # 结果区没有公司链接 ≠ 平台真查不到（2026-11-17 实机实锽）：腾讯验证码
+            # 弹层正挡在结果区上面（URL/标题/正文长度都不变，页面其它部分照常渲染）。
+            # 先查弹层：有就等人工过验证（拦截语义，绝不记「查不到」），过完验证后
+            # 结果区已在当前页里，原地重新找一轮链接。
+            overlay = block_guard.detect_overlay_selenium(self.driver)
+            if overlay:
+                self._log(f"  🛑 搜索结果被{overlay}挡住，已暂停推进名单（不记「查不到」）")
+                if self._wait_unblock(overlay):
+                    result_links = self.driver.find_elements(
+                        By.XPATH, "//a[contains(@href,'/company/')]"
+                    )
+                    if result_links:
+                        href = result_links[0].get_attribute("href") or ""
+                        hash_match = re.search(r'/company/([a-f0-9]+)\.html', href)
+                        if hash_match:
+                            self._log(f"  ✅ 过验证后从搜索页获取hash（{len(result_links)} 个结果）")
+                            return hash_match.group(1)
+                # 等待没解除/解除后仍无结果：交给上层按「可重采」回队首（链路语义），
+                # 编排层会继续退避重试，绝不把这一家记成「查不到」丢掉。
+                self._hash_fail_reason = "验证弹层未解除，搜索结果不可读"
+                return None
 
             # 搜索页打开了但没找到公司链接
             self._last_fail_reason = f"搜索页无该公司链接（可能真查不到或页面结构变化）"

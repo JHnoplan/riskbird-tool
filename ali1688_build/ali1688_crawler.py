@@ -127,13 +127,41 @@ SEARCH_URL = ("https://www.1688.com/zw/page.html?hpageId=old-sem-pc-list"
 
 # 供应商(公司)搜索渠道：每页约 20 家不同公司，产出远高于商品渠道
 COMPANY_SEARCH_URL = ("https://s.1688.com/company/company_search.htm"
-                      "&keywords={kw}&beginPage={page}")
+                      "?keywords={kw}&beginPage={page}")
 
 # 主搜渠道（1688 站内正规商品搜索页）：每页约 60 条 offer、约 50 家不同公司，
 # 实测同一垂直词池深 100+ 家（SEM 落地页仅 20 余条/页且大词也只有约 70 家池子）。
 # 公司维度数据藏在 offer 卡片埋点属性 member_id@b2b-xxx^item_id=yyy 里。
 MAIN_SEARCH_URL = ("https://s.1688.com/selloffer/offer_search.htm"
-                   "&keywords={kw}&beginPage={page}")
+                   "?keywords={kw}&beginPage={page}")
+
+# ── 查询串分隔符出厂校验（2026-11-17 整轮实机取证）────────────────────────────
+# 上面两条常量过去写成 `….htm&keywords=`（缺 `?`）。RFC 3986 里 `?` 之前整段都是**路径**，
+# 于是浏览器导航后落地 URL 长成 `s.1688.com//selloffer/offer_search.htmkeywords=%CB%AE…`
+# ——keywords 被粘到文件名上，查询串根本没交出去（同一时刻同一标签页用 `?` 形态能出
+# 51~60 条卡片、供应商渠道能出 20 家真公司）。这一形最坑的地方是它**不是每次都失败**：
+# 个别词、个别落地页变体下 1688 会容错解析出结果（整轮「耐压舱」就回了 295 条），
+# 于是账面上看起来「链路是通的」，其余 10 个词却整批零产出，还被归因成「暂无该词公司」。
+# 光改常量不够——下一次有人复制粘贴就会再长回来，所以导航前过一次校验：
+# 能就地修就修，但一定要把这一句打进日志（静默修复等于把缺陷藏进正常账目里）。
+_BAD_QUERY_SEP_RE = re.compile(r"(\.html?|\.aspx?)&", re.I)
+_bad_sep_warned = set()
+
+
+def checked_search_url(url, log=None):
+    """返回把 `.htm&` 修成 `.htm?` 的查询 URL；本来就正确就原样返回。
+
+    只修**第一个** `.htm&`（那就是 path/query 的分界位），后面各参数之间的 `&` 是对的，
+    不许顺手一起改。`log` 传进来时把畸形 URL 念一遍：这条链路曾经整轮零产出而日志一句
+    不提，教训就是「代码写错可以修，账上看不出来没法查」。"""
+    text = str(url or "")
+    fixed = _BAD_QUERY_SEP_RE.sub(r"\1?", text, count=1)
+    if fixed != text and log is not None:
+        key = text.split("?", 1)[0][:60]
+        if key not in _bad_sep_warned:
+            _bad_sep_warned.add(key)
+            log(f"⚠ 搜索 URL 缺查询串分隔符 `?`（已就地修正，请回查常量）：{key}&…")
+    return fixed
 
 PHONE_RE = re.compile(r'(?:86[\s-]?)?(?:0\d{2,3}[\s-]?\d{7,8}|1[3-9]\d{9})')
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
@@ -153,6 +181,25 @@ DETAIL_LEAF_ID_RE = re.compile(r'"leafCategoryId"\s*:\s*(\d{3,12})')
 DETAIL_LEAF_NAME_RE = re.compile(r'"leafCategoryName"\s*:\s*"([^"]{1,20})"')
 DETAIL_SHOP_CAT_RE = re.compile(r'shop-category-name">([^<]{2,40})<')   # 主营：xx / xx类目
 DETAIL_TITLE_RE = re.compile(r'<title>([^<]{4,80}?)\s*[-–—]?\s*(?:阿里巴巴|1688)?\s*</title>')
+
+
+def _urlencode_gbk(text):
+    """1688 搜索参数的站方口径编码：**GBK 百分号编码**（2026-11-17 实机 A/B 实锤）。
+
+    背景：s.1688.com 三个搜索渠道（主搜/公司搜/站外 SEM）的服务端都按 GBK 解
+    query 参数——同一关键词 UTF-8 编码时 title 回显 mojibake（「太阳能路灯」→
+    「澶槼鑳借矾鐏」）、页面里关键词 0 命中、60 张卡片全是无关推荐流（member_id
+    埋点照样 120 处，数量与真结果页无异）；改 GBK 编码后 title 正常、关键词
+    422 次命中、卡片全部相关。生产一直用 quote()（UTF-8），等于每轮都在搜乱码
+    词——产出「时有时无、质量差、类目护栏砍单率极高」的更上游根因就在这里。
+    生僻字/异体字 GBK 编不出时整词回退 UTF-8：检索质量退化但不抛异常（旧行为
+    就是 UTF-8，不会比现在更差）。
+    """
+    text = str(text)
+    try:
+        return quote(text.encode("gbk"))
+    except UnicodeEncodeError:
+        return quote(text)
 
 
 def reap_driver_service(driver) -> bool:
@@ -267,6 +314,43 @@ _REQUEST_ERROR_KINDS = (
 # 而这几档恰恰是「等一等就好」与「改代码」的分界线。
 _HTTP_STATUS_KINDS = ((429, "HTTP 429·限流"), (403, "HTTP 403·风控/需验证"),
                       (407, "HTTP 407·要代理口令"), (404, "HTTP 404·这一页没了"))
+
+# ── 「页面取回来了、却一张卡片都没有」的分诊常量（与 cdp_base 同一口径的镜像）────
+# 拦截图标记直接复用本文件已有的那两组（只认地址与标题，不扫正文：正常页里也有隐藏的
+# 验证码容器节点，扫正文会把好页说成风控页）。
+EMPTY_BLOCK_MARKS = BLOCK_URL_MARKERS + BLOCK_TITLE_MARKERS
+EMPTY_RESULT_TEXTS = ("没有找到相关", "暂无相关", "未找到相关", "无搜索结果", "抱歉，没有找到",
+                     "没有找到您", "0 个结果", "0个结果", "0 条结果", "0条结果",
+                     "no results found", "no matching")
+EMPTY_SHELL_MAX = 20000
+_TRIAGE_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+
+
+def empty_page_triage(html, url=""):
+    """「页面取回来了却一张卡片都没有」的分诊：返回 ``(kind, evidence)``。
+
+    kind 取 block（验证页）/ zero（站方自己说没结果）/ shell（薄壳未渲染）/ layout（页很大但
+    认不出卡片，最可能是改版）。完整由来与阈值说明见 b2bcollect_build/cdp_base.py 同名函数。
+    图标记只认地址与标题，扫正文会把带隐藏验证码容器的好页说成风控页。"""
+    text = html if isinstance(html, str) else ""
+    if not text.strip():
+        return "", ""
+    m = _TRIAGE_TITLE_RE.search(text[:60000])
+    scope = f"{url or ''} {m.group(1) if m else ''}".lower()
+    for mark in EMPTY_BLOCK_MARKS:
+        if mark.lower() in scope:
+            return "block", f"地址/标题里带着「{mark}」（验证页）"
+    body = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text[:120000],
+                  flags=re.S | re.I)
+    compact = re.sub(r"\s+", "", re.sub(r"<[^>]+>", " ", body)).lower()
+    for phrase in EMPTY_RESULT_TEXTS:
+        if re.sub(r"\s+", "", phrase).lower() in compact:
+            return "zero", f"站方页面上写着「{phrase}…”"
+    if len(text) < EMPTY_SHELL_MAX:
+        return "shell", f"整页只有 {len(text)} 字（薄壳/未渲染）"
+    return "layout", f"整页 {len(text)} 字、既没卡片也没「没找到」那句话（先查选择器是否已改版）"
+
+
 # ── 「本工具自己已经定过性的句子」的类别词表 ──────────────────────────────────────
 # 翻页层会把 `_goto` 留下的原因再包一层：`列表页导航失败（【被拦停】防采页没等到放行…）`。
 # 分型器过去只认 `startswith("【")`，于是这种**已经带着结论**的话被洗成
@@ -886,7 +970,21 @@ class Ali1688Crawler:
                         f"不是本站没有{noun}；最后一次：{short_reason(self._last_page_error, 70)}）")
             return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
                     f"404 或频控空页；是哪一种看紧邻上一行）")
+        # 页取回来了也不能一句「无{noun}」盖掉：那一句同时读不出「站方真没货」与「我们的
+        # 卡片选择器已改版」——整轮 11/11 词都走了这一句，零产出看起来像「1688 没货」。
+        # 与 b2bcollect_build/cdp_base.empty_page_triage 同一口径（本文件要能独立打包，
+        # 所以是镜像而不是 import；改那一头记得同步这一头，回归断言在两边都钉着）。
+        kind, evid = empty_page_triage(html, self._current_page_url())
+        if kind:
+            return (f"  「{kw}」{page_label}没解析到{noun}｜页面分诊＝{kind}：{evid}")
         return f"  「{kw}」{page_label}无{noun}"
+
+    def _current_page_url(self):
+        """分诊要看的当前页地址（验证页的特征常只在 URL 上）；拿不到就交空串。"""
+        try:
+            return str(getattr(self.driver, "current_url", "") or "")
+        except Exception:
+            return ""
 
     def snapshot_results(self):
         with self.results_lock:
@@ -1676,16 +1774,34 @@ class Ali1688Crawler:
     # JS 探测验证码模态弹窗：1688 的滑块验证是盖在正常页面上的 overlay，
     # URL/标题/正文都与正常搜索页一致，旧三层检测全部漏判。
     # 本脚本扫描 iframe 源、模态容器、关键文案三维度，命中任一即判拦截。
+    # 【误伤订正 2026-11-17】iframe 判据绝不允许把站点自家域（1688/alibaba）当
+    # 验证码特征：详情页的富文本描述、店铺客服那些**正常业务 iframe** 的 src 天然
+    # 含这两个词（它们就住在 *.1688.com / *.alibaba.com），而本函数每进一家详情
+    # 都要跑一遍——实机形状就是「每采一家就报一次验证码」，用户疲于过一个并不存在
+    # 的码；_wait_unblock 的解除判据读的又是同一个函数，误报永不解除，直到 3600s
+    # 超时收轮，整轮 0 家。只认真正的验证码特征域（sufei/nocaptcha/wappass/baxia/
+    # punish 是阿里系人机验证的实际落点，captcha/challenge/verify 是通用特征）。
+    # iframe 判据的特征域词表（单一真源）：JS 源码由它渲染，离线用例直接对拍它。
+    # 【误伤订正 2026-11-17】绝不允许把站点自家域（1688/alibaba）加进去：详情页的
+    # 富文本描述、店铺客服那些**正常业务 iframe** 的 src 天然含这两个词（它们就住在
+    # *.1688.com / *.alibaba.com），而 _detect_block 每进一家详情都要跑一遍——实机形状
+    # 就是「每采一家就报一次验证码」，用户疲于过一个并不存在的码；_wait_unblock 的
+    # 解除判据读的又是同一个函数，误报永不解除，直到 3600s 超时收轮，整轮 0 家。
+    # 只认真正的验证码特征域：sufei/nocaptcha/wappass/baxia/punish 是阿里系人机验证
+    # 的实际落点，captcha/challenge/verify 是通用特征。
+    CAPTCHA_IFRAME_MARKS = ("captcha", "verify", "sufei", "nocaptcha",
+                            "wappass", "challenge", "baxia", "punish")
     _CAPTCHA_OVERLAY_JS = """(function(){
-        // 1. 扫描 iframe：验证码通常嵌在跨域 iframe 里
+        // 1. 扫描 iframe：验证码通常嵌在跨域 iframe 里。词表与 Python 侧
+        //    CAPTCHA_IFRAME_MARKS 同源（由它渲染），只认人机验证特征域。
+        var marks = [%s];
         var iframes = document.querySelectorAll('iframe');
         for (var i = 0; i < iframes.length; i++) {
             var src = (iframes[i].src || '').toLowerCase();
-            if (src.indexOf('captcha') >= 0 || src.indexOf('verify') >= 0
-                || src.indexOf('sufei') >= 0 || src.indexOf('nocaptcha') >= 0
-                || src.indexOf('alibaba') >= 0 || src.indexOf('1688') >= 0
-                || src.indexOf('wappass') >= 0 || src.indexOf('challenge') >= 0) {
-                return 'iframe:' + src.slice(0, 60);
+            for (var w = 0; w < marks.length; w++) {
+                if (src.indexOf(marks[w]) >= 0) {
+                    return 'iframe:' + src.slice(0, 60);
+                }
             }
         }
         // 2. 扫描已知验证码容器选择器
@@ -1716,7 +1832,7 @@ class Ali1688Crawler:
             }
         }
         return '';
-    })()"""
+    })()""" % ", ".join(f"'{w}'" for w in CAPTCHA_IFRAME_MARKS)
 
     def _detect_block(self):
         if self.driver is None:
@@ -1849,6 +1965,7 @@ class Ali1688Crawler:
                 self._waiting_human = ""      # 人已经处理完了，这一格必须当场收掉
                 if login:
                     self._log("✅ 检测到已登录，继续采集")
+                    self._emit("block_cleared_signal", reason)   # 登录横幅/计时当场收账
                 else:
                     self._log(f"✅ 验证已解除（等待约 {waited} 秒），继续采集")
                     self._emit("block_cleared_signal", reason)
@@ -1869,6 +1986,40 @@ class Ali1688Crawler:
         self._waiting_human = ""
         self._run_abandon = (f"等待{human_wait_label(reason, login)}超时"
                              f"（{max_wait} 秒没人处理）")
+        return False
+
+    def _wait_for_login(self, max_wait=300):
+        """开局确凿未登录时，给一个**有限窗口**等人登录（期间不发任何搜索请求）。
+
+        与 _wait_unblock 的分工：那边是「已在跑、撞墙了等人救」，有熔断与冷却；
+        这边是「还没开跑，先把出联系方式的前提补齐」——所以不给熔断、不降速、
+        不进被拦账（一次登录动作不该给账号留污点记录）。
+        为什么必须有限窗口而不是死等 3600s：未登录继续跑＝烧 IP 信誉+反复吃验证
+        （2026-11-15 实机：联系方式页在未登录会话上最容易吃风控）；而无限等下去，
+        用户以为工具卡死。等到了立即继续，等不到就本轮优雅退出、下轮再试。
+        cookie 按当前页面域读：等待期间本标签一直停在 1688 首页，用户在别的标签
+        登录完成后，登录 cookie 写在 .1688.com 域上，这里照样读得到。
+        """
+        self._waiting_human = human_wait_label("", login=True)
+        waited = 0
+        while waited < max_wait:
+            if self._stop_requested:
+                self._waiting_human = ""
+                return False
+            time.sleep(3)
+            waited += 3
+            state = self._login_state_by_cookie()
+            if state is True:
+                self._waiting_human = ""
+                self._log(f"✅ 检测到已登录（等待约 {waited} 秒），1688 开始参与本轮采集")
+                # 登录解除与验证解除同一信号口径：界面横幅/接管计时据此当场收账，
+                # 不必等到本轮采集结束才收（那时横幅已经挂了十几分钟）。
+                self._emit("block_cleared_signal", "登录")
+                return True
+            if waited % 60 == 0:
+                self._log(f"   仍在等待登录 1688…已等 {waited} 秒"
+                          f"（本轮最多再等 {max(0, max_wait - waited) // 60} 分钟）")
+        self._waiting_human = ""
         return False
 
     def _sleep(self):
@@ -1944,13 +2095,17 @@ class Ali1688Crawler:
         return out
 
     def _province_suffix(self):
-        """省份精准采集：站方原生 `&province=<UTF-8 百分号编码的简体短名>`（三个搜索
+        """省份精准采集：站方原生 `&province=<GBK 百分号编码的简体短名>`（三个搜索
         渠道同源，2026-11-04 探针 A/B 实锤服务端真过滤）。未选省返回空串。
-        多省场景：URL 参数只能指向一个省，多省时放弃参数直筛，退回数据层过滤。"""
+        编码口径与 keywords 一致（见 _urlencode_gbk）：服务端按 GBK 解 query 参数，
+        UTF-8 的省份值会被解成 mojibake 而匹配不到任何省——2026-11-04 那轮 A/B
+        「有效」的结论其实建立在 mojibake 参数上，结果集差异只是服务端对未知值
+        降级不限省的表现，方向从未真正指向目标省。多省场景：URL 参数只能指向
+        一个省，多省时放弃参数直筛，退回数据层过滤。"""
         pv = str(getattr(self, "province", "") or "").strip()
         if not pv or "," in pv:
             return ""
-        return f"&province={quote(pv)}"
+        return f"&province={_urlencode_gbk(pv)}"
 
     def _iter_keyword_offers(self, kw):
         """遍历一个关键词的多页列表（站外 SEM 渠道），逐条 yield offer（已按 memberId 去重）。
@@ -1960,13 +2115,14 @@ class Ali1688Crawler:
         卡片自带公司名/商品标题先过一道早过滤（不进详情，省请求），进联系方式页前
         再带 `guard=True` 走详情类目复核；判不出信号时依旧 fail-open。"""
         stale_streak = 0
+        prev_ids = None
         self._guard_kw = kw
         for page in range(1, self.max_pages + 1):
             if self._stop_requested:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
+            url = SEARCH_URL.format(kw=_urlencode_gbk(kw), page=page) + self._province_suffix()
             if not self._goto(url):
                 self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
@@ -1979,11 +2135,13 @@ class Ali1688Crawler:
                 self._log(self._no_result_line(kw, f"第 {page} 页", html) + "，停止翻页")
                 return
             new = skipped = seen = 0
+            ids = set()
             for o in offers:
                 mid = str(o.get("memberId") or o.get("loginId") or o.get("company") or "")
                 cname = self._norm_name(o.get("company") or "")
                 if not mid:
                     continue     # 卡片没有任何主体标识：无法去重也无法进详情，不算「增量库跳过」
+                ids.add(mid)     # 集合差分的原料就取这里：与去重同一个主体标识，不留第二口径
                 if mid in self._seen_members or (cname and cname in self._seen_members) \
                         or f"{kw}#{mid}" in self._seen_members:
                     seen += 1
@@ -2012,11 +2170,21 @@ class Ali1688Crawler:
                        "guard": True}   # 站外页结果参差，与主搜同样进详情前做类目复核
             tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(offers)} 条，新增公司 {new} 家{tail}")
-            # 连续多页 0 新增即枯竭（主搜渠道跑过后尤其如此），别把页数预算耗在轮回的浅池上
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                # 站外 SEM 落地页本来就不按 keywords 筛（返回固定推荐位），这一形就是
+                # 「翻页参数没生效」；旧写法要连撞三页 0 新增才停下，还只说「无新增」。
+                self._log(f"  「{kw}」商品渠道第 {page} 页与上一页是「同一批卡片」"
+                          f"（重合 {rate:.0%}）：翻页参数没生效，这一词只能取到第一页"
+                          f"（不是「公司池枯竭」，也不是「1688 没这个货」），停止翻页")
+                return
+            # 连续多页 0 新增（但各页内容不同）：别把页数预算耗在轮回的浅池上
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 3:
-                    self._log(f"  「{kw}」商品渠道连续 {stale_streak} 页无新增，停止翻页")
+                    self._log(f"  「{kw}」商品渠道连续 {stale_streak} 页无新增（各页卡片"
+                              f"内容不同，但公司都已在增量库里），停止翻页")
                     return
             else:
                 stale_streak = 0
@@ -2044,18 +2212,38 @@ class Ali1688Crawler:
         """公司名归一化：跨渠道去重用（去空白与常见括号差异）。"""
         return re.sub(r"[\s（）()・.、，,]+", "", name or "")
 
+    @staticmethod
+    def _page_repeat(prev, cur):
+        """这一页与上一页是不是**同一页**（卡片 id 集合完全重合）。
+
+        为什么单独判这一形：`beginPage` 不生效时站方回的是同一批卡片，去重口径下每一页
+        都是「0 新增」，旧逻辑于是连续三页后写下「公司池已枯竭」。那是一句**方向相反的谎**：
+        「枯竭」= 这一词就这么多货（处方是换词），「翻页参数没生效」= 我们只能取到第一页
+        （处方是修 URL／换翻页口径）——把后者说成前者，人就去换词了，真凶留在原地。
+        判据只用集合相等（≥90% 重合也算），不看条数：条数相等而内容不同是正常翻页。
+        返回重合率（0.0 表示无法比/不重合）。
+        """
+        if not prev or not cur:
+            return 0.0
+        union = prev | cur
+        return len(prev & cur) / float(len(union) or 1)
+
     def _iter_keyword_companies(self, kw):
         """遍历供应商(公司)搜索渠道的多页列表，逐家 yield 公司条目（跨渠道去重）。
 
         该渠道每页约 20 家公司卡片；实测大词单页新增公司数为商品渠道的 4 倍以上。
-        早停：连续 2 页解析不到卡片视为无数据；连续 3 页 0 新增视为池子枯竭。"""
+        早停：连续 2 页解析不到卡片视为无数据；连续 3 页 0 新增视为池子枯竭（但先看
+        是不是「两页一模一样」——那是翻页参数没生效，不能算枯竭）。"""
         empty_streak = stale_streak = 0
+        prev_ids = None
         for page in range(1, self.max_pages + 1):
             if self._stop_requested:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = COMPANY_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
+            url = checked_search_url(
+                COMPANY_SEARCH_URL.format(kw=_urlencode_gbk(kw), page=page)
+                + self._province_suffix(), self._log)
             if not self._goto(url):
                 self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
@@ -2076,6 +2264,14 @@ class Ali1688Crawler:
                     return
                 continue
             empty_streak = 0
+            ids = {str(e.get("shop") or "") for e in entries} - {""}
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                self._log(f"  「{kw}」供应商渠道第 {page} 页与上一页是「同一批卡片」"
+                          f"（重合 {rate:.0%}）：翻页参数 beginPage 没生效，这一词只能取到第一页"
+                          f"（不是「公司池枯竭」，也不是「暂无该词公司」），停止翻页")
+                return
             new = 0
             seen = 0
             for e in entries:
@@ -2097,7 +2293,8 @@ class Ali1688Crawler:
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 3:
-                    self._log(f"  「{kw}」供应商渠道连续 {stale_streak} 页无新增，公司池已枯竭")
+                    self._log(f"  「{kw}」供应商渠道连续 {stale_streak} 页无新增（各页卡片"
+                              f"内容不同，但公司都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale_streak = 0
@@ -2276,8 +2473,10 @@ class Ali1688Crawler:
     def _iter_keyword_main_offers(self, kw):
         """遍历主搜渠道多页列表，逐条 yield 可进详情链路的伪 offer（按 memberId 去重）。
 
-        早停：连续 2 页解析不到卡片视为翻页到底；连续 3 页 0 新增视为池子枯竭。"""
+        早停：连续 2 页解析不到卡片视为翻页到底；连续 3 页 0 新增视为这一词取完了（先排
+        除「两页同一批卡片」＝翻页参数没生效）。"""
         empty_streak = stale_streak = 0
+        prev_ids = None
         self._guard_kw = kw
         self._guard_pred = None
         for page in range(1, self.max_pages + 1):
@@ -2285,7 +2484,9 @@ class Ali1688Crawler:
                 return
             while self._pause_requested and not self._stop_requested:
                 time.sleep(0.5)
-            url = MAIN_SEARCH_URL.format(kw=quote(kw), page=page) + self._province_suffix()
+            url = checked_search_url(
+                MAIN_SEARCH_URL.format(kw=_urlencode_gbk(kw), page=page)
+                + self._province_suffix(), self._log)
             if not self._goto(url):
                 self._note_page_fail(self._goto_fail_reason("列表页导航失败"))
                 return
@@ -2303,6 +2504,14 @@ class Ali1688Crawler:
                     return
                 continue
             empty_streak = 0
+            ids = {str(p.get("offerId") or "") for p in pairs} - {""}
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                self._log(f"  「{kw}」主搜渠道第 {page} 页与上一页是「同一批卡片」"
+                          f"（重合 {rate:.0%}）：翻页参数 beginPage 没生效，这一词只能取到第一页"
+                          f"（不是「公司池枯竭」，也不是「暂无该词结果」），停止翻页")
+                return
             new = 0
             page_skipped = 0
             page_seen = 0
@@ -2333,7 +2542,8 @@ class Ali1688Crawler:
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 3:
-                    self._log(f"  「{kw}」主搜渠道连续 {stale_streak} 页无新增，公司池已枯竭")
+                    self._log(f"  「{kw}」主搜渠道连续 {stale_streak} 页无新增（各页卡片内容"
+                              f"不同，但公司都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale_streak = 0
@@ -2654,7 +2864,18 @@ class Ali1688Crawler:
                 self._emit("crawl_finished_signal")
                 return
         # 「这个 Chrome 里 1688 没登录」必须在开局说清，而不是等第一家撞验证页再说
-        self._preflight_login_notice()
+        if self._preflight_login_notice():
+            # 确凿未登录：给一个有限窗口等人登录（期间不发任何搜索请求）。
+            # 为什么不等就跑：未登录会话的联系方式页最容易吃风控，跑起来只会
+            # 反复弹验证、烧掉这个出口 IP 的信誉（2026-11-15/11-17 两轮实机同因）；
+            # 为什么不无限等：用户会以为工具卡死。等到就继续，等不到本轮退出。
+            if not self._wait_for_login(max_wait=300):
+                self._log("⏭ 1688 未登录且等待超时，本轮不参与采集（不烧请求不喂风控；"
+                          "在这个 Chrome 里登录后，下一轮会自动参与）")
+                self._run_abandon = "1688 未登录，等待 300 秒没人登录，本轮跳过"
+                self._crawling = False
+                self._emit("crawl_finished_signal")
+                return
 
         total = len(keywords)
         chans = []

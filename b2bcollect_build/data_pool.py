@@ -20,6 +20,7 @@
 import getpass
 import json
 import os
+import pickle
 import queue
 import re
 import shutil
@@ -30,10 +31,11 @@ import threading
 import time
 import uuid
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from oss_pool_client import OSSPoolClient, OSSPoolError
 # 交付档位：缓存目录放在哪儿由档位定（见 edition.pool_cache_dir）。这里只问投影
@@ -81,6 +83,131 @@ STANDARD_FIELDS = {
     "source":     "数据来源",     # 数据来源（追溯用，附加）
 }
 EXPORT_HEADER = list(STANDARD_FIELDS.values())  # 导出表头顺序（12 列）
+
+# ── 字段级清洗（公开实现：入库前与导出交付共用同一套，绝不两处各写一份）──────
+# 只清高置信度脏值，宁缺毋滥、不猜不误杀（大厂 Data Quality Rule：清洗规则
+# 必须能向用户解释“为什么这个值被改了”，说不清的规则不上线）。
+# 实机脏点来源（2026-11-17 导出文件取证）：
+#   ①联系人尾缀「详细」——某站详情页把“点击查看详细”的文案残留进姓名列
+#   ②电话碎片「姓 名」——上下文标题串进号码，同一号码多份变体重复占列
+#   ③验证码文本进邮箱列——「内 容: xxx,内容: yyy」混着 @ 过了弱校验
+#   ④文件名/来源名/展会名/文章标题/批次名当主营——上游把来源列抄进业务列
+#   ⑤官网列「官网:x|地址:y|主营:z」混合串——站内多字段拼接没拆开
+# 消费方三处：ingest_cleaning.clean_one（入库前）、pool_dialogs._export_to_excel
+# （导出交付）、以及未来任何写出业务字段的链路。
+
+_FIELD_URL_RE = re.compile(r"https?://[^\s|｜,，]+")
+_FIELD_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def clean_person_name(name: str) -> str:
+    """剥联系人尾缀 UI 碎片：「张喜泉 详细」→「张喜泉」。"""
+    return re.sub(r"\s*详细\s*$", "", (name or "").strip())
+
+
+def clean_phone_values(nums) -> list:
+    """剥号码值里的上下文碎片并按数字去重保序。
+
+    「13557695557 姓 名,13557695557姓名」→ ['13557695557']：先把「姓 名」
+    这类标题残留剥掉，再按纯数字去重——同号多变体只留一份。
+    """
+    out, seen = [], set()
+    for p in nums or []:
+        p2 = re.sub(r"姓\s*名", "", str(p)).strip().strip(",，;； ")
+        d = re.sub(r"\D", "", p2)
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        out.append(p2)
+    return out
+
+
+def clean_email_values(emails) -> list:
+    """邮箱完整格式硬闸：「内 容: 验证码」这类非邮箱文本拦在门外。
+
+    入库前的弱校验（只查 @）放过了「内 容: xxx@163.com,内容: yyy」这种
+    整段混入的验证码上下文；这里按完整 email 形态逐个验证，不过闸的丢弃。
+    """
+    out = []
+    for e in emails or []:
+        e = str(e).strip()
+        if _FIELD_EMAIL_RE.match(e):
+            out.append(e)
+    return list(dict.fromkeys(out))
+
+
+def clean_website_value(w: str) -> str:
+    """官网列混合串抠出真 URL：「官网:x|地址:y|主营:z」→ 第一个 URL。
+
+    判据是串里有多字段分隔符或以字段名开头/含字段名——裸域名与正常
+    URL 原样保留（不误杀）。抠不出 URL 的混合串宁空勿脏。
+    """
+    w = (w or "").strip()
+    if not w:
+        return ""
+    if ("|" in w or "｜" in w or w.startswith(("官网", "地址", "主营"))
+            or "主营" in w or "关键词" in w):
+        m = _FIELD_URL_RE.search(w)
+        return m.group(0).rstrip("，。；") if m else ""
+    return w
+
+
+def clean_address_value(addr: str) -> str:
+    """地址列混合串取「地址:」段；纯官网/主营串不是地址，宁空勿脏。"""
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    m = re.search(r"地址[:：]([^|｜]+)", a)
+    if m:
+        return m.group(1).strip()
+    if ("官网" in a or "主营" in a or "关键词" in a) and _FIELD_URL_RE.search(a):
+        return ""
+    return a
+
+
+def clean_products_value(products: str, source: str = "") -> str:
+    """主营列高置信度脏值清除（文件名/来源名/导入名/展会名/文章标题/批次名）。
+
+    每条规则都对应一类实机取证过的污染形态；判定不上的原样保留——
+    主营是关键词密集的自由文本，宁留可疑不清真数据。
+    """
+    p = (products or "").strip()
+    if not p:
+        return ""
+    low = p.lower()
+    if re.search(r"\.(xlsx|xls|json|csv|html?|txt)\b", low) or "http" in low:
+        return ""                                  # 文件名/URL 串
+    src = (source or "").strip()
+    if src:
+        # 来源可能多段（「外部导入:x.xlsx / 1688」），每段都要比；
+        # 「主营是来源子串」只拦非中文短值——「光伏」也是导入文件名的子串，
+        # 对中文产品词判子串必误杀（宁缺毋滥不误杀）
+        _is_cn = bool(re.search(r"[\u4e00-\u9fff]", p))
+        for seg in (s.strip() for s in src.split(" / ")):
+            if not seg:
+                continue
+            if p == seg:
+                return ""                              # 来源名当主营（同名）
+            if len(seg) < len(p) and seg in p:
+                return ""                              # 主营里嵌着完整来源名
+            if len(p) < len(seg) and p in seg and not _is_cn:
+                return ""                              # 短非中文值（1688/alibaba）抄自来源名
+    for m in re.findall(r"外部导入[:：]([^/|]+)", src):
+        m = m.strip()
+        if not m:
+            continue
+        if m in p or (len(p) < len(m) and p in m and not _is_cn):
+            return ""                                  # 导入文件名当主营
+    # 展会/媒体名与文章标题（无产品词结构的高置信度脏值）
+    has_sep = any(s in p for s in ("、", ",", "，", ";", "；", ","))
+    if not has_sep and re.search(r"展会|展览会|博览会|大会暨|杂志|年会", p):
+        return ""
+    if p.endswith(("？", "?")):
+        return ""                                  # 文章标题
+    if re.search(r"(Master\s*V?\d|PV存量|_最终版|·G\d·)", p):
+        return ""                                  # 批次名样式
+    return p
+
 
 # ── 数据质量评分 ─────────────────────────────────────────────────────────
 
@@ -551,6 +678,316 @@ def record_region(rec: dict) -> str:
     return k
 
 
+# ── 总表身份令牌与按需物化（不解析总表也能查）──────────────────────────
+#
+# 实测事实（本机 736,263 条 / master.json 566MB，SQLite+FTS5 视图 1.7GB）：
+#   · json.loads 全量解析 17s、pickle.load 约 6s，但两者都要把每条记录物化成
+#     Python 对象——48MB 切片实测吃 558MB 峰值 RSS（约 10KB/条），全量外推
+#     约 6.2GB 常驻；
+#   · 本机物理内存 8GB（活动监视器实测空闲仅数百 MB、compressor 2.6GB），
+#     6.2GB 不是「慢一点」而是换页风暴：打开一次搜索框就要把 6.2GB 搬进内存
+#     一次，界面因此「加载很久很久」。pickle 快路径只省 CPU 不省内存，
+#     所以过去写的「秒开」从未真正达成。
+# 而 Gold 视图里本来就装着同一批数据，搜索/统计/分布/导出全部在库内算完
+# （见 pool_store 的 search/count/facets/stats/iter_records）。也就是说：
+# **读路径根本不需要总表在内存里**。
+#
+# 落地三件（对标湖仓 + 惰性求值引擎的标准形态）：
+#   1) 身份令牌 master_fp.json —— 把「磁盘缓存文件的字节身份」（size/mtime_ns/
+#      文件 crc32）与「总表内容指纹」（条数, crc32）绑在一起，另记 Silver 判据
+#      版本与删除向量内容身份。下次启动只需一次 stat + 一次文件 crc32（566MB
+#      实测 0.4s）就能确认「磁盘上还是这批数据」，完全不必解析。
+#   2) PoolStore.is_current(fp) —— 视图 meta 里记着建库时的 (条数, crc32)，
+#      与令牌对得上 → 视图与磁盘缓存同源，可以直接拿来查。
+#   3) LazyMaster —— 总表的代理对象：条数与真假立即回答（来自令牌），只有真的
+#      逐条取记录时才 materialize_master() 读盘。
+# 三段身份链任何一段对不上（判据升级、缓存被改写、视图不是这批数据、剔除标记
+# 变新）一律保守回退原有「解析总表 + 后台重建视图」路径：宁可慢，不可错。
+
+MASTER_FP_FILE = "master_fp.json"
+
+# 每条记录物化成 Python 对象的实测标定值。内存闸门用它估算「全表进内存
+# 要多少」，不追求精确，只用于在「够用」与「必然换页」之间画一条线。
+#
+# 必须**分格式**（2026-11-18 本机 738,734 条实测定标）：
+#   · json：48MB 切片 54,103 条 → 峰值 558MB RSS ≈ 10KB/条。这么高是因为
+#     json.loads 没有流式接口，整份文本（566MB）与解出的对象必须同驻，
+#     而且重复字符串（source/region 这类）不共享对象。
+#   · pkl：pickle.load 全表 738,734 条 → 峰值 RSS 1,944MB，扣掉解释器基线
+#     ≈ 2.5KB/条；这里取 4KB 留 1.6× 安全余量。
+# 以前两者共用 10.3KB 一个数，于是 pkl 路径（现在的默认缓存格式）需求被高估
+# 约 4 倍（7.6GB），把 8GB 机器一律判成「做不了」——闸门本该拦下「必然换页」，
+# 却因为估错把「10 秒能做完的事」拦成了死路（用户侧表现为彻底打不开）。
+RECORD_PY_BYTES = 10_300        # json 口径（整份文本与对象同驻）
+RECORD_PY_BYTES_PKL = 4_096     # pkl 口径（实测 2.5KB/条 + 1.6× 余量）
+
+
+def _file_identity(path: Path, with_crc: bool = True) -> Optional[dict]:
+    """文件字节身份（size + mtime_ns + 可选 crc32）；文件不存在返回 None。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    ident = {"file": path.name, "size": int(st.st_size),
+             "mtime_ns": int(st.st_mtime_ns)}
+    if with_crc:
+        try:
+            ident["crc"] = _file_bytes_crc(path)
+        except OSError:
+            return None
+    return ident
+
+
+def _file_bytes_crc(path: Path, chunk: int = 8 << 20) -> int:
+    """分块读文件算 crc32：566MB 实测 0.4s，内存有界（一次一块）。"""
+    crc = 0
+    with path.open("rb") as f:
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            crc = zlib.crc32(buf, crc)
+    return crc & 0xFFFFFFFF
+
+
+def _tok_num(mapping: dict, key: str, default: int = -1) -> int:
+    """从令牌字典里取一个整数，**把「字段缺失」与「值就是 0」分开判**。
+
+    为什么需要一个专门的函数：`int(d.get(k) or default)` 是本模块踩过两次的坑
+    ——0 在 Python 里是假值，`0 or -1` 直接得到 -1。而令牌里凡是用 (count, crc)
+    这种「空集就是 (0, 0)」形状的地方（删除向量、缓存文件条数），空集都是
+    **合法且最常见的常态**：拿 `or` 读它，会把一个本来成立的判据变成永远不成立，
+    而且不报错、不留日志，只表现为「为什么还是这么慢」。
+    """
+    try:
+        value = (mapping or {}).get(key)
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _iter_json_array_records(path: Path, chunk_bytes: int = 16 << 20,
+                             refill_below: int = 1 << 20):
+    """流式遍历磁盘上的 JSON 数组文件：一次只在内存里放一条记录。
+
+    标准库 json 没有流式解析——json.loads 必须把整个数组变成对象（本模块头部
+    记的 6.2GB 就是这么来的）。这里用 JSONDecoder.raw_decode 在滑动窗口上逐条
+    取：缓冲区剩余不足 refill_below 才截尾补读（每 15MB 才切片一次，不会退化成
+    每条复制一遍窗口），读到一条 yield 一条。
+
+    尾部的残缺/非对象元素一律**直接停止迭代**而不是抛错：调用方必须自己校验
+    条数是否与预期一致（bootstrap_master_fp 就是这么守门的）——把「读到一半断掉」
+    当成完整数据，等于拿半份总表发搜索结果的「共 N 条」。
+    """
+    dec = json.JSONDecoder()
+    sep = " \t\n\r,"
+    with path.open("r", encoding="utf-8") as f:
+        buf = f.read(chunk_bytes)
+        if not buf:
+            return
+        eof = len(buf) < chunk_bytes
+        idx = 0
+        if buf[idx] == "[":
+            idx = 1
+        while True:
+            while idx < len(buf) and buf[idx] in sep:
+                idx += 1
+            if idx >= len(buf):
+                if eof:
+                    return
+                buf, idx = "", 0
+                nxt = f.read(chunk_bytes)
+                if not nxt:
+                    return
+                buf = nxt
+                eof = len(nxt) < chunk_bytes
+                continue
+            if buf[idx] != "{":
+                return          # 非对象元素（或收尾的 ]）：不猜，交给调用方校验条数
+            while True:
+                try:
+                    obj, end = dec.raw_decode(buf, idx)
+                    break
+                except ValueError:
+                    if eof:
+                        return  # 尾部残缺：停止，条数校验会识破
+                    nxt = f.read(chunk_bytes)
+                    if not nxt:
+                        eof = True
+                        continue
+                    buf = buf + nxt
+                    eof = len(nxt) < chunk_bytes
+            yield obj
+            idx = end
+            if len(buf) - idx < refill_below and not eof:
+                buf, idx = buf[idx:], 0
+                nxt = f.read(chunk_bytes)
+                if not nxt:
+                    eof = True
+                else:
+                    buf = buf + nxt
+                    eof = len(nxt) < chunk_bytes
+
+
+def _approx_free_memory_bytes() -> Tuple[int, str]:
+    """本机还能安全分配多少内存（粗略但保守），返回 (字节数, 依据说明)。
+
+    为什么要有这道闸门：内存不足的机器上「把 736 万条读进 Python」不是慢，
+    而是把整机拖进换页——用户看到的现象是工具假死、鼠标转圈几分钟。与其
+    赌一把，不如把这一轮同步保守地留在原地（不推进游标、不丢数据），等内存
+    宽裕或用户点「立即整理」再做。
+
+    估算口径（刻意保守）：物理内存总量 × 0.55 − 本进程当前 RSS。只用标准库
+    （sysctl / sysconf / resource），不引入 psutil 这种打包态可能缺的依赖；
+    读不到就返回 0（判成「不够」）——估不出来时绝不能假设内存充足。
+
+    ru_maxrss 的单位**必须按平台判定，不能按数量级猜**（2026-11-18 实测教训）：
+    macOS/BSD 返回字节，Linux 返回 KB，Windows 返回 KB。上一版写的是
+    「rss < 1GB 就当成 KB 再乘 1024」——在 macOS 上任何 RSS 不足 1GB 的进程
+    （界面刚启动时就是几十 MB）都会被放大成 60GB 量级，avail 直接归零，
+    于是闸门对所有没令牌的机器**永久拒绝**：用户看到的不是「慢」而是
+    「搜索采购商彻底打不开 + 明明 8GB 却说可用 0GB」。这类「为了不出错而
+    加的闸门，因为单位错变成焊死门」的缺陷，判据只有一条：闸门必须在
+    一个空进程上给出与真实内存相符的数（见 debug/warmup_master_fp.py 阶段 1）。
+    """
+    total = 0
+    why = []
+    try:
+        for cmd in (("/usr/sbin/sysctl", "-n", "hw.memsize"),
+                    ("sysctl", "-n", "hw.memsize")):
+            if not os.path.exists(cmd[0]):
+                continue
+            import subprocess
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=2).stdout.strip()
+            if out.isdigit():
+                total = int(out)
+                why.append("sysctl hw.memsize")
+                break
+    except Exception:
+        pass
+    if total <= 0:
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            why.append("sysconf")
+        except (ValueError, OSError, KeyError):
+            total = 0
+    rss = 0
+    try:
+        import resource
+        import sys as _sys
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # macOS/BSD 是字节，Linux/Windows 是 KB：按平台换算，不看数量级
+        if _sys.platform != "darwin":
+            rss *= 1024
+        if rss <= 0 or rss > (1 << 40):   # 明显不合理就当未知
+            rss = 0
+        why.append("rss")
+    except Exception:
+        pass
+    if total <= 0:
+        return 0, "读不到物理内存（按不够处理）"
+    avail = int(total * 0.55) - rss
+    return max(avail, 0), "、".join(why) + f"（总 {total >> 30}GB）"
+
+
+class LazyMaster:
+    """总表的按需物化代理：条数与真假零成本回答，逐条取记录才读盘。
+
+    故意**不继承 list**：list 子类会被 CPython 的快路径直接读内部槽位
+    （list(x)/tuple(x)/sorted(x)/x[:] 以及 json.dumps 的 list 检查），而物化前
+    那些槽位是空的——静默拿到空表比报错危险得多（「数据池 0 家」「导出为空」
+    这类看不见的丢数据就是这么来的）。普通对象走迭代协议与 __getitem__，
+    任何容器化用法都能拿到真数据，不支持的操作会响亮报错。
+
+    失效方向：所有变异方法（append/extend/sort…）先物化再委托，同时 manager
+    会把 _master_cache 换成真 list，后续操作不再经过这里。
+    """
+
+    __slots__ = ("_mgr", "_count", "_items")
+
+    def __init__(self, mgr: "DataPoolManager", count: int):
+        self._mgr = mgr
+        self._count = int(count)
+        self._items: Optional[List[dict]] = None
+
+    # ── 不物化的回答 ──
+
+    def __len__(self) -> int:
+        return len(self._items) if self._items is not None else self._count
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    @property
+    def materialized(self) -> bool:
+        """记录是否已经在内存里（给日志/测试分清“真没数据”与“还没读”）。"""
+        return self._items is not None
+
+    # ── 需要真数据的方法：都先物化 ──
+
+    def _load(self) -> List[dict]:
+        if self._items is None:
+            self._items = self._mgr._materialize_into(self)
+        return self._items or []
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __getitem__(self, item):
+        return self._load()[item]
+
+    def __contains__(self, item):
+        return item in self._load()
+
+    def __reversed__(self):
+        return reversed(self._load())
+
+    def __add__(self, other):
+        return self._load() + list(other)
+
+    def __eq__(self, other):
+        if isinstance(other, LazyMaster):
+            return self._load() == other._load()
+        return self._load() == other
+
+    def __repr__(self):
+        return (f"<LazyMaster {self._count:,} 家"
+                f"{'，已物化' if self._items is not None else '，未读盘'}>")
+
+    def count(self, item) -> int:
+        return self._load().count(item)
+
+    def index(self, item, *args) -> int:
+        return self._load().index(item, *args)
+
+    def append(self, item) -> None:
+        self._load().append(item)
+        self._mgr._master_cache = self._items
+
+    def extend(self, items) -> None:
+        self._load().extend(items)
+        self._mgr._master_cache = self._items
+
+    def insert(self, i, item) -> None:
+        self._load().insert(i, item)
+        self._mgr._master_cache = self._items
+
+    def pop(self, i=-1):
+        return self._load().pop(i)
+
+    def remove(self, item) -> None:
+        self._load().remove(item)
+
+    def sort(self, **kw) -> None:
+        self._load().sort(**kw)
+
+    def clear(self) -> None:
+        self._load().clear()
+
+
 class DataPoolManager:
     """团队数据池：上传本次采集 → OSS → 搜索时增量合并。
 
@@ -596,6 +1033,21 @@ class DataPoolManager:
         self._view_fp: Optional[Tuple[int, int]] = None
         # 倒排索引解析结果缓存：((mtime_ns, size), 解析后的 dict)
         self._index_cached: Optional[Tuple[Tuple[int, int], dict]] = None
+        # 本地缓存写盘/读盘的最后一次失败原因（供界面如实归因：
+        # 「下次秒开」为什么没秒开，必须能说得出名字，不能只靠 except: pass）
+        self._last_cache_error: str = ""
+        # 后台同步被内存闸门拦下时的说明（空串 = 没有）
+        self._pending_sync_note: str = ""
+        # 剔除标记已认到、但本机总表本轮没重洗的说明（内存闸门拦下）。
+        # 与 _pending_sync_note 分开存：前者的「无增量」分支会被顺手清空，而
+        # 「同事剔了一家 + 本机内存不够」恰恰常与无增量同时发生，共用一个
+        # 字段就等于把这条说明交给无关的清理去决定它存不存活。
+        self._tomb_defer_note: str = ""
+        self._tomb_find_note: str = ""
+        # 读本地总表时被内存闸门挡下的原因（空串 = 没挡）：与「缓存文件读不出
+        # 来」必须是两种回答——前者请用户腾内存后再试一次就好，后者再怎么重试
+        # 也没用。混成一个「加载失败」会让人对着网络干瞪眼。
+        self._load_refused: str = ""
 
     # ── 用户名 ──
 
@@ -639,8 +1091,16 @@ class DataPoolManager:
         return self._store
 
     def master_fingerprint(self) -> Optional[Tuple[int, int]]:
-        """当前内存总表的内容指纹（一次算好复用；总表任何变动都会作废）。"""
+        """当前内存总表的内容指纹（一次算好复用；总表任何变动都会作废）。
+
+        懒采纳状态下**绝不用物化来凑指纹**：令牌已经带好了 (条数, crc32)，
+        这里丢了就是「身份不明」，返回 None 让调用方当作未对齐处理。当年
+        就是在这些地方默默「为了对个指纹而把整表读进来」，才让 6.2GB 常驻
+        变成每次打开都要付的固定代价。
+        """
         if self._master_cache is None:
+            return None
+        if self._master_fp is None and isinstance(self._master_cache, LazyMaster):
             return None
         if self._master_fp is None:
             from pool_store import fingerprint_records
@@ -652,7 +1112,8 @@ class DataPoolManager:
         self._master_fp = None
         self._view_fp = None
 
-    def _set_master(self, master: List[dict]):
+    def _set_master(self, master: List[dict], known_fp=None,
+                    view_current: bool = False):
         """总表唯一赋值入口：换表即作废指纹与视图对齐状态。
 
         指纹/视图状态依赖「当前总表内容」，散在各处赋值必然出现某条路径忘了
@@ -662,10 +1123,351 @@ class DataPoolManager:
         剔除标记在这里再过一遍：磁盘缓存里的 master.json 可能是「打标记之前」
         写的，只有挂在赋值入口才能保证已缓存的总表也认当前的删除向量
         （幂等：全量重建/增量路径已经洗过，这里第二次是空操作）。
+
+        known_fp + view_current：调用方已经逐位证明「这批内容就是视图里那批」
+        （known_fp 必须是**重放剔除标记之后**内容的指纹）时才传，此时对齐状态
+        原样保留。不传就是默认的保守分支：一切作废，等后台重新对齐。
         """
+        if isinstance(master, LazyMaster):
+            raise TypeError("LazyMaster 不能当总表赋值：先 materialize_master()")
         self._master_cache = self._apply_tombstones(master)
         self._master_cache_time = time.time()
+        if known_fp is not None and view_current:
+            self._master_fp = (int(known_fp[0]), int(known_fp[1]))
+            self._view_fp = self._master_fp
+            return
         self._invalidate_view()
+
+    # ── 按需物化：不读总表也能查（身份令牌 + LazyMaster）─────────────
+
+    def _master_fp_token_path(self) -> Path:
+        return self._cache_dir / MASTER_FP_FILE
+
+    def _cache_master_file(self) -> Optional[Path]:
+        """当前生效的总表缓存文件：pkl 优先（写侧主格式），否则旧 json。"""
+        for name in ("master.pkl", "master.json"):
+            p = self._cache_dir / name
+            if p.exists():
+                return p
+        return None
+
+    def has_local_cache(self) -> bool:
+        """本地是否有总表缓存（pkl 或 json）。
+
+        界面用它判断「走秒开还是走首次全量下载」：以前只看 master.json，
+        pkl 写完把 json 删了之后，下一轮就自报表没缓存 → 误走全量重建。
+        """
+        return self._cache_master_file() is not None
+
+    def _tomb_fingerprint(self) -> Tuple[int, int]:
+        """删除向量的内容身份（有序 norm 集合的条数 + crc32）。
+
+        用内容而不是文件 mtime：同一批标记重存一次不该让缓存「看起来变了」；
+        反过来，只要标记集合多了一个 norm，重放后的总表指纹必变，令牌必须
+        当场失效（否则会拿旧视图当新数据，被剔除的公司继续能搜到）。
+        """
+        self._load_tombstone_state()
+        from pool_store import fingerprint_records
+        norms = sorted(self._tomb_norms)
+        return fingerprint_records([{"company_norm": n} for n in norms])
+
+    def _write_master_fp_token(self, fp: Tuple[int, int],
+                               file_ident: Optional[dict] = None) -> bool:
+        """落盘身份令牌：把「这批磁盘缓存字节」与「总表内容指纹」绑死。
+
+        写失败必须让调用方知道（返回 False + 记 last_error）：令牌缺失不会报错，
+        只会让下次启动退回全量解析——过去 master.pkl 从未落地就是被
+        _save_local_state 里那个 `except Exception: pass` 吞掉的，同样的静默
+        失败不许再犯一次。
+        """
+        if file_ident is None:
+            f = self._cache_master_file()
+            file_ident = _file_identity(f) if f else None
+        if not file_ident:
+            self._last_cache_error = "身份令牌未写：找不到总表缓存文件"
+            return False
+        tcount, tcrc = self._tomb_fingerprint()
+        payload = {
+            "silver": _silver_rule_version(),
+            "count": int(fp[0]), "crc": int(fp[1]),
+            "cache": file_ident,
+            "tomb": {"count": tcount, "crc": tcrc},
+            "written_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            tmp = self._cache_dir / (MASTER_FP_FILE + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(tmp, self._master_fp_token_path())
+            return True
+        except Exception as e:
+            self._last_cache_error = f"身份令牌写入失败: {e}"
+            return False
+
+    def _read_master_fp_token(self) -> Optional[dict]:
+        try:
+            data = json.loads(
+                self._master_fp_token_path().read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _token_cache_file_matches(self, tok: dict) -> bool:
+        """令牌里记的缓存文件字节现在还是不是同一份（stat + 文件 crc32）。"""
+        cache = tok.get("cache")
+        if not isinstance(cache, dict):
+            return False
+        name = str(cache.get("file") or "")
+        if name not in ("master.pkl", "master.json"):
+            return False
+        now = _file_identity(self._cache_dir / name)
+        if not now:
+            return False
+        return (now["size"] == _tok_num(cache, "size")
+                and now.get("crc") == cache.get("crc"))
+
+    def try_adopt_cached_view(self, progress_cb=None) -> bool:
+        """不解析总表就把视图接上：三段身份链全部成立才采纳，否则一律返回假。
+
+        链路：缓存文件字节 → master_fp.json 里的 (条数, crc32) → 视图 meta。
+        任何一段对不上（没令牌、判据版本升级、缓存被别的进程改写、剔除标记变新、
+        视图不是这批数据、视图文件缺失）都返回 False，调用方保守走老链路——
+        宁可慢，不可拿旧视图当新数据。
+        """
+        if self._master_cache is not None:
+            return self._view_fp is not None
+        if self._store_off:
+            return False
+        st = self.store()
+        if st is None or not st.readable():
+            return False
+        if not self._cache_rules_current():
+            return False
+        tok = self._read_master_fp_token()
+        if not tok:
+            return False
+        if str(tok.get("silver") or "") != _silver_rule_version():
+            return False
+        if not self._token_cache_file_matches(tok):
+            return False
+        # 删除向量：令牌记的是写盘那一刻的标记内容身份，本地状态必须与它一致
+        self._load_tombstone_state()
+        tcount, tcrc = self._tomb_fingerprint()
+        tb = tok.get("tomb") or {}
+        # 必须用 _tok_num 而不是 `int(x or -1)`：零是**合法值**——绝大多数用户
+        # 一个剔除标记都没建过，(0, 0) 就是常态。上一版写成 `or -1`，于是
+        # `0 or -1` 把 0 读成 -1，-1 != 0 恒成立 → **没有剔除标记的机器上令牌
+        # 永远验证不过**，秒开路径被一行求值优先级掐断（用户侧表现就是「写了
+        # 令牌还是加载很久」）。这类静默恒假判据只能靠反向探针发现：见
+        # debug/adopt_why_probe.py 逐条件打印。
+        if _tok_num(tb, "count") != tcount or _tok_num(tb, "crc") != tcrc:
+            return False
+        try:
+            fp = (int(tok["count"]), int(tok["crc"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if fp[0] <= 0:
+            return False
+        if not st.is_current(fp):
+            return False
+        self._consumed_keys = self._read_consumed_keys()
+        self._master_cache = LazyMaster(self, fp[0])
+        self._master_cache_time = time.time()
+        self._master_fp = fp
+        self._view_fp = fp
+        if progress_cb:
+            try:
+                progress_cb(f"本地缓存与搜索加速同源，直接复用（{fp[0]:,} 家，"
+                            f"本轮不读总表）")
+            except Exception:
+                pass
+        return True
+
+    def bootstrap_master_fp(self, progress_cb=None) -> bool:
+        """没有身份令牌时的一次性补写：流式扫磁盘缓存算出总表指纹。
+
+        为什么需要它：升级前落盘的缓存只有 master.json，没有令牌；如果因此
+        走「整体解析」老路，就是每台老用户机器都要再付一次 6.2GB 换页风暴。
+        这里改成逐条流式读（有界内存）：只为了得到 (条数, crc32)，读完就丢。
+
+        守门条件（任何一条不满足就返回假，让调用方走原有保守路径）：
+          · 缓存必须是 json——pkl 没法流式读（而且 pkl 只能由本工具写出，
+            那时令牌必然已存在）
+          · rule_version 必须是当前 Silver 版本：否则读侧还要重算派生列，
+            「文件里的值」不等于「加载后的值」，指纹不可比
+          · 每条都要带当前版本标记（region_rule/province_rule）：有旧记录
+            就必须走完整加载，不许拼一个看上去对的指纹
+          · 条数必须与视图 meta 里的 record_count 一致：读到一半断掉/尾部残缺
+            会让 crc 自洽但条数少，这一条把它识破
+        """
+        path = self._cache_dir / "master.json"
+        if not path.exists() or (self._cache_dir / "master.pkl").exists():
+            return False
+        if not self._cache_rules_current():
+            return False
+        try:
+            total_bytes = path.stat().st_size
+        except OSError:
+            return False
+        from pool_store import FingerprintAccumulator
+        try:
+            from ingest_cleaning import PARTITION_RULE_VERSION
+        except Exception:
+            PARTITION_RULE_VERSION = ""
+        self._load_tombstone_state()
+        norms = self._tomb_norms
+        acc = FingerprintAccumulator()
+        seen = skipped = 0
+        last_reported = -10
+        for rec in _iter_json_array_records(path):
+            seen += 1
+            if not isinstance(rec, dict):
+                return False        # 数组里出现非对象：这批数据不可证
+            if (str(rec.get("region_rule") or "") != REGION_RULE_VERSION
+                    or str(rec.get("province_rule") or "")
+                    != PARTITION_RULE_VERSION):
+                return False        # 有记录需重算派生列，指纹与加载结果不同源
+            norm = rec.get("company_norm") or normalize_company_name(
+                str(rec.get("company") or ""))
+            if norm and norm in norms:
+                skipped += 1
+                continue            # 剔除标记重放：与 _apply_tombstones 同一条判据
+            acc.feed(rec)
+            if seen - last_reported >= 100000 and progress_cb:
+                last_reported = seen
+                try:
+                    progress_cb(f"首次整理本地缓存身份（只需一次）：已核对 "
+                                f"{seen:,} 条")
+                except Exception:
+                    pass
+        fp = acc.finish()
+        if fp[0] <= 0 or (fp[0] + skipped) != seen:
+            return False
+        st = self.store()
+        if st is None or not st.readable():
+            return False
+        meta = st.meta()
+        try:
+            if int(meta.get("record_count", "-1")) != fp[0]:
+                return False        # 条数与视图不一致：流式读不完整/数据真的不同
+        except (TypeError, ValueError):
+            return False
+        if not self._write_master_fp_token(fp, _file_identity(path)):
+            return False
+        if skipped and progress_cb:
+            try:
+                progress_cb(f"已按剔除标记核对：{seen:,} 条里去掉 {skipped} 条")
+            except Exception:
+                pass
+        return True
+
+    def _read_master_records(self) -> Optional[List[dict]]:
+        """只读盘不赋值：把总表缓存解析成列表（含派生字段存量兼容）。
+
+        与 _load_local_state 共用一份解析口径，区别只在不碰 _master_cache /
+        视图状态——按需物化时必须先算完指纹再决定要不要作废视图。
+        """
+        path = self._cache_master_file()
+        if path is None:
+            return None
+        try:
+            if path.suffix == ".pkl":
+                with path.open("rb") as f:
+                    master = pickle.load(f)
+            else:
+                master = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            self._last_cache_error = f"总表缓存读取失败: {e}"
+            return None
+        if not isinstance(master, list):
+            self._last_cache_error = "总表缓存格式不对（不是数组）"
+            return None
+        # 快捷路径口径与 _load_local_state 历史行为逐字一致（它一直传 True）：
+        # 离线兜底读旧缓存时也不重算派生列——多花 27s 重算不算错，但那会把
+        # 「给用户看旧规则洗出的数据」这条既定口径悄悄改掉
+        return DataPoolManager._normalize_partition_fields(
+            master, allow_fast_path=True)
+
+    def _materialize_into(self, lazy: LazyMaster) -> List[dict]:
+        """LazyMaster 的回调：读盘、核指纹、把 _master_cache 换成真 list。"""
+        real = self._read_master_records()
+        if real is None:
+            return []
+        real = self._apply_tombstones(real)
+        from pool_store import fingerprint_records
+        fp = fingerprint_records(real)
+        if self._master_fp is not None and fp != self._master_fp:
+            # 磁盘缓存与令牌不再同源（别的进程改写了缓存，或剔除标记变新）：
+            # 视图立刻作废，绝不能继续拿旧视图回答查询
+            import logging
+            logging.getLogger(__name__).warning(
+                "总表物化后指纹与令牌不一致（令牌 %s → 实际 %s），"
+                "视图作废等后台重建", self._master_fp, fp)
+            self._set_master(real)
+            return self._master_cache
+        self._master_cache = real
+        self._master_cache_time = time.time()
+        return real
+
+    def materialize_master(self) -> List[dict]:
+        """拿到真正的记录列表（懒采纳状态才读盘，已经物化则零成本）。"""
+        m = self._master_cache
+        if isinstance(m, LazyMaster):
+            return m._load()
+        return m or []
+
+    def master_is_lazy(self) -> bool:
+        return isinstance(self._master_cache, LazyMaster)
+
+    def get_record_by_norm(self, norm: str) -> Optional[dict]:
+        """按主键点查一条记录：只走视图，**绝不为了点查把懒态总表读回来**。
+
+        给「扫描前比对池里有没有这家公司」这类点查用：以前它们先把 73.8 万条
+        读进内存建一张全量映射，只为查十几行——有界点查既快又不吃内存。
+        2026-11-18 收口：旧写法在 `st.get()` 抛异常时会掉进
+        `for rec in self.materialize_master()` —— 一次瞬时的 SQL 抖动就能把
+        整张总表搬回内存（73.8 万条），而调用方只是想知道「在不在」。
+        现在按总表是否已经在内存里分两种处置：
+          · 懒态（只有 LazyMaster）→ 当场回答查不到并记日志：绝不为点查物化。
+            调用方 local_scan.PoolIndex.contains 的失败方向本来就被定成
+            「宁可答不在」（只影响提示文案，不自动取消勾选、不影响入库）。
+          · 非懒态（总表已在内存）→ 逐条找代价为零内存，保留作为兼容回退。
+        返回 None = 池里没有（或既没视图又不能为它搬全表）。
+        """
+        norm = str(norm or "")
+        if not norm:
+            return None
+        st = self.store()
+        if st is not None and self.store_ready():
+            try:
+                return st.get(norm)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "⚠ 视图点查失败（norm=%s）：%s", norm[:40], e)
+        if self.master_is_lazy():
+            # 视图不能用且总表仍是代理：回答「查不到」而不是把全表读回来
+            return None
+        for rec in self.materialize_master():
+            if isinstance(rec, dict) and str(rec.get("company_norm") or "") == norm:
+                return rec
+        return None
+
+    def pending_sync_note(self) -> str:
+        """本轮后台同步被内存闸门拦下的说明（空串 = 没有）。
+
+        这不是错误而是滞后：游标没推进，数据一个不少，下一次内存宽裕（或用户
+        点「立即整理」）会自动补上。界面必须把这句说出来，否则用户会以为
+        刚上传的数据丢了，而搜索结果其实与上次完整整理时点一致。
+
+        两类滞后都从这一个出口走：增量没并入（_pending_sync_note）与剔除标记
+        没重洗本机总表（_tomb_defer_note）。字段分开存、出口拼接，是为了让
+        「无增量分支清空前者」碰不到后者——界面只认这一个函数，不必知道背后
+        有几类滞后，也不会因为新增一类就漏显示。
+        """
+        parts = [str(getattr(self, "_pending_sync_note", "") or ""),
+                 str(getattr(self, "_tomb_defer_note", "") or "")]
+        return "；".join(p for p in parts if p)
 
     # ── 剔除标记（删除向量 / tombstone）──────────────────────────────────
     #
@@ -743,6 +1545,29 @@ class DataPoolManager:
         master = self._master_cache
         if not master or not self._tomb_norms:
             return 0
+        if isinstance(master, LazyMaster):
+            # 走到这里有两种来源，代价完全相同而**主动性完全不同**：
+            #   · 用户刚点了剔除（tombstone_companies）——这一步确实要改本机数据；
+            #   · 后台同步发现别的同事剔了记录（refresh_from_oss）——没有任何人
+            #     做过任何动作。以前这里无条件物化，于是「同事剔一条脏数据」
+            #     就能让本机刚刚秒开的界面在后台把 73.8 万条读回来（本机峰值
+            #     1.9GB）——「用户主动动作」这个理由只对前一种来源成立，而后一种
+            #     是自动跑的，拿它当依据就是闸门形同虚设。
+            # 拦下时**不动任何状态**：标记已经写进 OSS 与本地删除向量，下一次
+            # 加载照常重洗，本机只是暂时还看得见那几条——滞后是如实的，假死不是。
+            room, why = self.master_memory_room()
+            if not room:
+                self._tomb_defer_note = (
+                    f"新认到的剔除标记本轮没有重洗本机总表（{why}）；"
+                    "标记已保存，内存宽裕后自动补齐，数据一条没丢")
+                import logging
+                logging.getLogger(__name__).warning(
+                    "⏸ 剔除重洗因内存不足留在原地：%s", self._tomb_defer_note)
+                return 0
+            master = self.materialize_master()
+            if not master:
+                return 0
+        self._tomb_defer_note = ""
         kept = self._apply_tombstones(master)
         if len(kept) == len(master):
             return 0
@@ -864,6 +1689,10 @@ class DataPoolManager:
         self._save_tombstone_state()
         removed = self._resync_master_with_tombstones()
         return {"marked": len(entries), "removed": removed,
+                # 为什么标了 N 家而本机只去掉 0 条：内存闸门拦下重洗时把原因随手
+                # 带出来。不带的结果是把「本机滞后一轮」这件如实的事说成「一条都
+                # 没剔掉」，用户会反复点同一个按钮。
+                "defer_note": self._tomb_defer_note,
                 "filename": filename, "key": key}
 
     def tombstone_list(self) -> List[dict]:
@@ -872,6 +1701,16 @@ class DataPoolManager:
         return sorted(self._tomb_entries,
                       key=lambda e: str(e.get("time") or ""), reverse=True)
 
+    def tombstone_find_note(self) -> str:
+        """上一次 find_for_tombstone 的「没比对全」说明（空串 = 结果完整）。
+
+        为什么需要它：视图不可用时只能回答「剔过的几条」，在册企业那一半根本没
+        比对。如果调用方拿空结果当「没找到」，用户会以为标记没生效而再打一遍
+        （标记只追加不可撤回，两条互相矛盾的剔除记录比查不到更难收拾）。这个
+        结论由做出取舍的代码就地留下，界面只转述，不自己重新推一遍。
+        """
+        return str(getattr(self, "_tomb_find_note", "") or "")
+
     def find_for_tombstone(self, keyword: str, limit: int = 300) -> List[dict]:
         """按名字关键字找可剔除对象（附联系方式摘要供人核对）。
 
@@ -879,7 +1718,12 @@ class DataPoolManager:
         所以这里给的是总表里的真实聚合结果，不是输入框的回显。
         已经打过标记的企业**也必须出现在结果里**（总表重放后已经没有它们了）：
         否则用户搜一遍「没找到」，会以为标记没生效而再打一遍。
+
+        在册企业优先由视图召回（find_by_name）：旧实现顺序扫内存总表到 limit 条
+        就停，在懒采纳状态下等于为了查一个关键字把 6.2GB 读回来；而池子后段的
+        公司在旧口径里根本翻不到。判定语句（子串包含）两条路径同一条。
         """
+        self._tomb_find_note = ""      # 每次调用重新决定说明，不留上一次的残留
         kw = str(keyword or "").strip()
         if not kw:
             return []
@@ -909,7 +1753,24 @@ class DataPoolManager:
             got_norms.add(cn)
             if len(out) >= cap:
                 return out
-        for rec in (self._master_cache or []):
+        scanned = None
+        if self.store_ready():
+            try:
+                scanned = self._store.find_by_name(kw, limit=cap)
+            except Exception:
+                scanned = None
+        if scanned is None:
+            if self.master_is_lazy():
+                # 视图不可用/已坏，而总表仍只是个代理：绝不为一次关键字查找把
+                # 整张总表搬回内存（与 get_record_by_norm 那一格同形：2026-11-18
+                # 收口前，一次瞬时 SQL 抖动就能把 73.8 万条读回来）。
+                # 「已经剔过的」照常给出，在册企业这一半没比对成就把原因留下：
+                # 界面必须把它和「没找到」分开显示，否则会误导用户重复打标记。
+                self._tomb_find_note = ("检索视图本轮不可用，本次没有比对在册企业"
+                                        "（已列出的剔除标记不受影响，数据一条没丢）")
+                return out
+            scanned = self.materialize_master()   # 视图不可用/坏了才退回总表
+        for rec in (scanned or []):
             nm = str(rec.get("company") or "")
             cn = str(rec.get("company_norm") or "")
             if cn in got_norms:
@@ -943,6 +1804,13 @@ class DataPoolManager:
         搜索路径只看 sync_store 的结果（store_ready），不自己触发重建。
         """
         st = self.store()
+        if self.master_is_lazy():
+            # 懒采纳下不走重建：视图与磁盘缓存在采纳那一刻已经三段身份链自证过。
+            # 假如对齐状态丢了（视图被判为不是这批数据），绝不能用「把整表读进
+            # 内存」来补救——那就是 6.2GB 换页风暴的源头；宁可返回假，
+            # 让界面如实说「本次改用较慢的方式查找」并等下一次完整加载再重建。
+            return bool(self._view_fp is not None
+                        and self._view_fp == self._master_fp)
         fp = self.master_fingerprint()
         if st is None or fp is None or not self._master_cache:
             return False
@@ -1036,13 +1904,45 @@ class DataPoolManager:
         except Exception:
             return None
 
-    def store_stats(self) -> Optional[Dict[str, Any]]:
-        """全库概览（条数/来源/上传者/属地分布），视图未就绪返回 None。"""
+    def store_stats(self, fields: Optional[Sequence[str]] = None
+                    ) -> Optional[Dict[str, Any]]:
+        """全库概览（条数/来源/上传者/属地分布），视图未就绪返回 None。
+
+        fields 是点菜清单：库内概览里有一批口径各自要扫一遍全表（73.8 万行
+        实测单条 5s 量级），不传就全算 —— 给界面用的路径必须传。
+        """
         if not self.store_ready():
             return None
         try:
-            return self._store.stats()
+            return self._store.stats(fields)
         except Exception:
+            return None
+
+    def store_suggest(self, prefix: str, limit: int = 12) -> Optional[Dict[str, List[str]]]:
+        """搜索框补全的召回：全部在视图内算完，**不碰内存总表一个元素**。
+
+        返回 None = 视图没就绪 → 调用方自己决定是否退回总表；返回空字典值
+        （公司/产品都空）是「视图里真的没这个名字含该词的记录」，两者不能混。
+        """
+        if not self.store_ready():
+            return None
+        try:
+            return self._store.suggest(prefix, limit=limit)
+        except Exception:
+            return None
+
+    def store_view_count(self) -> Optional[int]:
+        """视图行数（从 meta 读，毫秒级）；视图不可用返回 None。
+
+        懒采纳下这是「池子有多大」的唯一便宜答案：以前这种数字要么扫全表计数
+        （秒级），要么把整表读进来（GB 级），都不该出现在打开界面那条路上。
+        """
+        st = self.store() if self.store_ready() else None
+        if st is None:
+            return None
+        try:
+            return int(st.meta().get("record_count", "-1"))
+        except (TypeError, ValueError, AttributeError):
             return None
 
     def reach_summary(self) -> Optional[Dict[str, int]]:
@@ -1052,13 +1952,26 @@ class DataPoolManager:
         视图不在才扫内存总表。两条路径判据同一条（pool_matcher.contact_flags 非零），
         否则「概览写的可外呼数」与「勾了只看有联系方式筛出的数」会互相打脸。
         返回 None = 既没视图也没总表，调用方不许把 None 显示成 0 家。
+
+        点菜只传 total/reachable：这一行与 get_master_stats 在同一个状态行里
+        被调用，两边各跑一次全库聚合就是双付（本机实测那轮 13.6s 里大部分
+        都花在这种没人要的口径上）。
         """
-        st = self.store_stats()
+        st = self.store_stats(("total", "reachable"))
         if st and "reachable" in st:
             total = int(st.get("total") or 0)
             reach = int(st.get("reachable") or 0)
             return {"total": total, "reachable": reach, "lead_only": total - reach}
         if not self._master_cache:
+            return None
+        if self.master_is_lazy():
+            # 走到这里 = 视图答不出覆盖度，而内存里还是个没读过一行的懒代理。
+            # 下面那两行遍历会把整张总表物化回来（73.8 万条，本机峰值 1.9GB），
+            # 而它的产出只是状态行后半句「其中 N 家可外呼」——一句提示不值这个价。
+            # 可达性不是理论可能：store_ready() 在运行时转假（另一个进程重建了视图、
+            # meta 缓存到期后指纹不再对齐、一次瞬时 SQL 抖动）就会掉进这一格，
+            # 而调用方 pool_dialogs._reach_note 本来就把 None 处理成「整句不说」，
+            # 所以降级是如实的，不是功能缺失（与 _compute_local_stats 同一口径）。
             return None
         try:
             from pool_matcher import contact_flags
@@ -1071,7 +1984,8 @@ class DataPoolManager:
     # ── 上传 ──
 
     @staticmethod
-    def _normalize_partition_fields(records: List[dict]) -> List[dict]:
+    def _normalize_partition_fields(records: List[dict],
+                                    allow_fast_path: bool = False) -> List[dict]:
         """批量补齐记录级派生字段：属地（is_domestic/region）+ 行业/省份/质量分。
 
         国内外链路贯通双保险：写侧（upload_session）显式落字段，
@@ -1084,14 +1998,27 @@ class DataPoolManager:
         物化视图要拿它们当分区列做裁剪与聚合，靠查询时现算等于每次搜索
         重跑一遍分类器。清洗层导入失败（打包态缺依赖）时属地仍按本函数
         归一，其余字段保持原样——降级不改变判据语义。
+
+        allow_fast_path：仅限 _load_local_state（缓存加载）这类已由
+        _cache_rules_current 校验过 Silver 版本的调用点传 True——版本齐的
+        记录零改动（幂等），73.6 万条全表重跑 record_region 实测 27s 可安全
+        跳过；合并出口/上传/下载喂的是刚变过内容的记录，属地必须重判
+        （默认 False，与历史行为一致）。
         """
         try:
             from ingest_cleaning import enrich_partition_fields
-            enrich_partition_fields(records)
+            enrich_partition_fields(records, allow_fast_path=allow_fast_path)
         except Exception:
             pass
         for rec in records:
             if not isinstance(rec, dict):
+                continue
+            # 版本快速路径（仅缓存加载开启）：已按当前判据算过属地的记录零改动
+            # （幂等），不再跑多信号投票；判据升级时版本标记不匹配，自然回退
+            # 全量重算（升级不会被挡住）。合并出口/上传/下载保持逐条重判。
+            if allow_fast_path and rec.get("region_rule") == REGION_RULE_VERSION:
+                rec.pop("_region_key", None)
+                rec.pop("_region_ver", None)
                 continue
             region = record_region(rec)
             rec["is_domestic"] = region == "dom"
@@ -1313,7 +2240,9 @@ class DataPoolManager:
 
     # ── 合并总表 ──
 
-    def get_merged_master(self, force_refresh: bool = False) -> List[dict]:
+    def get_merged_master(self, force_refresh: bool = False,
+                          progress_cb=None,
+                          force_full_load: bool = False) -> List[dict]:
         """获取合并后的总表（本地缓存 + OSS 增量合并）。
 
         大厂秒开思想（Google Drive / Dropbox）：
@@ -1321,6 +2250,12 @@ class DataPoolManager:
           · 无本地缓存（首次）→ 全量下载
           · force_refresh=True → 强制全量重建
           · 网络失败降级本地缓存（可用性优先）
+        progress_cb：全量重建（首次/缓存作废）阶段的状态回调——下载、合并、
+        建索引各阶段都能看到进展，而不是一句「首次加载」黑盒等待几分钟。
+
+        返回的可能是 LazyMaster（秒开路径）：条数与真假可零成本回答，逐条取
+        记录时才读盘。调用方不得对它做 json.dumps 或当作真 list 直接交给
+        pickle/sqlite 等快路径接口；需要真列表时走 materialize_master()。
         """
         # 内存缓存（同一次搜索会话内不重复走网络）
         if (self._master_cache is not None
@@ -1329,23 +2264,124 @@ class DataPoolManager:
             return self._master_cache
 
         if force_refresh:
-            master = self._full_rebuild()
+            master = self._full_rebuild(progress_cb=progress_cb)
             self._set_master(master)
             return master
 
-        # 无内存缓存 → 先加载本地三件套
+        # 无内存缓存 → 秒开首选路径：不解析总表也把视图接上。
+        # 这一分支把「打开搜索框」从「先把 6.2GB 搬进内存」里解放出来：
+        # 三段身份链（磁盘缓存字节 → 总表指纹 → 视图 meta）成立就直接采纳，
+        # 搜索/统计/分布全部在库内算（见 pool_store）。
+        if self._master_cache is None and self._adopt_lazy_master(progress_cb):
+            return self._master_cache
+
+        # 接不上（无令牌且补不出/视图不是这批数据）→ 才走原有的本地三件套
         if self._master_cache is None:
-            self._load_local_state()
+            self._load_local_state(force_full_load=force_full_load)
+            if self._master_cache is None and self._load_refused:
+                # 缓存明明在、却因为内存不够没读：绝不能继续往下走「全量重建」——
+                # 那条路先把远端几百 MB 全下来、再把同样的全表归并进内存（比这一条
+                # 更吃内存），等于先撞墙一次再往墙里冲。当场把原因递到界面，
+                # 由用户决定腾内存重试还是先不用。
+                refused, self._load_refused = self._load_refused, ""
+                raise MemoryError(refused)
 
         if self._master_cache is None:
             # 本地无缓存（首次使用）→ 全量下载
-            master = self._full_rebuild()
+            master = self._full_rebuild(progress_cb=progress_cb)
             self._set_master(master)
             return master
 
         # 有本地缓存 → 立即返回（不等 OSS，后台由 refresh_from_oss 静默同步）
         self._master_cache_time = time.time()
         return self._master_cache
+
+    def _adopt_lazy_master(self, progress_cb=None) -> bool:
+        """秒开入口：令牌命中就直接采纳；没令牌先做一次有界内存的补写。
+
+        为什么要补写（bootstrap）：升级前落盘的缓存只有 master.json、没有令牌，
+        直接退回「整体解析」就是每台老用户机器都要再付一次 6.2GB 换页风暴，
+        界面仍然是「加载很久很久」。流式扫一遍只为了拿到 (条数, crc32)，
+        内存有界（十几 MB），只需一次，下次启动就走纯令牌路径。
+        """
+        if self.try_adopt_cached_view(progress_cb=progress_cb):
+            return True
+        if (self._read_master_fp_token() is None
+                and self.has_local_cache()
+                and self.bootstrap_master_fp(progress_cb=progress_cb)):
+            return self.try_adopt_cached_view(progress_cb=progress_cb)
+        return False
+
+    def master_memory_room(self, count: Optional[int] = None) -> Tuple[bool, str]:
+        """本机能不能安全地把全表物化进内存（不够时给出如实原因）。
+
+        估算：条数 × 实测标定 10KB/条 + 缓存文件本身（解析时文本整块在内存）。
+        拿不准就算不够——估错一次的代价是整机换页几分钟，而晚一轮同步的代价
+        只是数据滞后，两个方向里必须选后者。
+
+        count 不传时的取值顺序「已经在内存里的条数 → 视图行数 → 令牌条数 →
+        按缓存文件字节数反推」：后三个都是**没读总表也能知道**的规模，正是
+        闸门最需要它的那一档（要决定读不读，就不能先读了才知道）。
+        """
+        if count is None:
+            count = len(self._master_cache or []) or self._expected_master_count()
+        f = self._cache_master_file()
+        is_pkl = bool(f) and f.suffix == ".pkl"
+        per = RECORD_PY_BYTES_PKL if is_pkl else RECORD_PY_BYTES
+        need = int(count) * per
+        # 只有 json 路径要再加一份文件字节：json.loads 先把整份文本读进内存；
+        # pkl 是分块反序列化，359MB 磁盘字节不会整体同驻（拿它加进需求里会
+        # 把需求凭空拔高 0.36GB，8GB 机器上这种量差就是拦与不拦的界线）
+        if f is not None and not is_pkl:
+            try:
+                need += f.stat().st_size
+            except OSError:
+                pass
+        avail, why = _approx_free_memory_bytes()
+        if avail < need:
+            # 到小数一位而不是 >>30 取整：取整会把 0.9GB 写成「0GB」，
+            # 用户读到“可用 0GB”会以为机器坏了，而真实原因只是不够 8GB
+            return False, (f"本机可用内存约 {avail / 2 ** 30:.1f}GB（{why}），"
+                           f"而整理 {count:,} 家全表约需 {need / 2 ** 30:.1f}GB")
+        return True, why
+
+    # 缓存文件字节 → 条数的反推系数（实测标定：master.pkl 359MB/73.8 万条
+    # ≈ 490 字节/条，master.json 566MB/73.6 万条 ≈ 770 字节/条）。故意取偏小
+    # 的值：反推出的条数偏大 → 估算偏保守 → 闸门宁可多拦一次也不放硬扛。
+    _CACHE_BYTES_PER_RECORD = {".pkl": 500, ".json": 800}
+
+    def _expected_master_count(self) -> int:
+        """不解析总表就估出「这份缓存大概多少条」。
+
+        为什么值得单独一个方法：内存闸门要在**读盘之前**回答够不够，而视图
+        meta 与身份令牌里都存着现成的条数（读一次 meta 是毫秒级）。三个来源
+        一个都拿不到时才退到按文件字节反推——宁可比真实条数多一点，不少一点。
+        """
+        tok = self._read_master_fp_token()
+        if tok:
+            try:
+                n = int(tok.get("count") or 0)
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                pass
+        if self._store is not None or not self._store_off:
+            try:
+                st = self.store()
+                if st is not None:
+                    n = int(st.meta().get("record_count", 0) or 0)
+                    if n > 0:
+                        return n
+            except Exception:
+                pass
+        f = self._cache_master_file()
+        if f is None:
+            return 0
+        try:
+            per = self._CACHE_BYTES_PER_RECORD.get(f.suffix, 800)
+            return int(f.stat().st_size // per)
+        except OSError:
+            return 0
 
     def refresh_from_oss(self) -> Optional[List[dict]]:
         """后台静默同步：检查 OSS 增量 → 合并 → 更新本地缓存。
@@ -1368,29 +2404,84 @@ class DataPoolManager:
                 return None  # 网络失败，静默跳过
             new_keys = [k for k in upload_keys if k not in self._consumed_keys]
             if not new_keys:
+                self._pending_sync_note = ""
                 if removed:
                     # 没有新增数据但剔掉了记录：把结果如实返回，调用方据此刷新界面
                     return self._master_cache
+                # 无增量也顺手把旧 json 缓存升格成 pkl（一次性后台写盘，
+                # 本方法已在 Worker 线程不卡界面）：否则老缓存每次启动都要
+                # 30s 重新解析 JSON，升级永远等不到「下一次有增量」的那天
+                self._upgrade_cache_format()
                 return None  # 无增量
+            # 内存闸门：秒开路径拿的是 LazyMaster，而增量合并必须拿全表旧内容
+            # 做归并（pool_merge 的模糊归并要看整批阻塞键分桶）。8GB 机器上
+            # 为了「并入这一轮增量」把 6.2GB 读进来，就是把用户刚拿到的秒开
+            # 界面又拖回假死；这里选择不推进游标、不丢数据，下一轮自动补上。
+            if self.master_is_lazy():
+                room, why = self.master_memory_room()
+                if not room:
+                    self._pending_sync_note = (
+                        f"远端新增 {len(new_keys)} 个文件本轮未并入本机搜索索引"
+                        f"（{why}）；数据一条没丢，内存宽裕后会自动补齐")
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "⏸ 增量同步因内存不足留在原地（游标未推进）：%s",
+                        self._pending_sync_note)
+                    return None
+                self._pending_sync_note = ""
             new_records, durable = self._download_records(new_keys)
             master = self._apply_increment(new_records, new_keys, durable)
             return master
 
-    def _full_rebuild(self) -> List[dict]:
+    def _upgrade_cache_format(self) -> None:
+        """旧 json 总表缓存一次性升格成 pkl 快路径。
+
+        只在 refresh_from_oss 的「无增量」分支（持 _refresh_lock）调用：
+        用当前内存态写 pkl 并删 json。与增量保存的竞态由调用时序规避——
+        本轮若有增量走的是增量分支（数据更新），不会同时跑升级。
+
+        懒采纳下直接返回：此时内存里只有 LazyMaster，pickle 它得到的不是一个
+        总表而是一个代理对象（而且会把 manager 自身一并拖进去）——秒开已经
+        不需要 pkl 了，令牌就是快路径，不要再拿它折腾第二份快路径。
+        """
+        try:
+            if self.master_is_lazy():
+                return
+            if (self._cache_dir / "master.pkl").exists() or not self._master_cache:
+                return
+            self._save_local_state(self._master_cache, None,
+                                   self._consumed_keys)
+        except Exception:
+            pass  # 格式升级失败不影响本次数据；下次无增量时再试
+
+    def _full_rebuild(self, progress_cb=None) -> List[dict]:
         """全量重建：下载全部用户文件合并 + 全量构建索引与游标。"""
+        def _say(msg):
+            if progress_cb:
+                try:
+                    progress_cb(msg)
+                except Exception:
+                    pass
         try:
             self.refresh_tombstones()          # 删除向量先就位，再参与合并
             upload_keys = self._list_upload_keys()
-            records, durable = self._download_records(upload_keys)
+            if progress_cb:
+                _say(f"正在下载远端数据（共 {len(upload_keys)} 个文件，"
+                     f"并行 8 路）…")
+            records, durable = self._download_records(upload_keys,
+                                                      progress_cb=progress_cb)
+            _say(f"正在合并 {len(records):,} 条记录（同名公司归并、联系方式并集）…")
             master = self._apply_tombstones(self._merge_records(records))
         except OSSPoolError as e:
-            # 全量下载失败：尝试用本地缓存兑底。这里必须容忍判据版本过期的缓存
+            # 全量下载失败：尝试用本地缓存兜底。这里必须容忍判据版本过期的缓存
             # ——离线时给用户看旧规则洗出的数据，远好于把「网络不通」表现为
             # 「数据池没有数据」；联网后的下一次加载会自动按新版本重建回刷。
             if self._load_local_state(allow_stale_rules=True):
                 return self._master_cache
             raise OSSPoolError(f"无法获取数据池（网络错误: {e}）")
+        _say(f"正在构建搜索加速（{len(master):,} 家）…")
         index = self._build_inverted_index(master)
+        _say("正在保存本地缓存（下次秒开）…")
         self._save_local_state(master, index, self._consumed_keys | durable)
         return master
 
@@ -1409,6 +2500,13 @@ class DataPoolManager:
         不再拿「记录数相等」这种弱代理当同源性证明。
         """
         old = self._master_cache or []
+        if isinstance(old, LazyMaster):
+            # 增量合并必须拿全表旧内容做归并；能走到这里说明内存闸门已经判过
+            # 够物化（见 refresh_from_oss）。读盘失败时绝不拿空表去当旧基线——
+            # 那会把一整池数据当成「只新这几条」写回磁盘，属于丢数据事故
+            old = self.materialize_master()
+            if not old:
+                return self._master_cache or []
         durable = set(durable_keys) if durable_keys is not None else set(new_keys)
         if not new_records:
             # 本批增量没有任何可用记录（网络中断或全是坏文件）：
@@ -1520,7 +2618,8 @@ class DataPoolManager:
         all_keys = self._list_keys_cached("users/")
         return sorted(k for k in all_keys if k.endswith(".json") and "/upload_" in k)
 
-    def _download_records(self, keys: List[str]) -> Tuple[List[dict], set]:
+    def _download_records(self, keys: List[str],
+                          progress_cb=None) -> Tuple[List[dict], set]:
         """下载一批上传文件里的记录，返回 (记录列表, 可推进游标的 key 集合)。
 
         性能：ThreadPoolExecutor 并行下载（首次全量加载从 O(n*RTT) 降到
@@ -1565,6 +2664,8 @@ class DataPoolManager:
         workers = min(8, max(4, len(keys) // 4))
         all_records: List[dict] = []
         durable_keys: set = set()
+        _done_n = 0
+        _emit_every = max(1, min(len(keys), 25))  # 进度文案节流：25 个一批报一次
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {k: executor.submit(download_one, k) for k in keys}
             # 按 keys 的规范序装配（不是按完成序）：下载仍然并行
@@ -1573,6 +2674,12 @@ class DataPoolManager:
                 all_records.extend(recs)
                 if durable:
                     durable_keys.add(key)
+                _done_n += 1
+                if progress_cb and (_done_n % _emit_every == 0 or _done_n == len(keys)):
+                    try:
+                        progress_cb(f"已下载 {_done_n}/{len(keys)} 个文件…")
+                    except Exception:
+                        pass
         # Bronze→Silver 读侧重放：名称门禁在合并前再过一遍。上传时洗过一次并不
         # 够——Bronze 是 append-only 原始层，判据升级（说明表拦截、栏目名拦截）无法
         # 回头改写历史对象，只在写侧加规则会让存量脏数据永久留在池里，出现
@@ -1644,21 +2751,43 @@ class DataPoolManager:
         口径修正：以前把 source（**数据来源**：网站/文件名）当成上传者去重，
         界面显示成"N 位用户"——几千个来源就是"N 千位用户"。上传者一律看
         source_user，来源另算 sources，两者各归各的语义。
+
+        点菜（fields）是本轮修的第二个瓶颈：概览里有一批口径每个都要单独扫
+        一遍全表（73.8 万行实测单条 5s 量级），而状态行只看个数。以前不点菜
+        等于每次打开都付十几秒，再被 reach_summary 重复一遍。
         """
         if not self._master_cache:
             return None
-        st = self.store_stats()
-        if st is not None:
-            names = [str(u) for u in (st.get("source_users") or [])]
+        st = self.store_stats(("total", "users", "sources_count",
+                               "last_update", "region"))
+        # 判据必须是「答案里确实有 total」而不是「st 不是 None」：视图在
+        # store_ready() 那一格还是对得上的（它只比内存里的两个指纹），而库文件
+        # 可能已经被另一个进程删掉/读失败，那时 stats() 返回 {}——答不出与
+        # 「真的就是 0 条」是两个不同的事实。以前拿 {} 也能走进下面这个分支，
+        # 同一屏就会出现一句「总表 0 家」、一句「其中 30 家可外呼」（本机实测：
+        # 删掉 pool_store.db 后 get_master_stats 的 total_uploads=0 而
+        # reach_summary 仍给 40）。落到这里就继续往下走内存总表那条旧路。
+        if st is not None and "total" in st:
             return {
                 "users": max(int(st.get("users") or 0), 1),
                 "total_uploads": int(st.get("total") or 0),
                 "sources": int(st.get("sources_count") or 0),
                 "last_update": str(st.get("last_update") or ""),
-                "user_names": names or ["本地缓存"],
+                # 上传者**名单**不在点菜清单里：拿它要多扫一遍全表（source_user
+                # 没二级索引，实测 5.5s），而界面只用「N 位用户」这个数。键保留
+                # 且填一个不撒谎的值：这份统计确实来自本地缓存，绝不为了把键填
+                # 得好看而把七十三万行再读一遍。
+                "user_names": ["本地缓存"],
                 "region": st.get("region") or {},
                 "from_view": True,
             }
+        if self.master_is_lazy():
+            # 走到这里 = 视图答不出统计，而内存里还是个没读过一行的懒代理。
+            # 下面那段遍历会把整张总表物化回来（就是 6.2GB 那个形状），一个
+            # 概览数字不值这个价。今天这条路由三条写路径的纪律挡住（_set_master
+            # 直接拒收 LazyMaster、sync_store 遇懒代理提前返回），但安全性不该
+            # 住在别的函数里：这一行把「不可达」变成「不许」。
+            return None
         users: set = set()
         sources: set = set()
         last = ""
@@ -1681,7 +2810,8 @@ class DataPoolManager:
             "from_view": False,
         }
 
-    def _load_local_state(self, allow_stale_rules: bool = False) -> bool:
+    def _load_local_state(self, allow_stale_rules: bool = False,
+                          force_full_load: bool = False) -> bool:
         """加载本地缓存三件套中的 master 与 consumed_keys 游标。
 
         索引随 master 成对保存，这里不加载——由 _load_inverted_index
@@ -1692,24 +2822,51 @@ class DataPoolManager:
 
         allow_stale_rules=False（默认）时校验判据版本：本地总表是用旧规则洗出来
         的，直接作废让上层走全量重建，判据升级才能自动回刷到存量数据。
-        只在「网络已经失败、只剩这份缓存可用」的兜底路径上传 True——
+        只在「网络已经失败、只剩这份缓存可用」的兜底路径传 True——
         宁可给用户看旧规则洗出的数据，也不要在离线时把池子清空。
+
+        缓存格式：主格式 master.pkl（pickle.load 对 566MB/73.6 万条实测 10s，
+        json.loads 同规模 32s）；pkl 缺失时回退旧 json 缓存。但两者都不是
+        「秒开」的答案：真正的代价是把七十几万个 dict 整个搬进内存（本机实测
+        6GB 量级），所以上一层 get_merged_master 会先试 try_adopt_cached_view
+        （不读总表也能查），只有身份链接不上才走到这里。
+
+        force_full_load：越过下面那道内存闸门。默认不开：闸门拦下的那一次
+        会让界面问用户「要不要现在硬做」（只有第一次需要），用户明确点了同意
+        才带着这个参数重跑——机器是用户的，代价说清了就该由他拍板，
+        但不能由代码替他赌一把。
         """
-        cache_file = self._cache_dir / "master.json"
-        if not cache_file.exists():
-            return False
+        self._load_refused = ""
         if not allow_stale_rules and not self._cache_rules_current():
             return False
-        try:
-            master = json.loads(cache_file.read_text(encoding="utf-8"))
-            if not isinstance(master, list):
+        # ── 一次性物化的内存闸门（2026-11-18 本机实测后补）───────────
+        # 走到这里意味着秒开路径没接上（没有身份令牌，或令牌与视图不同源），
+        # 只能把整张总表解析进内存。8GB 机器上这不是「慢一点」而是整机换页：
+        # 用户反馈的「搜索采购商加载很久很久」真身就是这一段——以前这条路
+        # 无门无槛，一进来就先把机器按住。现在先算一笔账：不够就当场失败，
+        # 并把原因与出口写清楚（宁可明确拒绍，不把机器拖死也不静默硬扛）。
+        if not force_full_load:
+            room, why = self.master_memory_room()
+            if not room:
+                self._load_refused = f"{why}；本次没有把数据池读进内存".strip()
+                import logging
+                logging.getLogger(__name__).warning(
+                    "⏸ 本地总表解析被内存闸门拦下：%s", self._load_refused)
                 return False
-            # 存量兼容：旧版缓存三件套可能无 is_domestic，加载即补全
-            self._set_master(DataPoolManager._normalize_partition_fields(master))
-            self._consumed_keys = self._read_consumed_keys()
-            return True
-        except Exception:
+        master = self._read_master_records()
+        if master is None:
             return False
+        self._set_master(master)
+        self._consumed_keys = self._read_consumed_keys()
+        # 身份令牌与总表成对落盘：升级前留下的老缓存只会在走完一次完整
+        # 加载后拿到令牌，下一轮就能走纯令牌路径而不再解析总表。只在
+        # Silver 版本当前时写：拿旧规则缓存兜底时写进去的指纹会把旧口径
+        # 认成当前口径，下一轮就再也不会回刷存量数据（判据升级自锁）。
+        if self._cache_rules_current():
+            fp = self.master_fingerprint()
+            if fp is not None:
+                self._write_master_fp_token(fp)
+        return True
 
     def _cache_rules_current(self) -> bool:
         """本地缓存是否由当前 Silver 判据生成（版本文件缺失/不符都算过期）。
@@ -1736,22 +2893,46 @@ class DataPoolManager:
         return set()
 
     def _save_local_state(self, master: List[dict],
-                          index: Optional[dict], consumed: set):
-        """把总表 + 倒排索引 + consumed_keys 成对写到本地磁盘。"""
+                          index: Optional[dict], consumed: set) -> bool:
+        """把总表 + 倒排索引 + consumed_keys 成对写到本地磁盘。
+
+        总表主格式 master.pkl（写入比 json.dumps 快 40%、体积小 35%、
+        读取快 3 倍；原子写用 tmp+replace，半写文件不会被读到）。
+        与总表成对还落一份**身份令牌** master_fp.json（见模块头注释）：
+        下一轮启动只需校验令牌就能不解析总表直接复用视图。
+
+        返回写盘是否成功，并把失败原因留在 _last_cache_error：这里历史上是
+        整段 `except Exception: pass`，master.pkl 从来没落地过却谁也不知道——
+        「下次秒开」失效必须说得出名字，不能只靠静默失败。
+        """
+        if isinstance(master, LazyMaster):
+            # 把代理对象 pickle 进磁盘缓存等于直接丢数据（读回来是个 LazyMaster，
+            # 下一轮整池看起来都是空的）：当场拒绝并归因，绝不让它落盘
+            self._last_cache_error = "总表未物化，不能写磁盘缓存"
+            import logging
+            logging.getLogger(__name__).error(
+                "⛔ 拒绝把 LazyMaster 写进磁盘缓存（调用方应先 materialize）")
+            return False
         try:
-            (self._cache_dir / "master.json").write_text(
-                json.dumps(master, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            pkl_tmp = self._cache_dir / "master.pkl.tmp"
+            with pkl_tmp.open("wb") as f:
+                pickle.dump(master, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(pkl_tmp, self._cache_dir / "master.pkl")
+            # 旧 json 缓存立即作废删除：留着只会被老版本误读出旧数据，
+            # 且占双份磁盘（566MB）
+            try:
+                (self._cache_dir / "master.json").unlink()
+            except FileNotFoundError:
+                pass
             if index is not None:
-                (self._cache_dir / "inverted_index.json").write_text(
-                    json.dumps(index, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            (self._cache_dir / "consumed_keys.json").write_text(
-                json.dumps(sorted(consumed), ensure_ascii=False),
-                encoding="utf-8",
-            )
+                idx_tmp = self._cache_dir / "inverted_index.json.tmp"
+                idx_tmp.write_text(json.dumps(index, ensure_ascii=False),
+                                   encoding="utf-8")
+                os.replace(idx_tmp, self._cache_dir / "inverted_index.json")
+            keys_tmp = self._cache_dir / "consumed_keys.json.tmp"
+            keys_tmp.write_text(json.dumps(sorted(consumed), ensure_ascii=False),
+                                encoding="utf-8")
+            os.replace(keys_tmp, self._cache_dir / "consumed_keys.json")
             # 判据版本与总表成对落盘：这份 master 只在「全量重建」或「版本已校验
             # 的缓存 + 过门禁的增量」之后才会被写，所以盖当前版本是成立的断言
             (self._cache_dir / "rule_version.json").write_text(
@@ -1759,8 +2940,17 @@ class DataPoolManager:
                 encoding="utf-8",
             )
             self._consumed_keys = set(consumed)
-        except Exception:
-            pass  # 缓存写入失败不影响主流程
+            self._last_cache_error = ""
+        except Exception as e:
+            self._last_cache_error = f"本地缓存写入失败: {e}"
+            import logging
+            logging.getLogger(__name__).warning("⚠️ 本地缓存写入失败：%s"
+                                                "（下次启动将重新解析/重建）", e)
+            return False
+        # 令牌必须在 pkl 落盘之后写（它记的就是 pkl 的字节身份）；
+        # 写不上不影响本次数据可用性，只影响下一轮是不是还要解析总表
+        from pool_store import fingerprint_records
+        return self._write_master_fp_token(fingerprint_records(master))
 
     @staticmethod
     def _build_inverted_index(master: List[dict]) -> dict:
@@ -1874,14 +3064,15 @@ class DataPoolManager:
 
     @staticmethod
     def normalize_row(row: dict) -> Optional[dict]:
-        """从清洗后的 18 列行格式转为标准记录格式。
+        """从清洗后的入库表行格式转为标准记录格式。
 
-        18 列 = 国内 9 列 + 国外 9 列（双区块），取有数据的那一侧。
+        两种形状都吃：接口那 9 列，以及带重复列名的 18 列（pandas 给后一块的列名加 `.1`）。
+        取有数据的那一侧，所以没模板的机器上出 9 列也不会少读一个字段。
         返回 None 表示该行无可提取的公司名。
         """
-        # 国内 9 列
+        # 前 9 列
         dom_company = (row.get("客户名称") or row.get("企业名称") or "").strip()
-        # 国外 9 列（列名带 .1 后缀）
+        # 后 9 列（列名带 .1 后缀）
         foreign_company = (
             row.get("客户名称.1") or row.get("企业名称.1") or ""
         ).strip()
@@ -1952,9 +3143,9 @@ class DataPoolManager:
             "wechats": wechats,
             "website": website_from_remark,
             "products": products_from_remark,
-            "industry": "",  # 清洗后 18 列格式不含行业
-            "address": address_from_remark,  # 清洗后 18 列格式的地址在备注里
-            "country": "",  # 清洗后 18 列格式不含国家
+            "industry": "",  # 入库表那一档列里没有行业
+            "address": address_from_remark,  # 入库表里没有地址列，地址在备注里
+            "country": "",  # 入库表里没有国家列
             "source": source,
             "source_user": DataPoolManager._get_username_static(),
             "source_time": datetime.now().isoformat(timespec="seconds"),

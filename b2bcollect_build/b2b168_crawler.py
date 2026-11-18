@@ -249,6 +249,7 @@ class B2b168Crawler(CdpSiteCrawler):
     # ── 覆盖基类翻页：POST 分页，纯 HTTP ───────────────────────
     def _iter_keyword(self, kw):
         empty = stale = 0
+        prev_ids = None
         page = 0
         while not self._stop_requested:
             page += 1
@@ -276,8 +277,11 @@ class B2b168Crawler(CdpSiteCrawler):
             else:
                 empty = 0
             new = skipped = seen = 0
+            ids = set()
             for e in entries:
                 mid = e["公司ID"]
+                if mid:
+                    ids.add(mid)   # 集合差分的原料就取这里：与去重同一个主体标识，不留第二口径
                 key = f"{self.PLATFORM_SLUG}:{mid}"
                 name = self._norm_name(e["公司名称"])
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}"
@@ -303,9 +307,21 @@ class B2b168Crawler(CdpSiteCrawler):
                 yield e
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 家，新增 {new}"
                       + self._page_tail(skipped, seen))
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                # 旧写法在这里直接 `return`，日志停在上一行的「新增 0 家」就不说了：
+                # 翻页参数没生效（每页取回同一批公司）与「这一词真的没货」长得一模一样，
+                # 而处方相反（前者修 URL，后者换词）。不归因就等于把选型问题留给用户猜。
+                self._log(f"  「{kw}」第 {page} 页与上一页是「同一批条目」（重合 {rate:.0%}）："
+                          f"翻页参数没生效，这一词只能取到第一页（不是「公司池枯竭」，"
+                          f"也不是「本站没数据」），停止翻页")
+                return
             if new == 0:
                 stale += 1
                 if stale >= 2:
+                    self._log(f"  「{kw}」连续 {stale} 页无新增（各页条目内容不同，"
+                              f"但都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale = 0

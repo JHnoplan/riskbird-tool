@@ -359,7 +359,9 @@ def stamp_source_evidence(records, log=None):
         if done:
             stamped += 1
     if stamped and log:
-        log(f"🏷 已给 {stamped} 行工商通道来的值标上「工商核验」层（评分按最硬的一层算）")
+        # 层级名走 _fe.TIER_LABEL 现查：这里手抄一个「工商核验」，改天层级表换叫法，
+        # 引擎日志还在念旧名字，而「补全层级」那一列落的是新名字——用户按日志找不到列值。
+        log(f"🏷 已给 {stamped} 行工商通道来的值标上「{_fe.TIER_LABEL['registry']}」层（评分按最硬的一层算）")
     return stamped
 
 
@@ -594,7 +596,7 @@ def run_waterfall(records, log=None, workers=6, budget=15 * 60, timeout=_wc.TIME
     try:
         stats["stamped"] = stamp_source_evidence(recs, log=log)
     except Exception as e:
-        log(f"⚠ 层级标注没跑成（{type(e).__name__}）：按「平台自带」兜底计，不改值")
+        log(f"⚠ 层级标注没跑成（{type(e).__name__}）：按「{_fe.TIER_LABEL['source']}」兜底计，不改值")
 
     try:
         stats["carry"] = carry_pass(recs, log=log)

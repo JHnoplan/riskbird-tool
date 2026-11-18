@@ -115,6 +115,22 @@ def files_fingerprint(paths) -> list:
     return sorted(out, key=lambda d: str(d.get("name") or ""))
 
 
+def _fp_num(value) -> int:
+    """指纹字段取值：把「读不出来」与「值就是 0」分开。
+
+    为什么需要它：本模块里 -1 是「这个附属字段拿不到」的哨兵，而
+    ``int(x or -1)`` 会把**合法的 0** 也读成哨兵：size=0 是真实存在的 0 字节
+    文件（写一半就崩溃留下的半成品），cols=0 是首行为空表头的真实列数。下面
+    比对里哨兵被当作「不作为不匹配的理由」跳过，于是「0 字节 → 5MB」仍判
+    指纹一致，续采就会拿 A 名单的进度去采 B 名单——正好绕过这道闸要防的事。
+    与 data_pool._tok_num 是同一条纪律（0 在 Python 里是假值）。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def fingerprint_matches(saved, current) -> bool:
     """指纹比对：文件集合必须完全一致；附属字段读不出来（-1）时不作为不匹配的理由"""
     def norm(items):
@@ -122,9 +138,9 @@ def fingerprint_matches(saved, current) -> bool:
         for it in items or []:
             if not isinstance(it, dict):
                 continue
-            got[str(it.get("name") or "")] = (int(it.get("size") or -1),
-                                              int(it.get("mtime") or -1),
-                                              int(it.get("cols") or -1))
+            got[str(it.get("name") or "")] = (_fp_num(it.get("size")),
+                                              _fp_num(it.get("mtime")),
+                                              _fp_num(it.get("cols")))
         return got
 
     a, b = norm(saved), norm(current)

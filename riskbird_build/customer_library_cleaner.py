@@ -38,11 +38,13 @@ import re
 
 DEFAULT_OUTPUT_NAME = "清洗后客户库入库数据.xlsx"
 
-# 模板表头兜底（A-I 外呼块 / J-R 备注块），运行时优先读模板真实表头
-FALLBACK_HEADER = [
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "外呼备注",
-    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号", "数据来源", "备注",
-]
+# 模板表头兜底：**没找到模板文件时**用这一份，必须逐字等于入库接口的 9 列契约
+# （同目录 yzd_client.IMPORT_HEADERS）。双块（A-I 外呼 / J-R 备注）只在**真模板**里存在，
+# 读到了仍按 `read_template_layout` 那条路径照模板填；读不到却兜成 18 列，交付表就成了
+# 同一组 9 列重复两遍、逐格相同——那是替客户臆造表结构（用户抱怨的「数据乱」），而且
+# 同名列后一个盖前一个，还会带崩下游按列名取数的脚本。2026-11-17 与主包同口径修正。
+FALLBACK_HEADER = ["客户名称", "企业名称", "岗位", "手机号", "固话",
+                  "邮箱", "微信号", "数据来源", "备注"]
 
 # 采集字段 → 模板列的取值优先级
 # 「联系人/岗位/微信号/备注」只在外部数据智能清洗时才会出现（三个平台的采集结果里
@@ -430,7 +432,8 @@ def read_template_layout(template_path: str, log=print):
     """读取模板表头，返回 (外呼块列索引, 备注块列索引, 完整表头)。
 
     列名在模板里出现两次（A-I 与 J-R），按出现顺序区分两块。
-    找不到模板时使用内置表头兜底。
+    找不到模板时使用内置表头兜底（＝接口 9 列，不成双）：这一句必须说出来，否则
+    「为什么这次的交付表只有 9 列」与「为什么上次有 18 列」就成了一笔说不清的账。
     """
     header = list(FALLBACK_HEADER)
     if template_path:
@@ -443,6 +446,9 @@ def read_template_layout(template_path: str, log=print):
                 log(f"已读取入库模板表头：{os.path.basename(template_path)}（{len(header)} 列）")
         except Exception as e:
             log(f"⚠ 读取模板失败，改用内置表头：{e}")
+    else:
+        log(f"ℹ 本轮没找到入库模板文件（客户库数据导入模板*.xlsx），按接口那 {len(header)} 列输出："
+            f"{'、'.join(header)}（需要双块模板格式就把模板放进 Downloads/Desktop/Documents 重跑）")
 
     pos = {}
     for idx, col in enumerate(header):

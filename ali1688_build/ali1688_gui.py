@@ -141,7 +141,10 @@ class AutoSaveWorker(QThread):
         os.replace(tmp, str(path))
 
     def _write_cn_mobile_file(self, path, rows):
-        """清洗 → 过滤中国手机号 → 写 18 列模板 Excel，返回写入行数。
+        """清洗 → 过滤中国手机号 → 按入库模板列结构写 Excel，返回写入行数。
+
+        列数不写死：找到客户模板就按模板出（A-I 外呼块 + J-R 备注块），没找到就按
+        接口那 9 列出（与《清洗后入库数据》同一份 `write_clean_excel`，两份表永远同构）。
 
         与「清洗数据」三份文件中的「国内只留手机号」同一口径，
         自动保存时同步落盘，方便用户直接拿来核对导入客户库的数据。

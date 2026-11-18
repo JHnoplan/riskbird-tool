@@ -161,30 +161,95 @@ def match_expr(query: str, max_tokens: int = 64, expanded: bool = True) -> str:
     return " OR ".join(_quote_token(t) for t in tokens)
 
 
+class FingerprintAccumulator:
+    """总表指纹的流式累加器（与 fingerprint_records 同一种分块、同一批字段）。
+
+    为什么要有它：566MB 的磁盘总表缓存一旦被 json.loads 整体物化，实测要吃
+    约 6.2GB 常驻内存（48MB 切片实测 558MB RSS ≈ 10KB/条）。8GB 内存的机器上
+    这不是「慢」而是换页风暴。要判断「磁盘上那批数据是不是视图里这批」，其实
+    只需要 (条数, crc32) 两个数，逐条读完就可以丢掉——有界内存的指纹必须能
+    边读边算。
+
+    但绝不允许出现第二份指纹判据：字段选取、分隔符、4096 条一块的累加方式
+    只要有一处不同，两个实现算出的 crc 就对不上，而「对不上」会被上层当成
+    「视图不是这批数据」→ 每次启动都整表重建。所以 fingerprint_records 反过来
+    改成这里的薄封装，口径只有一份实现。
+    """
+
+    CHUNK = 4096
+
+    def __init__(self):
+        self.count = 0
+        self._crc = 0
+        self._buf: List[str] = []
+
+    def feed(self, rec) -> None:
+        """喂一条记录：与非 dict 记录的行为与 fingerprint_records 一致（跳过）。"""
+        if not isinstance(rec, dict):
+            return
+        self.count += 1
+        self._buf.append("\x1e".join([
+            str(rec.get("company_norm") or ""),
+            str(rec.get("source_time") or ""),
+            str(rec.get("quality") or ""),
+            str(rec.get("region") or rec.get("is_domestic") or ""),
+        ]))
+        if len(self._buf) >= self.CHUNK:
+            self._flush()
+
+    def _flush(self):
+        self._crc = zlib.crc32("\x1f".join(self._buf).encode("utf-8", "ignore"),
+                               self._crc)
+        self._buf = []
+
+    def finish(self) -> Tuple[int, int]:
+        """收尾返回 (条数, crc32)。
+
+        注意条数只计「喂进来的 dict 记录」，与 fingerprint_records 对整表取
+        len(records) 的旧口径有一处差异：非 dict 记录在旧口径里占条数但不占
+        crc。磁盘缓存里不该出现非 dict 元素，出现时上层按「缓存不可信」处理
+        （见 bootstrap_master_fp 的逐条校验），所以这里统一用有效条数，
+        两种算法在健康数据上必须逐位相同。
+        """
+        if self._buf:
+            self._flush()
+        return self.count, self._crc & 0xFFFFFFFF
+
+
 def fingerprint_records(records: Sequence[dict]) -> Tuple[int, int]:
     """总表内容指纹 (条数, crc32)。
 
     用 crc32 而不是内置 hash()：后者受 PYTHONHASHSEED 随机化，跨进程不可比。
     指纹覆盖「顺序 + 公司主键 + 采集时间 + 质量分 + 属地」——增量合并真正改动
     某组内容时这些值必变；分块累加避免为 100 万条拼一个巨型字符串。
+
+    实现挂在 FingerprintAccumulator 上（口径唯一）；非 dict 记录仍占条数、
+    不进 crc，与历史行为逐位一致。
     """
-    crc = 0
-    buf: List[str] = []
+    acc = FingerprintAccumulator()
     for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        buf.append("\x1e".join([
-            str(rec.get("company_norm") or ""),
-            str(rec.get("source_time") or ""),
-            str(rec.get("quality") or ""),
-            str(rec.get("region") or rec.get("is_domestic") or ""),
-        ]))
-        if len(buf) >= 4096:
-            crc = zlib.crc32("\x1f".join(buf).encode("utf-8", "ignore"), crc)
-            buf = []
-    if buf:
-        crc = zlib.crc32("\x1f".join(buf).encode("utf-8", "ignore"), crc)
-    return len(records), crc & 0xFFFFFFFF
+        before = acc.count
+        acc.feed(rec)
+        if acc.count == before:          # 非 dict：只补条数，不参与 crc
+            acc.count += 1
+    count, crc = acc.finish()
+    return len(records), crc
+
+
+def suggest_expr(query: str, max_tokens: int = 6) -> str:
+    """搜索框补全专用的 FTS5 表达式：token 一律带词前缀 `*`。
+
+    与 match_expr 的唯一区别就是那个 `*`：补全时用户的话还没打完，
+    「solar」的索引词是整词，用整词口径提 `sol` 的建议必然一条都不中。
+    只取前若干个 token（且优先多字 token）：建议框只关心开头那截，
+    token 越多表达式越慢，而且尾部 token 是用户自己还没敲完的碎片。
+    """
+    tokens = match_tokens(query, expanded=False)
+    if not tokens:
+        return ""
+    multi = [t for t in tokens if len(t) >= 2]
+    picked = (multi or tokens)[:max(1, int(max_tokens))]
+    return " OR ".join(_quote_token(t) + "*" for t in picked)
 
 
 @lru_cache(maxsize=1)
@@ -654,6 +719,7 @@ class PoolStore:
                     "record_count": count, "fingerprint": "-1"}
                 version["updated_at"] = datetime.now().isoformat(timespec="seconds")
                 self._write_meta(conn, version)
+                self._drop_agg(conn)      # 与本次写同事务作废概览，不留旧数字窗口
                 conn.execute("COMMIT")
             self.invalidate_meta_cache()
             return True
@@ -691,6 +757,7 @@ class PoolStore:
                                      [(rid,) for rid in ids])
                 count = conn.execute("SELECT count(*) FROM company").fetchone()[0]
                 self._write_meta(conn, {"record_count": count, "fingerprint": "-1"})
+                self._drop_agg(conn)      # 同上：删了行就必须连概览一起作废
                 conn.execute("COMMIT")
             self.invalidate_meta_cache()
             return True
@@ -963,8 +1030,176 @@ class PoolStore:
             return []
         return [((str(v) if v else ""), int(n)) for v, n in rows if v]
 
-    def stats(self) -> Dict[str, Any]:
+    # ── 概览聚合：贵在哪、怎么省（改动前请先读完这段实测数字）────────────────
+    # 真实池子 738,734 行 / 1.6GiB 视图上逐条计时（只读连接，绝对值是上界，
+    # 相对关系才是结论）：
+    #   · 走在二级索引上的口径  region 60ms、industries 92ms、provinces 86ms、
+    #     sources_top 100ms、sources_count 85ms —— 便宜，各算各的无所谓。
+    #   · 必须扫全表的口径      reachable 5865ms、mobile 6408ms、email 5146ms、
+    #     wechat 4814ms、landline 4904ms、countries 4983ms、source_users 5482ms、
+    #     last_update 4851ms —— flags / source_user / source_time / country 四列
+    #     都没有二级索引，而且位与条件本来也用不上 B 树。
+    # 于是原来那份 stats() = 15 条语句 ≈ **42.9s**。而界面状态行只要 total /
+    # users / reachable 三个数，其余十几个聚合的结果直接被丢掉；更糟的是打开
+    # 一次会走两遍（get_master_stats 一遍、reach_summary 又一遍）。
+    #
+    # 两条腿的修法（缺一不可）：
+    #   1) **点菜**：stats(fields=...) 不再为只要两个数字的人算十五个；
+    #   2) **合并 + 持久化**：扫表一族合成一趟 SELECT（实测 6.5s 算出全部 8 个
+    #      口径，与逐条单跑的数值完全一致），结果连同视图身份写回 meta，
+    #      同一份视图上第二次、第三次读都是零成本。
+    #
+    # 上传者的**名单**不在这一族里：它是自由文本、取值个数没有上界（当前恰好
+    # 只有 2 个），把它存进 meta 就得再带一条「存不下怎么降级」的分支，而界面
+    # 只报人数。要名单的人单独现算（_user_names）。
+    _AGG_PREFIX = "agg_"
+    # (结果键, SQL 表达式)：合并那一趟的列，顺序就是解析顺序
+    _AGG_EXPRS: Tuple[Tuple[str, str], ...] = (
+        ("total", "COUNT(*)"),
+        ("reachable", "SUM(CASE WHEN COALESCE(flags, 0) <> 0 THEN 1 ELSE 0 END)"),
+        ("mobile", f"SUM(CASE WHEN flags & {FLAG_MOBILE} = {FLAG_MOBILE}"
+                   " THEN 1 ELSE 0 END)"),
+        ("email", f"SUM(CASE WHEN flags & {FLAG_EMAIL} = {FLAG_EMAIL}"
+                  " THEN 1 ELSE 0 END)"),
+        ("wechat", f"SUM(CASE WHEN flags & {FLAG_WECHAT} = {FLAG_WECHAT}"
+                   " THEN 1 ELSE 0 END)"),
+        ("landline", f"SUM(CASE WHEN flags & {FLAG_PHONE} = {FLAG_PHONE}"
+                     " THEN 1 ELSE 0 END)"),
+        ("last_update", "MAX(source_time)"),
+        ("users", "COUNT(DISTINCT CASE WHEN source_user<>''"
+                  " THEN source_user END)"),
+    )
+    _AGG_OUT_KEYS = tuple(k for k, _ in _AGG_EXPRS)
+    # stats() 能答的全部键（fields 点菜时的合法取值范围，也用于测试反查）
+    STATS_KEYS = _AGG_OUT_KEYS + (
+        "lead_only", "region", "sources_count", "source_users",
+        "industries", "provinces", "countries", "sources")
+
+    def _agg_identity(self) -> str:
+        """持久化汇总的作废凭证：视图内容一变，这个串就必须对不上。
+
+        四个分量全部来自 meta，都是**写方自己**负责更新的（逐条对过）：
+          rebuild → 开头就 DELETE FROM meta，然后写全新的 record_count/fingerprint/built_at；
+          upsert  → 写 record_count/fingerprint，并且每次必写 updated_at；
+          delete_norms → 写 record_count 与 fingerprint=-1。
+        选它们而不是选 PRAGMA data_version 的理由（实测过才敢写这里）：
+        写 data_version 的人不能同时是写缓存的人 —— 概览缓存是用另一条连接
+        写回 meta 的，那次写会把**主连接**的 data_version 顶高一格，刚存进去的
+        凭证立刻就对不上 → 每次读都重扫，缓存形同虚设（本机实测：热态每次 880ms，
+        而命中 meta 应当是 1ms 量级）。meta 里这几个字段则不会被我的缓存写入碰到。
+
+        跨进程的写入者也不破坏这个结论：它跑的是同一份代码，会在自己的事务里
+        把 agg_ 键删掉。真正的残留风险只有一个：将来新增了写方既忘删键、又没碰
+        上面四个字段——那要连 meta 缓存的 60s 一起越过去，而 is_current/store_ready
+        本来就在同一个 60s 边界上，不新增口径。
+        """
+        m = self.meta()
+        return "|".join(str(m.get(k, "")) for k in
+                        ("record_count", "fingerprint", "built_at", "updated_at"))
+
+    def _agg_load(self, want: Sequence[str]) -> Optional[Dict[str, Any]]:
+        """meta 里挂着 + 身份对得上 + 要的口径一个不缺，三条齐了才敢直接用。
+
+        「缺一个就整份重算」是有意的：这些数之间要互相对得上（lead_only 是
+        total 减 reachable，可外呼数不能是上一次的），半新一半旧比全都过期难查得多。
+        """
+        m = self.meta()
+        tag = self._AGG_PREFIX + "fp"
+        if not m.get(tag) or m[tag] != self._agg_identity():
+            return None
+        out: Dict[str, Any] = {}
+        for key in want:
+            raw = m.get(self._AGG_PREFIX + key)
+            if raw is None:
+                return None
+            try:
+                out[key] = str(raw) if key == "last_update" else int(raw)
+            except (TypeError, ValueError):
+                return None
+        return out
+
+    def _agg_scan(self) -> Dict[str, Any]:
+        """一趟全表扫描算出**整个**扫表一族，并顺手连身份一起存回 meta。
+
+        不按调用方要的那几个键裁剪这一趟是故意的：多算几个 SUM/COUNT(DISTINCT)
+        实测只贵两成（5.5s→6.5s），换来的是同一份视图上任何口径的后续读取
+        都零成本 —— 而这里真正省不下的是「打开界面要等十几秒」。
+        """
+        ident = self._agg_identity()          # 先取身份再扫数据，顺序有意义
+        try:
+            row = self._connect().execute(
+                "SELECT " + ", ".join(e for _, e in self._AGG_EXPRS)
+                + " FROM company").fetchone()
+        except Exception as e:
+            self._last_error = f"概览聚合失败: {e}"
+            return {}
+        out: Dict[str, Any] = {}
+        for (key, _), val in zip(self._AGG_EXPRS, row or ()):
+            if key == "last_update":
+                out[key] = str(val or "")
+            else:
+                # SUM(...) 在空表上给 NULL，而「一条都没有」是个确定的 0，
+                # 不是未知 —— 不能把 NULL 当成「跳过这个口径」传下去
+                out[key] = int(val or 0)
+        # 少算出任何一个口径就不存：宁下次重算，也不留一份缺数字的缓存给人凑
+        if len(out) == len(self._AGG_OUT_KEYS):
+            self._agg_persist(ident, out)
+        return out
+
+    def _agg_persist(self, ident: str, agg: Dict[str, Any]):
+        """把刚算好的汇总挂在视图身份上写进 meta（存不下就算了，不影响正确性）。
+
+        用一条独立的短超时连接写：视图可能正在被另一个线程整表重建（那个事务
+        要跑两分钟），缓存的目的是省时间，绝不能反过来变成新的等锁点。
+        只写 agg_ 前缀的键，绝不碰 record_count/fingerprint —— 那两个是写方的
+        私有凭证，我一旦代笔就等于伪造身份。
+        """
+        mapping = {self._AGG_PREFIX + "fp": ident}
+        mapping.update({self._AGG_PREFIX + k: str(v) for k, v in agg.items()})
+        conn = None
+        try:
+            conn = sqlite3.connect(str(self._path), timeout=0.2)
+            self._write_meta(conn, mapping)
+            conn.commit()
+            # 写盘走的是另一条连接，本连接里那份 60s meta 缓存仍是写之前的快照；
+            # 不清掉它，同一个进程里第二次读概览永远命中不了（等于白存一趟）。
+            # invalidate_meta_cache 目前只做一件事（清缓存），读路径调它是安全的。
+            self.invalidate_meta_cache()
+        except Exception as e:
+            # 降级不静默：存不上只是下次再算一趟（不影响正确性），但它是
+            # 「为什么每次打开还是几秒」的**唯一线索**——一个只负责「别报错」的
+            # except 会把缓存坏成一间长期没人发现的黑屋
+            self._last_error = f"概览缓存没存上（不影响正确性，下次会重算）: {e}"
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _drop_agg(self, conn: sqlite3.Connection):
+        """写方在自己的事务里作废持久化汇总（必须在事务内，与数据变更原子）。
+
+        只给 upsert / delete_norms 用：全量重建那边是 DELETE FROM meta 整表清，
+        本来就不会留下旧汇总。放在事务里而不是事后清理，是为了不让「数据已提交、
+        缓存没清」这个窗口存在 —— 那个窗口里的界面数字是旧的，而且看起来是对的。
+        """
+        conn.execute("DELETE FROM meta WHERE k LIKE ?",
+                     (self._AGG_PREFIX + "%",))
+
+    def _user_names(self, conn: sqlite3.Connection) -> List[str]:
+        """上传者名单（去重、排序）。要的人自己付一趟扫描，不搭概览的顺风车。"""
+        return [str(v) for (v,) in conn.execute(
+            "SELECT DISTINCT source_user FROM company WHERE source_user<>''"
+            " ORDER BY source_user")]
+
+    def stats(self, fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         """全库概览：几条 group by 在库内完成，不把任何记录读进 Python。
+
+        fields 点菜（None = 全部，与历史行为一致）：本函数以前固定算 15 条
+        语句、其中 8 条各扫一遍全表，而唯一的产品调用方只要三个数，其余结果
+        丢掉 —— 慢的不是数据，是「把没人要的数字也算两遍」。
+        新调用方一律传 fields，别把七个秒级扫描重新请回来。
 
         键名与 DataPoolManager.get_master_stats 对齐：
           users / source_users 是**上传者**去重（记录里的 source_user），
@@ -973,52 +1208,37 @@ class PoolStore:
         """
         if not self.readable():
             return {}
+        want = set(self.STATS_KEYS) if fields is None else {str(f) for f in fields}
+        if "lead_only" in want:
+            want.update(("total", "reachable"))   # 派生键需要它的两个母键
         out: Dict[str, Any] = {}
+        agg_want = [k for k in self._AGG_OUT_KEYS if k in want]
+        if agg_want:
+            agg = self._agg_load(agg_want) or self._agg_scan()
+            out.update({k: v for k, v in agg.items() if k in want})
+            if "lead_only" in want and "total" in out and "reachable" in out:
+                out["lead_only"] = out["total"] - out["reachable"]
         try:
             conn = self._connect()
-            out["total"] = conn.execute("SELECT count(*) FROM company").fetchone()[0]
-            out["region"] = {str(v): int(n) for v, n in conn.execute(
-                "SELECT region, count(*) FROM company GROUP BY region")}
-            # 联系方式覆盖度：只有官网/地址的「线索行」和能直接外呼的行必须分开报。
-            # 池子从 6 万涨到 8 万时带进来 1.3 万条线索行，只报总数会让用户以为
-            # 「8 万家都能打电话」，实际差着一截。判据与 flags 位、apply_filters 同源。
-            out["reachable"] = conn.execute(
-                "SELECT count(*) FROM company WHERE COALESCE(flags, 0) <> 0").fetchone()[0]
-            out["lead_only"] = out["total"] - out["reachable"]
-            out["mobile"] = conn.execute(
-                "SELECT count(*) FROM company WHERE flags & ? = ?",
-                (FLAG_MOBILE, FLAG_MOBILE)).fetchone()[0]
-            out["email"] = conn.execute(
-                "SELECT count(*) FROM company WHERE flags & ? = ?",
-                (FLAG_EMAIL, FLAG_EMAIL)).fetchone()[0]
-            out["wechat"] = conn.execute(
-                "SELECT count(*) FROM company WHERE flags & ? = ?",
-                (FLAG_WECHAT, FLAG_WECHAT)).fetchone()[0]
-            out["landline"] = conn.execute(
-                "SELECT count(*) FROM company WHERE flags & ? = ?",
-                (FLAG_PHONE, FLAG_PHONE)).fetchone()[0]
-            out["industries"] = [(str(v), int(n)) for v, n in conn.execute(
-                "SELECT industry, count(*) FROM company WHERE industry<>''"
-                " GROUP BY industry ORDER BY count(*) DESC LIMIT 30")]
-            out["provinces"] = [(str(v), int(n)) for v, n in conn.execute(
-                "SELECT province, count(*) FROM company WHERE province<>''"
-                " GROUP BY province ORDER BY count(*) DESC LIMIT 60")]
-            out["countries"] = [(str(v), int(n)) for v, n in conn.execute(
-                "SELECT country, count(*) FROM company WHERE country<>''"
-                " GROUP BY country ORDER BY count(*) DESC LIMIT 60")]
-            out["sources"] = [(str(v), int(n)) for v, n in conn.execute(
-                "SELECT source, count(*) FROM company WHERE source<>''"
-                " GROUP BY source ORDER BY count(*) DESC LIMIT 60")]
-            # 来源**总类数**（sources 只给前 60 名，界面要报"共 N 个来源"）
-            out["sources_count"] = conn.execute(
-                "SELECT count(DISTINCT source) FROM company WHERE source<>''"
-            ).fetchone()[0]
-            out["source_users"] = [str(v) for (v,) in conn.execute(
-                "SELECT DISTINCT source_user FROM company WHERE source_user<>''"
-                " ORDER BY source_user")]
-            out["users"] = len(out["source_users"])
-            out["last_update"] = conn.execute(
-                "SELECT max(source_time) FROM company").fetchone()[0] or ""
+            if "region" in want:
+                out["region"] = {str(v): int(n) for v, n in conn.execute(
+                    "SELECT region, count(*) FROM company GROUP BY region")}
+            if "sources_count" in want:      # idx_source 上的松散扫描，便宜
+                out["sources_count"] = conn.execute(
+                    "SELECT count(DISTINCT source) FROM company WHERE source<>''"
+                ).fetchone()[0]
+            if "source_users" in want:       # 无索引：只有真要名单的人才付这一趟
+                out["source_users"] = self._user_names(conn)
+            for key, column in (("industries", "industry"), ("provinces", "province"),
+                                ("countries", "country"), ("sources", "source")):
+                # 前三列有二级索引（_INDEX_COLUMNS），country 没有——它只在全量
+                # stats() 里被算，界面不要，所以不会在秒开路径上扫表
+                if key in want:
+                    out[key] = [(str(v), int(n)) for v, n in conn.execute(
+                        f"SELECT {column}, count(*) FROM company"
+                        f" WHERE {column}<>'' GROUP BY {column}"
+                        " ORDER BY count(*) DESC LIMIT ?",
+                        (60 if key != "industries" else 30,))]
         except Exception as e:
             self._last_error = f"统计失败: {e}"
         return out
@@ -1054,6 +1274,95 @@ class PoolStore:
         except Exception as e:
             self._last_error = f"公司名点查失败: {e}"
         return None
+
+    def suggest(self, prefix: str, limit: int = 12) -> Dict[str, List[str]]:
+        """输入前缀 → ``{"company": [...], "product": [...]}``，召回全在库内完成。
+
+        为什么必须有它：搜索框补全原来的实现是「把总表读进 Python，取前 5000 条
+        做子串匹配」。两个问题都是硬的：
+          · 正确性——只对落盘顺序前 5000 条提建议，后面的公司永远提不出来，
+            而且没人会想到建议列表和池子里数据的排列顺序有关；
+          · 成本——为了补几个字，把几百 MB 缓存反序列化成约 10KB/条的对象
+            （736,263 条实测 6.2GB 常驻），8GB 内存的机器上是换页风暴。
+        搜索引擎的正面答案是把补全交给索引（Elasticsearch completion suggester、
+        Google 的 FST 前缀树）；这里复用已建好的 FTS5 列，加词前缀匹配即可：
+        几毫秒、零物化，而且覆盖全库。
+
+        返回的是原始文本（公司名 / 主营产品），**不做包含性判定**：判定留在
+        调用方，与历史口径 `prefix in company` 逐字一致，索引只负责把候选集
+        从百万级缩小到几十条。召回因此是「近似超集」，不会漏掉旧实现能命中的
+        条目（旧实现受 5000 条上限约束，本来也不是完备口径）。
+        """
+        out: Dict[str, List[str]] = {"company": [], "product": []}
+        expr = suggest_expr(prefix)
+        if not expr or not self.readable():
+            return out
+        want = max(1, int(limit))
+        try:
+            conn = self._connect()
+        except Exception as e:
+            self._last_error = f"搜索建议连接失败: {e}"
+            return out
+        for key, col in (("company", "name_txt"), ("product", "prod_txt")):
+            # MATCH 的左边必须写 FTS 表名本身：写成表别名会报
+            # 「no such column」（实测 2026-11-18，_fetch/_probe 也都是这么写的）
+            sql = ("SELECT c.company, c.payload FROM company c "
+                   "JOIN company_fts ON company_fts.rowid = c.id "
+                   "WHERE company_fts MATCH ? "
+                   "ORDER BY bm25(company_fts, ?, ?, ?) LIMIT ?")
+            try:
+                rows = conn.execute(sql, (f"{{{col}}} : ({expr})",
+                                          *_BM25_WEIGHTS, want * 4)).fetchall()
+            except Exception as e:
+                # 单列失败不影响另一列：建议是锦上添花，绝不为它打断搜索框
+                self._last_error = f"搜索建议失败({col}): {e}"
+                continue
+            texts: List[str] = []
+            for name_txt, payload in rows:
+                if key == "company":
+                    texts.append(str(name_txt or ""))
+                else:
+                    try:
+                        texts.append(str(json.loads(payload).get("products") or ""))
+                    except (TypeError, ValueError):
+                        continue
+            # 保序去重：BM25 已经把相关性排好，同一条记录的多段文本会重复出现
+            out[key] = [t for t in dict.fromkeys(x.strip() for x in texts) if t][:want]
+        return out
+
+    def find_by_name(self, keyword: str, limit: int = 300) -> Optional[List[dict]]:
+        """按公司名关键字取完整记录（剔除对话框的查重路径），库内召回。
+
+        与 suggest 同样只打在 name_txt 上，但返回 payload 记录：剔除是不可撤回
+        的动作，界面必须给出联系方式摘要供人核对。视图不可用返回 **None**
+        （调用方据此回退总表；把 None 当成空列表会让用户以为池里没有）。
+
+        旧实现是在内存总表上顺序扫到 300 条命中就停，池子后段的公司搜不出来；
+        这里按相关性取候选，判定语句仍与旧实现同一条，只是覆盖面变成全库。
+        """
+        expr = suggest_expr(keyword)
+        if not expr or not self.readable():
+            return None
+        cap = max(1, int(limit))
+        sql = ("SELECT c.payload FROM company c "
+               "JOIN company_fts ON company_fts.rowid = c.id "
+               "WHERE company_fts MATCH ? "
+               "ORDER BY bm25(company_fts, ?, ?, ?) LIMIT ?")
+        try:
+            rows = self._connect().execute(sql, (f"{{name_txt}} : ({expr})",
+                                                 *_BM25_WEIGHTS, cap * 2)).fetchall()
+        except Exception as e:
+            self._last_error = f"按名查记录失败: {e}"
+            return None
+        out: List[dict] = []
+        for (payload,) in rows:
+            try:
+                rec = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out[:cap]
 
     def get(self, company_norm: str) -> Optional[dict]:
         if not company_norm or not self.readable():

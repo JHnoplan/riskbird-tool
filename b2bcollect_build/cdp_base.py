@@ -302,6 +302,55 @@ def page_ledger_line(page_fail, last_page_error, cap=60):
     return f"取页失败 {pf} 页（最后一次：{err or '未记录'}）"
 
 
+# ── 「页面取回来了、却一张卡片都没有」的分诊（2026-11-17 整轮实机）────────────────
+# 由来：世界工厂网「翻 22 页见 0 条」与 1688「第 1 页起无结果」在旧账里都只写成一句
+# 「无公司数据」，可这一形至少有四种完全不同的病因，四个方向的处方互相排斥：
+#   · zero  站方自己在页面上写了「没有找到相关…」 → 这一词真没货，处方是换词/换站；
+#   · block 取回的是验证页/风控薄壳 → 处方是过验证与降速，与解析代码无关；
+#   · shell 页面只有几百到几十字节（JS 未渲染/频控降级） → 处方是换取页方式；
+#   · layout 页面很大却没有卡片、也没有那句「没找到」 → **最可能是我们认不出卡片了**（改版），
+#     处方是修选择器——这一种若被写成「本站没有该词数据」，人就再也不会去看那个早就坏了的解析。
+# 分不出时宁可说 `unknown` 并把长度报出来，也不许默认成「没数据」：那正是本项目反复记账的
+# 「用一句含糊话盖掉一个真缺陷」。
+EMPTY_RESULT_TEXTS = ("没有找到相关", "暂无相关", "未找到相关", "无搜索结果", "抱歉，没有找到",
+                     "没有找到您", "0 个结果", "0个结果", "0 条结果", "0条结果",
+                     "no results found", "no matching")
+EMPTY_BLOCK_MARKS = ("x5secdata", "_____tmd_____", "/punish", "安全验证", "访问验证",
+                    "滑动验证", "滑块验证", "请输入验证码", "身份核实", "环境异常")
+# 拦截图标记只认**地址与标题**，别扫正文：正常页面里也常有隐藏的验证码容器节点，
+# 扫正文会把好页说成风控页（与上面那段 block>zero 优先级的作用一致：宁可不认也不认错）。
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+# 卡片容器都找不到的页就不必说「改版」：这个下限按实机抽样定（正常列表页 20 万~60 万字，
+# 频控薄壳 2 千~2 万字，验证页 20 万上下但地址/标题会先命中）。
+EMPTY_SHELL_MAX = 20000
+
+
+def empty_page_triage(html, url=""):
+    """返回 ``(kind, evidence)``：kind 取 zero/block/shell/layout/空，evidence 是那一句依据。
+
+    只看结构信号与站方自己写的那句话，不做「正文里有几个中文」之类的模糊猜测：这一格
+    的产出要进日志被人拿去行动，说不出就直说没说清。命中优先级 block > zero > shell > layout。
+    """
+    text = html if isinstance(html, str) else ""
+    if not text.strip():
+        return "", ""
+    m = _TITLE_RE.search(text[:60000])
+    scope = f"{url or ''} {m.group(1) if m else ''}".lower()
+    for mark in EMPTY_BLOCK_MARKS:
+        if mark.lower() in scope:
+            return "block", f"地址/标题里带着「{mark}」（验证页）"
+    body = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text[:120000],
+                  flags=re.S | re.I)
+    plain = re.sub(r"<[^>]+>", " ", body)
+    compact = re.sub(r"\s+", "", plain).lower()
+    for phrase in EMPTY_RESULT_TEXTS:
+        if re.sub(r"\s+", "", phrase).lower() in compact:
+            return "zero", f"站方页面上写着「{phrase}…”"
+    if len(text) < EMPTY_SHELL_MAX:
+        return "shell", f"整页只有 {len(text)} 字（薄壳/未渲染）"
+    return "layout", f"整页 {len(text)} 字、既没卡片也没「没找到」那句话（先查选择器是否已改版）"
+
+
 # ── [WAIT-BLOCK-BEGIN]
 # 「这一路正停在等人」的措辞只这一处定义（名单通道 site_adapters 直接 import 本函数，
 # 1688 镜像那份逐字节相同、由门禁按标记对拍）。由来：看板、结束日志、实机体检读的是
@@ -1597,18 +1646,68 @@ return '';})()"""
         """
         return self._probe_connect_word(self._last_page_error, label)
 
+    def _page_fail_shape(self):
+        """调用方没带原因时**自己去现场取证**：这一页为什么没取到，本机到底知道什么。
+
+        由来（2026-11-17 整轮 13 页取页失败，其中 12 页念的是「【未分型】｜请求层未给出
+        原因（见紧邻上一行）」）：那两路（马可波罗、麦麦B2B）的翻页是自家 `_fetch` 取页，
+        好几条失败分支直接 `return ""`——`_skip_dead_host` 命中、借标签降级时没拿到
+        pin_tab_id、导航抛异常——现场明明留了痕迹（熔断账、HTTP 状态码、拦截原因、
+        当前页地址），记账处却把手扔掉再喊人去看上一行，而上一行早就被上千行日志冲走。
+        基类自己的两个调用点一直在传 `_goto_fail_reason()`，是七个覆写翻页循环的子类各调
+        一次不带参数：每覆写一次就把归因丢一次。所以取证下沉到被调用方，不指望调用方记得传。
+
+        取证顺序＝处方从硬到软：当场导航失败（最具体）→ 主机熔断（换出口/等站点，别改代码）
+        → 站点回了 4xx/5xx（限流/风控/这一页没了）→ 200 却空正文（频控薄壳或渲染未完成，
+        **绝不能说成「请求被拒」**，那是一句方向相反的谎）→ 被拦停（等人过验证）→ 浏览器停在
+        哪个地址。类别词全部复用既有把手（`request_error_shape`/`short_reason`），不新造一档
+        让分型器又退回【未分型】。
+        """
+        why = str(getattr(self, "_last_goto_error", "") or "").strip()
+        if why:
+            return f"列表页导航失败（{why}）"
+        host = str(getattr(self, "_cur_fetch_host", "") or "")
+        dead = self._dead_hosts.get(host) if host else None
+        if dead:
+            # 熔断账里那句 why 本来就分过型（`【连不上·无应答】host:443｜…`），紧贴着 `（`
+            # 放进去才能被 _NESTED_KIND_RE 读出类别；先拼主机名再拼它会超出 12 字左边界，
+            # 实测整句会被下面的关键词档抢走、洗成【读响应超时】。
+            return f"主机已熔断（{request_error_shape(dead[1], cap=90)}）"
+        status = int(getattr(self, "_last_status", 0) or 0)
+        if status and status >= 400:
+            # 先取回类别、由本节自己拼壳：直接把 `request_error_shape("HTTP 403")` 嵌进
+            # 句子里，外层二次分型会把括号里那段当证据剥走，实机读出来是
+            # `【HTTP 403·风控/需验证】｜列表页被站点拒回：【 ·风控/需验证】` 这种半截空洞。
+            kind = request_error_kind(request_error_shape(f"HTTP {status}"))
+            return f"【{kind}】列表页被站点拒回（HTTP {status}）"
+        if status:
+            return (f"【页面未就绪】站方回 {status} 但正文为空（频控薄壳或渲染未完成，"
+                    f"不是这一页没有公司）")
+        block = str(getattr(self, "_block_reason", "") or "").strip()
+        if block:
+            return f"【被拦停】{short_reason(block, 70)}"
+        url = self._current_page_url()
+        if url:
+            # 验证页的特征常只在地址上（`/punish?x5secdata=`）；停在 about:blank 与停在
+            # 搜索 URL 上是两种病（前者＝浏览器没导航/会话断开，后者＝导航成了但页面是空的）。
+            return f"【页面未就绪】列表页取回为空｜停在 {url}"
+        return ("【未分型】取页返回空且现场没留原因——要修的是本站 _fetch 的失败分支"
+                "（它返回空串前没调 _note_request_error，不是站点采不到）")
+
     def _note_page_fail(self, err=""):
         """记一笔「这一页列表根本没取到」——只在**翻页层**调用，一页最多一次。
 
         原因与计数分家：原因由 `_note_request_error`（请求层）留，计数由这里加，因为
         「详情页取页失败」也是 `_fetch` 失败，把它计进来会让「取页失败 N 页」随公司数
         线性增长，而收尾的归因（⛔ 链路未通）讲的正是**列表这一页有没有取到**。
-        传了 err 就用它（翻页层自己知道的形状，如「导航失败」），没传就保留请求层留的。
+        传了 err 就用它（翻页层自己知道的形状，如「导航失败」），没传就保留请求层留的；
+        请求层那格也空时**不再甩一句「见紧邻上一行」**，而是走 `_page_fail_shape()` 自己
+        取证（由来与取证顺序见那个方法，2026-11-17 整轮 12/13 页都是这一句推卸）。
         """
         if err:
             self._note_request_error(err)
         elif not self._last_page_error:
-            self._note_request_error("请求层未给出原因（见紧邻上一行）")
+            self._note_request_error(self._page_fail_shape())
         self._page_fail += 1
         return self._page_fail
 
@@ -1637,7 +1736,23 @@ return '';})()"""
                         f"不是本站没有{noun}；最后一次：{short_reason(self._last_page_error, 70)}）")
             return (f"  「{kw}」{page_label}没换回页面（请求层没有报错，多为超出末页的 "
                     f"404 或频控空页；是哪一种看紧邻上一行）")
+        # 页真取回来了也不能一句「无{noun}」盖掉：那一句同时读不出「站方真没货」与
+        # 「我们的选择器已认不出卡片」这两种相反的病因（分诊口径与由来见 empty_page_triage 上方）。
+        kind, evid = empty_page_triage(html, self._current_page_url())
+        if kind and isinstance(html, str):
+            return (f"  「{kw}」{page_label}没解析到{noun}｜页面分诊＝{kind}：{evid}")
         return f"  「{kw}」{page_label}无{noun}"
+
+    def _current_page_url(self):
+        """分诊要看的「这一页是从哪个地址取回的」（拿不到就交空串，不报错）。
+
+        验证页的特征常只在 URL 上（`/punish?x5secdata=`），单看正文认不出来；而纯 HTTP
+        取页的站没有 driver，这里就该说「没地址可看」而不是猜一个。"""
+        try:
+            drv = getattr(self, "driver", None)
+            return str(getattr(drv, "current_url", "") or "") if drv else ""
+        except Exception:
+            return ""
 
     def snapshot_results(self):
         with self.results_lock:
@@ -1859,6 +1974,21 @@ return '';})()"""
         if seen:
             parts.append(f"增量库已含 {seen} 家(跳过)")
         return ("，" + "，".join(parts)) if parts else ""
+
+    @staticmethod
+    def _page_repeat(prev, cur):
+        """这一页与上一页是不是**同一批条目**（id 集合的重合率，≥0.9 算同一页）。
+
+        「连续 N 页 0 新增」有两种来路，处方正好相反：站方真的没货（处方是换词），
+        以及翻页参数没生效、每页取回的都是第一页（处方是修 URL／换翻页口径）。旧代码把
+        后者写成「公司池已枯竭」，人就去换词了，真凶留在原地（1688 实机抓到过一次）。
+        判据只看集合重合，不看条数：条数相等而内容不同是正常翻页。
+        与 ``ali1688_crawler._page_repeat`` 逐字一致（对拍见 test_data_dir_offline.py 第 14 节）。
+        """
+        if not prev or not cur:
+            return 0.0
+        union = prev | cur
+        return len(prev & cur) / float(len(union) or 1)
 
     @staticmethod
     def _has_any_contact(rec) -> bool:
@@ -3941,6 +4071,8 @@ return '';})()"""
         设备写成兄弟类目（搜「数控机床」回「车床,加工中心」的厂），这类词与关键词零二字组
         重叠，不补这一刀就是成片误杀（实机「数控机床」两页砍掉 36 家里有 5~7 家这样的真同行）。
         桥表是窄的人工表，只收实机证明过误杀的行业，不做泛用词库。
+        桥表补不完的那一类再走**查询条件同域词模型**（见 _rel_rescue）：零重叠只证明
+        「这家没用关键词的字写自己」，不证明「它属于另一个行业」。
         取不到可靠中文信号时 fail-open（宁多采一家不误杀）。"""
         if not self.relevance_guard:
             return True
@@ -3950,6 +4082,9 @@ return '';})()"""
         # 判定本体走模块级 relevance_hit（与清洗严格档共用同一份规则），本方法只多
         # 做采集侧特有的两件事：没有可靠中文信号一律放行、关键词退化到不成词也放行。
         if relevance_hit(kw, text):
+            self._rel_observe(kw, text, True)
+            return True
+        if self._rel_rescue(kw, text):
             return True
         return not self._kw_grams(kw)[1]
 
@@ -3966,7 +4101,102 @@ return '';})()"""
                 cls._PEER_FN = False
         return cls._PEER_FN(kw) if cls._PEER_FN else ()
 
-    # ── 站点钩子（子类实现）───────────────────────────────────
+    # ── 查询条件同域词模型（伪相关性反馈，pseudo-relevance feedback）───────────
+    # 要解决的问题（2026-11-17 整轮实机）：早过滤把明显相关的公司成片砍掉——中国制造网
+    # 「耐压舱」砍「安阳潜航海洋装备制造有限公司」、马可波罗「声学释放器」砍「上海海奕环境
+    # 科技/天津赛力斯自动化」、八方「水下系统集成商」砍「宁波广强机器人科技」。共同形状：
+    # 这些厂用行业词写自己（海洋装备/自动化/机器人），不用客户的搜索词写自己，二字组自然零重叠。
+    # 人工桥表（PEER_CATEGORY）长期补不完这种长尾，所以改走检索系统用了几十年的路子：
+    # **拿引擎自己交回的第一批命中当这一词的相关性模型**（Rocchio/AQE 那一族伪反馈），
+    # 再用「查询内常见、全表稀有」两个频率条件筛出真正的同域词——稀有度这一档是关键：
+    # 不加它，「科技/设备/有限公司」这种到处都有的字组会变成万能通行证，反向把无关厂放进来
+    # （那正是用户抱怨的另一头）。没手动词表、不改阈值常数以外的行为：只**否决误砍**，
+    # 永不拿它新增一次砍单，所以这一档只可能少砍、不可能多砍。
+    REL_PRF_MIN_POS = 3        # 这一词至少要看到 3 家命中才开始学
+    REL_PRF_MIN_SEEN = 20      # 全局至少要过 20 家候选，不然「稀有度」这个统计量没意义
+    REL_PRF_DF = 0.2           # 同域词要在这一词的命中里出现 ≥20%（查询内常见）
+    REL_PRF_DF_MIN = 2         # 并且至少真的命中过 2 家（1 家可能是抄了同一条描述）
+    REL_PRF_GLOBAL = 0.34      # 且在全表候选里 ≤34%（全表常见＝噪声，不算同域证据）
+
+    def _rel_bank(self):
+        """同域词模型的四个盒子（懒建：不往 __init__ 加字段，免得子类 __init__ 链没调
+        父类时默默丢账）。pos=每词命中样本的二字组计数，n=每词命中家数，
+        df=全表二字组出现过的候选家数，seen=全表过判家数。"""
+        bank = getattr(self, "_prf", None)
+        if bank is None:
+            bank = {"pos": {}, "n": {}, "df": {}, "seen": 0, "rescued": 0, "shown": set()}
+            self._prf = bank
+        return bank
+
+    @staticmethod
+    def _rel_cgrams(text):
+        """文本里的中文二字组集合（只看中文、去空白，与 relevance_hit 的 compact 口径一致）。"""
+        compact = re.sub(r"\s+", "", text or "")
+        out = set()
+        for i in range(len(compact) - 1):
+            a, b = compact[i], compact[i + 1]
+            if "\u4e00" <= a <= "\u9fa5" and "\u4e00" <= b <= "\u9fa5":
+                out.add(a + b)
+        return out
+
+    def _rel_observe(self, kw, text, hit):
+        """过一家就记一笔：df/seen 是**全表稀有度**的分母，命中与否都得入库。
+
+        为什么不能只在命中时入库：稀有度要用「本轮真的看过多少家、其中多少家带着这个字组」
+        做分母，才能把「公司/科技/设备」那一类通行证词辨出来；只数命中样本的话，分母与
+        分子同一拨公司，「这一词命中里人人都有」与「全表到处都是」就分不开（写完第一版
+        离线回归才暴露：三个正样本就能把 海洋 卡成 100% 全局，同域词永远不稀有）。
+        只存二字组频次：这一层一轮要过几千次判定，存原文要么胀内存要么每次重切。
+        也不存负面样本（被砍的名单）：那一批本身就是「零重叠」，存下来只会学到
+        「这一页什么词都不算」。
+        """
+        bank = self._rel_bank()
+        grams = self._rel_cgrams(text)
+        if not grams:
+            return
+        bank["seen"] += 1
+        df = bank["df"]
+        for g in grams:
+            df[g] = df.get(g, 0) + 1
+        if not hit:
+            return
+        pos = bank["pos"].setdefault(kw, {})
+        for g in grams:
+            pos[g] = pos.get(g, 0) + 1
+        bank["n"][kw] = bank["n"].get(kw, 0) + 1
+
+    def _rel_rescue(self, kw, text):
+        """零重叠时只**否决这一刀**（救回），绝不拿它新增一次砍单——单向阀门。
+
+        判据：候选与「这一词已命中的那几家」共享一个二字组，且这个字组同时满足
+        ①在这一词的命中样本里足够常见（同域，不是偶巧）、②在全表候选里足够稀有
+        （不是「公司/科技/设备」那一类通行证）。两条缺一不可，由来见上面那段注释。
+        救回计数只累加，收尾账目里用 `self._prf["rescued"]` 说「同域模型救回几家」。
+        """
+        bank = self._rel_bank()
+        self._rel_observe(kw, text, False)      # 先入库再判定：分母里要含这一家自己
+        n = bank["n"].get(kw, 0)
+        if n < self.REL_PRF_MIN_POS or bank["seen"] < self.REL_PRF_MIN_SEEN:
+            return False        # 模型还没学会：退回旧那一条规则，不拿没把握的统计量动手
+        pos = bank["pos"].get(kw) or {}
+        df = bank["df"]
+        seen = bank["seen"]
+        for g in self._rel_cgrams(text):
+            hit = pos.get(g, 0)
+            if hit < self.REL_PRF_DF_MIN or hit / n < self.REL_PRF_DF:
+                continue
+            if df.get(g, 0) > seen * self.REL_PRF_GLOBAL:
+                continue        # 全表到处都是这种字组，它不构成同域证据
+            bank["rescued"] += 1
+            if (kw, g) not in bank["shown"] and len(bank["shown"]) < 40:
+                bank["shown"].add((kw, g))
+                self._log(f"🧲 相关性同域模型：「{kw}」本轮学到的同域词「{g}」"
+                          f"（这一词 {hit}/{n} 家命中里都有、全表只占 "
+                          f"{df.get(g, 0) / max(1, seen):.0%}）救回一家零重叠的同行")
+            return True
+        return False
+
+    # ── 站点钩子（子类实现）─────────────────────────────
     def build_search_url(self, kw, page):
         raise NotImplementedError
 
@@ -4017,6 +4247,9 @@ return '';})()"""
             "ok": self.stat_ok,
             "early": self._early_skipped,
             "filtered": self._filtered_count,
+            # 同域词模型救回家数（零重叠但按查询内条件判为同行）：不报这一格的话，「早过滤 N 家」
+            # 这一账只会随时间静默变小，看不出是口径变了还是货变了。
+            "rel_rescued": int((getattr(self, "_prf", None) or {}).get("rescued") or 0),
             # 逐词相关性砍单账：某一词零净新增时，这一本账区分「闸门砍的」与「平台没货」
             "kw_filtered": dict(self.kw_filtered),
             "kw_early": dict(self.kw_early),
@@ -4075,6 +4308,7 @@ return '';})()"""
     # ── 列表翻页迭代 ──────────────────────────────────────────
     def _iter_keyword(self, kw):
         empty_streak = stale_streak = 0
+        prev_ids = None
         page = 0
         while not self._stop_requested:
             page += 1
@@ -4112,8 +4346,11 @@ return '';})()"""
             new = 0
             skipped = 0
             seen = 0
+            ids = set()
             for e in entries:
                 mid = str(e.get("memberId") or e.get("公司ID") or e.get("详情URL") or e.get("公司名称") or "")
+                if mid:
+                    ids.add(mid)   # 集合差分的原料就取这里：与去重同一个主体标识，不留第二口径
                 key = f"{self.PLATFORM_SLUG}:{mid}"
                 name = self._norm_name(e.get("公司名称") or "")
                 nkey = f"{self.PLATFORM_SLUG}:name:{name}" if name else ""
@@ -4139,10 +4376,18 @@ return '';})()"""
                 yield e
             tail = self._page_tail(skipped, seen)
             self._log(f"  「{kw}」第 {page} 页：{len(entries)} 条，新增 {new} 家{tail}")
+            rate = self._page_repeat(prev_ids, ids)
+            prev_ids = ids or prev_ids
+            if rate >= 0.9:
+                self._log(f"  「{kw}」第 {page} 页与上一页是「同一批条目」（重合 {rate:.0%}）："
+                          f"翻页参数没生效，这一词只能取到第一页（不是「公司池枯竭」，"
+                          f"也不是「本站没数据」），停止翻页")
+                return
             if new == 0:
                 stale_streak += 1
                 if stale_streak >= 2:
-                    self._log(f"  「{kw}」连续 {stale_streak} 页无新增，公司池已枯竭")
+                    self._log(f"  「{kw}」连续 {stale_streak} 页无新增（各页条目内容不同，"
+                              f"但都已在增量库里），这一词不再翻页")
                     return
             else:
                 stale_streak = 0

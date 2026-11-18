@@ -1211,63 +1211,94 @@ def confirm_by_full_read(path: str) -> Tuple[bool, str, int]:
 
 
 # ── 池内比对：只如实提示，不据此自动取消勾选 ───────────────────────────────
-
-def _contact_tokens(rec: dict) -> set:
-    """把一条记录的可检索联系方式压成集合（比对用，不改任何数据）。
-
-    号码只留数字末 11 位：池里历史数据把 ``+34 688 841 394`` 存成了
-    ``['+34','688','841','394','+34 688 841 394']`` 这种碎片形态，按原样比对会把
-    「其实已有」判成「新增」，界面就会满屏假警报。
-    """
-    out: set = set()
-    for key in ("phones", "mobiles", "landlines", "emails", "wechats"):
-        v = rec.get(key)
-        vals = v if isinstance(v, list) else ([v] if v else [])
-        for s in vals:
-            t = str(s or "").strip()
-            if not t:
-                continue
-            if key == "emails":
-                out.add("e:" + t.lower())
-            else:
-                digits = re.sub(r"\D", "", t)
-                if len(digits) >= 5:
-                    out.add("n:" + digits[-11:])
-    site = str(rec.get("website") or "").strip()
-    if site:
-        dom = re.sub(r"^(https?://)?(www\.)", "", site).split("/")[0].lower()
-        if dom:
-            out.add("w:" + dom)
-    return out
-
+#
+# 旧版本这里还有一个 _contact_tokens(rec)：把联系方式压成集合做“同公司不同
+# 号码”比对。它只有一个调用方（PoolIndex），而 PoolIndex 从不读那些集合——
+# 真正用的只有“公司名在不在池里”一个判定。为了这个判定把整张总表读进内存
+# 才是代价（见 PoolIndex 注释），联系方式比对随之作废，函数一并删掉，
+# 不留“看起来很忙但没人调用”的死代码。
 
 class PoolIndex:
-    """本地物化视图的 ``company_norm → 联系方式集合`` 索引。
+    """池内成员判定：这个 company_norm 在不在池里（扫描前的池内比对）。
 
-    只从内存总表构建，**不发起任何 OSS 请求**（守住「有缓存时秒开」那条不变量）。
-    总表拿不到就整体降级为「不比对」——比对不了就照常勾选，绝不因为索引缺失
-    而漏传文件。
+    只读本地，**不发起任何 OSS 请求**（守住「有缓存时秒开」那条不变量）。
+
+    2026-11-18 改造：旧实现为了「看采样行里十几家公司在不在池里」先把整张
+    总表反序列化成 Python 对象（736,263 条实测 6.2GB 常驻）再建一份同尺寸的
+    dict——只为回答一个成员判定。成员判定本就该下压到索引里（LSM/数据库
+    的点查，或 Elasticsearch 的 ids query）：现在优先走 Gold 视图的
+    company_norm 索引，一次一条、每条几毫秒。
+
+    视图不可用才退回旧的「读全表建 norm 集合」：结果口径完全一致，只是慢。
+    两条路都走不通（既没视图又读不了盘）就整体降级为「不比对」——比对不了
+    就照常勾选，绝不因为索引缺失而漏传文件。
     """
 
     def __init__(self, mgr: Optional[DataPoolManager] = None):
-        self.norm_contacts: Dict[str, set] = {}
         self.ready = False
         self.size = 0
         self.error = ""
+        self._mgr = None
+        self._norms = None          # 只在视图不可用时才建的兼容集合
         try:
             mgr = mgr or DataPoolManager()
-            master = mgr.get_merged_master() or []
-            for r in master:
+            self._mgr = mgr
+            count = mgr.store_view_count() if hasattr(mgr, "store_view_count") else None
+            if count is not None and count > 0:
+                # 视图就绪：行数就是公司家数（视图一行一家，主键 company_norm）
+                self.size = int(count)
+                self.ready = True
+                return
+            # 走到这里 = 视图拿不出行数，只能建全量 norm 集合。下面两条路径
+            # （materialize_master / _read_master_records）在懒采纳下都会把
+            # 73.8 万条整体读回来（本机实测峰值 1.9GB）：一个只为「比对采样行」
+            # 的对话框不该把机器按住，所以**在两条路径之前**问闸门，不够就带着
+            # 原因停下来而不是默默卡死。（上一版把闸门写在 if not real 里，而真正
+            # 贵的是它前面那一行 materialize_master()——门装在花钱之后等于没装）
+            room, why = (mgr.master_memory_room()
+                         if hasattr(mgr, "master_memory_room") else (True, ""))
+            if not room:
+                self.error = (f"检索视图本轮不可用，而比对需要把全部数据读进内存"
+                              f"——{why}")
+                return
+            real = mgr.materialize_master() if hasattr(mgr, "materialize_master") else []
+            if not real:
+                # 内存里还没有总表：只从本地磁盘缓存读，绝不因为建索引去拉 OSS
+                loader = getattr(mgr, "_read_master_records", None)
+                real = loader() if loader else []
+                if real and hasattr(mgr, "_apply_tombstones"):
+                    real = mgr._apply_tombstones(real)
+            norms = set()
+            for r in (real or []):
                 norm = r.get("company_norm") or normalize_company_name(
                     r.get("company") or "")
-                if not norm:
-                    continue
-                self.norm_contacts.setdefault(norm, set()).update(
-                    _contact_tokens(r))
-            self.size = len(self.norm_contacts)
+                if norm:
+                    norms.add(norm)
+            self._norms = norms
+            self.size = len(norms)
             self.ready = self.size > 0
         except Exception as e:
             self.error = first_line(e, 160)
+
+    def contains(self, norm: str) -> bool:
+        """这家公司在不在池里。
+
+        每次判定都重新看一眼视图状态（而不是只在构造时看过一次）：一次全盘
+        扫描要跑几分钟，视图可能中途被别的进程作废。此时宁可回答「不在」——
+        比对只影响提示文案、不自动取消勾选，回答不在至多少提示一句，
+        而「为了一次点查去把整张总表读回内存」就是本类要修的那个 6.2GB。
+        """
+        norm = str(norm or "")
+        if not norm:
+            return False
+        if self._norms is None:
+            if self._mgr is not None and self._mgr.store_ready():
+                try:
+                    return self._mgr.get_record_by_norm(norm) is not None
+                except Exception:
+                    return False
+            return False
+        return norm in self._norms
 
     def sample_diff(self, previews: List[dict]) -> Tuple[int, int]:
         """看采样行里的公司名有多少池里还没有 → ``(采样公司数, 池里没有的家数)``。
@@ -1288,7 +1319,7 @@ class PoolIndex:
                 if not norm:
                     continue
                 seen += 1
-                if norm not in self.norm_contacts:
+                if not self.contains(norm):
                     missing += 1
         return seen, missing
 

@@ -974,13 +974,16 @@ class CompanyMatcher:
                 if progress_cb:
                     progress_cb(f"🔑 这是一个关键词搜索")
                     progress_cb(f"📊 正在评估候选公司的相关度...")
+                # 候选池取 max(top_k, 150)：AI 精选段与本地补足段都从这里出——
+                # 候选池比用户要的条数还小，后面精排再准也补不回来
+                local_top = max(top_k, 150)
                 if candidate_indices:
                     # 非空候选集：只评候选（None/空列表都回退全量，
                     # 避免漏掉未参与建索引的字段）
-                    results = self.search_with_index(query, master, candidate_indices, top_k=50,
-                                                     progress_cb=progress_cb)
+                    results = self.search_with_index(query, master, candidate_indices,
+                                                     top_k=local_top, progress_cb=progress_cb)
                 else:
-                    results = self.search_local(query, master, top_k=50,
+                    results = self.search_local(query, master, top_k=local_top,
                                                 progress_cb=progress_cb)
                 if not results:
                     return []
@@ -1110,11 +1113,14 @@ class CompanyMatcher:
         if progress_cb and filtered_keywords != keywords:
             progress_cb(f"   💡 已优化关键词（去掉了带修饰词的）")
         
+        # 每词取量 max(top_k//3, 30)：默认 3~5 个关键词时合计 ≥ top_k，
+        # 两个词也能凑出 60+ 条候选，补足段才有原料（词多时靠去重合并不膨胀）
+        per_kw = max(top_k // 3, 30)
         for kw in filtered_keywords:
             if candidate_indices:
-                results = self.search_with_index(kw, master, candidate_indices, top_k=30)
+                results = self.search_with_index(kw, master, candidate_indices, top_k=per_kw)
             else:
-                results = self.search_local(kw, master, top_k=30)
+                results = self.search_local(kw, master, top_k=per_kw)
             for r in results:
                 norm = r.get("company_norm", "")
                 # 排除目标公司自身
@@ -1157,7 +1163,7 @@ class CompanyMatcher:
                 progress_cb(f"")
                 progress_cb(f"🤖 正在让 AI 分析每家公司的供应链关系...")
             rerank_prompt = self._build_company_match_prompt(
-                company_name, products, ai_analysis, all_candidates[:30]
+                company_name, products, ai_analysis, all_candidates[:40]
             )
             try:
                 ai_results = self._call_deepseek(rerank_prompt)
@@ -1176,11 +1182,12 @@ class CompanyMatcher:
                     progress_cb(f"")
                     progress_cb(f"✅ AI 分析完成！找到 {len(reranked[:top_k])} 家最相关的公司")
                     
-                    # 关键改进：如果 AI 精排结果太少（< 3 家），回退到本地评分结果
-                    if len(reranked) < 3:
+                    # 重排不是过滤：AI 精选段之后按本地评分补足到 top_k，
+                    # 与关键词链路同一口径（用户要多少条就给多少条）
+                    if len(reranked) < top_k:
                         if progress_cb:
                             progress_cb(f"")
-                            progress_cb(f"💡 AI 精排结果较少，结合本地评分补充更多相关公司...")
+                            progress_cb(f"💡 AI 精选不足 {top_k} 家，结合本地评分补足候选...")
                         # 合并 AI 结果和本地评分结果
                         ai_companies = {r.get("company", "") for r in reranked}
                         # 从原始候选中补充（排除 AI 已返回的）
@@ -1341,12 +1348,28 @@ class CompanyMatcher:
         reranked = []
         for ai_item in ai_results:
             rec = company_to_candidate.get(ai_item.get("company", ""))
-            if rec: 
+            if rec:
                 rec["_score"] = ai_item.get("score", 0) / 100.0
                 rec["_ai_reason"] = ai_item.get("reason", "")
                 rec["_ai_relationship"] = ai_item.get("relationship", "")
                 reranked.append(rec)
+        # 重排不是过滤（rerank ≠ filtering，对齐 ES rescore / 电商搜索的做法）：
+        # AI 精选段之后，其余候选按本地匹配度接在后面补足到 top_k。用户要 100 条
+        # 就给 100 条——低分公司也是按序候选，直接丢掉只会让结果莫名变少。
+        ai_companies = {r.get("company", "") for r in reranked}
+        supplemented = 0
+        for candidate in candidates:
+            if len(reranked) >= top_k:
+                break
+            if candidate.get("company", "") not in ai_companies:
+                candidate["_ai_reason"] = "本地评分匹配"
+                candidate["_ai_relationship"] = "相关"
+                reranked.append(candidate)
+                supplemented += 1
         reranked.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        if progress_cb and supplemented:
+            progress_cb(f"   其余 {supplemented} 家按本地匹配度一并排序，"
+                        f"共 {min(len(reranked), top_k)} 条")
         return reranked[:top_k]
 
     # ── DeepSeek 语义精排 ──
@@ -1363,7 +1386,7 @@ class CompanyMatcher:
         """构造 DeepSeek 匹配 prompt（供应链分析师角色）。"""
         # 候选摘要（控制 token 数）
         cand_list = []
-        for c in candidates[:30]:  # 最多发 30 条给 AI
+        for c in candidates[:40]:  # AI 输入上限：延迟与质量的平衡点（40 家约 10 秒）
             cand_list.append({
                 "company": c.get("company", ""),
                 "products": c.get("products", "")[:60],
@@ -1387,8 +1410,14 @@ class CompanyMatcher:
 - "reason": 一句话说明匹配原因（如"主营光伏组件，是用户的直接下游采购商"）
 - "relationship": "下游采购商" / "上游供应商" / "同行竞争者" / "不相关"
 
+评分标准：
+- 产品/业务直接命中查询意图给 70-100 分
+- 同行业、上下游或业务有一定关联给 40-70 分
+- 只沾边（地域或行业相近但业务无关）给 20-40 分
+- 完全不相关给 0-20 分
+
 要求：
-1. 只返回 score >= 30 的公司
+1. 对每家候选都给出评分并全部返回，不要丢弃低分公司（排序由系统处理）
 2. 按 score 降序排列
 3. 只返回 JSON 数组，不要其他文字或 markdown 标记
 4. company 字段必须与候选列表中的公司名完全一致
@@ -1408,7 +1437,7 @@ class CompanyMatcher:
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,  # 低温度 → 更确定性
-            "max_tokens": 2000,
+            "max_tokens": 4000,  # 40 家候选全量评分的输出预算（约 3600 token）
         }
 
         resp = req.post(url, headers=headers, json=payload, timeout=30)

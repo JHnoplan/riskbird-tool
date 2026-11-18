@@ -114,6 +114,16 @@ for _slug in LIST_CHANNEL_SLUGS:
 # 状态行的排列顺序：关键词各站在前，三路名单补采殿后（与产出文件里的拼接顺序一致）
 STATUS_ORDER = tuple(SITE_ORDER) + LIST_CHANNEL_SLUGS
 
+# ── 边采边补（功能④并行化）常量 ─────────────────────────────
+# 用户口径：「有些平台采集很慢，其他平台都采集完了，它还只采了一部分」——
+# 官网回采旧链路挂在 crawl() 收尾（全站线程都结束后才开始），采集慢的那一路
+# 直接拖住补采起点。常量只定节拍与每轮预算，并发路数沿用界面那一档。
+ENRICH_STREAM_INTERVAL = 60      # 消费者扫描节拍（秒）：各路产出新记录的间隔远大于它
+ENRICH_STREAM_BUDGET = 120       # 每轮增量补采的预算上限（秒）：保证一轮在下一轮之前落定
+# 名单通道「凭证在、详情整片空壳」时给用户的动手窗口（秒）：见 _list_channel_loop 里
+# `shell_login_asked` 那一段——这种局只有人重新扫一次码/过一次验证才能解，自动重试解不了。
+SHELL_RECOVERY_WAIT_S = 180
+
 # 原始表列**直接引用爬虫层那一份实现**，不再手抄一遍：抄的那一份早晚和原件差一列，
 # 而差的那列恰好是最后加进来的留痕列（证据三列），表现是「原始表里有补全层级、
 # 会话导出的那份没有」——两处账对不上，用户只能靠肉眼比列名。
@@ -153,6 +163,11 @@ class ParallelSession:
         # 各处等待循环自动退回「定时问一遍」的老口径，除叫醒时机外行为不变。
         self._done_board = None
         self._board_seen = 0
+        # 边采边补（功能④并行化）：独立消费者线程 + 大锁 + 累计账，见 _enrich_worker_loop
+        self._enrich_worker = None             # 边采边补线程（每轮 crawl 新建，收尾 join）
+        self._enrich_worker_stop = False       # 收尾专用停止位（与 _user_stop 分开）
+        self._enrich_mutex = threading.Lock()  # 补采大锁：worker 轮次与手动/收尾补采互斥
+        self._enrich_stream = None             # 本轮边采边补累计账（收尾总账用）
         self._done_sites = set()
         self._total_done = 0
         self._kw_progress = {}          # slug -> (已完成关键词数, 关键词总数)
@@ -801,6 +816,9 @@ class ParallelSession:
                                  name=f"crawl-{slug}", daemon=True)
             rt["thread"] = t
             t.start()
+        # 边采边补消费者：各路线程开跑后立刻启动（它只读各路 results 的原字典视图，
+        # 记录 append 后不再被改，与采集线程天然无并发写；与手动/收尾补采靠大锁互斥）
+        self._start_enrich_worker()
         for t in self._threads.values():
             while t.is_alive():
                 self._wait_any(1.0)
@@ -838,6 +856,8 @@ class ParallelSession:
             for slug, c, rt in finishing:
                 while rt["thread"].is_alive():
                     self._wait_any(1.0)
+        # 边采边补线程先收工（join）：之后收尾全量补采才开跑，两路永不同时写同一条记录
+        self._stop_enrich_worker()
         total = sum(len(c.results) for c in actives)
         for c in self._active_list_channels():
             total += len(c.results)
@@ -892,6 +912,13 @@ class ParallelSession:
         # 界面是在 crawl_finished 上触发导出与入库的，回采晚一步就等于这批补值永远进不了
         # 本轮交付文件；早一步则会在采集还没停稳时和野线程抢同一批记录。
         self.enrich_websites(reason="采集收尾")
+        # 边采边补总账：单独一行回答「并行化到底省了多少等」——账不单列的话，
+        # 收尾轮的 cached 计数会把后台的功劳记成「无活可干」。
+        es = self._enrich_stream
+        if es and (es.get("sites") or es.get("ok")):
+            self._log(f"🌐 边采边补总账：采集期间增量回采 {es['rounds']} 轮、访问 "
+                      f"{es['sites']} 个官网、{es['ok']} 行补到值、净新增 "
+                      f"{es['new_values']} 个联系方式（上面的收尾轮只兜底剩余）")
         # 回采那一轮没跑（没勾链路/手动停止/本轮无数据）时补一条独立支路：分层报表不该
         # 被一个它并不需要的开关决定出不出（理由见 _export_lead_standalone）。
         # 放在 enrich_websites 之后而不是让它自己判断返回值：这样两条支路互不知情，
@@ -1520,9 +1547,35 @@ class ParallelSession:
                         if shell:
                             # 连续空壳的头号原因是登录态掉了：限时等用户重新登录一次，
                             # 登录还在却仍空壳＝不是登录问题，别再白烧请求，直接休眠。
+                            # 2026-11-17 整轮补口径：旧写法把「探针说已登录」当成「不必等人」，
+                            # 可爱企查这一形是**凭证仍在、详情页整片空壳**（要人重新扫码/过验证），
+                            # cookie 探针永远回 ok——于是这一路一句引导都不给就睡到本轮结束
+                            # （本轮爱企查只补到 1 家）。现在把「连续空壳」本身就当「要人动手」的证据。
+                            # 但只给一次窗口（`shell_login_asked`）：这种局下 `login_state()` 会立刻
+                            # 回 ok，拿它当循环条件就是「3 家空壳→等 5 秒→再 3 家空壳」在队首打转，
+                            # 那是比休眠更坏的烧名单方式。
                             state, _d = c.login_state()
-                            if state == "need_login" and self._wait_login_gate(slug):
-                                rt["shell_streak"] = 0
+                            if state == "need_login":
+                                if self._wait_login_gate(slug):
+                                    rt["shell_streak"] = 0
+                                    continue
+                            elif not rt.get("shell_login_asked"):
+                                rt["shell_login_asked"] = True
+                                self._emit("login_required_signal",
+                                           f"{label}连续 {streak} 家详情空壳（登录凭证在、页面不出数据）："
+                                           f"请在浏览器里的{label}页面重新登录或过一次验证，"
+                                           f"本页等 {SHELL_RECOVERY_WAIT_S // 60} 分钟后自动接着查这一家")
+                                self._log(f"🔐 {label}连续 {streak} 家详情空壳但登录凭证仍在："
+                                          f"这一形多为会话要重新验证（不是「本站查无此公司」）。"
+                                          f"已点亮登录引导，给 {SHELL_RECOVERY_WAIT_S} 秒窗口请你动手，"
+                                          f"窗口过后自动重试（本轮只给这一次机会）")
+                                if not self._list_wait(float(SHELL_RECOVERY_WAIT_S), c):
+                                    break
+                                # 窗口后**不清 streak**：只拿下一家当恢复判据（登录真回来了
+                                # 这一家就会出数据；还是空壳则 streak 仍 ≥ gate，下一次循环直接
+                                # 休眠收工）。旧写法在这里清零，等于还要求 gate 家才触发——
+                                # 2026-11-18 离线回归把这件事抬了出来（连续 3 家空壳那一格实跑 6 家），
+                                # 白烧一倍名单而拿不到更多结论。
                                 continue
                         c0 = self.pending.counts(slug)
                         self._log(f"💤 {label}补采连续 {streak} 家"
@@ -1625,6 +1678,128 @@ class ParallelSession:
                           f"本轮跳过该路（{type(e).__name__}）")
         return out
 
+    # ── 边采边补（功能④并行化）：采集进行中就开补，不等全部收尾 ──────────
+    # 生产者-消费者：采集线程照旧只管产出（记录 append 后不再改，与补采线程天然
+    # 无并发写）；消费者按固定节拍扫各路 results 的**原字典**视图，增量回采
+    # 「带官网且缺联系方式」的行。收尾那一轮保留——它已几乎无事可做（后台补过的
+    # 行带「官网回采」留痕，needs_retry 直接跳过），退化为兜底核对，行为基线不变。
+    def _start_enrich_worker(self):
+        if not self.site_enrich:
+            return
+        t = self._enrich_worker
+        if t is not None and t.is_alive():
+            return
+        self._enrich_worker_stop = False
+        self._enrich_stream = {"rounds": 0, "sites": 0, "ok": 0, "new_values": 0,
+                               "queued": 0, "reasons": {}}
+        t = threading.Thread(target=self._enrich_worker_loop, name="enrich-stream",
+                             daemon=True)
+        self._enrich_worker = t
+        t.start()
+        # 开了什么路径就在启动那一行说清：旧文案只写「增量回采」，用户与排障的人都
+        # 读不出这一轮到底跑不跑最后那一档（把缺联系方式的家名转成三路工商侧补采队列）
+        # ——而那恰恰是本轮真正要修的那一档。
+        # 文案里不手抄任何一级的名字（一律走 stage_chain）：那串名字只有一个主人，
+        # 在会话层抄一份，改命名时日志与数据必定分家（waterfall_leads 回归锁的就是这一条）。
+        stage_note = (f"顺序＝{_wf.stage_chain()}" if self.waterfall
+                      else "只走单跳（未勾「瀑布式多源补全」）")
+        self._log(f"🌐 边采边补线程已启动：采集进行中每 {ENRICH_STREAM_INTERVAL} 秒跑一"
+                  f"轮完整补全（{stage_note}，每轮预算 {ENRICH_STREAM_BUDGET} 秒），"
+                  f"收尾再做一次全量兜底")
+
+    def _enrich_worker_loop(self):
+        # 先睡一个间隔再干第一轮：让各路先产出一批记录，否则首轮扫到的是空集。
+        # 睡眠用 1 秒粒度看停止位：用户点停止/收尾叫停要立刻收手，不是睡满整段。
+        for _ in range(ENRICH_STREAM_INTERVAL):
+            if self._user_stop or self._enrich_worker_stop:
+                return
+            time.sleep(1.0)
+        while not (self._user_stop or self._enrich_worker_stop):
+            self._enrich_round()
+            for _ in range(ENRICH_STREAM_INTERVAL):
+                if self._user_stop or self._enrich_worker_stop:
+                    return
+                time.sleep(1.0)
+
+    def _enrich_round(self):
+        """消费者的一轮：扫 live 记录 → 跑**完整瀑布**（不是只补“完全缺联系方式”那一档）。
+
+        大锁用非阻塞拿：手动补采正在跑时本轮直接让路（下一轮再来），绝不能
+        两路同时往同一条记录里 merge——merge 是「先读旧值再写新值」，并发跑
+        后写的那一路会把先写那一路刚补到的号覆盖掉（值就丢了）。
+
+        2026-11-17 整轮实机改口径（旧行为是“只跑单跳 + only_missing=True”）：那样后台
+        只能碰「四项全空」那一档（本轮 582 行里只有 16 行），而真正的工作量在完整瀑布
+        （五级，顺序一律取自 `_wf.stage_chain()`，本文件不手抄那一串名字；本轮 540 家）；
+        叠加后果最重的一个是：工商队列只在收尾那一轮才生成，采集进行的 45 分钟里
+        企知道/风鸟/爱企查三路几乎无活可干（本轮共只查到 13 家次），收尾一口气投 474 家
+        ×3 路＝1432 家次永远查不完。现在每一轮都走完整瀑布：缺联系方式的家名**行级**
+        入队，三路从采集第几分钟起就有活；幂等靠 SITE_MARK 留痕 + needs_retry 保证
+        （已判定终态的行不再花预算，add_waste 对已在册的也不重复计数）。
+        """
+        st = self._enrich_stream
+        if st is None:
+            return
+        try:
+            records = self._all_live_records()
+            if not records:
+                return
+            if not self._enrich_mutex.acquire(blocking=False):
+                return
+            try:
+                if self.waterfall:
+                    stats = self._run_waterfall("边采边补", records,
+                                                budget=float(min(ENRICH_STREAM_BUDGET,
+                                                                 self.site_enrich_budget)),
+                                                verbose=False)
+                else:
+                    stats = self._enrich_single_hop(
+                        "边采边补", records,
+                        budget=float(min(ENRICH_STREAM_BUDGET, self.site_enrich_budget)))
+            finally:
+                self._enrich_mutex.release()
+        except Exception as e:
+            self._log(f"⚠ 边采边补本轮异常（已跳过，不影响采集）：{type(e).__name__}: {e}")
+            return
+        if not isinstance(stats, dict):
+            return
+        got = self.enrich_summary(stats)
+        reg = stats.get("registry") or {}
+        st["rounds"] += 1
+        st["sites"] += int(got["sites"])
+        st["ok"] += int(got["ok"])
+        st["new_values"] += int(got["new_values"])
+        st["queued"] = st.get("queued", 0) + int(reg.get("queued") or 0)
+        for why, n in (stats.get("reasons") or (stats.get("network") or {}).get("reasons") or {}).items():
+            st["reasons"][why] = st["reasons"].get(why, 0) + int(n)
+        if got["sites"] or reg.get("queued"):
+            self._log(f"🌐 边采边补第 {st['rounds']} 轮：访问 {got['sites']} 个官网、"
+                      f"{got['ok']} 行补到值、净新增 {got['new_values']} 个联系方式"
+                      + (f"｜工商队列新增 {reg['queued']} 家（累计 {st['queued']}）"
+                         if reg.get("queued") else ""))
+
+    def _stop_enrich_worker(self, join_timeout=None):
+        """收尾：停掉边采边补线程并等它退出，之后收尾全量补采才开跑（串行互斥）。
+
+        停止位独立于 _user_stop：用户没点停止时也要让后台线程收工，否则收尾轮
+        与它在同一条记录上并发 merge。宽限 = 每轮预算 + 余量：最坏情况是它
+        刚开跑一轮增量，等这轮落定再收（落下的值不浪费，账也平）。
+        """
+        t = self._enrich_worker
+        if t is None:
+            return
+        self._enrich_worker_stop = True
+        if join_timeout is None:
+            # 宽限 = 每轮预算 + 固定量：完整瀑布一轮除了网络那一档，还要过同主体复用与
+            # 投队列两步（都不花 budget），只给 30 秒会在常态下报「未在宽限内退出」。
+            join_timeout = ENRICH_STREAM_BUDGET + 120
+        if t.is_alive():
+            t.join(timeout=join_timeout)
+        if t.is_alive():
+            self._log("⚠ 边采边补线程未在宽限内退出，收尾补采与它共用同一把锁，"
+                      "等它本轮收手后自动接棒")
+        self._enrich_worker = None
+
     def enrich_websites(self, reason="采集收尾", only_missing=False,
                         budget=None, workers=None, limit=None, force=False):
         """官网回采联系方式：采集收尾自动跑一次，界面「补采官网联系方式」也可手动跑。
@@ -1653,21 +1828,25 @@ class ParallelSession:
         if not records:
             self._log(f"🌐 {reason}：本轮没有数据，无需回采")
             return None
-        if self.waterfall:
-            stats = self._run_waterfall(reason, records, workers=workers,
-                                        budget=budget, limit=limit,
-                                        only_missing=only_missing)
-        else:
-            stats = self._enrich_single_hop(reason, records, workers=workers,
+        # 大锁：与边采边补线程互斥。收尾入口在 _stop_enrich_worker 之后，锁立即拿到；
+        # 采集进行中用户手动点「补采」时，等后台当轮增量落定再跑——两路串行，
+        # 同一条记录的 merge 不可能交错（交错 = 后写覆盖先写，补到的号会丢）。
+        with self._enrich_mutex:
+            if self.waterfall:
+                stats = self._run_waterfall(reason, records, workers=workers,
                                             budget=budget, limit=limit,
                                             only_missing=only_missing)
-        # 分层报表（功能 B+K）挂在两条支路**汇合之后**、而不是写在瀑布支路里面：
-        # 只勾「回采」不勾「瀑布」也是一轮完整交付，那种跑法少一张表属于静默少功能，
-        # 而静默少功能正是本项目记过账的缺陷形态。
-        # force 往下传：界面上手动点「补采」是一次新的补全，报表跟着刷新；自动链路里
-        # 两个入口（这里 + 收尾的独立支路）共用「本轮已出」判据，不会写成两遍。
-        if self.lead_export:
-            self._export_lead_tiers(records, reason=reason, force=bool(force))
+            else:
+                stats = self._enrich_single_hop(reason, records, workers=workers,
+                                                budget=budget, limit=limit,
+                                                only_missing=only_missing)
+            # 分层报表（功能 B+K）挂在两条支路**汇合之后**、而不是写在瀑布支路里面：
+            # 只勾「回采」不勾「瀑布」也是一轮完整交付，那种跑法少一张表属于静默少功能，
+            # 而静默少功能正是本项目记过账的缺陷形态。
+            # force 往下传：界面上手动点「补采」是一次新的补全，报表跟着刷新；自动链路里
+            # 两个入口（这里 + 收尾的独立支路）共用「本轮已出」判据，不会写成两遍。
+            if self.lead_export:
+                self._export_lead_tiers(records, reason=reason, force=bool(force))
         return stats
 
     @staticmethod
@@ -1736,18 +1915,23 @@ class ParallelSession:
         return stats
 
     def _run_waterfall(self, reason, records, workers=None, budget=None,
-                       limit=None, only_missing=False):
+                       limit=None, only_missing=False, verbose=True):
         """瀑布接管收尾那一轮（勾选「瀑布式多源补全」时才会走到这里）。
 
         账目分三级报，而且**每一级都要说自己为什么没动**：这是采集账目从一开始的
         纪律，接到补全上更要紧——瀑布最容易给人「跑了个空转」的错觉，因为第 1 级
         根本不发请求，日志要是只写「补了 N 个号」，用户下次就不信这条链路了。
+
+        ``verbose=False`` 只给边采边补那一路：那一轮每 60 秒开一次，五级逐行报表会把
+        真正的采集日志冲掉。压掉的只是**逐行渲染**（stage_lines 与开场那一句），账
+        本身照算、工商投队列那一句照打（本轮新机制的可见性全在它身上）。
         """
         stats = None
         try:
             # 顺序那句话从 _wf.stage_chain() 取：五级名字就是「补全层级」列里落的值，
             # 在这里手抄一份的话，改层级命名时日志会先跟数据分家（抄了 5 处、错了 5 处）。
-            self._log(f"🧵 {reason}：瀑布式补全开始（{len(records)} 行，顺序＝{_wf.stage_chain()}）")
+            if verbose:
+                self._log(f"🧵 {reason}：瀑布式补全开始（{len(records)} 行，顺序＝{_wf.stage_chain()}）")
             stats = _wf.run_waterfall(
                 records, log=self._log,
                 workers=int(self.site_enrich_workers if workers is None else workers),
@@ -1758,8 +1942,9 @@ class ParallelSession:
                 registry_queue=self._waterfall_queue,
                 reverify=bool(self.reverify),
                 reverify_days=self.reverify_days)
-            for line in _wf.stage_lines(stats):
-                self._log("  " + line)
+            if verbose:
+                for line in _wf.stage_lines(stats):
+                    self._log("  " + line)
             net = stats.get("network") or {}
             if net.get("retry"):
                 self._log(f"♻ 官网那一级里 {net['retry']} 行是暂时失败（停机/超时/证书），"

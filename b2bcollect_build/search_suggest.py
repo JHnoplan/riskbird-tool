@@ -29,6 +29,18 @@ _MIN_PREFIX_LEN = 2        # 最少输入 2 个字符才触发建议
 _MAX_SUGGESTIONS = 8       # 下拉列表最多展示 8 条
 
 
+def _is_unmaterialized_proxy(master) -> bool:
+    """master 是不是「还没读盘的总表代理」（data_pool.LazyMaster）。
+
+    为什么判据住在这里而不是调用方：调用方（SuggestLineEdit）在懒态下递的是
+    空表，但那只是当前调用方的自觉。取代理的任何一个元素都会把整张总表
+    （73.8 万条）读回来，而搜索建议只是锦上添花——这种不对等的代价必须由
+    真正会付钱的那一行拦住（与 get_record_by_norm / find_for_tombstone 同一个
+    口径）。普通 list 拿不到 materialized → 返回假，既有行为一行不改。
+    """
+    return getattr(master, "materialized", True) is False
+
+
 class SearchSuggester:
     """搜索建议引擎：历史 + 热门 + 前缀匹配。"""
 
@@ -118,8 +130,24 @@ class SearchSuggester:
 
     # ── 搜索建议 ──────────────────────────────────────────────────────────
 
-    def get_suggestions(self, prefix: str, master: List[dict]) -> List[dict]:
+    def get_suggestions(self, prefix: str, master: List[dict],
+                        view_suggest=None) -> List[dict]:
         """根据输入前缀返回搜索建议列表。
+
+        Args:
+            prefix: 用户已经输入的内容
+            master: 内存总表（只在视图召回不可用时才用，见下）
+            view_suggest: ``callable(prefix, limit) -> {"company": [...], "product": [...]}``，
+                由数据池的 Gold 物化视图提供。传了它就不碰 master 一个元素。
+
+        为什么召回必须交给视图（2026-11-18 重写）：旧实现是 `for rec in master[:5000]`，
+        两个问题都硬：
+          · 只对落盘顺序前 5000 条提建议——实测 73.8 万条的池子里搜「华为」，
+            旧口径一条建议都提不出来（华为在池子后段），新口径 8 条；
+          · 为了补几个字要把总表整体读进内存（736,263 条实测 6.2GB 常驻），
+            这就是「打开搜索框加载很久很久」的真正源头。
+        包含性判定（`prefix in text`）两边共用同一条，索引只负责把候选集从
+        百万级缩到几十条，绝不自己换一个口径挑数据。
 
         Returns:
             [{"text": "光伏组件", "type": "history|company|product|synonym"}, ...]
@@ -144,10 +172,28 @@ class SearchSuggester:
                 if len(suggestions) >= _MAX_SUGGESTIONS:
                     return suggestions
 
-        # 2. 公司名/产品名前缀匹配
-        if master:
-            company_matches = []
-            product_matches = []
+        # 2. 公司名/产品名前缀匹配：视图召回优先，视图不可用才退回旧的全表前 5000 条
+        company_matches = []
+        product_matches = []
+        recall = None
+        if view_suggest is not None:
+            try:
+                recall = view_suggest(prefix, _MAX_SUGGESTIONS * 2)
+            except Exception:
+                recall = None      # 召回接口坏了才允许退回总表路径
+        if recall is not None:
+            for name in recall.get("company") or []:
+                name = str(name or "").strip()
+                if name and prefix_lower in name.lower() and name not in seen:
+                    company_matches.append(name)
+                    seen.add(name)
+            for prod in recall.get("product") or []:
+                prod = str(prod or "").strip()[:30]
+                if prod and prefix_lower in prod.lower() and prod not in seen:
+                    product_matches.append(prod)
+                    seen.add(prod)
+        elif master and not _is_unmaterialized_proxy(master):
+            # 视图召回不可用才退回总表前 5000 条；懒代理在这里被直接排除（见上）
             for rec in master[:5000]:  # 限制扫描范围
                 company = rec.get("company", "")
                 products = rec.get("products", "")
@@ -159,15 +205,15 @@ class SearchSuggester:
                     seen.add(products[:30])
                 if len(suggestions) + len(company_matches) + len(product_matches) >= _MAX_SUGGESTIONS * 2:
                     break
-            # 公司名优先于产品名
-            for c in company_matches[:4]:
-                suggestions.append({"text": c, "type": "company"})
-                if len(suggestions) >= _MAX_SUGGESTIONS:
-                    return suggestions
-            for p in product_matches[:3]:
-                suggestions.append({"text": p, "type": "product"})
-                if len(suggestions) >= _MAX_SUGGESTIONS:
-                    return suggestions
+        # 公司名优先于产品名
+        for c in company_matches[:4]:
+            suggestions.append({"text": c, "type": "company"})
+            if len(suggestions) >= _MAX_SUGGESTIONS:
+                return suggestions
+        for p in product_matches[:3]:
+            suggestions.append({"text": p, "type": "product"})
+            if len(suggestions) >= _MAX_SUGGESTIONS:
+                return suggestions
 
         # 3. 行业同义词推荐（从 pool_matcher 导入）
         try:

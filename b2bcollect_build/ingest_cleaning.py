@@ -37,6 +37,15 @@ except Exception:
     _HAS_POOL_CORE = False
     REGION_RULE_VERSION = ""
 
+# 字段级清洗六函数与核心判据分开引入：旧包/缺函数时只降级字段清洗，
+# 不连坐整体清洗门禁（两者版本节奏不同，耦合会在升级时制造盲区）
+try:
+    from data_pool import (clean_person_name, clean_phone_values, clean_email_values,
+                           clean_website_value, clean_address_value, clean_products_value)
+    _HAS_FIELD_CLEAN = True
+except Exception:
+    _HAS_FIELD_CLEAN = False
+
 # ── 剔除原因码（GUI/日志按码归类，用户能看懂为什么少了几条）──
 REASON_NO_CONTACT = "无联系方式"
 REASON_NO_NAME = "缺公司名"
@@ -987,6 +996,46 @@ def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
         return None, REASON_BAD_NAME, {}
     rec["company_norm"] = rec.get("company_norm") or _normalize(company)
 
+    # 字段级清洗（公开实现与导出交付同一套，口径不漂移）：官网/地址混合串拆解、
+    # 主营脏值清除（文件名/来源名/展会名/文章标题/批次名）。每条修复都记账，
+    # 报告里可见；依赖缺失时跳过（降级为不洗字段，绝不因清洗失败丢数据）。
+    if _HAS_FIELD_CLEAN:
+        _w0 = str(rec.get("website") or "")
+        rec["website"] = clean_website_value(_w0)
+        if rec["website"] != _w0:
+            fixes["官网混合串拆解"] = 1
+        _a0 = str(rec.get("address") or "")
+        rec["address"] = clean_address_value(_a0)
+        if rec["address"] != _a0:
+            fixes["地址混合串清理"] = 1
+        _p0 = str(rec.get("products") or "")
+        rec["products"] = clean_products_value(_p0, str(rec.get("source") or ""))
+        if rec["products"] != _p0:
+            fixes["主营脏值清除"] = 1
+        # 联系人尾缀「详细」与号码上下文碎片「姓 名」：入库时就剥掉，
+        # 别等到导出才拦（中间任何消费方——搜索表格/合并/补采——都不该看见脏值）
+        _contacts0 = rec.get("contacts") or []
+        _contacts1 = []
+        for c in _contacts0:
+            if isinstance(c, dict):
+                _contacts1.append({"name": clean_person_name(c.get("name")),
+                                   "title": str(c.get("title") or "").strip()})
+            else:
+                _contacts1.append(c)
+        if _contacts1 != _contacts0:
+            fixes["联系人尾缀清理"] = 1
+            rec["contacts"] = _contacts1
+            if _contacts1 and isinstance(_contacts1[0], dict):
+                rec["contact"] = _contacts1[0].get("name", "")
+        for _pk in ("phones", "mobiles", "landlines"):
+            _nums0 = [str(x) for x in (rec.get(_pk) or [])]
+            if not _nums0:
+                continue
+            _nums1 = clean_phone_values(_nums0)
+            if _nums1 != _nums0:
+                fixes["号码上下文碎片剥离"] = 1
+                rec[_pk] = _nums1
+
     # 主营/行业/备注：截断正文垃圾、把日期串从主营里赶出去
     for field in ("products", "industry", "address"):
         val = str(rec.get(field) or "")
@@ -1020,8 +1069,11 @@ def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
     rec["mobiles"] = mobiles or [m for m in (rec.get("mobiles") or []) if m]
     rec["landlines"] = landlines or [l for l in (rec.get("landlines") or []) if l]
 
-    emails = [str(e).strip() for e in (rec.get("emails") or []) if str(e).strip()]
-    emails = [e for e in emails if "@" in e and len(e) <= 100]
+    if _HAS_FIELD_CLEAN:
+        emails = clean_email_values(rec.get("emails"))
+    else:  # 依赖缺失时的等价兜底（弱校验，总比不洗强）
+        emails = [str(e).strip() for e in (rec.get("emails") or []) if str(e).strip()]
+        emails = [e for e in emails if "@" in e and len(e) <= 100]
     if emails != (rec.get("emails") or []):
         fixes["邮箱格式修正"] = 1
     rec["emails"] = emails
@@ -1057,7 +1109,8 @@ def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
     return rec, "", fixes
 
 
-def enrich_partition_fields(records: List[dict]) -> Dict[str, int]:
+def enrich_partition_fields(records: List[dict],
+                            allow_fast_path: bool = False) -> Dict[str, int]:
     """存量记录补齐分区键：industry/province 只填空缺不覆盖，属地按当前判据核齐。
 
     为什么必须补在记录上而不是补在查询里：物化视图靠 region/industry/province
@@ -1073,6 +1126,10 @@ def enrich_partition_fields(records: List[dict]) -> Dict[str, int]:
     与 clean_one 同一套派生函数（classify_industry / derive_province /
     record_region / compute_quality_score），不新增任何第二份规则。
     返回各派生项的补算条数，供调用方打日志/展示。
+
+    allow_fast_path：仅限「缓存加载」这类已由 _cache_rules_current 校验过
+    Silver 版本的调用点开启——版本齐的记录零改动（幂等）可安全跳过；
+    合并出口/上传/下载喂的是刚变过内容的记录，属地必须重判，默认关闭。
     """
     counts: Dict[str, int] = {}
 
@@ -1081,6 +1138,19 @@ def enrich_partition_fields(records: List[dict]) -> Dict[str, int]:
 
     for rec in records or []:
         if not isinstance(rec, dict):
+            continue
+        # 版本快速路径（仅缓存加载开启）：属地/地区两件版本齐的记录，enrich
+        # 对它是零改动（幂等）——直接跳过多信号投票、词表扫描与质量分重算。
+        # 73.6 万条全表重跑实测 27s，是缓存加载耗时的大头。
+        # 哨兵值（未分类/未知地区）也走捷径：调用方 _load_local_state 先经过
+        # _cache_rules_current() 校验——缓存本身就是当前 Silver 版本（含当前
+        # 词表）生成的，哨兵也是当前词表的产物，加载时重算纯属浪费；判据/词表
+        # 升级必然 bump 版本标记 → 版本不齐自然回退重算。
+        # 默认（合并出口/上传/下载）绝不走捷径：记录内容刚变过，属地必须重判
+        # （「国外记录挂广东」这类矛盾修正只在重判里能发现）。
+        if (allow_fast_path and _HAS_POOL_CORE
+                and str(rec.get("region_rule") or "") == REGION_RULE_VERSION
+                and str(rec.get("province_rule") or "") == PARTITION_RULE_VERSION):
             continue
         industry = str(rec.get("industry") or "").strip()
         # 「缺失」的判定与 partition_industry 同源（explicit_industry）：空值、哨兵、
