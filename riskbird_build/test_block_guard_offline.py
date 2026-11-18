@@ -6,7 +6,10 @@
 3. 被拦时不推进名单、不写空记录，解除后从卡住的那一家继续；
 4. 爱企查"联想被抑制"与"真查无此公司"要能分开（前者等人工，后者记未找到）；
 5. 界面收到 blocked_signal 后红条提示"请在浏览器完成验证"，解除后自动收掉；
-6. 空白窗口清理只关 about:blank / chrome://newtab，带内容页面与 keep_ids 不碰。
+6. 空白窗口清理只关 about:blank / chrome://newtab，带内容页面与 keep_ids 不碰；
+7. 站点拒绝浏览器：判据命中与防误杀、跳板真的换来源、拒绝页现场留证；
+8. 永久判据：产品不许调本类没有的方法、夹具不许比产品更富（两条各自带反向对照）；
+9. 归还标签：必须带 targetId 发命令，并且拿标签列表复验，关不掉就开口。
 """
 import json
 import os
@@ -316,6 +319,219 @@ try:
 finally:
     ds.requests.get = real_get
 print("⑥ 空白窗口清理：只关空白、keep 生效、回执不算数（重查才算）、读不到要说没读到 ✓")
+
+# ── 7. 站点拒绝浏览器：判据命中/防误杀/与风控类分开/退路真生效 ───────
+# 2026-11-18 用户实机：点「打开爱企查」，Chrome 能开页面但一瞬间提示不能使用
+# 此浏览器。旧判据里一个字都没登记 → 被当成「页面正常但没数据」，名单会被
+# 静默烧成一片「查不到」。新判据必须同时交出反向探针，证明它不是空跑。
+import ast       # noqa: E402（7c 要现算产品与夹具里的 self.X 调用，不拿写死的名单冒充）
+import tempfile  # noqa: E402
+import shutil   # noqa: E402（上面那几段自己不清临时目录，本段收尾要用）
+from pathlib import Path  # noqa: E402（留证文件要读回来看内容，只看文件名判不了质）
+
+_r = bg.detect_cdp(cdp_state("https://aiqicha.baidu.com/", "", 137,
+                            "不能使用此浏览器，请更换其他浏览器访问"))
+assert bg.is_browser_reject(_r), f"拒绝页文案必须判成「浏览器被拒」这一类：{_r}"
+# 反向 1：同样的文案出现在正文很长的正常页面里不能判（企业站页脚常写浏览器建议）
+assert not bg.detect_cdp(cdp_state("https://aiqicha.baidu.com/company_detail_1",
+                                  "某公司 - 爱企查", 9000,
+                                  "不支持此浏览器 建议使用 Chrome 浏览器")), \
+    "长页面里的浏览器建议文案不能误判成拦截"
+# 反向 2：短页面但属于风控插页 → 判风控类，两类不能混（混了就等错东西）
+_r2 = bg.detect_cdp(cdp_state("https://aiqicha.baidu.com/s?q=x", "", 200,
+                             "请关闭浏览器的调试窗口后继续访问"))
+assert _r2 and not bg.is_browser_reject(_r2), f"风控插页不能被归成拒绝类：{_r2}"
+# 反向 3：去掉那句文案就什么都不判（判据不是靠「短页面一律拦」充数的）
+assert not bg.detect_cdp(cdp_state("https://aiqicha.baidu.com/", "", 137,
+                                  "正在加载")), "没有拒绝文案的短页不能被判拦截"
+print("⑦a 拒绝类判据：命中/长页不误杀/与风控类分开/去掉文案即不判 ✓")
+
+# ── 7b. _confirm_open：正常页不白跳、拒绝页跳一次、跳不动也要给人下一步 ──
+_tmp7 = tempfile.mkdtemp(prefix="bg_reject_")
+# 假标签按「真 CDP 边界」建模：Page.navigate 会改地址，页面自己写 location.href 也会改
+# 地址，读地址就读这一格。上一版是给假对象挂了一支产品当时并不存在的 c._navigate，
+# 于是「百度跳板」离线走得通、真机第一步就 AttributeError——夹具比产品更富就是
+# 假绿的来源，下面 7c 把这件事钉成永久判据。
+_tab7 = {"url": "https://aiqicha.baidu.com/", "rej": True, "flip": False}
+_cmds7 = []                       # 产品真发出去的 CDP 命令（断言要看方法名与参数）
+
+
+def _js7(expr):
+    # 分支顺序不能改：取现场信息那句 JS 里就含 `u:location.href`，一旦把「读地址」排在
+    # 它前面，这句会被误答成一个 URL 字符串，detect_cdp 解析不到就进不了拒绝分支。
+    if "readyState" in expr:
+        return "complete"
+    if "JSON.stringify" in expr:
+        return json.dumps({"u": _tab7["url"], "t": "", "ua": "Chrome", "r": "",
+                           "l": 137, "h": "不能使用此浏览器，请更换其他浏览器访问"})
+    if "outerHTML" in expr:
+        return "<html><body>不能使用此浏览器</body></html>"
+    if "location.href=" in expr.replace(" ", ""):      # 页面自己发起的跳转（跳板第二跳）
+        _tab7["url"] = expr.split("=", 1)[1].split(")")[0].strip("'\"; ")
+        if "aiqicha" in _tab7["url"] and _tab7["flip"]:
+            _tab7["rej"] = False          # 从百度跳进来之后站点不再拒
+        return None
+    if "location.href" in expr:
+        return _tab7["url"]
+    return ""
+
+
+def _cmd7(method, params=None):
+    _cmds7.append((method, dict(params or {})))
+    if method == "Page.navigate":
+        _tab7["url"] = str((params or {}).get("url") or "")
+    return {"result": {"data": ""}}
+
+
+def _make_c7(flip_after_hop):
+    c = A.AiQiChaCrawlerV2()
+    c.signals = None
+    c.diag_dir = _tmp7
+    c.logs = []
+    c._log = lambda m: c.logs.append(m)
+    c._wait_page_hydrated = lambda ws, n: True
+    # 签名与产品一致：_execute_js 是 (ws_url, script) 两参数，而 detect_cdp
+    # 拿到的执行器只有一个 script 参数。上一版这里混用一个 1 参数函数，结果留证
+    # 和跳板都抛 TypeError（被产品自己接住了，但假场景就测不成真路径）。
+    c._execute_js = lambda ws, expr: _js7(expr)
+    c._send_command = lambda ws, method, params=None: _cmd7(method, params)
+    c._detect_block = lambda ws=None: (bg.detect_cdp(_js7) if _tab7["rej"] else "")
+    _tab7["flip"] = flip_after_hop
+    _tab7["url"] = "https://aiqicha.baidu.com/"
+    return c
+
+
+def _hops():
+    """产品真发出去的「换页面」命令（Page.navigate 的目标地址），按顺序。"""
+    return [p.get("url") for m, p in _cmds7 if m == "Page.navigate"]
+
+
+_sleep7 = time.sleep
+time.sleep = lambda s: None          # 跳板与导航复验里有真实等待，测试里不让它真等
+try:
+    _tab7["rej"] = False
+    _cmds7.clear()
+    c7 = _make_c7(False)
+    assert c7._confirm_open("WS") is True, "正常页面必须报打开成功"
+    assert not _hops(), f"没被拒时绝不能多跳一次百度（白等还闪页面）：{_hops()}"
+    assert any("爱企查页面已打开" in m for m in c7.logs), c7.logs
+
+    _tab7["rej"] = True
+    _cmds7.clear()
+    c7b = _make_c7(True)
+    assert c7b._confirm_open("WS") is True
+    assert _hops() and "baidu.com" in _hops()[0], f"被拒后必须真的从百度跳板走一次：{_hops()}"
+    assert any("跳进来后页面正常" in m for m in c7b.logs), c7b.logs
+    # 跳板的全部意义在「换来源」：只有第一跳可以用 CDP 导航，第二跳必须由百度
+    # 页面自己改 location.href。否则等于地址栏直接敲，Referer 依旧为空，这一跳白做。
+    assert len(_hops()) == 1, f"第二跳不该再用 CDP 导航（来源就丢了）：{_hops()}"
+    _dumped = [x for x in os.listdir(_tmp7) if x.startswith("爱企查_浏览器被拒证据")]
+    assert _dumped, f"拒绝页现场必须留证（下次排查不能靠猜）：{os.listdir(_tmp7)}"
+    _ev = (Path(_tmp7) / _dumped[0]).with_suffix(".txt").read_text(encoding="utf-8")
+    assert "不能使用此浏览器" in _ev and "无 Referer" in _ev, \
+        f"留证要能看出结论与来源，否则下次还是靠猜：{_ev[:120]}"
+    assert any("已留现场证据" in m for m in c7b.logs), c7b.logs
+    # 同一轮只存一份：再来一次不得堆文件
+    _tab7["rej"] = True
+    c7b._confirm_open("WS")
+    assert len([x for x in os.listdir(_tmp7) if x.startswith("爱企查_浏览器被拒证据")]) == 1, \
+        "一次运行只存一份证据（堆文件就是在淹现场）"
+
+    _tab7["rej"] = True
+    _cmds7.clear()
+    c7c = _make_c7(False)            # 跳板也不能翻页的硬场景
+    assert c7c._confirm_open("WS") is True
+    assert _hops(), "硬场景也要先试过退路"
+    assert any("跳板退路无效" in m for m in c7c.logs), c7c.logs
+    assert any("手动刷新" in m for m in c7c.logs), \
+        f"退路无效时必须给出能动手的下一步，不能只说失败：{c7c.logs}"
+    assert not any("页面已打开" in m for m in c7c.logs), \
+        "被拒的页面绝不能报「已打开」（结论与现场不同源就是误导）"
+finally:
+    time.sleep = _sleep7
+shutil.rmtree(_tmp7, ignore_errors=True)
+print("⑦b _confirm_open：正常不白跳/被拒跳一次并留证/退路无效也说清下一步 ✓")
+
+# ── 7c. 永久判据：产品不许调本类没有的方法，夹具也不许比产品更富 ───────
+# 7b 那一族缺陷（产品调不存在的 _navigate，而夹具正好自己补了一支把它盖住）离线全绿、
+# 真机才炸，根因是「没人要求被测的那个类真的有这个方法」。两条判据方向相反，
+# 合起来才把这一族堵死。两条都各自带反向对照，不允许自己是空跑。
+def _phantom_self_calls(src_text, cls):
+    """现算 src_text 里被当成 self.X(...) 调用、而 cls 上既无此方法又无实例属性赋值的名字。"""
+    tree = ast.parse(src_text)
+    called, assigned = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "self":
+            called.add(n.func.attr)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) \
+                and n.value.id == "self" and isinstance(n.ctx, ast.Store):
+            assigned.add(n.attr)
+    return sorted(x for x in called if not hasattr(cls, x) and x not in assigned)
+
+
+def _fixture_legs(obj, cls):
+    """假对象上挂的私有可调用里，真类没有的那几支（= 夹具自己造的新腿）。"""
+    return sorted(k for k, v in vars(obj).items()
+                  if k.startswith("_") and callable(v) and not hasattr(cls, k))
+
+
+_phantom = _phantom_self_calls(open(A.__file__, encoding="utf-8").read(), A.AiQiChaCrawlerV2)
+assert not _phantom, \
+    f"产品在调本类根本没有的方法（走到就是 AttributeError，不许再靠离线放过）：{_phantom}"
+_richer = sorted({k for _fx in (c7, c7b, c7c) for k in _fixture_legs(_fx, A.AiQiChaCrawlerV2)})
+assert not _richer, \
+    f"夹具比产品更富（挂了真类没有的方法，离线假绿、真机必炸）：{_richer}"
+# 反向对照 A：判据自己不能是空跑——造一段调不存在方法的源码，必须被点名
+_probe_a = _phantom_self_calls("class X:\n    def f(self):\n        self._no_such_leg()\n",
+                               A.AiQiChaCrawlerV2)
+assert _probe_a == ["_no_such_leg"], f"幻影调用判据失效（造出来的假方法却没抓到）：{_probe_a}"
+# 反向对照 B：临时给假对象挂一支真类确实没有的腿，必须被点名
+c7._probe_fake_leg = lambda ws: None
+_probe_b = _fixture_legs(c7, A.AiQiChaCrawlerV2)
+del c7._probe_fake_leg
+assert _probe_b == ["_probe_fake_leg"], f"夹具富化判据失效（挂了产品没有的腿却没抓到）：{_probe_b}"
+print("⑦c 永久判据：产品幻影调用为零、夹具不富过产品，两条各自拿反向对照自证 ✓")
+
+# ── 7d. _close_tab：必须带 targetId 发命令，并且拿标签列表复验 ───────
+# 与跳板同一轮真机查出的第二处：旧写法 params 传空、又无条件 return True，而
+# `_send_command` 只递原始响应不对 error 抛异常，于是「没报错」被当成「关掉了」，
+# 实测在共享 Chrome 里攒下两枚没人认领的标签。这一处之能藏住，是因为离线零覆盖。
+_tid7 = "aabbccddeeff00112233445566778899aabbccdd"
+_tabs7 = [{"id": _tid7, "url": "https://aiqicha.baidu.com/"}]
+_sent7 = []
+c7d = A.AiQiChaCrawlerV2()
+c7d.signals = None
+c7d.logs = []
+c7d.pin_tab_id = ""          # 故意复位：与 close_browser 调它之前的状态一致（旧写法在这拿到空 id）
+c7d._log = lambda m: c7d.logs.append(m)
+c7d._send_command = lambda ws, method, params=None: (
+    _sent7.append((method, dict(params or {}))), {"result": {}})[1]
+c7d._get_tabs = lambda: list(_tabs7)
+_sleep7d = time.sleep
+time.sleep = lambda s: None          # 复验要等三轮，测试里不让它真等
+try:
+    assert c7d._close_tab("ws://127.0.0.1:9255/devtools/page/" + _tid7) is False, \
+        "标签还在列表里就必须说没关掉（拿没报错冒充做成过就是这个形状）"
+    assert _sent7 and _sent7[0][0] == "Target.closeTarget" \
+        and _sent7[0][1].get("targetId") == _tid7, f"closeTarget 必须带上那一枚的 targetId：{_sent7}"
+    assert any("没关掉" in m for m in c7d.logs), f"没关掉要开口说，不能静默：{c7d.logs}"
+    _tabs7.clear()                   # Chrome 真的收走了
+    assert c7d._close_tab("ws://127.0.0.1:9255/devtools/page/" + _tid7) is True, \
+        "列表里已经没有它了，就该报关掉"
+
+    # 新分支也得有人管：复验三次全抛时，既不许报关掉，也不许说「确实还挂着」
+    def _boom7():
+        raise RuntimeError("标签列表读不到")
+    c7d._get_tabs = _boom7
+    c7d.logs.clear()
+    assert c7d._close_tab("ws://127.0.0.1:9255/devtools/page/" + _tid7) is False, \
+        "读不到标签列表时不许报关掉（无从确认就是无从确认）"
+    assert any("读不到标签列表" in m and "没法确认" in m for m in c7d.logs), \
+        f"这一格要说清是「无从确认」而不是「确实还挂着」：{c7d.logs}"
+finally:
+    time.sleep = _sleep7d
+print("⑦d _close_tab：带 targetId + 标签列表复验，关不掉就开口 ✓")
 
 # ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
 # 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器

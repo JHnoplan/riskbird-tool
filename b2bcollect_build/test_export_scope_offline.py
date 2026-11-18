@@ -413,7 +413,7 @@ with tempfile.TemporaryDirectory() as td:
     wb, ws, rows = run_real_export("dom", td)
     _assert(len(rows) == 2, "选「仅国内」：文件里只有 2 行国内记录")
     _assert(all(r[2] in ("国内甲公司与", "国内乙厂") for r in rows), "国内记录落盘正确")
-    _assert(len(rows[0]) == 12, "列结构仍为 12 列标准 schema（客户库模板列映射不变）")
+    _assert(len(rows[0]) == 11, "导出为 11 列交付口径（数据来源列不上交付文件，上传 schema 仍 12 列）")
     _assert(ws.title == "搜索结果_国内", "工作表名标出口径：搜索结果_国内")
     _assert("国内" in wb.properties.title, "文档属性带口径")
     _assert(rows[0][3] == "13800138000", "手机号归「电话」列（不串到固话）")

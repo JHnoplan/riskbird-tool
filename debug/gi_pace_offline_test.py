@@ -18,12 +18,22 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 同一条纪律：本套件验 b2bcollect 这一份产品，而 `cdp_base` 开局就 `import
+# customer_library_cleaner`——那是三个目录各有一份的同名模块。两份都 insert(0) 时
+# 后插的 riskbird 抢到最前，cdp_base 里的 `_cleaner` 就成了隔壁产物的副本
+# （两份已经差开几百行）。隔壁目录只用来借独有模块，必须排在后面。
 sys.path.insert(0, os.path.join(BASE, "b2bcollect_build"))
-sys.path.insert(0, os.path.join(BASE, "riskbird_build"))
+sys.path.append(os.path.join(BASE, "riskbird_build"))
 
 import requests  # noqa: E402
 import gi_crawler  # noqa: E402
 import cdp_base  # noqa: E402
+
+# 导对了哪一份产品当场自证（拿实现验实现看不出“又被副本遮蔽”）
+for _nm, _mod in (("cdp_base", cdp_base), ("gi_crawler", gi_crawler),
+                  ("customer_library_cleaner", cdp_base._cleaner)):
+    assert os.sep + "b2bcollect_build" + os.sep in _mod.__file__, \
+        f"导错产品的 {_nm}（被另一份同名副本遮蔽）：{_mod.__file__}"
 
 PASS = FAIL = 0
 
@@ -253,6 +263,60 @@ check_true("配额页话术要带等待预期（只写「防采插页」用户�
            "2 小时" in (_r or ""))
 check("配额页 parse_list 是 0 家（这正是旧版误当空结果的形状）",
       len(_gq.parse_list(_QUOTA, "制冷设备")), 0)
+
+print("\n=== C4 翻页参数没生效：每页取回同一批条目，就说「同一批」不说「池子枯竭」 ===")
+# 站方配额 3 页，但 curpage 这一形实机也撞到过「换个页码地址、正文一个字没变」。
+# 旧代码要连撞两页 0 新增才停下，还写「公司池已枯竭」：那把处方指到「换词」上，
+# 而真凶是翻页参数（处方应是修 URL）。1688 那一轮实机就是被这句引偏了两轮。
+import re as _re_c4
+_LIST_NEXT = _LIST.replace("</table>",
+                           '<tr><td><a href="/search_company.asp?keyword=x&amp;curpage=2">下一页</a>'
+                           "</td></tr></table>")
+_LIST_NEXT2 = (_LIST_NEXT.replace("weficoil", "bexample").replace("saieryi", "cexample")
+                .replace("山东威飞技术发展", "山东乙示例机械").replace("上海赛尔意电气", "上海丙示例电子"))
+
+
+def _by_page(pages):
+    """按 URL 里的 curpage 回放。不能拿「第几次请求」当页码：_fetch 内部有重试与
+    质询引导，请求次数≠页数，那样喂会把下一页发成上一页（本段第一版就是这么错的）。"""
+    def _f(url, n):
+        _m4 = _re_c4.search(r"curpage=(\d+)", url)
+        _i4 = (int(_m4.group(1)) if _m4 else 1) - 1
+        return _Resp(pages[_i4] if _i4 < len(pages) else pages[-1])
+    return _f
+
+
+_logs_c4 = []
+g = _mk(_by_page([_LIST_NEXT]), port=9411)
+g._log = lambda *a, **k: _logs_c4.append(str(a[0]) if a else "")
+_got_c4 = list(g._iter_keyword("海洋工程"))
+_new1_c4 = int(_re_c4.search(r"第 1 页：\d+ 条，新增 (\d+) 家", "\n".join(_logs_c4)).group(1))
+check_true("第一页真有出货（不是一上来就空页）", _new1_c4 > 0)
+check("两页合计出货＝第一页那一页的出货（第二页同一批，一家都不该再多）",
+      len(_got_c4), _new1_c4)
+check_true("第二页就点名「同一批条目／翻页参数没生效」",
+           any("第 2 页与上一页是「同一批条目」" in m and "翻页参数没生效" in m for m in _logs_c4))
+check_true("不必再多烧一页去凑「连续两页 0 新增」", not any("第 3 页" in m for m in _logs_c4))
+check_true("不许把这一形写成「无新增所以池子枯竭」（只允许否定句里提到枯竭）",
+           not any("枯竭" in m and "不是" not in m for m in _logs_c4))
+
+print("\n=== C5 各页内容不同、只是都在增量库里：那一形要说「不再翻页」而不是「同一批」 ===")
+_logs_c5 = []
+g = _mk(_by_page([_LIST_NEXT, _LIST_NEXT2]), port=9412)
+g._log = lambda *a, **k: _logs_c5.append(str(a[0]) if a else "")
+# 先把两页的公司都标成「已经采过」：这一形的真相是增量库已含，不是翻页失效
+for _h5 in (_LIST_NEXT, _LIST_NEXT2):
+    for _e5 in g.parse_list(_h5, "海洋工程"):
+        g._seen_members.add(f"{g.PLATFORM_SLUG}:{_e5['公司ID']}")
+        g._seen_members.add(f"{g.PLATFORM_SLUG}:name:{g._norm_name(_e5['公司名称'])}")
+_got_c5 = list(g._iter_keyword("海洋工程"))    # 生成器不跑完就没有请求、也没有日志
+check("一家都不重复入库", len(_got_c5), 0)
+check_true("两页都翻过了（内容不同就不会提前收轮）",
+           any("第 2 页" in m for m in _logs_c5))
+check_true("说的是「各页内容不同、都已在增量库里」",
+           any("各页条目内容不同" in m for m in _logs_c5))
+check_true("这一形不许报「同一批条目」（两页内容真的不同）",
+           not any("同一批条目" in m for m in _logs_c5))
 
 total = PASS + FAIL
 print("\n" + "=" * 62)

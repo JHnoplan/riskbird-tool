@@ -321,5 +321,49 @@ gui15._cp_flush("测试")
 assert any("采集进度已落盘" in m for m in gui15.logs), gui15.logs
 print("15 ✅ 逐条写台账与游标退回")
 
+# ── 16. 指纹里的合法 0 不能被读成「拿不到」的哨兵（0 字节名单必须识破）──
+# -1 在本模块的既定口径是「附属字段读不出来 → 不作为不匹配的理由」；一旦
+# `int(x or -1)` 把合法的 0（空文件、空表头）也变成 -1，「文件内容全变了」
+# 就被这项跳过当成「没证据」，续采就能拿 A 名单的进度去采 B 名单。
+zero_fp = [{"name": "名单.xlsx", "size": 0, "mtime": 1000, "cols": 0}]
+grown_fp = [{"name": "名单.xlsx", "size": 5_000_000, "mtime": 2000, "cols": 12}]
+assert not CP.fingerprint_matches(zero_fp, grown_fp), \
+    "0 字节半成品长成 5MB 必须判指纹不符"
+assert CP.fingerprint_matches(zero_fp, [dict(zero_fp[0])]), \
+    "同为 0 的合法值不该误报变更（防一刀切反过来拦死续采）"
+# 合成用例必须**只改要验的那一个字段**：上一版给 grown_fp 连 mtime 一起改了，
+# 于是缺陷代码靠 mtime 差异也能「识破」，size 那一格根本没被检验（装回缺陷
+# 后只有下面两条与端到端那条报错，上面的全绿——就是这个坑的现场）。
+assert not CP.fingerprint_matches(
+    [{"name": "名单.xlsx", "size": 0, "mtime": 1000, "cols": 7}],
+    [{"name": "名单.xlsx", "size": 4096, "mtime": 1000, "cols": 7}]), \
+    "只让 size 从 0 变出去（mtime/cols 全不动）也必须识破"
+assert not CP.fingerprint_matches(
+    [{"name": "名单.xlsx", "size": 4096, "mtime": 1000, "cols": 0}],
+    [{"name": "名单.xlsx", "size": 4096, "mtime": 1000, "cols": 7}]), \
+    "只让 cols 从 0（空表头）变出去也必须识破"
+unknown_fp = [{"name": "名单.xlsx", "size": -1, "mtime": -1, "cols": -1}]
+assert CP.fingerprint_matches(unknown_fp, grown_fp), \
+    "真的读不出来（-1）时仍按既定口径豁免比对"
+assert CP.fingerprint_matches(grown_fp, unknown_fp), \
+    "反方向同理：哨兵只豁免比对，不自己当成变更证据"
+assert CP.fingerprint_matches(grown_fp,
+                              [{"name": "名单.xlsx", "size": None,
+                                "mtime": 2000, "cols": 12}]), \
+    "字段缺失（None）归入 -1 豁免：与「值就是 0」不是一回事"
+# 端到端：走真实生产函数（只测手写字典会把「生产者其实写了 0」这一环漏掉）
+zpath = os.path.join(ROOT, "零字节名单.xlsx")
+with open(zpath, "w", encoding="utf-8") as fh:
+    fh.write("")
+fp_zero = CP.files_fingerprint([zpath])
+assert fp_zero[0]["size"] == 0, f"0 字节文件的 size 就是 0，不是 -1：{fp_zero}"
+assert fp_zero[0]["cols"] == -1, \
+    f"空文件读不出列数 → 确实归入 -1 豁免：{fp_zero}"
+with open(zpath, "w", encoding="utf-8") as fh:
+    fh.write("公司名\nA公司\n")
+assert not CP.fingerprint_matches(fp_zero, CP.files_fingerprint([zpath])), \
+    "真实文件从 0 字节变成有内容：指纹必须识破"
+print("16 ✅ 指纹取值把「0」与「拿不到」分开，0 字节名单不会伪装成同一份")
+
 shutil.rmtree(ROOT, ignore_errors=True)
 print("\nALL ASSERTS PASSED")

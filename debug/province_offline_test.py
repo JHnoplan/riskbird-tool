@@ -129,14 +129,19 @@ check("makepolo 陕西=shanxii 不是 shanxi", _mp.build_search_url("泵", 1).en
 _mp.province = ""
 check("makepolo 未选省不带 ae", "ae=" in _mp.build_search_url("泵", 1), False)
 
-# 1688 采集器依赖 selenium：本机 .venv 有则测；站方参数值=简体短名（UTF-8 百分号编码）
+# 1688 采集器依赖 selenium：本机 .venv 有则测。站方参数值=简体短名，但编码必须与
+# keywords 同一口径走 **GBK**（旧注释写的「UTF-8 百分号编码」是错的：2026-11-04 客户
+# 现场取证判死——同一个 query 里 keywords 是 GBK、province 是 UTF-8 时，服务端按 GBK
+# 解出来的是乱码，省份筛选直接失效；见 ali1688_crawler._urlencode_gbk）。这一条期望
+# 在这里独立写死，不去 import 那个函数：拿实现验实现就永远测不出「编码又被改回 UTF-8」。
 try:
     sys.path.insert(0, os.path.join(BASE, "ali1688_build"))
     import ali1688_crawler as _m1688
     _a = _m1688.Ali1688Crawler.__new__(_m1688.Ali1688Crawler)
     _a.province = "广东"
     from urllib.parse import quote
-    check("1688 省份后缀", _a._province_suffix(), "&province=" + quote("广东"))
+    check("1688 省份后缀（GBK，与 keywords 同口径）", _a._province_suffix(),
+          "&province=" + quote("广东".encode("gbk")))
     _a.province = ""
     check("1688 未选省无后缀", _a._province_suffix(), "")
 except ImportError:

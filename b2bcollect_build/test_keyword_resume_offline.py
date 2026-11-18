@@ -382,8 +382,24 @@ w.site_checks["1688"].setChecked(False)        # …1688 关掉，验证恢复�
 ok_restore = w._restore_task(saved)
 check("恢复任务成功", ok_restore is True)
 check("关键词框回填成上次的词", w.kw_text.toPlainText().splitlines() == ["A词", "B词", "C词"])
-check("平台勾选按上次恢复", w.site_checks["1688"].isChecked()
+check("平台勾选按上次恢复（显式接着采：1688 尊重快照）", w.site_checks["1688"].isChecked()
       and not w.site_checks["11467"].isChecked())
+# 启动静默回填（silent=True）与显式接着采是两条路径：前者 1688 恒回默认不勾
+# （高摩擦站不自动启用），后者尊重快照。这里补验前者：同一条含 1688 的任务，
+# 启动静默回填后 1688 不勾，多平台照常恢复。
+_log_silent = []
+_real_log = w._on_log
+w._on_log = lambda msg: (_log_silent.append(msg), _real_log(msg))[1]
+w.site_checks["11467"].setChecked(True)
+w.site_checks["1688"].setChecked(False)     # 故意改乱：模拟上次启动后的界面现状
+w._restore_task(saved, silent=True)
+w._on_log = _real_log
+check("启动静默回填：1688 恒回默认不勾（高摩擦站不自动启用）",
+      w.site_checks["1688"].isChecked() is False)
+check("启动静默回填：多平台照快照恢复（快照只有 1688，多平台不勾不连坐）",
+      w.site_checks["11467"].isChecked() is False)
+check("启动静默回填：上次勾了 1688 被重置时有日志说明（文案就地发出）",
+      any("1688" in ln and "手动勾选" in ln for ln in _log_silent))
 check("数据仍指向同一个任务文件夹", w.session_dir == str(sess_folder))
 check("游标接回爬虫（A 词已跑完）",
       w.session.crawlers["b2b168"]._kw_done == {"A词"}

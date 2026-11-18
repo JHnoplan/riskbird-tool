@@ -116,15 +116,46 @@ class _FakeMgr:
         return {"k1", "k2"}
 
 
+def _worker_self_attrs():
+    """产品侧 `SearchWorker._recall` + `_scope_records` 真正触碰的 self 属性（AST 现算）。
+
+    这一格以前只测「视图能用」那条路，回退到整张总表那条路一碰就炸在产品代码深处的
+    AttributeError，排查的人只能从堆栈往回猜「夹具少给了什么」。把属性清单从产品源码
+    里当场取出来对拍，漂移就变成在这里点名「缺哪个」，而且清单不由本文件维护——
+    产品加一个 self.xxx，这里自动跟着要求。
+    """
+    import ast
+    import inspect
+    import textwrap
+    names = set()
+    for fn in (pd.SearchWorker._recall, pd.SearchWorker._scope_records):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                    and n.value.id == "self"):
+                names.add(n.attr)
+    return names
+
+
 def _fake_worker(query, mgr=None, filters=None, max_results=100):
-    """不实例化 QThread：鸭子类型直接喂未绑定方法 _recall。"""
-    return types.SimpleNamespace(
+    """不实例化 QThread：鸭子类型直接喂未绑定方法 _recall。
+
+    `_scope_records` 挂的是**产品自己的方法**（`MethodType` 绑上去），不在这里另写一份：
+    「懒采纳下回退全表要先过内存闸门，不够就就地失败并把原因说清」这条纪律就住在那
+    个方法里，夹具复刻一份 stub 就等于把它复制成第二个真源——它会漂。
+    """
+    w = types.SimpleNamespace(
         query=query, master=["M1", "M2"], mgr=mgr, regions=[],
         filters=filters or {}, candidate_indices=None,
         max_results=max_results,
         RECALL_CAP=pd.SearchWorker.RECALL_CAP,
         PRUNE_MIN_FLOOR=pd.SearchWorker.PRUNE_MIN_FLOOR,
     )
+    w._scope_records = types.MethodType(pd.SearchWorker._scope_records, w)
+    missing = sorted(_worker_self_attrs() - set(vars(w)))
+    _assert(not missing, "夹具必须跟上 SearchWorker 的真实形状（缺哪个属性就在这一格点名）",
+            str(missing))
+    return w
 
 
 def test_search_industry_pruning():

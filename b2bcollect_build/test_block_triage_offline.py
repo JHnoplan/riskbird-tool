@@ -19,7 +19,9 @@
 # 全程不联网、不启 Chrome：响应注入假会话，cdp_base 的 time 换成可推进的假时钟。
 import sys
 import inspect
+import types
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -610,7 +612,10 @@ from pathlib import Path as _Path
 
 _REPO = _Path(__file__).resolve().parents[1]
 for _d in ("riskbird_build", "ali1688_build"):
-    sys.path.insert(0, str(_REPO / _d))
+    # append，不是 insert(0)：这一段只是要**借读**隔壁目录独有的 ali1688_crawler，
+    # 不是要把本产品的模块换成隔壁那份同名副本（customer_library_cleaner /
+    # task_registry / yzd_client 三个目录各有一份，已经把本目录抢在前面锁住了）。
+    sys.path.append(str(_REPO / _d))
 import ali1688_crawler as _a1688                                  # noqa: E402
 
 _GUEST_1688 = [{"name": n} for n in ("cna", "isg", "_m_h5_tk", "_m_h5_tk_enc",
@@ -689,6 +694,110 @@ check("开局话术不拦路：说清「公司名照常采」，不把未登录�
       "照常采" in _p_guest.logs[0] and "不用重新开始采集" in _p_guest.logs[0])
 
 print("⑨ 1688 未登录归因：开局说在前面 + 撞验证页补一句，判不出则全部闭嘴 ✓")
+
+# ── ⑨-2. overlay 探测第 1 维（iframe）只认验证码特征域 ──────────────────────
+# 【误伤订正 2026-11-17 的防回退断言】旧判据把 src 含 "alibaba"/"1688" 的 iframe
+# 也当验证码——那正是详情页描述、店铺客服这些**正常业务 iframe** 的家域，等于每进
+# 一家详情必报一次验证码，而 _wait_unblock 的解除判据读的又是同一个函数，误报永不
+# 解除、等到超时收轮，整轮 0 家。这里钉死两头：业务 iframe 必须放行，真正的验证码
+# 特征域（sufei/nocaptcha/wappass/baxia/punish/captcha/challenge/verify）必须拦下。
+# _detect_block 对 self 的全部依赖就是 driver，用 SimpleNamespace 即可、不碰 __init__。
+class _OverlayDriver:
+    """_detect_block 需要的最小 driver：url/title 正常，正文足够长（绕开第三层
+    「极短正文」判据），第四层返回值由用例指定。"""
+
+    def __init__(self, script_ret):
+        self.current_url = "https://s.1688.com/selloffer/offer_search.htm?k=太阳能路灯"
+        self.title = "太阳能路灯-1688"
+        self._script_ret = script_ret
+
+    def find_element(self, *a, **k):
+        class _Body:
+            text = "正文" * 300      # 长正文：前三层（URL/标题/短正文）全都不命中
+        return _Body()
+
+    def execute_script(self, js, *a, **k):
+        return self._script_ret
+
+
+_detect_block = _a1688.Ali1688Crawler._detect_block
+_MARKS = _a1688.Ali1688Crawler.CAPTCHA_IFRAME_MARKS
+# ① 词表白名单语义：站点自家域绝不在表内；业务 iframe 的 src 不命中任何特征域。
+# （fake driver 只能回显 JS 的判定结果，验不了 JS 逻辑本身；词表是单一真源，
+#   JS 由它渲染，所以直接对拍词表——业务域不命中 ＝ 修复后 JS 对它们返回空。）
+check("iframe 特征域词表不含站点自家域（alibaba/1688）",
+      "alibaba" not in _MARKS and "1688" not in _MARKS)
+for _src in ("https://airdescribing.alibaba.com/desc.html?id=3",
+             "https://air.1688.com/cs/chat.html"):
+    check(f"业务 iframe {_src[:36]} 不命中任何特征域（旧判据必误报）",
+          not any(w in _src for w in _MARKS))
+# ② JS 由词表渲染（防「词表改了 JS 还是旧列表」两处手抄漂移）
+for _w in _MARKS:
+    check(f"JS 渲染含特征域 '{_w}'", f"'{_w}'" in _a1688.Ali1688Crawler._CAPTCHA_OVERLAY_JS)
+# ③ _detect_block 第四层接线：JS 判定结果非空 → 判拦截，空 → 放行。
+#    self 除了 driver 还要取 _CAPTCHA_OVERLAY_JS，SimpleNamespace 必须一起注入
+#    （缺了会在第四层 try 里抛 AttributeError 被吞掉，_detect_block 恒返回空）。
+for _tag, _ret, _expect in (
+    ("JS 判定为 sufei/nocaptcha 验证 iframe",
+     "iframe:https://sufei.taobao.com/nocaptcha/get?x=1", "验证码弹窗"),
+    ("JS 判定为 wappass 风控 iframe",
+     "iframe:https://ynuf.alihttp.org/wappass/x", "验证码弹窗"),
+    ("JS 判定为 baxia 安全容器 iframe",
+     "iframe:https://castatic.fegine.com/baxia/entry", "验证码弹窗"),
+    ("JS 判定无验证码（业务 iframe 放行后的空返回）", "", ""),
+):
+    _blk = _detect_block(types.SimpleNamespace(
+        driver=_OverlayDriver(_ret),
+        _CAPTCHA_OVERLAY_JS=_a1688.Ali1688Crawler._CAPTCHA_OVERLAY_JS))
+    if _expect:
+        check(f"{_tag} → 判拦截（含「{_expect}」）", bool(_blk) and _expect in _blk)
+    else:
+        check(f"{_tag} → 不判拦截", _blk == "")
+
+print("⑨-2 overlay iframe 判据白名单：业务 iframe 放行、验证域拦截，误伤订正防回退 ✓")
+
+# ── ⑨-3. 开局确凿未登录的**有限等待**：等到就继续，等不到本轮优雅跳过 ──────
+# 2026-11-17 重设计的产能开关：未登录继续跑＝烧 IP 信誉+反复吃验证（两轮实机同因），
+# 死等 3600s＝用户以为卡死。本轮行为：等待最多 5 分钟、等人灯亮着、每分钟报进度；
+# 登录了立即继续，超时不参与本轮（不烧请求不喂风控，下一轮自动再试）。
+_wfl = _a1688.Ali1688Crawler._wait_for_login
+_real_sleep = _a1688.time.sleep
+_a1688.time.sleep = lambda s: None      # 假时钟：等待循环不真睡，轮询序号由用例控制
+try:
+    class _LoginSeq:
+        """按调用次序吐登录态（_login_state_by_cookie 的替身）。"""
+
+        def __init__(self, seq):
+            self._seq, self._i = list(seq), -1
+
+        def __call__(self):
+            self._i += 1
+            return self._seq[min(self._i, len(self._seq) - 1)]
+
+    logs3 = []
+    _emit3 = lambda *a, **k: None          # 登录成功要发解除信号，fake self 也得带 _emit
+    _s3a = types.SimpleNamespace(
+        _waiting_human="", _stop_requested=False, _emit=_emit3,
+        _log=logs3.append, _login_state_by_cookie=_LoginSeq([False] * 20 + [True]))
+    check("⑨-3a 等待中检测到已登录 → 继续采集", _wfl(_s3a, max_wait=300) is True)
+    check("⑨-3a- 等人灯当场收账（成功后 _waiting_human 复位）", _s3a._waiting_human == "")
+    check("⑨-3a- 逐分钟有进度日志（用户知道工具在等人、没卡死）",
+          any("仍在等待登录" in m for m in logs3), str(logs3))
+    _s3b = types.SimpleNamespace(
+        _waiting_human="", _stop_requested=False, _emit=_emit3,
+        _log=logs3.append, _login_state_by_cookie=_LoginSeq([False]))
+    check("⑨-3b 一直没人登录 → 超时优雅退出", _wfl(_s3b, max_wait=30) is False)
+    check("⑨-3b- 超时后等人灯收账（不许挂着灯退出）", _s3b._waiting_human == "")
+    _s3c = types.SimpleNamespace(
+        _waiting_human="", _stop_requested=True, _emit=_emit3,
+        _log=logs3.append, _login_state_by_cookie=_LoginSeq([False]))
+    check("⑨-3c 停止位优先：等登录循环立刻让路", _wfl(_s3c, max_wait=300) is False)
+finally:
+    _a1688.time.sleep = _real_sleep
+check("⑨-3d crawl 开局接线：preflight 确凿未登录 → _wait_for_login（防回退）",
+      "_wait_for_login" in inspect.getsource(_a1688.Ali1688Crawler.crawl))
+
+print("⑨-3 开局未登录有限等待：等到即跑、超时跳过、等人灯全程可见 ✓")
 
 # ── 10. 独立 Ali1688Tool 包也要收掉 chromedriver 子进程 ────────────────────
 # 同一件事的第二处口径缺口：b2bcollect 包里 1688 的会话出自 chrome_driver.create()
@@ -5616,5 +5725,283 @@ if _g33 is not None:
 print("26g 第 33 条本尊跑在真源上：真树全绿 + 十四种退回形状各响 ✓")
 
 print("㉗ 第 33 条（列表条目账）：门禁本尊与四档处方在离线这一侧对拍过 ✓")
+
+# ── ㉘ 搜索参数 GBK 口径：三个渠道的 keywords/province 都要按站方 GBK 编码 ────
+# 2026-11-17 实机 A/B 实锤（debug/1688_gbk_main_probe.html vs 1688_utf8_main_probe.html）：
+# s.1688.com 服务端按 GBK 解 query 参数——UTF-8 的「太阳能路灯」被解成 mojibake 后
+# 拿去搜，60 张卡片全是无关推荐流（关键词在页面 0 命中，member_id 埋点照样 120 处）；
+# GBK 编码后同一页 422 次命中、卡片全相关。旧 quote()（UTF-8）等于每轮都在搜乱码词，
+# 是 1688 产出「时有时无、质量差、砍单率极高」的更上游根因——三处渠道与省份后缀
+# 一起锁死在本节，谁改回 UTF-8 谁当场响。
+_gbk = _a1688._urlencode_gbk
+check("㉘a 关键词按 GBK 编码（「太阳能路灯」→ %CC%AB%D1%F4%C4%DC%C2%B7%B5%C6）",
+      _gbk("太阳能路灯") == "%CC%AB%D1%F4%C4%DC%C2%B7%B5%C6", _gbk("太阳能路灯"))
+check("㉘a- 绝不混入 UTF-8 形态（UTF-8 的「太」首字节 %E5%A4）",
+      "%E5%A4" not in _gbk("太阳能路灯"), _gbk("太阳能路灯"))
+check("㉘b GBK 编不出的生僻字整词回退 UTF-8（不抛异常、不半词）",
+      bool(_gbk(chr(0x20000))) and _gbk(chr(0x20000)) == quote(chr(0x20000)))
+_src_gbk = ((Path(__file__).resolve().parents[1] / "ali1688_build" / "ali1688_crawler.py")
+            .read_text(encoding="utf-8"))
+check("㉘c 三个渠道的 keywords 都用 _urlencode_gbk（漏一处＝那一路搜乱码词）",
+      _src_gbk.count("kw=_urlencode_gbk(kw)") == 3
+      and "kw=quote(kw)" not in _src_gbk,
+      f"count={_src_gbk.count('kw=_urlencode_gbk(kw)')}")
+check("㉘d 省份后缀同口径（UTF-8 省名被解成 mojibake 后永远匹配不到省）",
+      "province={_urlencode_gbk(pv)}" in _src_gbk
+      and "province={quote(pv)}" not in _src_gbk)
+_ns28 = types.SimpleNamespace(province="广东")
+_sfx28 = _a1688.Ali1688Crawler._province_suffix(_ns28)
+check("㉘e 省份后缀出 GBK 形态（「广东」→ %B9%E3%B6%AB）",
+      "%B9%E3%B6%AB" in _sfx28, _sfx28)
+_ns28.province = ""
+check("㉘e- 未选省返回空串（防回退：空值不许带出参数名）",
+      _a1688.Ali1688Crawler._province_suffix(_ns28) == "")
+_ns28.province = "广东,江苏"
+check("㉘e- 多省逗号串放弃参数直筛（退数据层过滤的旧契约不变）",
+      _a1688.Ali1688Crawler._province_suffix(_ns28) == "")
+print("㉘ 搜索参数 GBK 口径：三渠道 keywords + 省份后缀全部锁死在站方编码上 ✓")
+
+# ── ㉙ 可见验证弹层探测（腾讯 captcha overlay）：企知道 175 家被误丢的根因 ────
+# 2026-11-17 实机实锤：企知道上线 tencent-captcha-dy 弹层，它是 DOM overlay——
+# URL/标题/正文长度全不变，原有三层判据全漏；搜索页打开但结果区被挡，
+# 备用方案判「无结果」→ MISSING → 一轮名单 175 家被丢（实机 09:14：183 家仅成 8）。
+# 修复：block_guard 第 4 层只认精确容器 class + 可见性尺寸闸；企知道 _detect_block
+# 叠加 + _get_hash_via_search 判「无结果」前先查弹层（有 → 等人工过码，绝不记
+# 「查不到」）。实机四标签对照（共享 Chrome）：企知道命中、爱企查/1688/风鸟全干净。
+import block_guard as _bg
+_js29 = _bg.CAPTCHA_OVERLAY_JS
+check("㉙a 只认精确容器锚点（__warp/__full-header，绝不文本 contains）",
+      "tencent-captcha-dy__warp" in _js29 and "tencent-captcha-dy__full-header" in _js29
+      and "innerText" not in _js29)
+check("㉙a- 可见性闸齐全（getClientRects 非空 + 尺寸 100×50）",
+      "getClientRects" in _js29 and "offsetWidth>=100" in _js29
+      and "offsetHeight>=50" in _js29)
+_logs29 = []
+_drv29 = types.SimpleNamespace(execute_script=lambda expr: _logs29.append(expr) or "腾讯安全验证弹层（请在浏览器里完成验证）")
+check("㉙b detect_overlay_selenium 透传本尊 JS 并回传原因串",
+      _bg.detect_overlay_selenium(_drv29) == "腾讯安全验证弹层（请在浏览器里完成验证）"
+      and _logs29 and _logs29[0] == _js29)
+check("㉙b- driver=None/执行异常都安静返空（探测层绝不把链路问题变成误报）",
+      _bg.detect_overlay_selenium(None) == ""
+      and _bg.detect_overlay_selenium(types.SimpleNamespace(execute_script=lambda e: (_ for _ in ()).throw(RuntimeError("x")))) == "")
+check("㉙c detect_overlay_cdp 同一套 JS（爱企查裸 CDP 同判据）",
+      _bg.detect_overlay_cdp(lambda e: "腾讯安全验证弹层（请在浏览器里完成验证）")
+      == "腾讯安全验证弹层（请在浏览器里完成验证）"
+      and _bg.detect_overlay_cdp(None) == "")
+_qzd29 = ((Path(__file__).resolve().parents[1] / "riskbird_build" / "qizhidao_crawler.py")
+          .read_text(encoding="utf-8"))
+check("㉙d 企知道 _detect_block 叠加了弹层层（漏了它弹层挡住的页照样被读空）",
+      "detect_overlay_selenium" in _qzd29.split("def _wait_unblock")[0])
+check("㉙d- _get_hash_via_search 判「无结果」前先查弹层：有就等人工过码重找，"
+      "等不到回 None（可重采）——「查不到」只许发生在确认无弹层之后",
+      "detect_overlay_selenium" in _qzd29.split("def _get_hash_via_search")[1]
+      and "_wait_unblock" in _qzd29.split("def _get_hash_via_search")[1]
+      and "return None" in _qzd29.split("def _get_hash_via_search")[1])
+check("㉙d- 风鸟/爱企查的弹层探测能力就位（block_guard 第 4 层是三站共用的）",
+      callable(_bg.detect_overlay_selenium) and callable(_bg.detect_overlay_cdp)
+      and (Path(__file__).resolve().parents[1] / "riskbird_build" / "block_guard.py").exists())
+print("㉙ 可见验证弹层：精确锚点+可见闸锁定；企知道两处接线防回退；三站共用 ✓")
+
+# ── ㉚ 边采边补（功能④并行化）：采集进行中就补，收尾退化为兜底 ─────
+# 用户口径：「有些平台采集很慢，其他平台都采集完了，它还只采了一部分」——旧链路
+# 把官网回采挂在 crawl() 收尾，采集慢的那一路直接拖住补采起点。并行化 = 生产者
+# （采集线程只管产出，记录 append 后不再改，与消费者天然无并发写）- 消费者
+# （独立线程按节拍扫 live 视图增量回采缺联系方式的行），收尾全量轮保留为兜底
+# （补过的行带「官网回采」留痕，needs_retry 直接跳过，行为基线不变）。
+import parallel_session as _ps_mod                                        # noqa: E402
+import time as _time30                                                   # noqa: E402
+_src30 = ((Path(__file__).resolve().parents[1] / "b2bcollect_build"
+           / "parallel_session.py").read_text(encoding="utf-8"))
+check("㉚a crawl 启动消费者：在各路线程开跑后、join 等待前",
+      "self._start_enrich_worker()" in _src30
+      and _src30.index("self._start_enrich_worker()")
+      > _src30.index("name=f\"crawl-{slug}\"")
+      and _src30.index("self._start_enrich_worker()")
+      < _src30.index("for t in self._threads.values():"))
+check("㉚b crawl 收尾先停消费者再算总账（与收尾全量轮串行）",
+      "self._stop_enrich_worker()" in _src30
+      and _src30.index("self._stop_enrich_worker()")
+      < _src30.index("total = sum(len(c.results) for c in actives)"))
+
+
+def _body30(src, name):
+    """按方法定位函数体（旧写法用 `split("def X")[1].split("def Y")` 借住了两个函数
+    中间只有彼此这个巧合；现在中间多了一层方法，靠名字取下一个 `def ` 才不会把隔壁
+    方法的代码读进本轮要断言的那一段。"""
+    import re as _re30
+    m = _re30.search(r"\n    def " + name + r"\b", src)
+    if not m:
+        return ""
+    nxt = _re30.search(r"\n    (?:@|def )", src[m.end():])
+    return src[m.end(): m.end() + nxt.start()] if nxt else src[m.end():]
+
+
+def _code30(body):
+    """剔掉函数自己的 docstring，只留下能跑的代码。
+
+    docstring 里常常**引述**被废弃的旧口径（比如「旧行为是 only_missing=True」），
+    拿整段文本去做「旧口径不许再出现」型断言，就会把「注释解释了为什么不用它」
+    误判成「代码又回退了」——2026-11-18 ㉚c 就是这样红的。"""
+    i = body.find('"""')
+    if i < 0:
+        return body
+    j = body.find('"""', i + 3)
+    return body[:i] + (body[j + 3:] if j >= 0 else "")
+
+
+_hop30 = _code30(_body30(_src30, "_enrich_single_hop"))
+_wf30 = _code30(_body30(_src30, "_run_waterfall"))
+_er30 = _code30(_body30(_src30, "_enrich_round"))
+check("㉚c 消费者每一轮都走**完整瀑布**（2026-11-17 整轮实机改口径：旧写法把后台钉在"
+      " only_missing=True 那一档，582 行里只有 16 行属于它，42 轮只碰 18 个官网、净新增 1 个值；"
+      "工商队列也因此整轮空转，收尾才投 474 家×3 路＝1432 家次永远查不完）",
+      "self._run_waterfall(" in _er30 and "only_missing=True" not in _er30
+      and "self._enrich_single_hop(" in _er30, _er30[:240])
+check("㉚d 收尾叫停是温和收工：两条支路的 stop lambda 都只认用户级停止，不作废当轮增量"
+      "（口径跟着实现搬到了 _run_waterfall/_enrich_single_hop，消费者只负责选走哪一条）",
+      "stop=lambda: bool(self._user_stop)" in _wf30
+      and "stop=lambda: bool(self._user_stop)" in _hop30
+      and "_enrich_worker_stop" not in _wf30.split("stop=")[1].split("limit=")[0],
+      "stop 口径回退成认后台停止位（当轮增量会被整轮作废）")
+check("㉚e enrich_websites 与消费者互斥（大锁包住两条支路与报表）",
+      "with self._enrich_mutex:" in _src30.split("def enrich_websites")[1]
+      .split("def enrich_summary")[0])
+check("㉚f 收尾总账单列（后台的功劳不被收尾 cached 计数吞掉）",
+      "边采边补总账" in _src30 and "_enrich_stream" in _src30)
+
+_logs30 = []
+_ps30 = ParallelSession()
+_ps30._log = lambda m="": _logs30.append(str(m))
+# 未勾开关不启动（旧关闭语义原样）
+_ps30.site_enrich = False
+_ps30._start_enrich_worker()
+check("㉚g 未勾「采集后回采」不启动消费者", _ps30._enrich_worker is None)
+# 勾选后启动 + 重复启动不叠加
+_ps30.site_enrich = True
+_ps30._start_enrich_worker()
+_w30 = _ps30._enrich_worker
+check("㉚h 勾选后消费者启动且账目初始化（账里必须有 queued 那一栏：工商投队列的功劳不能被报成 0）",
+      _w30 is not None and _w30.is_alive()
+      and _ps30._enrich_stream == {"rounds": 0, "sites": 0, "ok": 0, "new_values": 0,
+                                   "queued": 0, "reasons": {}}
+      and any("边采边补线程已启动" in m for m in _logs30))
+_w_before = _ps30._enrich_worker
+_ps30._start_enrich_worker()
+check("㉚i 已有活消费者时重复启动不叠加", _ps30._enrich_worker is _w_before)
+
+# 轮次行为：monkeypatch 官网回采引擎，验参数与账目
+_calls30 = {}
+def _fake_enrich30(records, log=None, workers=6, budget=900, timeout=None,
+                   stop=None, limit=1500, only_missing=False, resolver=None):
+    _calls30["kw"] = {"workers": workers, "budget": budget,
+                      "only_missing": only_missing, "limit": limit,
+                      "stop_result": (stop() if callable(stop) else None),
+                      "n": len(records)}
+    return {"sites": 3, "ok": 2, "new_values": 5, "reasons": {"超时": 1}}
+class _WcStub30:
+    """只替 `enrich_records` 这一个把手（验参数与账目）：排队口径那几步
+    （pick_site / _has_any / needs_retry）仍走真实现。旧替身只定义了一个方法，
+    而 `_enrich_round` 现在把活派给 `_enrich_single_hop`——那一层要先过排队闸，
+    替身不代理就会在「缺方法」的 AttributeError 上假失败，把要验的引擎调用绕过去了。"""
+    enrich_records = staticmethod(_fake_enrich30)
+
+    def __getattr__(self, name):
+        import website_contact as _wc30
+        return getattr(_wc30, name)
+
+_orig_wc30 = _ps_mod._site_wc
+_ps_mod._site_wc = _WcStub30()
+try:
+    # 记录里必须带官网：`_enrich_round` 现在把活派给 `_enrich_single_hop`，而它在
+    # 「一行可回采官网都没有」时直接早退（不花预算）——没官网的样本根本走不到引擎那一步，
+    # 拿它验参数就是在验一个没被调用的替身。
+    _ps30._all_live_records = lambda: [{"公司名称": "甲公司", "公司网址": "https://acme.example.com"},
+                                       {"公司名称": "乙公司", "公司网址": "https://beta.example.com"}]
+    _logs30.clear()
+    _ps30._enrich_round()
+    check("㉚j 未勾瀑布时的轮次参数（only_missing 不再钉住——只补「四项全空」那一档会把后台饿死；"
+          "预算取两值较小者；stop 只认用户级停止）",
+          _calls30["kw"]["only_missing"] is False
+          and _calls30["kw"]["budget"] == min(_ps_mod.ENRICH_STREAM_BUDGET,
+                                              _ps30.site_enrich_budget)
+          and _calls30["kw"]["stop_result"] is False
+          and _calls30["kw"]["n"] == 2)
+    check("㉚k 账目累计 + 有产出才打日志",
+          _ps30._enrich_stream["rounds"] == 1 and _ps30._enrich_stream["sites"] == 3
+          and _ps30._enrich_stream["ok"] == 2 and _ps30._enrich_stream["new_values"] == 5
+          and _ps30._enrich_stream["reasons"] == {"超时": 1}
+          and any("边采边补第 1 轮" in m for m in _logs30))
+    # 锁被占（手动补采在跑）时让路
+    _calls30.clear()
+    _ps30._enrich_mutex.acquire()
+    try:
+        _ps30._enrich_round()
+    finally:
+        _ps30._enrich_mutex.release()
+    check("㉚l 手动补采持锁时消费者让路（绝不两路并发写同一条记录）",
+          _calls30.get("kw") is None and _ps30._enrich_stream["rounds"] == 1)
+    # 单轮异常不冒泡
+    class _WcBoom30(_WcStub30):
+        def enrich_records(self, *a, **kw):
+            raise RuntimeError("boom")
+    _ps_mod._site_wc = _WcBoom30()
+    _logs30.clear()
+    _ps30._enrich_round()
+    check("㉚m 消费者单轮异常不冒泡且日志里看得见（两层兜底：本轮层与引擎层任一层报都行，"
+          "但绝不允许只静默丢掉一轮）",
+          any("已跳过，不影响已采数据" in m and "boom" in m for m in _logs30)
+          and _ps30._enrich_stream["rounds"] == 1)
+finally:
+    _ps_mod._site_wc = _orig_wc30
+# 本轮无数据时空转
+_calls30.clear()
+_ps30._all_live_records = lambda: []
+_ps30._enrich_round()
+check("㉚n 本轮无数据时消费者空转（不算轮次）",
+      _calls30.get("kw") is None and _ps30._enrich_stream["rounds"] == 1)
+
+# 停止语义
+_ps30._user_stop = True
+_t30 = _time30.time()
+_ps30._enrich_worker_loop()          # 直接调：立即 return，不睡满节拍
+check("㉚o 用户级停止使消费者立即收手", _time30.time() - _t30 < 2.0)
+_ps30._user_stop = False
+_t30 = _time30.time()
+_ps30._stop_enrich_worker()          # worker 在首轮 sleep 中：置位后 1 秒粒度退出
+check("㉚p 收尾 join：消费者退出且登记清空（与收尾补采严格串行）",
+      _ps30._enrich_worker is None and _time30.time() - _t30 < 5.0)
+
+# ㉚q/㉚r 勾上瀑布的那一条支路（本轮功能背书的正题：后台每一轮都走完整瀑布，而不是
+# 只跑单跳）：_run_waterfall 在实例上接替身，验「派到了哪一条、参数对不对、账上不上」。
+_wf_seen = {}
+
+
+def _fake_wf30(reason, records, workers=None, budget=None, limit=None,
+               only_missing=False, verbose=True):
+    _wf_seen.update({"reason": reason, "n": len(records), "budget": budget,
+                     "only_missing": only_missing, "verbose": verbose})
+    return {"sites": 3, "ok": 2, "new_values": 5, "reasons": {"超时": 1},
+            "registry": {"queued": 7}}
+
+
+_ps30.waterfall = True
+_ps30._run_waterfall = _fake_wf30
+_ps30._all_live_records = lambda: [{"公司名称": "甲公司", "公司网址": "https://acme.example.com"},
+                                   {"公司名称": "乙公司", "公司网址": "https://beta.example.com"}]
+_calls30.clear()
+_logs30.clear()
+_ps30._enrich_round()
+check("㉚q 勾瀑布时每一轮都走完整瀑布（不钉 only_missing、不逐行刷报表）",
+      _calls30.get("kw") is None and _wf_seen.get("reason") == "边采边补"
+      and _wf_seen.get("n") == 2 and _wf_seen.get("only_missing") is False
+      and _wf_seen.get("verbose") is False
+      and _wf_seen.get("budget") == min(_ps_mod.ENRICH_STREAM_BUDGET,
+                                        _ps30.site_enrich_budget))
+check("㉚r 工商队列投出去的家数上账且在日志里可见（旧写法只到收尾才投队列，"
+      "采集那 45 分钟三路几乎无活可干）",
+      _ps30._enrich_stream["queued"] == 7 and _ps30._enrich_stream["rounds"] == 2
+      and any("工商队列新增 7 家" in m and "累计 7" in m for m in _logs30))
+_ps30.waterfall = False
+print("㉚ 边采边补：生产者-消费者接线齐全、互斥/温和收工/异常兜底/停止语义/两条支路全锁死 ✓")
 
 print(f"\n全部 {ok} 项断言通过 ✅")

@@ -282,14 +282,22 @@ pool_dialogs.DataPoolManager = lambda *a, **k: mgr
 
 
 class _StubLoadWorker(QObject):
-    """对话框构造时的加载线程换成「立刻返回已备好的总表」，避免真联网。"""
+    """对话框构造时的加载线程换成「立刻返回已备好的总表」，避免真联网。
+
+    信号和构造参数必须跟真实 LoadMasterWorker 同步：差一个信号或一个参数，
+    对话框侧的 connect / 传参就当场异常。2026-11-18 加 force_full_load 与
+    consent_needed 时就是被这一点咬到的：报错点在 SearchDialog._load_master
+    里，看上去像产品改坏了，其实是桩过时——本来就该由套件先红。
+    """
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, list, str)
     refreshed = pyqtSignal(list, str)
+    consent_needed = pyqtSignal(str)
 
-    def __init__(self, force_refresh=False, mgr=None):
+    def __init__(self, force_refresh=False, mgr=None, force_full_load=False):
         super().__init__()
         self.mgr = mgr
+        self.force_full_load = force_full_load
 
     def start(self):
         self.finished.emit(True, MASTER, f"总表 {len(MASTER)} 家公司")
@@ -301,6 +309,88 @@ dlg = pool_dialogs.SearchDialog()
 _drain(0.2)
 _assert_eq(len(dlg._master), 100, "对话框拿到总表")
 _assert(dlg._pool_mgr is mgr, "对话框与总表共用同一个管理器（视图/索引同源）")
+
+# ════════════════════════════════════════════════════════════════════════════
+#  2b. 内存闸门同意出口：拦下要问、只问一次、两个答案各走各的路
+# ════════════════════════════════════════════════════════════════════════════
+_OrigBox = pool_dialogs.QMessageBox
+_asked = []
+
+
+class _AnswerBox:
+    """假 QMessageBox：把用户选择换成可控变量（无头环境不能真弹窗）。
+
+    Yes/No 两个常量必须从真的 QMessageBox 上搬：产品代码比的是
+    `box.exec() == QMessageBox.Yes`，自己编两个数字会让断言变成空跑。
+    """
+    Yes = _OrigBox.Yes
+    No = _OrigBox.No
+    Question = _OrigBox.Question
+    Warning = _OrigBox.Warning
+    Information = _OrigBox.Information
+    answer = _OrigBox.Yes
+
+    def __init__(self, parent=None):
+        self.text = ""
+
+    def setIcon(self, *a):
+        pass
+
+    def setWindowTitle(self, *a):
+        pass
+
+    def setText(self, t):
+        self.text = t
+        _asked.append(t)
+
+    def setStandardButtons(self, *a):
+        pass
+
+    def button(self, which):
+        class _B:
+            def setText(self, *a):
+                pass
+        return _B()
+
+    def exec(self):
+        return _AnswerBox.answer
+
+    @staticmethod
+    def warning(*a, **k):
+        # 拒绝对会走失败渲染，那里还有 QMessageBox.warning(…) 静态调用；
+        # 无头环境不能真弹，收到调用即算成功，返回一个合法按钮码
+        return _OrigBox.Ok
+
+    @staticmethod
+    def information(*a, **k):
+        return _OrigBox.Ok
+
+
+pool_dialogs.QMessageBox = _AnswerBox
+dlg._consent_asked = False
+dlg._on_consent_needed("本机可用内存约 0.2GB，而整理 738,734 家全表约需 2.9GB")
+_assert_eq(len(_asked), 1, "闸门拦下时问了用户一次（不是静默跳过）")
+_assert("738,734" in _asked[-1] and "秒开" in _asked[-1],
+        "问话里同时给出闸门原话和「只做一次」的关键信息")
+_assert(getattr(dlg._load_worker, "force_full_load", None) is True,
+        "点「现在就整理」后确实越闸重跑（force_full_load=True）")
+
+_asked.clear()
+dlg._on_consent_needed("再拦一次")
+_assert_eq(len(_asked), 0, "同一个对话框不重复骚扰（只问一次）")
+
+# 选「先不整理」：必须如实报未加载，绝不能装成加载成功
+_before = dlg._load_worker
+dlg._consent_asked = False
+_AnswerBox.answer = _OrigBox.No
+dlg._on_consent_needed("内存不够：测试文案")
+_assert("本轮未加载" in dlg.status_lbl.text(),
+        "拒绝对走失败渲染，状态行如实说明未加载")
+# 用对象身份而不是类型判断：后者在对象不是桩的时候会恒真（会说谎的断言）
+_assert(dlg._load_worker is _before,
+        "拒绝对没有另起一个越闸的加载线程")
+_AnswerBox.answer = _OrigBox.Yes
+pool_dialogs.QMessageBox = _OrigBox
 
 
 def _run_search(dlg, query, use_deepseek=False):

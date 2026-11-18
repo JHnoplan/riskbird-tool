@@ -1081,6 +1081,73 @@ _copied = [wf.stage_name(s) for s in wf.STAGES if wf.stage_name(s) in _ps_src]
 _assert(not _copied,
         f"会话层整份文件里不许再出现任何一级的手抄名字（一律走 stage_chain/stage_name）：{_copied}")
 
+# ⑥c 上面那条只量了会话层一份文件；同一把尺子要量到三个交付目录的全部代码，否则
+# 「层级名只许一处定义」就只是 parallel_session 一个地方的巧合（2026-11-18 自查就是在
+# GUI 与评分里抓出 6 处、引擎日志里抓出 2 处，全都是上一轮改命名时漏掉的）。
+# 判据用 ast 而不是全文匹配：docstring 里**引述**旧写法是在解释为什么不能这么写（本文件
+# 自己就有几处），把它们算成违约等于逼文档跟着口径一起改字——那是假阳性，会把门禁
+# 磨成没人敢开的摆设。真正的违约只有一种：会渲染给用户看的字符串常量。
+_TIER_NAMES = sorted(set(fe.TIER_LABEL.values()))
+
+
+def _o_scan_tiers(text, where):
+    """这份源码里有哪几处把层级名写死在了非 docstring 的字符串里。"""
+    import ast as _ast
+    _tree = _ast.parse(text)
+    _doc = set()
+    for _n in _ast.walk(_tree):
+        if isinstance(_n, (_ast.Module, _ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+            _b = getattr(_n, "body", None)
+            if _b and isinstance(_b[0], _ast.Expr) and isinstance(_b[0].value, _ast.Constant):
+                _doc.add(id(_b[0].value))
+    _out = []
+    for _n in _ast.walk(_tree):
+        if not (isinstance(_n, _ast.Constant) and isinstance(_n.value, str)) or id(_n) in _doc:
+            continue
+        for _nm in _TIER_NAMES:
+            if _nm in _n.value:
+                _out.append(f"{where}:{_n.lineno}「{_nm}」")
+                break
+    return _out
+
+
+def _o_tier_offenders():
+    """扫三个交付目录（只扫顶层代码：dist/ 里是打包产物与第三方库，不是我们的口径）。
+
+    排除两份：test_*（测试里要写断言字符串与反向对照）与 field_evidence.py（名字的主人）。
+    """
+    _root = Path(fe.__file__).resolve().parent.parent
+    _by_pkg, _out = {}, []
+    for _pkg in ("b2bcollect_build", "riskbird_build", "ali1688_build"):
+        _hit_n = 0
+        for _f in sorted((_root / _pkg).glob("*.py")):
+            if _f.name.startswith("test_") or _f.samefile(Path(fe.__file__)):
+                continue
+            _hit_n += 1
+            _out += _o_scan_tiers(_f.read_text(encoding="utf-8"), f"{_pkg}/{_f.name}")
+        _by_pkg[_pkg] = _hit_n
+    return _by_pkg, _out
+
+
+_o_by_pkg, _o_hits = _o_tier_offenders()
+_o_scan_n = sum(_o_by_pkg.values())
+_assert("/b2bcollect_build/" in Path(fe.__file__).as_posix()
+        and all(_o_by_pkg.values()) and _o_scan_n >= 100,
+        f"门禁确实量到了三个交付目录的顶层代码（{_o_by_pkg}，共 {_o_scan_n} 份，注册表取的是 "
+        f"{Path(fe.__file__).parent.name}）——路径错一个层级就会变成「扫了个空目录、永远绿」")
+_assert(not _o_hits,
+        f"除层级注册表本身，三份产物代码里没有任何一处把层级名手抄进会渲染的字符串"
+        f"（一律走 stage_name / TIER_LABEL）：{_o_hits}")
+# 反向对照：新门禁不能是个永远为真的空壳。明知违约的写法必须被点名，
+# docstring / 注释里的引述必须被放行——两边各测一次，才能说中间那条绿是量出来的。
+_assert(_o_scan_tiers('log("已标上「' + _TIER_NAMES[3] + '」层")\n', "probe.py"),
+        "反向对照：把层级名写死在日志串里，门禁要报出来（不报＝这条尺子是空跑的）")
+_assert(not _o_scan_tiers('"""历史写法叫「' + _TIER_NAMES[3] + '」，现在走 TIER_LABEL"""\n'
+                          'log("已标上「" + _fe.TIER_LABEL["registry"] + "」层")\n', "probe.py"),
+        "反向对照：docstring 里引述旧写法不算违约（否则文档与口径被迫一起改字）")
+_assert(_TIER_NAMES and all(_TIER_NAMES),
+        f"层级名非空且互不相同（{_TIER_NAMES}）——名字表空了上面两条都会假绿")
+
 # ⑦ 快照：三条都登记，且恢复时不许弹模态框
 snap = w._params_snapshot()
 for _k in ("waterfall", "lead_report", "reverify"):

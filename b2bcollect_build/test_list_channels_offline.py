@@ -531,9 +531,43 @@ for _col, _vals in (("手机号", ("13908060501", "13908060503", "13908060504", 
 check("文件里「数据来源」可追溯三路（合并后仍分得清来源）",
       all(p in str(_f1[_i["数据来源"][0]] or "") for p in ("企知道", "风鸟", "爱企查")),
       str(_f1[_i["数据来源"][0]]))
+# 兜底那一档走的是**接口 9 列、不成双**（2026-11-17 改口径：旧版兜底把同组 9 列填两遍，
+# 用户原话「数据乱」「导出不需要多余栏」）。上面这条旧断言却要求这里出现两块列头——
+# 它钉的是被删掉的旧写法，所以 2026-11-18 把它拆成两条各验各的：
+# 兜底不许成双，双块只在**真模板**里存在，且必须两块都不留空。
+check("无模板时表头就是接口那 9 列，同一组列不许重复成双块（兜底＝替客户臆造表结构）",
+      len(_hdr) == 9 and len(_i["手机号"]) == 1 and len(set(_hdr)) == 9, str(_hdr))
+# 双块那一路不能因为上面这条就没人管：客户把模板放进输出目录时，两块都得吃到同一份
+# 合并结果，第二块留空等于客户库导入少一半数据（这一格就是补那个覆盖空洞）。
+from openpyxl import Workbook as _WB                       # noqa: E402
+_TMPL = Path(tmp) / "客户库数据导入模板（双块）.xlsx"
+_wb3 = _WB()
+_wb3.active.append(["客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号",
+                    "数据来源", "外呼备注",
+                    "客户名称", "企业名称", "岗位", "手机号", "固话", "邮箱", "微信号",
+                    "数据来源", "备注"])
+_wb3.save(_TMPL)
+_clean2 = Path(tmp) / "企业数据_清洗后入库数据_双块模板.xlsx"
+check("客户模板在位时清洗后文件照样落盘", bool(s.export_cleaned_excel(str(_clean2), template_path=str(_TMPL))))
+_wb4 = load_workbook(_clean2, read_only=True)
+_g2 = [list(r) for r in _wb4.worksheets[0].iter_rows(values_only=True)]
+_wb4.close()
+_h2, _b2 = _g2[0], [r for r in _g2[1:] if any(r)]
+_j2 = {c: [k for k, v in enumerate(_h2) if v == c] for c in ("客户名称", "手机号", "邮箱", "数据来源")}
 check("双块列头都填了同一份合并结果（客户库导入两块都不留空）",
-      len(_i["手机号"]) == 2 and str(_f1[_i["手机号"][-1]] or "") == str(_f1[_i["手机号"][0]] or ""),
-      str([_f1[k] for k in _i["手机号"]]))
+      len(_h2) == 18 and all(len(_j2[c]) == 2 for c in _j2)
+      and all([str(v or "") for v in _r2[:9]] == [str(v or "") for v in _r2[9:18]] for _r2 in _b2)
+      and all(str(_r2[_j2["手机号"][k]] or "") for _r2 in _b2 for k in (0, 1)),
+      f"表头 {len(_h2)} 列；行样本：{_b2}")
+_g1 = next(r for r in _b2 if r[_j2["客户名称"][0]] == "公司1有限公司")
+check("双块里的手机号/邮箱仍是三路并集那一份（第二块不是另一套数据）",
+      all(v in str(_g1[_j2["手机号"][k]]) for k in (0, 1)
+          for v in ("13908060501", "13908060503", "13908060504", "13908060506"))
+      and all(v in str(_g1[_j2["邮箱"][k]]) for k in (0, 1)
+              for v in ("a@b.com", "c@d.com", "e@f.com", "g@h.com")),
+      f"{_g1[_j2['手机号'][0]]} | {_g1[_j2['手机号'][1]]} | {_g1[_j2['邮箱'][0]]}")
+check("两块的分界按模板走（外呼块用「外呼备注」、备注块用「备注」，不许串列）",
+      _h2[8] == "外呼备注" and _h2[17] == "备注" and len(_b2) == 2, str(_h2[8:9] + _h2[17:18]))
 check("清洗后表名保持「客户库」（入库模板兼容口径不变）", _sheet_title == "客户库", _sheet_title)
 check("原始表拼接三路产出（6 条都在，一条不丢）",
       len(s.snapshot_results()) == 6, str(len(s.snapshot_results())))

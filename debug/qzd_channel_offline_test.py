@@ -15,9 +15,15 @@ import time
 import types
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(BASE, "b2bcollect_build"), os.path.join(BASE, "riskbird_build")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# 本套件验的是 **b2bcollect 这一份产品**，而 customer_library_cleaner / task_registry /
+# yzd_client 在三个产品目录里各有一份（不同名目录、同名模块）。riskbird_build 只需要
+# 借出 block_guard / qizhidao_crawler / chrome_driver 那几份独有模块，因此它只能
+# **append**（排在后面），本目录才能 insert(0)。旧写法两个目录都 insert(0)，后插的
+# riskbird 反而抢到最前，于是并行层跑的是 riskbird 的清洗器与台账——那份组合任何
+# 一个交付产物里都不存在（同一个坑在 batch3 回归的 7a 那一格已经红过一次）。
+sys.path.insert(0, os.path.join(BASE, "b2bcollect_build"))
+if os.path.join(BASE, "riskbird_build") not in sys.path:
+    sys.path.append(os.path.join(BASE, "riskbird_build"))
 
 PASS, FAIL = [], []
 
@@ -32,6 +38,14 @@ def true(name, cond):
 
 # ══════════════════════════ A. parallel_session 看门狗 ══════════════════════════
 import parallel_session as ps                      # noqa: E402
+import customer_library_cleaner as _cl_q           # noqa: E402
+import task_registry as _tr_q                      # noqa: E402
+
+# 导对了哪一份产品必须自证（拿实现验实现永远测不出“哪天又被副本遮蔽”）
+for _nm, _mod in (("parallel_session", ps), ("customer_library_cleaner", _cl_q),
+                  ("task_registry", _tr_q)):
+    assert os.sep + "b2bcollect_build" + os.sep in _mod.__file__, \
+        f"导错产品的 {_nm}（被另一份同名副本遮蔽）：{_mod.__file__}"
 
 
 QZD = "qzd"          # N 路化后一切都按 slug 寻址（企知道只是其中的默认那一路）
@@ -313,12 +327,26 @@ try:
         q5 = _Q(attach_seq=("ok",), record={"法定代表人": "", "注册资本": "", "地址": ""},
                 results=[{"公司名": "旧公司", "电话": "13900000000"}])
         s5 = _session(["庚公司", "辛公司", "壬公司", "癸公司"], q5)
+        # 记下每次要求等待的秒数，但**照原样放行**给真 _list_wait（虚拟时钟下不占墙钟）：
+        # 只验「有没有给过这一次 180 秒窗口」，不把被验的等待函数换成替身
+        _waits5 = []
+        _real_wait5 = s5._list_wait
+        s5._list_wait = lambda secs, ch=None: (_waits5.append(float(secs)) or _real_wait5(secs, ch))
         s5._run_list_channel(QZD)
-        check("⑤ 连续 3 家空壳后停手", len(q5.queried), 3)
+        # 3 家空壳触发窗口 + 窗口后 1 家当恢复判据＝4 家收工。旧写法在窗口后把 streak
+        # 清零，于是还要再烧 gate 家才熄火（实跑 6 家）：白烧一倍名单换不来更多结论。
+        check("⑤ 空壳熄火＝连续 3 家＋窗口后只再拿 1 家当恢复判据", len(q5.queried), 4)
         check("⑤ 熄火标志置位", s5._rt(QZD)["halted"], True)
         true("⑤ 不关开关", s5.list_enabled[QZD])
         true("⑤ 承诺已补到的仍入库", any("仍照常入库" in m for m in s5.logs))
         true("⑤ 旧结果仍在导出（开关未关）", bool(s5._list_active(QZD)))
+        check("⑤ 给过一次恢复窗口（量级＝SHELL_RECOVERY_WAIT_S）",
+              sum(1 for v in _waits5 if v >= ps.SHELL_RECOVERY_WAIT_S), 1)
+        check("⑤ 窗口只给一次（日志与引导信号都不重复承诺）",
+              (sum(1 for m in s5.logs if "本轮只给这一次机会" in m),
+               sum(1 for n, a in s5.emits
+                   if n == "login_required_signal" and a and "详情空壳" in str(a[0]))),
+              (1, 1))
     finally:
         block_guard.is_shell_record = _shell_real
 
@@ -569,12 +597,20 @@ try:
         """「页面真打开了、正文也水合完成，但里面确实没有这家公司的链接」：
         这才是与断网不同形的那一种。备用方案里有一道 readyState + 正文规模的水合闸，
         替身必须过闸——否则会掉进 except 被当成链路异常（返回 None），用例就在
-        「假的失败」和「真的失败」之间分不清。"""
+        「假的失败」和「真的失败」之间分不清。
+        ⚠ 每一段 JS 要**按自己的身份**回答：2026-11-18 这一格对一切非 readyState 的 JS
+        一律回「正文×400」，把后加的可见弹层探测（CAPTCHA_OVERLAY_JS，真站无弹层时回空串）
+        也答成了「有个弹层」，于是「真查不到」被走成弹层等待分支、返回 None。替身猜内容
+        而不是认调用，就会把两种形状焊回同一种。"""
         def get(self, url):
             pass
 
         def execute_script(self, js):
-            return "complete" if "readyState" in js else ("正文" * 400)
+            if "readyState" in js:
+                return "complete"
+            if js == block_guard.CAPTCHA_OVERLAY_JS:
+                return ""                      # 这一页上没有验证弹层
+            return "正文" * 400
 
         def find_elements(self, by, value):
             return []
@@ -582,6 +618,26 @@ try:
     c12.driver = _EmptyDriver()
     check("⑫ 页面正常但没这家公司→仍返回空串（两种情形不同形）",
           c12._get_hash_via_search("甲公司"), "")
+
+    class _OverlayDriver(_EmptyDriver):
+        """腾讯验证码弹层正挡在结果区上面：URL/标题/正文长度都不变，只有第 4 层探测看得到。
+        这一形必须与上面那一格分形：回空串会被上层记成「真查不到」永久丢弃（实机一轮 175 家）。"""
+        def execute_script(self, js):
+            if js == block_guard.CAPTCHA_OVERLAY_JS:
+                return "验证码弹层已可见"
+            return _EmptyDriver.execute_script(self, js)
+
+    c12.driver = _OverlayDriver()
+    c12._wait_unblock = lambda *a, **k: False      # 等人过验证没等到：不许记「查不到」
+    # 两个原因字段要先归零：上一格（断网、真查不到）留的值还在实例上，不清就会拿
+    # 「上一格的现场」当「这一格的行为」来断言（验的是内存，不是代码）
+    c12._hash_fail_reason = c12._last_fail_reason = ""
+    check("⑫ 有弹层挡着时绝不返回空串（那是把拦成记成查不到）",
+          c12._get_hash_via_search("甲公司"), None)
+    check("⑫ 弹层那一格的原因要说得出是弹层没解除",
+          "验证弹层" in str(getattr(c12, "_hash_fail_reason", "")), True)
+    check("⑫ 弹层不写「搜索页无该公司链接」那一格（两种病不同处方）",
+          not str(getattr(c12, "_last_fail_reason", "")).startswith("搜索页无该公司链接"), True)
 
     # ⑬ search_company 分流：None → 可重采；"" → 真查不到（不带可重采）
     def _mk13(hash_ret):

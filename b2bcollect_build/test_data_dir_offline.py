@@ -54,8 +54,13 @@ import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-for p in (str(HERE), str(HERE.parent / "riskbird_build"), str(HERE.parent / "ali1688_build")):
-    sys.path.insert(0, p)
+# 本目录 insert(0)、隔壁两个目录 append：下面要借读 riskbird 的 qizhidao_crawler 与
+# ali1688 的 ali1688_crawler，但 customer_library_cleaner / task_registry / yzd_client
+# 三份都是同名不同物的副本——循环里统一 insert(0) 会让最后一个目录（ali1688）抢到最前，
+# 这一整棵落点链路就跑在隔壁产物的副本上（同型缺陷：⑦a 那一格）。
+sys.path.insert(0, str(HERE))
+for p in (str(HERE.parent / "riskbird_build"), str(HERE.parent / "ali1688_build")):
+    sys.path.append(p)
 
 import cdp_base                # noqa: E402
 import site_adapters           # noqa: E402
@@ -66,6 +71,16 @@ import audit_logger            # noqa: E402  (第 6 节：运行期文件的默�
 import mapping_recommender     # noqa: E402  (第 6 节：同上，两个消费者共用一份口径)
 import tool_config             # noqa: E402  (第 6 节：落点口径本体，按名字改它来演故障)
 import deepseek_expander       # noqa: E402  (第 7 节：口径模块没加载时的退路落点)
+import customer_library_cleaner as _cl_dd                          # noqa: E402
+import task_registry as _tr_dd                                     # noqa: E402
+
+# 导对了哪一份产品当场自证：隔壁目录只用来借读 runtime_paths / qizhidao_crawler 那几份
+# 独有模块；同名副本（清洗器 / 台账 / 上传客户端）必须是本目录那一份，否则这一棵落点树
+# 验的是另一个产物。
+for _nm, _mod in (("cdp_base", cdp_base), ("customer_library_cleaner", _cl_dd),
+                  ("task_registry", _tr_dd)):
+    assert "b2bcollect_build" in _mod.__file__, \
+        f"导错产品的 {_nm}（被隔壁同名副本遮蔽）：{_mod.__file__}"
 
 TMP = Path(tempfile.mkdtemp(prefix="b2bdir_"))
 FAKE_HOME = TMP / "home"
@@ -1344,7 +1359,7 @@ def _fn_body_dump(fn):
 
 _cdp_cls = cdp_base.CdpSiteCrawler
 _a16_cls = ali1688_crawler.Ali1688Crawler
-for _fname in ("_page_tail", "_has_any_contact", "_entry_locked", "_seen_store_pending",
+for _fname in ("_page_tail", "_page_repeat", "_has_any_contact", "_entry_locked", "_seen_store_pending",
                "_relevance_revision", "_stale_filtered", "_stale_filtered_keys", "_locked_keys"):
     check(f"14a {_fname} 两边的函数体逐字同构（改一处的说法必须两边一起改）",
           _fn_body_dump(getattr(_cdp_cls, _fname)) is not None

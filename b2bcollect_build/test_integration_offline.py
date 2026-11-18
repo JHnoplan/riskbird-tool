@@ -685,6 +685,17 @@ def test_gui_defaults():
         w._restore_site_checks(list(SITE_ORDER))
         assert not _pops, f"程序化恢复勾选态弹了 {len(_pops)} 个模态框（该屏蔽信号）"
         assert w.site_checks["1688"].isChecked() is True, "回填要把 1688 恢复成上次的勾选态"
+        # 启动静默回填路径（reset_1688=True）：1688 恒回默认不勾，其余照快照恢复；
+        # 上次快照里真有 1688 时必须打一条日志说明（文案就地发出，不打哑改）。
+        _slog = []
+        _real_log = w._on_log
+        w._on_log = lambda m: (_slog.append(m), _real_log(m))[1]
+        w.site_checks["1688"].setChecked(True)
+        w._restore_site_checks(list(SITE_ORDER), reset_1688=True)
+        w._on_log = _real_log
+        assert w.site_checks["1688"].isChecked() is False, "静默回填后 1688 恒不勾"
+        assert any("1688" in m and "手动勾选" in m for m in _slog), "重置 1688 必须打日志说明"
+        assert any(c.isChecked() for c in w.site_checks.values()), "重置只碰 1688，多平台不受连坐"
         w._restore_site_checks([s for s in SITE_ORDER if s != "1688"])
         assert w.site_checks["1688"].isChecked() is False
         w._restore_site_checks([])          # 老快照没记站点：不许把平台全关掉
@@ -719,6 +730,245 @@ def test_gui_defaults():
     # 同一条纪律与成因见硬门第 21 条、test_site_enrich_offline.py 末尾那段。
     w.hide()
     w = None
+
+
+# ── 6.8b 两道静态门的模块清单：幻影调用与实参个数共用**同一份**，免得一处加了
+# 模块、另一处漏扫（这一族「同一个判据两份实现只修一份」已经吃过多次）。
+# riskbird 侧那五个是名单通道的真身，列进来前逐个用 AST 判过顶层只有
+# docstring/定义/常量：2026-11-18 曾因「遍历目录 import」触发 26 个 debug_*.py 顶层
+# 裸执行、真的开浏览器跑起采集，所以清单只能逐条判定后手写，绝不用 glob 扫目录。
+_GATE_MODULES = [
+    "parallel_session", "pending_companies", "cdp_base", "data_pool",
+    "pool_store", "search_suggest", "local_scan", "site_adapters",
+    "pool_dialogs", "b2bcollect_gui",
+    "aiqicha_crawler_v2", "riskbird_crawler", "dual_session", "chrome_driver",
+    "runtime_paths",
+]
+
+
+def _iter_gate_classes():
+    """产出 (模块名, 类名, 类对象)：只交本模块自己定义的类，re-export 在它那一边扫。"""
+    import importlib
+
+    for modname in _GATE_MODULES:
+        mod = importlib.import_module(modname)      # 导入失败就是交付问题，不静默跳过
+        for cname, cls in sorted(vars(mod).items()):
+            if not isinstance(cls, type):
+                continue
+            if cls.__module__ != modname:
+                continue
+            yield modname, cname, cls
+
+
+def _phantom_self_calls(cls):
+    """这一类里被当成 `self.X(...)` 调用、却既不是实例属性、也不在真 MRO 上的名字。
+
+    为什么要有这一条（2026-11-18 同一轮真机+扫全查出两枚）：`aiqicha_crawler_v2` 里
+    三处调 `self._navigate(...)`、`b2bcollect_gui` 里一处调 `self._log(...)`，而两个类
+    都没有这些方法——前者让「百度跳板」这条退路一次也没真跑过，后者让「欠登录」横幅
+    根本弹不出来。这类缺陷在离线全绿、在真机才炸，因为从来没人要求「被调的那个方法
+    得真的存在」。
+
+    两条为了不误工而设的规则（都是本轮真实踩过的形）：
+      · 用 `hasattr` 走**运行时 MRO**，不做纯静态比对：Qt 基类与混入（如
+        `class AiqichaSite(_ListChannelBase, AiQiChaCrawlerV2)`）能自然解出来；
+      · 基类自己缺、但**每一个子类都有**的，是抽象契约不是 bug（如
+        `_ListChannelBase.check_login` 住在爬虫基类里），只有「子类也接不住」才判红。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cls)))
+    called, assigned = set(), set()
+
+    def _collect(node):
+        """只走本类自己的代码：遇嵌套类就停（那一格里的是它的 self，不是本类的）。"""
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) \
+                    and isinstance(child.func.value, ast.Name) and child.func.value.id == "self":
+                called.add(child.func.attr)
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) \
+                    and child.value.id == "self" and isinstance(child.ctx, ast.Store):
+                assigned.add(child.attr)
+            _collect(child)
+
+    _collect(tree.body[0])
+
+    def _covered_by_subclasses(name):
+        subs = cls.__subclasses__()
+        if not subs:
+            return False
+        return all(_covered_by_subclasses_or_has(s, name) for s in subs)
+
+    out = []
+    for name in sorted(called - assigned):
+        if hasattr(cls, name) or _covered_by_subclasses(name):
+            continue
+        out.append(name)
+    return out
+
+
+def _covered_by_subclasses_or_has(sub, name):
+    if hasattr(sub, name):
+        return True
+    kids = sub.__subclasses__()
+    return bool(kids) and all(_covered_by_subclasses_or_has(s, name) for s in kids)
+
+
+def test_no_phantom_self_calls():
+    """交付链上的每个类：不许调自己根本没有的方法（真机才炸的那一族）。"""
+    scanned, bad = 0, []
+    for modname, cname, cls in _iter_gate_classes():
+        scanned += 1
+        for name in _phantom_self_calls(cls):
+            bad.append(f"{modname}.{cname}.{name}")
+    assert scanned >= 60, f"扫到的类太少，这条判据就是在空跑：{scanned}"
+    assert not bad, f"产品在调本类没有的方法（走到就是 AttributeError）：{bad}"
+    # 反向对照：判据自己不能是空跑——造一个调不存在方法的类，必须被点名
+    class _ProbePhantom:
+        def f(self):
+            self._probe_phantom_leg()
+
+    assert _phantom_self_calls(_ProbePhantom) == ["_probe_phantom_leg"], \
+        "幻影调用判据失效（造出来的假方法却没抓到）"
+    ok(f"幻影调用归零：扫了 {scanned} 个类，每个 self.X(...) 都能解析到真方法/真属性")
+
+
+def _arity_mismatch_self_calls(cls):
+    """这一类里 `self.X(...)` 的实参形状与 X 的签名对不上的地方。
+
+    为什么幻影门还不够（2026-11-18 当场撞出来的）：幻影门只问「方法存不存在」，
+    不问「存在的那个方法你传对了吗」。本轮收尾脚本调 `ch._close_tab()` 少传一个
+    `ws_url`，产品签名是 `_close_tab(self, ws_url)` —— 走到就是 TypeError，和外层
+    `except Exception` 吞掉后的静默失效同一族。名字对、参数错，同样是真机才炸。
+
+    四条「不误工」规则，每一条都是原型真真实实误报过的形状：
+      · **剥掉签名里的 self/cls**：从类上 getattr 拿到的是未绑定函数，签名带着首参，
+        不剥就会把每个必传参数算多一个（原型第一版全仓报出几十条就是这么来的）；
+      · **关键字实参能填必传位置参数**：`self._do_search(query, use_deepseek=False)`
+        只占 1 个位置实参但两个参数都齐，只数 node.args 会把全仓关键字调用报成缺参；
+      · **`*args` / `**kwargs` 一律放过**：本仓真实存在 `def _wait_unblock_limited(self,
+        reason, **kw)` 这类透传签名，报「签名里没有这个关键字」是冤枉；
+      · **行号换算成绝对行号**：ast.parse 类源码时会从 1 重数，不换算会把人指到错的行
+        （实测类内 513 行的调用在文件里是 2086 行）。
+    解析失败一律往上抛：一条解析不动的判据看起来和「真干净」一模一样，
+    原型第一版就是这样把 62 个类全数跳过还打了绿灯。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    src = inspect.getsource(cls)
+    # 行号换算：ast.parse 一段类源码会从 1 重数。偏移量只能问「这个类在文件里从第
+    # 几行起」，别去片段里找 `class ` 那一行——getsource 交回来的片段本来就以它开头，
+    # 找到的下标永远是 0，等于没加（上一版报 652 行、真实 725 行就是这么错的）。
+    offset = inspect.getsourcelines(cls)[1] - 1
+    tree = ast.parse(textwrap.dedent(src))
+    out = []
+
+    def _signature(name):
+        """返回可判的 (必传数, 位置参数总数, 参数名集合, 有无 **kw)；拿不到回 None。"""
+        try:
+            fn = getattr(cls, name)
+        except AttributeError:
+            return None                       # 名字不存在由幻影门管，这里不重复报
+        if isinstance(fn, property) or not callable(fn):
+            return None
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return None                       # C 实现/装饰器伪装，静态数不出来就放过
+        ps = list(sig.parameters.values())
+        if ps and ps[0].name in ("self", "cls") \
+                and ps[0].kind in (ps[0].POSITIONAL_ONLY, ps[0].POSITIONAL_OR_KEYWORD):
+            ps = ps[1:]                       # 剥掉未绑定的首参
+            sig = sig.replace(parameters=ps)
+        if any(p.kind == p.VAR_POSITIONAL for p in ps):
+            return None
+        return (sum(1 for p in ps if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    and p.default is inspect.Parameter.empty),
+                sum(1 for p in ps if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)),
+                {p.name for p in ps},
+                any(p.kind == p.VAR_KEYWORD for p in ps))
+
+    def _check(node):
+        got = _signature(node.func.attr)
+        if got is None:
+            # 上面那五个「判不出形状」的分支都回 None：在这里直接放过。
+            # （第一版没这一句，四元解包 None 直接把 22 个类全报成解析失败——
+            # 判据自己带崩比判据空跑还好查，因为它响；但不能拿响声当结论。）
+            return None
+        req, total_pos, names, has_var_kw = got
+        given = len(node.args)
+        kws = {k.arg for k in node.keywords if k.arg}
+        covered = given + len([n for n in names if n in kws])
+        if covered < req:
+            miss = sorted(kws) if kws else []
+            return (f"只给了 {given} 个位置实参"
+                    + (f"、关键字 {miss}" if miss else "（没有关键字实参）")
+                    + f"，仍不够签名的 {req} 个必传参数")
+        if given > total_pos:
+            return f"给了 {given} 个位置实参，签名最多接受 {total_pos} 个"
+        if not has_var_kw:
+            for kn in sorted(kws - names):
+                return f"传了签名里没有的关键字参数 {kn}"
+        return None
+
+    def _walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                continue        # 嵌套类里的 self 不是本类的
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) \
+                    and isinstance(child.func.value, ast.Name) \
+                    and child.func.value.id == "self" and isinstance(child.func.attr, str):
+                if not any(isinstance(a, ast.Starred) for a in child.args) \
+                        and not any(k.arg is None for k in child.keywords):
+                    why = _check(child)
+                    if why:
+                        out.append((child.func.attr, child.lineno + offset, why))
+            _walk(child)
+
+    _walk(tree.body[0])
+    return out
+
+
+def test_no_arity_mismatch_self_calls():
+    """交付链上的每个类：`self.X(...)` 的实参形状必须对得上 X 的签名。"""
+    scanned, bad, broken = 0, [], []
+    for modname, cname, cls in _iter_gate_classes():
+        scanned += 1
+        try:
+            issues = _arity_mismatch_self_calls(cls)
+        except Exception as e:
+            # 解析不动 = 这条判据对这个类根本没生效，必须算红线而不是跳过
+            broken.append(f"{modname}.{cname} 解析失败 {type(e).__name__}: {e}")
+            continue
+        for name, lineno, why in issues:
+            bad.append(f"{modname}.{cname} 第{lineno}行 self.{name}(...)：{why}")
+    assert scanned >= 60, f"扫到的类太少，这条判据就是在空跑：{scanned}"
+    assert not broken, f"实参判据自身解析失败（等于没判）：{broken}"
+    assert not bad, f"实参形状与签名不符（走到就是 TypeError）：{bad}"
+    # 反向对照：抓 1 放过 2 —— 既证有牙，又证不冤枉两种合法形状
+    class _ProbeArity:
+        def needs_two(self, a, b):
+            return a, b
+
+        def kwargs_ok(self, reason, **kw):
+            return reason
+
+        def call_it(self):
+            self.needs_two(1)                # 少一个必传参数：必须被抓
+            self.needs_two(1, b=2)           # 关键字填上：必须放过
+            self.kwargs_ok("r", max_wait=30)  # **kw 透传：必须放过
+
+    probe = _arity_mismatch_self_calls(_ProbeArity)
+    assert len(probe) == 1 and probe[0][0] == "needs_two", \
+        f"实参判据不准（应恰好抓 1 放过 2）：{probe}"
+    ok(f"实参形状归零：扫了 {scanned} 个类，每个 self.X(...) 都对得上签名"
+       f"（反向对照抓 1 放过 2 已验）")
 
 
 # ── 6.9 状态行读数保真：线程崩了不许永远报「推进中」 ────────────
@@ -768,6 +1018,8 @@ def main():
         test_pure_http_tab_gate()
         test_gongchang_site()
         test_site_status_truthful()
+        test_no_phantom_self_calls()
+        test_no_arity_mismatch_self_calls()
         test_gui_defaults()
     print(f"\n全部通过：{len(PASS)} 组断言")
 

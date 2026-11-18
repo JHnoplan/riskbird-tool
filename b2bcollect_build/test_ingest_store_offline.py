@@ -1059,6 +1059,48 @@ _assert_eq(_paren["company"], "上海某工程有限公司（筹）",
 _ltd, _r3, _ = clean_one({"company": "3M Company.", "phones": ["13800003333"]})
 _assert_eq(_ltd["company"], "3M Company", "英文缩写式句点也清掉，实体保留")
 
+# ── 字段级清洗七类实机脏点（2026-11-17 导出文件取证；入库前即拦，不等导出）──
+# ①联系人尾缀「详细」
+_c1, _c1r, _c1fx = clean_one({"company": "东莞某五金有限公司", "phones": ["13800006666"],
+                              "contacts": [{"name": "张喜泉 详细", "title": "经理"}]})
+_assert_eq(_c1["contacts"][0]["name"], "张喜泉", "联系人尾缀「详细」入库前即剥掉")
+_assert_eq(_c1fx.get("联系人尾缀清理"), 1, "尾缀清理计入修复报告")
+# ②号码上下文碎片「姓 名」+ 同号多变体去重
+_c2, _, _c2fx = clean_one({"company": "佛山某照明有限公司",
+                           "phones": ["13557695557 姓 名", "13557695557姓名", "13900007777"]})
+_assert_eq(_c2["phones"], ["13557695557", "13900007777"],
+           "号码剥「姓 名」碎片后同号归一（变体不重复占列）")
+_assert_eq(_c2fx.get("号码上下文碎片剥离"), 1, "碎片剥离计入修复报告")
+# ③验证码文本进邮箱：整段上下文含 @ 也过不了完整格式硬闸
+_c3, _, _ = clean_one({"company": "杭州某贸易有限公司", "phones": ["13800008888"],
+                       "emails": ["内 容: sales@demo.com,内容: 已发送", "real@corp.cn"]})
+_assert_eq(_c3["emails"], ["real@corp.cn"],
+           "验证码上下文串被邮箱格式硬闸拦住，真邮箱保留")
+# ④官网/地址混合串拆解
+_c4, _, _c4fx = clean_one({"company": "苏州某机械有限公司", "phones": ["13800009999"],
+                           "website": "官网:https://www.demo-mach.com | 地址:苏州工业园区 | 主营:数控机床",
+                           "address": "官网:https://www.demo-mach.com | 地址:苏州工业园区 | 主营:数控机床"})
+_assert_eq(_c4["website"], "https://www.demo-mach.com", "官网混合串抠出真 URL")
+_assert_eq(_c4["address"], "苏州工业园区", "地址混合串取「地址:」段")
+# ⑤来源名当主营 / 文件名当主营 / 展会名与文章标题当主营
+_src = "外部导入:11.10光伏储能.xlsx / 1688"
+for _dirty, _why in [
+    ("11.10光伏储能.xlsx", "文件名当主营"),
+    ("1688", "来源名当主营"),
+    ("2026上海国际光伏展览会", "展会名当主营"),
+    ("你知道光伏组件怎么选吗？", "文章标题当主营"),
+    ("Master V7 ·G2·", "批次名当主营"),
+]:
+    _cd, _, _ = clean_one({"company": "宁波某光伏有限公司", "phones": ["13800011111"],
+                           "products": _dirty, "source": _src})
+    _assert_eq(_cd["products"], "", f"{_why}入库前清除  ({_dirty!r})")
+_cp, _, _ = clean_one({"company": "宁波某光伏有限公司", "phones": ["13800022222"],
+                       "products": "光伏组件、储能电池、逆变器", "source": _src})
+_assert_eq(_cp["products"], "光伏组件、储能电池、逆变器", "真主营原样保留（不误杀）")
+# 幂等：清洗过的记录再走一遍零改动（不越洗越乱）
+_c5, _, _c5fx = clean_one(dict(_c4))
+_assert_eq(_c5fx, {}, "已清洗记录二次入库零修复（幂等）")
+
 # 全量取证：以 . ! ? 收尾的原始名称里，捷克 s.r.o.、欧洲品牌 "Ecrowd!"
 # 这类是真名——判据只看全角句标点与分号，绝不用 ASCII 标点判散文
 for _keep in ["Ecrowd!", "Nabach Wir machen Was!", "ABCO expert s.r.o.",
@@ -1511,8 +1553,524 @@ _assert_eq(len(_offline_master), 1,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-print("\n═══ 15. 清理 ═══")
-for st in (store, store2, store3):
+print("\n═══ 15. 秒开身份链：令牌 / 懒采纳 / 闸门（每条反向判据都配对照）═══")
+
+# 这一段买的是「秒开」这条命：三段身份链（缓存文件字节 → master_fp.json 指纹
+# → 视图 meta）任何一段静默断裂都不报错、不写日志，只表现为「为什么还是加载
+# 很久」。本仓已经为它踩过三次（0 or -1 掐断删除向量判据、令牌没落盘、闸门
+# 装在花钱之后），而上面 14 段一处都没覆盖——最脆弱的链路留在测试盲区里，
+# 修多少次都可能在下次改动中静默复发。
+# 写法上的硬要求：每条「破坏后必须拒绝」的反向判据，后面都紧跟一条「还原后
+# 必须成立」的正向对照。没有对照的反向判据是假的——恒假的判据既能通过「篡改
+# 后返回假」，也能通过「一切正常时返回假」，等于什么都没测。
+from data_pool import LazyMaster, MASTER_FP_FILE, _tok_num
+from local_scan import PoolIndex
+
+_assert_eq(_tok_num({"count": 0, "crc": 0}, "count", -1), 0,
+           "_tok_num：0 是合法常态（绝大多数用户没有剔除标记），不能读成 -1")
+_assert_eq(_tok_num({"count": None}, "count", -1), -1,
+           "_tok_num：只有字段缺失才回默认值")
+_assert_eq(_tok_num({"count": "abc"}, "count", -1), -1,
+           "_tok_num：坏值回默认值，而不是抛异常打断整条采纳链")
+_assert_eq(_tok_num({}, "count", 7), 7,
+           "_tok_num：默认值由调用方给（拿不准的方向一律保守）")
+
+# ── 正向基线：全量重建 → 令牌落盘 → 第二次打开只走秒开，一条记录都不读 ──
+# 数据集段内自建，不复用前面那批 oss 对象：上一版直接拿模块级的 ``oss``，
+# 结果被其它段落往同一变量里追加的 2 条上传污染（100 变 102）。把条数绑到
+# 别的段落的副作用上，等于埋一颗「下次谁再改谁就莫名红」的地雷。
+oss_l = FakeOSS()
+_recs_l = ([_rec(f"秒开国内公司{i}有限公司", products="光伏逆变器",
+                 address="浙江省宁波市", mobiles=[f"139000{i:05d}"],
+                 source="秒开测试表.xlsx", source_user="alice")
+            for i in range(60)]
+           + [_rec(f"Lazy Buyer {i} Ltd", products="solar mounting",
+                   country="Spain", address="Madrid", emails=[f"l{i}@x.com"],
+                   source="秒开海外站.xlsx", source_user="bob")
+              for i in range(40)])
+oss_l.objects["users/alice/upload_lazy_1.json"] = {
+    "username": "alice", "records": _recs_l[:60]}
+oss_l.objects["users/bob/upload_lazy_2.json"] = {
+    "username": "bob", "records": _recs_l[60:]}
+
+mgr_l = _mk_mgr(oss_l)
+_master_l = mgr_l.get_merged_master()
+_assert_eq(len(_master_l), 100, "秒开基线：首次全量重建 100 条")
+_assert(not isinstance(_master_l, LazyMaster),
+        "首次全量重建拿到的是真 list（此刻还没有视图，只能读表）")
+_token_path = os.path.join(mgr_l._cache_dir, MASTER_FP_FILE)
+_assert(os.path.exists(_token_path),
+        "全量重建后身份令牌必须落盘：缺它等于每台机器都要再付一次整体解析")
+_assert(mgr_l.sync_store(), "秒开基线：视图构建成功")
+
+mgr_l2 = DataPoolManager(oss_client=oss_l, cache_dir=mgr_l._cache_dir)
+_lazy = mgr_l2.get_merged_master()
+# 下面两条都走 getattr 而不是直接读属性：采纳一旦回归，“第二次打开”拿到的是真
+# list，直接写 _lazy.materialized 会 AttributeError 把整个脚本打断——回归报告
+# 中途崩溃等于只给你前几行，后面的判据全看不到（变异探针实测就是这样）。
+_lazy_mat = getattr(_lazy, "materialized", "<非懒态>")
+_assert(mgr_l2.master_is_lazy(), "同一份缓存第二次打开：采纳懒代理，不解析总表")
+_assert(isinstance(_lazy, LazyMaster), "get_merged_master 返回的就是 LazyMaster")
+_assert(_lazy_mat is False, "秒开后 materialized 为假：一条记录都没进内存")
+_assert_eq(len(_lazy), 100, "懒态也能答对条数（数字来自令牌，不来自读表）")
+_assert(bool(_lazy), "懒态真值判断成立（「还没读」绝不能被当成「没数据」）")
+_assert_eq(mgr_l2.store_view_count(), 100,
+           "「池子有多大」走视图 meta：不扫全表也不物化")
+_norm_hit = next((r["company_norm"] for r in _master_l
+                  if r.get("company") == "秒开国内公司0有限公司"), "<没找到>")
+_assert(_norm_hit == "秒开国内公司0有限公司",
+        "点查用的主键就是预期那一家（归一化口径对得上，不是蒙对的）")
+_rec_hit = mgr_l2.get_record_by_norm(_norm_hit)
+_assert(_rec_hit is not None and _rec_hit.get("company_norm") == _norm_hit,
+        "懒态点查命中视图主键（不为了查一条把整张总表搬回内存）")
+_assert(getattr(_lazy, "materialized", "<非懒态>") is False,
+        "点查之后仍未物化：这里曾是 6.2GB 的入口（视图抖动 → 回落全表）")
+_assert(mgr_l2.get_record_by_norm("查无此公司有限公司") is None,
+        "懒态点查未命中如实返回 None（不拿 None 当「读表失败」的信号）")
+
+# ── 反向 1：删除向量身份与令牌不符（就是当年 0 or -1 那一格的位置）──
+_token_raw = open(_token_path, encoding="utf-8").read()
+_t = json.loads(_token_raw)
+_t["tomb"]["count"] = int(_t["tomb"]["count"]) + 1
+json.dump(_t, open(_token_path, "w", encoding="utf-8"))
+_assert(not DataPoolManager(oss_client=oss_l,
+                            cache_dir=mgr_l._cache_dir).try_adopt_cached_view(),
+        "反向：剔除标记数量与令牌不符 → 拒绝采纳（不拿旧视图当新数据）")
+open(_token_path, "w", encoding="utf-8").write(_token_raw)
+_assert(DataPoolManager(oss_client=oss_l,
+                        cache_dir=mgr_l._cache_dir).try_adopt_cached_view(),
+        "还原后采纳必须成立（防空跑：上一条 FAIL 不是因为判据恒假）")
+
+# ── 反向 2：令牌文件整体缺失 → 连 _adopt_lazy_master 都不许成立 ──
+# （这一条同时看住补写入口：pkl 缓存流式补不出指纹，就必须老实返回假，
+#   绝不「补不出来却装作补出来了」，也绝不顺手破坏旧令牌文件）
+shutil.move(_token_path, _token_path + ".bak")
+_assert(not DataPoolManager(oss_client=oss_l,
+                            cache_dir=mgr_l._cache_dir)._adopt_lazy_master(),
+        "反向：令牌文件缺失 → 不走纯令牌秒开")
+_assert(os.path.exists(_token_path + ".bak"),
+        "补写路径不许删除或覆盖既有令牌文件（宁可不用，不可损坏）")
+shutil.move(_token_path + ".bak", _token_path)
+_assert(DataPoolManager(oss_client=oss_l,
+                        cache_dir=mgr_l._cache_dir)._adopt_lazy_master(),
+        "令牌文件还原后秒开恢复（这一条才是上一条 FAIL 的解释权）")
+
+# ── 反向 3：缓存文件被别的进程改写过 → 文件身份段必须否决 ──
+_pkl = os.path.join(mgr_l._cache_dir, "master.pkl")
+_assert(os.path.exists(_pkl),
+        "缓存文件身份基线：master.pkl 在（本套件的总表缓存落在 pkl 上）")
+_pkl_size = os.path.getsize(_pkl)
+with open(_pkl, "ab") as _fh:
+    _fh.write(b"\n")
+_assert(not DataPoolManager(oss_client=oss_l, cache_dir=mgr_l._cache_dir)
+        ._token_cache_file_matches(json.loads(_token_raw)),
+        "反向：缓存文件多一个字节 → 令牌的文件身份段否决")
+with open(_pkl, "r+b") as _fh:
+    _fh.truncate(_pkl_size)
+_assert(DataPoolManager(oss_client=oss_l, cache_dir=mgr_l._cache_dir)
+        ._token_cache_file_matches(json.loads(_token_raw)),
+        "字节还原后文件身份判据重新成立（防恒假）")
+
+# ── PoolIndex：闸门必须装在花钱之前（搜索采购商比对是第二个 6.2GB 现场）──
+POOL_RECS = [{"company_norm": f"池内公司{i}有限公司",
+              "company": f"池内公司{i}有限公司"} for i in range(100)]
+
+
+class _GateSpy:
+    """假 manager：把 PoolIndex 的调用顺序如实录下来——顺序本身就是判据。
+
+    「先问闸门还是先读表」在结果上完全看不出来（两种写法最后都能给出一个
+    ready 标志），只能靠调用序列判定。上一版就是把闸门写在 ``if not real``
+    里面，而真正贵的是它前面那行 materialize_master()：门装在花钱之后等于
+    没装，而且测试照样全绿。
+    """
+
+    def __init__(self, view_count, room):
+        self.calls = []
+        self._view_count = view_count
+        self._room = room
+        self._by_norm = {r["company_norm"]: r for r in POOL_RECS}
+
+    def store_view_count(self):
+        self.calls.append("view_count")
+        return self._view_count
+
+    def master_memory_room(self):
+        self.calls.append("room")
+        return self._room
+
+    def materialize_master(self):
+        self.calls.append("materialize")
+        return POOL_RECS
+
+    def _read_master_records(self):
+        self.calls.append("read_records")
+        return POOL_RECS
+
+    def store_ready(self):
+        return self._view_count is not None and self._view_count > 0
+
+    def get_record_by_norm(self, norm):
+        self.calls.append("get")
+        return self._by_norm.get(str(norm or ""))
+
+
+_spy_blocked = _GateSpy(None, (False, "本机可用内存不够把全部数据读进来（模拟）"))
+idx_blocked = PoolIndex(_spy_blocked)
+_assert_eq(_spy_blocked.calls, ["view_count", "room"],
+           "闸门在两个物化入口之前就被问到（调用序列是唯一能看出来的判据）")
+_assert(not idx_blocked.ready and "内存" in idx_blocked.error,
+        "拦下时带着原因停下，而不是静默给一个空索引")
+_assert(not idx_blocked.contains("池内公司7有限公司"),
+        "比对不了就统一答「不在」：只影响提示文案，绝不据此取消勾选（漏传才是事故）")
+
+_spy_full = _GateSpy(None, (True, ""))
+idx_full = PoolIndex(_spy_full)
+_assert(idx_full.ready and idx_full.size == 100,
+        "正向对照：闸门放行时全量 norm 集合照样建得起来")
+_assert("materialize" in _spy_full.calls or "read_records" in _spy_full.calls,
+        "放行时确实调了物化入口（否则上一条的成立是假的）")
+_assert(idx_full.contains("池内公司7有限公司")
+        and not idx_full.contains("查无此公司有限公司"),
+        "退回路径的点查口径与视图一致（同一判据两套实现不许分叉）")
+
+_spy_view = _GateSpy(100, (True, ""))
+idx_view = PoolIndex(_spy_view)
+_assert(idx_view.ready and idx_view.size == 100,
+        "视图就绪：池子规模直接来自 meta，打开对话框就能报出家数")
+_assert("room" not in _spy_view.calls and "materialize" not in _spy_view.calls,
+        "视图就绪时既不问闸门也不物化（秒开比对全程有界内存）")
+_assert(idx_view.contains("池内公司7有限公司")
+        and not idx_view.contains("查无此公司有限公司"),
+        "视图路径按主键点查：命中与未命中都对")
+_assert(not idx_view.contains(""),
+        "空 norm 一律答不在（不拿空串去撞主键，也不因此读全表）")
+
+# ── 第三个 6.2GB 现场：剔除对话框的关键字查找（视图抖动 → 退回扫全表）──
+# 懒采纳下视图本来就同源就绪，所以这一格的物化只会由 find_by_name 报错触发：
+# 一次 SQL 抖动就把 73.8 万条读回来，而用户只是想知道「这家我是不是已经剔过」。
+# 同时看住口径分叉：结果不完整时必须留下原因，否则界面会把「没比对成」当成
+# 「没找到」，用户会再打一遍不可撤回的剔除标记。
+def _view_boom(*a, **k):
+    raise RuntimeError("模拟视图瞬时抖动")
+
+
+_mgr_nb = DataPoolManager(oss_client=oss_l, cache_dir=mgr_l._cache_dir)
+_m_nb = _mgr_nb.get_merged_master()
+_assert(_mgr_nb.master_is_lazy(), "探针前置：这一组必须从懒态出发")
+_st_nb = _mgr_nb.store()
+_fbn_real = _st_nb.find_by_name
+_st_nb.find_by_name = _view_boom
+_hits_degraded = _mgr_nb.find_for_tombstone("秒开国内公司", limit=300)
+_assert(getattr(_m_nb, "materialized", "<非懒态>") is False,
+        "反向：视图抖动时关键字查找不得把整张总表搬回内存")
+_assert("在册企业" in _mgr_nb.tombstone_find_note(),
+        "抖动时把「没比对全」就地留下（界面据此才不会报「没找到」）")
+_assert_eq(len(_hits_degraded), 0,
+           "结果不完整时只给「已经剔过的」：不拿部分结果冒充全量命中")
+_st_nb.find_by_name = _fbn_real
+_hits_full = _mgr_nb.find_for_tombstone("秒开国内公司", limit=300)
+_assert_eq(_mgr_nb.tombstone_find_note(), "",
+           "还原后说明必须清空（防恒真：上一条不是永远有话）")
+_assert(len(_hits_full) >= 60,
+        "视图恢复后关键字能召回到册企业（正向对照）")
+
+# 非懒态（总表真的在内存）时退回扫全表必须照旧可用：新闸门只拦
+# 「为一次点查搬全表」那一种，把既有口径改掉就是另一种回归。
+_mgr_fb = DataPoolManager(oss_client=oss_l, cache_dir=mgr_l._cache_dir)
+_mgr_fb.get_merged_master()
+_mgr_fb.materialize_master()
+_assert(not _mgr_fb.master_is_lazy(), "探针前置：这一组已经真的物化到内存")
+_mgr_fb.store().find_by_name = _view_boom
+_hits_fb = _mgr_fb.find_for_tombstone("秒开国内公司", limit=300)
+_assert(len(_hits_fb) >= 60 and _mgr_fb.tombstone_find_note() == "",
+        "非懒态下视图抖动仍退回扫总表且不留说明（旧口径一行没改）")
+
+# ── 搜索建议：懒代理不得为「锦上添花」被物化（它是每次按键都要跑的动作）──
+# 旧写法把拦截放在调用方（SuggestLineEdit 递空表），只要换个调用方直接递
+# 总表代理进来，建议下拉就会把 73.8 万条读回来——判据必须住在会付钱那行。
+from search_suggest import SearchSuggester, _is_unmaterialized_proxy
+
+sug = SearchSuggester(data_dir=_new_tmp_dir())
+_assert_eq(_is_unmaterialized_proxy(_master_l), False,
+           "真 list 不会被当成代理（既有路径一行没改）")
+_view_items = sug.get_suggestions(
+    "光伏", _lazy,
+    view_suggest=lambda p, n: {"company": ["秒开国内公司1有限公司"],
+                               "product": ["光伏逆变器"]})
+_assert(_lazy.materialized is False, "视图召回路径全程不碰总表")
+_assert(any(it.get("type") == "product" and "光伏逆变器" in it["text"]
+            for it in _view_items),
+        "建议确实来自库内召回，不是从内存表里拦出来的")
+_noview_items = sug.get_suggestions("光伏", _lazy)
+_assert(_lazy.materialized is False,
+        "反向：没有视图召回也不许为建议物化整张总表")
+_assert(isinstance(_noview_items, list),
+        "拦下时仍给出可用结果（历史/同义词照旧，不能报异常或假死）")
+_real_items = sug.get_suggestions("光伏", _master_l)
+_assert(any(it.get("type") in ("company", "product") for it in _real_items),
+        "正向对照：递真表时前缀匹配照旧出结果（上一条不是守卫永远跳过）")
+
+
+# ════════════════════════════════════════════════════════════════════════
+print("\n═══ 16. 概览统计：点菜 / 持久化汇总 / 覆盖度与剔除重洗不许物化全表 ═══")
+
+# 上一段管的是「总表要不要读回内存」，这一段管的是「视图能答之后还要扫几遍全表」。
+# 真实 73.8 万行实测：stats() 的 15 条语句里 8 条各自扫一遍全表（单条 4.8~6.4 秒），
+# 而状态行只要 total/users/reachable 三个数，并且同一屏要付两遍（get_master_stats
+# 一遍、reach_summary 又一遍）——慢的不是数据，是「把没人要的数字也算了两遍」。
+# 这个瓶颈在本套件里**不可能暴露**：以前的语料最大 2 万条，聚合再慢也只是毫秒，
+# 「测试全绿」与「用户等十几秒」完全可以同时成立。所以这一段不数「我的代码调了几次」，
+# 而是用 SQLite 自带的 trace 回调数**数据库真实收到几条语句**：语句数就是用户等的
+# 时间本身，也是唯一没法靠重构蒙过去的证据。
+from data_pool import normalize_company_name
+from pool_matcher import FLAG_EMAIL, FLAG_MOBILE, FLAG_PHONE, FLAG_WECHAT
+
+
+class _SqlSpy:
+    """把 store 主连接收到的语句录下来（只观察，不改变任何行为）。"""
+
+    def __init__(self, store):
+        self.conn = store._connect()
+        self.seen = []
+
+    def __enter__(self):
+        self.conn.set_trace_callback(self.seen.append)
+        return self
+
+    def __exit__(self, *exc):
+        self.conn.set_trace_callback(None)
+
+    def scans(self):
+        """真正碰过 company 表的语句（读 meta 那些毫秒级的不计代价）。"""
+        return [s for s in self.seen if "FROM company" in s]
+
+
+_ov_recs = []
+for _i in range(300):
+    if _i % 7 == 0:      # 每 7 条留一条「只有官网/地址」的行：lead_only 要有非零母集
+        _r = _rec(f"概览线索公司{_i}有限公司", products="光伏支架",
+                  address="广东省深圳市", website=f"https://l{_i}.example.com")
+    elif _i % 3:
+        _r = _rec(f"概览手机公司{_i}有限公司", products="光伏逆变器",
+                  address="浙江省宁波市", mobiles=[f"1370000{_i:04d}"])
+    else:
+        _r = _rec(f"概览邮箱公司{_i}有限公司", products="储能电池",
+                  address="江苏省苏州市", emails=[f"o{_i}@x.com"])
+    _r["source"] = f"概览表{_i % 9}.xlsx"
+    _r["source_user"] = "alice" if _i % 5 else "bob"
+    # company_norm 必须取 normalize_company_name 的结果：剔除探针拿它与删除
+    # 向量比对（_rec 默认只给小写全名，与标记不同源就永远剔不掉）
+    _r["company_norm"] = normalize_company_name(_r["company"])
+    _ov_recs.append(_r)
+
+# Python 侧参照值：判据本体是 pool_matcher.contact_flags，SQL 必须跟它一致——
+# 拿视图的聚合去验视图的聚合等于什么都没验。
+_ov_expect = {
+    "total": len(_ov_recs),
+    "reachable": sum(1 for r in _ov_recs if contact_flags(r)),
+    "mobile": sum(1 for r in _ov_recs if contact_flags(r) & FLAG_MOBILE),
+    "email": sum(1 for r in _ov_recs if contact_flags(r) & FLAG_EMAIL),
+    "wechat": sum(1 for r in _ov_recs if contact_flags(r) & FLAG_WECHAT),
+    "landline": sum(1 for r in _ov_recs if contact_flags(r) & FLAG_PHONE),
+    "users": len({r["source_user"] for r in _ov_recs if r["source_user"]}),
+}
+_ov_last = max(str(r.get("source_time") or "") for r in _ov_recs)
+
+st_ov = PoolStore(_new_tmp_dir())
+_assert(st_ov.rebuild(_ov_recs, fingerprint_records(_ov_recs)),
+        "概览探针：视图重建成功（300 条）")
+
+
+def _ov_cold(store):
+    """回到「这个视图版本第一次被问」的状态。
+
+    用产品自己的作废原语而不是手写 DELETE：手写作废一旦与产品的作废口径分叉，
+    探针测的就是一个产品里并不存在的状态。
+    """
+    conn = store._connect()
+    store._drop_agg(conn)
+    conn.commit()
+    store.invalidate_meta_cache()
+
+
+_ov_cold(st_ov)
+with _SqlSpy(st_ov) as _spy_cold:
+    _few = st_ov.stats(("total", "reachable"))
+_assert_eq(len(_spy_cold.scans()), 1,
+           f"冷态点菜只发一趟合并扫描（实际 {len(_spy_cold.scans())} 条）")
+with _SqlSpy(st_ov) as _spy_warm:
+    _few2 = st_ov.stats(("total", "reachable"))
+_assert_eq(len(_spy_warm.scans()), 0,
+           "同一份视图上第二次读概览：一条表查询都不发（命中持久化汇总）")
+_assert_eq(_few2, _few, "命中缓存的数字与刚扫出来的完全一致（缓存不改变口径）")
+_assert_eq(_few["total"], _ov_expect["total"], "total == Python 侧条数")
+_assert_eq(_few["reachable"], _ov_expect["reachable"],
+           "reachable == contact_flags 非零的家数（SQL 不是自己解释自己）")
+_assert_eq(set(_few), {"total", "reachable"},
+           "点菜不许塞没人要的键（每个键都是一趟扫描）")
+
+# ── 不点菜 = 历史口径一行没改 ──
+_ov_cold(st_ov)
+with _SqlSpy(st_ov) as _spy_all:
+    _allst = st_ov.stats()
+_assert(len(_spy_all.scans()) >= 2 * len(_spy_cold.scans()),
+        f"不点菜仍比点菜贵得多（{len(_spy_all.scans())} 条 vs "
+        f"{len(_spy_cold.scans())} 条）")
+_assert(set(st_ov.STATS_KEYS) <= set(_allst),
+        "不点菜时 15 个键一个不少（提速没偷偷删功能）")
+for _k in ("total", "reachable", "mobile", "email", "wechat", "landline", "users"):
+    _assert_eq(_allst[_k], _ov_expect[_k], f"合并那一趟的 {_k} == Python 侧参照值")
+_assert_eq(_allst["last_update"], _ov_last,
+           "last_update 也在合并那一趟里（MAX(source_time)）")
+
+_lead = st_ov.stats(("lead_only",))
+_assert("total" in _lead and "reachable" in _lead,
+        "派生键自动带上两个母键（否则 lead_only 只能靠猜）")
+_assert_eq(_lead["lead_only"], _lead["total"] - _lead["reachable"],
+           "lead_only == total - reachable（与筛选面板「只看有联系方式」互补同源）")
+_assert_eq(set(st_ov.stats(("total", "根本没这个键"))), {"total"},
+           "点菜里混进未知键：只答认识的，不抛异常也不瞎算")
+
+# ── 写路径必须在自己的事务里作废汇总：否则界面会拿着旧数字继续说话 ──
+# 两道保障分开验：①写方真的删了 agg_ 键（结构化，不依赖身份算式）；②身份本身
+# 也变了。上一版只验了「数字回到新值」，结果把 _drop_agg 整段摘掉仍然全绿——
+# 因为 upsert 同时写 record_count/updated_at，身份腿独立拦住了。拿一个有两
+# 条腿的机制只测一条腿，等于删坏一条没人报警（2026-11-18 变异实测发现）。
+_new_ov = [_rec("概览新增公司有限公司", products="光伏逆变器",
+               address="安徽省合肥市", mobiles=["13611110000"])]
+_new_ov[0]["company_norm"] = normalize_company_name(_new_ov[0]["company"])
+_assert(st_ov.upsert(_new_ov, None), "概览探针：增量写入 1 条")
+_assert(not any(k.startswith("agg_") for k in st_ov.meta()),
+        "写方必须删掉持久化汇总键（光靠身份也能答对，但那会把两条腿变成一条）")
+_after_up = st_ov.stats(("total", "reachable"))
+_assert_eq(_after_up["total"], _ov_expect["total"] + 1,
+           "反向：写入后总数立即 +1（写方漏作废就会一直报旧数）")
+_assert_eq(_after_up["reachable"], _ov_expect["reachable"] + 1,
+           "可外呼数同步 +1（漏作废在这里同样会露馅）")
+_assert(st_ov.delete_norms({r["company_norm"] for r in _new_ov}),
+        "概览探针：删回这 1 条")
+_assert(not any(k.startswith("agg_") for k in st_ov.meta()),
+        "删除路径也要自己删键（与 upsert 同形，不能只修其中一条写路径）")
+_assert_eq(st_ov.stats(("total", "reachable")), _few,
+           "删除后数字回到原值：两条写路径都真正作废了缓存")
+
+# ── 反向：作废凭证被改动 → 必须重算，不能拿旧汇总蒙 ──
+_cnt_real = st_ov.meta().get("record_count")
+_conn_ov = st_ov._connect()
+_ov_cold(st_ov)
+with _SqlSpy(st_ov) as _spy_tamper:
+    _conn_ov.execute("UPDATE meta SET v='999999' WHERE k='record_count'")
+    _conn_ov.commit()
+    st_ov.invalidate_meta_cache()
+    _tampered = st_ov.stats(("total",))
+_assert_eq(len(_spy_tamper.scans()), 1,
+           "身份被改 → 汇总必须重算（命中那份缓存就是把旧数字当新数字报）")
+_assert_eq(_tampered["total"], _ov_expect["total"],
+           "重算给出的是真实条数，不是被污染的值")
+_conn_ov.execute("UPDATE meta SET v=? WHERE k='record_count'", (_cnt_real,))
+_conn_ov.commit()
+st_ov.invalidate_meta_cache()
+_assert_eq(st_ov.stats(("total",))["total"], _ov_expect["total"], "还原身份后仍然对")
+with _SqlSpy(st_ov) as _spy_back:
+    st_ov.stats(("total", "reachable"))
+_assert_eq(len(_spy_back.scans()), 0,
+           "还原后又回到零语句命中（上面那条 FAIL 来自缓存作废，不是判据恒假）")
+
+# ── 空视图：SUM 在空表上给 NULL，而「一条都没有」是确定答案不是未知 ──
+st_ov0 = PoolStore(_new_tmp_dir())
+_assert(st_ov0.rebuild([], fingerprint_records([])), "空视图重建成功")
+_assert_eq(st_ov0.stats(("total", "reachable", "lead_only")),
+           {"total": 0, "reachable": 0, "lead_only": 0},
+           "空表答 0 而不是缺键/None（把「没有」当成「不知道」界面会整句不说）")
+st_ov0.close()
+
+# ── 界面侧：概览/覆盖度/剔除都不许把懒代理的总表读回来 ──
+oss_ov = FakeOSS()
+oss_ov.objects["users/alice/upload_ov_1.json"] = {
+    "username": "alice", "records": _ov_recs[:150]}
+oss_ov.objects["users/bob/upload_ov_2.json"] = {
+    "username": "bob", "records": _ov_recs[150:]}
+mgr_ov = _mk_mgr(oss_ov)
+_master_ov = mgr_ov.get_merged_master()
+_n_ov = len(_master_ov)
+_assert(not isinstance(_master_ov, LazyMaster), "界面侧探针前置：首次加载拿到真表")
+_assert(mgr_ov.sync_store(), "界面侧探针：视图构建成功")
+
+# 「视图答不出」不是理论场景：store_ready() 只比内存里两个指纹，而库文件可能已经被
+# 另一个进程删掉/读失败，那时 stats() 给 {}——本机实测（真实缓存里删掉 pool_store.db）
+# get_master_stats 报 total_uploads=0，而同屏的 reach_summary 报 40 家。
+_st_ov = mgr_ov.store()
+_stats_real = _st_ov.stats
+_st_ov.stats = lambda fields=None: {}
+_stats0 = mgr_ov.get_master_stats()
+_assert_eq(_stats0.get("total_uploads"), _n_ov,
+           "反向：视图答 {} 时不许报 0 家，必须退回真表算（同屏两套口径就是骗人）")
+_assert_eq(_stats0.get("from_view"), False,
+           "退回真表时如实标注来源（不冒充是视图给的）")
+_st_ov.stats = _stats_real
+_assert_eq(mgr_ov.get_master_stats().get("total_uploads"), _n_ov,
+           "还原对照：视图能答时照旧走视图（上一条不是判据恒真）")
+
+mgr_ov2 = DataPoolManager(oss_client=oss_ov, cache_dir=mgr_ov._cache_dir)
+_lazy_ov = mgr_ov2.get_merged_master()
+_lazy_mat_ov = getattr(_lazy_ov, "materialized", "<非懒态>")
+_assert(mgr_ov2.master_is_lazy(), "界面侧探针：第二个管理器走秒开（懒代理）")
+_assert(_lazy_mat_ov is False,
+        "前置：这个懒代理一行都没读过（没有这条，下面全部「仍未物化」都是废话）")
+# 剔除组单独拿一份自己的懒态管理器，而且必须在任何剔除动作**之前**建好：
+# ①沿用同一个对象会让一个回归（reach_summary 提前物化）连带把后面几条不相干的
+#   判据也拉红，报告分不清根因与连带就失去了最有用的那部分；
+# ②剔除会改写删除向量，令牌里的剔除分量与本地向量就不再同源，事后新建的管理器
+#   根本不采纳视图，「懒代理 + 闸门」那一格反而测不到。
+mgr_ov3 = DataPoolManager(oss_client=oss_ov, cache_dir=mgr_ov._cache_dir)
+_lazy_ov3 = mgr_ov3.get_merged_master()
+_assert(mgr_ov3.master_is_lazy() and
+        getattr(_lazy_ov3, "materialized", "<非懒态>") is False,
+        "前置：剔除探针用的是另一个没读过一行的懒代理")
+_st_ov2 = mgr_ov2.store()
+_stats_real2 = _st_ov2.stats
+_st_ov2.stats = lambda fields=None: {}
+_assert_eq(mgr_ov2.reach_summary(), None,
+           "反向：视图答不出 + 懒态 → 覆盖度答 None，不为一句提示物化全表")
+_assert(getattr(_lazy_ov, "materialized", "<非懒态>") is False,
+        "反向：reach_summary 之后仍未物化（这里就是 73.8 万条的入口）")
+mgr_ov2.get_master_stats()
+_assert(getattr(_lazy_ov, "materialized", "<非懒态>") is False,
+        "反向：get_master_stats 同样不许为概览物化全表")
+_st_ov2.stats = _stats_real2
+_rs_ok = mgr_ov2.reach_summary()
+_assert(_rs_ok and _rs_ok["total"] == _n_ov,
+        "还原对照：视图能答时覆盖度照旧给出（上一条 FAIL 不是判据恒假）")
+_assert(getattr(_lazy_ov, "materialized", "<非懒态>") is False,
+        "正向：走视图给出数字时全程也没物化（秒开仍然成立）")
+
+# ── 反向：内存闸门拦下时，剔除重洗也不得把全表搬回来 ──
+# 这一格以前只拿「用户主动动作」当理由，而 refresh_from_oss 也在调它：同事剔
+# 一条脏数据就能让本机刚秒开的界面在后台把 73.8 万条读回来。
+_room_real = mgr_ov3.master_memory_room
+mgr_ov3.master_memory_room = lambda count=None: (False, "探针：本机可用内存不够")
+_res_refused = mgr_ov3.tombstone_companies([str(_master_ov[0]["company"])],
+                                           reason="探针：闸门拦下反向")
+_assert("内存" in str(_res_refused.get("defer_note") or ""),
+        "闸门拦下时返回体里带原因（界面才能把「本机滞后一轮」说清楚）")
+_assert(getattr(_lazy_ov3, "materialized", "<非懒态>") is False,
+        "反向：闸门拦下时剔除绝不物化全表")
+_assert(mgr_ov3.pending_sync_note() != "",
+        "滞后会从 pending_sync_note() 这一个出口露出来（界面只读它）")
+mgr_ov3.master_memory_room = _room_real
+_res_ok2 = mgr_ov3.tombstone_companies([str(_master_ov[1]["company"])],
+                                       reason="探针：闸门放行对照")
+_assert(getattr(_lazy_ov3, "materialized", "<非懒态>") is True,
+        "还原对照：闸门放行时确实重洗（物化）——上一条不是恒不物化")
+_assert_eq(_res_ok2.get("defer_note") or "", "",
+           "放行后说明必须清空（防恒真：不是无论怎样都有话）")
+_assert_eq(mgr_ov3.pending_sync_note(), "", "两类滞后都清空后界面恢复无提示")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+print("\n═══ 17. 清理 ═══")
+for st in (store, store2, store3, st_ov):
     st.close()
 for d in _tmp_roots:
     shutil.rmtree(d, ignore_errors=True)
