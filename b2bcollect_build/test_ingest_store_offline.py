@@ -2115,8 +2115,8 @@ try:
         _dp._approx_free_memory_bytes,
         read_windows=lambda: (16.0 * _GB16B, 9.0 * _GB16B))
 except AttributeError as _e16b0:
-    # 旧缺陷就是这一形：sysconf 窄捕获让 AttributeError 从探测本体逃到调用方。
-    # 接住它再报 FAIL，是为了让批跑日志说清「是哪一形」而不是只留一段 traceback。
+    # 旧缺陷就是这一形状：sysconf 窄捕获让 AttributeError 从探测本体逃到调用方。
+    # 接住它再报 FAIL，是为了让批跑日志说清「逃出来的是哪一处」而不是只留一段 traceback。
     _assert(False, f"sysconf 缺失（Windows 形状）不许抛 AttributeError 穿到调用方：{_e16b0}")
     _avail16b, _why16b = 0, ""
 _assert("GlobalMemoryStatusEx" in _why16b,
@@ -2127,7 +2127,7 @@ _assert(_avail16b == min(9 * _GB16B, int(16 * _GB16B * 0.55)),
 _assert(0 < _avail16b <= 16 * _GB16B,
         f"可用量不许超过物理总量（上一轮就是把 8GB 机器报成 60GB）：{_avail16b}")
 
-# ② 旧代码的炸点：sysconf 缺失本身不许把异常冒到调用方
+# ② 旧代码的炸点：sysconf 缺失本身不许让异常冒到调用方
 #    （对照档用 posix：连 Windows 那一档都进不去，只能靠探测自己宽捕）
 try:
     _avail16b2, _why16b2 = _under_shape(_dp._approx_free_memory_bytes, os_name="posix")
@@ -2145,7 +2145,7 @@ _assert(_avail16b3 == 0,
 
 # ④ 数值要真的流进闸门：同一个 count，内存小机器拒、大机器过
 #    （只测探测返回值不算数：闸门不读它也能全绿，那是一条空跑判据）
-_need_cnt16b = 1_000_000            # 按标定单价估出的需求量正好落在下面两档之间（实拿 3.8GB）
+_need_cnt16b = 1_000_000            # 按标定单价估出的需求量正好落在下面两档之间（实测 3.8GB）
 _room_small = _under_shape(
     lambda: mgr_ov3.master_memory_room(count=_need_cnt16b),
     read_windows=lambda: (4.0 * _GB16B, 2.0 * _GB16B))
@@ -2164,7 +2164,7 @@ _avail_real16b, _why_real16b = _dp._approx_free_memory_bytes()
 _assert(_avail_real16b > 0,
         f"本机（开发机就是交付平台之一）探测必须给出正数，不然本机永远整理不了总表："
         f"{_avail_real16b}／{_why_real16b}")
-# 拿真数字判，不用「不含 0GB）这种子串」的写法：那种断言在 10GB / 20GB / 30GB
+# 拿真数字判，不用「断言文案里不含某个子串」的写法：那种断言在 10GB / 20GB / 30GB
 # 的机器上会自己制造假失败（判据不许挑开发机的内存规格）
 _total_shown16b = re.search(r"总 (\d+)GB", _why_real16b)
 _assert(_total_shown16b is not None and int(_total_shown16b.group(1)) >= 1,
@@ -2172,6 +2172,27 @@ _assert(_total_shown16b is not None and int(_total_shown16b.group(1)) >= 1,
 _assert(_avail_real16b < int(_total_shown16b.group(1)) * _GB16B,
         f"可用量必须小于总量（报出比总量还大的可用数就是单位又错了）："
         f"{_avail_real16b}／{_why_real16b}")
+
+
+# ⑥ 0 是一个有效读数，不是「没读到」：内存吃光时必须报 0，不许退回总量×系数
+#    （复审阶段查出的二次缺陷：拿 avail_phys == 0 当「没有读数」的哨兵，于是
+#    Windows 报「可用 0 字节」时反而落回 POSIX 公式，而 Windows 上取不到 RSS
+#    （rss=0），可用量就被算成总量的 55%——闸门在最该拦的那一档放行，与
+#    函数自己的 fail-closed 原则正好相反。）
+_avail16b6, _why16b6 = _under_shape(
+    _dp._approx_free_memory_bytes,
+    read_windows=lambda: (16.0 * _GB16B, 0.0))
+_assert(_avail16b6 == 0,
+        f"系统报「可用 0 字节」时必须就是 0（不许报成总量的 55%＝{_avail16b6 >> 30}GB）：{_why16b6}")
+_room_exhausted = _under_shape(
+    lambda: mgr_ov3.master_memory_room(count=10_000),
+    read_windows=lambda: (16.0 * _GB16B, 0.0))
+_assert(_room_exhausted[0] is False,
+        f"内存吃光的 Windows 机器连 1 万家都不许过（这是拦与放的方向，不是大小）："
+        f"{_room_exhausted}")
+_assert("0.0GB" not in str(_room_exhausted[1]),
+        f"拒绝文案里不许出现「可用 0.0GB 而约需 0.0GB」这种两边都四舍五入掉、"
+        f"两处都读不出差别的形状：{_room_exhausted[1]}")
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -880,7 +880,11 @@ def _approx_free_memory_bytes() -> Tuple[int, str]:
             # （旧写法只捕 ValueError/OSError/KeyError，于是整个函数在 Windows 上
             # 直接炸穿调用方）。这里让路，交给下面那一档跨平台探测。
             total = 0
-    avail_phys = 0
+    # None 代「这一档探测没给我可用量读数」；0 是一个有效读数（内存已经吃光）。
+    # 两者绝不能共用一个哨兵：拿 0 当「没读到」会让内存吃光的机器落回下面那条
+    # 「总量×系数减 RSS」的估算，而 Windows 上取不到 RSS（rss=0），可用量反而被
+    # 报成总量的 55%——闸门在最该拦的那一档放行，与本函数的 fail-closed 原则相反。
+    avail_phys: Optional[int] = None
     if total <= 0 and os.name == "nt":
         # Windows 没有 sysctl、没有 os.sysconf、也没有 resource 模块，三档全空。
         # 不能只把异常吞掉就算修好：total 留 0 会走到「读不到物理内存（按不够处理）」，
@@ -917,10 +921,11 @@ def _approx_free_memory_bytes() -> Tuple[int, str]:
         pass
     if total <= 0:
         return 0, "读不到物理内存（按不够处理）"
-    if avail_phys > 0:
+    if avail_phys is not None:
         # 系统直接报的可用物理内存与「总量×系数」取小的那一档：前者是当下的真实
-        # 余量（别的程序正在吃内存时它会明显小于系数值），后者是留给本进程峰值的
-        # 保守上限。两个方向都要，缺一个就会要么放硬扛、要么把还能用的机器拦在门外。
+        # 余量（别的程序正在吃内存时它会明显小于系数值，包括吃光到 0），后者是留给
+        # 本进程峰值的保守上限。两个方向都要，缺一个就会要么放硬扛、要么把还能用
+        # 的机器拦在门外。这一档不再减 rss：可用物理内存本身已经把本进程占的那份刨掉了。
         avail = min(avail_phys, int(total * 0.55))
         return max(avail, 0), "、".join(why) + f"（总 {total >> 30}GB）"
     avail = int(total * 0.55) - rss
@@ -2374,9 +2379,16 @@ class DataPoolManager:
         avail, why = _approx_free_memory_bytes()
         if avail < need:
             # 到小数一位而不是 >>30 取整：取整会把 0.9GB 写成「0GB」，
-            # 用户读到“可用 0GB”会以为机器坏了，而真实原因只是不够 8GB
-            return False, (f"本机可用内存约 {avail / 2 ** 30:.1f}GB（{why}），"
-                           f"而整理 {count:,} 家全表约需 {need / 2 ** 30:.1f}GB")
+            # 用户读到“可用 0GB”会以为机器坏了，而真实原因只是不够 8GB。
+            # 不到 0.1GB 的量再降一档按 MB 念：否则「可用 0.0GB 而约需 0.0GB」
+            # 两个数都读不出差别，与同一条纪律的初衷相反（小池子 + 内存吃光时
+            # 正好命中这一格）。
+            def _mem_text(x: int) -> str:
+                gb = x / 2 ** 30
+                return f"{gb:.1f}GB" if gb >= 0.1 else f"{x / 2 ** 20:.0f}MB"
+
+            return False, (f"本机可用内存约 {_mem_text(avail)}（{why}），"
+                           f"而整理 {count:,} 家全表约需 {_mem_text(need)}")
         return True, why
 
     # 缓存文件字节 → 条数的反推系数（实测标定：master.pkl 359MB/73.8 万条
