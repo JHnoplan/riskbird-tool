@@ -68,6 +68,7 @@ debug/gi_pace_offline_test.py
 debug/keyword_junk_offline_test.py
 debug/local_scan_offline_test.py
 debug/qzd_channel_offline_test.py
+debug/batch_runner_offline_test.py
 debug/check_gui_fit.py
 b2bcollect_build/test_optimizations.py
 "
@@ -76,8 +77,9 @@ b2bcollect_build/test_optimizations.py
 # 一样，只有理由能把它们分开——没有理由的排除等于把判据改成沉默。
 EXCLUSIONS="
 debug/append_offline_14.py|一次性源码补丁脚本：跑一次就往 gi_mp_offline_check.py 里再插一段
-debug/append_offline_15.py|同上（它自己不是断言，是被断言的那份套件的写入口）
-debug/fix_offline_14_5.py|同上
+debug/append_offline_15.py|一次性源码补丁脚本：同上一族，往 gi_mp_offline_check.py 追加 ⑮ 段
+debug/fix_offline_14_5.py|一次性源码补丁脚本：同上三族，改写 gi_mp_offline_check.py 里已有的 ⑭-5 段
+debug/offline_env_probe.py|不是断言套件而是现场探针本体（「这份解释器跑得动吗」那一问的唯一实现）；它的判据在 debug/batch_runner_offline_test.py 里，而它自己已被开跑前那一步真跑过一次
 "
 
 # ── 自动发现 + 完整性判据 ────────────────────────────────────────────────
@@ -188,19 +190,66 @@ if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
 
+# ── 空清单的早退：排在 --list 之后、探针之前（2026-11-19 本轮实发）────────────
+# 顺序错了会把诊断换掉：往下走的话探针读到的还是这同一份空清单，于是回「范围断了、问不出
+# 依赖」那一格（退出码 2），屏幕上只剩「现场不齐」的话术——而真正要查的是 FILES 手写表 /
+# DELIVERY_DIRS 自动发现 / 本轮传入的 B2B_REGRESSION_ONLY。这一格红过一次就是这么被读坏的：
+# 症状和「环境坏了」逐字节一样，修的人却去补包。
+# 放在 --list 之后是契约：--list 只如实交出展开结果（空就空着，不替调用方下判定），
+# 「空范围不许开跑」这条决定留给真跑批的这一层，与上面注释里「判定和证据分开两个通道」一致。
+if [ "$(printf '%s\n' $FILES | grep -c . || true)" -eq 0 ]; then
+  echo "❌ 批跑清单是空的：没有任何套件被执行，这份「全绿」没有任何含义"
+  echo "   查 FILES 手写表与 DELIVERY_DIRS 自动发现两段"
+  if [ -n "${B2B_REGRESSION_ONLY:-}" ]; then
+    # %q 而不是直接打原值：本轮那次注入的就是一个**空格**，直接打出来与没打一样，
+    # 看屏幕的人会以为变量是空的。
+    echo "   本轮走了 B2B_REGRESSION_ONLY 口子（$(printf '%q' "${B2B_REGRESSION_ONLY}")）：它以它为准，其余判据一条不少"
+  fi
+  exit 1
+fi
+
 # 环境检查为什么必须排在 --list 之后：--list 不跑任何套件，它只是把清单声明读出来，
 # 而硬门第 23/24 条与离线对拍正是靠这一句拿「批跑到底覆盖哪几路」的权威答案。把它挡在
 # 解释器检查后面，等于让门禁的结论取决于跑不跑得动——那是两种完全不同的红。
 
-# 解释器必须先在场并且**带着 PyQt5**：批跑入口退到系统 python3 的话，54 套里三十几套会红成
+# 解释器必须先在场，并且**跑得动本轮全部离线套件**：批跑入口退到系统 python3 的话，几十套会红成
 # ModuleNotFoundError，看着像代码坏了，其实是环境不对——「证据先在场，判定才有意义」这条也管环境。
+# 这一问从 2026-11-19 起交给探针（debug/offline_env_probe.py），不再在这里写死 `import PyQt5`：
+# 写死的那一版漏掉了 PIL——它正是「平行会话 → makepolo_crawler → mk_phone_ocr」这条链上会执行的
+# 一句 `from PIL import Image`，结果那一轮满屏假红被当成业务缺陷去查根因。探针的范围取自**本脚本
+# 自己的批跑清单**（--list），依赖取自**那份清单里每一份套件的 import 闭包**：两处都不再抄第二份名单。
 if [ ! -x "$PY" ]; then
-  echo "❌ 找不到可执行的 ${PY}（仓库根 $(pwd)）：先 python3 -m venv .venv && .venv/bin/pip install -r riskbird_build/requirements.txt"
+  echo "❌ 找不到可执行的 ${PY}（仓库根 $(pwd)）：先 python3 -m venv .venv && .venv/bin/pip install -r .github/requirements/b2bcollect.txt"
   exit 2
 fi
-if ! "$PY" -c "import PyQt5" >/dev/null 2>&1 < /dev/null; then
-  echo "❌ ${PY} 里没有 PyQt5：整批离线套件会假红成一堆 ModuleNotFoundError（不是代码坏了）。"
-  echo "   要么换成装了依赖的那个解释器（PY=/path/to/python），要么 .venv/bin/pip install -r riskbird_build/requirements.txt"
+# 探针文件本身不在位必须单独报（与下面四种结论都不同）：`python <不存在的文件>` 的退出码
+# 也是 2，而 2 在本脚本里表示「批跑清单取不到」。少这一句，缺文件会红成「范围断了」，修的人
+# 去查 FILES 手写表——而真正缺的是 debug/offline_env_probe.py 没跟着提交（CI 检出正是这一形：
+# 它不在这轮新加的批跑清单里，而在排除表里，第 24 条那份“套件都要已提交”的门照不到它）。
+if [ ! -f debug/offline_env_probe.py ]; then
+  echo "❌ 现场探针不在位：debug/offline_env_probe.py 读不到"
+  echo "   本机有、提交里没有的话，先 git add debug/offline_env_probe.py && git commit；"
+  echo "   它不在批跑清单里（是前置工具不是断言套件），但批跑入口第一句就要拿它问现场"
+  exit 2
+fi
+# `|| probe_rc=$?`：退出码必须在接管它的那一句里取（第 15 条），本脚本随时可能被带着
+# errexit 的调用方拉起来。`< /dev/null`：同第 20 条 20f，后台起批跑时父终端被回收会让
+# fd 0 是个已关闭的描述符，python 在跑第一行之前就崩——那会被读成「现场不齐」。
+probe_rc=0
+"$PY" debug/offline_env_probe.py --check < /dev/null || probe_rc=$?
+# 四种结论分开接，不退成一个词（本轮要的正是这一格）：1 缺依赖 / 2 清单取不到 /
+# 3 探针自己起不来。后两种尤其不许按「没报缺 = 现场齐」继续开跑：那一路的证据全没了。
+if [ $probe_rc -eq 2 ]; then
+  echo "❌ 批跑清单取不到，「现场齐不齐」这一问答不了："
+  echo "   先修 debug/run_offline_regression.sh --list 那一步（上面已经给了两条通道的原文），别去看套件红不红"
+  exit 2
+fi
+if [ $probe_rc -eq 3 ]; then
+  echo "❌ 现场探针自己没跑成（退出码 3）：连「缺不缺」都没问出口，不许按现场齐继续开跑"
+  exit 2
+fi
+if [ $probe_rc -ne 0 ]; then
+  echo "❌ ${PY} 跑不动本轮离线套件：把上面点名的那几只补齐，或 PY=/path/to/python 换一份解释器"
   exit 2
 fi
 
@@ -555,6 +604,9 @@ else
 fi
 echo "套件：$pass 通过 / $fail 失败 / $skip 跳过（缺实机夹具），本轮共展开 $total 项"
 # 一项都没跑就等于「全绿」：清单解析空了、目录改名了，症状都和「真的全过」一模一样。
+# 上面开跑前已经拦过一次，这里留作第二个证人：它判的是**展开并计数后**的 total，
+# 与 FILES 之间还隔着 DELIVERY_DIRS 发现、排除表、B2B_REGRESSION_ONLY 三步加工——那三步
+# 里任何一步把清单吃掉，都只有这一句能看见（删掉上面那句不会让这里变绿，反之也一样）。
 if [ "$total" -eq 0 ]; then
   echo "❌ 批跑清单是空的：没有任何套件被执行，这份「全绿」没有任何含义（查 FILES/自动发现两段）"
   exit 1

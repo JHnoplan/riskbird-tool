@@ -95,6 +95,14 @@ _云展账号.json
 _采集任务索引.json
 mapping_history.json
 采集进度.json
+# 域名解析缓存（website_contact.DNS_CACHE_FILE_NAME）：里面只有「域名 → 能不能解析/什么时候查过」，
+# 不含任何凭证，但它同样是我们说的第二类——跑一轮就在落点目录里自己长出来、且每次跑都改的运行时状态。
+# 拦它的理由和日志一样：可再生 + 入库只会让 diff 变噪音（一次真实补采能写几千个域）。
+site_dns_cache.json
+# 交易所披露主数据（exchange_master.MASTER_FILE_NAME）：东方财富全量拉到本地的那一份缓存，
+# 几十 MB、每 90 天重拉一次，成分只有公司名/电话/邮箱/域名——同样第二类：可再生且入库
+# 只会把一次重拉变成几万次增删的假改动。拦不住它就会把两万多家主体的快照当成代码变更提上来。
+exchange_master.json
 # Chrome / CDP 的 user-data-dir：**整个目录**都不许入库，不按内部文件名一条条列。
 # 原来那四行（Cookies / Login Data / History / Local Storage）是列不全的——本机实测四个
 # 开发用 profile 里还有 1528 个文件 git 看得见：`Local State`（顶层，里面有 Cookie 主密钥

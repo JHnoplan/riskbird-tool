@@ -160,6 +160,8 @@ fi
   --hidden-import field_evidence --hidden-import enrich_waterfall \
   --hidden-import lead_scoring --hidden-import channel_health \
   --hidden-import text_shape \
+  --hidden-import site_discovery --hidden-import pinyin_lite \
+  --hidden-import exchange_master \
   --add-data "config.json:." --add-data "mk_phone_font.json:." \
   --add-data "../enf_clean:enf_clean" \
   --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" \

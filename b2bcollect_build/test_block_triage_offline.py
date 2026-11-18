@@ -5971,15 +5971,90 @@ _ps30._stop_enrich_worker()          # worker 在首轮 sleep 中：置位后 1 
 check("㉚p 收尾 join：消费者退出且登记清空（与收尾补采严格串行）",
       _ps30._enrich_worker is None and _time30.time() - _t30 < 5.0)
 
-# ㉚q/㉚r 勾上瀑布的那一条支路（本轮功能背书的正题：后台每一轮都走完整瀑布，而不是
+# ㉚s 会话层**每一个**「self.某方法(...)」调用的参数名都必须是实现接得住的（AST 扫全模块）。
+# 为什么要这一条而不是在替身里手写一张完整形参表：那张表就是第二套编号。本轮把
+# ``master_fetch`` 加进 ``_run_waterfall`` 的调用点，替身没跟上，TypeError 被
+# ``_enrich_round`` 那层「任何异常都不许冒泡」的兜底吞成「这一轮没跑瀑布」——判据当场红，
+# 红的形状却完全指不到真凶（看起来像业务参数错了，实则接线错了一个名字）。同一类错在
+# 任何一处调用点都长同一个样子：日志安静、数据里看不出来，所以扫的是整个模块而不是本轮那一处。
+def _arg_gate_30(source, cls, cls_name):
+    node = next(n for n in _ast.parse(source).body
+                if isinstance(n, _ast.ClassDef) and n.name == cls_name)
+    bad = []
+    for n in _ast.walk(node):
+        f = n.func if isinstance(n, _ast.Call) else None
+        if not (isinstance(f, _ast.Attribute) and isinstance(f.value, _ast.Name)
+                and f.value.id == "self"):
+            continue
+        target = getattr(cls, f.attr, None)
+        fn = getattr(target, "__func__", target)          # classmethod/staticmethod
+        if not inspect.isfunction(fn):
+            continue                                       # 属性、缺失名都不算接线
+        params = inspect.signature(fn).parameters
+        if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            continue                                       # 接得住任意名字的跳过
+        if any(isinstance(a, _ast.Starred) for a in n.args):
+            continue                                       # *args 拆包看不出数量
+        kw = [k.arg for k in n.keywords if k.arg]
+        pos = len(n.args)
+        room = sum(1 for p in params.values()
+                   if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        if params and list(params)[0] in ("self", "cls"):
+            room -= 1          # 调用点不写 self，形参表里却算了它一个
+        if any(p.kind is p.VAR_POSITIONAL for p in params.values()):
+            room = pos
+        if [k for k in kw if k not in params] or pos > room:
+            bad.append((f.attr, n.lineno, kw, pos, room))
+    return bad
+
+
+_arg_bad_30 = _arg_gate_30(inspect.getsource(_ps_mod), _ps_mod.ParallelSession,
+                           "ParallelSession")
+check("㉚s 会话层每一个 self 方法调用的参数名与个数都被实现接住（AST 扫全模块）",
+      not _arg_bad_30, f"错配：{_arg_bad_30[:3]}｜名字打错一个字母在生产里就是 TypeError，"
+                       "而它会安静地落在一个兜底 try 里")
+# ㉚s- 这条门自己的牙。为什么不能拿变异台验它：变异台改的是**内存里的函数对象**，
+# 而这一条读的是**文件源码**，两者根本不在一份字上（拿它去对拍只能报「没红」，那是假案）。
+# 静态门的牙只能这么验：喂它一份注定有错的源码，要求它报得出那两种错，而且不许多报——
+# 带 **kw 的方法接得住任意名字，误报一次下次就有人把它关掉。
+_gate_src_30 = (
+    "class Fake:\n"
+    "    def take(self, a, b=None, *, verbose=True): pass\n"
+    "    def wide(self, *args, **kw): pass\n"
+    "    def use(self):\n"
+    "        self.take(1, b=2, wrong=3)\n"      # 名字接不住
+    "        self.take(1, 2, 3)\n"              # 个数超出
+    "        self.wide(anything=1)\n"           # 带 **kw：不许报
+    "        self.take(1, verbose=False)\n"     # 正向对照：不许报
+)
+_gate_ns_30 = {}
+exec(compile(_gate_src_30, "<arg_gate_fixture>", "exec"), _gate_ns_30)
+_gate_bad_30 = _arg_gate_30(_gate_src_30, _gate_ns_30["Fake"], "Fake")
+check("㉚s- 这条门咬得动夹具里那两种错、也不多咬（静态门的牙只能这么验）",
+      [x[0] for x in _gate_bad_30] == ["take", "take"],
+      f"实报：{_gate_bad_30}｜只许那两处红，带 **kw 的与正向对照都不许被误报")
+
+# ㉚q/㉚q2/㉚q3/㉚r 勾上瀑布的那一条支路（本轮功能背书的正题：后台每一轮都走完整瀑布，而不是
 # 只跑单跳）：_run_waterfall 在实例上接替身，验「派到了哪一条、参数对不对、账上不上」。
 _wf_seen = {}
+_wf_sig30 = inspect.signature(_ps_mod.ParallelSession._run_waterfall)
 
 
-def _fake_wf30(reason, records, workers=None, budget=None, limit=None,
-               only_missing=False, verbose=True):
-    _wf_seen.update({"reason": reason, "n": len(records), "budget": budget,
-                     "only_missing": only_missing, "verbose": verbose})
+def _fake_wf30(reason, records, **kw):
+    """替身按**实现自己的签名**收参数（不在这里重抄一张形参表）。
+
+    重抄的那张表就是上面 ㉚s 记过账的那个坑；而只收 ``**kw`` 又会把「调用点写了实现接不住
+    的名字」吞成无痕，所以这里自己先对一遍签名，再把参数**按实现的默认值**补齐——判据读到
+    的是「这一轮真正生效的参数」，不是替身里那一套我猜的默认值。
+    """
+    bad = [k for k in kw if k not in _wf_sig30.parameters]
+    if bad:
+        raise TypeError(f"调用点传了 _run_waterfall 接不住的关键字：{bad}")
+    bound = _wf_sig30.bind(_ps30, reason, records, **kw)
+    bound.apply_defaults()
+    _wf_seen.update({k: v for k, v in bound.arguments.items()
+                     if k not in ("self", "records")})
+    _wf_seen["n"] = len(records)
     return {"sites": 3, "ok": 2, "new_values": 5, "reasons": {"超时": 1},
             "registry": {"queued": 7}}
 
@@ -5996,11 +6071,29 @@ check("㉚q 勾瀑布时每一轮都走完整瀑布（不钉 only_missing、不�
       and _wf_seen.get("n") == 2 and _wf_seen.get("only_missing") is False
       and _wf_seen.get("verbose") is False
       and _wf_seen.get("budget") == min(_ps_mod.ENRICH_STREAM_BUDGET,
-                                        _ps30.site_enrich_budget))
+                                        _ps30.site_enrich_budget),
+      f"生效参数：{ {k: v for k, v in _wf_seen.items() if k not in ('reason', 'n')} }"
+      f"｜日志尾巴：{_logs30[-2:]}（这一路有兜底 try，接线错了只会体现在日志里）")
 check("㉚r 工商队列投出去的家数上账且在日志里可见（旧写法只到收尾才投队列，"
       "采集那 45 分钟三路几乎无活可干）",
       _ps30._enrich_stream["queued"] == 7 and _ps30._enrich_stream["rounds"] == 2
       and any("工商队列新增 7 家" in m and "累计 7" in m for m in _logs30))
+# ㉚q2/㉚q3 披露主数据那一次性全量拉取**由谁付**（f4f10 接进来后新增的口径）。
+# 边采边补每 60 秒开一轮，绝不能为「顺手补」开一次两万四千多家、五十几秒的批量下载——
+# 那一下花在后台路上既看不到也说不清，正是用户报的那次「鼠标转圈」。
+# 但收尾那一路必须付这一次：两条都钉 False 的话主数据永远拉不下来，而「披露级整轮没值」
+# 在日志里长得和「名录里没这家」一模一样，谁也不会去查文件根本不存在。
+check("㉚q2 后台那一路不承当主数据全量拉取（master_fetch=False）",
+      _wf_seen.get("master_fetch") is False,
+      f"边采边补实传：{_wf_seen.get('master_fetch', '（没传，走模块默认＝允许拉）')}")
+_wf_seen.clear()
+_ps30.lead_export = False
+_ps30.enrich_websites(reason="采集收尾", force=True)
+check("㉚q3 收尾那一路不把 master_fetch 钉成 False：全量拉取必须有人付一次，"
+      "否则披露级永远空转",
+      _wf_seen.get("reason") == "采集收尾"
+      and _wf_seen.get("master_fetch") is not False,
+      f"收尾实传：{_wf_seen.get('master_fetch', '（没传，走模块默认＝允许拉）')}")
 _ps30.waterfall = False
 print("㉚ 边采边补：生产者-消费者接线齐全、互斥/温和收工/异常兜底/停止语义/两条支路全锁死 ✓")
 

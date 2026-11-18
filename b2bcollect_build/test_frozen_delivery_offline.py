@@ -8451,37 +8451,47 @@ def test_regression_suites_tracked_gate():
                    f"{_rel} 曾经只活在这台开发机上（本机绿、CI 检出后压根没这个文件）")
 
     # ── 3) 三种 git 状态各响一次，措辞与处置一一对应 ──
-    _one = _files[0]
-    _assert_eq(gate.check_regression_suites_tracked(_files), [],
-               "放行（合成）：清单里每一份都在提交里、都没被改过")
-    with _git_state(index=[x for x in _files if x != _one],
-                    head=[x for x in _files if x != _one]):
-        _got = gate.check_regression_suites_tracked(_files)
-    _assert_eq(len(_got), 1, f"反向对照：少一份就响一条，不多不少（实际={_got}）")
-    _assert(_one in _got[0] and "从未被 git 跟踪" in _got[0] and "git add" in _got[0],
-            f"「压根没跟踪」的措辞要给 git add（实际={_got[0][:100]}）")
-    with _git_state(index=_files, head=[x for x in _files if x != _one]):
-        _got = gate.check_regression_suites_tracked(_files)
-    _assert_eq(len(_got), 1, f"反向对照：只 add 没提交也要响（实际={_got}）")
-    _assert("已 git add 但还没提交" in _got[0],
-            f"这一类的处置是 commit，不是 add——写错一步就白跑一轮（实际={_got[0][:100]}）")
-    with _git_state(index=_files, head=_files, dirty=[_one]):
-        _got = gate.check_regression_suites_tracked(_files)
-    _assert_eq(len(_got), 1, f"反向对照：在提交里但工作区改过也要响（实际={_got}）")
-    _assert("两份内容不是同一份" in _got[0],
-            f"要说清为什么「本机跑绿」对交付没有担保（实际={_got[0][:110]}）")
-    _assert("它是批跑清单里的一路回归" in _got[0],
-            f"要把「为什么这一份值得判」带上，否则读起来像通用提交检查（实际={_got[0][:140]}）")
+    # 清单为空时必须**留下一条红并跳过**，不能 `_files[0]`：2026-11-19 那次 `--list` 退出码 1、
+    # 0 行，IndexError 把本节后面的几百条判据一起掩盖掉了，屏幕上只剩一段 traceback——
+    # 而这一节自己恰恰是「范围断了」最有说服力的证人（上面那条「清单取得到」的红被它盖住了）。
+    # 跳过不能是沉默：这里主动记一条红，不然「没跑」会被读成「跑了且绿」。
+    if not _files:
+        _assert(False, "清单为空：第 3/4 节拿清单里的真文件做 git 状态夹具，没得可做，"
+                       "整段跳过（取不到清单上面已记过一次红，这里是第二个证人）")
+    else:
+        _one = _files[0]
+        _assert_eq(gate.check_regression_suites_tracked(_files), [],
+                   "放行（合成）：清单里每一份都在提交里、都没被改过")
+        with _git_state(index=[x for x in _files if x != _one],
+                        head=[x for x in _files if x != _one]):
+            _got = gate.check_regression_suites_tracked(_files)
+        _assert_eq(len(_got), 1, f"反向对照：少一份就响一条，不多不少（实际={_got}）")
+        _assert(_one in _got[0] and "从未被 git 跟踪" in _got[0] and "git add" in _got[0],
+                f"「压根没跟踪」的措辞要给 git add（实际={_got[0][:100]}）")
+        with _git_state(index=_files, head=[x for x in _files if x != _one]):
+            _got = gate.check_regression_suites_tracked(_files)
+        _assert_eq(len(_got), 1, f"反向对照：只 add 没提交也要响（实际={_got}）")
+        _assert("已 git add 但还没提交" in _got[0],
+                f"这一类的处置是 commit，不是 add——写错一步就白跑一轮（实际={_got[0][:100]}）")
+        with _git_state(index=_files, head=_files, dirty=[_one]):
+            _got = gate.check_regression_suites_tracked(_files)
+        _assert_eq(len(_got), 1, f"反向对照：在提交里但工作区改过也要响（实际={_got}）")
+        _assert("两份内容不是同一份" in _got[0],
+                f"要说清为什么「本机跑绿」对交付没有担保（实际={_got[0][:110]}）")
+        _assert("它是批跑清单里的一路回归" in _got[0],
+                f"要把「为什么这一份值得判」带上，否则读起来像通用提交检查（实际={_got[0][:140]}）")
 
-    # ── 4) 范围真的等于批跑清单（门里没有第二套发现逻辑） ──
-    with _git_state():
-        _got = gate.check_regression_suites_tracked(_files)
-    _assert_eq(len(_got), len(_files),
-               f"清单里 {len(_files)} 项在空 git 状态下要逐条点名（实际 {len(_got)} 条）"
-               f"——只报一句「有文件没提交」就没人知道少的是哪几路")
-    _named = [x for x in _files if any(x in p for p in _got)]
-    _assert_eq(len(_named), len(_files),
-               f"每一条都要归得到具体文件（归属不干净＝批跑里少一路时看不出来）")
+        # ── 4) 范围真的等于批跑清单（门里没有第二套发现逻辑） ──
+        # 这一节也必须在非空清单上跑：空清单时 `len(_got) == len(_files) == 0` 会**天然通过**，
+        # 那正是「能在空集上通过的判据就是没有判据」——绿得比红更贵。
+        with _git_state():
+            _got = gate.check_regression_suites_tracked(_files)
+        _assert_eq(len(_got), len(_files),
+                   f"清单里 {len(_files)} 项在空 git 状态下要逐条点名（实际 {len(_got)} 条）"
+                   f"——只报一句「有文件没提交」就没人知道少的是哪几路")
+        _named = [x for x in _files if any(x in p for p in _got)]
+        _assert_eq(len(_named), len(_files),
+                   f"每一条都要归得到具体文件（归属不干净＝批跑里少一路时看不出来）")
 
     # ── 5) fail-closed：问不到 git 与问不到清单，都不许按合格返回 ──
     with _patch(gate, "in_work_tree", lambda: False):
@@ -8495,6 +8505,11 @@ def test_regression_suites_tracked_gate():
     _got = gate.check_regression_suites_tracked(["debug/ag_gate24_absent.py"])
     _assert(any("磁盘上没有" in x for x in _got),
             f"在清单里但磁盘上没有：批跑入口会拦，门也要同步点名（实际={_got}）")
+    # 与上面第 3/4 节那个「空清单就跳过」的守卫钉的是同一个子规则：**范围断了不等于合格**。
+    # 这里拿它做永久证人（不是一次性实验）：把空表退成「一份都没问题」就是最阴的那类假绿。
+    _got = gate.check_regression_suites_tracked([])
+    _assert(any("一份套件都没判" in x for x in _got),
+            f"空清单喂给门：不许按「合格」返回（范围断了与没问题必须是两回事）（实际={_got}）")
 
 
 def test_no_dev_machine_paths_gate():

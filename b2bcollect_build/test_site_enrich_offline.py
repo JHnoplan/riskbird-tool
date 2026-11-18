@@ -24,8 +24,10 @@ socket.getaddrinfo 都换成本表驱动的实现，requests.get 上装硬闸，
 运行：python test_site_enrich_offline.py
 """
 import os
+import socket
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -52,6 +54,7 @@ def _assert(condition, label):
 
 import website_contact as wc                                        # noqa: E402
 import field_evidence as fe                                          # noqa: E402
+import enrich_waterfall as _wf                                       # noqa: E402
 import task_registry as _tasks                                      # noqa: E402
 from cdp_base import CdpSiteCrawler                                 # noqa: E402
 from parallel_session import RAW_HEADERS, ParallelSession            # noqa: E402
@@ -77,14 +80,28 @@ _DNS_TABLE = {
 }
 _dns_misses = []
 _net_trips = []
+# 对照域探针的开关：预检要写「这个域不存在」前会先问一次对照域，判本机解析器通不通。
+# 这里只能由**夹具**提供答案：去桩掉 _resolver_alive 就是拿桩验桩，测不到真链路。
+_ctl = {"alive": True}
+_ctl_probes = []          # 对照域被真查过几次（不记这一笔，“探针没开火”就是一条永不会红的判据）
 
 
 def _fake_getaddrinfo(host, *a, **k):
-    ips = _DNS_TABLE.get(str(host).lower().rstrip("."))
-    if not ips:
-        _dns_misses.append(host)
-        raise OSError(f"离线用例查了表外域名：{host}")
-    return [(2, 1, 6, "", (ip, 0)) for ip in ips]
+    h = str(host).lower().rstrip(".")
+    ips = _DNS_TABLE.get(h)
+    if ips:
+        return [(2, 1, 6, "", (ip, 0)) for ip in ips]
+    if h in wc.DNS_CONTROL_HOSTS:
+        # 对照域是「本机解析器此刻通不通」的唯一探针，所以它必须**不查表**、只看开关：
+        # 表里存不存这三个域是夹具的事，开关才是被测代码能观察到的那件事。
+        _ctl_probes.append(h)
+        if _ctl["alive"]:
+            return [(2, 1, 6, "", ("58.87.101.9", 0))]
+        raise OSError("对照域也解不出来（模拟本机解析器废了）")
+    if h.endswith(".invalid"):                # RFC 6761 保留：真机就回 errno=8（查无此名）
+        raise socket.gaierror(8, "nodename nor servname provided")
+    _dns_misses.append(h)
+    raise OSError(f"离线用例查了表外域名：{host}")
 
 
 _real_getaddrinfo = wc.socket.getaddrinfo
@@ -123,6 +140,8 @@ def _reset_net():
     _calls.clear()
     _net_trips.clear()
     _dns_misses.clear()
+    _ctl_probes.clear()
+    _ctl["alive"] = True
     wc.reset_caches()
 
 
@@ -178,6 +197,103 @@ _assert(wc.is_public_host("not-in-table.example") is True,
       "查不到不等于危险：判不出时不拦，让请求自己失败（不许把没网说成不安全）")
 _assert(wc.pick_site({"公司网址": "https://xxx.jdzj.com/shop/1", "官网": "www.mingliang-led.com"})
         == "https://www.mingliang-led.com", "平台页跳过、按优先级取下一个像官网的字段")
+
+# ── B2. 域名可达性预检（DNS 缓存的三条闸）───────────────────────
+# 这一节本来一条判据都没有：预检能把一轮 990 行里那 327 家「不可达」从「每家付 10 秒
+# 连接超时」降到「一次并发解析」，但它同时是唯一被允许往缓存里写「这个域名不存在」的
+# 地方——写坏了就是两天内把好好域名一家家拦掉。**能提速的通道同时是能投毒的通道**，
+# 所以三道闸都要钉，而且每道都要钉正反两个方向：只钉「该拦时拦住了」，闸焊死也算通过。
+print("B2. 域名可达性预检（负结论只能由预检写，三道闸各管一种写坏缓存）")
+_pf_logs = []
+
+
+def _pf(hosts, **kw):
+    kw.setdefault("respect_persist", False)      # 闸的行为不靠磁盘也能验，先拿快的
+    _pf_logs.clear()
+    return wc.preflight_hosts(hosts, log=lambda m: _pf_logs.append(str(m)), **kw)
+
+
+_reset_net()
+_assert(wc.host_reachable("case-a.invalid") is None, "没跑过预检＝「没查过」：不拦也不跳")
+_assert(wc.is_public_host("case-a.invalid") is True,
+        "SSRF 闸碰到「查无此名」按设计放行（解不出 ≠ 危险，让请求自己失败）")
+_assert(wc.host_reachable("case-a.invalid") is None,
+        "但 SSRF 那一路**不许**顺手把负结论写进可达性缓存：它分不清「域名真没了」与"
+        "「本机此刻没网」，后者一固化下次联网预检就会把整批好域名当不存在拦掉")
+
+_reset_net()
+st = _pf(["www.mingliang-led.com", "case-b.invalid"])
+_assert(st["live"] == 1 and st["dead"] == 1,
+        f"批内同时有在网与查无此名时分档正确（{st['live']}/{st['dead']}）")
+_assert(wc.host_reachable("case-b.invalid") is False,
+        "预检把「查无此名」落成负结论：下一轮这一家不再付连接超时")
+_assert(not _ctl_probes,
+        "批内只要有一个域解出来了就**不再问对照域**：那一个成功已当场证明本机解析器是通的。"
+        "旧写法每轮开局先打三个对照域，那三个是真外网域名——离线用例当场变成「悄悄联网」，"
+        "并把「本机 DNS 不可用」这句**假结论**印进日志，后面的预检不再是生产那条路")
+
+_reset_net()
+_ctl["alive"] = False
+st = _pf(["case-c.invalid", "case-d.invalid"])
+_assert(st["skipped"] and st["dead"] == 0,
+        f"本机解析器判废时一条负结论都不写（dead={st['dead']}）")
+_assert(wc.host_reachable("case-c.invalid") is None
+        and wc.host_reachable("case-d.invalid") is None,
+        "「坏掉的递归 DNS 能把全网判成不存在」那种负结论一写就是两天，比不缓存糟糕得多")
+_assert(bool(_ctl_probes),
+        "但探针不许因为「挪到写盘前」就不开火：批内零成功又有负结论要写时它必须问")
+_assert(st["unknown"] == 2,
+        f"被丢弃的负结论退回「没查过」并把家数记进 unknown（{st['unknown']}）："
+        "不记这一笔，后面 enrich_site 的账就凑不齐")
+_assert(any("不记任何「不存在」结论" in m and "2 个域照旧去抓" in m for m in _pf_logs),
+        "话术里那个数必须是**丢弃的家数**：拿清零后的 dead 拼句子就恒印「0 个域」，"
+        "日志说「本轮没拦任何一家」而实际上整整一批都是被拦掉的——最坏的那种假账")
+
+_reset_net()
+st = _pf(["case-e.invalid"])          # 对照域默认通（夹具开关已复位）
+_assert(st["dead"] == 1 and wc.host_reachable("case-e.invalid") is False,
+        "反向对照：解析器是通的时，全批零成功**不能**拦下合法负结论——"
+        "一轮里真的只有一两家小域名不存在是完全可能的，把探针当永真闸就等于废掉整个缓存")
+
+_reset_net()
+_many = [f"case-f{i}.invalid" for i in range(wc.DNS_DEAD_MIN_PROBED)]
+st = _pf(_many + ["www.mingliang-led.com"])
+_assert(st["dead"] == 0 and not [h for h in _many if wc.host_reachable(h) is False],
+        f"{len(_many)}/{len(_many) + 1} 判死超过阈值 → 占比闸丢弃全部负结论（dead={st['dead']}）")
+_assert(not _ctl_probes,
+        "占比闸靠批内自己的分布就能判，不需要再问对照域（两道闸不重叠也不互等）")
+
+_reset_net()
+st = _pf([f"case-g{i}.invalid" for i in range(wc.DNS_DEAD_MIN_PROBED - 1)])
+_assert(st["dead"] == wc.DNS_DEAD_MIN_PROBED - 1,
+        "样本没到 DNS_DEAD_MIN_PROBED 就不下「解析器不可信」的结论："
+        "10 家全是死域在小表里完全正常，拿占比当唯一依据就会把少量死域名当成机器坏了")
+
+_reset_net()
+st = _pf(["not-in-table.example"])
+_assert(st["unknown"] == 1 and wc.host_reachable("not-in-table.example") is None,
+        "超时/临时失败算「没查过」（不是「不存在」）：跟上面的查无此名必须是两个结论")
+
+_reset_net()
+wc._dns_disk_note("case-h.invalid", False, when=time.time() - wc.DNS_TTL_DEAD - 1)
+_assert(wc.host_reachable("case-h.invalid") is None,
+        "负结论过期就当没查过（新注册的域名要能复活），而不是把过期读成永久")
+wc._dns_disk_note("case-h.invalid", False)
+_assert(wc.host_reachable("case-h.invalid") is False,
+        "同一结论重记一次就复活：TTL 是「重新问一次」不是「判死」")
+
+_reset_net()
+st = _pf(["www.mingliang-led.com", "case-i.invalid"], respect_persist=True)
+_assert(st["dead"] == 1 and wc.dns_disk_flush() is True, "预检结论落盘")
+with wc._LOCK:
+    wc._DNS_DISK.clear()
+wc._DNS_DISK_LOADED = False
+_assert(wc.host_reachable("case-i.invalid") is None,
+        "内存镜像清空且未加载时＝没查过（「没加载过就不写盘」与「没加载过就不读」是同一口径）")
+wc._dns_disk_load()
+_assert(wc.host_reachable("case-i.invalid") is False,
+        "跨任务复用：结论从盘里回来，一次都不再问（这就是那 327 家不再各付 10 秒的原因）")
+_reset_net()
 
 # ── C. 证据分级 ─────────────────────────────────────────────
 print("C. 证据分级（页面哪里出现的）")
@@ -409,6 +525,146 @@ _assert(st5["marked"] == 0 and any(k.startswith("内部异常") for k in st5["re
         f"工作线程里的异常被收口成一条原因，不冒泡：{st5['reasons']}")
 _assert(_net_trips == [], "全程没有一次真 HTTP 请求（requests.get 硬闸从未被触发）")
 
+# ── H2. 追加候选的惰性问法（escalate）──────────────────────
+# 这一段的每一条都对着一种**曾经真实写错过**的形状，不是装饰：
+#   · 预支（在排队阶段就把要花钱的候选拼上去）→ 抽到值的行也在买单；
+#   · 共用单行名额（按剩余名额追加）→ 零网络候选本来就交 4 个、单行只取前 3 个，
+#     于是那一问永远轮不到，层级表多一级而实际一个包都不发（定义了没接线）；
+#   · 不去重／每轮都问 → 同一个域名访问两遍，白烧一倍配额。
+# 所以下面六条分别钉住：命中即停不问、占满名额仍要接得上、只问一次、不重复访问、
+# 层级记对、没传时与老行为逐字相同。
+print("H2. 追加候选的惰性问法（真线程池 + 假网络 + 假 provider）")
+_reset_net()
+_PAGES.clear()
+_PAGES["www.first-hit.com"] = GOOD          # 行自带官网，第一个候选就出值
+_PAGES["www.free-1.com"] = NOWHERE          # 免费候选：页面上没号码
+_PAGES["www.free-2.com"] = NOWHERE
+_PAGES["www.free-3.com"] = NOWHERE
+_PAGES["www.rescued.com"] = GOOD            # 只有反查回来的那一个站有值
+_FREE3 = [("https://www.free-1.com/", "brand"),
+          ("https://www.free-2.com/", "brand"),
+          ("https://www.free-3.com/", "brand")]
+assert len(_FREE3) == wc.MAX_CANDIDATES_PER_ROW, \
+    "夹具前提：这一串正好占满单行名额（占不满就测不到「名额挤占」那种形状）"
+_esc_calls = []
+
+
+def _esc(got):
+    def _fn(rec):
+        _esc_calls.append(str(rec.get("公司名称") or ""))
+        return list(got)
+    return _fn
+
+
+# ① 命中即停：第一个候选就抽到值的行，绝不许为它多问一次
+_reset_net()
+_esc_calls.clear()
+_r1 = [_rec("甲公司", "www.first-hit.com")]
+_s1 = wc.enrich_records(_r1, workers=1, budget=30, limit=50,
+                        escalate=_esc([("https://www.rescued.com/", "search")]))
+assert _s1["ok"] == 1
+_assert(_esc_calls == [],
+        f"第一个候选就出值的行，一次都不问追加那一级（实际问了 {len(_esc_calls)} 次）——"
+        "预支配额就是在这里烧掉的")
+_assert([wc.host_of(u) for u in _calls] == ["www.first-hit.com"],
+        f"问都没问，自然一个额外页都不抓：{_calls}")
+
+# ② 免费候选占满单行名额时，追加那一级照样接得上（这一条钉的是「共用名额」那种写法）
+_reset_net()
+_esc_calls.clear()
+_r2 = [_rec("乙公司", "")]
+_s2 = wc.enrich_records(_r2, workers=1, budget=60, limit=50,
+                        resolver=lambda rec: list(_FREE3),
+                        escalate=_esc([("https://www.rescued.com/", "search")]))
+_assert(_esc_calls == ["乙公司"],
+        f"免费候选占满单行名额（{wc.MAX_CANDIDATES_PER_ROW} 个）时仍要问一次："
+        f"实际 {_esc_calls}——共用名额的写法会在这里变成永轮不到")
+_assert("www.rescued.com" in [wc.host_of(u) for u in _calls],
+        f"问回来的候选真的去抓了（不是只拼进名单就算）：{_calls}")
+_assert(_r2[0]["电话"] == PHONE and _s2["ok"] == 1,
+        "反查回来的站抽到值并就地写回：" + str(_r2[0]["电话"]))
+_ev2 = fe.parse_evidence(_r2[0])
+_assert(_ev2.get("电话", ("", ""))[1] == "search",
+        f"这个值的「补全层级」记的是搜索反查那一层（实际：{_ev2.get('电话')}）——"
+        "记错层就会把外网反查的号算成官网直采的可信分")
+
+# ③ 单行只许问一次（反查没结果也不能每试一个候选就重问一遍）
+_reset_net()
+_esc_calls.clear()
+_r3 = [_rec("丙公司", "")]
+wc.enrich_records(_r3, workers=1, budget=60, limit=50,
+                  resolver=lambda rec: list(_FREE3), escalate=_esc([]))
+_assert(_esc_calls == ["丙公司"],
+        f"反查一无所获时也只问一次（三个免费候选都失败 ≠ 问三次）：实际 {len(_esc_calls)} 次")
+# 数的是**访问过的域名集合**而不是页数：一个站最坏要翻好几个页（联系页 + 常见路径），
+# 拿页数当候选数会把「一个候选五个页」读成「问了五次」。
+_h3 = {wc.host_of(u) for u in _calls}
+_assert(_h3 == {"www.free-1.com", "www.free-2.com", "www.free-3.com"},
+        f"反查没拿到候选时，访问的域名集合不增（白抓的站就在这里多出来）：{sorted(_h3)}")
+
+# ④ 去重必须在封顶**之前**：反查回来的四个候选里三个刚被免费候选试过（都已判过
+# 「页面未见可用号码」），而追加名额只有 ESCALATE_MAX_PER_ROW 个。不去重的后果不是
+# 「多访问一遍」——进程内同一域名只请求一次的缓存会把重复访问吞掉，屏幕上根本看不见；
+# 后果是**重复站把唯一那个新站挤出门槛**，那一行就永远补不上。钉前者会得到一条
+# 无论实现对错都通过的装饰判据（上一版就是这么写的），这里钉的是可观察的那个代价。
+_reset_net()
+_esc_calls.clear()
+_r4 = [_rec("丁公司", "")]
+_ESC4_DUP = [("https://www.free-1.com/", "search"),
+             ("https://www.free-2.com/", "search"),
+             ("https://www.free-3.com/", "search"),
+             ("https://www.rescued.com/", "search")]
+assert len(_ESC4_DUP) > wc.ESCALATE_MAX_PER_ROW, \
+    "夹具前提：重复项要多到能挤掉新站，否则这条判据测不到「去重与封顶的先后」"
+wc.enrich_records(_r4, workers=1, budget=60, limit=50,
+                  resolver=lambda rec: list(_FREE3), escalate=_esc(_ESC4_DUP))
+_h4 = [wc.host_of(u) for u in _calls]
+_assert("www.rescued.com" in _h4,
+        f"反查回来的重复站不许把唯一那个新站挤掉（去重必须在封顶之前）："
+        f"实际访问过 {sorted(set(_h4))}")
+_assert(_r4[0]["电话"] == PHONE,
+        f"被挤掉新站时这一行就补不到值（后果必须落在值上，不只是名单形状）："
+        f"电话=「{_r4[0]['电话']}」")
+_assert(_esc_calls == ["丁公司"], f"单行只问一次这一条不受去重写法影响：{_esc_calls}")
+
+# ⑤ 没传 escalate（默认）＝老行为，一个额外问题都不发
+_reset_net()
+_esc_calls.clear()
+_r5 = [_rec("戊公司", "")]
+_s5 = wc.enrich_records(_r5, workers=1, budget=60, limit=50,
+                        resolver=lambda rec: list(_FREE3))
+_h5 = {wc.host_of(u) for u in _calls}
+_assert(_h5 == {"www.free-1.com", "www.free-2.com", "www.free-3.com"},
+        f"没接 provider 时只试免费候选，访问的域名集合不增：{sorted(_h5)}")
+# 不只要「没多访」，还要**连一次函数调用都没发生过**：没开时下游拿到的是 None
+# 而不是空函数——把 None 代成空函数，「没开」与「开了但没结果」在账上就同形了。
+_assert(not _esc_calls and "escalate_ask" not in _s5,
+        "没传 escalate 时追加那一级的计数器一个都不涨（账上分不清没开与开了没结果）")
+
+# ⑥ provider 抛异常等同没找到：绝不把已经跑了一半的回采轮带崩
+_reset_net()
+
+
+def _boom_esc(rec):
+    raise RuntimeError("假 provider 故意炸")
+
+
+try:
+    _s6 = wc.enrich_records([_rec("己公司", "")], workers=1, budget=60, limit=50,
+                            resolver=lambda rec: list(_FREE3), escalate=_boom_esc)
+except Exception as _e6:                          # noqa: BLE001 - 这条判据判的就是“没冒泡”
+    _s6 = {"error": type(_e6).__name__}
+_assert(_s6.get("error") is None and _s6.get("escalate_err") == 1,
+        f"provider 抛异常被收口成一条账（不冒泡、不中断）：{_s6}")
+_assert(_net_trips == [], "H2 全程没有一次真 HTTP 请求（requests.get 硬闸从未被触发）")
+# 夹具收口：H2 把 _PAGES 换成自己的那一批域名，下一段（I 会话层）仍拿明亮照明的页当
+# 唯一出值页。不留这一手就是「I 段红是因为 H2 把页表清了」这种假回归。
+_PAGES.clear()
+_PAGES["www.mingliang-led.com"] = GOOD
+_PAGES["www.a-b.com"] = NOWHERE
+_reset_net()
+_esc_calls.clear()
+
 # ── I. 会话层 ───────────────────────────────────────────────
 print("I. 会话层接线（ParallelSession）")
 sess = ParallelSession()
@@ -448,6 +704,12 @@ _assert((total, with_site, missing) == (1, 1, 1),
         f"preview 与真跑同一份判据：{(total, with_site, missing)}")
 sess._all_live_records = lambda: [_rec("某某食品公司", "https://xxx.jdzj.com/shop/1")]
 _assert(sess.site_enrich_preview()[1] == 0, "preview 不把平台页算成可回采官网")
+# 同一行在两个开关下必须得出两个不同的数，而且差值得有解释：只钉单跳那一档，
+# 「勾了瀑布也按 pick_site 数」这种退化成旧口径的写法就没人拦得住。
+sess.waterfall = True
+_assert(sess.site_enrich_preview()[1] == 1,
+        "同一行勾了瀑布就算得起来（行自带的那一个官网是平台页，但还有别的途径）")
+sess.waterfall = False
 
 # ── J. 界面手动入口 ─────────────────────────────────────────
 print("J. 界面手动入口（offscreen 真 MainWindow）")
@@ -486,23 +748,55 @@ app.processEvents()
 _assert(any("没有数据" in b for b in boxes), "没数据时点它：说清没东西可补，而不是点了没反应")
 _assert(w._site_worker is None, "没数据时不起线程")
 
-w.session._all_live_records = lambda: [_rec("某某食品公司", "")]
+w.session._all_live_records = lambda: [_rec("某", "")]
+# 这一档默认开着瀑布，所以 0 行的解释必须是「所有途径一级都不接得上」那一套；只讲
+# 「公司网址那列没有可用官网」是单跳时代的说法——勾了新功能却听旧解释，
+# 用户会以为是老问题，而真原因可能是邮箱列也空、同主体也没有值。
+# 夹具这一行要**真的一个途径都没有**：拼音通道接进来后，双字以上的中文商号都会算出候选
+# （那一档的判据在 test_waterfall_leads_offline 的 H 条，不在这里重述），拿旧夹具跑就变成
+# 「有途径却断言没途径」，红的不是界面而是这句话本身。单字名是当下最短的真零途径形状。
 boxes.clear()
 w.btn_site_now.click()
 app.processEvents()
-# 这一档默认开着瀑布，所以 0 行的解释必须是「五级途径都接不上」那一套；只讲
-# 「公司网址那列没有可用官网」是单跳时代的说法——勾了新功能却听旧解释，
-# 用户会以为是老问题，而真原因可能是邮箱列也空、同主体也没有值。
 _assert(any("没有可补采的行" in b for b in boxes),
         "有数据但一行途径都没有：单独一句话说明白（标题按口径改名，不再只说官网）")
-_assert(any("五种途径都试过" in b for b in boxes),
-        "勾了瀑布时 0 行的解释跟着口径换：把五级途径点名，而不是只讲官网那一列")
+# 断言从**层级表本体**拉：个数与每一个名字都必须在话术里出现。旧断言只钉「五种途径」这
+# 四个字的字面，而那句话是手抄在界面里的——阶段表多一级时旧断言会跟着旧文案一起错。
+# 2026-11-18 再收紧一层：要额外花外网配额才会走的那一级（现网反查）没开时**不许算进话里**：
+# 「六种途径都试过」在只跑了五种的时候是一句看不出来的谎，而它偏偏长得像合规。
+# 所以两个口径各验一遍：开关关→个数只算本轮真会走的、且不得点名那一级；
+# 开关开→个数与名字都要把那一级补齐。
+_act = _wf.active_stages(bool(w.session.expensive_lookup))
+_assert(any(f"{len(_act)} 种途径都试过" in b for b in boxes),
+        f"勾了瀑布、没开现网反查时 0 行的解释跟着口径换：途径**个数**由本轮真会走的层级算（{len(_act)}）")
+_bad_tiers = [s for s in _act if _wf.stage_name(s) not in " ".join(boxes)]
+_assert(not _bad_tiers,
+        f"话术里逐级点名到本轮真会走的每一级，且用的就是「补全层级」列落库的那个名字"
+        f"（缺这些级：{_bad_tiers}）：白话描述与层级名分家最难发现")
+_gated_said = [s for s in _wf.STAGES if s not in _act
+               and _wf.stage_name(s) in " ".join(boxes)]
+_assert(not _gated_said,
+        f"没开的现网反查不许被说成「试过的途径」（话术里出现了：{_gated_said}）——"
+        "把没花的配额报成花过，用户下次就不会信这一列的账")
+w._set_expensive_lookup(True)      # 走唯一写入口，顺带验依赖（此时瀑布是开的）
+boxes.clear()
+w.btn_site_now.click()
+app.processEvents()
+_act2 = _wf.active_stages(True)
+_assert(len(_act2) == len(_wf.STAGES),
+        "夹具前提：开了现网反查就是全层级都走（否则上面那两条对照不是同一个口径）")
+_assert(any(f"{len(_act2)} 种途径都试过" in b for b in boxes),
+        f"开了现网反查后个数要把那一问也算进去（{len(_act2)}）")
+_missing2 = [s for s in _act2 if _wf.stage_name(s) not in " ".join(boxes)]
+_assert(not _missing2,
+        f"开了现网反查后那句要把「{_wf.stage_name('search')}」也点名出来（缺：{_missing2}）")
+w._set_expensive_lookup(False)     # 还原默认，别把开关状态留给后面的章节
 _assert(w._site_worker is None, "无途径可补时也不起线程")
 w.session.waterfall = False
 boxes.clear()
 w.btn_site_now.click()
 app.processEvents()
-_assert(any("平台页" in b and "五种途径" not in b for b in boxes),
+_assert(any("平台页" in b and "种途径" not in b for b in boxes),
         "反向对照：没勾瀑布时只讲单跳口径（公司网址里的平台页那几条），不塞瀑布的话术")
 w.session.waterfall = True
 

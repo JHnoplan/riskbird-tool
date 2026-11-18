@@ -3,7 +3,7 @@
 
 这五个功能合起来是把工具从「一次采一张表」变成「会自己补、会自己排序、会自己刷新的资产」。
 它们的正确性**全部在判据里**，不在抓取动作里，所以本套件按
-「口径同源 → 证据编解码 → TTL → 瀑布四级 → 评分分层 → 通道健康 → 会话 → 界面」八段钉，
+「口径同源 → 证据编解码 → TTL → 瀑布逐级 → 评分分层 → 通道健康 → 会话 → 界面」八段钉，
 全程不联网（fetch_html / socket.getaddrinfo / requests.get 三处都换成表驱动或硬闸）：
 
   A. 层级注册表与阶段表同源：名字只许一套；STAGES 按成本升序（Clay 那条「顺序比源重要」
@@ -15,8 +15,11 @@
   E. carry_pass：零请求补齐、**继承 donor 的层级与核验时间**（2026-11-14 自查抓到的降级卖号 bug）、
      只追加不覆盖、重跑幂等
   F. pick_targets：命中即停不花请求、勾重验后过期行进队列、不勾时一律不进
-  G. workable_count：三口径并集（单跳数不到的行必须数到）——界面拦不拦按钮就靠这个数
-  H. run_waterfall：五级顺序、账目齐全、registry 投递走注入回调并封顶、
+  G. workable_count：四口径并集（单跳数不到的行必须数到；披露口径只在索引已热时数）
+     ——界面拦不拦按钮就靠这个数，而它跑在界面线程上
+  G2. exchange_pass：三档命中、**被拦下与没这家分开记账**、只追加不覆盖、核验时间不倒拨、
+     披露域名只当第一候选（层级记 site）、预览那条路零读盘零建索引、命中行不再花请求
+  H. run_waterfall：逐级顺序（级数不写死在判据里）、账目齐全、registry 投递走注入回调并封顶、
      任一级异常只影响那一级（不许冒泡把已采数据一起丢掉）
   I. snapshot/diff：新增 / 补充 / **改写(异常)** 三种变化形态
   J. 评分与分层：三维权重、硬可信闸、过期打折且闸掉立即跟进、依据列可解释、
@@ -30,6 +33,9 @@
      （静默少功能）、报表失败不影响主交付、两种账目形态的摘要口径同源
   O. 界面层：三个勾选恒定可见（档位藏不住口径开关）、默认值、值/控件/会话三处同步、
      依赖级联与前置回弹、快照恢复不许弹模态框、话术跟着口径换
+  P. 级数免疫：把阶段表当变量扰动（加一级 / 减一级 / 摘掉花钱那一级），界面 tooltip、
+     会话顺序那句、账目里的序号必须全部自动跟随——这一节是给「再接一级」做前置闸的，
+     不是再验一遍今天这几级的文案
 
 运行：python test_waterfall_leads_offline.py
 """
@@ -127,6 +133,16 @@ def _stub_enrich(records, log=None, **kw):
 _real_enrich = wc.enrich_records
 wc.enrich_records = _stub_enrich
 
+# ── 披露主数据级的离线护栏 ────────────────────────────────────────
+# 阶段表现在含 exchange 一级，它默认「盘上没有就先拉全量」，而本套件一个包都不许发。
+# 两道闸各挡一件事：状态目录已被 B2B_STATE_DIR 钉进沙箱（那里天生没有主数据文件），
+# 这里再把 AUTO_FETCH 关掉——缺后者，跑完 H 段拿到的会是「第 1 页拉取失败
+# （AssertionError）」而不是「本地还没有主数据文件」，前者把护栏破坏伪装成了业务结论。
+# G2 一节需要「对得上主体」的账时走 exchange_master.load_rows（内存装索引，不读盘不出网）。
+import exchange_master as em                                        # noqa: E402
+_real_auto_fetch = em.AUTO_FETCH
+em.AUTO_FETCH = False
+
 
 def _rec(name, **kw):
     """造一条采集记录：默认补齐四个留痕/证据键，形状与 _base_rec 一致。"""
@@ -161,6 +177,14 @@ _assert(len({fe.TIER_SCORE[s] for s, *_ in fe.TIERS}) > 1
         "可信分与成本是**分开**登记的：按成本排出来的顺序里可信度并不单调（混成一个数才是错）")
 _assert(fe.CONFIDENT_MIN == fe.TIER_SCORE["site"],
         "命中即停的闸取自「官网直采」那一层，不是另拍的数")
+# 这一条是 exchange 级的性能命门，不是加分项：披露分低于那道闸时，本级写完值
+# 仍然会被 pick_targets 判成待办——「零请求的一级」就白跑了一轮网络。两个数写在
+# 不同的表里（层级注册表与会话闸），谁改一个都不会当场报错。
+_assert(fe.TIER_SCORE["exchange"] >= fe.CONFIDENT_MIN
+        and fe.TIER_COST["exchange"] == 0,
+        f"披露级（可信 {fe.TIER_SCORE['exchange']}、成本 {fe.TIER_COST['exchange']}）"
+        f"补齐的行会被「命中即停」闸放行（闸在 {fe.CONFIDENT_MIN}）："
+        "免费的零请求才真能落成「不再花请求」")
 _assert(fe.evidence_columns() == (fe.EVIDENCE_COL, fe.PROOF_COL, fe.VERIFIED_COL),
         "证据三列的名字与顺序只有一个来源")
 _assert(fe.CONFIDENT_MIN == ls.WORK_CONF_MIN,
@@ -286,21 +310,67 @@ _assert(wf.brand_tokens(_rec("F3", 公司名称="SHENZHEN HUAWEI TECHNOLOGIES CO
         == ["huawei", "shenzhen"],
         "公司形式词（TECHNOLOGIES/CO/LTD）剔掉、地名段降到末尾但**不删**："
         "确有以地名注册为商号的小公司，删掉就是把它们判死")
-_assert(wf.discover_site(_rec("F4", 公司名称="SHENZHEN HUAWEI TECHNOLOGIES CO.,LTD"))
-        == ("https://huawei.com/", "brand"),
-        "第一个候选是商号而不是地名（否则每条记录先白烧一次 shenzhen.com 再被归属核验拒绝）")
+# 商号段的**取位规则**（本轮修的四个形状，每一个都对应一类白烧的现网请求）。
+# 上一版取「最左标签」+「parts[-3]」，带子域前缀的自有域名两位都落在 www/shop 上，
+# 于是整行一个候选都产不出——日志上只表现为「品牌域名推导 0 家」，与「确实推不出」同形。
+_bt = wf.brand_tokens(_rec("D2", 公司网址="https://www.mingliang-led.com/"))
+_assert(_bt == ["mingliang-led"], f"自有域名取注册域第一段，不取子域前缀：{_bt}")
+_bt = wf.brand_tokens(_rec("D3", 公司网址="https://hapstar.cn.b2b168.com/x.html"))
+_assert(_bt == ["hapstar"], f"租户标签自己带点时按平台域深度切（数点数位会切到 cn）：{_bt}")
+_bt = wf.brand_tokens(_rec("D4", 公司网址="https://yixingjd_com.b2b168.com/"))
+_assert(_bt == ["yixingjd"] and "yixingjdcom" not in _bt,
+        f"TLD 尾巴拆掉而不是粘成不存在的域名形状：{_bt}")
+_bt = wf.brand_tokens(_rec("D5", 公司网址="https://acef_comcn.huangye88.com/"))
+_assert(_bt == ["acef"], f"三截粘连尾巴 comcn 也要认得：{_bt}")
+_bt = wf.brand_tokens(_rec("D6", 详情URL="https://x12345.b2b168.com/"))
+_assert(_bt == [], f"店铺编号不当商号（拿它拼域名必然指向别人家）：{_bt}")
+_bt = wf.brand_tokens(_rec("D7", 公司网址="https://shop.51job.com/"))
+_assert(_bt == ["51job"],
+        f"编号拦管用数字**占比**而不是数字个数，不误杀 51job 这种真字号：{_bt}")
+_bt = wf.brand_tokens(_rec("D8", 公司网址="www.brand.com.cn"))
+_assert(_bt == ["brand"], f"双段公共后缀交给 _reg_domain 判，不另列第二份表：{_bt}")
+_bt = wf.brand_tokens(_rec("D9", 公司网址="https://x.qy.hc360.com/"))
+_assert(_bt == [],
+        f"平台命中的最长一条才算深度（取短了会把 qy 当租户）：{_bt}")
+# 上面那条在当前表里其实开不了火：qy/b2b/ydp 都短于 4 位，取错深度也会被
+# BRAND_MIN_LEN 顺手拦掉，于是「取最长」与「取第一条」同形。所以这里临时往平台表里
+# 加一条**二级标签够长**的合成项（shops 既≥4 又不在 GENERIC 表里）：取错深度就会多
+# 吐一个 shops.cn 这种平台自己的域名。不这么搭夹具，这条判据就是一条永不会红的装饰。
+_PLATFORMS = wc.PLATFORM_HOSTS
+try:
+    wc.PLATFORM_HOSTS = _PLATFORMS + ("shops.hc360.com",)
+    _bt = wf.brand_tokens(_rec("D10", 公司网址="https://mingliang-led.shops.hc360.com/"))
+    _assert(_bt == ["mingliang-led"],
+            f"多级平台条目按最长匹配定深度，不把平台自己的二级标签当商号：{_bt}")
+finally:
+    wc.PLATFORM_HOSTS = _PLATFORMS
+_f4 = wf.discover_site(_rec("F4", 公司名称="SHENZHEN HUAWEI TECHNOLOGIES CO.,LTD"))
+_assert(_f4 and _f4[0] == ("https://huawei.com/", "brand"),
+        f"第一个候选是商号而不是地名（否则每条记录先白烧一次 shenzhen.com）：{_f4}")
+_assert("shenzhen.com" not in [u for u, _t in _f4[:2]],
+        f"地名段不得抢在同一个商号的第二个 TLD 之前：{_f4}")
 _ds = wf.discover_site(_rec("G", 邮箱="info@mingliang-led.com"))
-_assert(_ds == ("https://mingliang-led.com/", "mailsite"),
+_assert(_ds[0] == ("https://mingliang-led.com/", "mailsite"),
         f"邮箱域排在品牌拼域名前面（同一档成本里它更可信）：{_ds}")
-_assert(wf.discover_site(_rec("H", 邮箱="a@qq.com", 公司名称="张三五金店")) == ("", ""),
-        "只有免费邮箱 + 纯中文商号＝认不出官网（返回空而不是硬拼一个站）")
-_assert(wf.discover_site(_rec("I", 邮箱="sales@1688.com"))[1] != "mailsite",
+_h = wf.discover_site(_rec("H", 邮箱="a@qq.com", 公司名称="张三五金店"))
+# 这一条本轮**刻意改判**：旧口径下「免费邮箱 + 纯中文商号」返回空（那时除了搜索没有
+# 别的路）；拼音通道接进来就是为这一大批公司开的。但两道闸都没松：
+# ① 免费邮箱依旧不产 mailsite 候选；② 拼音候选只算 brand 档，值能不能写仍听归属核验。
+_assert(not [t for _u, t in _h if t == "mailsite"],
+        f"免费邮箱域仍不进 mailsite（把腾讯总机当五金厂电话的那道闸没松）：{_h}")
+_assert(_h and _h[0][1] == "brand",
+        f"纯中文商号现在有拼音候选（本轮接进来的通道 ②，不是判据漏了）：{_h}")
+_assert(wf.discover_site(_rec("I", 邮箱="sales@1688.com")) == [],
         "平台域名当邮箱域时不走 mailsite（那是平台客服号的入口）")
 _res = wf.resolver_for([_rec("J", site="www.mingliang-led.com/contact"),
                         _rec("J", 邮箱="sales@mingliang-led.com")])
-_url, _slug = _res(_rec("J", 邮箱="sales@mingliang-led.com"))
-_assert(_url == "https://www.mingliang-led.com/contact" and _slug == "mailsite",
-        f"同域名另一行本来带着官网→借那个现成 URL，但来源仍是推导（记 mailsite 不记 site）：{(_url, _slug)}")
+_j = _res(_rec("J", 邮箱="sales@mingliang-led.com"))
+_assert(_j and _j[0] == ("https://www.mingliang-led.com/contact", "mailsite"),
+        f"同域名另一行本来带着官网→借那个现成 URL，但来源仍是推导（记 mailsite 不记 site）：{_j}")
+# 本行自己的邮箱域与借来的那个站是**同一个注册域**，留着它就是同一个站占两个名额。
+# 单行预算只有三个位，多占一个位等于拼音/商号那一路整行拿不到候选。
+_assert(len(_j) == 1,
+        f"借来的站不重复占位（同注册域的候选被丢弃，不是按整串 URL 去重）：{_j}")
 _assert(isinstance(wf.registry_source_names(), set) and wf.registry_source_names(),
         "工商三路的来源名取自现成的通道标签（不写第二份站名）")
 _rn = sorted(wf.registry_source_names())[0]
@@ -383,7 +453,9 @@ print("G. 可补家数（口径跟着开关换）")
 _rows = [_rec("带官网公司", site="www.mingliang-led.com"),
          _rec("只有邮箱公司", 邮箱="sales@onlymail-abc.com"),
          _rec("同主体公司", 手机=""), _rec("同主体公司", 手机="13800001111")]
-_assert(wc.pick_site(_rows[1]) == "" and wf.discover_site(_rows[1])[0],
+_assert(wc.pick_site(_rows[1]) == "" and bool(wf.discover_site(_rows[1])),
+        # 写成 `discover_site(...)[0]` 也能跑，但候选列表一旦为空它就是 IndexError 而不是
+        # 判红——夹具坏掉时现场看不出是哪一行。
         "夹具成立：第 2 行在单跳口径下不算可补、在瀑布下算")
 _n_all = wf.workable_count(_rows)
 _n_single = len([r for r in _rows if wc.pick_site(r)])
@@ -391,7 +463,205 @@ _assert(_n_all >= 3 and _n_all > _n_single,
         f"三口径并集 {_n_all} 行 > 单跳口径 {_n_single} 行"
         "（勾了瀑布还按单跳数，界面就会拦住明明能补的按钮——用户读到「功能没生效」）")
 
-# ── H. run_waterfall：五级顺序与账目 ────────────────────────────────
+# ── G2. 披露主数据级：三档命中、两种失败分账、预览零 IO ─────────────
+# 这一节守的四件事，每件都能在一行代码里静默失效：
+#   ① 对齐口径与防错配闸（历史上被真实名录打回过一条真错配）；
+#   ② 零请求真能落成「不再花请求」（依赖可信分≥命中即停闸，A 段已钉）；
+#   ③ 预览不替本级读盘建索引（界面线程上两秒多就是用户报的「转圈」）；
+#   ④ 披露域名只当第一候选，且层级不假装是披露给的号（值仍来自页面）。
+# 夹具走 em.load_rows 而不是造文件：内存装索引不读盘不出网，而口径对象必须是
+# wf.align_key 本身——写成另一个等价函数会被 ensure 认成「口径换了」而重建索引，
+# 夹具静默退回「盘上没有」，那是假绿的典型形状。
+print("G2. 交易所披露接线（exchange_pass、候选首位、预览零 IO）")
+_M_ROWS = [
+    {"SECUCODE": "831761.BJ", "SECURITY_CODE": "831761", "SECURITY_NAME_ABBR": "夜光明",
+     "ORG_NAME": "宁波夜光电材料股份有限公司",
+     "ORG_TEL": "0574-63886666,13800002222", "ORG_EMAIL": " IR@yeguangming.com ",
+     "ORG_WEB": "www.yeguangming.com"},
+    {"SECUCODE": "600150.SH", "SECURITY_CODE": "600150", "SECURITY_NAME_ABBR": "中国船舶",
+     "ORG_NAME": "中国船舶工业股份有限公司", "ORG_TEL": "021-58906666",
+     "ORG_EMAIL": "ir@cssc.com", "ORG_WEB": ""},
+    # 同一家在两个市场各挂一条、各披露一个号：主体标识必须是全名归一而不是 SECUCODE，
+    # 否则这两条永远合不上（上一版就是：count 报的是记录数而不是家数，合并分支是死代码）。
+    {"SECUCODE": "200003.SZ", "SECURITY_CODE": "200003", "SECURITY_NAME_ABBR": "金田B",
+     "ORG_NAME": "深圳市金田实业股份有限公司", "ORG_TEL": "0755-82220001",
+     "ORG_EMAIL": "", "ORG_WEB": "www.jintian.com"},
+    {"SECUCODE": "400003.NQ", "SECURITY_CODE": "400003", "SECURITY_NAME_ABBR": "金田",
+     "ORG_NAME": "深圳市金田实业股份有限公司", "ORG_TEL": "0755-82220002",
+     "ORG_EMAIL": "ir@jintian.com", "ORG_WEB": ""},
+]
+_AS_OF = "2026-11-05"     # 故意比 _rec 默认的采集时间（11-01）新：不倒拨那条对照需要两边异日
+_meta = em.load_rows(_M_ROWS, align=wf.align_key, as_of=_AS_OF)
+_assert(_meta["present"] and _meta["count"] == 3,
+        f"4 条记录→ 3 家主体（{_meta['count']}）：多市场各一条必须合上，"
+        f"否则「名录 N 家」与「命中几家」说的不是一个东西")
+
+_http_before_g2 = len(_http_trips)
+_net_before_g2 = len(_net_trips)
+_g2_filled = _rec("宁波夜光电材料股份有限公司")
+_g2_reject = _rec("中国船舶集团有限公司")          # 真实名录打回过的那一条
+_g2_none = _rec("东莞市某某五金厂")
+_g2_merge = _rec("深圳市金田实业股份有限公司", 电话="0755-88880000")   # 旧号一个不许丢
+_g2_rows = [_g2_filled, _g2_reject, _g2_none, _g2_merge]
+_g2 = wf.exchange_pass(_g2_rows, allow_fetch=False)
+_assert(_g2["present"] and _g2["asked"] == 4 and _g2["matched"] == 2,
+        f"问到 4 行、对上 2 行（档位分布 {_g2['by_grade']}）："
+        f"集团那条被闸拦下就不可能同时算成命中：{_g2['matched']}")
+_assert(_g2["rejected"] == 1 and _g2["unmatched"] == 1,
+        f"「被拦下」与「名录里没这家」分开记账（{_g2['rejected']} / {_g2['unmatched']}）："
+        "混成一个「没对上」就答不出「这家上市公司为什么没补到」")
+_assert(any("集团" in x for x in _g2["rejected_examples"]),
+        f"被拦下的那一行留下可复核的原话（不只是个数字）：{_g2['rejected_examples']}")
+_tel = [x for x in wc._SPLIT_RE.split(_g2_filled["电话"]) if x]
+_mob = [x for x in wc._SPLIT_RE.split(_g2_filled["手机"]) if x]
+_emv = [x for x in wc._SPLIT_RE.split(_g2_filled["邮箱"]) if x]
+_assert(len(_tel) == 1 and len(_mob) == 1 and len(_emv) == 1,
+        f"披露包按列落到三格（座机进电话、手机进手机）：{_tel}/{_mob}/{_emv}")
+_assert(_emv == ["ir@yeguangming.com"],
+        f"披露值同样过形态闸并统一小写（原值是带空格的「 IR@...」）：{_emv}")
+_assert(f"{fe.TIER_LABEL['exchange']}" in _g2_filled[fe.EVIDENCE_COL]
+        and "F10披露" in _g2_filled[fe.PROOF_COL],
+        f"写了值才记层，证据里看得见是谁报的：{_g2_filled[fe.PROOF_COL][:60]}")
+_proof_tel = fe.parse_proof(_g2_filled).get("电话", "")
+_assert("｜" not in _proof_tel and "|" not in _proof_tel,
+        f"本级写出去的那一句证据里没有竖线：那列按 [｜|] 切段，一句话里带上分隔符就被切成"
+        f"两段（实得：{_proof_tel[:80]}）")
+# 切段不剩半句：三格各一句、各自都能读出出处。上一版这里直扫整列查「无竖线」，
+# 而列分隔符本身就是竖线——那条判据无论实现对错都红，把真风险（一句被切成两段）
+# 固定伪装成一行的红，下次真出问题就没人再看它。
+_pf_g2 = fe.parse_proof(_g2_filled)
+_assert(set(_pf_g2) == {"电话", "手机", "邮箱"}
+        and all("F10披露" in v for v in _pf_g2.values()),
+        f"三格各留下一句完整、能读出处的证据（切段不剩半句）：{sorted(_pf_g2)}")
+_mt = [_x for _x in wc._SPLIT_RE.split(_g2_merge["电话"]) if _x]
+_assert("0755-88880000" in _mt and "0755-82220001" in _mt and "0755-82220002" in _mt,
+        f"只追加不覆盖，且两个市场的号都收（旧号可能是唯一真号）：{_mt}")
+_proof_merge = fe.parse_proof(_g2_merge).get("电话", "")
+_assert("2个市场" in _proof_merge,
+        f"多市场主体在证据里说得清不是两个家：{_proof_merge[:70]}")
+_assert(_g2_filled[fe.VERIFIED_COL] == _AS_OF,
+        f"核验时间取名录版本日（比行里那轮采集新才写）：{_g2_filled[fe.VERIFIED_COL]}")
+_older = _rec("宁波夜光电材料股份有限公司", at="2026-12-20")
+wf.exchange_pass([_older], allow_fetch=False)
+_assert(not str(_older.get(fe.VERIFIED_COL) or ""),
+        "反向对照：名录比行内采集时间旧时不许倒拨时间（盖掉新时间就是把新数据判成旧）")
+_assert(len(_http_trips) == _http_before_g2 and len(_net_trips) == _net_before_g2,
+        f"本级逐行一个包都不发（出网 {_http_before_g2}→{len(_http_trips)}、"
+        f"DNS {_net_before_g2}→{len(_net_trips)}）：成本 0 不是注释里的说法而是可数的账")
+
+# needs_work 与 pick_targets 同源：两条路必须对同一行同判
+_g2_calm = _rec("宁波夜光电材料股份有限公司", 电话="0574-63886666",
+                手机="13800002222", 邮箱="ir@yeguangming.com")
+for _f in fe.CONTACT_FIELDS:
+    fe.set_field_evidence(_g2_calm, _f, "registry", "工商登记")
+_for_work = [_rec("东莞市某某五金厂"), _g2_calm]
+_keep, _skip, _stale = wf.pick_targets(_for_work)
+_assert(all(wf.needs_work(r)[0] == (r in _keep) for r in _for_work)
+        and len(_keep) == 1 and _skip == 1,
+        f"needs_work 与 pick_targets 逐行同判（keep={len(_keep)}, skip={_skip}）："
+        "免费那一面与烧请求那一面不能各判一套")
+
+# 披露域名只当第一候选：排序、同注册域去重、不挤占后面的候选
+_rp2 = wf.resolver_for(_g2_rows, site_of=wf.disclosed_site_for)
+_cand0 = _rp2(_rec("宁波夜光电材料股份有限公司"))
+_assert(_cand0 and _cand0[0] == ("https://www.yeguangming.com/", "site"),
+        f"披露域名排第一位、层级记「官网直采」（值来自页面）：{_cand0[:2]}")
+_email_same = _rec("宁波夜光电材料股份有限公司", 邮箱="ir@yeguangming.com")
+_cand1 = _rp2(_email_same)
+_regs1 = [wc._reg_domain(wc.host_of(u) or "") for u, _t in _cand1]
+_assert(len(_regs1) == len(set(_regs1)),
+        f"同一个注册域只占一个候选位（单行只有三个名额）：{[t for _u, t in _cand1]}")
+_assert([t for _u, t in _cand1][:2] == ["site", "brand"],
+        f"披露域名占第一位、邮箱反查那个同域候选不再重复占位：{[t for _u, t in _cand1][:3]}")
+_rp_nosite = wf.resolver_for(_g2_rows)
+_cand_nos = _rp_nosite(_email_same)
+_assert("https://www.yeguangming.com/" not in [u for u, _t in _cand_nos]
+        and _cand_nos and _cand_nos[0][1] == "mailsite",
+        f"不传 site_of 时本级在候选里一个痕迹都不留（回到老行为第一位仍是邮箱反查）：{_cand_nos[:2]}")
+_assert(wf.disclosed_site_for(_rec("东莞市某某五金厂")) == ""
+        and wf.master_match_for(_rec("东莞市某某五金厂")) is None,
+        "名录里没这家：两个入口都交空而不是猜一个域名")
+
+# 预览那条路零 IO：界面线程不能为本级读盘建索引
+_read_calls = []
+_build_calls = []
+_real_read, real_build = em.read_master, em.build_index
+
+
+def _spy_read(*a, **k):
+    _read_calls.append(1)
+    return _real_read(*a, **k)
+
+
+def _spy_build(*a, **k):
+    _build_calls.append(1)
+    return real_build(*a, **k)
+
+
+em.read_master, em.build_index = _spy_read, _spy_build
+_real_discover_g2, _real_picksite_g2 = wf.discover_site, wc.pick_site
+wf.discover_site = lambda rec: []          # 只验「第四个条件」接线，不重测发现引擎
+wc.pick_site = lambda rec: ""
+try:
+    em.reset_index()
+    # 拿**没被本级写过值**的四行：三个字段全空 + 发现引擎挨桩关掉，剩下的只有第四条条件。
+    # （拿 _g2_rows 不行：它们已经被上面的 exchange_pass 填过值，同主体那条会先把数推上去）
+    _probe = [_rec("宁波夜光电材料股份有限公司"), _rec("中国船舶集团有限公司"),
+              _rec("东莞市某某五金厂"), _rec("深圳市金田实业股份有限公司")]
+    _cold = wf.workable_count(_probe)
+    _assert(em.index() is None and not _read_calls and not _build_calls,
+            f"索引没热时预览一个盘都不读（读盘 {len(_read_calls)} 次、建索引 "
+            f"{len(_build_calls)} 次）：为一句界面文案去解析两万多条就是新的转圈来源")
+    em.load_rows(_M_ROWS, align=wf.align_key, as_of=_AS_OF)
+    # 计数器从这一刻重新起算：夹具自己调的 load_rows 内部就会走一次 build_index，
+    # 不清掉的话「预览不建索引」会被夹具自己判红（而不是被代码判红）。
+    del _read_calls[:]
+    del _build_calls[:]
+    _warm = wf.workable_count(_probe)
+    _assert(_cold == 0 and _warm == 2,
+            f"热好的索引里只有**真对得上主体**的行算可补（{_cold} → {_warm}）："
+            "四行里两家对得上，集团那行被拦下、五金厂那行名录里没有，都不该被数成能补")
+    _assert(not _read_calls and not _build_calls,
+            "预览全程不读盘不建索引（只用已就位的索引）")
+finally:
+    wf.discover_site, wc.pick_site = _real_discover_g2, _real_picksite_g2
+    em.read_master, em.build_index = _real_read, real_build
+
+# 账目四形状彼此不同（与 H2 段那三条同一个纪律：同形异义就是假账）
+_l_none = "".join(wf.stage_lines({"exchange": {"present": False,
+                                               "reason": "本地还没有主数据文件"}}))
+_l_miss = "".join(wf.stage_lines({"exchange": {"present": True, "count": 3, "as_of": _AS_OF,
+                                               "asked": 1, "matched": 0, "unmatched": 1}}))
+_l_novalue = "".join(wf.stage_lines({"exchange": {"present": True, "count": 3, "as_of": _AS_OF,
+                                                  "asked": 1, "matched": 1, "filled": 0}}))
+_l_hit = "".join(wf.stage_lines({"exchange": dict(_g2, present=True, count=3, as_of=_AS_OF)}))
+_l_err = "".join(wf.stage_lines({"exchange": {"error": "RuntimeError", "present": False}}))
+_assert("本轮没参与" in _l_none and "本地还没有主数据文件" in _l_none,
+        f"本级没动时必须说出为什么（否则「名录 0 家」会被读成「全表没一家上市」）：{_l_none}")
+_assert("一家都没对上" in _l_miss and "名录里没有" in _l_miss,
+        f"没对上那一档单独说一句：{_l_miss}")
+_assert("对上的行本来就有这些号" in _l_novalue,
+        f"对上了但没新值与一家都没对上不同形：{_l_novalue}")
+_assert("零请求补齐" in _l_hit and "防错配闸拦下" in _l_hit and "披露域名" in _l_hit,
+        f"命中那一档把家数、被拦下、域名三件事都说清：{_l_hit}")
+_assert("出错" in _l_err and _l_none != _l_miss != _l_novalue != _l_hit != _l_err,
+        "四种形状四句话（混成一句就是本级最容易被误读的地方）")
+
+# 总入口：本级在 pick_targets 之前，命中且补齐的行不再进网络级
+em.load_rows(_M_ROWS, align=wf.align_key, as_of=_AS_OF)
+_enrich_calls.clear()
+_st2 = wf.run_waterfall([_rec("宁波夜光电材料股份有限公司"), _rec("东莞市某某五金厂")],
+                        log=lambda m: None, registry_queue=lambda names: len(names))
+_assert(_st2["exchange"]["filled"] == 1 and _st2["network"].get("eligible") == 1,
+        f"披露补齐的行不再进网络级（本级补到 {_st2['exchange']['filled']} 行，"
+        f"待办只剩 {_st2['network'].get('eligible')} 行）：顺序反过来就是先烧完再记账")
+_assert(_st2["confident_skip"] == 1,
+        f"命中即停的闸接住了本级：{_st2['confident_skip']} 行本轮一次请求都没花")
+em.reset_index()
+_assert(em.index() is None and em.AUTO_FETCH is False,
+        "本级夹具已全部回收（不留一份假主数据给后面的章节）")
+
+# ── H. run_waterfall：逐级顺序与账目 ────────────────────────────────
 print("H. 瀑布总入口")
 _enrich_calls.clear()
 _log_lines = []
@@ -454,6 +724,110 @@ _assert(_boom.get("network", {}).get("error") == "_Boom",
         f"网络级异常记在账上而不是抛出：{_boom.get('network')}")
 _assert(_boom["carry"]["filled"] == 1, "异常只影响那一级：免费那一级照样完成")
 wc.enrich_records = _stub_enrich
+
+# ── H2. 现网反查那一级：开关、惰性、账目三形状 ──────────────────
+# 这一段守的是三种同形但异义的形状，不分开钉就永远分不出到底生没生效：
+#   「没开」、「开了但一行都没问到」、「开了也问了但没反出来」。
+# 另外钉住两条不会自己成立的：预览那条路绝不外网（2026-11-18 卡死的防线），
+# 以及 resolver 只交零成本候选（现网反查不在排队阶段预支）。
+print("H2. 现网反查接线（开关、透传、预览零网络）")
+_assert(wf.escalator_for() is None and wf.escalator_for(()) is None,
+        "开关全关时 provider 根本不存在（None 而不是空函数）——"
+        "写成空函数就会把「没开」与「开了没结果」在账上压成同一个形状")
+_assert(callable(wf.escalator_for(("serp",))), "开一路时拿到的是可调用对象")
+_assert(set(wf.active_stages(False)) == set(wf.STAGES) - set(wf.EXPENSIVE_STAGES)
+        and wf.active_stages(True) == wf.STAGES,
+        "active_stages 只摘掉「要额外花配额」那几级，开了就是全层级（不在这里手抄名单）")
+_assert("search" not in wf.active_stages(False)
+        and "registry" in wf.active_stages(False) and "carry" in wf.active_stages(False),
+        "没开时只摘掉现网反查那一级：免费的第一级与最后的工商级都不该被连带拿掉")
+
+_exp_calls = []
+_real_discover_exp = wf._sd.discover_expensive
+
+
+def _fake_discover(rec, log=None, use=()):
+    _exp_calls.append(tuple(use or ()))
+    return [("https://serp-found.com/", "search")]
+
+
+wf._sd.discover_expensive = _fake_discover
+try:
+    _enrich_calls.clear()
+    _off = wf.run_waterfall([_rec("反查甲"), _rec("反查乙")], log=lambda m: None,
+                            registry_queue=lambda n: len(n))
+    _assert(_exp_calls == [] and _enrich_calls
+            and _enrich_calls[0].get("escalate") is None,
+            "开关默认关时：现网反查一次都没问，下游连 provider 都拿不到（不是拿到一个空的）")
+    _assert(_off["escalate"]["channels"] == [],
+            f"没开这件事要记在账上而不是只活在局部变量里：{_off['escalate']}")
+
+    _enrich_calls.clear()
+    _exp_calls.clear()
+    wf.run_waterfall([_rec("反查丙")], log=lambda m: None,
+                     serp_lookup=True, registry_queue=lambda n: len(n))
+    _fn = _enrich_calls[0].get("escalate")
+    _assert(callable(_fn), "开 serp 一路后下游拿到可调用对象")
+    _assert(_exp_calls == [],
+            "开了不等于立刻就问：provider 在下游手上，本模块自己一次都不调（这就是惰性）")
+    _got = _fn(_rec("反查丙"))
+    _assert(_exp_calls[-1] == ("serp",) and _got == [("https://serp-found.com/", "search")],
+            f"只把界面上开的那一路透下去、候选原样交回：{_exp_calls[-1]} / {_got}")
+
+    _enrich_calls.clear()
+    wf.run_waterfall([_rec("反查丁")], log=lambda m: None,
+                     shop_lookup=True, serp_lookup=True, registry_queue=lambda n: len(n))
+    _enrich_calls[0]["escalate"](_rec("反查丁"))
+    _assert(_exp_calls[-1] == ("shop", "serp"),
+            f"两路都开时透下去的顺序仍是先 shop 后 serp（证据更硬的在前）：{_exp_calls[-1]}")
+
+    # 预览那条路必须零网络：workable_count 跑在界面线程上，这里多一次现网动作
+    # 就是 2026-11-18 那次整窗转圈改回来。
+    _exp_calls.clear()
+    _n_prev = wf.workable_count(_rows)
+    _assert(_exp_calls == [],
+            f"界面预览一条都不问现网反查（数出了 {_n_prev} 行可补，但一个包都没发）")
+
+    # resolver 只交零成本候选：那一问如果又回到排队阶段，上面两条立刻同时失效
+    _rp = wf.resolver_for(_rows)
+    _tiers_r = [t for _u, t in _rp(_rec("反查戊", 邮箱="sales@onlymail-abc.com"))]
+    _assert("search" not in _tiers_r,
+            f"resolver 只交零成本候选，搜索反查不在里面（它就是排队阶段预支的老形状）：{_tiers_r}")
+
+    # 整级坏掉：候选给空、异常不递回抓页循环、而且只说一次
+    def _boom_discover(rec, log=None, use=()):
+        raise RuntimeError("夹具：反查通道整级坏掉")
+
+    _lines_b = []
+    wf._sd.discover_expensive = _boom_discover
+    try:
+        _fb = wf.escalator_for(("serp",), log=lambda m: _lines_b.append(str(m)))
+        _rets = [_fb(_rec(f"出错{i}")) for i in range(3)]
+    finally:
+        wf._sd.discover_expensive = _fake_discover
+    _assert(_rets == [[], [], []],
+            f"provider 内部出错时交回空候选、不抛回抓页循环：{_rets}")
+    _assert(len(_lines_b) == 1,
+            f"整级坏掉只说一次（一轮几百行逐行刷会把真正的采集日志冲掉）：{len(_lines_b)} 句")
+
+    # 账目三形状必须彼此不同（全在这三条里，不在报表外面重述）
+    _l_off = "".join(wf.stage_lines({"network": {"eligible": 5}, "escalate": {"channels": []}}))
+    _l_idle = "".join(wf.stage_lines({"network": {"eligible": 5, "escalate_ask": 0},
+                                      "escalate": {"channels": ["serp"]}}))
+    _l_on = "".join(wf.stage_lines({"network": {"eligible": 5, "escalate_ask": 3,
+                                                "escalate_hit": 2},
+                                    "escalate": {"channels": ["shop", "serp"]}}))
+    _assert("本轮没开" in _l_off, f"没开时本级自己说没开（否则「跑完了」会被读成「都用过了」）：{_l_off}")
+    _assert("一个额外请求都没花" in _l_idle,
+            f"开了但一行都没问到也要说清（与没开不同形）：{_l_idle}")
+    _assert("3 家" in _l_on and "2 家" in _l_on,
+            f"真问了就把家数报出来（问了 3、拿到候选 2）：{_l_on}")
+    _assert(_l_off != _l_idle != _l_on,
+            "三种形状各写各的一句话（混成一句就是本段开头说的那个同形异义）")
+finally:
+    wf._sd.discover_expensive = _real_discover_exp
+    _assert(wf._sd.discover_expensive is _real_discover_exp,
+            "反查桩已还原（不留给后面的章节拿到假通道）")
 
 # ── I. snapshot / diff：三种变化形态 ────────────────────────────────
 print("I. 字段变更留痕")
@@ -1045,10 +1419,10 @@ _assert(w.session.reverify is True and any("额外花网络请求" in m for m in
         "打开重验时把「要多花请求」讲在明面上（这一档的代价不能等跑了才发现）")
 w.chk_reverify.setChecked(False)
 
-# ⑥ 五级说法同源：界面、会话日志、引擎日志、「补全层级」列用的是同一串名字
+# ⑥ 逐级说法同源：界面、会话日志、引擎日志、「补全层级」列用的是同一串名字
 _chain = wf.stage_chain()
 _assert(_chain == " → ".join(fe.TIER_LABEL[s] for s in wf.STAGES) and "转工商补采" not in _chain,
-        f"stage_chain 就是层级表里那五个值（{_chain}）——不是第二套命名")
+        f"stage_chain 就是层级表按执行顺序点出的那几个值（{_chain}）——不是第二套命名")
 _assert(wf.stage_no("registry") == len(wf.STAGES) and wf.stage_tag("registry")
         == f"第 {len(wf.STAGES)} 级（{wf.stage_name('registry')}）",
         f"序号由 STAGES 的位置算出来（{wf.stage_tag('registry')}）：以前界面数到⑤、"
@@ -1063,14 +1437,32 @@ def _o_missing_marks():
 
 _missing = _o_missing_marks()
 _assert(not _missing,
-        f"瀑布 tooltip 把五级按同源序号点齐（缺：{_missing}）——用户就是照这段话决定要不要勾的")
+        f"瀑布 tooltip 把全部 {len(wf.STAGES)} 级按同源序号点齐（缺：{_missing}）"
+        "——用户就是照这段话决定要不要勾的（级数不写死在判据里）")
 _assert(wf.stage_name("registry") in w.chk_waterfall.toolTip(),
-        f"tooltip 里的第 5 级就叫「{wf.stage_name('registry')}」（与「补全层级」列落库的值同名，"
+        f"tooltip 里的最后一级（第 {wf.stage_no('registry')} 级）就叫"
+        f"「{wf.stage_name('registry')}」（与「补全层级」列落库的值同名，"
         "以前写成「转工商补采」，用户拿表找不到界面讲过的那一级）")
 _o_logs.clear()
 w.chk_waterfall.setChecked(False)
 w.chk_waterfall.setChecked(True)
-_assert(any(_chain in m for m in _o_logs), "开关日志也念同一串顺序（不各写一份）")
+# 那句话念的是**本轮真会走的**那几级（与界面/会话共用 active_stages），不是全表：
+# 现网反查没开时却念出带它那一级的那串顺序，日志就在承诺一次不会发生的外网反查，而下一行「为什么没出」
+# 又会说那一行都没反——同一段日志自己打自己。
+_chain_now = wf.stage_chain(stages=wf.active_stages(bool(w.session.expensive_lookup)))
+_assert(any(_chain_now in m for m in _o_logs),
+        f"开关日志也念同一串顺序（不各写一份）：本轮该是 {_chain_now}")
+_o_logs.clear()
+w.chk_expensive.setChecked(True)
+_assert(w.session.expensive_lookup is True,
+        "现网反查勾选即时下发到会话（不等「开始采集」才推：手动补采那一路读的就是会话这一份）")
+_assert(any(wf.stage_name("search") in m for m in _o_logs)
+        and any("外网配额" in m for m in _o_logs),
+        f"打开现网反查那一刻就把「{wf.stage_name('search')}」这一问要多花配额讲在明面上"
+        "（代价不能等跑了才发现，与「到期重验」同一条纪律）")
+w.chk_expensive.setChecked(False)
+_assert(w.session.expensive_lookup is False and w.chk_expensive.isChecked() is False,
+        "关掉时控件与会话一起落回（留一边就是「界面写着关、实际还在花配额」）")
 _reg_line = "".join(wf.stage_lines({"registry": {"missing": 7, "queued": 5}}))
 _assert(wf.stage_name("registry") in _reg_line and "转工商补采" not in _reg_line,
         f"分档账目那行也是同一个名字：{_reg_line}")
@@ -1080,6 +1472,32 @@ _ps_src = Path(ps.__file__).read_text(encoding="utf-8")
 _copied = [wf.stage_name(s) for s in wf.STAGES if wf.stage_name(s) in _ps_src]
 _assert(not _copied,
         f"会话层整份文件里不许再出现任何一级的手抄名字（一律走 stage_chain/stage_name）：{_copied}")
+# 上一道门只扫**名字**，扫不到写死的数字。而会话里「没投出去」那一句恰恰是唯一带序号的
+# 日志（2026-11-18 那轮：日志里写「瀑布第 3 级」，界面列表同一事排的是 ⑤），所以单独钉一次。
+_q_logs = []
+_q_sess = ps.ParallelSession()
+_q_sess._log = lambda m: _q_logs.append(str(m))
+_assert(_q_sess.pending.is_bound is False,
+        "夹具前提：本套件里 pending 没绑任务文件夹（不在这个前提上时下面两条验的不是同一件事）")
+_assert(_q_sess._waterfall_queue(["某甲有限公司"]) == 0 and _q_logs,
+        "一家都没投出去时日志必须有一句话（不当排队处理就是假装已排队）")
+_q_line = next((m for m in _q_logs if "没投出去" in m), "")
+_exp_q = f"🏛 瀑布{wf.stage_tag('registry')}没投出去"
+_assert(_q_line.startswith(_exp_q),
+        f"这一句的**序号与名字**都取自阶段表（应为「{_exp_q}」，实得「{_q_line[:48]}」）："
+        "写死数字时阶段表多一级它就错一位，而它错的时候看上去比谁都具体")
+
+# 恢复任务/手动补采只设了任务文件夹、没走「开始采集」的 bind_pending：投递前必须按
+# 现成文件夹补绑，否则用户日志里那句「本轮没绑定任务文件夹…N 家缺口」的真身其实是
+# 没绑盘，而不是真无文件夹——600 家明明能投却被整批拦下。
+_r_sess = ps.ParallelSession()
+_r_sess.set_task_folder(str(Path(tempfile.mkdtemp(prefix="wfl_rebind_"))))
+_assert(_r_sess.pending.is_bound is False,
+        "夹具前提：恢复链路只 set_task_folder、此刻 pending 仍未绑")
+_r_n = _r_sess._waterfall_queue(["恢复甲有限公司", "恢复乙有限公司"])
+_assert(_r_sess.pending.is_bound is True and _r_n == 2,
+        f"投递前按任务文件夹补绑：两家都投得出去（补绑后 is_bound、实投 {_r_n}）："
+        "漏了这一步就是恢复/手动补采时整批工商级缺口投不出去的那个 bug")
 
 # ⑥c 上面那条只量了会话层一份文件；同一把尺子要量到三个交付目录的全部代码，否则
 # 「层级名只许一处定义」就只是 parallel_session 一个地方的巧合（2026-11-18 自查就是在
@@ -1217,7 +1635,7 @@ try:
             "（留一份导入期快照的话，改名的那一轮界面与日志都会留在旧名上）")
     _marks_after = _o_missing_marks()
     _assert(bool(_marks_after) and any("ZZZ临时改名" in m for m in _marks_after),
-            "反向对照：上面那条「tooltip 点齐五级」用的就是同一个表达式，改名后它必须变红"
+            "反向对照：上面那条「tooltip 逐级点齐」用的就是同一个表达式，改名后它必须变红"
             f"（实测缺：{_marks_after}）")
 finally:
     fe.TIER_LABEL["registry"] = _orig_label
@@ -1227,6 +1645,110 @@ _assert(wf.stage_name("registry") == _orig_label and not _o_missing_marks(),
 for _n2, _fn in _real_box.items():
     setattr(QMessageBox, _n2, _fn)
 _assert(QMessageBox.information is not _o_box, "模态框桩已还原")
+
+# ── P. 级数免疫：把阶段表当变量扰动 ────────────────────────────
+print("P. 级数免疫（增删一级时，界面 tooltip、会话顺序那句、账目里的序号全部自动跟随）")
+# 这一节验的不是「今天这几级的文案对不对」（A、H2、O 三段已逐条钉过），而是
+# **级数本身可变**这个前提：每接进一级（6→7 已经发生，后面还会再接），如果还要回头改
+# 界面话术、改会话顺序那句、改报表里的级数，就说明同源没做完——而漏改的那一处不会报错，
+# 只会变成用户嘴里的一句「日志里为什么少了一个途径」。
+# 扰动夹具必须取层级注册表里**真实存在、但此刻还没进阶段表**的那一级 source（平台自带，
+# 成本 0、可信 55）。两条理由各挡一种假绿：① 造一个假名测不到「成本升序」与「圈号够不够」
+# 这两条真闸；② 拿已经在阶段表里的那一级（exchange 在这接线之前就是这个夹具）冒充「加一级」，
+# 验的其实是「把一级换个位置」——真加一级才会撞到的那些地方一次都没撞到。
+_p_perturb = "source"
+_p_stages = wf.STAGES
+_p_guides = G.waterfall_stage_guides()
+import re as _re_p                                                    # noqa: E402
+assert _p_perturb in fe.TIER_LABEL and _p_perturb not in _p_stages, \
+    "夹具前提：扰动用的是注册表里真有的级，且它确实不在阶段表里（在的话形状一验的不是加一级）"
+_assert(fe.TIER_COST[_p_perturb] == 0,
+        "夹具前提：扰动那一级是免费的（只有免费的才能插进前面那一堆里，还让成本保持升序）")
+_assert(set(_p_guides) == set(_p_stages),
+        f"今天每一级都有自己的界面说明（缺：{sorted(set(_p_stages) - set(_p_guides))}，"
+        f"多写：{sorted(set(_p_guides) - set(_p_stages))}）：多写的那一半是旧级的残留话术，一样要红")
+_p_logs = []
+_p_calls_saved = len(_enrich_calls)
+try:
+    # 形状一：把免费的那一级插进最前面那一堆里（成本 0 的位置有好几个，插错一位就会被
+    # 下面「成本升序」那条当场拦下——这正是真接一级时最容易犯的排序错）
+    wf.STAGES = ("carry", _p_perturb, "exchange", "mailsite", "site",
+                 "brand", "search", "registry")
+    _p_costs = [fe.TIER_COST[s] for s in wf.STAGES]
+    _assert(len(wf.STAGES) == 8 and wf.stage_no("registry") == len(wf.STAGES),
+            f"加一级后最后一级序号自动变成 {len(wf.STAGES)}（{wf.stage_tag('registry')}）："
+            "序号只有一个来源，不可能养出第二套编号")
+    _assert(_p_costs == sorted(_p_costs),
+            f"成本升序这条铁律对 8 级照样成立（{_p_costs}）：免费的必须排在最前")
+    _assert(wf.stage_mark(_p_perturb) == f"② {fe.TIER_LABEL[_p_perturb]}",
+            f"新进这一级拿到的是它**当前位置**的圈号（{wf.stage_mark(_p_perturb)}），"
+            "不是把某个号写死在谁身上")
+    # 只有新级自己挪对还不够：它后面每一级都必须一起往后退一位。
+    # 上一版这里查的是 exchange（当时的新级），形状二再查一次往前——两向各钉一次。
+    _p_shift = {s: wf.stage_no(s) for s in ("exchange", "mailsite", "registry")}
+    _assert(_p_shift == {"exchange": 3, "mailsite": 4, "registry": 8},
+            f"新级后面的每一级整体往后退一位（实得 {_p_shift}）：只挪新级、不动老级，"
+            "日志就会把用户指向错的那一级")
+    _assert(wf.stage_chain() == " → ".join(fe.TIER_LABEL[s] for s in wf.STAGES),
+            "顺序那一句把 8 级全串出来，一个都不少")
+    _assert(wf.active_stages(False) == tuple(s for s in wf.STAGES if s != "search"),
+            "摘级的依据只有 EXPENSIVE_STAGES 那一份名单：不花配额的级（跨行复用、本地主数据、"
+            "平台自带）一级都不许被顺手摘掉")
+    _assert(w.session._wf_stages() == wf.active_stages(bool(w.session.expensive_lookup)),
+            "会话层不缓存级数：扰动阶段表后它现算（留副本的话，加一级当天日志就说少一级）")
+    _p_tip = G.waterfall_tooltip_text()
+    _p_miss = [wf.stage_mark(s) for s in wf.STAGES if wf.stage_mark(s) not in _p_tip]
+    _assert(not _p_miss, f"界面 tooltip 按**当前**层级表逐级点名，8 级也不缺（缺：{_p_miss}）")
+    # 缺说明的那一级：不抛 KeyError（界面还得能开）、也不静默少一行（少一行没人知道）。
+    # 条数必须恰好等于缺说明的级数：这样补上说明后两边一起归零，判据不会赖在旧形状上。
+    _p_gap = [s for s in wf.STAGES if s not in _p_guides]
+    _assert(_p_tip.count("还没有面向用户的说明") == len(_p_gap),
+            f"缺说明的级在 tooltip 里当众自曝，条数与缺的级数一致（{len(_p_gap)} 对 "
+            f"{_p_tip.count('还没有面向用户的说明')}）：自曝条数不等于缺口就是数错了")
+    wf.run_waterfall([_rec("p1 只有邮箱戊公司", 邮箱="x@onlymail-abc.com")],
+                     log=lambda m: _p_logs.append(str(m)),
+                     registry_queue=lambda names: len(names))
+    _assert(any(wf.stage_tag("registry") in m for m in _p_logs),
+            f"7 级时工商那一句念的是「{wf.stage_tag('registry')}」（实得：{_p_logs[-2:]}）")
+    # 不查旧序号字面（那只能挡住我恰好想到的那几个串），查**不变量**：日志里出现的
+    # 每一个「第 N 级（名字）」都必须与阶段表里的位置对得上，且名字必须是本表里的。
+    # 基准必须在这里**自己算**（STAGES.index + 1）：上一版拿 wf.stage_no 当基准，而序号缺陷
+    # 恰好就出在 stage_no 自己身上——用被测表达式自证的判据永远红不了（实测：把 stage_no
+    # 换成导入期快照，日志写成「第 6 级」而基准也算出 6，它照样绿）。
+    _p_l2s = {fe.TIER_LABEL[s]: s for s in wf.STAGES}
+    _p_bad = []
+    for _m in _p_logs:
+        for _n, _lb in _re_p.findall(r"第 (\d+) 级（([^）]*)）", _m):
+            if _lb not in _p_l2s or int(_n) != wf.STAGES.index(_p_l2s[_lb]) + 1:
+                _p_bad.append((f"第 {_n} 级", _lb))
+    _assert(not _p_bad,
+            f"日志里每一个「第 N 级（名字）」都对得上阶段表里的位置（错配：{_p_bad}，"
+            f"日志尾巴：{_p_logs[-2:]}）：同一件事两套编号就是从这里回来的")
+
+    # 形状二：摘掉中间一级（序号整体前移那一类事故）
+    wf.STAGES = tuple(s for s in _p_stages if s != "mailsite")
+    _assert(len(wf.STAGES) == 6 and wf.stage_no("registry") == 6,
+            f"摘一级后序号跟着收缩（{wf.stage_tag('registry')}）")
+    _assert(wf.stage_mark("brand") == f"④ {fe.TIER_LABEL['brand']}",
+            f"后面的级整体往前一位（{wf.stage_mark('brand')}）：圈号不能按 slug 写死")
+    _p_gone = fe.TIER_LABEL["mailsite"]
+    _assert(_p_gone not in wf.stage_chain() and _p_gone not in G.waterfall_tooltip_text(),
+            f"被摘掉的级不许再被说成试过的途径（{_p_gone} 还出现在话术里）")
+
+    # 形状三：把「要花钱那一级」从阶段表里拿掉（反向谎：开了开关也说不出那一级）
+    wf.STAGES = tuple(s for s in _p_stages if s != "search")
+    _assert(wf.active_stages(True) == wf.active_stages(False) == wf.STAGES,
+            "阶段表里没那一级时，开关开与不开的口径必须相同（不许凭空多出一级）")
+finally:
+    wf.STAGES = _p_stages
+    del _p_logs[:]
+    del _enrich_calls[_p_calls_saved:]
+_assert(wf.STAGES == _p_stages and wf.stage_no("registry") == len(_p_stages),
+        "阶段表已还原（本套件后面的章节与下一个套件拿到的都是真表）")
+_assert(_p_perturb not in wf.STAGES and "平台自带" not in wf.stage_chain()
+        and "平台自带" not in G.waterfall_tooltip_text(),
+        "还原后扰动痕迹完全消失：注册表里登过、但没进阶段表的那一档（平台自带）"
+        "不许在任何一句用户话术里活着——话术只能念阶段表真有的那几级")
 
 # ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
 # 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器

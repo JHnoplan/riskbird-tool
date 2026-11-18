@@ -212,6 +212,12 @@ class ParallelSession:
         # 字段级到期重验（功能 I）：按「这一列多久没被验过」决定要不要再问一次。
         self.reverify = False
         self.reverify_days = None       # None＝用 field_evidence.TTL_DAYS 各字段默认
+        # 现网反查（瀑布里要额外花外网配额的那一级：商铺子域 + 搜索引擎）。
+        # 会话上只开**一个**口子：用户真正要定的是「要不要为缺口多花配额」这一件事，
+        # 「用哪一路反查」是 site_discovery 自己的可信序（先证据硬的自有域名、后 SERP）。
+        # 把机制拆成两个界面开关只会逼用户替代码做它本来就该做的决定，还多一处可以配错。
+        # run_waterfall 仍收两个开关（那是模块能力与测试接口），在这里一并下发。
+        self.expensive_lookup = False
         self._site_enrich_stats = None   # 最近一轮账目（看板/日志/离线用例都读这一份）
         self._waterfall_stats = None
         self._lead_stats = None
@@ -465,7 +471,8 @@ class ParallelSession:
     def configure(self, delay_between=None, max_pages=None, relevance_guard=None,
                   incremental=None, max_records=None, province=None, site_enrich=None,
                   clean_strict=None, clean_keywords=None, waterfall=None,
-                  lead_export=None, reverify=None, site_workers=None):
+                  lead_export=None, reverify=None, site_workers=None,
+                  expensive_lookup=None):
         for c in self._active_crawlers():
             if delay_between is not None:
                 d = float(delay_between)
@@ -523,6 +530,9 @@ class ParallelSession:
             self.lead_export = bool(lead_export)
         if reverify is not None:
             self.reverify = bool(reverify)
+        if expensive_lookup is not None:
+            # 同一类会话级口径：管的是「缺口还要不要花第二重代价去碰」，不属于任何一站。
+            self.expensive_lookup = bool(expensive_lookup)
         # 清洗档位与会话同寿（不是「本轮参数」）：采集结束后再点清洗、导出、同步数据池
         # 都要按同一档位走。界面勾选变化时也会即时写这里（单一写入口见 GUI _set_clean_strict）。
         if clean_strict is not None:
@@ -1701,7 +1711,7 @@ class ParallelSession:
         # ——而那恰恰是本轮真正要修的那一档。
         # 文案里不手抄任何一级的名字（一律走 stage_chain）：那串名字只有一个主人，
         # 在会话层抄一份，改命名时日志与数据必定分家（waterfall_leads 回归锁的就是这一条）。
-        stage_note = (f"顺序＝{_wf.stage_chain()}" if self.waterfall
+        stage_note = (f"顺序＝{_wf.stage_chain(stages=self._wf_stages())}" if self.waterfall
                       else "只走单跳（未勾「瀑布式多源补全」）")
         self._log(f"🌐 边采边补线程已启动：采集进行中每 {ENRICH_STREAM_INTERVAL} 秒跑一"
                   f"轮完整补全（{stage_note}，每轮预算 {ENRICH_STREAM_BUDGET} 秒），"
@@ -1730,7 +1740,7 @@ class ParallelSession:
 
         2026-11-17 整轮实机改口径（旧行为是“只跑单跳 + only_missing=True”）：那样后台
         只能碰「四项全空」那一档（本轮 582 行里只有 16 行），而真正的工作量在完整瀑布
-        （五级，顺序一律取自 `_wf.stage_chain()`，本文件不手抄那一串名字；本轮 540 家）；
+        （整条层级链，顺序一律取自 `_wf.stage_chain()`，本文件不手抄那一串名字；本轮 540 家）；
         叠加后果最重的一个是：工商队列只在收尾那一轮才生成，采集进行的 45 分钟里
         企知道/风鸟/爱企查三路几乎无活可干（本轮共只查到 13 家次），收尾一口气投 474 家
         ×3 路＝1432 家次永远查不完。现在每一轮都走完整瀑布：缺联系方式的家名**行级**
@@ -1748,10 +1758,14 @@ class ParallelSession:
                 return
             try:
                 if self.waterfall:
+                    # ``master_fetch=False``：披露主数据那一次性全量拉取不让每 60 秒一路承当。
+                    # 盘上已有那份照读照用（那才是本级绝大多数时候的形状），只是不为了拉它
+                    # 开一轮五十几秒的批量下载：那一下花在「顺手补」的路上既看不到也说不清，
+                    # 而采集收尾那一路（用户真在等结果）会付这一次。
                     stats = self._run_waterfall("边采边补", records,
                                                 budget=float(min(ENRICH_STREAM_BUDGET,
                                                                  self.site_enrich_budget)),
-                                                verbose=False)
+                                                verbose=False, master_fetch=False)
                 else:
                     stats = self._enrich_single_hop(
                         "边采边补", records,
@@ -1914,24 +1928,39 @@ class ParallelSession:
             self._log(f"⚠ {reason}异常（已跳过，不影响已采数据）：{type(e).__name__}: {e}")
         return stats
 
+    def _wf_stages(self):
+        """本轮真会走的那几级：没开现网反查时，要靠外网配额的那一级一次都不会问。
+
+        两处话术（边采边补那一路的启动行、与每轮开场那一行）共用这一份：报出去的顺序
+        一定得是本轮真跑的顺序，把没开的那一级也算进去，日志就在替用户承诺一次不会发生的
+        外网反查（而下一行「为什么没出」又会说那一行都没反——同一段日志自己打自己）。
+        """
+        return _wf.active_stages(bool(self.expensive_lookup))
+
     def _run_waterfall(self, reason, records, workers=None, budget=None,
-                       limit=None, only_missing=False, verbose=True):
+                       limit=None, only_missing=False, verbose=True,
+                       master_fetch=None):
         """瀑布接管收尾那一轮（勾选「瀑布式多源补全」时才会走到这里）。
 
         账目分三级报，而且**每一级都要说自己为什么没动**：这是采集账目从一开始的
         纪律，接到补全上更要紧——瀑布最容易给人「跑了个空转」的错觉，因为第 1 级
         根本不发请求，日志要是只写「补了 N 个号」，用户下次就不信这条链路了。
 
-        ``verbose=False`` 只给边采边补那一路：那一轮每 60 秒开一次，五级逐行报表会把
-        真正的采集日志冲掉。压掉的只是**逐行渲染**（stage_lines 与开场那一句），账
-        本身照算、工商投队列那一句照打（本轮新机制的可见性全在它身上）。
+        ``verbose=False`` 只给边采边补那一路：那一轮每 60 秒开一次，逐级逐行的报表会把
+        真正的采集日志冲掉。压掉的只是**逐行渲染**（stage_lines 与开场那一句），账本
+        身照算、工商投队列那一句照打（本轮新机制的可见性全在它身上）。
+
+        ``master_fetch``：披露级允不允许**为了拉全量而出网**（None＝按模块默认）。
+        为什么会话层要接这个口而不是让两级自己同口径：那一次拉取是本级唯一的批量外网
+        动作（分页约 50 页、实测五十几秒），把它给边采边补那一路就是「每分钟都可能重开
+        一次慢活」；收尾那一路才是用户真在等结果的时候。
         """
         stats = None
         try:
-            # 顺序那句话从 _wf.stage_chain() 取：五级名字就是「补全层级」列里落的值，
-            # 在这里手抄一份的话，改层级命名时日志会先跟数据分家（抄了 5 处、错了 5 处）。
+            # 顺序那句话从 _wf.stage_chain() 取：每一级的名字就是「补全层级」列里落的值，
+            # 在这里手抄一份的话，改层级命名时日志会先跟数据分家（抄几处就错几处）。
             if verbose:
-                self._log(f"🧵 {reason}：瀑布式补全开始（{len(records)} 行，顺序＝{_wf.stage_chain()}）")
+                self._log(f"🧵 {reason}：瀑布式补全开始（{len(records)} 行，顺序＝{_wf.stage_chain(stages=self._wf_stages())}）")
             stats = _wf.run_waterfall(
                 records, log=self._log,
                 workers=int(self.site_enrich_workers if workers is None else workers),
@@ -1941,7 +1970,13 @@ class ParallelSession:
                 only_missing=bool(only_missing),
                 registry_queue=self._waterfall_queue,
                 reverify=bool(self.reverify),
-                reverify_days=self.reverify_days)
+                reverify_days=self.reverify_days,
+                # 一个开关开两路：上面那条注释说的就是这里——界面上那一条勾选代表
+                # 「允许为缺口额外花外网配额」，具体走哪几路由 site_discovery 的可信序定。
+                # 不传就是一个都不问（escalator_for 返 None），老行为一个字不变。
+                shop_lookup=bool(self.expensive_lookup),
+                serp_lookup=bool(self.expensive_lookup),
+                master_fetch=master_fetch)
             if verbose:
                 for line in _wf.stage_lines(stats):
                     self._log("  " + line)
@@ -1964,23 +1999,37 @@ class ParallelSession:
         return stats
 
     def _waterfall_queue(self, names):
-        """瀑布第 3 级：把还是缺联系方式的家名投进工商补采名单（**复用现成通道**）。
+        """``registry`` 那一级（序号由 STAGES 算）：把还是缺联系方式的家名投进工商补采名单（**复用现成通道**）。
 
         刻意不自己查企知道/风鸟/爱企查：那三路已经有退避、限流、熔断、接管与属地关卡，
         在补全模块里再写一遍查询等于把那些坑重新挖一次。这里只做一件事——投名单，
         并如实回报投出去几家（任务文件夹没绑定时 `add_waste` 一个都不收，
         那种情况下必须让「没投出去」在日志里看得见，而不是假装已经排队）。
+
+        层级序号**只从 _wf.stage_tag 取**，不在这里手抄：日志里写死「第 3 级」而界面把这一级
+        排在 ⑤ 的那段时间是真实发生过的——用户对着日志数到的是完全另一级。本文件连层级名字
+        都不许出现（既有硬门扫整份源码），需要的地方一律走 stage_name/stage_tag。
         """
         if not names:
             return 0
+        _tag = f"瀑布{_wf.stage_tag('registry')}"
+        if not self.pending.is_bound and self.task_folder:
+            # 恢复任务/手动补采这条链路只 set_task_folder、不走「开始采集」里的 bind_pending：
+            # 投递前按现成任务文件夹补绑一次，否则整批工商级缺口会「投不出去」（用户日志里那句
+            # 「本轮没绑定任务文件夹…N 家缺口」）。bind 幂等——载入既有台账+名单、resync、不冲
+            # 已采数据，对已绑过的路是空操作。
+            try:
+                self.pending.bind(self.task_folder)
+            except Exception as e:
+                self._log(f"⚠ {_tag}按任务文件夹补绑失败（{type(e).__name__}）：这一家都不投")
         if not self.pending.is_bound:
-            self._log("🏛 瀑布第 3 级没投出去：本轮没绑定任务文件夹（待采名单落不了盘），"
+            self._log(f"🏛 {_tag}没投出去：本轮没绑定任务文件夹（待采名单落不了盘），"
                       f"{len(names)} 家缺口留在此刻的表里，下次带文件夹跑还会再排")
             return 0
         try:
             return int(self.pending.add_waste(list(names)) or 0)
         except Exception as e:
-            self._log(f"⚠ 瀑布第 3 级投名单失败（{type(e).__name__}）：一家都不算投出去")
+            self._log(f"⚠ {_tag}投名单失败（{type(e).__name__}）：一家都不算投出去")
             return 0
 
     def _export_lead_standalone(self, reason="采集收尾"):

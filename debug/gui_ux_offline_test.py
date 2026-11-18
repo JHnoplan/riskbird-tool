@@ -455,15 +455,22 @@ check("④ 每一条配置行都不许含主动作按钮（黑名单覆盖全部
       not [i for i, r in enumerate(_lrows) if _ACTION_BTNS & _widgets(r)],
       [(i, sorted(x.text() for x in _ACTION_BTNS & _widgets(r)))
        for i, r in enumerate(_lrows) if _ACTION_BTNS & _widgets(r)])
-# 第三行是「采完之后怎么处理」那三条链路开关：它恒定挂进布局（数据口径开关不跟着功能入口
-# 一起藏），所以这一格既判它在位、也判它只装这三样。为什么单独一行而不是挤回第二行，GUI
-# 那边写着实测数字（hp2 再加三个长文案勾选框会把配置区最小宽顶过 1100）——把结论钉在这儿，
+# 第三行是「采完之后怎么处理」那几条链路开关：它恒定挂进布局（数据口径开关不跟着功能入口
+# 一起藏），所以这一格既判它在位、也判它只装勾选。为什么单独一行而不是挤回第二行，GUI
+# 那边写着实测数字（hp2 再加几个长文案勾选框会把配置区最小宽顶过 1100）——把结论钉在这儿，
 # 下次有人为了「少一行」把它们塞回 hp2，这条会当场响。
-check("④ 第三行在位（三条口径开关恒定入布局，任何档位都不整行撤掉）",
+# 2026-11-18 把这一格从「只装那三个勾选」改成性质判：现网反查那一个口径开关进来后，
+# 白名单枚举当场红——而红的不是布局坏了，是判据自己成了病因（本文件 431~436 行写的
+# 正是这一条）。现在守的是两个真性质：①这一行只有勾选框（按钮/标签/输入框不算合规）；
+# ②那三条历史开关不许被逐出这一行。再接一个口径开关不必改这里，而把它塞回第二行会响。
+check("④ 第三行在位（口径开关恒定入布局，任何档位都不整行撤掉）",
       len(_lrows) >= 3, str(len(_lrows)))
 if len(_lrows) >= 3:
-    check("④ 第三行只装瀑布补全/线索分层/到期重验三个勾选（不放按钮、不放标签、不放输入框）",
-          _widgets(_lrows[2]) == {w.chk_waterfall, w.chk_lead, w.chk_reverify},
+    _box_cls = type(w.chk_waterfall)
+    check("④ 第三行只装勾选框（不放按钮、不放标签、不放输入框），且瀑布补全/线索分层/"
+          "到期重验三条都在这一行", bool(_widgets(_lrows[2]))
+          and all(isinstance(x, _box_cls) for x in _widgets(_lrows[2]))
+          and {w.chk_waterfall, w.chk_lead, w.chk_reverify} <= _widgets(_lrows[2]),
           sorted(f"{x.metaObject().className()}:{x.text()}" for x in _widgets(_lrows[2])))
 check("④ 页数说明并入采集间隔 tooltip（不新开控件）",
       "翻页一律不限制" in w.spin_delay.toolTip())

@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import html as html_mod
 import ipaddress
+import json
+import os
 import re
 import socket
 import threading
@@ -84,12 +86,38 @@ __all__ = [
     "plausible_phone", "plausible_email", "merge_values", "enrich_site",
     "enrich_records", "pick_site", "reset_caches", "WEBSITE_KEYS", "SITE_MARK",
     "RETRY_MARK", "MAX_ATTEMPTS", "needs_retry", "attempts_of", "is_transient_why",
-    "GATE_NAME", "io_workers_cap",
+    "GATE_NAME", "io_workers_cap", "preflight_hosts", "host_reachable", "dns_disk_flush",
+    "DNS_DEAD_WHY", "fetch_html_post", "BROWSER_HEADERS", "BLOCK_CODES",
+    "TLD_TAIL_WORDS", "PLATFORM_HOSTS",
 ]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 HEADERS = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
+# 被 WAF/CDN 按「请求头像不像浏览器」拦掉的站，缺的几乎从来不止 UA：Sec-Fetch-* 成套、
+# 完整的 Accept、客户端提示（sec-ch-ua）都要有。只换 UA 往往照样 403，所以这里给
+# **一整组**而不是一路试错——每一次试错都是每家都要付的一趟请求。
+# 与 UA 保持同一 Chromium 大版本，头之间互相矛盾（UA 说 126、sec-ch-ua 说 125）本身
+# 就是判黑特征，那种自相矛盾比缺头更可疑。
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+               "image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+# 换浏览器头值得重试一次的状态码：都是「门开着、但不让你进」而不是「这家没这个页」。
+BLOCK_CODES = (401, 403, 407)
 TIMEOUT = 12                 # 单页**读数**硬超时：企业站慢，但慢到 12s 以上不如算失败
 # 连接阶段单独给数（与 cdp_base.HTTP_CONNECT_TIMEOUT 同一口径，两份常量的等式由离线套件
 # 对拍钉住——「同一件事两个数」正是这一族缺陷的来源）。为什么必须拆：企业官网整站连不上时
@@ -120,6 +148,14 @@ PLATFORM_HOSTS = (
     "300.cn", "qianji.cn", "jinshu.cn", "smokexj.com", "linkforms.com",
 )
 
+# TLD 词表（含 `comcn` 这类三截粘连写法）：商铺标签普遍把企业自有域名登记成
+# `yixingjd_com` / `hapstar-cn` 这种一段字符串，两处都要读它：
+#   · `enrich_waterfall.brand_tokens` 据此把尾巴拆掉（yixingjd_com → yixingjd）；
+#   · `site_discovery._candidate_ok` 据此拦下粘连产物（yixingjdcom.cn 不是域名形状）。
+# 只许留一份定义：两份迟早分家，而分家的表象是「同一个候选在一处被拦、在另一处被放行」。
+TLD_TAIL_WORDS = ("comcn", "netcn", "orgcn", "com", "cn", "net", "org",
+                  "top", "xyz", "vip", "cc", "info", "shop", "mall")
+
 # ── 号码/邮箱抽取（口径与离线链路一致，实测写法盲区都在这儿）────────
 MOBILE_RE = re.compile(r'(?<!\d)(1[3-9]\d)[-\s]?(\d{4})[-\s]?(\d{4})(?!\d)')
 # 分隔符允许 0~3 个字符：「010- 64229311」这种连字符后还空一格的排法必须能命中；
@@ -142,11 +178,36 @@ CONTACT_HREF_RE = re.compile(r'contact|lianxi|about|guanyu|footer|reach', re.I)
 CONTACT_TEXT_RE = re.compile(r'联系我们|联系方式|关于我们|联系人|服务热线|客服中心')
 # 猜路径与每站请求封顶：判不出主体/整页没号码的站，猜得越多越像「乱爬」，
 # 而真实收益集中在前一两个命名上（contact / contactus 占绝大多数）。
+# 分两档是必要的而不是「能多猜就多猜」：第一轮（GUESS_MAX=4）跑完仍然没出值的行，
+# 才值得在**二轮深挖**里把整张命名表扫一遍——那些行是本轮唯一还有收益的对象，
+# 而已经补到值的行再翻六页只会把预算从别人身上抢走（预算是整轮共享的）。
 GUESS_MAX = 4
 MAX_PAGES_PER_SITE = 6
+CONTACT_LINKS_FIRST = 2            # 第一轮从首页链接里取几个联系/关于页
+CONTACT_LINKS_DEEP = 5             # 二轮深挖取的个数（离线链路 v16 实测口径）
+MAX_PAGES_PER_SITE_DEEP = 12       # 二轮单站封顶（含猜路径），与预算双闸一起管
 GUESS_PATHS = ("contact.html", "contact_us.html", "contactus.html", "contact/",
                "contact-us.html", "lianxi.html", "lianxiwomen.html", "lxwm",
-               "about.html", "gywm", "guanyu.html", "gsxq.html")
+               "about.html", "gywm", "guanyu.html", "gsxq.html",
+               # ↓ 以下只在二轮深挖里试（扩展名变体：老企业站 CMS 大量是 shtml/asp/php）
+               "contact.shtml", "contact.asp", "contact.php", "contact/index.html",
+               "gywm.html", "lxfw.html", "about/index.html", "guanyu/")
+GUESS_PATHS_DEEP = len(GUESS_PATHS)   # 深挖 = 整张表扫完（不再只取前 GUESS_MAX 个）
+# 单行最多试几个官网候选（行自带那个也算在内）。三个是权衡后的数：前两个候选
+# 占了真实命中的绝大多数（邮箱域 + 主商号），第三个已是「拼音/另一个拉丁段」这一类
+# 低命中候选；不设上限时，一行十几个拼音候选可以独占一分钟以上的预算，
+# 而那张表后面还有几百家没轮到（预算是整轮共享的，不是按行计的）。
+MAX_CANDIDATES_PER_ROW = 3
+# 单行在多个候选之间共享的墙钟上限（秒）：一个候选最坏 6 页 × 12 秒，三个候选就是
+# 三分钟。给行级封顶而不是指望单站 budget，因为慢站串联时单站封顶根本碰不到。
+ROW_WALL_BUDGET_S = 60.0
+# 追加候选（``escalate`` 那一级）在**免费候选之外**另给几个位。为什么不共用上面那个 3：
+# MAX_CANDIDATES_PER_ROW 管的是「一堆推导候选里砍掉哪几个」——那是同一可信档内部的取舍，
+# 而追加那一级排在免费候选**全部试完之后**，两者不在同一条序上，共用一个数就会互相挤位
+# （实测形状：零网络候选本来就有 4 个，名额先被占满，追加那一级一个都轮不上＝定义了没接线）。
+# 真正管住这级成本的是下面两条：单行墙钟照旧共享（ROW_WALL_BUDGET_S 到点就不试）、
+# 以及「只有空手而归才问」这个前置条件本身。
+ESCALATE_MAX_PER_ROW = 3
 
 CONTACT_CTX_RE = re.compile(
     r'电话|联系方式|服务热线|手机|传真|邮箱|信箱|地址|客服|Tel|MOB|PHONE|FAX|E-?MAIL|Call|Contact', re.I)
@@ -213,11 +274,374 @@ def _cache_get(url):
 
 def reset_caches():
     """离线用例/新任务开始前清进程内缓存（缓存跨任务留着，会让改过的官网字段
-    在下一轮看起来「没生效」——那种「明明改了却看不出变化」最难查）。"""
+    在下一轮看起来「没生效」——那种「明明改了却看不出变化」最难查）。
+
+    DNS 那份**内存镜像**一起清，但磁盘文件不动：清它的代价是下一轮预检重新解析
+    上千个域，而这一句注释里说的「看不出变化」只发生在同一轮任务内（留痕列才是
+    跨任务的排队依据，不是 DNS 缓存）。离线用例因此始终从「没查过」的起点开始，
+    不会因为在开发机上跑过一次真网络就莫名其妙少补几家。"""
+    global _DNS_DISK_LOADED
     with _LOCK:
         _HOST_CACHE.clear()
         _HOST_CACHE_BYTES[0] = 0        # 字节账必须跟着清：留着下次一进来就以为满了
         _DNS_CACHE.clear()
+        _DNS_DISK.clear()
+        _DNS_DISK_LOADED = False
+
+
+# ── DNS 可达性：磁盘缓存 + 后台并发预检 ─────────────────────────
+# 这一节解决的是一件事：**「这个域名到底存不存在」必须在发 HTTP 之前知道，但不许
+# 在界面线程上按行串行问**（2026-11-18 外部机器实测点「补采官网联系方式」整窗转圈，
+# 以及另一头「不可达(ConnectionError) 327 家」每家白付 10 秒连接超时——同一个事实
+# 的两个方向的浪费）。
+# 口径全部集中在这里，判据一次讲清：
+#   · 结论只有三种：解析得到（live）/ 查无此名（dead）/ 没查过（unknown）。
+#     「没查过」**永远不拦、不跳**——把不知道读成危险，离线机器上一次都不给补；
+#   · 负结论（dead）只允许由 :func:`preflight_hosts` 写，而且要先过两道本机探针闸
+#     （见 _dns_local_resolver_ok 与死名占比闸）：一个坏掉的递归 DNS 能把全网判成
+#     不存在，那种负结论一写就是两天，比不缓存糟糕得多；
+#   · 缓存跨任务持久，所以落点只许问 tool_config.state_file（口径见其文档），
+#     绝不允许「和程序同目录」那种相对路径。
+DNS_TTL_LIVE = 7 * 86400           # 解析得到的域：一周后重新问一次（站点会搬家）
+DNS_TTL_DEAD = 2 * 86400           # 查无此名：两天后给一次复活机会（新注册域名）
+DNS_CACHE_FILE_NAME = "site_dns_cache.json"
+DNS_DISK_MAX_ENTRIES = 60000       # 990 行的表约 1~2 千个域，这里封的是几十个任务的量
+DNS_PREFLIGHT_WORKERS = 10         # 并发解析路数（DNS 是纯等待，10 路在弱机上也压不出负载）
+DNS_PREFLIGHT_HOST_S = 2.5         # 单域硬上限：getaddrinfo 不接受 timeout 参数，只能包线程
+DNS_PREFLIGHT_BUDGET_S = 60.0      # 整轮预检封顶：到点就把没查的当「没查过」放行
+# 换算依据：一轮 990 行里那 327 家「不可达」每家要付 10 秒连接超时（≈ 3270 秒），
+# 而 1000 个域并发 10 路、单域 300 毫秒量级，十秒就能探完——花一分钟换五十分钟划算。
+# 到了封顶还没轮到的域一律当「没查过」放行（fail-open），不拦。
+# 对照域：判「本机解析器此刻到底通不通」。用多个是因为单站可能被本机 hosts/防火墙
+# 特殊照顾，那一次误判会把整轮预检废掉（废掉的代价是白烧几千次连接超时）。
+DNS_CONTROL_HOSTS = ("www.baidu.com", "www.qq.com", "www.taobao.com")
+# 死名占比闸：一批里 9 成以上都「不存在」，几乎不可能是数据本身的质量问题，
+# 而是这台机器的解析器在撒谎（企业内网 split-horizon、认证门户、被污染的 hosts）。
+# 这时候一条负结论都不记——宁可慢，也不把好域名判死。
+DNS_DEAD_RATIO_MAX = 0.9
+DNS_DEAD_MIN_PROBED = 20           # 样本太小不下这个结论（10 家全是死域是可能的）
+DNS_DEAD_WHY = "域名不存在（DNS 预检判死）"
+# EAI_NONAME=8（名字没有解析出来）；EAI_NODATA 在 glibc 是 5、macOS/BSD 是 71，
+# 而且新版 glibc 已经不再导出这个常量——所以按值集合判而不按 socket 上的名字判。
+# 其它 gaierror（EAI_AGAIN=临时失败、EAI_FAIL…）一律算「不知道」，不记负结论。
+_EAI_DEAD_ERRNO = frozenset({8, 5, 71})
+
+_DNS_DISK = {}                     # host -> [live(bool), ts(float)]；内存镜像，也是持久化的内容
+_DNS_DISK_LOADED = False
+_DNS_DISK_DIRTY = [0]
+_DNS_DISK_ERROR = [""]             # 第一次写失败的原因，只播一次（每轮都刷一行没意义）
+
+
+def dns_cache_path() -> str:
+    """DNS 缓存落点：只问 tool_config.state_file（与审计日志、列映射历史同一口径）。
+
+    三条退路没有一条指向当前工作目录——理由与 audit_logger 那段完全一样：打包态的
+    CWD 由「谁把进程拉起来」决定，写 ``./xxx.json`` 会在 Mac 只读副本下静默失败，
+    而这一路的失败表现是「预检像没起作用，每次都重新解析」，谁也不会去查。
+    """
+    try:
+        import tool_config as _tc
+        try:
+            return str(_tc.state_file(DNS_CACHE_FILE_NAME))
+        except Exception:
+            return str(_tc.user_state_dir() / DNS_CACHE_FILE_NAME)
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".b2bcollect",
+                            "b2bcollect_state", DNS_CACHE_FILE_NAME)
+
+
+def _dns_disk_load():
+    """读盘（只在预检开头调一次；文件缺失/损坏都按「没有缓存」继续，不报错）。
+
+    刻意**不**在 :func:`is_public_host` 里惰性加载：那会让离线用例的结果取决于
+    开发机上曾经跑过的那一次真网络。加载点唯一 = 预检入口，测试与生产同一条路。
+    """
+    global _DNS_DISK_LOADED
+    if _DNS_DISK_LOADED:
+        return
+    _DNS_DISK_LOADED = True          # 先置位：读失败也不在每家身上重试一次磁盘 IO
+    path = dns_cache_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    now = time.time()
+    with _LOCK:
+        for host, val in raw.items():
+            if not isinstance(val, (list, tuple)) or len(val) < 2:
+                continue
+            try:
+                live, ts = bool(val[0]), float(val[1])
+            except (TypeError, ValueError):
+                continue
+            if now - ts > (DNS_TTL_LIVE if live else DNS_TTL_DEAD):
+                continue             # 过期的条目不搬进内存，顺手在下次落盘时清掉
+            h = str(host).strip().lower()
+            if h and h not in _DNS_DISK:     # 内存里的结论优先（本轮刚查出来的更新）
+                _DNS_DISK[h] = [live, ts]
+
+
+def _dns_disk_note(host, live, when=None):
+    """记一条可达性结论到内存镜像（落盘由 :func:`dns_disk_flush` 收口，别每家写一次盘）。"""
+    h = str(host or "").strip().lower()
+    if not h:
+        return
+    with _LOCK:
+        old = _DNS_DISK.get(h)
+        if old is not None and old[0] == bool(live) and (when or time.time()) - float(old[1]) < 3600:
+            return                   # 同一个结论一小时内反复记：只会把脏标记和落盘次数堆起来
+        _DNS_DISK[h] = [bool(live), float(when or time.time())]
+        if len(_DNS_DISK) > DNS_DISK_MAX_ENTRIES:
+            for k in sorted(_DNS_DISK, key=lambda x: _DNS_DISK[x][1])[: len(_DNS_DISK) // 4]:
+                _DNS_DISK.pop(k, None)
+        _DNS_DISK_DIRTY[0] += 1
+
+
+def dns_disk_flush(force=False):
+    """把内存镜像原子写盘（临时文件 + replace：写到一半掉电不会留下半个 JSON）。
+
+    「没加载过就不写」是必需的一道：内存镜像此时只有本轮的几十条，直接覆盖会把
+    历史攒下来的几万条一次性抹掉——那表现为「缓存越用越少」，最难归因。
+    返回 True=已落盘/无需落盘，False=写失败（原因记在 :func:`dns_disk_error`，由预检播报）。
+    """
+    if not _DNS_DISK_LOADED:
+        return False
+    with _LOCK:
+        if not _DNS_DISK_DIRTY[0] and not force:
+            return True
+        _DNS_DISK_DIRTY[0] = 0
+        payload = {k: [v[0], v[1]] for k, v in _DNS_DISK.items()}
+    path = dns_cache_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        with _LOCK:
+            if not _DNS_DISK_ERROR[0]:
+                _DNS_DISK_ERROR[0] = f"{type(e).__name__}"
+        try:
+            os.remove(path + ".tmp")
+        except OSError:
+            pass
+        return False
+
+
+def dns_disk_error():
+    with _LOCK:
+        return _DNS_DISK_ERROR[0]
+
+
+def host_reachable(host):
+    """True=解析得到 / False=预检判它查无此名 / None=没查过。**只读，一次都不出网**。
+
+    与 :func:`is_public_host` 是两件事，必须分开：那一个管**安全**（是不是内网地址，
+    判不出时不拦），这一个管**值不值得花一次连接超时**。合成一个函数就会出现
+    「今天没网 → 几千个域全被判不安全 → 整轮回采空转还报「已拦截」」那种最坏的形状。
+    """
+    h = str(host or "").strip().lower().rstrip(".")
+    if not h:
+        return None
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        pass
+    else:
+        return True                      # 直接写 IP 的行：没有「查无此名」这回事
+    with _LOCK:
+        got = _DNS_DISK.get(h)
+    if not got:
+        return None
+    ttl = DNS_TTL_LIVE if got[0] else DNS_TTL_DEAD
+    if time.time() - float(got[1]) > ttl:
+        return None                      # 过期当「没查过」：由下一轮预检重新问
+    return bool(got[0])
+
+
+def _dns_lookup(host, limit):
+    """单域解析（带硬上限线程包一层）。返回 (结论, 是否公网)；结论 None=不知道。
+
+    为什么要自己开线程包：`socket.getaddrinfo` 没有 timeout 参数，超时由系统 resolver
+    的配置决定（默认 2 次尝试 × 5 秒，碰上被防火墙 DROP 的 53 端口就是 10 秒以上）。
+    预检是按上千个域跑的，不包这一层，整轮封顶就成了摆设。包起来的线程是 daemon：
+    它只是停在一次系统调用里，不会在进程退出时拖住任何人（这也是这里不用
+    ThreadPoolExecutor 的原因——它的 atexit 会 join 未完任务，等于把卡死搬到退出路上）。
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["infos"] = socket.getaddrinfo(host, None, socket.AF_INET)
+        except socket.gaierror as e:
+            box["errno"] = (e.args[0] if e.args else None)
+        except Exception as e:            # UnicodeError（中文域）/ 内存类异常：都当不知道
+            box["other"] = type(e).__name__
+
+    t = threading.Thread(target=_run, name="dns-lookup", daemon=True)
+    t.start()
+    t.join(timeout=limit)
+    if t.is_alive():
+        return None, True
+    if "infos" in box:
+        infos = box.get("infos") or []
+        if not infos:
+            return None, True
+        public = True
+        try:
+            public = not any(
+                ipaddress.ip_address(x[4][0]).is_private
+                or ipaddress.ip_address(x[4][0]).is_loopback
+                or ipaddress.ip_address(x[4][0]).is_link_local
+                for x in infos)
+        except ValueError:
+            public = True
+        return True, public
+    if box.get("errno") in _EAI_DEAD_ERRNO:
+        return False, True                # 查无此名：可以记负结论
+    return None, True                     # 临时失败/其它：不知道
+
+
+def _resolver_alive():
+    """本机解析器现在能不能用（对照域探针）。全都失败 → 这一轮一条负结论都不记。"""
+    for host in DNS_CONTROL_HOSTS:
+        live, _p = _dns_lookup(host, DNS_PREFLIGHT_HOST_S)
+        if live:
+            return True
+    return False
+
+
+def preflight_hosts(hosts, workers=DNS_PREFLIGHT_WORKERS, budget=DNS_PREFLIGHT_BUDGET_S,
+                    stop=None, log=None, respect_persist=True):
+    """并发把一批域名解析一遍，把结论写进同一份缓存（磁盘 + 内存），供后面所有环节复用。
+
+    这是「谁判断可达性」的唯一出口：界面预检查**绝不**调它（那正是上次转圈的根因），
+    它只在已经在后台线程里跑的回采开始时调一次。返回统计字典，不抛异常。
+
+    三条闸（每一条都对应一种「缓存被写坏」的真实场景，缺一条就宁可不做这个缓存）：
+      1) **对照域探针**：要写负结论、而这批里一个都没解析成功时，先问一次对照域；
+         解不出来就判定本机解析器不可信，这一轮的负结论一条都不写（见下面的时序说明）；
+      2) **死名占比闸**：一批里九成以上判死 → 判定为解析器不可信，负结论全部丢弃；
+      3) **未知不拦**：超时/临时失败/没轮到的域一律算「没查过」，照旧去抓。
+
+    探针的**时序**（2026-11-18 改的，原来在这里发过一轮真外网 DNS）：旧写法是开跑前先打
+    三个对照域，不通就整轮跳过。听起来稳妥，实际有两处不对：① 这批域名自己就带着答案——
+    只要有一个解析成功，就已经当场证明本机解析器此刻是通的，再问对照域纯属白问（现网每轮
+    多付三次查询，离线用例还多查三个夹具外的真域名，把「本机 DNS 不可用」这句**假结论**
+    印进日志，后面所有关于预检的行为都不是生产那条路了）；② 真正需要区分「这批数据里域名
+    真的死得多」和「这台机器根本解不出来」的时刻，只有**准备写负结论**那一步。所以探针挪到
+    了写盘前，条件是「有负结论要写 且 批内零成功」。代价说清楚：解析器完全卡死的机器上，
+    这一轮会先把批内查询跑到封顶（整轮预算管着，默认 60 秒）才反应过来——但那种机器上后面
+    每一家的抓取本来也每家都要付满超时，整轮已经是废的了，不值得为它保留一次开局白问。
+    """
+    log = log or (lambda m: None)
+    want = []
+    seen = set()
+    for h in (hosts or []):
+        k = str(h or "").strip().lower().rstrip(".")
+        if k and k not in seen:
+            seen.add(k)
+            want.append(k)
+    stats = {"asked": len(want), "cached": 0, "live": 0, "dead": 0,
+             "unknown": 0, "skipped": "", "seconds": 0, "unprobed": 0}
+    if not want:
+        return stats
+    if respect_persist:
+        _dns_disk_load()
+    # 筛待查项：host_reachable 自己拿 _LOCK（非可重入），这里**绝不能**先套一层锁。
+    todo = [h for h in want if host_reachable(h) is None]
+    stats["cached"] = len(want) - len(todo)
+    if not todo:
+        return stats
+    t0 = time.time()
+    lock = threading.Lock()
+    idx = {"n": 0}
+    verdicts = []                      # [(host, live|None, public)]
+    n_workers = max(1, min(int(workers), 32))
+
+    def work():
+        while True:
+            if stop and stop():
+                return
+            with lock:
+                i = idx["n"]
+                if i >= len(todo):
+                    return
+                idx["n"] += 1
+                host = todo[i]
+            live, public = _dns_lookup(host, DNS_PREFLIGHT_HOST_S)
+            with lock:
+                verdicts.append((host, live, public))
+
+    ths = [threading.Thread(target=work, name=f"dns-preflight-{i}", daemon=True)
+           for i in range(min(n_workers, len(todo)))]
+    for t in ths:
+        t.start()
+    while any(t.is_alive() for t in ths):
+        for t in ths:
+            t.join(timeout=0.4)
+        if time.time() - t0 > budget:
+            break
+        if stop and stop():
+            break
+    stats["seconds"] = int(time.time() - t0)
+    stats["unprobed"] = max(0, len(todo) - len(verdicts))
+    dead = [h for h, live, _p in verdicts if live is False]
+    live_n = sum(1 for _h, live, _p in verdicts if live is True)
+    unknown = sum(1 for _h, live, _p in verdicts if live is None)
+    probed = len(dead) + live_n
+    veto = ""
+    # 闸 1（对照域）只在「批内一个都没解出来、又确实有负结论要写」时开火：批内有一个
+    # 成功就已经证明本机解析器是通的，不必再问夹具外/外网的域名。
+    if dead and not live_n and not _resolver_alive():
+        stats["skipped"] = "本机 DNS 不可用"
+        veto = (f"对照域（{'、'.join(DNS_CONTROL_HOSTS)}）一个都解不出来"
+                f"，判定为本机此刻解析不了外网域名")
+    # 闸 2（死名占比）：能走到这里说明对照域是通的（或批内本来就有成功），
+    # 那 9 成以上判死就只能归因给解析器在乱答 NXDOMAIN。
+    elif probed >= DNS_DEAD_MIN_PROBED and len(dead) / float(probed) > DNS_DEAD_RATIO_MAX:
+        veto = (f"{len(dead)}/{probed} 个域都判成不存在，比例高得不像数据问题"
+                f"（阈值 {int(DNS_DEAD_RATIO_MAX * 100)}%）")
+    # 命中的那道闸只改变「负结论写不写」，不改变抓取行为：被丢弃的那些域在这里退回
+    # 「没查过」，后面 enrich_site 照旧一家家去试，失败原因仍按实测写。丢弃的**家数**必须
+    # 单独留住：下面两句话术都要报这个数，而 dead 在这里清零后报出来就是恒为 0 的假账。
+    dropped = len(dead) if veto else 0
+    if veto:
+        dead = []                      # 全部丢弃：这一轮的负结论一条都不入盘
+    # 结论入盘必须在锁外：_dns_disk_note 自己拿同一把 _LOCK（非可重入），
+    # 在锁里调它是当场死锁，不是「稍慢」。占比闸命中时（veto 非空）负结论全部丢弃。
+    for host, live, public in verdicts:
+        if live is False:
+            if not veto:
+                _dns_disk_note(host, False)
+        elif live is True:
+            _dns_disk_note(host, True)
+            if public is False:
+                with _LOCK:
+                    _DNS_CACHE[host] = False      # SSRF 闸的公网结论跟着更新
+    stats.update({"live": live_n, "dead": len(dead), "unknown": unknown + dropped})
+    if veto:
+        log(f"🔌 域名预检：{veto} → 本轮不记任何「不存在」结论"
+            f"（{dropped} 个域照旧去抓）")
+    if live_n or len(dead) or unknown or dropped:
+        # 「没答案」这一格报的是 unknown + dropped：被两道闸退回的那些域本来就是「本轮不主张
+        # 结论」，不算进去这一行就凑不齐（在网 0、查无 0、没答案 0 却解了 3 个域＝对不上账）。
+        log(f"🔌 域名预检：本轮并发解析 {len(verdicts)}/{len(todo)} 个域"
+            f"（{n_workers} 路、{stats['seconds']} 秒）→ 在网 {live_n}、查无此名 {len(dead)}"
+            f"、没答案 {unknown + dropped}" + (f"，还有 {stats['unprobed']} 个没轮到" if stats["unprobed"] else "")
+            + (f"；缓存命中 {stats['cached']} 个（跨任务复用，一次都不问）" if stats["cached"] else ""))
+    if respect_persist:
+        dns_disk_flush()
+        if dns_disk_error():
+            log(f"⚠ 域名缓存没能写到本地（{dns_disk_error()}）：不影响本轮补采，"
+                f"只是下次还得重新解析一遍")
+    return stats
 
 
 # ── URL 规整与安全闸 ───────────────────────────────────────────
@@ -268,12 +692,19 @@ def is_platform_host(host):
     return any(h == d or h.endswith("." + d) for d in PLATFORM_HOSTS)
 
 
-def is_public_host(host):
+def is_public_host(host, allow_lookup=True):
     """SSRF 边界：外部可控的 URL 不能把请求带进内网/元数据地址。
 
     只在**能肯定**是私网/回环/链路本地/保留段时才拒；解析失败（NXDOMAIN、无网络）
     不等于危险——那样判会把「今天没网」说成「地址不安全」，也会让整轮回采空转。
     真正的不可达由 fetch 自己报。解析结果按域缓存，避免每条记录都发一次 DNS 查询。
+
+    ``allow_lookup=False`` 是给**一次都不许出网的调用点**用的（界面点按钮前的预检查、
+    候选域的本地筛选）。这里必须留一个口子：2026-11-18 外部机器实测「补采官网联系方
+    式」点下去整窗转圈几十秒到几分钟，根因就是预检查在 GUI 线程里按行串行发 DNS
+    （本机量到 12 行 30.5 秒、平均一次 301 毫秒，990 行就是几十分钟）。缓存里没有就
+    返回 True（不拦）——「不知道」不是「危险」，把不知道读成危险，离线机器上一次都
+    不给补；真值由后台的 :func:`preflight_hosts` 并发查一次后写进同一份缓存。
     """
     h = (host or "").lower().rstrip(".")
     if not h or h in ("localhost",) or h.endswith((".local", ".internal", ".lan", ".localdomain")):
@@ -289,9 +720,21 @@ def is_public_host(host):
         cached = _DNS_CACHE.get(h)
     if cached is not None:
         return cached
+    if host_reachable(h) is False:
+        # 预检已经知道「这个域名解析不到」：那它必然不可能是内网地址，不必再问一次 DNS。
+        # 返回值与「判不出不拦」同为 True——可达性该拦的那一刀在 enrich_site 的
+        # host_reachable 上（那里拦的是「别花这 10 秒」），不在这个安全闸里。
+        return True
+    if not allow_lookup:
+        # 零网络口径：没查过就当「不拦」。返回值与「查过、判不出」同为 True，
+        # 但**不许把它写进缓存**——写进去就把「没查过」固化成「查过且安全」，
+        # 下一轮预检会跳过这个域，真拦不住的时候就是拿内网地址去补数据。
+        return True
     verdict = True
+    live = False
     try:
         infos = socket.getaddrinfo(h, None, socket.AF_INET)
+        live = bool(infos)
         verdict = not any(
             ipaddress.ip_address(x[4][0]).is_private
             or ipaddress.ip_address(x[4][0]).is_loopback
@@ -303,6 +746,12 @@ def is_public_host(host):
         if len(_DNS_CACHE) > 8000:
             _DNS_CACHE.clear()
         _DNS_CACHE[h] = verdict
+    # 只顺手记「这个域确实解析得到」这一类肯定结论。「查不到」**不从这里入盘**：
+    # 这一路分不清「这个域名不存在」与「本机此刻没网/递归服务器抖了」，把后者
+    # 写成负结论会毒化缓存两天，下次联网跑整轮预检会把好域名一家家当不存在拦掉。
+    # 负结论只能由 preflight_hosts 出（它先打一个对照域，本机 DNS 不通就一条不记）。
+    if live:
+        _dns_disk_note(h, True)
     return verdict
 
 
@@ -583,10 +1032,83 @@ def fetch_html(url, timeout=TIMEOUT):
     把补回来的号码交给中间人说了算——本工具是把值直接写进交付表格、后面没有人工复核
     环节，所以宁可少几家也要守住这条：证书失败就如实计入「证书校验失败」这个原因，
     让操作者看得见数量，而不是悄悄采信一条可能被篡改的号码。
+
+    两类**各只一次**的自救（都封在「最多两次请求」，不引入重试风暴）：
+      ① HTTP401/403/407 → 换一组完整的浏览器头重打同一 URL。这是 2026-11-18
+         那轮 204 家 HTTP403 的直接处置：WAF 按请求头判黑与「这家没有联系方式」
+         是两件完全不同的事，不分开就会把一整批正常企业永久当成死站；
+      ② 「证书校验失败」→ 回落 http 同路径一次。只限这一种失败：它意味着 TCP 与
+         TLS 握手都到了对方服务器、只是证书不让人接受（企业站链不全的头号形状），
+         同一个内容走 80 端口极可能是好的。
+         **ConnectionError/超时不回落**——443 连不上时 80 大概率也连不上，回落只是
+         把一次 10 秒的白付变成两次。明文那一跳确实放弃了传输层防篡改，
+         所以它仍然要过同一套停放判定 + 归属核验（_grade_pages），并且行内本来
+         就允许「数据里写的就是 http 官网」这种形态——口径与今天一致，不是新开的口子。
+    """
+    html, final, why = _fetch_once(url, timeout=timeout)
+    if html is not None:
+        return html, final, ""
+    code = _code_of_why(why)
+    if code in BLOCK_CODES:
+        html2, final2, why2 = _fetch_once(url, timeout=timeout, headers=BROWSER_HEADERS)
+        if html2 is not None:
+            return html2, final2, ""
+        return None, final2 or final, why2 or why        # 换头也没开：报**最后**那个原因
+    if str(why or "").startswith("证书校验失败") and str(url).lower().startswith("https://"):
+        html3, final3, why3 = _fetch_once("http://" + url[8:], timeout=timeout)
+        if html3 is not None:
+            return html3, final3, ""
+        return None, final3 or final, "证书校验失败"      # 回落也没能：仍按 TLS 原因计入（可重试）
+    return None, final, why
+
+
+def _code_of_why(why):
+    """从「HTTP403」这类原因串里取状态码；不是 HTTP 类失败返回 0。"""
+    m = re.match(r'^HTTP(\d{3})$', str(why or "").strip())
+    return int(m.group(1)) if m else 0
+
+
+def fetch_html_post(url, data, timeout=TIMEOUT):
+    """POST 版拓页：与 :func:`fetch_html` 共用全部安全闸与封顶（只是不发浏览器头重试，
+    重试一条 POST 的副作用不可控，而搜索接口重试也不换回结果）。
+
+    为什么需要它而不是在发现层自己 `requests.post`：那样就有两份抓取实现，
+    SSRF 闸、响应体封顶、超时拆分、TLS 不降级这些判据只会在一份里演进——
+    本仓库记过账的那类「同一规则写两份、迟早各判各的」缺陷就是这么来的。
+    """
+    return _fetch_once(url, timeout=timeout, data=data, headers=BROWSER_HEADERS)
+
+
+def _fetch_once(url, timeout=TIMEOUT, headers=None, data=None):
+    """一次真的请求（不重试、不换协议、不关校验），返回 (html, final_url, 失败原因)。
+
+    拆成「一次」与「fetch_html 的两次策略」两层，是为了让传输层保持可推理：
+    上层那个「待重试」台账数的是**轮次**，如果传输层自己偷偷重试三次，
+    「这一家到底请求了几次」就再也没人能说清（这一点写在 _http_session 的注释里）。
+
+    ``data`` 非空时走 POST（搜索接口用）。**GET 与 POST 共用本函数而不是各写一份**：
+    超时拆分、响应收口、重定向后的 SSRF 复核、字节封顶、编码推定——这五件里
+    任何一件只在一条路径上生效，就会成为「同一个站 GET 能拦、POST 拦不住」那种分叉。
     """
     import requests
+    hh = dict(HEADERS)
+    if headers:
+        hh.update(headers)
     try:
-        r = _http_session().get(url, timeout=(CONNECT_TIMEOUT, timeout), allow_redirects=True)
+        parsed = urlparse(url)
+        if (parsed.path or "") not in ("", "/"):
+            # 子页带同站首页作 Referer：很多 WAF 看「document 请求没有 Referer/Sec-Fetch」
+            # 就拦，猜路径那一族（/contactus.html）正是最容易撞在这上面的一类。
+            hh.setdefault("Referer", f"{parsed.scheme}://{parsed.netloc}/")
+    except ValueError:
+        pass
+    try:
+        sess = _http_session()
+        kw = dict(timeout=(CONNECT_TIMEOUT, timeout), allow_redirects=True, headers=hh)
+        if data is not None:
+            r = sess.post(url, data=data, **kw)
+        else:
+            r = sess.get(url, **kw)
         try:
             final = r.url or url
             code = int(r.status_code)
@@ -686,15 +1208,23 @@ def _grade_pages(pages, name):
     return ranked_p, ranked_e, "", False
 
 
-def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
-    """单个官网：首页 + 最多 2 个联系页（首页没出东西再兜底猜 contact 路径）。
+def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0, deep=False):
+    """单个官网：首页 + 最多几个联系页（首页没出东西再兜底猜 contact 路径）。
 
     返回 {"phones": [(值,分)], "emails": [(值,分)], "why": 人话原因, "pages": 页数}
+
+    ``deep=True`` 是「缺值行深挖」：联系页从 2 个放宽到 5 个、猜路径从 4 条放宽到整张
+    命名表、单站页数封顶从 6 提到 12。这个开关**只该给本轮还缺联系方式的行**，
+    预算是整轮共享的，已经补到值的行再翻六页就是从别人身上抢预算。
 
     缓存的粒度是**抓到的页面**，不是打分结果：一张表里同一家公司常有几十条产品记录
     （同一官网），网络只花一次；但归属判定跟「这一行的公司名」有关，必须每行重算——
     按域名缓存打分结果会把 A 公司的电话盖到同站的 B 公司头上（同域名挂多主体的站
     真实存在：集团官网、行业频道页），那种错最贵。
+
+    深挖碰上「同一个站已经被浅轮抓过」时**不重新请求**：先把缓存里的页面重新评一次，
+    还是没值才去抓那些**没试过的**路径（靠 tried 集合去重）。同一个站浅、深两轮
+    共 6+12 页全部重抽一遍，是预算上最贵的重复劳动。
     """
     t0 = time.time()
     url = norm_site(site)
@@ -703,24 +1233,42 @@ def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
     host = host_of(url)
     if is_platform_host(host):
         return {"phones": [], "emails": [], "why": "字段指向平台页（非企业官网）", "pages": 0}
+    if host_reachable(host) is False:
+        # 预检已经知道这个域名解不出来：不必再付 CONNECT_TIMEOUT（10 秒）去碰它。
+        # 这一句才是那 327 家「不可达(ConnectionError)」的真正处置——先拦在发请求之前，
+        # 而不是每家都去实测一次超时。它不是终态结论（缓存 TTL 两天，预检也会重问），
+        # 所以走下面的原因判据：它不匹配 TRANSIENT_WHY_RE → 本轮判终态、不再花预算。
+        return {"phones": [], "emails": [], "why": DNS_DEAD_WHY, "pages": 0}
     if not is_public_host(host):
         return {"phones": [], "emails": [], "why": "非公网地址（已拦截）", "pages": 0}
     get = opener or (lambda u: fetch_html(u, timeout=timeout))
-    cached = _cache_get(url)
-    if cached is not None:
-        pages, dead_why = cached
-        if dead_why:
-            return {"phones": [], "emails": [], "why": dead_why, "pages": 0, "cached": True}
-        ph, em, note, dead = _grade_pages(pages, name)
-        why = note or ("" if (ph or em) else "页面未见可用号码/邮箱")
-        return {"phones": ph, "emails": em, "why": why, "pages": len(pages), "cached": True}
+    cap = MAX_PAGES_PER_SITE_DEEP if deep else MAX_PAGES_PER_SITE
+    link_limit = CONTACT_LINKS_DEEP if deep else CONTACT_LINKS_FIRST
+    guess_paths = GUESS_PATHS[:GUESS_PATHS_DEEP] if deep else GUESS_PATHS[:GUESS_MAX]
 
     pages = []
-    html, final, err = get(url)
+    cached = _cache_get(url)
+    if cached is not None:
+        cached_pages, dead_why = cached
+        if dead_why:
+            return {"phones": [], "emails": [], "why": dead_why, "pages": 0, "cached": True}
+        if not deep:
+            ph, em, note, dead = _grade_pages(cached_pages, name)
+            why = note or ("" if (ph or em) else "页面未见可用号码/邮箱")
+            return {"phones": ph, "emails": em, "why": why,
+                    "pages": len(cached_pages), "cached": True}
+        pages = list(cached_pages)
+    # 已经付过请求的 URL（含首页本身）：深挖轮靠它跳过老页面，只补新路径
+    tried = {u for u, _f, _l in pages} | {url}
+    html = pages[0][0] if pages else None
+    final = pages[0][1] if pages else url
+
     if html is None:
-        _cache_pages(url, [], err or "首页不可达")
-        return {"phones": [], "emails": [], "why": err or "首页不可达", "pages": 0}
-    pages.append((html, final, "首页"))
+        html, final, err = get(url)
+        if html is None:
+            _cache_pages(url, [], err or "首页不可达")
+            return {"phones": [], "emails": [], "why": err or "首页不可达", "pages": 0}
+        pages.append((html, final, "首页"))
     ph, em, note, dead = _grade_pages(pages, name)
     base_reg = _reg_domain(host_of(final))     # 落地域（可能被重定向过）
 
@@ -735,9 +1283,11 @@ def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
     # 没出值且站点没有被判死，才值得再花请求：先看页面上的联系/关于页，
     # 仍空再按企业站 CMS 的命名习惯猜几个 contact 路径（很多站首页确实不写号码）。
     if not (ph or em) and not dead:
-        for u, label in find_contact_links(html, final):
-            if time.time() - t0 > budget or not same_site(u) or len(pages) >= MAX_PAGES_PER_SITE:
+        for u, label in find_contact_links(html, final, limit=link_limit):
+            if time.time() - t0 > budget or not same_site(u) or len(pages) >= cap \
+                    or u in tried:
                 continue
+            tried.add(u)
             h2, f2, _e2 = get(u)
             if h2:
                 pages.append((h2, f2, label))
@@ -747,12 +1297,15 @@ def enrich_site(site, name="", timeout=TIMEOUT, opener=None, budget=45.0):
         if not (ph or em) and not dead:
             parsed = urlparse(final)
             root = f"{parsed.scheme}://{parsed.netloc}/"
-            for gp in GUESS_PATHS[:GUESS_MAX]:
-                if time.time() - t0 > budget or len(pages) >= MAX_PAGES_PER_SITE:
+            for gp in guess_paths:
+                if time.time() - t0 > budget or len(pages) >= cap:
                     break
                 gurl = root + gp
+                if gurl in tried:
+                    continue
                 if not same_site(gurl):
                     break
+                tried.add(gurl)
                 h3, f3, _e3 = get(gurl)
                 if h3:
                     pages.append((h3, f3, gp))
@@ -864,8 +1417,14 @@ def split_mobile(phone):
 #          白占一份预算，试到第 MAX_ATTEMPTS 次就转终态（想重启它，清空这一列即可）。
 RETRY_MARK = SITE_MARK + "待重试"
 MAX_ATTEMPTS = 3
+# HTTP403/401/407 算**暂时失败**，2026-11-18 外部机器实测推翻了这个模块旧口径：
+# 那一轮 800 家里 204 家回 HTTP403（占缺口一半），旧正则不认它 → 全被判终态 →
+# 那 204 家从此永不再问，而 403 最常见的成因是「前面的 WAF 按请求头不像浏览器判黑」
+# ——换一组完整的浏览器头再打一次的成本是**一次请求**，判成终态的成本是这一家永久
+# 不再被补。仍封顶 MAX_ATTEMPTS 次：真被拉黑的站试三次就停，不烧预算。
+# （配套的抓取侧升级见 fetch_html：403 族会自动换头重试一次 + https→http 回落一次。）
 TRANSIENT_WHY_RE = re.compile(
-    r'^(?:不可达|抓取异常|证书校验失败|首页不可达|内部异常|HTTP(?:408|429|5\d\d)$|超时)')
+    r'^(?:不可达|抓取异常|证书校验失败|首页不可达|内部异常|HTTP(?:401|403|407|408|429|5\d\d)$|超时)')
 
 
 def is_transient_why(why):
@@ -921,7 +1480,8 @@ def _has_any(rec, keys=("电话", "手机", "邮箱")):
 
 
 def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT,
-                   stop=None, limit=1500, only_missing=False, resolver=None):
+                   stop=None, limit=1500, only_missing=False, resolver=None,
+                   deep=False, preflight=True, escalate=None):
     """就地补写 records 的电话/手机/邮箱（英文逗号去重合并），并写「官网回采」账。
 
     排队口径：**缺联系方式的先做**（收益最高），其次才是本来就有号码的做补充——
@@ -932,44 +1492,113 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     返回统计字典；任何单条失败都不影响其它记录，函数本身不抛异常。
 
     ``resolver`` 是瀑布式补全（功能 A）接进来的**官网发现provider**：
-    `fn(record) -> (url, 层级slug)` 或假值。只在「行自带的官网字段不可用」时才问它，
-    也就是说它是 `pick_site` 的下一级而不是替代者——这一条顺序很重要：行里本来就有
-    正确官网时，任何推导都比不上直接访问那一家。层级由 provider 报下来，是因为
-    「这个网址是怎么来的」只有它自己知道（邮箱域名反查 / 品牌域名推导），
-    而这件事决定了后面那批值可信分是多少。provider 抛异常等同于没找到，
+    `fn(record) -> (url, 层级slug) | [(url, 层级slug), ...] | url | 假值`。
+    只在「行自带的官网字段不可用」时才问它，也就是说它是 `pick_site` 的下一级而不是
+    替代者——这一条顺序很重要：行里本来就有正确官网时，任何推导都比不上直接访问那一家。
+    层级由 provider 报下来，是因为「这个网址是怎么来的」只有它自己知道（邮箱域名反查 /
+    品牌域名推导），而这件事决定了后面那批值可信分是多少。provider 抛异常等同于没找到，
     绝不能把已经跑了一半的回采轮带崩。
+
+    为什么允许它回**一串**候选而不是一个：一个商号拼 .com 撞到别人站的概率很高
+    （hapstar 这种字号，.com 与 .cn 是两个不相干的主），旧口径「只拿第一个候选、
+    归属不过就整行作废」等于把后面那几个本来能成的候选白白拒掉。现在同一行按候选
+    顺序试到「抽到值」为止，单行有墙钟上限与个数上限（见 MAX_CANDIDATES_PER_ROW），
+    不会退化成「一行烧光整轮预算」。
+
+    ``deep=True`` 时，**本轮还缺联系方式的行**按深挖口径跑（联系页 5 个 + 整张猜路径表）；
+    已经有值的行不深挖——预算共享，那里是负收益。
+    ``preflight=True`` 时在开工作线程前先把本批候选域并发解析一遍（结论进同一份缓存），
+    解不出来的域在 enrich_site 里直接按「域名不存在」不付连接超时。界面线程**绝不能**
+    调到这里来（那正是 2026-11-18 那次整窗转圈的根因）。
+
+    ``escalate`` 是**惰性**追加候选的 provider：`fn(record) -> [(url, 层级slug), ...]`。
+    与 resolver 的区别全在**问的时机**：resolver 在排队阶段一次性算完（那时还不知道谁
+    能抽到值），escalate 只在「这一行前面的候选全部试完、一无所获、还没被预算拦下」
+    的那一刻才问一次。要花钱的那一级（现网反查、搜索引擎）必须走这条路——预支配额
+    会让本来一次都不用花的行也买单，而预算到点时那些钱连一行结果都换不回来。
+    本模块不认识任何引擎：候选从哪来、花谁的额度、怎么限流熔断，都是上游的事，
+    这里只管候选序与两个封顶（个数上限、单行墙钟）。没传＝老行为，一个额外请求都不发。
     """
     log = log or (lambda m: None)
     recs = [r for r in (records or []) if isinstance(r, dict)]
 
-    def _resolve(rec):
-        """问 provider 要一个官网（顺带把层级名定下来）；任何失败都当没找到。"""
+    def _norm_tier(tier):
+        return tier if tier in _fe.TIER_LABEL else "mailsite"
+
+    def _candidates(rec):
+        """问 provider 要**一批**官网候选（行自带的那一个永远排第一）。"""
         if resolver is None:
-            return "", ""
+            return []
         try:
             got = resolver(rec)
         except Exception:
-            return "", ""
+            return []
         if not got:
-            return "", ""
+            return []
         if isinstance(got, str):
-            # 只回了一个网址、没说层级：按「邮箱域名反查」记。这一档是保守选择——
-            # provider 是「行自带官网字段不可用」时才问的，那来路不明的推导结果
-            # 不许享受直采的可信分。
-            return got, "mailsite"
-        url = str((got or [""])[0] or "").strip()
-        tier = str((got or ["", ""])[1] or "").strip() or "mailsite"
-        return url, (tier if tier in _fe.TIER_LABEL else "mailsite")
+            return [(got, "mailsite")] if got else []
+        if isinstance(got, (tuple, list)) and got and isinstance(got[0], str):
+            url = str(got[0] or "").strip()
+            tier = _norm_tier(str(got[1] if len(got) > 1 else "").strip())
+            return [(url, tier)] if url else []
+        out = []
+        for item in (got or []):
+            if isinstance(item, str):
+                url, tier = item, "mailsite"
+            elif isinstance(item, (tuple, list)) and item:
+                url = str(item[0] or "").strip()
+                tier = _norm_tier(str(item[1] if len(item) > 1 else "").strip())
+            else:
+                continue
+            if url and all(url != x[0] for x in out):
+                out.append((url, tier))
+        return out
+
+    def _ask_escalate(rec, pool):
+        """问「要花钱的那一级」要追加候选：只在免费候选全空手的那一刻叫一次。
+
+        三条兜底都是硬的：没传 provider 就是一个都不问（老行为）；provider 抛异常
+        等同于没找到（绝不能把已经跑了一半的回采轮带崩，与 resolver 同一条纪律）；
+        拿回来的 URL 与已试过的重复、或层级 slug 不在注册表里，当场不要——
+        宁可少一个候选，也不要一个「补全层级」列里写出对不上号的档。
+        """
+        if escalate is None:
+            return []
+        try:
+            got = escalate(rec) or []
+        except Exception:                       # noqa: BLE001 - provider 出问题不影响已跑的部分
+            with lock:
+                stats["escalate_err"] = stats.get("escalate_err", 0) + 1
+            return []
+        seen = {u for u, _t in pool}
+        out = []
+        for item in got:
+            if isinstance(item, str):
+                url, tier = item, "mailsite"
+            elif isinstance(item, (tuple, list)) and item:
+                url = str(item[0] or "").strip()
+                tier = _norm_tier(str(item[1] if len(item) > 1 else "").strip())
+            else:
+                continue
+            if url and url not in seen:
+                seen.add(url)
+                out.append((url, tier))
+        out = out[:ESCALATE_MAX_PER_ROW]
+        with lock:
+            stats["escalate_ask"] = stats.get("escalate_ask", 0) + 1
+            if out:
+                stats["escalate_hit"] = stats.get("escalate_hit", 0) + 1
+        return out
 
     cand = []
     for r in recs:
         site = pick_site(r)
         if site:
-            cand.append((r, site, "site"))
+            cand.append((r, [(site, "site")]))
             continue
-        url, tier = _resolve(r)
-        if url:
-            cand.append((r, url, tier))
+        items = _candidates(r)
+        if items:
+            cand.append((r, items[:MAX_CANDIDATES_PER_ROW]))
     if only_missing:
         cand = [x for x in cand if not _has_any(x[0])]
     # 留痕已判定为终态的记录不再花第二次预算；待重试的（且未到次数上限）重新排队
@@ -980,9 +1609,26 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
     stats = {"total": len(recs), "eligible": len(targets), "cached": skip_done,
              "ok": 0, "added": 0, "no_site": len(recs) - len(cand),
              "reasons": {}, "budget_hit": 0, "marked": 0, "retry": 0,
-             "verified": 0, "tiers": {}, "discovered": 0, "gated": 0}
+             "verified": 0, "tiers": {}, "discovered": 0, "gated": 0,
+             "multi": 0, "dns": {}}
     if not targets:
         return stats
+
+    # ── 开抓前先把域名并发改一遍（本函数已在后台线程里，界面线程绝不走到这里）──
+    if preflight:
+        hosts = []
+        for _rec, items in targets:
+            for url, _tier in items:
+                h = host_of(norm_site(url) or url)
+                if h and h not in hosts:
+                    hosts.append(h)
+        try:
+            stats["dns"] = preflight_hosts(hosts, stop=stop, log=log)
+        except Exception as e:
+            # 预检自身出问题不影响回采：没结论就是「不知道」，每家照旧去抓，
+            # 最多回到今天这个「327 家各付 10 秒超时」的旧行为。
+            log(f"⚠ 域名预检没跑成（{type(e).__name__}）：本轮不拦不可达域，照旧逐家实抓")
+            stats["dns"] = {"error": type(e).__name__}
 
     lock = threading.Lock()
     idx = {"n": 0}
@@ -1021,12 +1667,12 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
             if i >= len(targets):
                 return False
             idx["n"] += 1
-            rec, site, tier = targets[i]
+            rec, items = targets[i]
         # 整段包起来：工作线程里任何一条异常若冒泡出去，线程池就少一路，剩下
         # 的家数由更少的线程去跑（表现为「越跑越慢」而日志一句不提）——本轮
         # 真实踩过一次 TypeError，正是这样被静默吞掉的。
         try:
-            one(rec, site, tier)
+            one(rec, items)
         except Exception as e:
             with lock:
                 why = f"内部异常({type(e).__name__})"
@@ -1096,11 +1742,56 @@ def enrich_records(records, log=None, workers=6, budget=15 * 60, timeout=TIMEOUT
         except Exception:
             pass                       # 治理自身出问题绝不能把回采带崩
 
-    def one(rec, site, tier):
+    def one(rec, items):
+        """按候选顺序问这一家的官网：**抽到值就停**，一个都没抽到就记最后一个原因。
+
+        候选顺序就是可信顺序（provider 排好的：行自带 > 邮箱域 > 主商号 > 拼音），
+        所以「先抽到的就收」不会把低可信的推导盖在高可信的直采上。
+        一层没中时**继续下一个候选**是本轮质量提升的主要来源：旧口径一个候选
+        没过归属核验就整行作废，而同一个商号的 .com/.cn 往往是一个在别人手里。
+        """
         name = str(rec.get("公司名称") or rec.get("公司名") or "")
-        _t = time.monotonic()
-        res = enrich_site(site, name, timeout=timeout)
-        feed_gate(res, (time.monotonic() - _t) * 1000.0)
+        row_t0 = time.monotonic()
+        deep_row = bool(deep) and not _has_any(rec)
+        site, tier = "", "site"
+        res = {"phones": [], "emails": [], "why": "没有可用官网候选", "pages": 0}
+        tried_n = 0
+        pool = list(items or [])
+        pos = 0
+        asked = False        # 单行只许问一次追加那一级：问了没结果还接着问就是拿预算原地打转
+        while True:
+            if stopped():
+                return                   # 预算/停止：本轮不写这一条，留痕仍是空的（下次照排）
+            if pos >= len(pool):
+                # 手上的候选走空了。**只有在这一刻**才决定要不要去问要花钱的那一级：
+                # 前面抽到值的话已经 break 出去，根本走不到这个破口；走到这里的只有两种
+                # ——免费候选全试过都没抽到值，或者行自带那个官网本来就抓不通。
+                # 这就是「只对缺口花配额」与「对全表花配额」的分别。
+                if asked or escalate is None:
+                    break
+                asked = True
+                pool.extend(_ask_escalate(rec, pool))
+                continue
+            left = ROW_WALL_BUDGET_S - (time.monotonic() - row_t0)
+            if left <= 0:
+                # 行级封顶到点：剩下的候选一个都不试。留痕按**最后一个实测原因**写，
+                # 而不是把没试过的候选也算成失败——那种账会把「预算没了」记成「这家不行」。
+                stats["row_budget_hit"] = stats.get("row_budget_hit", 0) + 1
+                break
+            url, t = pool[pos]
+            pos += 1
+            tried_n += 1
+            site, tier = url, t
+            _t = time.monotonic()
+            res = enrich_site(url, name, timeout=timeout,
+                              budget=min(45.0, max(8.0, left)), deep=deep_row)
+            feed_gate(res, (time.monotonic() - _t) * 1000.0)
+            if res.get("phones") or res.get("emails"):
+                break
+        if tried_n > 1:
+            # 按**行**计数而不是按候选：这一格的用途是「本轮有多少家是靠第二个候选
+            # 才补上的」，按候选累加会把三家候选全试的行算成两次。
+            stats["multi"] = stats.get("multi", 0) + 1
         if stopped():
             return                           # 预算已用完：本轮不写这一条
         phones = [v for v, _s in res.get("phones") or []]
