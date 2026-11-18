@@ -503,7 +503,7 @@ _sent7 = []
 c7d = A.AiQiChaCrawlerV2()
 c7d.signals = None
 c7d.logs = []
-c7d.pin_tab_id = ""          # 故意复位：与 close_browser 调它之前的状态一致（旧写法在这拿到空 id）
+c7d.pin_tab_id = ""          # 故意拿空绑定：_close_tab 必须只信 ws 地址尾部那一枚，不许拿全局兼容
 c7d._log = lambda m: c7d.logs.append(m)
 c7d._send_command = lambda ws, method, params=None: (
     _sent7.append((method, dict(params or {}))), {"result": {}})[1]
@@ -532,6 +532,52 @@ try:
 finally:
     time.sleep = _sleep7d
 print("⑦d _close_tab：带 targetId + 标签列表复验，关不掉就开口 ✓")
+
+# ── 7e. close_browser：只关自己那一枚，不许退到 tabs[0] ─────────────────
+# 7d 把 targetId 修对之后**新长出来**的风险：命令真的能关掉标签了，而 close_browser
+# 原先是「先复位 pin_tab_id，再调 _get_ws_url()」，而后者在 pin 为空时会退到
+# tabs[0]（第 334-335 行）。共享 Chrome 是三平台一个浏览器，tabs[0] 往往是
+# 风鸟 / 1688 正在采的那一枚——退路在修好的那一刀上会从「什么都没关掉」
+# 变成「真的关掉别人的」。把静默失效改成可用时，必须同时查它下游有没有
+# 「拿错对象」的形状，这一节就是那条纪律的固定回归。
+_MINE7 = "1111111111111111111111111111111111111111"
+_OTHER7 = "2222222222222222222222222222222222222222"
+_c7e_logs, _c7e_sent = [], []
+c7e = A.AiQiChaCrawlerV2()
+c7e.signals = None
+c7e.attach_mode = True
+c7e.pin_tab_id = _MINE7
+c7e._log = lambda m: _c7e_logs.append(m)
+c7e._send_command = lambda ws, method, params=None: (
+    _c7e_sent.append((str(ws), method, dict(params or {}))), {"result": {}})[1]
+# 别人那一枚排在最前：任何退到 tabs[0] 的写法都会在这里露出来
+_c7e_tabs = [{"id": _OTHER7, "url": "https://s.1688.com/selloffer/offer_search.htm",
+              "webSocketDebuggerUrl": "ws://127.0.0.1:9255/devtools/page/" + _OTHER7},
+             {"id": _MINE7, "url": "https://aiqicha.baidu.com/",
+              "webSocketDebuggerUrl": "ws://127.0.0.1:9255/devtools/page/" + _MINE7}]
+c7e._get_tabs = lambda: [dict(t) for t in _c7e_tabs]
+time.sleep = lambda s: None          # _close_tab 里要等三轮复验，测试里不让它真等
+try:
+    c7e.close_browser()
+    assert _c7e_sent, "收工至少要发出一次归还命令（静默不发就是拿「没报错」冒充收工）"
+    _ws7e, _m7e, _p7e = _c7e_sent[0]
+    assert _m7e == "Target.closeTarget", f"收工只该发 closeTarget：{_c7e_sent}"
+    assert _p7e.get("targetId") == _MINE7, \
+        f"必须关自己那一枚，实际关的是 {_p7e.get('targetId')}（退到 tabs[0] 就是关别人的）"
+    assert _OTHER7 not in str(_c7e_sent), f"别人那一枚一个字都不该出现在命令里：{_c7e_sent}"
+    assert c7e.pin_tab_id is None, "收工后绑定必须复位（下一次 attach 才知道自己是干净的）"
+
+    # 自己那一枚已经不在列表里：不许拿 tabs[0] 顶替，只许按 id 开口说拿不到
+    _c7e_sent.clear()
+    _c7e_logs.clear()
+    _c7e_tabs[:] = [t for t in _c7e_tabs if t["id"] != _MINE7]
+    c7e.pin_tab_id = _MINE7
+    c7e.close_browser()
+    assert not _c7e_sent, f"找不到自己那一枚时一条命令都不许发：{_c7e_sent}"
+    assert any(_MINE7 in m for m in _c7e_logs), f"拿不到 ws 要按 id 点名：{_c7e_logs}"
+finally:
+    time.sleep = _sleep7d
+print("⑦e close_browser：按 id 精确归还自己那一枚，退到 tabs[0] 一律判红 ✓")
 
 # ── 收尾：趁 QApplication 还活着把窗口拆掉（顺序与 b2bcollect_gui.main 的 finally 同一条）──
 # 套件从不调 app.exec_()，也就绕过了生产那段有序收尾；而生产那段存在的理由正是「让解释器

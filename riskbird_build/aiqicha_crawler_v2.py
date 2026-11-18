@@ -415,7 +415,8 @@ class AiQiChaCrawlerV2:
              回了一个 error，但 `_send_command` 只把原始响应递出来、不抛异常，于是这句
              `return True` 是假的——实机跑两轮就在共享 Chrome 里攒下两枚没人认领的爱企查
              标签。现在从 ws 地址本身取那一枚的 id（命令本来就是发给它的），比
-             `pin_tab_id` 可靠：close_browser 在调它之前已经把 pin_tab_id 复位了。
+             `pin_tab_id` 可靠：调用方 close_browser 已按 id 精确找回这一枚的 ws 地址
+             （它不再走 `_get_ws_url()`，那条路在 pin_tab_id 为空时会退到 tabs[0]）。
           ② 发完命令不算完，拿标签列表复验一次：还在就照实说没关掉。
         """
         tid = str(ws_url or "").rsplit("/", 1)[-1] or str(self.pin_tab_id or "")
@@ -716,11 +717,23 @@ class AiQiChaCrawlerV2:
         """关闭浏览器（CDP 模式下不关会话，但自己那一枚标签必须收掉）"""
         if self.attach_mode and self.pin_tab_id:
             # 双标签并行：只关自己独占的标签，共享浏览器留给另一个会话
-            # 先把标签 id 取在手里再复位：那一枚没关掉时要能点名（账上只写「关过了」等于没说）
+            # 先把标签 id 取在手里：那一枚没关掉时要能点名（账上只写「关过了」等于没说）
             tab = self.pin_tab_id
-            self.pin_tab_id = None
             try:
-                ws = self._get_ws_url()
+                # 必须按 id 从标签列表里精确找回自己那一枚的 ws 地址，**不能**走
+                # _get_ws_url()：它在 pin_tab_id 为空时会退到 tabs[0]（第 334-335 行），
+                # 而共享 Chrome 里 tabs[0] 常常是风鸟 / 1688 那一路正在采的标签。
+                # 2026-11-18 把 Target.closeTarget 的 targetId 修对之前，这条退路只是
+                # 「什么都没关掉、标签攒在 Chrome 里」；修对之后它变成「真的关掉别人的
+                # 那一枚」——把一枚静默失效修成可用时，必须同时检查它下游有没有
+                # 「拿错对象」的形状，否则事故只是从“没做成”换成了“做错了”。
+                # pin_tab_id 也因此推迟到 finally 才复位：_close_tab 拿不到 ws 尾段时
+                # 还会回读它兜底（第 421 行）。
+                ws = None
+                for item in self._get_tabs():
+                    if item.get("id") == tab:
+                        ws = item.get("webSocketDebuggerUrl")
+                        break
                 if ws:
                     self._close_tab(ws)
                 else:
@@ -729,6 +742,8 @@ class AiQiChaCrawlerV2:
             except Exception as e:
                 self._log(f"⚠ 收工归还标签 {tab} 没成功（{type(e).__name__}）——共享 Chrome 里还"
                           f"挂着这一枚标签，请手动关掉（不影响已采数据）")
+            finally:
+                self.pin_tab_id = None
     
     def _is_session_alive(self) -> bool:
         """检查会话是否存活"""

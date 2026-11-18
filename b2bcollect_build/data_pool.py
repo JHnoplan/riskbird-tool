@@ -839,9 +839,12 @@ def _approx_free_memory_bytes() -> Tuple[int, str]:
     赌一把，不如把这一轮同步保守地留在原地（不推进游标、不丢数据），等内存
     宽裕或用户点「立即整理」再做。
 
-    估算口径（刻意保守）：物理内存总量 × 0.55 − 本进程当前 RSS。只用标准库
-    （sysctl / sysconf / resource），不引入 psutil 这种打包态可能缺的依赖；
-    读不到就返回 0（判成「不够」）——估不出来时绝不能假设内存充足。
+    估算口径（刻意保守）：物理内存总量 × 0.55 − 本进程当前 RSS；Windows 上取不到
+    本进程 RSS，改成 GlobalMemoryStatusEx 直接报的可用物理内存与总量×0.55 取小。
+    只用标准库（sysctl / sysconf / resource / ctypes+kernel32），不引入 psutil 这种
+    打包态可能缺的依赖；读不到就返回 0（判成「不够」）——估不出来时绝不能假设内存充足。
+    但「读不到」只能是真的一个探测口都没有：某个平台缺某一档 API 时必须换下一档，
+    不许让整档平台长期落到返回 0 的那一条上（那等于把该产品形态永久拒在门外）。
 
     ru_maxrss 的单位**必须按平台判定，不能按数量级猜**（2026-11-18 实测教训）：
     macOS/BSD 返回字节，Linux 返回 KB，Windows 返回 KB。上一版写的是
@@ -872,7 +875,32 @@ def _approx_free_memory_bytes() -> Tuple[int, str]:
         try:
             total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
             why.append("sysconf")
-        except (ValueError, OSError, KeyError):
+        except Exception:
+            # 必须是宽捕获：Windows 根本没有 os.sysconf，抛的是 AttributeError
+            # （旧写法只捕 ValueError/OSError/KeyError，于是整个函数在 Windows 上
+            # 直接炸穿调用方）。这里让路，交给下面那一档跨平台探测。
+            total = 0
+    avail_phys = 0
+    if total <= 0 and os.name == "nt":
+        # Windows 没有 sysctl、没有 os.sysconf、也没有 resource 模块，三档全空。
+        # 不能只把异常吞掉就算修好：total 留 0 会走到「读不到物理内存（按不够处理）」，
+        # 于是**每一台 Windows 机器**的全表整理与后台同步都被永久判成「可用内存约
+        # 0.0GB」——这个闸门在 2026-11-18 已经因为 RSS 单位算错焊死过一次，跨平台
+        # 探测缺失是同一个失效形状的另一种走法。
+        # 探测不在这里再写一份：GlobalMemoryStatusEx 在本包的唯一把手是
+        # perf_governor._read_windows_memory()（采集并发闸门也在用它）。两处各自
+        # 搭一份 ctypes 结构体，迟早是一处修了另一处没修（本仓同一族「同一个判据
+        # 两份实现只修一份」已经吃过多次）。Windows 构建命令里 --hidden-import
+        # perf_governor 在案，这一路依赖不是可有可无的旁支。
+        try:
+            import perf_governor
+
+            w_total, w_avail = perf_governor._read_windows_memory()
+            if w_total:
+                total = int(w_total)
+                avail_phys = int(w_avail or 0)
+                why.append("GlobalMemoryStatusEx")
+        except Exception:
             total = 0
     rss = 0
     try:
@@ -889,6 +917,12 @@ def _approx_free_memory_bytes() -> Tuple[int, str]:
         pass
     if total <= 0:
         return 0, "读不到物理内存（按不够处理）"
+    if avail_phys > 0:
+        # 系统直接报的可用物理内存与「总量×系数」取小的那一档：前者是当下的真实
+        # 余量（别的程序正在吃内存时它会明显小于系数值），后者是留给本进程峰值的
+        # 保守上限。两个方向都要，缺一个就会要么放硬扛、要么把还能用的机器拦在门外。
+        avail = min(avail_phys, int(total * 0.55))
+        return max(avail, 0), "、".join(why) + f"（总 {total >> 30}GB）"
     avail = int(total * 0.55) - rss
     return max(avail, 0), "、".join(why) + f"（总 {total >> 30}GB）"
 

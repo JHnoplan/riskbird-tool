@@ -2069,6 +2069,112 @@ _assert_eq(mgr_ov3.pending_sync_note(), "", "两类滞后都清空后界面恢�
 
 
 # ════════════════════════════════════════════════════════════════════════════
+print("\n═══ 16b. 内存探测的跨平台形状：Windows 不许落到「按不够处理」那条出口 ═══")
+# 2026-11-18 深审查出：_approx_free_memory_bytes() 的三档探测（sysctl / sysconf /
+# resource）在 Windows 上一档都不存在，而 sysconf 那一档只捕了
+# ValueError/OSError/KeyError——Windows 抛的是 AttributeError，会直接炸穿调用方。
+# Windows 是主交付平台（Setup.exe / portable zip），而这一路此前离线零覆盖：
+# 以前的夹具只把 master_memory_room 的返回值 mock 掉，从没跑过探测本体。
+# 只把异常吞掉也不算修好：total 留 0 会让闸门对每一台 Windows 机器永久回
+# 「可用内存约 0.0GB」——同一个闸门本轮已经因为 RSS 单位算错焊死过一次。
+_GB16B = 1 << 30
+_real_os16b = _dp.os
+
+
+class _FakeOS16b:
+    """只给 _approx_free_memory_bytes 会碰的三个口，全部按 Windows 的形状给。"""
+
+    def __init__(self, name):
+        self.name = name
+
+    @property
+    def path(self):
+        return type("_P", (), {"exists": staticmethod(lambda p: False)})()
+
+    def sysconf(self, *_a, **_k):
+        raise AttributeError("sysconf")      # Windows 解释器根本没有这个函数
+
+
+def _under_shape(fn, *, os_name="nt", read_windows=None):
+    """把三档 posix 探测全拿掉，只留（或不留）Windows 那一档，跑一次 fn()。"""
+    import perf_governor as _gov16b
+
+    _rw_real = _gov16b._read_windows_memory
+    _gov16b._read_windows_memory = read_windows or (lambda: (None, None))
+    _dp.os = _FakeOS16b(os_name)
+    try:
+        return fn()
+    finally:
+        _dp.os = _real_os16b
+        _gov16b._read_windows_memory = _rw_real
+
+
+# ① 正向：Windows 上拿到 GlobalMemoryStatusEx 就得给出真实可用量，不许是 0
+try:
+    _avail16b, _why16b = _under_shape(
+        _dp._approx_free_memory_bytes,
+        read_windows=lambda: (16.0 * _GB16B, 9.0 * _GB16B))
+except AttributeError as _e16b0:
+    # 旧缺陷就是这一形：sysconf 窄捕获让 AttributeError 从探测本体逃到调用方。
+    # 接住它再报 FAIL，是为了让批跑日志说清「是哪一形」而不是只留一段 traceback。
+    _assert(False, f"sysconf 缺失（Windows 形状）不许抛 AttributeError 穿到调用方：{_e16b0}")
+    _avail16b, _why16b = 0, ""
+_assert("GlobalMemoryStatusEx" in _why16b,
+        f"Windows 那一档必须说出自己的探测来源，不然读数从哪里来的都不知道：{_why16b}")
+# min(可用 9GB, 总量×0.55=8.8GB)：两个方向取小，而不是拿总量减一个取不到的 RSS
+_assert(_avail16b == min(9 * _GB16B, int(16 * _GB16B * 0.55)),
+        f"Windows 读数应当是 min(可用物理, 总量×系数)，实际 {_avail16b}／{_why16b}")
+_assert(0 < _avail16b <= 16 * _GB16B,
+        f"可用量不许超过物理总量（上一轮就是把 8GB 机器报成 60GB）：{_avail16b}")
+
+# ② 旧代码的炸点：sysconf 缺失本身不许把异常冒到调用方
+#    （对照档用 posix：连 Windows 那一档都进不去，只能靠探测自己宽捕）
+try:
+    _avail16b2, _why16b2 = _under_shape(_dp._approx_free_memory_bytes, os_name="posix")
+    _assert(_avail16b2 == 0 and "读不到物理内存" in _why16b2,
+            f"一个探测口都没有时要返回 0 并说清原因，实际：{_avail16b2}／{_why16b2}")
+except AttributeError as _e16b:
+    _assert(False, f"sysconf 缺失（Windows 形状）不许抛 AttributeError 穿到调用方：{_e16b}")
+
+# ③ Windows 形状但 kernel32 调用失败：fail-soft（返回 0）而不是炸
+_avail16b3, _why16b3 = _under_shape(
+    _dp._approx_free_memory_bytes,
+    read_windows=lambda: (_ for _ in ()).throw(OSError("kernel32 拒绝")))
+_assert(_avail16b3 == 0,
+        f"探测报错时必须按「不够」处理（fail-soft），不许抛也不许假设内存充足：{_avail16b3}")
+
+# ④ 数值要真的流进闸门：同一个 count，内存小机器拒、大机器过
+#    （只测探测返回值不算数：闸门不读它也能全绿，那是一条空跑判据）
+_need_cnt16b = 1_000_000            # 按标定单价估出的需求量正好落在下面两档之间（实拿 3.8GB）
+_room_small = _under_shape(
+    lambda: mgr_ov3.master_memory_room(count=_need_cnt16b),
+    read_windows=lambda: (4.0 * _GB16B, 2.0 * _GB16B))
+_assert(_room_small[0] is False,
+        f"反向：4GB 内存的 Windows 机器整理 {_need_cnt16b:,} 家必须被拦下：{_room_small}")
+_assert("0.0GB" not in str(_room_small[1]),
+        f"拦下时要报出真实可用量，不许再拿「0.0GB」把机器说成坏了：{_room_small}")
+_room_big = _under_shape(
+    lambda: mgr_ov3.master_memory_room(count=_need_cnt16b),
+    read_windows=lambda: (64.0 * _GB16B, 60.0 * _GB16B))
+_assert(_room_big[0] is True,
+        f"还原对照：64GB 的 Windows 机器必须放行（上一条不是恒拒）：{_room_big}")
+
+# ⑤ 本机真跑：闸门必须在空进程上给出与真实内存相符的数（函数 docstring 里那条判据）
+_avail_real16b, _why_real16b = _dp._approx_free_memory_bytes()
+_assert(_avail_real16b > 0,
+        f"本机（开发机就是交付平台之一）探测必须给出正数，不然本机永远整理不了总表："
+        f"{_avail_real16b}／{_why_real16b}")
+# 拿真数字判，不用「不含 0GB）这种子串」的写法：那种断言在 10GB / 20GB / 30GB
+# 的机器上会自己制造假失败（判据不许挑开发机的内存规格）
+_total_shown16b = re.search(r"总 (\d+)GB", _why_real16b)
+_assert(_total_shown16b is not None and int(_total_shown16b.group(1)) >= 1,
+        f"原因里要带得出真实物理总量（至少 1GB），实际：{_why_real16b}")
+_assert(_avail_real16b < int(_total_shown16b.group(1)) * _GB16B,
+        f"可用量必须小于总量（报出比总量还大的可用数就是单位又错了）："
+        f"{_avail_real16b}／{_why_real16b}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 print("\n═══ 17. 清理 ═══")
 for st in (store, store2, store3, st_ov):
     st.close()
