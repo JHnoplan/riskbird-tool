@@ -190,6 +190,10 @@ _WARNINGS: Tuple[str, ...] = ()
 # 当前账号的权限等级（由 access_guard 判定后回填）：{} 表示尚未判定
 _ACCOUNT: Dict[str, object] = {}
 
+# 「这一格等级是哪一次刷新带回来的」的键名。住在数据自己的那一侧（而不是住在写入方），
+# 是为了让迟到门与诊断只能看到同一个量：两处各存一份键名就会漂成两个字段。
+_LEVEL_AT_KEY = "at"
+
 
 # ── 档位解析 ────────────────────────────────────────────────────────────────
 
@@ -390,8 +394,41 @@ def level_matrix() -> Dict[str, Dict[str, bool]]:
 
 # ── 账号等级回填（只有 access_guard 该调这里）───────────────────────────────
 
-def set_account_level(level: Optional[int], account: str = "",
-                      reason: str = "", pending: bool = False) -> bool:
+def level_write_is_stale(at: Optional[float], account: str = "") -> bool:
+    """这一轮还算不算「当前会话的结论」？不算就不许再改上限。
+
+    为什么要这一问（2026-11-19 本机取证）：旧写法是「谁回来得晚谁说了算」，于是一个
+    迟到的回调就能把权限改写给**另一个号**：上一个管理员号的那一轮能把手上只有
+    权限 1 的号提成等级 0（全套入口 + 权限管理面板），已被删掉的号也能被旧名单送回名单。
+
+    尺是两步，顺序不能反：
+    1. **同一个号**（本轮的号与当前记录里的号一致）→ 不算迟到。这条必须放行：需求 6c
+       的「开机预算内没问到 → 后台确认回来后当场补齐」靠的就是同一号、更晚落地的那一轮，
+       拿发起时刻一刀切就会把补齐路堵死（本轮实测回归过三次：晚到的确认停在临时档位）。
+    2. **号不同了**才比发起时刻：更晚发起的那一轮才是当前会话的答案（换号后的新一轮），
+       更早发起的那一轮是为旧那个号读的 → 拒。时刻取发起时刻而不取落地时刻：落地时刻
+       正是会被网络往返颠倒的那个东西，拿它排序等于拿病灶当体温计。
+
+    两个口子直接放行：``at=None``（调用方不是在回答某一次刷新，而是直接下结论）与
+    「当前记录没带时刻/没带号」（上一格写于这把尺存在之前，或本就是未判定）。拦错的代价
+    是把 fail-closed 的显式定档也挡在门外——那比放行更不安全。
+    """
+    if at is None:
+        return False
+    cur_at = _ACCOUNT.get(_LEVEL_AT_KEY)
+    if cur_at is None:
+        return False
+    cur_account = str(_ACCOUNT.get("account") or "")
+    if cur_account and cur_account == str(account or ""):
+        return False
+    try:
+        return float(at) < float(cur_at)
+    except (TypeError, ValueError):
+        return False
+
+
+def set_account_level(level: Optional[int], account: str = "", reason: str = "",
+                      pending: bool = False, at: Optional[float] = None) -> bool:
     """access_guard 判定出等级后回填；返回**生效档位是否发生变化**（GUI 据此提示重启）。
 
     未知等级值（既不在矩阵里也不是 None）按最保守那一档处理，与 ``resolve()``
@@ -411,6 +448,10 @@ def set_account_level(level: Optional[int], account: str = "",
     if level is None:
         _ACCOUNT = {}
         return edition() != before
+    if level_write_is_stale(at, account):
+        # 迟到的那一轮：不改档位，也就不报「需要重启」。这里只闷声拒写会看不出来，
+        # 所以调用方（access_guard._evaluate）自己先问过一遍并记了面包屑。
+        return False
     lv = int(level)
     if lv not in _LEVEL_CAPS:
         lv = UNKNOWN_ACCOUNT_LEVEL
@@ -418,7 +459,7 @@ def set_account_level(level: Optional[int], account: str = "",
         pending = False       # 名单确实拿到了、只是里面那个值不认识：结论已定，不存在待确认
     _ACCOUNT = {"level": lv, "account": str(account or ""),
                 "reason": reason or f"账号 {account} 等级 {lv}",
-                "pending": bool(pending)}
+                "pending": bool(pending), _LEVEL_AT_KEY: at}
     return edition() != before
 
 

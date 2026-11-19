@@ -26,8 +26,20 @@ import argparse
 import io
 import json
 import os
+import sys
 import urllib.request
 import zipfile
+
+# 与 .github/scripts 里另外几份同源：控制台编码必须由脚本自己写定，不能交给环境代码页。
+# 本轮把旧桶那一支（需求 10 兼容通道）加进来之后，这里新增了三处中文写控制台——第 12 条
+# 硬门就是这么抓到它的：英文 Windows 镜像（cp1252）上写出的当下就抛 UnicodeEncodeError，
+# 而「驱动没拿到」这句唯一的结论会被那条异常盖掉，构建日志只剩一片乱码加一个非零退出码。
+# 本机（UTF-8）永远复现不出来，所以必须在**第一处中文之前**写好这一句（顺序本身也有门）。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 LKG_URL = ("https://googlechromelabs.github.io/chrome-for-testing/"
            "last-known-good-versions-with-downloads.json")

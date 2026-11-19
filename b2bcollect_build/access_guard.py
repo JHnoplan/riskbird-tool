@@ -875,6 +875,28 @@ def _released_reason() -> str:
 
 # ── 守卫主体 ────────────────────────────────────────────────────────────────
 
+# 迟到的那一轮不许定档：每一格从服务端拿回来的状态都记住「它是哪一次发起的刷新带回来的」，
+# 写的时候只接受不早于现值的那一次。尺取**发起时刻**而不是落地时刻——落地时刻正是会被
+# 网络往返颠倒的那个东西，拿它排序等于拿病灶当体温计。
+# 为什么要它（2026-11-19 本机确定性取证，三个现场都能稳定复现）：一次刷新从发请求到
+# 落地之间隔着整个网络往返，而这段路上发生的事不会被「回来再说」取消：
+#   · 开机那轮预取慢到超出预算 → 主线程按 fail-closed 钉成丐版 → 会话换成了新守卫
+#     （界面上等价于换账号）→ 旧那一轮姗姗完成，把**上一个账号的名单**定档到了当前账号：
+#     权限 1 的号被提成等级 0，全套入口与「权限管理」面板长了出来；
+#   · 同一守卫里两轮刷新乱序（先发后至）：后发的那一轮已经把「号在名单里」落地定成等级 1，
+#     先发的那一轮回来得更晚，把内存名单与定档一起回退成**更早的服务端状态**；
+#   · 发起时的绑定号与现在不是同一个：名单是为旧那个号去问的，拿它给新号定档得到的
+#     只会是「已移出白名单或未绑定」这句假话，还按结论记账（pending=False），
+#     界面的当场补齐就此熄火。
+# 三个现场同一根因：「迟到的那一轮」从来没人问过它负不负责当前会话；而它一回到底就会直接
+# 写权限上限。定档那一格的尺是两步（同一个号 → 不算迟到；号不同了 → 才比发起时刻），
+# 口径与键名都住在 edition（``level_write_is_stale`` / ``_LEVEL_AT_KEY``）：数据在谁那里，
+# 口径就在谁那里，两处各存一份就会漂成两个字段。第一步不能省：需求 6c 的「开机没问到、
+# 后台确认回来后当场补齐」靠的就是同一号、更晚落地的那一轮（只用发起时刻一刀切会把
+# 补齐路堵死，本轮实测回归过）。名单与分片两格则只需发起时刻单调（见 _acl_stale）：
+# 它们是「为某一次发起读回来的快照」，本来就不存「补齐」这一说。
+
+
 class AccessGuard(QObject):
     """权限守卫：check() 判定 + eventFilter() 全局按钮拦截 + 设备认领与顶号。"""
 
@@ -910,6 +932,11 @@ class AccessGuard(QObject):
         self._revoked = ""                           # 待交出去的顶号事件（一次性）
         self._revoked_latched = False                # 本轮掉线是否已经报过
         self._account_reader = None                  # 测试注入点：绑定账号读取函数
+        # 两份「这一格是哪一次发起的刷新带回来的」（口径见文件上方的发起时刻说明）。
+        # 取 0.0 而不是 _MONO_NEVER：发起时刻来自 time.monotonic()，任何真实的一轮都大于 0，
+        # 所以「从未落地过」自然输给第一轮；拿负无穷当起点就要在每一处比较前多记一笔特例。
+        self._acl_from = 0.0
+        self._bind_from = 0.0
 
     # ── 依赖懒加载（缺模块/缺密钥都不许在 import 期炸） ──
 
@@ -1169,6 +1196,11 @@ class AccessGuard(QObject):
         两者必须绑在同一次刷新里：只更新名单不更新绑定，会出现「等级已经变成
         受限版、设备判定还停留在上一个账号」的错配。两份结果各自记录成功时刻，
         任一处失败只让那一半保持待刷新状态，不把另一半的成功一起丢掉。
+
+        还有一件事也在这一轮里定下来：``started_at``——**本轮的发起时刻**。它与
+        ``_acl_at``/``_bind_at``（落地时刻）不是同一个量：后者会被网络往返颠倒，正是
+        「先发后至」这个病灶本身；拿它排序等于拿病灶当体温计。发起时刻才是「谁更新」的
+        物理事实，三格（名单 / 分片 / 定档）都拿它比（见文件上方 _acl_from 的由来）。
         """
         try:
             from oss_pool_client import OSSPoolError
@@ -1182,7 +1214,7 @@ class AccessGuard(QObject):
             self._set_service("network", "最近一次出网未取回远端名单")
 
             phone = self._bound_phone()
-
+            started_at = time.monotonic()
             ok_acl = False
             accounts: Optional[List[str]] = None
             grants: Optional[Dict[str, int]] = None
@@ -1198,6 +1230,12 @@ class AccessGuard(QObject):
                     k, d = self._classify_oss_error(e)
                     self._set_service(k, d)
                     doc = None
+            if doc is not None and self._acl_stale(started_at):
+                # 迟到的那一轮：名单不进内存、也不写副本。它是「为更早一次发起」读回来的
+                # 快照，落进来就会把更新的那一轮顶掉——实测能把权限 1 的号提成等级 0
+                # （上一个管理员号那一轮姗姗来迟），也能把已被删掉的号又送回名单。
+                self._drop_stale_round("名单", started_at)
+                return False
             if doc is not None:
                 accounts = _parse_accounts(doc)
                 grants, declared = _parse_grants(doc)
@@ -1208,6 +1246,7 @@ class AccessGuard(QObject):
                     self._grants = grants or {}
                     self._grants_declared = declared
                     self._acl_at = time.monotonic()
+                    self._acl_from = started_at
                 self._write_disk({"accounts": accounts, "grants": grants or {},
                                   "grants_declared": declared, "phone": phone})
 
@@ -1231,15 +1270,23 @@ class AccessGuard(QObject):
                         ok_bind = False        # 读不到就当不知道，绝不猜成「是本机」
                 except Exception:
                     ok_bind = False
+                if binding is not None and self._bind_stale(started_at):
+                    # 分片迟到：不把「本机是不是当前设备」回退成旧答案，也不谎报这一半成功。
+                    self._drop_stale_round("设备分片", started_at)
+                    binding = None
+                    ok_bind = False
                 if binding is not None:
                     with self._lock:
                         self._binding = binding
                         self._binding_phone = phone
                         self._bind_at = time.monotonic()
+                        self._bind_from = started_at
 
             with self._lock:
                 self._fetched_at = min(self._acl_at, self._bind_at)
-            self._evaluate(phone)
+            # 定档拿的是**本轮发起时刻**而不是落地时刻：开机预算里已经另下过一次结论时，
+            # 这一轮回来得更晚就不能再去改它（现场见 _evaluate 的 at 口径）。
+            self._evaluate(phone, started_at)
             self._notify_refreshed()
             return bool(ok_acl and ok_bind)
         except Exception:
@@ -1449,18 +1496,54 @@ class AccessGuard(QObject):
 
     # ── 等级与设备状态的回填（唯一写 edition 的地方） ──
 
-    def _evaluate(self, phone: str):
+    def _acl_stale(self, at: float) -> bool:
+        """名单这一格：这次发起的时刻比现值的来源更晚吗？
+
+        相等不算迟到（同一轮重跑自己那一格是允许的），只有更早才拒——那是「先发后至」。
+        不拦的代价量过：后发那一轮已经把「号在名单里」定成等级 1，先发那一轮回来得更晚，
+        名单与定档一起回退成更早的服务端状态，号被误杀成丐版（本机可稳定复现）。
+        """
+        return at < self._acl_from
+
+    def _bind_stale(self, at: float) -> bool:
+        """设备分片这一格：同一把尺。分片迟到会把「本机是不是当前设备」回退成旧答案。"""
+        return at < self._bind_from
+
+    def _drop_stale_round(self, what: str, at: float) -> None:
+        """把「这一轮已过期、丢在哪一格」记成一枚可回看的面包屑。
+
+        既不 print 也不抛：慢网络 + 换号的真实组合下这一条会常态发生，抛异常等于把
+        一次正常刷新变成崩溃；而「明明问到了名单、界面为什么没跟着变」这类报障的答案
+        恰恰就在丢的那一格上。只报格名与发起时刻（单调轴的相对量），不报号码。
+        """
+        try:
+            import crash_forensics as _cf
+            _cf.note("acl-stale-round", what=what, at=round(float(at), 3))
+        except Exception:
+            pass
+
+    def _evaluate(self, phone: str, at: Optional[float] = None):
         """把「等级 → edition 能力上限」和「本机是否在当前会话」算出来。
 
         等级回填必须发生在这里，而不是界面上：界面只问 ``edition.has(cap)``，
         让它自己去查名单就把权限模型拆成了两半。
+
+        ``at`` 是带来这份名单的那一次**发起时刻**（见 _fetch）：传了就要过迟到门，
+        比现值来源更早的那一次不改权限上限；不传（None）是同步路径的显式定档——
+        本地副本开机预取、CLI 自报、解绑清除那些——它们不是在回答「某一次刷新」，
+        而是直接下一个结论，不该被异步那把尺拦住。
         """
         with self._lock:
             accounts = self._accounts
             grants = dict(self._grants)
             declared = self._grants_declared
         phone = phone or self._bound_phone()
-        if accounts is None:
+        if at is not None and _ed.level_write_is_stale(at, phone):
+            # 迟到的那一轮不许改上限：它拿的是「为更早一次发起」读回来的名单，
+            # 落进来实测能把权限 1 的号提成等级 0（上一个管理员号那一轮姗姗来迟）。
+            # 设备那一半照判：它读的分片已由 _bind_stale 守过，与等级无关。
+            self._drop_stale_round("定档", at)
+        elif accounts is None:
             # 「这次没问到身份」与「问到了、答案是拒绝」必须分开记账（需求 6，
             # 2026-11-19 实机报障「绑了权限 1 的账号却只有基础功能」）。旧写法让这条
             # 分支落到下面的 else，代价是双重的：
@@ -1475,11 +1558,12 @@ class AccessGuard(QObject):
             _ed.set_account_level(
                 LEVEL_LITE, phone,
                 reason=f"本次没有取回权限名单（{kind or 'unknown'}），暂按丐版",
-                pending=self.auth_worth_retry())
+                pending=self.auth_worth_retry(), at=at)
         elif accounts and phone in accounts:
             level = resolve_level(phone, grants, declared)
             _ed.set_account_level(level, phone,
-                                  reason=f"白名单等级 {level}（{LEVEL_NAMES.get(level)}）")
+                                  reason=f"白名单等级 {level}（{LEVEL_NAMES.get(level)}）",
+                                  at=at)
         else:
             # 不在名单 / 未绑定：显式钉到最保守的丐版等级，**不能留在「未判定」**。
             # 未判定在 pro 构建下会被 effective_level() 默认成管理员 = 全套入口，
@@ -1487,7 +1571,7 @@ class AccessGuard(QObject):
             # 后台静默能力（不看按钮点击的同步上传）反而被打开」——正是本功能要堵的
             # 「被删除的账号还能使用」。运行中被移出名单，就地收到丐版。
             _ed.set_account_level(LEVEL_LITE, phone,
-                                  reason="已移出白名单或未绑定，按丐版收口")
+                                  reason="已移出白名单或未绑定，按丐版收口", at=at)
 
         binding = self._binding_for(phone, use_fallback=False)
         if binding is None:
@@ -2227,7 +2311,10 @@ def prefetch_local() -> Optional[int]:
     if not phone or not accounts or phone not in accounts:
         return None
     level = resolve_level(phone, grants, declared)
-    _ed.set_account_level(level, phone, reason=f"本地名单副本等级 {level}")
+    # 同步下结论的路拿**当下**做时刻：它不是在回答「某一次刷新」，而是直接定档。
+    # 不给它一个时刻，后面任何一次后台刷新（发起得更早也行）都能把它顶掉。
+    _ed.set_account_level(level, phone, reason=f"本地名单副本等级 {level}",
+                          at=time.monotonic())
     return level
 
 
@@ -2301,6 +2388,11 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
         accounts = guard._accounts          # None = 这次没能从 OSS 拿到名单
         grants = dict(guard._grants)
         declared = guard._grants_declared
+    # 开机这一问的时刻：它是「当前会话的结论」的时间地标，比它更早发起的那一轮（包括
+    # 预热那一腿慢到超出预算、在这之后才回来的那一次）都不许再改权限上限。
+    # 必须在上面那一等**之后**取：写在等之前，本次结论就会被自己等来的那一轮判成
+    # 「迟到的旧结论」（本轮真实回归：密钥被拒那句文案被自己等回来的那一轮挡在门外）。
+    at = time.monotonic()
     phone = guard._bound_phone()
     if accounts is None or not phone or phone not in accounts:
         # 定档口径不变（一律丐版，fail-closed 是安全边界），但**原因**必须落到
@@ -2319,10 +2411,10 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
             why = f"账号 {phone} 不在本次拉取的名单里"
             pending = False     # 名单拿到了、里面没有这个号：这是结论，不是等待
         _ed.set_account_level(LEVEL_LITE, phone,
-                              reason=f"开机按丐版起界面：{why}", pending=pending)
+                              reason=f"开机按丐版起界面：{why}", pending=pending, at=at)
         return LEVEL_LITE
     level = resolve_level(phone, grants, declared)
-    _ed.set_account_level(level, phone, reason=f"开机 OSS 权威等级 {level}")
+    _ed.set_account_level(level, phone, reason=f"开机 OSS 权威等级 {level}", at=at)
     return level
 
 
