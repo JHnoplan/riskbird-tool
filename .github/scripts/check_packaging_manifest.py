@@ -8833,13 +8833,27 @@ WEIGHT_FORBIDDEN_ARTIFACT = {
 }
 # 超过这个字节数（MB）的顶层成分必须在 WEIGHT_BUDGET_MB 里登记理由；登记了也不许长过自己的上限。
 WEIGHT_DISCLOSE_MB = 3.0
+# 上限按 2026-11-19 本机产物的**真身字节**回填（measure_artifact：同一 realpath 只算一次，
+# 符号链接不重复计费）。为什么每项都留几兆余量：重量上限留得太紧，下一次正常的依赖升级
+# 就会先撞门，而撞了门的人多半是把上限改大而不是去查为什么长了。
 WEIGHT_BUDGET_MB = {
-    "PyQt5": (95, "界面框架（只收 Widgets/Gui/Core 三个绑定与其插件）"),
+    # 旧上限 95MB 是去掉 --collect-all PyQt5 之前量到的整包 Qt；现在只剩真在用的
+    # Widgets/Gui/Core 三个绑定与其 framework（Frameworks 与 Resources 两侧同源，只算一次）。
+    "PyQt5": (45, "界面框架：Qt5 的 Widgets/Gui/Core 三个绑定与其 framework 真身"),
     "selenium": (26, "风鸟/爱企查/企知道三路列表通道用它驱动 Chrome"),
     "PIL": (16, "手机号图片码识别（mk_phone_ocr）与截图处理"),
     "lxml": (13, "bs4 的解析器加速"),
     "chromedriver": (22, "随包 macOS 驱动：新电脑首启不必联网下载（用户口径：影响首启体验就不砍）"),
     "drivers": (80, "随包 Windows 最近 3 个大版本驱动，同上（不足 2 个时 fetch_chromedrivers.py 会中止）"),
+    # 下面三项是「体积视野补全」才露出来的真身：旧口径只看 Contents/Resources，它们一直在
+    # 包外（MacOS 与 Frameworks）——不是新长出来的重量，是以前的账本看不见。
+    "B2bCollectTool": (18, "主程序与 PyInstaller bootloader（MacOS/ 下那份可执行）"),
+    "Python.framework": (8, "随包 CPython 解释器框架本体：产物自带解释器，这是任何 "
+                          "PyInstaller 包都省不掉的那一块"),
+    "python3__dot__13": (8, "libpython 本体（名字里的 __dot__ 是 PyInstaller 对「.」的转义）："
+                            "同上，随包解释器自带"),
+    "libcrypto.3.dylib": (8, "OpenSSL：requests 与 OSS 上传走的就是它——随包才不依赖系统那" 
+                            "个版本（老 Windows 的系统 TLS 正是需求 10 里的一类故障）"),
 }
 
 # 需求 5：PyInstaller Qt hook 的连带收件里，「本工具永远用不到」的那一批，构建后剪掉。
@@ -8966,6 +8980,83 @@ def artifact_resource_root(artifact) -> Path:
     return p
 
 
+def artifact_measure_roots(artifact) -> list:
+    """体积与剪裁的**视野**：可能是好几个根，不是只有一个。
+
+    由来（2026-11-19 拿真产物对账）：mac 的 .app 把真身摊在 `Contents/{Frameworks,
+    Resources,MacOS}` 三处，只盯 `Contents/Resources` 会同时犯三个错——漏计主程序
+    （实测 14MB）、把符号链接别名（QtGui/QtCore/libcrypto 那一堆）当成独立成分报
+    「未登记」、又把真身所在的 Frameworks/PyQt5（实测 39MB）看成不到披露线。三处都
+    收进视野，Windows onedir 仍是 `_internal` 一个根（那里不用符号链接，旧行为不变）。
+    """
+    p = Path(artifact)
+    contents = p / "Contents"
+    if contents.is_dir():
+        roots = [contents / n for n in ("Frameworks", "Resources", "MacOS")
+                 if (contents / n).is_dir()]
+        return roots or [contents]
+    internal = p / "_internal"
+    if internal.is_dir():
+        return [internal]
+    res = p / "Resources"
+    return [res if res.is_dir() else p]
+
+
+def artifact_candidate_paths(rel: str, roots=None) -> list:
+    """一条相对路径在所有视野下的候选落点（剪裁与白拿名单共用）。
+
+    同一份 Qt 布局在 Frameworks 与 Resources 两侧都存在（一侧是真身、一侧是链接壳），
+    只查一侧就会「剪了壳、留了身」或「身剪了、壳还在报白拿」。每个条目都要在所有
+    视野里问一遍。
+    """
+    parts = rel.split("/")
+    out = []
+    for root in (roots if roots is not None else []):
+        out.append(root.joinpath(*parts))
+    return out
+
+
+def measure_artifact(artifact) -> tuple:
+    """按 **realpath 去重**统计真身字节。返回 (成分名 -> MB, 合计 MB)；视野读不到时返 ({}, -1.0)。
+
+    为什么不能拿「顶层条目名字」直接当成分：实测产物里有 229 个符号链接、全部指向
+    包内——`Resources/QtGui` 指向 `Resources/PyQt5/Qt5/lib/QtGui.framework`。按顶层名字
+    记账就会一边把链接当成 6MB 的「新成分」、一边把真身所在的目录再算一遍。现在只累
+    加非链接真文件（每个 realpath 只算一次），成分名取「剥掉视野首段后的第一段」，于是
+    Frameworks/selenium 与 Resources/selenium 合并成同一个 selenium。
+    """
+    roots = artifact_measure_roots(artifact)
+    seen, comps = set(), {}
+    hit = False
+    for root in roots:
+        if not root.is_dir():
+            continue
+        hit = True
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            for name in filenames:
+                f = base / name
+                if f.is_symlink():
+                    continue            # 链接壳不算字节：真身会在自己那一格里被计
+                try:
+                    key = os.path.realpath(f)
+                    size = os.path.getsize(key)
+                except OSError:
+                    continue
+                if key in seen:
+                    continue            # 硬链接/同一真身只算一次
+                seen.add(key)
+                rel = f.relative_to(root).parts
+                # relative_to(root) 已经不含 root 自己那一段（Frameworks/Resources/MacOS），
+                # 所以第一段就是成分名：selenium/webdriver 要归 selenium、PIL/__dot__dylibs 要
+                # 归 PIL、QtCore.framework/Versions/5/QtCore 要归 QtCore.framework。
+                comp = rel[0]
+                comps[comp] = comps.get(comp, 0.0) + size / 1048576.0
+    if not hit:
+        return {}, -1.0
+    return comps, sum(comps.values())
+
+
 def _dir_size_mb(p: Path) -> float:
     total = 0
     if p.is_file():
@@ -8981,61 +9072,70 @@ def _dir_size_mb(p: Path) -> float:
 
 
 def check_package_weight_artifact(artifact, label: str = "") -> tuple:
-    """构建后那一面：产物里到底装了什么、各占多少。返回 (问题列表, 人读报告)。"""
-    root = artifact_resource_root(artifact)
+    """构建后那一面：产物里到底装了什么、各占多少。返回 (问题列表，人读报告)。"""
     tag = f"{label} " if label else ""
-    if not root.is_dir():
-        return [f"{tag}重量门读不到产物资源根：{root}（产物不在就别宣布减重成功）"], []
-    entries = [x for x in root.iterdir() if x.name != "__pycache__"]
-    sized = sorted(((x, _dir_size_mb(x)) for x in entries), key=lambda kv: -kv[1])
+    roots = artifact_measure_roots(artifact)
+    if not any(r.is_dir() for r in roots):
+        return [f"{tag}重量门读不到产物体积视野：{'、'.join(str(r) for r in roots)}"
+                f"（产物不在就别宣布减重成功）"], []
+    comps, total = measure_artifact(artifact)
     problems = []
-    # ① 白拿名单：整目录或单个相对路径命中就点名（键用正斜杠写，读的时候两边都对齐）
+    # ① 白拿名单：每一条都在**全部视野**里问过（只查一侧会漏：真身可能在 Frameworks）
     for rel, why in WEIGHT_FORBIDDEN_ARTIFACT.items():
-        hit = root.joinpath(*rel.split("/"))
-        if hit.exists():
-            problems.append(f"{tag}产物里有 `{rel}`（约 {_dir_size_mb(hit):.0f}MB）：{why}")
+        for hit in artifact_candidate_paths(rel, roots):
+            if hit.exists():
+                problems.append(f"{tag}产物里有 `{rel}`（约 {_dir_size_mb(hit):.0f}MB）：{why}")
+                break
     # ② 成分账：每一份超过披露线的都得在册，且不许长过自己登记的上限
-    for path, mb in sized:
+    for name, mb in sorted(comps.items(), key=lambda kv: -kv[1]):
         if mb < WEIGHT_DISCLOSE_MB:
             continue
-        cap = WEIGHT_BUDGET_MB.get(path.name)
+        cap = WEIGHT_BUDGET_MB.get(name)
         if cap is None:
             problems.append(
-                f"{tag}产物里冒出 {mb:.0f}MB 的成分 `{path.name}` 却没登记："
+                f"{tag}产物里冒出 {mb:.0f}MB 的成分 `{name}` 却没登记："
                 f"要么砍掉它，要么在 WEIGHT_BUDGET_MB 写清它凭什么值这几兆"
                 f"（下一人才不会又问一遍「包为什么这么大」）")
         elif mb > cap[0]:
             problems.append(
-                f"{tag}`{path.name}` 现在 {mb:.0f}MB，超过登记的 {cap[0]}MB 上限"
+                f"{tag}`{name}` 现在 {mb:.0f}MB，超过登记的 {cap[0]}MB 上限"
                 f"（登记理由：{cap[1]}）：重量不会自己长，是某次改动让它长的")
-    report = [f"{tag}产物资源根 {root.name}：合计 {sum(mb for _p, mb in sized):.0f}MB，"
+    report = [f"{tag}产物体积（真实磁盘字节、同一真身只算一次）：合计 {total:.0f}MB，"
               f"成分账（≥{WEIGHT_DISCLOSE_MB:.0f}MB 全部列出）："]
-    for path, mb in sized:
+    for name, mb in sorted(comps.items(), key=lambda kv: -kv[1]):
         if mb >= WEIGHT_DISCLOSE_MB:
-            mark = "" if path.name in WEIGHT_BUDGET_MB else "  ←未登记"
-            report.append(f"   · {mb:6.0f}MB  {path.name}{mark}")
+            mark = "" if name in WEIGHT_BUDGET_MB else "  ←未登记"
+            report.append(f"   · {mb:6.0f}MB  {name}{mark}")
     return problems, report
 
 
 def prune_artifact(artifact, label: str = "") -> int:
     """构建后剪掉 ARTIFACT_PRUNE 清单里那些 hook 连带收件；返回合计剪掉的 MB，读不到产物返回 -1。"""
-    root = artifact_resource_root(artifact)
     tag = f"{label} " if label else ""
-    if not root.is_dir():
-        print(f"❌ {tag}剪裁读不到产物资源根：{root}（产物不在就别宣布减重成功）")
+    roots = artifact_measure_roots(artifact)
+    if not any(r.is_dir() for r in roots):
+        print(f"❌ {tag}剪裁读不到产物体积视野：{'、'.join(str(r) for r in roots)}（产物不在就别宣布减重成功）")
         return -1
     total = 0.0
     for rel in ARTIFACT_PRUNE:
-        p = root.joinpath(*rel.split("/"))
-        if not p.exists():
-            continue
-        mb = _dir_size_mb(p)
-        if p.is_file():
-            p.unlink()
-        else:
-            shutil.rmtree(p)
-        total += mb
-        print(f"· {tag}剪掉 {rel}（{mb:.0f}MB）")
+        # 两侧都剪：mac 的 Frameworks 与 Resources 各有一份同名布局，只剪一侧就是「没剪净」
+        for p in artifact_candidate_paths(rel, roots):
+            if not p.exists():
+                continue
+            mb = _dir_size_mb(p)
+            if p.is_file():
+                p.unlink()
+            else:
+                shutil.rmtree(p)
+            total += mb
+            # 只报「在产物里的哪一格」：同一份清单在 Frameworks 与 Resources 两侧都命中时，
+            # 念全路径才能看出剪了两处（这里不用 Path.is_relative_to：那是 3.9+ 的方法，
+            # 而本门模块会被 10B 的 Python 3.8 探针 import）。
+            try:
+                shown = str(p.relative_to(roots[0].parent))
+            except ValueError:
+                shown = str(p)
+            print(f"· {tag}剪掉 {shown}（{mb:.0f}MB）")
     print(f"✅ {tag}剪裁完成：合计 {total:.0f}MB。这些是 hook 连带收件里本工具永远用不到的"
           f"（webgl 插件拖进来的整条 QML 栈 + 从未生效过的 Qt 翻译）；剪完的产物马上过重量门，"
           f"谁再把它长出来当场红")

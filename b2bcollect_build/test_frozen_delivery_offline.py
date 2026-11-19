@@ -11621,8 +11621,9 @@ def test_package_weight_gate():
         _assert_eq(gate.check_package_weight_artifact(root.parent, "夹具")[0], [],
                    "去掉白拿与越限成分后就该全绿（拦得住也要放得行）")
         _probs, _rep2 = gate.check_package_weight_artifact(Path(td) / "不存在的产物", "夹具")
-        _assert(_probs and "读不到产物资源根" in _probs[0],
-                "路径给错时必须开口，不能默默交一份「零问题」的答卷（产物不在就别宣布减重成功）")
+        _assert(_probs and "读不到产物体积视野" in _probs[0],
+                "路径给错时必须开口，不能默默交一份「零问题」的答卷（产物不在就别宣布减重成功；"
+                "这一句文案随口径从「资源根」改成「体积视野」，判据跟着真源走）")
 
     # ── 5) 剪裁链路（需求 5 第三刀）：清单单一真源，三处入口只调不抄，先剪后称 ──
     # 由来（2026-11-19 产物 otool 实测）：前两刀之后 numpy(约 10MB)、translations(约 6MB)
@@ -11772,6 +11773,109 @@ def test_package_weight_gate():
     _got = _order_problems(_mut)
     _assert(any("排在重量分支之前" in g for g in _got),
             f"变异「先称后剪」必须被杀红（实际={_got}）")
+
+    # ── 6) 体积口径（2026-11-19 拿真产物对账后补）：视野要含三处、链接不双计、主程序入账 ──
+    # 由来：旧口径只看 Contents/Resources，实测把「合计」报成 109MB（真身 138MB），还把
+    # QtGui/QtCore/libcrypto 这些**符号链接别名**当成 8 个「未登记新成分」——而真身所在的
+    # Frameworks/PyQt5（39MB）反倒因为不在视野里没进账，14MB 的主程序（MacOS/）压根没被
+    # 看过。数字错，登记的上限与「减了多少重」就全是假的，所以这一节比前三刀都重要。
+    for _fn in ("artifact_measure_roots", "artifact_candidate_paths", "measure_artifact"):
+        _assert(callable(getattr(gate, _fn, None)), f"门模块里有 {_fn}（体积口径的唯一把手）")
+
+    def _build_fake_app(td):
+        """造一个 mac 形状的最小产物：真身在 Frameworks、Resources 只放链接壳、主程序在 MacOS。"""
+        cont = Path(td) / "FakeTool.app" / "Contents"
+        body = cont / "Frameworks" / "PyQt5" / "Qt5" / "lib" / "QtCore.framework" / "Versions" / "5"
+        body.mkdir(parents=True)
+        (body / "QtCore").write_bytes(b"q" * (3 * 1024 * 1024))            # 真身 3MB
+        shell = cont / "Resources" / "PyQt5" / "Qt5" / "lib"
+        shell.mkdir(parents=True)
+        os.symlink("../../../../Frameworks/PyQt5/Qt5/lib/QtCore.framework",
+                   shell / "QtCore.framework")                             # 链接壳：同一份字节
+        sel = cont / "Frameworks" / "selenium" / "webdriver"
+        sel.mkdir(parents=True)
+        (sel / "driver.bin").write_bytes(b"q" * (4 * 1024 * 1024))         # 子目录不许当成分名
+        exe = cont / "MacOS"
+        exe.mkdir(parents=True)
+        (exe / "FakeTool").write_bytes(b"q" * (2 * 1024 * 1024))           # 主程序要在账
+        return cont
+
+    with tempfile.TemporaryDirectory() as td:
+        _build_fake_app(td)
+        _comps, _total = gate.measure_artifact(Path(td) / "FakeTool.app")
+        _assert_eq(round(_comps.get("PyQt5", 0)), 3,
+                   "链接壳不许让真身算两遍（3MB 就是 3MB）：旧口径正是靠跟随链接把 QtGui 多算了 6MB")
+        _assert(not ({"Versions", "webdriver", "QtCore.framework"} & set(_comps)),
+                f"成分名必须取「视野下的第一段」：拿子目录名当成分会把 selenium 拆成 webdriver、"
+                f"把 framework 拆成 Versions（实际={sorted(_comps)}）——本轮真实踩到，旧写法"
+                "多剥一层就把真成分全弄散了")
+        _assert_eq(round(_comps.get("selenium", 0)), 4,
+                   "Frameworks/selenium/webdriver/* 要归到同一个 selenium")
+        _assert_eq(round(_comps.get("FakeTool", 0)), 2,
+                   "MacOS/ 下的主程序必须在账（旧口径漏掉的就是那一格 14MB）")
+        _assert_eq(round(_total), 9, f"合计就是真实字节 3+4+2（实际={_total:.1f}）")
+        _assert_eq(sorted(r.name for r in gate.artifact_measure_roots(Path(td) / "FakeTool.app")),
+                   ["Frameworks", "MacOS", "Resources"],
+                   "mac 的 .app 体积视野必须三处齐：少一处就少一类成分")
+        _win = Path(td) / "WinTool" / "_internal" / "pandas"
+        _win.mkdir(parents=True)
+        (_win / "x.pyd").write_bytes(b"q" * (4 * 1024 * 1024))
+        _assert_eq([r.name for r in gate.artifact_measure_roots(Path(td) / "WinTool")], ["_internal"],
+                   "Windows onedir 仍只看 _internal（那里不用符号链接，旧行为不许变）")
+        # 白拿名单也要跨视野：真身只在 Frameworks 一侧时，只看 Resources 就会「自宣布干净」。
+        _pd = Path(td) / "FakeTool.app" / "Contents" / "Frameworks" / "pandas"
+        _pd.mkdir(parents=True)
+        (_pd / "x.pyd").write_bytes(b"q" * 1024)
+        _gp, _ = gate.check_package_weight_artifact(Path(td) / "FakeTool.app", "夹具")
+        _assert(any("pandas" in x for x in _gp),
+                f"白拿名单要在全部视野里问过：pandas 只在 Frameworks 一侧也必须响（实际={_gp}）")
+
+    def _prune_two_sides(td):
+        """两侧各一份 translations：只剪一侧就是「剪了壳、留了身」，白拿名单还会报脏。"""
+        cont = Path(td) / "FakeTool.app" / "Contents"
+        for side in ("Frameworks", "Resources"):
+            d = cont / side / "PyQt5" / "Qt5" / "translations"
+            d.mkdir(parents=True)
+            (d / "a.qm").write_bytes(b"q" * (2 * 1024 * 1024))
+        return cont
+
+    with tempfile.TemporaryDirectory() as td:
+        cont = _prune_two_sides(td)
+        _cand = gate.artifact_candidate_paths(
+            "PyQt5/Qt5/translations", gate.artifact_measure_roots(Path(td) / "FakeTool.app"))
+        _assert_eq(len(_cand), 2, f"两侧都要有候选落点（实际={_cand}）")
+        _cut = gate.prune_artifact(Path(td) / "FakeTool.app", "夹具")
+        _assert(_cut >= 2, f"两侧各 2MB，剪掉的要按真字节合计（实际={_cut}）")
+        for side in ("Frameworks", "Resources"):
+            _assert(not (cont / side / "PyQt5" / "Qt5" / "translations").exists(),
+                    f"{side} 侧的 translations 必须真被剪掉")
+
+    # 反向对照：把口径改回「只看 Resources」那一版旧写法，同一份夹具必须量出缺项。
+    # 这一路证明上面的断言不是恒真：旧口径真的会漏，判据真的能分辨。
+    _orig_roots = gate.artifact_measure_roots
+    try:
+        gate.artifact_measure_roots = lambda a: [Path(a) / "Contents" / "Resources"]
+        with tempfile.TemporaryDirectory() as td:
+            _build_fake_app(td)
+            _c2, _t2 = gate.measure_artifact(Path(td) / "FakeTool.app")
+            _assert(_t2 < 9 or "FakeTool" not in _c2 or "PyQt5" not in _c2,
+                    f"旧口径（只看 Resources）量出来就是少东西（实际合计={_t2:.1f}、成分={sorted(_c2)}）："
+                    "如果这一路也报 9MB，上面那些断言就是永真式")
+    finally:
+        gate.artifact_measure_roots = _orig_roots
+
+    # 本轮实测回填的账要钉住：上限不是拍脑袋，是量出来的；谁改回旧数字就得解释。
+    for name, cap, why_in_cap in (("PyQt5", 45, "framework"), ("B2bCollectTool", 18, "bootloader"),
+                                  ("python3__dot__13", 8, "libpython"),
+                                  ("libcrypto.3.dylib", 8, "OpenSSL")):
+        _assert(name in gate.WEIGHT_BUDGET_MB,
+                f"成分账里有 {name}（实测），登记表却把它弄丢了——丢一次就红一次构建")
+        _assert(gate.WEIGHT_BUDGET_MB[name][0] == cap and why_in_cap in gate.WEIGHT_BUDGET_MB[name][1],
+                f"{name} 的上限与理由要停在实测那一档（{cap}MB，理由含「{why_in_cap}」）："
+                f"旧上限 95 是 --collect-all 时代的整包 Qt，拿它当今日上限＝这道门对 PyQt5 永不生效")
+    _assert(not any("/" in k for k in gate.WEIGHT_BUDGET_MB),
+            "登记表全部用「视野下第一段」的成分名：写带斜杠的路径永远碰不到 measure_artifact 的键，"
+            "那条登记就是挂着但从不生效的空账")
 
 
 def test_installer_env_gate():
