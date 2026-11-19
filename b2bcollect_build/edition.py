@@ -74,6 +74,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -410,8 +411,14 @@ def level_write_is_stale(at: Optional[float], account: str = "") -> bool:
        正是会被网络往返颠倒的那个东西，拿它排序等于拿病灶当体温计。
 
     两个口子直接放行：``at=None``（调用方不是在回答某一次刷新，而是直接下结论）与
-    「当前记录没带时刻/没带号」（上一格写于这把尺存在之前，或本就是未判定）。拦错的代价
-    是把 fail-closed 的显式定档也挡在门外——那比放行更不安全。
+    「当前记录没带时刻/没带号」（这把尺存在之前留下的结）。
+    但 ``at=None`` 只豁免**这一笔被不被拒**，不豁免「要不要留下时刻地标」：下面写入时会给
+    它补一个当时的单调时刻。不补就是一个真漏（2026-11-19 本机取证）：换号后同步定档把
+    STD 写成等级 1，随后那个**为旧号 ADMIN 去问的**那一轮迟到落地，把记录改写成
+    「等级 0 / 15088131371」——权限 1 的号因此长出全套入口与「权限管理」面板。尺只能比
+    带时刻的记录，而同步路径恰恰不带时刻，等于把这一格留给了「谁回来得晚谁说了算」。
+    拦错的代价是把 fail-closed 的显式定档也挡在门外——那比放行更不安全，所以
+    「没带时刻」与「号不同」两条都到位才拒。
     """
     if at is None:
         return False
@@ -459,7 +466,11 @@ def set_account_level(level: Optional[int], account: str = "", reason: str = "",
         pending = False       # 名单确实拿到了、只是里面那个值不认识：结论已定，不存在待确认
     _ACCOUNT = {"level": lv, "account": str(account or ""),
                 "reason": reason or f"账号 {account} 等级 {lv}",
-                "pending": bool(pending), _LEVEL_AT_KEY: at}
+                "pending": bool(pending),
+                # 每一笔写入都留下时刻地标：调用方给了就用它（那一轮的发起时刻），
+                # 没给（同步路径直接下结论）就用写入时刻。少了这一句，迟到的轮次在这格
+                # 永远问不出答案（见 level_write_is_stale 里那个真漏）。
+                _LEVEL_AT_KEY: (time.monotonic() if at is None else at)}
     return edition() != before
 
 
