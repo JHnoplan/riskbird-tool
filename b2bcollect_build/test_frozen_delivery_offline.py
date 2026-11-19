@@ -12024,7 +12024,10 @@ def test_package_weight_gate():
     # 别名必须认得两平台、两版本形状（这一格就是云端那一红的直接根因）
     for _real, _alias in (("python3__dot__11", "python3NN"), ("python3__dot__13", "python3NN"),
                          ("python311.dll", "python3NN"), ("python313.dll", "python3NN"),
-                         ("libcrypto.3.dylib", "libcryptoN"), ("libcrypto-3.dll", "libcryptoN")):
+                         ("libcrypto.3.dylib", "libcryptoN"), ("libcrypto-3.dll", "libcryptoN"),
+                         # 兼容通道首运那一红的名义形状：CPython 3.8 链 OpenSSL 1.1（run
+                         # 44598716037 实测 3MB）。不带这一例，正则改回去也是全绿。
+                         ("libcrypto-1_1.dll", "libcryptoN")):
         _assert(gate._budget_key(_real) == _alias,
                 f"产物里的 `{_real}` 要归到 `{_alias}` 那一格（实得 {gate._budget_key(_real)}）："
                 f"归一化只认本机那一台机器看到的名字，就是云端那一轮的红")
@@ -12033,6 +12036,14 @@ def test_package_weight_gate():
     for _un in ("python3.11", "libcrypto10", "python3abc"):
         _assert(gate._budget_key(_un) == _un,
                 f"别的成分名一律照原名对账（{_un} 被动了＝归一化正则泄到了不该管的地方）")
+    # 反方向也要钉：`-x64` 那一档是**故意没放行**的（至今没有任何一份产物里出现过这个名字）。
+    # 不钉住它，「顺手把正则放宽」会把这条门唯一的用处拆掉：新形状应当红一次、把真名
+    # 念出来、逼来的人回答「这几兆凭什么进包」；预防性放行则是把这句话永远吞掉。
+    # 将来云端真量到这个名字，就改正则并**同时**把这一例撑到上面那张正例表里去——
+    # 两步必须一起动，只做一半的改动会在这里响。
+    _unseen = "libcrypto-1_1-x64.dll"
+    _assert(gate._budget_key(_unseen) == _unseen,
+            f"没在云端量过的形状 `{_unseen}` 不许被归一（要放行就得先拿出一份真产物账本）")
 
     # 静态那一半：拿合成账本喂四形，每形都要响（只靠构建后那一面，本机永远绿、云端才红）
     _orig_budget = gate.WEIGHT_BUDGET_MB

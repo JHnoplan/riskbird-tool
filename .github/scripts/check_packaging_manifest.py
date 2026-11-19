@@ -8941,14 +8941,22 @@ WEIGHT_BUDGET_MB = {
     "libcryptoN": {"mac": 8, "win": 8,
                     "why": "OpenSSL：requests 与 OSS 上传走的就是它——随包才不依赖系统那个版本（老"
                            " Windows 的系统 TLS 正是需求 10 里的一类故障）。mac 叫"
-                           " libcrypto.N.dylib（实测 3～5MB），win 叫 libcrypto-N.dll（实测 5MB）"},
+                           " libcrypto.3.dylib（实测 3～5MB），win 侧则**跟着随包解释器换代**："
+                           " 3.11 是 libcrypto-3.dll（实测 5MB），Win7 兼容通道的 3.8 链的是"
+                           " OpenSSL 1.1，叫 libcrypto-1_1.dll（run 44598716037 实测 3MB）"
+                           "——那个 `_1` 是次版本号，不是 x64 标记，也不是新长出来的重量"},
 }
 # 成分名 → 账本别名的归一化表：只有「同一格东西在不同机器上换名字」这一族需要归一，
 # 所以按形状精确匹配（整名匹配，不是搜索），别的成分一律照原名对账。
 # 每项是 (匹配成分名的正则, 账本里的别名)。
 WEIGHT_VERSION_ALIASES = (
     (re.compile(r"python3(?:__dot__)?\d{1,2}(?:\.dll)?\Z"), "python3NN"),
-    (re.compile(r"libcrypto[._-]\d+(?:\.(?:dylib|dll))?\Z"), "libcryptoN"),
+    # `(?:_\d+)?` 那一档是 2026-11-20 兼容通道首运补的：CPython 3.8 的 _ssl 链 OpenSSL 1.1，
+    # win 侧真名是 libcrypto-1_1.dll（run 44598716037 / 剪裁那一步实测 3MB），而旧写法只吃到
+    # `libcrypto-<主版本>`，归一失败就落回原名查账 → 报「未登记」。只补**云端量到的那一种形状**：
+    # 将来若换成 libcrypto-1_1-x64.dll，这一格会再红一次并把真名念出来，不预防性放行没见过
+    # 的名字（那是把「下一人得问包为什么大」换成「下一人永远问不到」）。
+    (re.compile(r"libcrypto[._-]\d+(?:_\d+)?(?:\.(?:dylib|dll))?\Z"), "libcryptoN"),
 )
 
 
