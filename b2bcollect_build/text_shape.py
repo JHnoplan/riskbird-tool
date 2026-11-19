@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
-"""text_shape.py —— 失败原因收成一行：**只准一个把手**（第 ㉓ 族的单一真源）。
+"""text_shape.py —— 文本收口的**单一把手层**，只依赖标准库。
 
+本层现在管两族（两族都是「同一个缺陷在交付链里有几十处独立写法」这个同一个形状）：
+  ① 失败原因收成一行（第 ㉓ 族）：`short_reason` / `first_line`，见下面注释；
+  ② 数据值收成可显示文本（第 ㉛ 族，2026-11-19 需求 8）：`cell_text` / `cell_join`，
+     挡住「数字型手机号把 QTableWidgetItem 搞崩、把 join 搞崩」这一类类型不保的崩溃。
+
+把手为什么必须住在这样一个零依赖的小模块里（而不是 cdp_base / customer_library_cleaner）：
+上面「为什么单独成模块」那一段已经写过一次，两族的选型理由完全同源，不重复印。
+
+【以下为第一族的原有口径，未变】
 为什么单独成模块（2026-11-16 第八轮实机报告 + 随后的同类查全）：
   1) 实机体检报告里出现过这种句子——
      `【连不上·无应答】b2b.11467.com:443｜Connection to b2b.11467.com timed out. (con）`
@@ -106,3 +115,88 @@ def first_line(text, limit=120):
     if not s:
         return ""
     return short_reason(s.splitlines()[0], limit)
+
+
+# ── 第二族：数据值 → 可显示文本（第 ㉛ 族的单一把手） ─────────────────
+
+def cell_text(value) -> str:  # noqa: C901  类型分派本身就是一串互斥分支，拆成多个函数会丢掉「单一口径」这件事
+    r"""把「一个数据值」收成表格/文本能安全显示的字符串。
+
+    为什么必须单独有这一支（2026-11-19 需求 8 实测，四个形状都当场跑过）：
+      · ``QTableWidgetItem(13800000000)`` → **OverflowError**：11 位手机号（1.3e10）超过
+        int32 上限 2147483647，PyQt 把这个整数当成 ``QTableWidgetItem.Type`` 枚举做了范围校验；
+      · ``QTableWidgetItem(123)`` → **不报错但显示空白**（同样是枚举重载，text 为空）——
+        小整数不会崩，只会把号码静默吞掉，比崩更难发现；
+      · ``QTableWidgetItem(1.5 / ['a'] / {'k':1})`` → TypeError；
+      · ``", ".join([13800000000])`` 与 ``re.sub(r"\D", "", 13800000000)`` → TypeError。
+    后两条落在由 C++ 调用的 queued 槽里就是进程 ``abort()``：这就是用户报的「搜索完就崩」。
+    数据为什么能是数字型：Excel/pandas 读进来不带引号的号码就是数值（本仓
+    ``customer_library_cleaner._cell_text`` 的注释已经为这件事写过一次），而
+    ``ingest_cleaning`` 旧写法只洗了 ``phones`` 那一支，``mobiles`` 走兜底时原样保留元素类型。
+
+    口径（与仓库内已有的 ``_cell_text`` 保持同一方向，但多挡住三个会崩的形状）：
+      None/NaN/inf → 空串；bool → 是/空；int → 完整数字串；float → 展开成不丢位的数字串；
+      日期 → 年月日；list/tuple/set → 逐项递归后用「、」接；numpy 标量 → 先 ``.item()``；
+      其它 → ``str()``。**本体绝不抛**：显示边界的把手自己招了异常，等于把崩溃换个地方发生。
+
+    为什么住在这里而不是 customer_library_cleaner：那个文件是三个交付目录里的同名拷贝，
+    从本工具去 import 它正是需求 5 要避免的跨工具耦合；而本模块只依赖标准库，权限自检那种
+    最早加载的链路也接得到（上面第一段已经立过这条选型理由）。
+    """
+    try:
+        if value is None or isinstance(value, str):
+            return value if value is not None else ""
+        if isinstance(value, bool):          # 必须在 int 之前：Python 里 bool 是 int 的子类
+            return "是" if value else ""
+        item = getattr(value, "item", None)
+        if callable(item) and not isinstance(value, (bytes, bytearray)):
+            # numpy/pandas 标量：np.int64 不是 int 的子类，不先转回 Python 原生类型就会
+            # 一路落到下面的 str()，得到「13800000000」倒是运气好，得到「<class 'numpy.int64'>」
+            # 就是界面上一排乱码。转完递归一次，口径不另外写一份。
+            try:
+                return cell_text(item())
+            except Exception:
+                pass                          # .item() 招了就走原生口径，不在这里下结论
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                return ""                     # NaN/inf：Excel 空单元格的常见形状，写「nan」进表格就是假数据
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.10f}".rstrip("0").rstrip(".")
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return "、".join(x for x in (cell_text(v) for v in value) if x)
+        if hasattr(value, "strftime"):
+            try:
+                return value.strftime("%Y-%m-%d")
+            except Exception:
+                pass                          # 自定义日期对象 strftime 招了就走下面的 str，不丢掉整个单元格
+        if isinstance(value, dict):
+            # 字典直接 str 会给出「{'name': ...}」这种程序员形状；字典出现在业务字段里本身就是
+            # 数据异常，如实展成可读的一串，同时在面包屑里能查到这一条。
+            return "、".join(f"{cell_text(k)}：{cell_text(v)}" for k, v in value.items())
+        return str(value)
+    except Exception:
+        # 最后的铁底：任何类型的 __str__/__repr__ 都能自己抛（循环引用、破对象）。
+        # 这里只报「这个值显示不了」，不报「所以这个工具可以消失」。
+        return f"（无法显示：{type(value).__name__}）"
+
+
+def cell_join(values, sep: str = ", ") -> str:
+    """把一批值接成一行：``", ".join(values)`` 的接班人（列表里混一个 int 就抛 TypeError 那一只）。
+
+    为什么不直接 ``cell_text(list)``：展示层的分隔符是有意选定的（手机号用「, 」、
+    主营行业用「、」），把手只修类型，不能顺手改掉用户看惯的分隔。
+
+    （2026-11-19 自检当场抓下的真错：本函数初版写成了 `sep(生成器)`——把字符串当函数调用，
+    TypeError 被下面那句「绝不抛」直接吞成空串，接口看起来完全正常但永远输出空。
+    教训：**防御性 except 会把自己的代码缺陷一起藏掉**，所以这一支必须有一条
+    「混进一个 int 也不许抛、且逐字等于手拼结果」的往返判据，不能只靠写的时候看一眼。）
+    """
+    try:
+        return sep.join(x for x in (cell_text(v) for v in (values or [])) if x)
+    except Exception:
+        return ""

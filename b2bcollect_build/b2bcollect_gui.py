@@ -257,6 +257,19 @@ try:
 except ImportError:
     HAS_TOOL_UPDATE = False
 
+# 运行期崩溃取证（需求 8：Windows 搜完采购商就崩）：写法上跟上面同一族，但**重要性不同**。
+# 上面那些可选模块坏了只是「少一个提醒」，本模块坏了则是「下一次实机报障又回到互相猜」——
+# 那正是本轮开工前所处的状态（用户说崩了、我们说没日志）。所以：
+#   · 仍用可选写法，绝不能因为「想留证据」这件事本身把工具带不起来；
+#   · 但装得上装不上、落在哪个文件、faulthandler 开没开都要进启动台账，由离线判据钉住：
+#     「取证没就位」本身必须是一条看得见的缺陷，不能是一个谁都没注意过的 None。
+try:
+    import crash_forensics
+    HAS_CRASH_FORENSICS = True
+except ImportError:
+    crash_forensics = None          # 显式绑一个 None：下游每一处都得能问出「没这个模块」
+    HAS_CRASH_FORENSICS = False
+
 # ── 启动台账：每一次「打开工具」都留下一行进程自己说得出真话的证据 ─────────────
 # 文件名与行格式只许有一份写法：交付门禁、离线测试、远程支持三方读的都是这一份。
 LAUNCH_LOG_NAME = "launch_history.log"
@@ -2756,6 +2769,19 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._autosave_tick)
         self._timer.start(3 * 60 * 1000)
+        # 崩溃取证的界面提示（需求 8）。取证装置在**后台线程**里只把「该说的话」入队
+        # （理由见 crash_forensics.drain_pending 上方那段：QWidget 只能在界面线程动，
+        # 为了报一个错去跨线程碰界面，就是亲手安排下一场崩溃），这里按节拍在界面线程取。
+        # 为什么不用一个更短的间隔：这一句的唯一用途是「出了事要说」，平时一条也不会入队，
+        # 两秒既不会让用户觉得工具反应慢，也不会让没人看的时候积出一堆横幅。
+        self._crash_banner_live = False
+        self._crash_last_notice_at = 0.0
+        self._crash_notice_timer = QTimer(self)
+        self._crash_notice_timer.timeout.connect(self._drain_crash_notices)
+        # 只在模块真在的时候起这个定时：不在时报横幅就是引用一个不存在的名字（与上面
+        # HAS_ACL_GUARD 那一条同一红线——降级能用的意思就是每个名字都先判再引用）。
+        if HAS_CRASH_FORENSICS:
+            self._crash_notice_timer.start(self.CRASH_NOTICE_TICK_MS)
         # 采集计时（对齐企知道/1688 工具）：秒级刷新；验证等待/手动暂停时接管计时，
         # 避免人工等待把平均耗时算虚高。
         self._crawl_timer = QTimer(self)
@@ -4277,7 +4303,83 @@ class MainWindow(QMainWindow):
             self._offer_chrome_fix()
         elif link == "#chrome-recheck":
             self._check_chrome_env()
+        elif link == "#crash-open":
+            self._open_crash_report()
         # 其余未知动作静默忽略：横幅文案由别处拼装，将来加新链接不该在这里炸界面
+
+    # 崩溃取证的界面提示（需求 8）：这两个数都是「不骚扰也不丢事」的折中。
+    # 2 秒：入队只在真出事时发生，取证的证据已经先写进文件，界面早半秒晚半秒都不改变结论。
+    # 5 分钟：横幅被别的必须在场的提示占着时这条提示会等；等过了就只留在日志里，
+    # 因为证据已经在文件里一分钟都没丢，把五分钟前的旧事重新糊上横幅只会解释错当下。
+    CRASH_NOTICE_TICK_MS = 2000
+    CRASH_NOTICE_TTL_S = 300.0
+
+    def _drain_crash_notices(self):
+        """把取证装置攒下的「刚才出过事」取走，日志与横幅各说各该说的那一半。
+
+        三条口径都是本轮算清楚的：
+        · 日志是底账、横幅是入口，两边都要。只写日志用户不知道有这份证据存在（需求 8
+          开工前就是「用户说崩了、我们说没日志」）；只出横幅则下一件事就把这句话盖掉了。
+        · 横幅正被别的提示占着时**绝不抢**：口径直接沿用 Chrome 体检那一条（isHidden
+          而不是 isVisible，理由在那段注释里：无头态下 isVisible 恒为 False，规矩就测不出来）。
+          需求 6 的「重启才能生效」与需求 2 的「有新版」都是必须在场的提示，抢赢就是把
+          别人的红线踩掉。
+        · 一次只念最近一条并把剩余条数说出来：连着出三类故障时逐条弹框会把界面变成
+          第二个现场（本仓对弹窗的红线：后台不许抢对话）。
+        """
+        if not HAS_CRASH_FORENSICS:
+            return
+        try:
+            items = list(crash_forensics.drain_pending())
+        except Exception as e:
+            # 取证装置自取一步就能在界面线程抛：这条红线是「少一个提醒」而不是
+            # 「把工具带崩」，但它必须被说出来，不能变成静默失灵（本仓反复踩过的那一族）。
+            self._on_log(f"⚠ 崩溃取证提示没取成：{type(e).__name__}: {e}"
+                         "（不影响采集，原因仍会写进取证文件）")
+            return
+        if not items and not self._crash_banner_live:
+            return                                  # 平时走到这里就是两个判断，不碰任何界面
+        for k, p in items:
+            self._on_log(f"⚠ {k}——原因与当时的线程栈已经写进取证文件：{p}")
+        if items:
+            self._crash_last_notice_at = time.time()
+        elif time.time() - self._crash_last_notice_at > self.CRASH_NOTICE_TTL_S:
+            # 过期：只收自己贴上去的那一张，别人正占着横幅时一个字也不动。
+            if self._crash_banner_live:
+                self._hide_banner()
+            self._crash_banner_live = False
+            return
+        if not self._crash_banner_live:
+            if not self.banner.isHidden():
+                return                              # 不抢：上面那句日志已经兜住
+            extra = (f"（这一批还有 {len(items) - 1} 条，都写在同一个文件里）"
+                     if len(items) > 1 else "")
+            self._show_banner(
+                "⚠ 工具刚才有一步没做成，已把原因和当时每一根线程的栈记下来，"
+                f"其余功能照常。{extra}"
+                '<a href="#crash-open">打开取证文件</a>',
+                "#f8d7da", "#721c24")
+            self._crash_banner_live = True
+
+    def _open_crash_report(self):
+        """横幅上那条「打开取证文件」的落点：把路径交给系统，并把结果说清楚。
+
+        失败也必须说得出：静默吃掉等于用户点了没反应，还是得回来问我们。而取证
+        文件自己就在哪个目录，这件事在写不进去时比写进去更要紧（启动台账里那一行
+        「取证=已装 落点=…」就是为这一刻准备的）。
+        """
+        if not HAS_CRASH_FORENSICS:
+            self._on_log("⚠ 取证模块不在包里，这一条需要重新打包才能修（见启动台账里取证那一行）")
+            return
+        ok, msg = crash_forensics.open_report()
+        if ok:
+            self._on_log(f"✓ 已交给系统打开：{msg}")
+            self._on_log("  · 这一份里只有时间、版本、步骤与异常栈，手机号与设备号都已脱敏，"
+                         "可以直接整份发回给开发者。")
+        else:
+            self._on_log(f"⚠ {msg}")
+            QMessageBox.warning(self, "取证文件打不开", msg
+                                + "\n\n文件内容仍在日志里，把最后几行⚠ 开头的话发回来也能定位。")
 
     def _on_login_required(self, msg):
         """某站开局说「这个 Chrome 里没登录」：横幅常显直到登录完成。
@@ -9292,6 +9394,20 @@ def main():
     # 的修法完全相反（前者查进程/权限，后者查界面代码与落盘）。
     _launch_note = (f"frozen={'是' if getattr(sys, 'frozen', False) else '否'}"
                     f" platform={sys.platform}")
+    # 运行期崩溃取证先装钩子（需求 8）。顺序很要紧：必须在 QApplication 之前——Qt 的
+    # abort 发生在「已经跑起来之后」，而解释器钩子是唯一还能在 abort 前把话留下来的东西
+    # （本轮实测：PyQt 5.15 在致命异常时确实先走 excepthook 再 abort，所以来得及落盘）。
+    # 状态一律写进 begin 那一行台账：“装了钩子”与“钩子还能写”是两件事，只看前者就是自欺。
+    if HAS_CRASH_FORENSICS:
+        try:
+            _cf = crash_forensics.install()
+            _launch_note += (f" 取证=已装 落点={_cf['report']}"
+                             f" faulthandler={'是' if _cf['faulthandler_on'] else '否'}")
+        except Exception as _cf_exc:
+            # 取证装置自己报错绝不能把启动带倒（它坏了只是没证据，这里抛了就是没工具）。
+            _launch_note += f" 取证=安装失败（{type(_cf_exc).__name__}: {first_line(_cf_exc, 60)}）"
+    else:
+        _launch_note += " 取证=模块不在"
     _launch_record(LAUNCH_STAGE_BEGIN, _launch_note)
     # 卡点取证同时开工：从这里起到 shown/fail 之间的任何一段「没有动静」都会留下一份
     # 全线程的栈。它不改任何功能，只是让下一次「双击没界面」不再需要二十分钟的现场取证

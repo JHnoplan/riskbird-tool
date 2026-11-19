@@ -29,6 +29,12 @@ import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
+# 类型收口只准一个把手（第 ㉛ 族，text_shape.cell_text）：本模块是 Silver 层，在这里把
+# 「号码列混着数值类型进来」收掉，界面上才不需要为每一条上传过的脏数据再防一次。
+# 直接 import 不做降级：text_shape 只标依赖标准库（上面那两组降级开关全部不适用），
+# 它不在等于这个包本身不完整，那时该响的是打包硬门而不是这里。
+from text_shape import cell_text
+
 try:
     from data_pool import (record_region, compute_quality_score, _is_valid_record,
                            REGION_RULE_VERSION)
@@ -963,6 +969,39 @@ def _repair_contacts(rec: dict) -> int:
     return fixed
 
 
+# 本该是「一列」的字段：数据源给到标量时必须先收口成列表再往下走。
+_LIST_COLUMNS = ("mobiles", "phones", "landlines", "emails", "wechats")
+
+
+def _as_str_list(value: Any) -> List[str]:
+    """把「本该是一列」的字段收口成 ``list[str]``，**标量绝不当可迭代对象用**。
+
+    需求 8 实测形状：Excel/pandas 读进来的一列号码经常就是标量（``mobiles="13900000001"``
+    或 ``mobiles=13900000001``），而本模块原先到处写的 ``for x in (value or [])`` 对字符串是
+    **逐字符**迭代——整列号码被洗成 ``['1', '3', '9', '0']``：不报错、不崩溃，只是所有
+    联系方式再也打不通。「静默把数据洗坏」比崩一次更贵（崩了有人会来问，洗坏了会直接
+    交出去），所以在清洗入口一次收口，下游每一支读到的都保证是列表。
+
+    逐项字面化统一走 ``text_shape.cell_text``：与界面渲染、号码去重同一个口径，不在这里
+    另写一份 ``str()``——numpy 标量、NaN、1.3e10 这些形状各支写法不同，正是分叉的起点。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items: List[Any] = list(value)
+    else:
+        # 字符串、bytes、数字、日期……到这一层都按「就是一个值」处理，不送进 for 循环
+        items = [value]
+    out: List[str] = []
+    for it in items:
+        if it is None:
+            continue
+        text = cell_text(it).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
     """清洗单条记录。
 
@@ -972,6 +1011,17 @@ def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
     if not isinstance(rec, dict):
         return None, REASON_NO_NAME, {}
     fixes: Dict[str, int] = {}
+
+    # 列形字段收口（需求 8 同族）：必须排在下面每一支读它们之前。只动「不是列表」的值，
+    # 已经是列表的交给各支自己的逐项处理——不改现有语义，只堵标量被逐字拆开这一条。
+    for _k in _LIST_COLUMNS:
+        _v0 = rec.get(_k)
+        if _v0 is None or isinstance(_v0, (list, tuple, set, frozenset)):
+            continue
+        _v1 = _as_str_list(_v0)
+        rec[_k] = _v1
+        if _v1:
+            fixes["列表列标量收口"] = fixes.get("列表列标量收口", 0) + 1
 
     company = str(rec.get("company") or "").strip(" \t　\"'")
     # 公司名里残留的序号/文件名前缀（历史文件常见 "1. 某某公司"）
@@ -1066,8 +1116,13 @@ def clean_one(rec: dict) -> Tuple[Optional[dict], str, Dict[str, int]]:
     rec["phones"] = repaired
     mobiles = [p for p in repaired if _is_mobile(p)]
     landlines = [p for p in repaired if not _is_mobile(p)]
-    rec["mobiles"] = mobiles or [m for m in (rec.get("mobiles") or []) if m]
-    rec["landlines"] = landlines or [l for l in (rec.get("landlines") or []) if l]
+    # 兜底那两支必须逐项收口成 str：旧写法直接留下原元素类型，而 Excel/pandas 读进来的
+    # 号码经常本来就是数值（需求 8 实测：11 位手机号 1.3e10 进 QTableWidgetItem 招
+    # OverflowError，进界面那一句 ", ".join 招 TypeError，两者在 queued 槽里都是整进程 abort）。
+    # 口径只走 text_shape.cell_text 这一个把手：phones 那一支上面已经 str() 过，三支不同口径
+    # 正是「一类数据洗得干净、另一类原封入库」这种分叉的起点了。
+    rec["mobiles"] = mobiles or [t for t in (cell_text(m) for m in (rec.get("mobiles") or [])) if t]
+    rec["landlines"] = landlines or [t for t in (cell_text(l) for l in (rec.get("landlines") or [])) if t]
 
     if _HAS_FIELD_CLEAN:
         emails = clean_email_values(rec.get("emails"))

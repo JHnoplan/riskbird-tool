@@ -18,3 +18,10 @@ deepseek_cache.json
 # --acl-doctor 在源码态把报告落在模块目录（打包态落在包外 b2bcollect_state/），
 # 它是每次自检都会重写的产物，入库只会让提交面变脏
 acl_doctor.txt
+
+# 升级与崩溃取证的运行时产物。正常形态下它们落在包外（~/.b2bcollect/updates 与桌面），
+# 但离线判据会把 HOME 指到临时目录跑真链路，名字挡不住就是一次 `git add <目录>` 就能
+# 把本机现场扫进索引的事故（第 22 条判的就是这件事：挡 = git 在 add 那一刻怎么说）。
+last_update.json
+crash_report.txt
+crash_threads.txt

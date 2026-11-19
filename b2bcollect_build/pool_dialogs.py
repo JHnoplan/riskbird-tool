@@ -16,9 +16,13 @@ import time
 import traceback
 from datetime import datetime
 from typing import List, NamedTuple, Optional
-# 失败原因收成一行只准一个把手（第 ㉓ 族）：真源在同目录 text_shape.py，零依赖，
-# 所以「最早加载、且要在采集器全坏时还能说话」的这条链也能用它。
-from text_shape import first_line
+# 失败原因收成一行只准一个把手（第 ㉓ 族）；数据值收成可显示文本只准一个把手（第 ㉛ 族）。
+# 真源都在同目录 text_shape.py，零依赖，所以「最早加载、且要在采集器全坏时还能说话」
+# 的这条链也能用它。cell_text/cell_join 是需求 8（Windows 搜索完就崩）的根因修复位：
+# 数字型手机号进 QTableWidgetItem 会抛 OverflowError，进 ", ".join 会抛 TypeError，
+# 而它们发生在由 C++ 调用的 queued 槽里就是整个进程 abort。
+from text_shape import first_line, cell_text, cell_join
+import crash_forensics
 
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QSize, QPropertyAnimation,
                           QEasingCurve, QPoint, QTimer)
@@ -71,8 +75,14 @@ except ImportError:
 
 
 # ── 敏感数据脱敏工具函数 ──
-def _mask_phone(phone: str) -> str:
-    """手机号脱敏：13812345678 → 138****5678"""
+def _mask_phone(phone) -> str:
+    """手机号脱敏：13812345678 → 138****5678
+
+    入参先过 cell_text：Excel/pandas 读进来的号码经常是 int / float / numpy 标量（需求 8
+    实测：11 位手机号 1.3e10 超过 int32，直接递给 QTableWidgetItem 招 OverflowError，递给
+    下面那句 re.sub 招 TypeError）。类型口径只有一个，不在每个调用点各补一次 str()。
+    """
+    phone = cell_text(phone)
     if not phone:
         return ""
     digits = re.sub(r"\D", "", phone)
@@ -85,8 +95,9 @@ def _mask_phone(phone: str) -> str:
     return phone
 
 
-def _mask_email(email: str) -> str:
-    """邮箱脱敏：john@example.com → j***@example.com"""
+def _mask_email(email) -> str:
+    """邮箱脱敏：john@example.com → j***@example.com（入参同样先过类型把手）"""
+    email = cell_text(email)
     if not email or "@" not in email:
         return email or ""
     local, domain = email.rsplit("@", 1)
@@ -97,13 +108,128 @@ def _mask_email(email: str) -> str:
     return f"{masked_local}@{domain}"
 
 
-def _mask_wechat(wechat: str) -> str:
-    """微信号脱敏：保留首尾字符"""
+def _mask_wechat(wechat) -> str:
+    """微信号脱敏：保留首尾字符（入参同样先过类型把手）"""
+    wechat = cell_text(wechat)
     if not wechat:
         return ""
     if len(wechat) <= 2:
         return wechat[0] + "*"
     return wechat[0] + "***" + wechat[-1]
+
+
+# ── 需求 8：表格取值的类型口径（「本该是列表/数字」的字段也不能假设自已是列表/数字）──
+
+def _as_text_list(value) -> List[str]:
+    """把「本该是一串值」的字段稳成 ``list[str]``。
+
+    为什么不能假设它一定是列表：上传源头是 Excel，某一列只有一个号码时 pandas 经常直接给
+    一个标量（`'13800000000'`），历史池 JSON 里也存过 int。旧写法 `mobiles[:2]` 在这两种
+    形状上的后果各不相同，但都坏：
+      · 传入 str → `'13800000000'[:2]` 拿到 `'13'` —— 不崩，但**把号码显示成两位数**；
+      · 传入 int → 切片直接 TypeError —— 崩（queued 槽里就是整个进程 abort）。
+    规则：None → `[]`；**str 永远算单元素，绝不按字符拆**；list/tuple/set → 逐项过
+    cell_text；其它标量 → 单元素。只丢掉收口后为空的项，不丢任何有值的项。
+
+    判断一律只看类型、不拿 `value == ""` 去比：那个写法碰到 numpy/pandas 数组会抛
+    「truth value of an array is ambiguous」——防御边界自己会抛，就等于没有防御边界。
+    空串交给下面的 cell_text：它收口成 `''`，自然落回 `[]`，结论一样但不会碰上比较运算。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [t for t in (cell_text(v) for v in value) if t]
+    if isinstance(value, dict):
+        s = cell_text(value)                  # 字典出现在号码位本身就是数据异常，如实展出一串可读的
+        return [s] if s else []
+    s = cell_text(value)
+    return [s] if s else []
+
+
+def _as_list_keep_dict(value) -> list:
+    """同上，但**逐元素保留原类型**：需要读出 dict 里的某个键时用（联系人）。
+
+    单独开一支是因为 `_as_text_list` 会把 dict 展成「k：v」串，那对联系人是错的：
+    名字在 `name` 键里，不是要展示的全文。str 依旧不按字符拆。
+    定义在 `_contact_names` 之前，读的人不需要往下翻才能知道它拿的是什么。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    s = cell_text(value)
+    return [s] if s else []
+
+
+def _contact_names(contacts) -> str:
+    """联系人列：列表里混着 dict 和裸字符串时都要读得出名字。
+
+    旧写法 `", ".join(c.get("name", "") for c in contacts …)` 只考虑了「元素是 dict」这一种：
+    只要上游给的是 `['张三']`，`str.get` 就是 AttributeError；给的是 `'张三'`，连 `.get`
+    都轮不到——先在字符上迭代再报错。两种都在崩的那一条路径上。
+    """
+    out = []
+    for c in _as_list_keep_dict(contacts):
+        if isinstance(c, dict):
+            # 人名不走 clean_person_name：那是入库口径（剔职称/去重复），
+            # 展示层只负责把已入库的值读出来，二次加工会把洗好的名字洗坏。
+            name = cell_text(c.get("name") or c.get("姓名") or "").strip()
+        else:
+            name = cell_text(c).strip()
+        if name:
+            out.append(name)
+    return ", ".join(out)
+
+
+def _score_of(rec) -> float:
+    """匹配度稳成 float：缺失、字符串「85%」、None、数字都要有确定读法。
+
+    旧写法是 `f"{score:.0%}"` 加三处 `score > 0.6`：只要 score 不是数字，格式化就抛
+    （`Unknown format code` / 字符串与 float 比较招 TypeError），而且颜色分支在同一个
+    函数里紧跟其后，一个坏值能把整张表带到 abort。这里宁可读成 0（显示成 0%）也不猜：
+    读不出匹配度是数据问题，界面为它死掉才是产品事故。
+
+    取值域已核：`pool_matcher` 产的是 `round(total, 4)`，各分项都在 0~1，所以合法读数是
+    0~1。因此「大于 1」不可能是正常匹配度，只可能是「85」这种百分数写法漏了百分号；
+    遇到它就除以 100 而不是印成 8500%——这不是猜数字，是把已知的两种脏写法收同一个口径。
+    """
+    raw = rec.get("_score", 0) if isinstance(rec, dict) else 0
+    if isinstance(raw, bool):
+        return 0.0
+    text = cell_text(raw)
+    pct = "%" in text
+    if isinstance(raw, (int, float)):
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        if f != f:                               # NaN 读成 0，别在表格里印出 nan%
+            return 0.0
+        # 数字支路也要过同一条归一：上面 docstring 承诺了「大于 1 就当成漏了百分号」，
+        # 而上一版只在字符串支路做了——`_score=85`（int）照样印成 8500%，颜色分支还把它判成绿色。
+        # 同一个口径写两处却只做了一半，等于没写（离线判据 I9c 逮到的就是这一处）。
+        return f / 100.0 if abs(f) > 1 else f
+    s = text.strip().replace("%", "").replace(",", "")
+    if not s:
+        return 0.0
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return 0.0
+    return v / 100.0 if (pct or abs(v) > 1) else v
+
+
+def _worker_fail_reason(exc) -> str:
+    """把一次后台异常收成一句能上界面的话。
+
+    只有一个口径：走 text_shape.first_line（第 ㉓ 族），因为 `str(e).splitlines()[0][:120]`
+    这种写法会把 `net::ERR_CONNECTION_` 切成半截名字，而用户正是拿着那句话去查的。
+    空消息（比如 `raise ValueError()`）也不能变成「搜索没能完成：」然后面没字，
+    所以补上异常类型名——至少能拿它去搜栈。
+    """
+    return first_line(str(exc), 120) or type(exc).__name__
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -473,8 +599,36 @@ class WorkerBase(QThread):
             import logging
             logging.getLogger(__name__).warning(
                 "后台线程收尾时界面已销毁，结果不再递送：%s", e)
+        except Exception as e:
+            # 需求 8（2026-11-19 实测）：这一条以前只接 RuntimeError，其它异常直接
+            # 从 QThread.run 逃逸——而 PyQt 5.15.11 对这件事的处理是 **SIGABRT**（实测退出码
+            # 134），用户看到的就是「搜完一下就没了」。现在接住它做三件事：
+            #   1. 落取证文件（带全线程栈与面包屑，下一次实机报障不再靠猜）；
+            #   2. 把「本轮没跑完」如实递回界面（见 _deliver_failure）——否则按钮永远禁用，
+            #      用户描述的「进程卡死」就是这个形状；
+            #   3. 不接 KeyboardInterrupt / SystemExit：那不是本线程该替全进程作出的决定。
+            crash_forensics.report(f"后台任务异常：{self._fail_label()}", e,
+                                   where=self._fail_where())
+            self._deliver_failure(e)
         finally:
             _RUNNING_WORKERS.discard(self)
+
+    def _fail_label(self) -> str:
+        """取证与提示用的任务名（子类改这一句就说清了「是哪件事没干完」）。"""
+        return type(self).__name__
+
+    def _fail_where(self) -> str:
+        return f"{type(self).__name__}._body"
+
+    def _deliver_failure(self, exc) -> None:
+        """失败了怎么告诉界面：默认只留证据，子类按自己的信号签名重写。
+
+        为什么默认什么都不发：信号签名每个 worker 都不一样（(bool, str) /
+        (bool, object, str) / (bool, list, str)），基类只能猜。猜错的代价是「报错
+        报到了另一个参数上」，那比不发还难查；所以这里把选择权留在做出决定的地方。
+        """
+        import logging
+        logging.getLogger(__name__).warning("后台任务失败（未递回界面）：%s", exc)
 
     def _body(self):
         raise NotImplementedError
@@ -643,6 +797,20 @@ class LoadMasterWorker(WorkerBase):
                                 self._stats_msg(mgr, shown, view_ok, synced=True))
         except RuntimeError:
             pass                   # 界面对象已经销毁：结果不再有人要，安静收尾
+
+    def _fail_label(self) -> str:
+        return "加载数据池"
+
+    def _deliver_failure(self, exc) -> None:
+        """线程自己炸了也要把结果递回去：界面在等这一步，不递就是按钮永远转圈。
+
+        这一句是用户那句「是不是进程卡死」的直接回答：以前非 RuntimeError 会从 run()
+        逃逸去触 Qt 的 qFatal，连「递回去」的机会都没有；现在既落证据又上界面。
+        """
+        try:
+            self.finished.emit(False, [], f"数据池加载失败: {_worker_fail_reason(exc)}")
+        except RuntimeError:
+            pass              # 界面已关，没有接收者；证据已经在取证文件里
 
     def _body(self):
         try:
@@ -829,6 +997,16 @@ class SearchWorker(WorkerBase):
             return scope, "关键词索引", RecallCounts(), ""
         return scope, "全表扫描", RecallCounts(), ""
 
+    def _fail_label(self) -> str:
+        return "搜索采购商"
+
+    def _deliver_failure(self, exc) -> None:
+        """搜索线程意外收尾：把「本轮没结果」说清递回，而不是让界面停在搜索中。"""
+        try:
+            self.finished.emit(False, [], f"搜索未完成: {_worker_fail_reason(exc)}")
+        except RuntimeError:
+            pass              # 界面已关；取证文件里已经有全线程栈
+
     def _body(self):
         try:
             matcher = CompanyMatcher()
@@ -840,6 +1018,12 @@ class SearchWorker(WorkerBase):
             note = _recall_note(recall, len(scope), counts, cap=self.RECALL_CAP)
             if note:
                 self.progress.emit(note)
+            # 阶段边界留面包屑（需求 8）：崩溃时「最后走到哪一步」全靠这几行定。
+            # 不逐帧记：几百万候选的循环里记满 240 条会把真正有用的那几步挤出去。
+            # 关键词也走把手收口，不直接把用户输入整段贴进取证文件：取证文件是会被整份
+            # 发给我们的东西，长句子与换行都不该原样落进去。
+            crash_forensics.note("召回完成", 关键词=first_line(self.query, 40),
+                                 候选=len(scope), 来源=recall)
             if self.use_deepseek:
                 # 智能匹配：自动识别公司名/关键词，选最佳策略
                 self.progress.emit("🤖 启动 AI 深度分析...")
@@ -872,6 +1056,8 @@ class SearchWorker(WorkerBase):
             # 补上（口径唯一实现），两条路径给用户的范围必须一致
             if recall != "检索视图" and self.filters:
                 results = CompanyMatcher.apply_filters(results, self.filters)
+            crash_forensics.note("精排与筛选完成", 结果=len(results), 方式=method,
+                                 上限=self.max_results)
             message = f"{method}：找到 {len(results)} 条相关结果"
             message += _scope_note(counts, len(results))
             # 总池规模随每次搜索结论出现：用户不必点开概览也知道池子有多大
@@ -993,6 +1179,16 @@ class RecommendWorker(WorkerBase):
                     return ([scope[i] for i in idx if 0 <= i < n],
                             "关键词索引", RecallCounts())
         return self._scope_records(), "全表扫描", RecallCounts()
+
+    def _fail_label(self) -> str:
+        return "智能推荐"
+
+    def _deliver_failure(self, exc) -> None:
+        """推荐线程意外收尾：同样必须递一句实话，不能只留个转圈的界面。"""
+        try:
+            self.finished.emit(False, [], f"推荐未完成: {_worker_fail_reason(exc)}")
+        except RuntimeError:
+            pass
 
     def _body(self):
         try:
@@ -2006,6 +2202,7 @@ class SearchDialog(QDialog):
             "关掉一些占内存的程序后重新打开本窗口，会再问一次是否整理。"
             f"\n\n闸门原话：{reason}")
 
+    @crash_forensics.slot_guard("数据池加载完成后的界面收尾")
     def _on_master_loaded(self, success: bool, master, message: str):
         if success:
             self._master = master
@@ -2180,6 +2377,7 @@ class SearchDialog(QDialog):
         self._search_worker.finished.connect(self._on_search_finished)
         self._search_worker.start()
 
+    @crash_forensics.slot_guard("思考步骤显示")
     def _on_think_step(self, msg: str):
         """思考步骤：同时更新状态栏和思考面板。"""
         self.status_lbl.setText(msg)
@@ -2195,6 +2393,7 @@ class SearchDialog(QDialog):
         if sb:
             sb.setValue(sb.maximum())
 
+    @crash_forensics.slot_guard("脱敏开关切换")
     def _on_mask_toggled(self, state):
         """脱敏开关切换：如果已有搜索结果，立即重新渲染表格。"""
         if self._results:
@@ -2438,6 +2637,7 @@ class SearchDialog(QDialog):
                 f"本页 {len(results)} 条（按刚才列出的结果统计，"
                 f"本次没用到关键词粗筛）", RecallCounts())
 
+    @crash_forensics.slot_guard("数据概览统计")
     def _update_analytics(self, results: list):
         """根据搜索结果更新概览卡片和分布统计。"""
         # ── 概览卡片 ──
@@ -2501,6 +2701,7 @@ class SearchDialog(QDialog):
             lines.append(f"  {str(name)[:width]:{width}s} {bar} {count}")
         return lines
 
+    @crash_forensics.slot_guard("搜索完成后的界面收尾")
     def _on_search_finished(self, success: bool, results: list, message: str):
         self.btn_search.setEnabled(True)
         self.btn_deepseek.setEnabled(True)
@@ -2548,6 +2749,7 @@ class SearchDialog(QDialog):
 
     # ── 表格填充 ──
 
+    @crash_forensics.slot_guard("渲染结果表格")
     def _fill_table(self, results: list):
         # 重置全选框与勾选状态：新结果不继承上一次的勾选
         self.chk_select_all.blockSignals(True)
@@ -2559,7 +2761,11 @@ class SearchDialog(QDialog):
         do_mask = self.chk_mask.isChecked()
 
         self.table.setRowCount(len(results))
-        for row_idx, rec in enumerate(results):
+
+        # 一行渲染完一个闭包：不是为了好看，是为了「一行坏不许 100 行陪葬」。
+        # 以前整张表只有一层护栏：某一条记录形状没猜到 -> 抛异常 -> 外层吞掉 -> 用户看到
+        # 一张空表，而搜索其实成功了。下面这堆取值全部留在闭包里，逐行隔离。
+        def _render_row(row_idx, rec, do_mask):
             # 复选框（新表格行默认不勾选）
             chk = QCheckBox()
             chk.setChecked(False)
@@ -2572,52 +2778,48 @@ class SearchDialog(QDialog):
             self.table.setCellWidget(row_idx, 0, w)
 
             # 公司名
-            self.table.setItem(row_idx, 1, QTableWidgetItem(rec.get("company", "")))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(cell_text(rec.get("company", ""))))
 
-            # 联系人
-            contacts = rec.get("contacts", [])
-            contact_str = ", ".join(c.get("name", "") for c in contacts if c.get("name"))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(contact_str))
+            # 联系人（列表里混 dict / 裸字符串 / None 都要读得出来，见 _contact_names）
+            self.table.setItem(row_idx, 2,
+                               QTableWidgetItem(_contact_names(rec.get("contacts", []))))
 
             # 手机号（根据脱敏开关决定显示方式）
-            mobiles = rec.get("mobiles", [])
-            if not mobiles:
-                mobiles = rec.get("phones", [])
-            if do_mask:
-                display_mobiles = [_mask_phone(m) for m in mobiles[:2]]
-            else:
-                display_mobiles = mobiles[:2]
-            self.table.setItem(row_idx, 3, QTableWidgetItem(", ".join(display_mobiles)))
+            # 每一列都先过把手再递给 QTableWidgetItem：这是需求 8 的根因位——一条数字型的
+            # 脏号码就能让整张表在渲染那一行时把进程带走（实测 queued 槽里招异常 = abort）。
+            mobiles = _as_text_list(rec.get("mobiles")) or _as_text_list(rec.get("phones"))
+            display_mobiles = ([_mask_phone(m) for m in mobiles[:2]] if do_mask
+                               else mobiles[:2])
+            self.table.setItem(row_idx, 3, QTableWidgetItem(cell_join(display_mobiles)))
 
             # 固话/邮箱（根据脱敏开关决定显示方式）
-            phones = rec.get("phones", [])
-            emails = rec.get("emails", [])
+            phones = _as_text_list(rec.get("phones"))
+            emails = _as_text_list(rec.get("emails"))
             if do_mask:
                 display_phones = [_mask_phone(p) for p in phones[:1]]
                 display_emails = [_mask_email(e) for e in emails[:1]]
             else:
                 display_phones = phones[:1]
                 display_emails = emails[:1]
-            contact_info = ", ".join(display_phones + display_emails)
-            self.table.setItem(row_idx, 4, QTableWidgetItem(contact_info))
+            self.table.setItem(row_idx, 4,
+                               QTableWidgetItem(cell_join(display_phones + display_emails)))
 
             # 微信（根据脱敏开关决定显示方式）
-            wechats = rec.get("wechats", [])
-            if do_mask:
-                display_wechats = [_mask_wechat(w) for w in wechats[:1]]
-            else:
-                display_wechats = wechats[:1]
-            self.table.setItem(row_idx, 5, QTableWidgetItem(", ".join(display_wechats)))
+            wechats = _as_text_list(rec.get("wechats"))
+            display_wechats = ([_mask_wechat(x) for x in wechats[:1]] if do_mask
+                                else wechats[:1])
+            self.table.setItem(row_idx, 5, QTableWidgetItem(cell_join(display_wechats)))
 
-            # 主营/来源
-            products = rec.get("products", "")[:30]
-            source = rec.get("source", "")[:20]
+            # 主营/来源（旧写法对 int 切片直接 TypeError，对 str 字段倒是恰好能跑——
+            # 所以下面这一句以前「看起来没问题」完全取决于数据长什么样）
+            products = cell_text(rec.get("products", ""))[:30]
+            source = cell_text(rec.get("source", ""))[:20]
             self.table.setItem(row_idx, 6, QTableWidgetItem(
                 f"{products} | {source}" if products else source
             ))
 
-            # 匹配度
-            score = rec.get("_score", 0)
+            # 匹配度（_score_of 把字符串「85%」、None、NaN 都收成一个确定的 float）
+            score = _score_of(rec)
             score_item = QTableWidgetItem(f"{score:.0%}")
             score_item.setTextAlignment(Qt.AlignCenter)
             # 颜色编码：>0.6 绿，>0.3 橙，否则灰
@@ -2658,6 +2860,35 @@ class SearchDialog(QDialog):
                 fb_lay.addWidget(btn_dislike)
                 fb_lay.addStretch()
                 self.table.setCellWidget(row_idx, 8, fb_widget)
+
+        bad_rows = []
+        for row_idx, rec in enumerate(results):
+            if not isinstance(rec, dict):
+                # 形状不对的单条记录不该让整张表陪葬（旧写法在下一句 rec.get 就
+                # AttributeError，而这是 queued 槽，后果是整个进程 abort）：当成只有
+                # 一个显示名的伪记录渲染出来，并在取证面包屑里留下这一行。
+                crash_forensics.note("结果里有非字典记录，按空记录显示",
+                                     行=row_idx, 类型=type(rec).__name__)
+                rec = {"company": cell_text(rec)}
+            try:
+                _render_row(row_idx, rec, do_mask)
+            except Exception as e:
+                # 单行失败：证据落盘 + 这一行标成看得见的占位 + 其它行继续渲染。
+                # 为什么不在这里 just 接住就算：了无痕迹的「少了一行」比崩溃更难查，
+                # 所以占位里必须带上原因，取证文件里必须带上全线程栈。
+                bad_rows.append(row_idx)
+                crash_forensics.report(f"渲染结果表格第 {row_idx + 1} 行", e,
+                                       where="_fill_table._render_row")
+                try:
+                    self.table.setItem(row_idx, 1, QTableWidgetItem(
+                        f"（这一行显示不了：{_worker_fail_reason(e)}）"))
+                except Exception:
+                    pass          # 连占位都写不进去（表格已被销毁之类）也不能把这里再抛
+        if bad_rows:
+            crash_forensics.note("结果表格有行渲染失败",
+                                 行数=len(bad_rows), 首行=bad_rows[0] + 1)
+            self._append_think(f"⚠️ 有 {len(bad_rows)} 行没能显示出来（其它结果不受影响，"
+                               f"原因已记入取证文件）")
 
     # ── 选择/导出 ──
 
@@ -2789,6 +3020,7 @@ class SearchDialog(QDialog):
         self._recommend_worker.finished.connect(self._on_recommend_finished)
         self._recommend_worker.start()
 
+    @crash_forensics.slot_guard("智能推荐结果收尾")
     def _on_recommend_finished(self, success: bool, results: list, message: str):
         """推荐收尾：文案与搜索同一口径（_scope_note），空结果/冲突都如实说。"""
         self.status_lbl.setStyleSheet("")
@@ -3410,8 +3642,8 @@ class ImportPreviewDialog(QDialog):
         table.setColumnWidth(1, 150)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         for col_idx, header in enumerate(pv["headers"]):
-            # 源列名
-            name = header or f"（第 {col_idx + 1} 列 · 无表头）"
+            # 源列名（Excel 里没表头的那一列经常给成数字，过把手才不会崩也不会显示空白）
+            name = cell_text(header) or f"（第 {col_idx + 1} 列 · 无表头）"
             item = QTableWidgetItem(name)
             table.setItem(col_idx, 0, item)
             # 识别字段下拉（可修正）；初值优先级：快照 > 智能推荐 > 自动识别
@@ -3430,9 +3662,10 @@ class ImportPreviewDialog(QDialog):
                 lambda _t: self._refresh_warning())
             table.setCellWidget(col_idx, 1, combo)
             self._combos[(fpath, sheet, col_idx)] = combo
-            # 样例值
+            # 样例值：这里直接摆的就是 Excel 原始单元格的值，int/float/None/日期都会出现在
+            # 这一句里（旧写法 " ｜ ".join(samples) 混一个非字符串就 TypeError）。
             samples = pv["samples"].get(col_idx, [])
-            sample_text = " ｜ ".join(samples) if samples else "（空列）"
+            sample_text = cell_join(samples, " ｜ ") if samples else "（空列）"
             item2 = QTableWidgetItem(sample_text)
             item2.setToolTip(sample_text)
             table.setItem(col_idx, 2, item2)
@@ -4355,15 +4588,18 @@ class PoolTombstoneDialog(QDialog):
             cell0.setCheckState(Qt.Unchecked)
             self.table.setItem(r, 0, cell0)
             vals = [h.get("company") or "",
-                    "、".join(h.get("phones") or []) or "—",
-                    "、".join(h.get("emails") or []) or "—",
+                    # 同一个类型陷阱（需求 8）：这一列也是从池里读出的号码，混一个 int 就能
+                    # 把「、」.join 招崩；走同一个把手，不在第二个对话框里再写一遍防御。
+                    cell_join(h.get("phones"), "、") or "—",
+                    cell_join(h.get("emails"), "、") or "—",
                     h.get("website") or "—",
                     h.get("source") or "—",
                     h.get("source_user") or "—",
                     "已剔" if h.get("tombstoned") else "—"]
             for c, v in enumerate(vals, start=1):
-                it = QTableWidgetItem(str(v))
-                it.setToolTip(str(v))
+                v = cell_text(v)                    # str(v) 对 int 能给对数字，对 1.38e10 这种 float 会印出 13800000000.0
+                it = QTableWidgetItem(v)
+                it.setToolTip(v)
                 if h.get("tombstoned"):
                     it.setForeground(QColor("#9e9e9e"))
                     if c == 1:

@@ -143,6 +143,13 @@ fi
 
 # 参数与 build-b2bcollect-mac.yml 逐条对齐（pip 名≠import 名的两个都写）。
 # 差异只有一处：CI 用 arm64 runner 下载 arm64 驱动，本机用本机架构的驱动。
+# 为什么整条命令里一行注释都不能插（本轮自己踩过）：bash 在词法层就把续行接成一整句，
+# 句中的 `#` 会当场把这条命令**截断**，后半段（含入口脚本 b2bcollect_gui.py）会被当成
+# 独立命令执行——症状是「本机打包悄悄出一份参数不全的包」，而不是语法报错。要写理由就写在
+# 这一句之前（下面那段 crash_forensics 的登记理由就是这么挪上来的）。
+# 运行期崩溃取证（需求 8）：pool_dialogs 在**类定义时**就用它的 slot_guard 装饰 queued 槽，
+# 漏登记不是「少一个提醒」而是开机 ModuleNotFoundError——所以界面侧那个可选 import 写法只
+# 用于把「没进包」这件事说得出，真正的保险是这一行与上面两个 workflow。
 "$PY" -m PyInstaller --clean "${EXE_ARGS[@]+"${EXE_ARGS[@]}"}" --windowed \
   --name B2bCollectTool \
   --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 \
@@ -168,6 +175,7 @@ fi
   --hidden-import field_evidence --hidden-import enrich_waterfall \
   --hidden-import lead_scoring --hidden-import channel_health \
   --hidden-import text_shape \
+  --hidden-import crash_forensics \
   --hidden-import site_discovery --hidden-import pinyin_lite \
   --hidden-import exchange_master \
   --hidden-import download_verify --hidden-import chrome_doctor \
