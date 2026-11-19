@@ -43,6 +43,14 @@ import time
 
 import requests
 
+# Windows runner 的控制台代码页是 cp1252：任何一句中文 print 都会在 print 的当下抛
+# UnicodeEncodeError。收口放在**模块顶层**而不是 main() 里：这个脚本的中文输出不只在
+# main()（upload_one 也要念复读取证），而第 41 条编码门判的是源码行号——它不接受
+# 「运行时总会先调 main」这种调用顺序担保，因为它正是为这类担保已经碎过一次而立的。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 BUCKET = "images6396289"
 ENDPOINT = "oss-cn-shenzhen.aliyuncs.com"
 RELEASE_PREFIX = "0817899624/tool_releases"
@@ -224,11 +232,7 @@ def upload_one(path: str, ak_id: str, ak_secret: str) -> str:
 
 
 def main(argv: list) -> int:
-    # Windows runner 控制台代码页是 cp1252：下面往控制台写中文/符号
-    # 会在 print 的当下抛 UnicodeEncodeError，先把 stdout/stderr 死锁成 UTF-8
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # 控制台编码已在模块顶层收口（见文件上方那段注释：它必须早于任何一句中文写控制台）
     if len(argv) < 2:
         print(__doc__)
         return 2
