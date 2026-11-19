@@ -439,7 +439,7 @@ def _write_xlsx(rows, filepath, log=print, template_path=None):
 
 if __name__ == "__main__":
     import tempfile
-    import pandas as pd
+    from openpyxl import Workbook
 
     tmp_dir = tempfile.mkdtemp(prefix="enhanced_clean_test_")
     test_xlsx = os.path.join(tmp_dir, "测试数据.xlsx")
@@ -447,7 +447,7 @@ if __name__ == "__main__":
     # 构造测试数据：含国内手机、国内固话、国外号码
     # 注意：不能加"国家"/"region"列（会被列匹配误映射为"联系人"）
     # 外国公司靠官网域名/邮箱/地址/公司名后缀识别
-    df = pd.DataFrame([
+    rows = [
         {"公司名": "深圳光能科技有限公司", "电话": "13800138000", "邮箱": "sales@guangneng.com",
          "官网": "www.guangneng.com", "地址": "深圳市南山区科技园"},
         {"公司名": "上海海洋设备有限公司", "电话": "021-58889999", "邮箱": "info@ocean-sh.com",
@@ -459,8 +459,17 @@ if __name__ == "__main__":
         {"公司名": "Tokyo Marine Co., Ltd.", "电话": "+81-3-1234-5678",
          "邮箱": "info@tokyomarine.jp", "地址": "東京都中央区"},
         {"公司名": "空号测试公司", "电话": "", "邮箱": "", "地址": ""},
-    ])
-    df.to_excel(test_xlsx, index=False)
+    ]
+    # 表头取各行的键并集、按首次出现排序，缺的格子留空——与原来 DataFrame.to_excel 的
+    # 形状一致（NaN 写进 xlsx 本来就是空格），断言针对的是清洗结果条数，不是单元格类型。
+    headers: list = []
+    for row in rows:
+        headers.extend(k for k in row if k not in headers)
+    wb = Workbook()
+    wb.active.append(headers)
+    for row in rows:
+        wb.active.append([row.get(k, "") for k in headers])
+    wb.save(test_xlsx)
 
     print(f"测试文件：{test_xlsx}")
     print(f"输出目录：{tmp_dir}")

@@ -150,9 +150,15 @@ fi
 # 运行期崩溃取证（需求 8）：pool_dialogs 在**类定义时**就用它的 slot_guard 装饰 queued 槽，
 # 漏登记不是「少一个提醒」而是开机 ModuleNotFoundError——所以界面侧那个可选 import 写法只
 # 用于把「没进包」这件事说得出，真正的保险是这一行与上面两个 workflow。
+# 需求 5 减重：不再 `--collect-all PyQt5`。界面代码只 import QtWidgets/QtCore/QtGui（全仓
+# 实测 grep，QtTest 只出现在离线套件里），PyInstaller 自带的 per-module hook 会按这三个
+# 自己去收对应插件与依赖库；而 collect-all 是把 PyQt5 的**每一个**子模块连带它的
+# qml(19MB)、translations(11MB) 和 geoservices/sceneparsers/assetimporters/renderers/
+# webview/texttospeech 等插件全收进来。删它的前提是「产物能开窗」，所以本机打包后面那一格
+# 冒烟必须跑（体积门与它的口径见 check_packaging_manifest.py）。
 "$PY" -m PyInstaller --clean "${EXE_ARGS[@]+"${EXE_ARGS[@]}"}" --windowed \
   --name B2bCollectTool \
-  --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 \
+  --collect-all selenium --collect-all lxml --collect-all bs4 \
   --collect-submodules PIL \
   --hidden-import requests --hidden-import websocket --hidden-import websocket_client \
   --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome \
@@ -163,7 +169,7 @@ fi
   --hidden-import keyword_expander --hidden-import deepseek_expander \
   --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner \
   --hidden-import enf_clean.normalize --hidden-import enf_clean.phone \
-  --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd \
+  --hidden-import phonenumbers --hidden-import xlrd \
   --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry \
   --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher \
   --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition \

@@ -11,5 +11,9 @@ lxml
 pillow
 pyinstaller
 phonenumbers
-pandas
+# pandas 已于需求 5 减重时移除：产物里没有任何运行路径用得到 DataFrame（唯一的引用是
+# enhanced_cleaner 的 `__main__` 自测块，已改 openpyxl），而它连带 numpy 一共约 27MB 白拿。
+# 不把这一行留在装环境里是有意的：装了它就等于等某人在进包的模块里写一句 import pandas，
+# PyInstaller 会安静地把它再拉回产物，而体积回弹不会有任何一步报错。拦回归的硬门见
+# .github/scripts/check_packaging_manifest.py 的体积门。
 xlrd

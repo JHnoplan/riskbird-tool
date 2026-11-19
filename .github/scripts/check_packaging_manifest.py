@@ -8792,9 +8792,205 @@ def check_trap_handler_defined(sources=None, texts=()) -> list:
     return problems
 
 
+# ── 第 40 条：产物重量门（需求 5「工具减重」）───────────────────────────────
+# 由来（2026-11-19）：用户报「Windows 的包 300 多 M，我不清楚你现在的逻辑是什么」。量完才
+# 知道重量在哪，而两处都是白拿：
+#   ① pandas 17MB + 它连带的 numpy 10MB。全仓唯一进到产物分析闭包里的引用是 enhanced_cleaner
+#      的 `if __name__ == "__main__"` 自测块——而第 18 条 e 那只扫**顶层** import，藏在 __main__
+#      块里的这一句它看不见，PyInstaller 却按字节码收依赖、看得见。这就是「门都在、重量照进」。
+#   ② `--collect-all PyQt5`：把 PyQt5 每个子模块连带 qml(19MB)、translations(11MB) 与
+#      geoservices/sceneparsers/assetimporters/renderers/webview/texttospeech 等插件全收进来，
+#      而界面代码实测只 import QtWidgets/QtCore/QtGui（QtTest 只出现在离线套件里），
+#      per-module hook 会自己收这三个需要的插件；全仓也没有一句 QTranslator，那 11MB 翻译从来就没生效过。
+# 所以这条门判两面：①**构建前**（静态）——三处入口的参数与进包分析闭包里的源码都不许把这些
+# 重量带回来；②**构建后**（实测）——产物资源根里真长出这些目录就点名报红，并把每一份超过
+# 3MB 的成分连同字节数列出来。第②面才是「包为什么这么大」这句话每次构建自答一次。
+WEIGHT_BANNED_FLAGS = {
+    ("--hidden-import", "pandas"):
+        "pandas 连带 numpy 约 27MB 白拿：产物里没有任何运行路径用得到 DataFrame。"
+        "导出走 openpyxl、读旧版 .xls 走 xlrd——这两个是真在用，别跟着一起砍",
+    ("--collect-all", "PyQt5"):
+        "collect-all 连 qml(19MB)/translations(11MB) 和六类用不到的插件一起收；"
+        "界面只 import QtWidgets/QtCore/QtGui，per-module hook 会自己收齐这三个的插件",
+    ("--collect-submodules", "PyQt5"):
+        "换写法绕过上一条不算修好：收的仍是 PyQt5 全部子模块",
+}
+# 分析闭包里零引用的重量包：写在任何位置（函数体内、`if __name__` 块里）都算带进产物。
+WEIGHT_FORBIDDEN_IMPORTS = {
+    "pandas": "约 17MB，且会把 numpy(10MB) 一起拖进来",
+    "numpy": "约 10MB，产物里只有 pandas 需要它；界面与清洗链路都不直接 import",
+}
+# 产物资源根里不许出现的相对路径（键是相对路径，值是「为什么它是白拿」）。
+WEIGHT_FORBIDDEN_ARTIFACT = {
+    "pandas": "需求 5 已从三处入口摘掉 --hidden-import pandas，它回来只可能是有人"
+              "在进包源码里又写了一句 import pandas（见本条由来）",
+    "numpy": "pandas 的连带品，pandas 不在就没有它",
+    "PyQt5/Qt5/qml": "Qt Quick/QML 运行时：本工具是 QtWidgets 程序，一句 QML 都不用",
+    "PyQt5/Qt5/translations": "Qt 自带翻译：全仓没有一句 QTranslator，Qt 也不会自动加载它们，"
+                              "这几兆从第一版起就没生效过（界面中文靠我们自己的文案）",
+}
+# 超过这个字节数（MB）的顶层成分必须在 WEIGHT_BUDGET_MB 里登记理由；登记了也不许长过自己的上限。
+WEIGHT_DISCLOSE_MB = 3.0
+WEIGHT_BUDGET_MB = {
+    "PyQt5": (95, "界面框架（只收 Widgets/Gui/Core 三个绑定与其插件）"),
+    "selenium": (26, "风鸟/爱企查/企知道三路列表通道用它驱动 Chrome"),
+    "PIL": (16, "手机号图片码识别（mk_phone_ocr）与截图处理"),
+    "lxml": (13, "bs4 的解析器加速"),
+    "chromedriver": (22, "随包 macOS 驱动：新电脑首启不必联网下载（用户口径：影响首启体验就不砍）"),
+    "drivers": (80, "随包 Windows 最近 3 个大版本驱动，同上（不足 2 个时 fetch_chromedrivers.py 会中止）"),
+}
+
+
+def _weight_analyzed_sources() -> list:
+    """PyInstaller 真会去分析的那些源码文件（不是 --add-data 塞进去的死文件）。
+
+    为什么必须区分：`../enf_clean` 整目录随包，里面 clean_three_files.py 等三份确实 import
+    pandas——但它们是**数据**，运行时没人 import（进包的是 enf_clean.normalize/.phone），
+    PyInstaller 不会分析它们。把它们算进闭包，这条门就会为了三份死文件要求全仓不许出现
+    `import pandas`，而那种红没人能照着修（要么删别人的开发脚本，要么把门调松）。
+    """
+    files = [BUILD_DIR / f"{name}.py" for name in local_modules()]   # 已排除 test_ 与 NOT_PACKAGED
+    files.append(BUILD_DIR / "b2bcollect_gui.py")                    # 入口：位置参数，不进 hidden-import
+    for rel, _why in NOT_PACKAGED.items():                           # 入口脚本按 ENTRY_SCRIPTS 的口径再兜一次
+        p = BUILD_DIR / f"{rel}.py"
+        if rel in ENTRY_SCRIPTS:
+            files.append(p)
+    for rel in module_manifest()[0]:                                 # 跨目录采集器源码
+        files.append(ROOT / rel)
+    win = CALLERS.get("Windows workflow")
+    if win and win.exists():                                         # 带点的包名：enf_clean.normalize 这类
+        text = _strip_comments(win.read_text(encoding="utf-8", errors="replace"))
+        for value in _flag_values(text, "--hidden-import"):
+            if "." not in value:
+                continue            # 裸名由 local_modules()/externals 覆盖，这里只补包内子模块
+            tail = value.replace(".", "/")
+            for base in (BUILD_DIR, ROOT):
+                candidate = base / f"{tail}.py"
+                if candidate.is_file():
+                    files.append(candidate)
+                    break
+    out, seen = [], set()
+    for p in files:
+        try:
+            key = p.resolve()
+        except OSError:
+            continue
+        if key not in seen and p.is_file():
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def check_package_weight_static() -> list:
+    """构建前那一面：参数与源码闭包都不许把白拿的重量带回来。"""
+    problems = []
+    for label, path in CALLERS.items():
+        if not path.exists():
+            continue
+        # 必须先剥整行注释：本机脚本里就写着「不再 --collect-all PyQt5」这句理由，
+        # 不剥的话门禁会把这句解释当成一条违规（荒唐告警会让人不信整条门）。
+        text = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        for (flag, value), why in WEIGHT_BANNED_FLAGS.items():
+            if value in _flag_values(text, flag):
+                problems.append(f"{label}：参数里有 `{flag} {value}`——{why}")
+    for src in _weight_analyzed_sources():
+        # 取树只走公共把手（第 33/39 条同一口径）：本仓为「一遍扫描 + 按内容缓存」付过代价，
+        # 新条款再自己 parse/walk 一遍就是绕过那一层的第二把刀。
+        try:
+            tree = _file_tree(str(src), src.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError as e:
+            problems.append(f"{_rel(src)} 解析不了（{e.msg}），重量闭包这一份判不了——不许当它不存在")
+            continue
+        for node in _walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names = [node.module.split(".")[0]]
+            else:
+                continue
+            for n in names:
+                if n in WEIGHT_FORBIDDEN_IMPORTS:
+                    problems.append(
+                        f"{_rel(src)} 第 {node.lineno} 行 import {n}：{WEIGHT_FORBIDDEN_IMPORTS[n]}。"
+                        f"PyInstaller 按字节码收依赖，写在函数体或 `if __name__` 块里一样进包"
+                        f"（第 18 条 e 只扫顶层 import，看不见这种写法——pandas 当初就是这么混进来的）")
+    return problems
+
+
+def artifact_resource_root(artifact) -> Path:
+    """从产物路径定位「资源根」：onedir 的 _internal、.app 的 Contents/Resources，或它自己。
+
+    三个平台的布局各不相同（Windows onedir 是 `<name>/_internal`，mac 可能是 `.app/Contents/`
+    里混放），而体积门不想每次都靠人记路径——按形状找，找到哪个算哪个。
+    """
+    p = Path(artifact)
+    candidates = [p / "_internal", p / "Contents" / "Resources", p / "Contents" / "MacOS", p]
+    for c in candidates:
+        if c.is_dir() and any(x.name == "_internal" or x.suffix == ".so" or x.is_dir()
+                              for x in c.iterdir()):
+            if c.name in ("_internal", "Resources", "MacOS") or (p / "_internal").is_dir():
+                return c
+    return p
+
+
+def _dir_size_mb(p: Path) -> float:
+    total = 0
+    if p.is_file():
+        total = p.stat().st_size
+    else:
+        for f in p.rglob("*"):
+            try:
+                if f.is_file() and not f.is_symlink():
+                    total += f.stat().st_size
+            except OSError:
+                continue            # 只读包冒烟那一步会 chmod -w，个别文件读不到字节不算缺陷
+    return total / 1024.0 / 1024.0
+
+
+def check_package_weight_artifact(artifact, label: str = "") -> tuple:
+    """构建后那一面：产物里到底装了什么、各占多少。返回 (问题列表, 人读报告)。"""
+    root = artifact_resource_root(artifact)
+    tag = f"{label} " if label else ""
+    if not root.is_dir():
+        return [f"{tag}重量门读不到产物资源根：{root}（产物不在就别宣布减重成功）"], []
+    entries = [x for x in root.iterdir() if x.name != "__pycache__"]
+    sized = sorted(((x, _dir_size_mb(x)) for x in entries), key=lambda kv: -kv[1])
+    problems = []
+    # ① 白拿名单：整目录或单个相对路径命中就点名（键用正斜杠写，读的时候两边都对齐）
+    for rel, why in WEIGHT_FORBIDDEN_ARTIFACT.items():
+        hit = root.joinpath(*rel.split("/"))
+        if hit.exists():
+            problems.append(f"{tag}产物里有 `{rel}`（约 {_dir_size_mb(hit):.0f}MB）：{why}")
+    # ② 成分账：每一份超过披露线的都得在册，且不许长过自己登记的上限
+    for path, mb in sized:
+        if mb < WEIGHT_DISCLOSE_MB:
+            continue
+        cap = WEIGHT_BUDGET_MB.get(path.name)
+        if cap is None:
+            problems.append(
+                f"{tag}产物里冒出 {mb:.0f}MB 的成分 `{path.name}` 却没登记："
+                f"要么砍掉它，要么在 WEIGHT_BUDGET_MB 写清它凭什么值这几兆"
+                f"（下一人才不会又问一遍「包为什么这么大」）")
+        elif mb > cap[0]:
+            problems.append(
+                f"{tag}`{path.name}` 现在 {mb:.0f}MB，超过登记的 {cap[0]}MB 上限"
+                f"（登记理由：{cap[1]}）：重量不会自己长，是某次改动让它长的")
+    report = [f"{tag}产物资源根 {root.name}：合计 {sum(mb for _p, mb in sized):.0f}MB，"
+              f"成分账（≥{WEIGHT_DISCLOSE_MB:.0f}MB 全部列出）："]
+    for path, mb in sized:
+        if mb >= WEIGHT_DISCLOSE_MB:
+            mark = "" if path.name in WEIGHT_BUDGET_MB else "  ←未登记"
+            report.append(f"   · {mb:6.0f}MB  {path.name}{mark}")
+    return problems, report
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前）")
+    ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
+    ap.add_argument("--artifact-weight", metavar="PATH",
+                    help="第 40 条的构建后那一面：对给定产物目录做重量实测（由打包脚本与两个 "
+                         "workflow 在 PyInstaller 之后调；不传就只跑静态那一面）")
+    ap.add_argument("--artifact-label", default="", help="产物身份，只用于报错时点名是哪一份（如 Windows/Mac）")
     args = ap.parse_args(argv)
 
     externals, expected_channels = module_manifest()
@@ -9310,6 +9506,18 @@ def main(argv=None) -> int:
         print(f"✅ 陷阱处理器：{len(SHELL_SOURCES)} 份手写 shell 里每一句 trap 能递达的函数"
               "都在登记之前就已定义（沿函数体传递展开、注释里的指路话不算调用）")
 
+    weight = check_package_weight_static()
+    if weight:
+        bad += 1
+        print("❌ 产物重量门（构建前，第 40 条）不合格：")
+        for p in weight:
+            print(f"   · {p}")
+            print(f"::error::产物重量：{p}")
+    else:
+        banned = "、".join(f"{flag} {value}" for flag, value in WEIGHT_BANNED_FLAGS)
+        print(f"✅ 产物重量门（构建前）：三处入口都没用禁名单里的写法（{banned}），"
+              f"进包分析闭包（{len(_weight_analyzed_sources())} 份源码）里也没有一处 import 重量包")
+
     for label, path in CALLERS.items():
         if not path.exists():
             print(f"❌ {label}：找不到文件 {path.relative_to(ROOT)}")
@@ -9328,6 +9536,20 @@ def main(argv=None) -> int:
         else:
             extra = "，触发目录覆盖跨目录源码" if path.name.endswith(".yml") else ""
             print(f"✅ {label}：跨目录模块、本地模块、运行期数据、git 跟踪四项齐全{extra}")
+
+    if args.artifact_weight:
+        wprobs, wreport = check_package_weight_artifact(args.artifact_weight, args.artifact_label)
+        for line in wreport:
+            print(line)
+        if wprobs:
+            bad += 1
+            print("❌ 产物重量门（构建后，第 40 条）不合格：")
+            for p in wprobs:
+                print(f"   · {p}")
+                print(f"::error::产物重量：{p}")
+        else:
+            print(f"✅ 产物重量门（构建后）：白拿名单里一个都没长出来，超过 "
+                  f"{WEIGHT_DISCLOSE_MB:.0f}MB 的成分全部在册且未越上限")
 
     if bad:
         print(f"\n❌ 打包清单硬门：{bad} 处不合格。少一个文件不会报错、只会少一个"
@@ -9353,7 +9575,8 @@ def main(argv=None) -> int:
           "报告用的相对路径与 git 写法同源（两种分隔符形状都拿真登记表对拍过）、"
           "通道账的两张口径表同源而分列、那句念法只住一个把手（每一路都念好那一格交出去）、"
           "等人那盏灯只能由把手点亮且全链路真的点亮过（措辞只住 WAIT-BLOCK、收口统一灭灯）、"
-          "注释里每一句指路节号都走得通")
+          "注释里每一句指路节号都走得通、"
+          "产物重量两面都过（构建前参数与闭包、构建后白拿名单与成分账）")
     return 0
 
 

@@ -6940,7 +6940,11 @@ def test_pip_source_resilience_gate():
     _assert(_dirpkg,
             f"正例走的必须包含「仓库内目录包随 --add-data 进包」这一格（实际={_dirpkg}）")
     _direct = sorted(n for n in names if n.lower() in dists)
-    _assert(len(_direct) >= 6,
+    # 这一格的职责是「扫到的不是一片空」，不是「必须是 6 条」：2026-11-19 需求 5 减重第一刀
+    # 把 enhanced_cleaner 自测块里的 `import pandas` 换成 openpyxl 之后，这一列从 6 条降到
+    # 5 条——降得对，正是这一刀想要的结果（pandas 曾从顶层 import 走进依赖对拍）。
+    # 下限留 5 而不是改成 == 5：写死等值会让下一次正常加依赖也红，那只会教人把门改松。
+    _assert(len(_direct) >= 5,
             f"直接同名的第三方 import 也扫到了一大片（{len(_direct)} 条，实际={_direct}）")
 
     _tmp = Path(tempfile.mkdtemp(prefix="pipgate_"))
@@ -11501,6 +11505,117 @@ def test_trap_handler_defined_gate():
             "倒回去就是本轮那三件代价（退码被 127 顶掉、清理不跑、零异常日志）")
 
 
+def test_package_weight_gate():
+    print("\n═══ AO. 产物重量门（第 40 条硬门）═══")
+    # 需求 5「工具减重」的守卫。写这一节的理由和它拦的东西同族：上一轮 pandas 就是
+    # 靠着「清单里写了一行 --hidden-import pandas」+「某个进包模块的 `if __name__` 里有一句
+    # import pandas」两头一起混进产物的，而当时 39 条硬门全绿——因为 import 对拍那只扫
+    # 顶层。一条拦不住的形状，就得两面都钉：构建前的参数与闭包、构建后的真实字节。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(encoding="utf-8")
+    for _fn in ("check_package_weight_static", "check_package_weight_artifact",
+                "_weight_analyzed_sources", "artifact_resource_root"):
+        _assert(callable(getattr(gate, _fn, None)), f"门模块里有 {_fn}（能被单独喂夹具）")
+    _at = gate_src.find("weight = check_package_weight_static()")
+    _assert(_at > 0, "硬门 main() 里真的调了构建前那一面（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 700],
+            "构建前那一面的结论要并进退出码（只 print 不改退出码的门等于公告栏）")
+    _assert("--artifact-weight" in gate_src and "::error::产物重量" in gate_src,
+            "构建后那一面要有能被打包脚本调起的开关，且红话要进云端 annotation")
+
+    # ── 1) 真仓库全绿，而且绿得有内容（名单读空时的「全部合格」是假绿，第 22 条同族）──
+    _srcs = gate._weight_analyzed_sources()
+    _assert_eq(gate.check_package_weight_static(), [], "今天的仓库与三处入口都不欠重量")
+    # 拿 posix 风格比后缀，不去猜「这台机器上 _rel 会给我正斜杠还是反斜杠」：分隔符
+    # 口径写进判据就是给自己埋一个「换平台就假红/假绿」的坑。
+    _names = {p.as_posix() for p in _srcs}
+    _assert(len(_srcs) >= 50, f"分析闭包名单不许空转（实际 {len(_srcs)} 份）")
+    _assert(any(n.endswith("enhanced_cleaner.py") for n in _names),
+            "enhanced_cleaner 必须在名单里——它正是上一轮混进 pandas 那一份")
+    _assert(any(n.endswith("enf_clean/normalize.py") for n in _names),
+            "带点的包名（enf_clean.normalize）也要解析成文件进了名单")
+    _assert(not any("clean_three_files" in n for n in _names),
+            "--add-data 整目录带走、但运行时没人 import 的那三份不计算闭包：把它们算进来，"
+            "这条门就会为了三份死文件要求全仓不许出现 import pandas（没人能照着修的红）")
+
+    # ── 2) 参数面：三个禁写法各响一条，换写法绕过也要响 ──
+    _orig_callers = gate.CALLERS
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            fake = Path(td) / "entry.sh"
+            for flag, value, needle in (("--hidden-import", "pandas", "pandas 连带 numpy"),
+                                        ("--collect-all", "PyQt5", "collect-all 连 qml"),
+                                        ("--collect-submodules", "PyQt5", "换写法绕过")):
+                fake.write_text(f"pyinstaller {flag} {value} --name X entry.py\n", encoding="utf-8")
+                gate.CALLERS = {"合成入口": fake}
+                _got = gate.check_package_weight_static()
+                _assert_eq(len(_got), 1, f"喂进 `{flag} {value}` 只响那一条（实际={_got}）")
+                _assert(needle in _got[0], f"红话要点名为什么它是白拿（实际={_got[0]}）")
+            # 反向对照：同一句话写在注释里不算违规（本机脚本里就写着「不再 --collect-all
+            # PyQt5」这句理由，误判它就是把人往错方向带）
+            fake.write_text("# 不再 --collect-all PyQt5（已删）\npyinstaller --name X entry.py\n",
+                            encoding="utf-8")
+            gate.CALLERS = {"合成入口": fake}
+            _assert_eq(gate.check_package_weight_static(), [],
+                       "注释里提到禁写法不许响：判的是参数，不是这几个字有没有出现过")
+    finally:
+        gate.CALLERS = _orig_callers
+
+    # ── 3) 闭包面：藏在函数体里的一句 import 也要抓住（上一轮就是从这一缝溜进去的）──
+    _orig_sources = gate._weight_analyzed_sources
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "sneaky.py"
+            bad.write_text("def _selftest():\n    import pandas as pd\n    return pd\n",
+                           encoding="utf-8")
+            gate._weight_analyzed_sources = lambda: [bad]
+            _got = gate.check_package_weight_static()
+            _assert_eq(len(_got), 1, f"函数体内的 import 同样算带进产物（实际={_got}）")
+            _assert("写在函数体" in _got[0] and "第 2 行" in _got[0],
+                    f"红话要点名行号与「为什么顶层门看不见它」（实际={_got[0]}）")
+    finally:
+        gate._weight_analyzed_sources = _orig_sources
+
+    # ── 4) 实测面：拿真字节验白拿名单、未登记、越上限与「读不到根」四种形状 ──
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "B2bCollectTool" / "_internal"
+        (root / "pandas").mkdir(parents=True)
+        (root / "PyQt5" / "Qt5" / "qml").mkdir(parents=True)
+        (root / "PyQt5" / "Qt5" / "translations").mkdir(parents=True)
+        for rel, mb in (("pandas/in.csv", 1), ("PyQt5/Qt5/qml/a", 1),
+                        ("PyQt5/Qt5/translations/b", 1), ("stranger/c", 4),
+                        ("selenium/d", gate.WEIGHT_BUDGET_MB["selenium"][0] + 2)):
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            with f.open("wb") as fh:                 # 稀疏文件：只花逻辑字节，不落盘真数据
+                fh.truncate(int(mb * 1024 * 1024))
+        _got, _rep = gate.check_package_weight_artifact(root.parent, "夹具")
+        _assert(sum(1 for x in _got if "产物里有" in x) == 3,
+                f"pandas/qml/translations 三处白拿各响一条（实际={_got}）")
+        _assert(any("stranger" in x and "却没登记" in x for x in _got),
+                "超过披露线却没登记的新成分要指名道姓（这就是「包为什么胖了」那句问句的答案）")
+        _assert(any("selenium" in x and "超过登记的" in x for x in _got),
+                "已登记的成分长过自己的上限也要响：登记一次不是永久通行证")
+        _assert(any("合计" in x for x in _rep) and any("未登记" in x for x in _rep),
+                f"不管红绿都要把成分账打出来（实际报告={_rep[:2]}）")
+        # 干净产物：只留一份在簿的小成分，两面都不许响
+        import shutil
+        shutil.rmtree(root / "pandas")
+        shutil.rmtree(root / "PyQt5")
+        shutil.rmtree(root / "stranger")
+        shutil.rmtree(root / "selenium")
+        (root / "ok").mkdir()
+        with (root / "ok" / "e").open("wb") as fh:
+            fh.truncate(1024 * 1024)
+        _assert_eq(gate.check_package_weight_artifact(root.parent, "夹具")[0], [],
+                   "去掉白拿与越限成分后就该全绿（拦得住也要放得行）")
+        _probs, _rep2 = gate.check_package_weight_artifact(Path(td) / "不存在的产物", "夹具")
+        _assert(_probs and "读不到产物资源根" in _probs[0],
+                "路径给错时必须开口，不能默默交一份「零问题」的答卷（产物不在就别宣布减重成功）")
+
+
+# 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
+# NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
     test_config_chain, test_oss_credentials, test_failure_taxonomy, test_gui_wording,
     test_deepseek_and_cache, test_doctor, test_delivery_chain, test_state_dir,
@@ -11523,6 +11638,7 @@ SECTIONS = (
     test_curl_bounds_gate,
     test_qt_shutdown_teardown_gate,
     test_state_file_protection_gate,
+    test_package_weight_gate,
     test_suite_exit_code_guard_gate,
     test_regression_suites_tracked_gate,
     test_no_dev_machine_paths_gate,
