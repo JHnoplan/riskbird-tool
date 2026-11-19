@@ -51,7 +51,16 @@ check("陕西MIC=Shaanxi", pf.MIC_EN["陕西"], "Shaanxi")
 check("西藏MIC=Tibet", pf.MIC_EN["西藏"], "Tibet")
 check("内蒙古MIC=InnerMongolia", pf.MIC_EN["内蒙古"], "InnerMongolia")
 check("马可波罗拼音值互不撞车", len(set(pf.MAKEPOLO_PINYIN.values())), len(pf.PROVINCES))
-check("参数直筛站名单", sorted(pf.PARAM_SITES), ["1688", "gongchang", "makepolo", "mic"])
+# 参数直筛站名单。这一份字面表天生会随上下站漂移（本轮 gongchang 下站就是它先红，
+# 而 province_filter 自己早就改对了）：改这张表时必须同时动
+# `parallel_session.SITE_ORDER / SITE_CLASSES / SITE_NAMES` 与 `pf.PARAM_VERIFY`，
+# 所以下面两条不依赖字面表的关系判据才是真正拦住漂移的那两道。
+check("参数直筛站名单", sorted(pf.PARAM_SITES), ["1688", "makepolo", "mic"])
+# 每一个参数站都必须登记自己的核验档位：忘了登记的站会静默走默认 strict，
+# 采回来的量掉一半而界面一句原因都不说（mic/makepolo 本来就是 lenient）。
+check("参数站都有核验档位登记", set(pf.PARAM_VERIFY) == set(pf.PARAM_SITES), True)
+# 已下站的 slug 不许回到任何省份口径里（需求 7：世界工厂网质量太差）。
+check("已下站 slug 不许复活", set(pf.PARAM_SITES) & {"gongchang"}, set())
 check("8 平台=7 并行站+1688", {"mic", "b2b168", "11467", "aipage", "maimaib2b",
                               "globalimporter", "makepolo", "1688"} <=
       pf.PARAM_SITES | {"b2b168", "11467", "aipage", "maimaib2b", "globalimporter"}, True)
