@@ -8822,12 +8822,14 @@ WEIGHT_FORBIDDEN_IMPORTS = {
 }
 # 产物资源根里不许出现的相对路径（键是相对路径，值是「为什么它是白拿」）。
 WEIGHT_FORBIDDEN_ARTIFACT = {
-    "pandas": "需求 5 已从三处入口摘掉 --hidden-import pandas，它回来只可能是有人"
+    "pandas": "需求 5 已从三处入口摘掉 --hidden-import pandas，它回来只可能是有 人"
               "在进包源码里又写了一句 import pandas（见本条由来）",
-    "numpy": "pandas 的连带品，pandas 不在就没有它",
-    "PyQt5/Qt5/qml": "Qt Quick/QML 运行时：本工具是 QtWidgets 程序，一句 QML 都不用",
-    "PyQt5/Qt5/translations": "Qt 自带翻译：全仓没有一句 QTranslator，Qt 也不会自动加载它们，"
-                              "这几兆从第一版起就没生效过（界面中文靠我们自己的文案）",
+    "numpy": "PIL._typing 的 TYPE_CHECKING 块会把它拖进字节码（那段运行时永不执行）；"
+             "三处入口已用 --exclude-module numpy 排除，它出现在产物里＝排除参数被摘了",
+    "PyQt5/Qt5/qml": "Qt Quick/QML 运行时：本工具是 QtWidgets 程序，一句 QML 都 不用",
+    "PyQt5/Qt5/translations": "Qt 自带翻译：全仓没有一句 QTranslator，Qt 也不会 自动加载它们，"
+                              "这几兆从第一版起就没生效过（界面中文靠我们自己的 文案）；"
+                              "构建后由 ARTIFACT_PRUNE 剪裁清单剪掉，再出现＝入口没调 --prune-artifact",
 }
 # 超过这个字节数（MB）的顶层成分必须在 WEIGHT_BUDGET_MB 里登记理由；登记了也不许长过自己的上限。
 WEIGHT_DISCLOSE_MB = 3.0
@@ -8839,6 +8841,37 @@ WEIGHT_BUDGET_MB = {
     "chromedriver": (22, "随包 macOS 驱动：新电脑首启不必联网下载（用户口径：影响首启体验就不砍）"),
     "drivers": (80, "随包 Windows 最近 3 个大版本驱动，同上（不足 2 个时 fetch_chromedrivers.py 会中止）"),
 }
+
+# 需求 5：PyInstaller Qt hook 的连带收件里，「本工具永远用不到」的那一批，构建后剪掉。
+# 由来（2026-11-19 产物 otool 实测）：platforms/libqwebgl.dylib（Qt 的 WebGL 平台插件，
+# 桌面 Widgets 工具永不选用）链接 QtQuick/QtWebSockets/QtQmlModels/QtQml 四个
+# framework——只要 platforms 目录被 hook 收走（平台插件总是全收），这一条链就把整条
+# QML 渲染栈拉进产物（合计约 17MB），而全仓零 QML 代码。translations（约 6MB）同理：
+# hook 按子模块 metadata 收 *.qm，全仓没有一句 QTranslator，这些翻译从第一版起就没
+# 生效过。hook 没有排除开关，只能产物后处理；清单写死在这里单一真源，三处打包入口
+# 都调 --prune-artifact 走同一个实现——抄三遍迟早分叉（本项目被咬过最多次的形状）。
+# 剪完由重量门白名单守着：谁再把它长出来就红。
+ARTIFACT_PRUNE = (
+    # macOS 形状：framework 目录 + 插件 dylib
+    "PyQt5/Qt5/plugins/platforms/libqwebgl.dylib",
+    "PyQt5/Qt5/lib/QtQuick.framework",
+    "PyQt5/Qt5/lib/QtQml.framework",
+    "PyQt5/Qt5/lib/QtQmlModels.framework",
+    "PyQt5/Qt5/lib/QtWebSockets.framework",
+    # Windows 形状：同名连带是 PyQt5/Qt5/bin 下的 dll（Qt5Quick.dll 等官方命名；
+    # 两套名字都写，不存在就跳过——一份清单两平台共用）
+    "PyQt5/Qt5/plugins/platforms/qwebgl.dll",
+    "PyQt5/Qt5/bin/Qt5Quick.dll",
+    "PyQt5/Qt5/bin/Qt5Qml.dll",
+    "PyQt5/Qt5/bin/Qt5QmlModels.dll",
+    "PyQt5/Qt5/bin/Qt5WebSockets.dll",
+    "PyQt5/Qt5/bin/QtQuick.dll",
+    "PyQt5/Qt5/bin/QtQml.dll",
+    "PyQt5/Qt5/bin/QtQmlModels.dll",
+    "PyQt5/Qt5/bin/QtWebSockets.dll",
+    # 两平台同名：Qt 翻译
+    "PyQt5/Qt5/translations",
+)
 
 
 def _weight_analyzed_sources() -> list:
@@ -8984,12 +9017,40 @@ def check_package_weight_artifact(artifact, label: str = "") -> tuple:
     return problems, report
 
 
+def prune_artifact(artifact, label: str = "") -> int:
+    """构建后剪掉 ARTIFACT_PRUNE 清单里那些 hook 连带收件；返回合计剪掉的 MB，读不到产物返回 -1。"""
+    root = artifact_resource_root(artifact)
+    tag = f"{label} " if label else ""
+    if not root.is_dir():
+        print(f"❌ {tag}剪裁读不到产物资源根：{root}（产物不在就别宣布减重成功）")
+        return -1
+    total = 0.0
+    for rel in ARTIFACT_PRUNE:
+        p = root.joinpath(*rel.split("/"))
+        if not p.exists():
+            continue
+        mb = _dir_size_mb(p)
+        if p.is_file():
+            p.unlink()
+        else:
+            shutil.rmtree(p)
+        total += mb
+        print(f"· {tag}剪掉 {rel}（{mb:.0f}MB）")
+    print(f"✅ {tag}剪裁完成：合计 {total:.0f}MB。这些是 hook 连带收件里本工具永远用不到的"
+          f"（webgl 插件拖进来的整条 QML 栈 + 从未生效过的 Qt 翻译）；剪完的产物马上过重量门，"
+          f"谁再把它长出来当场红")
+    return int(total)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
     ap.add_argument("--artifact-weight", metavar="PATH",
                     help="第 40 条的构建后那一面：对给定产物目录做重量实测（由打包脚本与两个 "
                          "workflow 在 PyInstaller 之后调；不传就只跑静态那一面）")
+    ap.add_argument("--prune-artifact", metavar="PATH",
+                    help="构建后剪掉 ARTIFACT_PRUNE 清单里 hook 连带收件（webgl 插件拖进的 QML 栈 "
+                         "+ 从未生效的 Qt 翻译）；清单单一真源在本文件，三处打包入口都调这个实现")
     ap.add_argument("--artifact-label", default="", help="产物身份，只用于报错时点名是哪一份（如 Windows/Mac）")
     args = ap.parse_args(argv)
 
@@ -9536,6 +9597,11 @@ def main(argv=None) -> int:
         else:
             extra = "，触发目录覆盖跨目录源码" if path.name.endswith(".yml") else ""
             print(f"✅ {label}：跨目录模块、本地模块、运行期数据、git 跟踪四项齐全{extra}")
+
+    if args.prune_artifact:
+        _mb = prune_artifact(args.prune_artifact, args.artifact_label)
+        if _mb < 0:
+            bad += 1
 
     if args.artifact_weight:
         wprobs, wreport = check_package_weight_artifact(args.artifact_weight, args.artifact_label)

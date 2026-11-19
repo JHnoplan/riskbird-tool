@@ -16,7 +16,11 @@
 #      不在位就中止（防止把「没带凭证」的包发出去 = 别人电脑上全是精简版）；
 #   2) chromedriver：打进包根（chrome_driver.candidates 的 frozen 首选位）——
 #      这一步找不到只警告不拦停，理由见那一段；
-#   3) 构建：PyInstaller 一次成型；
+#   3) 构建：PyInstaller 一次成型（--exclude-module numpy：PIL._typing 的
+#      TYPE_CHECKING 块会把它拖进字节码，那段运行时永不执行，全仓运行链路零引用）；
+#   3.5) 产物剪裁与重量门【门】：--prune-artifact 剪掉 hook 连带收件里本工具永远
+#      用不到的那批（webgl 插件拖进的整条 QML 栈 + 从未生效的 Qt 翻译），
+#      --artifact-weight 跑产物成分账（白拿名单/未登记大成分/登记上限）；
 #   4) 产物自检门禁【门】：跑的是 .app 里的可执行文件、不是源码，--acl-doctor 真连
 #      权限服务并验采集通道完整性，不通就报错退出；
 #   5) 只读包窗口冒烟【门】：把 .app 拷一份改成只读再跑 --ui-smoke，复现 Gatekeeper
@@ -160,6 +164,7 @@ fi
   --name B2bCollectTool \
   --collect-all selenium --collect-all lxml --collect-all bs4 \
   --collect-submodules PIL \
+  --exclude-module numpy \
   --hidden-import requests --hidden-import websocket --hidden-import websocket_client \
   --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome \
   --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler \
@@ -197,6 +202,16 @@ fi
   --add-data "../riskbird_build/runtime_paths.py:riskbird_build" \
   "${DRIVER_ARG[@]+"${DRIVER_ARG[@]}"}" \
   b2bcollect_gui.py < /dev/null
+
+# ── 3.5) 产物剪裁与重量门【门】：减重的构建后一面，红得快、红得有账 ──────────
+#     剪裁清单单一真源在 check_packaging_manifest.py 的 ARTIFACT_PRUNE（抄一遍这份
+#     列表就是第二份真源，改了那边忘了这边就是分叉——本项目被咬过最多次的形状），
+#     这里只负责调；重量门把白拿名单、未登记大成分、登记上限三件事对一遍账。
+#     两者都带 fd 0（20f 门）：独立起的 python 必须自己会停，不靠启动它的终端。
+echo "· 产物剪裁 + 重量门（ARTIFACT_PRUNE + 第 40 条构建后一面）"
+"$PY" ../.github/scripts/check_packaging_manifest.py \
+  --prune-artifact dist/B2bCollectTool.app --artifact-weight dist/B2bCollectTool.app \
+  --artifact-label 本机Mac < /dev/null
 
 # ── 4) 产物自检门禁：跑的是 .app 里的可执行文件，不是源码 ──
 #     只有它才同时具备「打包态 frozen 判定」与「随包 config.json」这两个真实条件。
