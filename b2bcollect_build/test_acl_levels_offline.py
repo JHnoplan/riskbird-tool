@@ -13,6 +13,8 @@
   E. 管理面：add / set-level / remove（两道防自我锁死）/ describe_levels 同源
      / list_devices / kick / whoami
   F. prefetch_local：开机先用本地副本定级，一条网络请求都不发
+  F3. 「没问到身份」≠「没有权限」（需求 6 的记账分界）
+  F4. 迟到的那一轮不许改写当前会话的结论（需求 6 第二层：迟到守卫与三个竞态现场）
   G. 管理员命令行：每个旗标都能跑通（argparse 构造期炸过一次）、参数缺失/格式错/
      闸口拒绝/网络故障四类失败都是「非零退出码 + 一句人话」，不是半屏 traceback
   H. 退出收尾：守卫（模块级 QObject 单例）必须在 QApplication 之前显式销毁——留着就是
@@ -24,12 +26,14 @@
 
 运行：QT_QPA_PLATFORM=offscreen .venv/bin/python b2bcollect_build/test_acl_levels_offline.py
 """
+import ast
 import contextlib
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1039,6 +1043,171 @@ def test_auth_pending_separation():
             "代理只报变量名、不报地址（内网代理地址本身就是敏感信息）")
 
 
+# ══════════════════════ F4. 迟到的那一轮不许改写当前会话的结论（需求 6 第二层）
+class StaggeredOSS(FakeOSS):
+    """按「第几次问名单」换答案与延时：恒定延时造不出乱序。
+
+    为什么不能复用 ``FakeOSS(delay=...)``：它对每一轮的延时都一样，于是「后发起的
+    先落地」这个本节的病灶在夹具里根本不成立——两轮的相对顺序与发起顺序一致，
+    迟到守卫一条都验不到（上一轮那两条假绿就是这么来的）。这里让每一轮自带
+    (文档, 延时)，才真能排出「先发后至」。
+    """
+
+    def __init__(self, rounds=(), **kw):
+        super().__init__(**kw)
+        self.rounds = list(rounds)
+        self.acl_gets = 0
+
+    def download_json(self, key):
+        if key == ag.ACL_KEY and self.acl_gets < len(self.rounds):
+            doc, delay = self.rounds[self.acl_gets]
+            self.acl_gets += 1
+            self.calls += 1
+            self.seq.append(f"GET {key}")
+            if delay:
+                time.sleep(delay)
+            return json.loads(json.dumps(doc)), '"etag"'
+        return super().download_json(key)
+
+
+def _late_round(g, in_flight, settle=0.2):
+    """先起一慢轮（后台），等它真的出了网，再在当前线程跑一轮快的，最后收尾。
+
+    ``settle`` 不是「碰运气等网络」：它等的是**发起顺序**这个夹具前提（慢轮已进入
+    download_json 的 sleep），不是等它落地——落地顺序恰恰是这里要拿反的那一件事。
+    """
+    th = threading.Thread(target=g._fetch, daemon=True)
+    th.start()
+    time.sleep(settle)
+    in_flight()
+    th.join(8.0)
+    _assert(not th.is_alive(), "后台那一轮必须在时限内结束（挂住就是刷新链路本身有锁问题）")
+    return th
+
+
+def test_stale_round_guard():
+    """2026-11-19 本机取证的三个现场，从临时脚本固化成常驻判据。
+
+    病灶只有一个形状：**谁回来得晚谁说了算**。但它有三个不同的入口，各需要不同的门：
+      现场一 为旧号读的那一轮迟到 → _fetch 的名单门（_acl_stale）拦下，连内存都不进；
+      现场二 同一个号、旧快照迟到 → 名单门拦下（这一格定档门故意不管：同号晚到要放行，
+             否则需求 6c 的「当场补齐」会被堵死）；
+      现场三 同步定档（at=None）先下了结论，随后异步那轮迟到 → 只能拿定档门拦，
+             而它比的是记录里那个时刻地标——地标缺失时它问不出答案（本轮修的就是这一格）。
+    三条都靠真实线程乱序复现：拿假想时刻注水只能验到函数，验不到「三个入口都被同一把
+    尺罩住」这件事本身。
+    """
+    print("\n═══ F4. 迟到的那一轮不许改写当前会话的结论（需求 6 第二层）═══")
+    import crash_forensics as _cf
+
+    old_doc = {"accounts": [ADMIN], "grants": {ADMIN: 0}}                    # 为旧 ADMIN 读的那一份
+    cur_doc = {"accounts": [ADMIN, STD], "grants": {ADMIN: 0, STD: 1}}        # 为当前 STD 读的那一份
+
+    # ── 1) 现场一（端到端）：上一个管理员号那一轮迟到，不许把权限 1 的号提权 ──
+    cli = StaggeredOSS(rounds=[(old_doc, 0.7), (cur_doc, 0.05)])
+    g = _fresh(ADMIN, cli)
+    _cf.reset_for_tests()
+    _late_round(g, lambda: (setattr(g, "_account_reader", lambda: STD), g._fetch()))
+    _assert_eq(_ed.account_level(), _ed.LEVEL_FULL,
+               "当前会话的结论必须是权限 1 那一份（旧号那一轮迟到了也不能提权）")
+    _assert(not _ed.acl_admin_visible(),
+            "权限 1 的号不许长出「权限管理」入口（这正是实机报障上看到的形状）")
+    _assert(any("acl-stale-round" in b and "名单" in b for b in _cf.breadcrumbs()),
+            f"丢掉的轮次必须留下面包屑（只闷声拒写看不出来）：{_cf.breadcrumbs()[-3:]}")
+    _assert(all(ADMIN not in b and STD not in b for b in _cf.breadcrumbs()),
+            "面包屑只报格名与发起时刻，不许把号码写进可外发的取证文件")
+
+    # ── 2) 现场二：同一个号、旧快照迟到 → 靠 _fetch 自己那一格拦（定档门不管同号）──
+    demote_doc = {"accounts": [ADMIN, STD], "grants": {ADMIN: 0, STD: 1}}    # 晚发起：管理员已把 STD 降回 1
+    stale_doc = {"accounts": [ADMIN, STD], "grants": {ADMIN: 0, STD: 0}}     # 先发起：降级前的旧快照
+    cli2 = StaggeredOSS(rounds=[(stale_doc, 0.7), (demote_doc, 0.05)])
+    g2 = _fresh(STD, cli2)
+    _late_round(g2, lambda: g2._fetch())
+    _assert_eq(_ed.account_level(), _ed.LEVEL_FULL,
+               "同一账号、更晚发起的那一轮才代表当前会话：旧快照不得把权限回退成等级 0")
+
+    # ── 3) 现场三：同步定档先下结论，随后旧号那一轮迟到 ──
+    # 这一格本轮才修好：同步路径写的 at=None，而尺只能比带时刻的记录——地标的缺失
+    # 等于把这一格留给「谁回来得晚谁说了算」。换号后权限 1 的号被旧 ADMIN 那一轮
+    # 改写成「等级 0 / 15088131371」就是这么发生的。
+    # 写这一节时才暴露出同一形状的另一半：定档那一半被拦住了，**名单本身**却照样进了
+    # 内存（旧快照里没有 STD），下一次 check() 就会对当前这个有权限的号谎称「不在
+    # 白名单」并收掉功能。所以现在多了一道身份门（_round_phone_changed）在上游拦住，
+    # 下面的断言同时钉住两半：等级不能被改，内存名单也不能被旧快照顶掉。
+    g3 = _fresh(ADMIN, StaggeredOSS(rounds=[(old_doc, 0.5)]))
+    _cf.reset_for_tests()
+
+    def _switch_and_fix():
+        g3._account_reader = lambda: STD
+        with g3._lock:                      # 模拟本地副本已把名单拿在手里（同步定档的前提）
+            g3._accounts = list(cur_doc["accounts"])
+            g3._grants = dict(cur_doc["grants"])
+            g3._grants_declared = True
+        g3._evaluate(STD)                   # 不带 at：同步路径直接下结论
+
+    _late_round(g3, _switch_and_fix, settle=0.12)
+    _assert_eq(_ed.account_level(), _ed.LEVEL_FULL, "换号后同步定档：权限 1 就是 1")
+    _assert(_ed._ACCOUNT.get("account") == STD,
+            f"当前记录得是换了之后的那个号：{_ed._ACCOUNT.get('account')!r}")
+    with g3._lock:
+        _mem = list(g3._accounts or [])
+    _assert(STD in _mem,
+            f"旧号那一轮的名单不得顶掉内存里的那一份（否则下一个 check() 就误判当前号无权限）：{_mem}")
+    _assert(any("acl-stale-round" in b and "换号" in b for b in _cf.breadcrumbs()),
+            f"整轮因换号被作废要留痕：{_cf.breadcrumbs()[-3:]}")
+
+    # 3b) 定档门自己被直接冲击时仍然拦得住（不因为上游多了一道门就退化成没人验的摆设）
+    g3._evaluate(ADMIN, at=time.monotonic() - 60.0)
+    _assert_eq(_ed.account_level(), _ed.LEVEL_FULL,
+               "拿旧时刻、为另一个号发的那一轮直接定档，必须被定档门拦下")
+    _assert(any("acl-stale-round" in b and "定档" in b for b in _cf.breadcrumbs()),
+            f"定档门拒写时必须留痕：{_cf.breadcrumbs()[-3:]}")
+
+    # ── 4) 尺本身：四格真值表（直接调 set_account_level，不走守卫）──
+    # 为什么这一档不拿上面的端到端覆写就够了：端到端只能验「今天这条路径不串号」，
+    # 验不到尺的四个分支各自为什么成立；而默认值语义被改动时，只有直接喂 at 才能红。
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}))
+    _ed.reset_for_tests()
+    _ed.set_account_level(_ed.LEVEL_FULL, STD, at=1500.0, reason="夹具：当前会话")
+    _assert(not _ed.level_write_is_stale(None, ADMIN),
+            "at=None 一律放行：同步定档不是在回答某一次刷新，拦它就是拿 fail-closed 当靶子")
+    _assert(not _ed.level_write_is_stale(2000.0, ADMIN),
+            "号不同、但发起得更晚 → 那才是当前会话的答案，不拒")
+    _assert(_ed.level_write_is_stale(1000.0, ADMIN),
+            "号不同、且发起得更早 → 迟到了，拒")
+    _assert(not _ed.level_write_is_stale(1000.0, STD),
+            "同一个号 → 放行：需求 6c 的「当场补齐」靠的就是同号、更晚落地的那一轮")
+    _ed._ACCOUNT = {"level": _ed.LEVEL_LITE, "account": ADMIN}       # 这把尺存在之前的历史结
+    _assert(not _ed.level_write_is_stale(1000.0, STD),
+            "当前记录没带时刻地标（升级前的旧结）→ 放行，不能把老机器锁死在临时档位")
+
+    # ── 5) 写入必留时刻地标（现场三的本体）──
+    _ed.reset_for_tests()
+    _ed.set_account_level(_ed.LEVEL_FULL, STD, reason="夹具：同步定档（不给 at）")
+    _assert(_ed._ACCOUNT.get("at") is not None,
+            f"at=None 的写入也必须留下时刻地标：{_ed._ACCOUNT!r}")
+    _ed.set_account_level(_ed.LEVEL_ADMIN, ADMIN, at=1.0)             # 为旧号、更早发起的一轮
+    _assert_eq(_ed.account_level(), _ed.LEVEL_FULL,
+               "上一句那次「更早发起、为另一个号」的写入必须被拒（地标没留就是假绿）")
+
+    # ── 6) 调用点红线：每一处都必须显式表态 at= ──
+    # 默认值兜住了≠调用点对语义表过态。哪天默认从 None 换成别的，不表态的调用点
+    # 会静默换语义（而同步定档与回答某一轮刷新完全不是同一件事）。
+    _untagged = []
+    for _p in sorted(Path(__file__).resolve().parent.glob("*.py")):
+        if _p.name.startswith("test_"):
+            continue
+        for _n in ast.walk(ast.parse(_p.read_text(encoding="utf-8"), filename=str(_p))):
+            if isinstance(_n, ast.Call):
+                _f = _n.func
+                if (_f.attr if isinstance(_f, ast.Attribute) else getattr(_f, "id", "")) \
+                        == "set_account_level" and not any(k.arg == "at" for k in _n.keywords):
+                    _untagged.append(f"{_p.name}:{_n.lineno}")
+    _assert(not _untagged,
+            "所有 set_account_level 调用点必须显式写 at=（同步定档就写 at=None）："
+            f"未表态的有 {_untagged}")
+
+
 # ══════════════════════════════════════════════════════ G. 管理员命令行
 @contextlib.contextmanager
 def _cli_client(cli):
@@ -1264,6 +1433,7 @@ def main():
     test_prefetch_local()
     test_prefetch_authoritative()
     test_auth_pending_separation()
+    test_stale_round_guard()
     test_guard_teardown()
     test_cli()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")

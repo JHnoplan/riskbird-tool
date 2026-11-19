@@ -489,7 +489,7 @@ def auth_reason() -> str:
 
 def clear_account_level() -> None:
     """解绑/换号时清掉旧账号的等级，避免上一个账号的上限继续生效。"""
-    set_account_level(None)
+    set_account_level(None, at=None)        # 清除不是「回答某一轮刷新」，但同样要表态
 
 
 # ── 界面投影（GUI 只调这一层，不自己写档位判断）──────────────────────────────

@@ -1236,6 +1236,15 @@ class AccessGuard(QObject):
                 # （上一个管理员号那一轮姗姗来迟），也能把已被删掉的号又送回名单。
                 self._drop_stale_round("名单", started_at)
                 return False
+            if doc is not None and self._round_phone_changed(phone):
+                # 换号发生在本轮出网之后、回包之前：这一轮是**替上一个号**去问的。
+                # 定档那一半有 level_write_is_stale 盯着（等级不会被旧号那轮改写），但
+                # 名单本身没有：旧快照进了内存，下一次 check() 就会把当前这个有权限的号
+                # 读成「不在白名单」，对着权限 1 的用户谎称被移出名单并收掉功能。
+                # 时刻在这里帮不上忙：这是本进程第一次成功的刷新，没有「更晚落地的那一轮」
+                # 可比——能比的只有「这一轮到底是为谁去问的」这个身份事实。
+                self._drop_stale_round("名单（已换号）", started_at)
+                return False
             if doc is not None:
                 accounts = _parse_accounts(doc)
                 grants, declared = _parse_grants(doc)
@@ -1509,6 +1518,21 @@ class AccessGuard(QObject):
         """设备分片这一格：同一把尺。分片迟到会把「本机是不是当前设备」回退成旧答案。"""
         return at < self._bind_from
 
+    def _round_phone_changed(self, phone: str) -> bool:
+        """本轮出网时绑的号，与此刻当前会话的号不是同一个？
+
+        只认「两头都有值且不相等」这一种：出网时未绑定 → 它没替任何旧号说话；此刻
+        未绑定（刚解绑）→ 名单本身仍是一份有效名单，交给后面的空号分支判，不该在这
+        一格把整轮连同它的本地副本一起丢掉。
+        """
+        if not phone:
+            return False
+        try:
+            cur = self._bound_phone()
+        except Exception:
+            return False        # 问不出当前号就不当它换了（宁可放行也不误拦刷新）
+        return bool(cur) and cur != phone
+
     def _drop_stale_round(self, what: str, at: float) -> None:
         """把「这一轮已过期、丢在哪一格」记成一枚可回看的面包屑。
 
@@ -1700,7 +1724,7 @@ class AccessGuard(QObject):
             # 与 _evaluate 同一口径：被移出白名单就显式收到丐版，不留「未判定」
             # （未判定在 pro 构建下会被默认成管理员 = 全套入口，等于放行）。
             _ed.set_account_level(LEVEL_LITE, phone,
-                                  reason="不在白名单，按丐版收口")
+                                  reason="不在白名单，按丐版收口", at=None)
             return False, "当前账号无使用权限，请联系管理员获得使用权限"
 
         # 等级 → edition 能力上限。放在设备判定**之前**回填：被顶掉的机器、
@@ -3144,7 +3168,8 @@ def _cli(argv: Optional[List[str]] = None):
         _phone = get_guard()._bound_phone()
         if _phone and _phone in doc["accounts"]:
             _lv = resolve_level(_phone, doc["grants"], declared)
-            _ed.set_account_level(_lv, _phone, reason=f"--show 本地解析绑定账号等级 {_lv}")
+            _ed.set_account_level(_lv, _phone, reason=f"--show 本地解析绑定账号等级 {_lv}",
+                                  at=None)      # 命令行自报：不是在回答某一次刷新
             _tail = f"（绑定账号 {_phone}）"
         else:
             _tail = "（本机未绑定，按构建档位隐含）" if _phone == "" else "（绑定账号不在名单）"
