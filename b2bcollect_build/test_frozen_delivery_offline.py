@@ -11624,6 +11624,155 @@ def test_package_weight_gate():
         _assert(_probs and "读不到产物资源根" in _probs[0],
                 "路径给错时必须开口，不能默默交一份「零问题」的答卷（产物不在就别宣布减重成功）")
 
+    # ── 5) 剪裁链路（需求 5 第三刀）：清单单一真源，三处入口只调不抄，先剪后称 ──
+    # 由来（2026-11-19 产物 otool 实测）：前两刀之后 numpy(约 10MB)、translations(约 6MB)
+    # 与 QtQuick 一族(约 11MB) 仍常驻产物。numpy 是从 PIL._typing 的 TYPE_CHECKING 块被
+    # 拖进（那段运行时永不执行，--exclude-module numpy 排除即可）；其余是 Qt hook 的
+    # 连带收件——platforms/libqwebgl.dylib（WebGL 平台插件，桌面 Widgets 工具永不选用）
+    # 链着整条 QML 渲染栈，translations 按 hook 的 metadata 规则收，hook 都没有排除
+    # 开关，只能构建后剪。清单写死在门模块单一真源，三处入口都调 --prune-artifact 走
+    # 同一个实现——抄三遍迟早分叉（本项目被咬过最多次的形状）；剪完由白拿名单守着。
+    _assert(callable(getattr(gate, "prune_artifact", None)),
+            "门模块里有 prune_artifact（可被三处入口调起；函数在而入口不接线＝这条链从没跑过）")
+    _PRUNE_KEY = (
+        "PyQt5/Qt5/plugins/platforms/libqwebgl.dylib",
+        "PyQt5/Qt5/lib/QtQuick.framework",
+        "PyQt5/Qt5/plugins/platforms/qwebgl.dll",
+        "PyQt5/Qt5/translations",
+    )
+
+    def _prune_problems(items):
+        got = []
+        for rel in _PRUNE_KEY:
+            if rel not in items:
+                got.append(f"剪裁清单里没有 {rel}：webgl 插件拖进的 QML 栈与从未生效过的"
+                           "Qt 翻译就会常驻产物")
+        if any("\\" in x or x.startswith("/") for x in items):
+            got.append("剪裁清单条目必须是相对 posix 路径（joinpath 按斜杠拆）：绝对路径"
+                       "或反斜杠在另一台机器上是剪不到东西的哑条目")
+        return got
+
+    _assert_eq(_prune_problems(gate.ARTIFACT_PRUNE), [],
+               "今天的剪裁清单四条关键收件都在位（mac 与 Windows 两套形状共用同一份清单）")
+    # 白拿名单与剪裁清单要对账：translations 两边都挂着——剪掉让它这轮不红，白名单
+    # 守「再长出来就红」。只挂一边，另一边迟早变成没人接的空枪。
+    _assert("--prune-artifact" in gate.WEIGHT_FORBIDDEN_ARTIFACT.get("PyQt5/Qt5/translations", ""),
+            "translations 的白拿理由要交代它是被 --prune-artifact 剪掉的：白拿名单与"
+            "剪裁清单互为对账，只写一边另一边就成了没人接的空枪")
+    # 函数级夹具：清单内的真被剪、清单外一个不碰、读不到产物返回 -1 好让入口并退出码。
+    with tempfile.TemporaryDirectory() as td:
+        _r = Path(td) / "B2bCollectTool" / "_internal"
+        for rel in ("PyQt5/Qt5/plugins/platforms/libqwebgl.dylib",
+                    "PyQt5/Qt5/translations/qtbase_zh_cn.qm", "keep.txt"):
+            _f = _r / rel
+            _f.parent.mkdir(parents=True, exist_ok=True)
+            with _f.open("wb") as _fh:               # 稀疏 2MB：真实剪裁是 MB 级，
+                _fh.truncate(2 * 1024 * 1024)        # int 截断后返回 0 会与「没剪到」分不开
+        _cut = gate.prune_artifact(_r.parent, "夹具")
+        _assert(_cut > 0, f"夹具里确有清单内成分，剪裁要报告正数（实际={_cut}）")
+        _assert(not (_r / "PyQt5" / "Qt5" / "translations").exists(), "清单内的目录必须真被剪掉")
+        _assert((_r / "keep.txt").exists(), "清单外的成分一个不许碰（剪裁不是格式化）")
+        _assert(gate.prune_artifact(Path(td) / "不在的产物", "夹具") == -1,
+                "读不到产物时返回 -1：入口把这一路并进退出码，而不是报个喜就过")
+
+    def _order_problems(src):
+        p_at = src.find("if args.prune_artifact:")
+        w_at = src.find("if args.artifact_weight:")
+        if p_at <= 0 or w_at <= p_at:
+            return ["main() 里剪裁分支必须排在重量分支之前：先剪后称，顺序反了称重"
+                    "称的就是没剪的产物"]
+        if "bad += 1" not in src[p_at:p_at + 300]:
+            return ["剪裁失败（-1）要并进退出码：只 print 不改退出码，红装绿卖"]
+        return []
+
+    _assert_eq(_order_problems(gate_src), [], "main() 的剪裁接线在位且先剪后称")
+    _assert("TYPE_CHECKING" in gate.WEIGHT_FORBIDDEN_ARTIFACT.get("numpy", ""),
+            "numpy 的白拿理由要写真根因（PIL._typing 的 TYPE_CHECKING 块拖进、运行时"
+            "永不执行）：写「只有 pandas 要它」那种旧账会误导下一个想删 import 的人")
+    # 三处入口接线（吃文本的判据函数：变异复验喂变异字符串，不动真交付物）。
+    _entries = {
+        "本机脚本": (_REPO / "debug" / "build_b2bcollect_mac_local.sh").read_text(encoding="utf-8"),
+        "mac workflow": (_REPO / ".github" / "workflows" / "build-b2bcollect-mac.yml").read_text(encoding="utf-8"),
+        "Windows workflow": (_REPO / ".github" / "workflows" / "build-b2bcollect.yml").read_text(encoding="utf-8"),
+    }
+    _PRUNE_CALL = {
+        "本机脚本": "--prune-artifact dist/B2bCollectTool.app --artifact-weight dist/B2bCollectTool.app",
+        "mac workflow": "--prune-artifact dist/B2bCollectTool.app --artifact-weight dist/B2bCollectTool.app",
+        "Windows workflow": "--prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool",
+    }
+
+    def _entry_problems(texts):
+        got = []
+        for label, t in texts.items():
+            if "--exclude-module numpy" not in t:
+                got.append(f"{label}：没有 --exclude-module numpy——PIL._typing 的 "
+                           "TYPE_CHECKING 块运行时永不执行，排除零风险；摘了它 numpy(约"
+                           "10MB) 就回流")
+            if _PRUNE_CALL[label] not in t:
+                got.append(f"{label}：没有「{_PRUNE_CALL[label]}」这条同次调用——剪裁"
+                           "（--prune-artifact）与称重（--artifact-weight）必须同一次调用"
+                           "指向同一产物：剪完不马上称重，剪裁链路就没有验收")
+            # 拦的是「抄清单本体」＝把条目路径抄进入口；注释与 echo 里提到清单名只是
+            # 指路，不算（与第 2 小节同款教训：判的是参数，不是这几个字有没有出现过）。
+            for rel in _PRUNE_KEY:
+                if rel in t:
+                    got.append(f"{label}：出现了剪裁清单条目「{rel}」的字节——剪裁清单是"
+                               "单一真源，入口只调不抄（抄一遍就是第二份真源，改清单时"
+                               "入口那份不会跟着改，迟早分叉）")
+        return got
+
+    _assert_eq(_entry_problems(_entries), [],
+               "三处入口的排除/剪裁/称重接线齐全，且都在只调不抄")
+    # 反向对照：改一个与接线无关的字段不许响（误报的门会被当噪音关掉）。
+    _assert_eq(_entry_problems({**_entries, "mac workflow":
+               _entries["mac workflow"].replace("--artifact-label Mac", "--artifact-label macOS", 1)}),
+               [], "改产物标签这种无关字段不许响")
+    # ── 变异复验：清单、接线、main 三层各挑要害，红话点名代价 ──
+    for label, items, needle in (
+        ("删 translations 条目",
+         tuple(x for x in gate.ARTIFACT_PRUNE if x != "PyQt5/Qt5/translations"),
+         "没有 PyQt5/Qt5/translations"),
+        ("删 libqwebgl 条目",
+         tuple(x for x in gate.ARTIFACT_PRUNE if "libqwebgl" not in x),
+         "没有 PyQt5/Qt5/plugins/platforms/libqwebgl.dylib"),
+        ("写成反斜杠条目", ("PyQt5\\Qt5\\translations",), "相对 posix 路径"),
+    ):
+        _got = _prune_problems(items)
+        _assert(any(needle in g for g in _got),
+                f"清单变异「{label}」必须被杀红（实际={_got}）")
+    for label, texts, needle in (
+        ("mac 摘掉剪裁调用", {**_entries, "mac workflow": _entries["mac workflow"].replace(
+            _PRUNE_CALL["mac workflow"] + " \\", "")}, "同次调用"),
+        ("mac 剪完不称重", {**_entries, "mac workflow": _entries["mac workflow"].replace(
+            _PRUNE_CALL["mac workflow"], "--prune-artifact dist/B2bCollectTool.app", 1)}, "同次调用"),
+        ("Windows 摘掉 exclude numpy", {**_entries, "Windows workflow": _entries[
+            "Windows workflow"].replace("--exclude-module numpy ", "")}, "没有 --exclude-module numpy"),
+        ("本机脚本抄清单条目", {**_entries, "本机脚本": _entries["本机脚本"] +
+            "\nPyQt5/Qt5/plugins/platforms/libqwebgl.dylib"}, "只调不抄"),
+    ):
+        _mut = _entry_problems(texts)
+        _assert(any(needle in g for g in _mut),
+                f"入口变异「{label}」必须被杀红（实际={_mut}）")
+    # main() 接线三路：分支摘掉 / 失败不进退出码 / 先称后剪，每一路都要红得点名。
+    _mut = gate_src.replace("    if args.prune_artifact:", "    if False:", 1)
+    _assert(_mut != gate_src, "变异「main 剪裁分支摘掉」锚点没对上（变异等于空跑）")
+    _got = _order_problems(_mut)
+    _assert(any("剪裁分支" in g for g in _got),
+            f"变异「main 剪裁分支摘掉」必须被杀红（实际={_got}）")
+    _mut = gate_src.replace("if _mb < 0:\n            bad += 1", "if _mb < 0:\n            pass", 1)
+    _assert(_mut != gate_src, "变异「-1 不进退出码」锚点没对上（变异等于空跑）")
+    _got = _order_problems(_mut)
+    _assert(any("并进退出码" in g for g in _got),
+            f"变异「-1 不进退出码」必须被杀红（实际={_got}）")
+    _p_at = gate_src.find("if args.prune_artifact:")
+    _w_at = gate_src.find("if args.artifact_weight:")
+    _end = gate_src.find("    if bad:", _w_at)
+    _mut = gate_src[:_p_at] + gate_src[_w_at:_end] + gate_src[_p_at:_w_at] + gate_src[_end:]
+    _assert(_mut != gate_src, "变异「先称后剪」锚点没对上（变异等于空跑）")
+    _got = _order_problems(_mut)
+    _assert(any("排在重量分支之前" in g for g in _got),
+            f"变异「先称后剪」必须被杀红（实际={_got}）")
+
 
 def test_installer_env_gate():
     print("\n═══ BB. 安装器运行环境体检门（需求 10）═══")
@@ -11771,6 +11920,81 @@ def test_installer_env_gate():
                 f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
 
 
+def test_feature_table_gate():
+    print("\n═══ CC. 功能清单表格与能力矩阵对拍（需求 9）═══")
+    # 「工具功能清单.md」是给用户与权限管理员看的交付物，它的价值全在「与代码一致」：
+    # 管理员照第二节那张矩阵授权——表上写了矩阵里没有的能力，就是把没有的功能承诺
+    # 出去；矩阵里有的能力表上漏了，管理员就不知道那一格该不该勾。所以这张表不许靠
+    # 手抄印象维护，每一处能力名与等级口径都要与 edition.py 的真源逐字对拍：改了
+    # 矩阵忘了改表（或反过来），交付链当场红，而不是下一个管理员照着假话授权。
+    import edition as ed
+
+    def _problems(text: str) -> list:
+        got = []
+        # ① 矩阵 8 个能力键全部在表（反引号形式）；表里写的能力键不许超出矩阵。
+        for cap in ed.ALL_CAPS:
+            if f"`{cap}`" not in text:
+                got.append(f"能力 `{cap}` 在表格里缺席：矩阵里有的能力表上漏了，"
+                           "管理员就不知道这一格该不该勾")
+        # 反引号 token 过滤：只审「长得像能力键」的——全小写、至少一个下划线、无点
+        # 无斜杠无反斜杠。这条正则天然排除一切文件名（b2bcollect_gui.py 带点）、路径
+        # （b2bcollect_data/riskbird_data 带斜杠）与命令行，不需要去罗列后缀。
+        _tokens = set(text.split("`")[1::2])
+        for tok in sorted(_tokens):
+            if (re.fullmatch(r"[a-z]+(?:_[a-z]+)+", tok)
+                    and tok not in ed.ALL_CAPS and tok not in ("pro", "lite")):
+                got.append(f"表格里出现「{tok}」：长得像能力键却不在 edition.ALL_CAPS 里——"
+                           "把没有的功能承诺出去了，要么改表要么先往矩阵里加能力")
+        # ② 等级名与等级口径与 LEVEL_NAMES / LEVEL_DESCS 逐字一致。
+        if not all(s in text for s in ("管理员（等级 0）", "标准（等级 1）", "受限（等级 2）")):
+            got.append("矩阵表头的三个等级名要写全「管理员（等级 0）/标准（等级 1）/"
+                       "受限（等级 2）」——权限管理页上按的就是这三个名字，表上写别的话就对不上")
+        for _phrase in ("全部功能 + 权限管理入口", "不能管理权限", "只有精简版那一组功能"):
+            if _phrase not in text:
+                got.append(f"等级口径「{_phrase}」在表格里缺席：这句与 edition.LEVEL_DESCS "
+                           "逐字对拍，改了矩阵文案忘了改表，管理员就是照着假话在授权")
+        # ③ 能力的人话名（CAP_LABELS）全部在表：矩阵表用的是这些词，表格必须同源。
+        for label in ed.CAP_LABELS.values():
+            if label not in text:
+                got.append(f"能力人话名「{label}」在表格里缺席：权限面板显示的是这个词，"
+                           "表上换成另一种说法两边就对不上")
+        return got
+
+    _p = _REPO / "工具功能清单.md"
+    _assert(_p.is_file(), "工具功能清单.md 在仓库根（它是需求 9 的交付物，不在位＝这张表丢了没人知道）")
+    _real = _p.read_text(encoding="utf-8")
+    _assert_eq(_problems(_real), [],
+               "今天的功能清单表格与 edition.py 能力矩阵全量对齐（能力键/等级名/口径/人话名）")
+
+    # ── 变异复验：每一路都必须被杀红，且红话要点名当初的代价（BB 节同款形状：变异
+    #    只动字符串，真文件一个字节都不碰——拿交付物做变异实验是把工具当沙盒）──
+    _muts = (
+        # 删行变异的锚点刻意选 list_all_channels：它是表格里唯一只出现一次的能力键
+        # （acl_admin/pool_ui 等都在矩阵表和正文里各出现一次，删矩阵行 token 仍在，
+        # ① 的缺席判据不红——那就是一个假变异）。
+        ("删一个能力行", "| 风鸟/爱企查名单补采（`list_all_channels`） | ✅ | ✅ | — |\n", "",
+         "能力 `list_all_channels` 在表格里缺席"),
+        ("塞一个矩阵外的能力名", "| 数据池四个入口（`pool_ui`） | ✅ | ✅ | — |",
+         "| 数据池四个入口（`pool_ui`） | ✅ | ✅ | — |\n| 数据池导出（`pool_export`） | ✅ | ✅ | — |",
+         "长得像能力键却不在 edition.ALL_CAPS 里"),
+        ("等级名改写", "标准（等级 1）", "标准版（等级 1）",
+         "三个等级名要写全"),
+        ("等级口径改字", "全部功能，不能管理权限", "全部功能，不能管权限",
+         "等级口径「不能管理权限」在表格里缺席"),
+        # 人话名变异必须真把那个词移除（「历史任务续采→历史任务」）：改成加字的话
+        # 子串仍在，③ 的缺席判据不红。
+        ("人话名改写", "历史任务续采（`history_tasks`）", "历史任务（`history_tasks`）",
+         "能力人话名「历史任务续采」在表格里缺席"),
+    )
+    for label, old, new, needle in _muts:
+        _mut = _real.replace(old, new, 1)
+        _assert(_mut != _real, f"变异「{label}」没有真的改变文本（锚点没对上，变异等于空跑）")
+        _got = _problems(_mut)
+        _assert(_got, f"变异「{label}」必须被杀红（现在全绿＝这一路判据没有牙）")
+        _assert(any(needle in g for g in _got),
+                f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
+
+
 # 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
 # NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
@@ -11797,6 +12021,7 @@ SECTIONS = (
     test_state_file_protection_gate,
     test_package_weight_gate,
     test_installer_env_gate,
+    test_feature_table_gate,
     test_suite_exit_code_guard_gate,
     test_regression_suites_tracked_gate,
     test_no_dev_machine_paths_gate,
