@@ -171,15 +171,27 @@ check("整张表也只有 9 列（没有第二块重复栏）", len(hdr_all) == 
 # 国内只留手机号 / 国外」这三份在没有客户模板的机器上比《清洗后入库数据》多一整块重复栏
 # ——同一个工具的两个出口对同一件事给两种列数，用户读到的就是「数据乱、导出不需要多余栏」。
 # 现在三份都走 write_clean_excel 那一份真源：有模板→双块且两块相同，无模板→接口 9 列。
-import pandas as _pd                                                  # noqa: E402
-import enhanced_cleaner as EC                                         # noqa: E402
+from openpyxl import Workbook as _WB                    # noqa: E402
+import enhanced_cleaner as EC                            # noqa: E402
 _src_e = os.path.join(TMP, "增强清洗输入.xlsx")
-_pd.DataFrame([
+# 这一格原来用 pandas 造 xlsx 夹具。需求 5 把 pandas 从交付依赖里摘掉后它就断了：
+# 本机装了 pandas（moviepy/opencv 连带）所以看不出来，按交付清单装出来的干净环境跑
+# 这路回归会直接 ImportError——「只有开发机能跑的判据」等于没有判据。造表只需要
+# openpyxl：它本来就是随包的导出依赖，下面读回来用的也是同一个库，不必多拉一个重量级。
+_rows_e = [
     {"公司名": "深圳光能科技有限公司", "电话": "13800138000", "邮箱": "sales@guangneng.com",
      "官网": "www.guangneng.com", "地址": "深圳市南山区科技园"},
     {"公司名": "German Solar GmbH", "电话": "+49 30 12345678", "邮箱": "info@germansolar.de",
      "地址": "Berlin, Germany"},
-]).to_excel(_src_e, index=False)
+]
+_hdr_e: list = []
+for _r in _rows_e:
+    _hdr_e.extend(k for k in _r if k not in _hdr_e)
+_wb_e = _WB()
+_wb_e.active.append(_hdr_e)
+for _r in _rows_e:
+    _wb_e.active.append([_r.get(k, "") for k in _hdr_e])
+_wb_e.save(_src_e)
 
 
 def _grids_e(result):
