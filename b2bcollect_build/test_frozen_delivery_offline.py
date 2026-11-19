@@ -228,14 +228,25 @@ def _redact(text) -> str:
         lambda m: m.group(0)[:4] + f"…（已脱敏，{len(m.group(0))} 位）", str(text))
 
 
+def _one_line(text) -> str:
+    """把任何进日志的判定文案压成**一行**（行形状由报告层保证，不靠每一处调用者自觉）。
+
+    为什么要这一层：子进程的 stdout 本身就带 `❌ ` 与 `::error::` 前缀，谁把它原样嵌进
+    断言文案，日志里就凭空多出一行以 `❌` 开头的文本——而「grep ❌ 找失败」正是读这份报告的
+    人唯一的导航方式。本轮实测两次（DG 节真跑冒烟、上面那个夹具批跑），两次都把人带去查
+    一条根本不存在的失败。观测手段污染被观测对象，与判据说谎是同一类代价。
+    """
+    return " | ".join(str(text).strip().splitlines())
+
+
 def _assert(cond, msg):
     global _PASS, _FAIL
     if cond:
         _PASS += 1
-        print(f"  ✅ {_redact(msg)}")
+        print(f"  ✅ {_one_line(_redact(msg))}")
     else:
         _FAIL += 1
-        print(f"  ❌ {_redact(msg)}")
+        print(f"  ❌ {_one_line(_redact(msg))}")
 
 
 def _assert_eq(actual, expected, msg):
@@ -248,14 +259,14 @@ def _assert_raises(exc_type, fn, msg):
         fn()
     except exc_type:
         _PASS += 1
-        print(f"  ✅ {_redact(msg)}")
+        print(f"  ✅ {_one_line(_redact(msg))}")
         return
     except Exception as e:
         _FAIL += 1
-        print(f"  ❌ {_redact(msg)}（抛的是 {type(e).__name__}: {_redact(e)}）")
+        print(f"  ❌ {_one_line(_redact(msg))}（抛的是 {type(e).__name__}: {_one_line(_redact(e))}）")
         return
     _FAIL += 1
-    print(f"  ❌ {_redact(msg)}（没抛异常）")
+    print(f"  ❌ {_one_line(_redact(msg))}（没抛异常）")
 
 
 def _fmt_idx(i):
@@ -1057,6 +1068,7 @@ _COLLECT_RE = r'--collect-(?:all|submodules)\s+([\w.]+)'
 _ADD_DATA_RE = r'--add-data\s+"([^"]+)"'
 
 _GATE_MOD = None
+_LEGACY_TC_MOD = None
 
 
 def _manifest_gate():
@@ -2790,6 +2802,26 @@ def _iter_steps(text: str):
         yield name, body
 
 
+def _step_env(body: str) -> dict:
+    """这一步 `env:` 块里的**字面量**赋值（`"${{ … }}"` 那种要 Actions 现场才解得开的跳过）。
+
+    为什么夹具需要它：本文件的跑法是把 run 体**抠出来直接执行**，而真实 Actions 会先把
+    这一步的 env 注入进程环境。需求 10B 把包名/地板从命令体提到了 step env（两条通道共用
+    同一段 shell，差异只放这四个值），不注入就会得到一串假红：`ls -l "$OUT_FILE "` 展开成
+    空串 → `ls: : No such file or directory` → 八条正例全倒（本轮实测）。
+    只注入字面量、不替表达式编值：编一个假值进去等于让夹具决定交付物叫什么，红了也说不清。
+    """
+    m = re.search(r"^      env:\s*$\n((?:        [A-Za-z_][A-Za-z0-9_]*:.*\n?)+)", body, re.M)
+    out = {}
+    for ln in (m.group(1).splitlines() if m else []):
+        key, _, val = ln.strip().partition(":")
+        val = val.strip().strip('"').strip("'")
+        if "${{" in val or not val:
+            continue
+        out[key] = val
+    return out
+
+
 def _step_shell(region: str, default: str) -> str:
     """这一步真正由哪个 shell 执行：显式声明优先，没声明就是 runner 的默认值。"""
     m = re.search(r"^\s*shell:\s*(\w+)", region, re.M)
@@ -3563,6 +3595,13 @@ def test_workflow_shell_syntax():
     NSIS_V4_BANNER = "MakeNSIS v3.10"                 # 判据从上面那行里取出来的片段
     NSIS_LEGACY_BANNER = "Nullsoft Install System v3.10"   # 老 NSIS / -V1 的自报写法
     inst_body = next((b for n, b in _iter_steps(win) if INST_STEP in n), "")
+    # 安装步骤自己的 env：夹具接下来要像 Actions 那样把它注进子进程（见 `_step_env`）。
+    # 这里先把它「确实读到了两个交付物名」钉住：读不到就不注入，那会退回本轮那串假红——
+    # 红了却指向一个不存在的交付缺陷，比不红更贵。
+    INST_ENV = _step_env(inst_body)
+    _assert("OUT_FILE" in INST_ENV and "PORTABLE_NAME" in INST_ENV,
+            f"安装步骤的 env 里读不到交付物名（实得={INST_ENV}）：夹具没法照 Actions 那样注入，"
+            "下面那些正例的红会是假红")
     cut = inst_body.find(PIN_ANCHOR)
     _assert(cut >= 0, f"安装步骤里找得到版本判据的锚点 {PIN_ANCHOR}（找不到=整段被删了）")
     gate_script = inst_body[cut:] if cut >= 0 else ""
@@ -3651,11 +3690,15 @@ def test_workflow_shell_syntax():
                             '{ echo "Error: invalid VIProductVersion format, should be X.X.X.X"; '
                             'echo "Error - aborting creation process"; exit 1; }; ;; esac; done\n'
                             + head
-                            + ": > B2bCollectToolSetup.exe\n"
-                              ": > B2bCollectTool_Win_portable.zip\n"
+                            # 两个交付文件名也从**注入的 env** 里取，不在这里抄一遍名字：
+                            # 真包名改了（上一轮就是这种漂移），夹具跟着落新名字，而
+                            # `ls -l "$OUT_FILE"` 那一问继续是真的在问交付物在不在。
+                            + ': > "${OUT_FILE:?夹具没注入 OUT_FILE}"\n'
+                              ': > "${PORTABLE_NAME:?夹具没注入 PORTABLE_NAME}"\n'
                               f"exit {stub_rc}\n", encoding="utf-8")
             stub.chmod(0o755)
-            env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
+            env = dict(os.environ, **INST_ENV,
+                       MAKENSIS=str(stub), NSIS_PINNED=pinned,
                        RUNNER_TEMP=(str(root / "nope") if bad_temp else str(root)),
                        APP_VERSION=(stamp_build if stamp_build is not None else ""),
                        WIN_ROOT=str(root),
@@ -10504,6 +10547,12 @@ def test_tree_cache_gate():
         "got = ast.parse(text, filename=label)": "把手本体：整层只许这一处真的去解字节",
         "tree = ast.parse(text)": "`_code_only_text` 会就地摘 docstring（body.pop），故意吃一份私有树",
         'return ast.parse("")': "`_ast_safe_parse` 的坏语法兜底：交一份空树，不让异常带走整条门",
+        # 第 42 条甲：同一份源码要按**两个**语法口径各解一次，3.8 那一次吃不了把手——
+        # `_file_tree` 是按本机解释器（今天 3.13）解的，拿它的结论替 3.8 担保恰好就是这一
+        # 条要防的事（feature_version=(3,8) 才是「3.8 能不能读」的那个问法）。
+        # 同一函数里「后面三道 AST 判据」那一次已经改走 `_file_tree`，不在这张表里。
+        "ast.parse(text, filename=str(path), feature_version=PY38_FLOOR)":
+            "第 42 条甲：要的是「3.8 能不能解」，把手按本机语法解、口径不对，不许共享",
         'got = _tab_exit_problems("夹具", ast.parse(frag), dict(table))': "内联夹具片段，不是磁盘源码",
         'got = _tab_nav_evidence_problems("夹具", ast.parse(frag))': "内联夹具片段，不是磁盘源码",
         'got = _tab_chrome_env_problems("夹具", frag, ast.parse(frag))': "内联夹具片段，不是磁盘源码",
@@ -10706,9 +10755,11 @@ def test_python_floor_gate():
     _assert("这张编号表不是全集" in gate_src,
             "表末尾那句「这张编号表不是全集」要在（漏的那一句正是这一条要防的事）")
 
-    # ── 2) 地板只有一个来源：四份 workflow 必须说同一种版本 ──
+    # ── 2) 地板只有一个来源：各份 workflow 的**门禁**解释器必须说同一种版本 ──
+    # （份数不写在文案里：那一句「四份」在第五份接进来之后就成了谎话，与 DD 节那个
+    #   写死的「3」是同一处缺陷。）
     _fl, _fp = gate.python_floor()
-    _assert_eq(_fp, [], "今天的四份 workflow 对解释器版本口径一致")
+    _assert_eq(_fp, [], "今天的各份 workflow 的**门禁**解释器口径一致")
     _assert(_fl >= (3, 10), f"地板读出来是个真版本（实际 {_fl}）")
     _assert("python-version" in gate_src and "_PY_FLOOR_PAT" in gate_src,
             "地板是**从 workflow 派生**的，不是在本条款里又抄了一遍数字（抄的那一份会过期）")
@@ -12051,25 +12102,47 @@ def test_installer_env_gate():
             return got
         body = code[oi + 1:fe]
 
-        # 1) 判据链的执行顺序：切 64 位视图 → 清 flag → 读系统版本 → 立刻判 flag。
+        # 1) 判据链的执行顺序：切 64 位视图 → 清 flag → 读 Win10+ 那个值 → 立刻判 flag
+        #    → 读不到就退到老口径（MajorVersion/MinorVersion）→ 两条路汇到同一段读取。
         #    IfErrors 夹在别的注册表读取后面就作废（flag 被顶掉），顺序本身是判据。
-        seq = ["SetRegView 64", "ClearErrors", "ReadRegDWORD $R0", "IfErrors envchk_old"]
-        pos = []
+        # 【需求 10B】IfErrors 的跳转目标从 envchk_old 改成 envchk_prewin10：旧写法把
+        # 「读不到 CurrentMajorVersionNumber」直接等同于「拦下」，于是 Win7 永远走不到
+        # 那句地板比较——兼容通道传什么地板都没用，安装器会自己拦死自己。
+        seq = ["SetRegView 64", "ClearErrors", "ReadRegDWORD $R0",
+               "IfErrors envchk_prewin10", "envchk_prewin10:", "ReadRegDWORD $R0",
+               "envchk_common:", "ReadRegStr $8"]
+        # 逐项**向后**找：允许同一个 needle 出现两次（两条读取路径上都是
+        # ReadRegDWORD $R0）。上一版用「从开头找第一个」的 next()，第二个 $R0 又落回
+        # 第一处的下标，于是 pos != sorted(pos) 永远成立——基线自己就红，而且它把
+        # 后面每一路变异的红话都污染成同一句「顺序不对」（2026-11-20 实跑才暴露）。
+        pos, _cur = [], -1
         for needle in seq:
-            i = next((j for j, (_n, s) in enumerate(body) if s.startswith(needle)), None)
+            i = next((j for j in range(_cur + 1, len(body))
+                      if body[j][1].startswith(needle)), None)
             if i is None:
-                got.append(f".onInit 里找不到「{needle}」这句：体检链断了，"
-                           "Win7/8 会漏拦或 Win10 会误拦")
+                got.append(f".onInit 里找不到「{needle}」这句（或它没排在上一句之后）："
+                           "体检链断了，Win7/8 会漏拦或 Win10 会误拦")
+            else:
+                _cur = i
             pos.append(i)
         if None not in pos and pos != sorted(pos):
             got.append(f"体检链顺序不对（{' → '.join(seq)} 必须按这个次序执行）："
                        "IfErrors 不紧跟在读版本那一句后面，error flag 就被中间那句读取顶掉，"
                        "老系统判据作废")
-        # 2) IntCmp 逐字钉：三个跳转依次「相等/小于/大于」，major=10 的 Win10 是相等。
+        # 2) 两级比较逐字钉：major 比完还要比 minor。三个跳转依次「相等/小于/大于」，
+        #    两行都必须「相等→往下、小于→拦、大于→放行」。
+        #    为什么必须有第二行：Vista 是 6.0、Win7 是 6.1、Win8 是 6.2，地板 6.1 若只比
+        #    major，Vista 会在「相等」那一格被放行，然后到用户机器上变成一个打不开的图标。
         ic = next((s for _n, s in body if s.startswith("IntCmp $R0")), None)
-        if ic != "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok":
-            got.append(f"IntCmp 参数顺序必须逐字是「相等→envchk_ok 小于→envchk_old 大于→envchk_ok」，"
-                       f"实际：{ic}——相等那一格写反，major=10 的正常 Win10 会被当成老系统拦下")
+        if ic != "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_same_major envchk_old envchk_ok":
+            got.append(f"major 那一格 IntCmp 必须逐字是「相等→envchk_same_major 小于→envchk_old "
+                       f"大于→envchk_ok」，实际：{ic}——相等那一格写反，major=10 的正常 Win10 "
+                       "会被当成老系统拦下；直接写 envchk_ok 则 Vista(6.0) 会被 6.1 的地板放行")
+        ic2 = next((s for _n, s in body if s.startswith("IntCmp $R7")), None)
+        if ic2 != "IntCmp $R7 ${MIN_WIN_MINOR} envchk_sp envchk_old envchk_ok":
+            got.append(f"minor 那一格 IntCmp 必须逐字是「相等→envchk_sp 小于→envchk_old "
+                       f"大于→envchk_ok」，实际：{ic2}——少了这一行，地板里的 minor 就是装饰品，"
+                       "Vista(6.0) 与 Win7(6.1) 在判据里是同一台机器")
         # 3) 空串兜底 + 先记日志再下结论
         if not any(s.startswith('StrCmp $R0 "" envchk_old') for _n, s in body):
             got.append("IntCmp 前没有「空串也按老系统拦」的兜底：flag 之外的失败表示法"
@@ -12087,7 +12160,7 @@ def test_installer_env_gate():
         om = next((j for j, (_n, s) in enumerate(body)
                    if s == 'MessageBox MB_OK|MB_ICONSTOP "$R6"'), None)
         isl = next((j for j, (_n, s) in enumerate(body)
-                    if s.startswith("IfSilent envchk_old_abort")), None)
+                    if s.startswith("IfSilent envchk_abort")), None)
         if om is not None and (isl is None or isl > om):
             got.append("老系统分支里 IfSilent 必须排在 MessageBox 之前：静默安装（运维推送 /S）"
                        "里没人能点那个「确定」，安装进程会一直挂到被超时杀掉")
@@ -12126,6 +12199,85 @@ def test_installer_env_gate():
         if "b2bcollect_build/installer/deps/" not in gi:
             got.append(".gitignore 没有挡 b2bcollect_build/installer/deps/：25MB 的微软运行库"
                        "一旦被谁 git add 进来，clone 从此大 25MB，微软换版还要跟二进制 diff 斗")
+        # 9) 【需求 10B】地板必须「可覆盖 + 有默认 + 文案同源」，且两条包共用同一份 nsi。
+        #    为什么不复制一份 nsi：两份文件会把「缺依赖当场补装」「体检日志」「旧实例
+        #    探测」这些踩过坑的逻辑再抄一遍，抄第二遍的东西一定会漂（同一教训见依赖
+        #    清单收成一份文件那一格）。
+        for _name in ("MIN_WIN_MAJOR", "MIN_WIN_MINOR"):
+            if f"!ifndef {_name}" not in text:
+                got.append(f"{_name} 没有包在 !ifndef 里：makensis 命令行上的 -D 先于脚本生效，"
+                           "直接 !define 会把兼容通道传进来的地板**静默盖掉**——地板回到 10，"
+                           "兼容包在 Win7 上照样拦，而构建全绿、日志一句不报")
+        # 拦下文案的第一句必须引用地板宏。写死"Windows 10"的那一版，在兼容包里会把
+        # 「这台明明够格」的用户按一句话拦走——弹窗说的必须就是 IntCmp 判的那件事。
+        _first_line = next((s for _n, s in code
+                            if s.startswith('StrCpy $R6 "') and "版本低于" in s), None)
+        if _first_line is None:
+            got.append("找不到「系统版本低于 …」那句拦下文案：体检拦下时不给原因，"
+                       "用户只会看到一个没装成功的开始菜单图标")
+        elif "${MIN_WIN_TEXT}" not in _first_line:
+            got.append(f"拦下文案第一句没引用 ${{MIN_WIN_TEXT}}（实际：{_first_line[:48]}…）："
+                       "地板可以改、文案写死，两边就会各说一套")
+        if "!define MIN_WIN_TEXT" not in text:
+            got.append("没有 ${MIN_WIN_TEXT} 这一处唯一定义：系统名散落在多条文案里，"
+                       "改地板时必漏其中一条")
+        # 「去索取兼容版安装包」这句指路只许出现在主包分支里：兼容包自己不许把用户
+        # 指回「去拿一个他手上正在用的东西」。
+        # 【为什么不用 text.find("!ifdef HAS_LEGACY_HINT")】——上一版就是这么写的，于是
+        # 宏名写成 HAS_LEGACY_HINT_TYPO 的变异**完全骗过了它**（前者是后者的前缀，find
+        # 照样命中），而宏名写错恰恰是这句话漏出主包分支的头一种方式。子串判据在
+        # 「名字可能被加后缀」的地方等于没有判据：这里按行取出指令的第一个 token 做全等。
+        _lines = [ln.strip() for ln in text.splitlines()]
+        # 对**每一处**命中都回溯：只查第一处的话，「把这句复制一份到 !else 那一支」这种
+        # 走法永远检不到——一条只盯首次出现的判据，等于给「多写一处」开了后门。
+        _his = [i for i, s in enumerate(_lines)
+                if "B2bCollectToolSetup_Win7.exe" in s and s.startswith("StrCpy")]
+        if not _his:
+            got.append("找不到「向管理员索取兼容版安装包」那句指路：主包拦下 Win7 用户时，"
+                       "手里没有一条能走通的出路")
+        for _hi in _his:
+            _depth, _guard, _saw_else = 0, None, False
+            for _i in range(_hi - 1, -1, -1):
+                _s = _lines[_i]
+                if _s.startswith("!endif"):
+                    _depth += 1
+                elif _s.startswith("!else") and _depth == 0:
+                    # 同层见过 !else ⇒ 这句在**另一支**里（也就是兼容包编出来会带上它），
+                    # 后面再撞上 !ifdef 也不能算过关。
+                    _saw_else = True
+                elif _s.startswith(("!ifdef ", "!ifndef ", "!if ")):
+                    if _depth == 0:
+                        _guard = _s
+                        break
+                    _depth -= 1
+            _tok = _guard.split(None, 1)[1].strip() if _guard and " " in _guard else None
+            if _saw_else:
+                got.append(f"兼容版包名那句指路在 !else 那一支里（行 {_hi + 1}）：它会被编进"
+                           "**兼容包**，而兼容包的用户手里拿的就是兼容版")
+            elif _tok != "HAS_LEGACY_HINT":
+                got.append(f"兼容版包名那句指路（行 {_hi + 1}）没被 !ifdef HAS_LEGACY_HINT 直接包住"
+                           f"（实际外层是「{_guard or '没有编译期开关'}」）：兼容通道编出来的包也会"
+                           "喊「去索取兼容版」，而用户手里拿的就是兼容版")
+        # 10) 标签唯一：重复标签是 makensis 的编译错误，而本机（Mac）编译不了 NSIS——
+        #     这一格是那段脚本**唯一**的本地防线。2026-11-20 加 Win7 缺 SP1 分支时，我就
+        #     这么造出了一个重复的 envchk_old_abort，靠的正是这条而不是云端试错。
+        _seen = {}
+        for _n, _ln in enumerate(text.splitlines(), 1):
+            if _ln[:1].isspace() or not _ln.rstrip():
+                continue
+            _m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*$", _ln.rstrip())
+            if _m:
+                _seen.setdefault(_m.group(1), []).append(_n)
+        _dup = {k: v for k, v in _seen.items() if len(v) > 1}
+        if _dup:
+            got.append("标签重复：" + "、".join(f"{k}（行 {v}）" for k, v in _dup.items())
+                       + "——makensis 会直接报「label already defined」，而本机编译不了 NSIS，"
+                       "这一格就是它唯一的本地防线")
+        # 11) 跳 Call EnvLog 活着的寄存器不许是 $9：EnvLog 内部拿 $9 当文件句柄。
+        #     新加的小版本/SP 字段若寄在 $9，会被下一句 Call 静默换成一个句柄数字。
+        _el = re.search(r"Function EnvLog\n(.*?)\nFunctionEnd", text, re.S)
+        if _el and "$9" in _el.group(1) and re.search(r"ReadReg(DWORD|Str) \$9\b", text):
+            got.append("有版本字段寄在 $9，而 EnvLog 用 $9 当文件句柄：Call 一过值就变成句柄号")
         return got
 
     _assert_eq(_problems(_real, _gi), [],
@@ -12137,20 +12289,46 @@ def test_installer_env_gate():
     # ── 变异复验：每一路都必须被杀红，且红话要点名当初的代价 ──
     _muts = (
         ("IntCmp 顺序写反",
-         "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok",
+         "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_same_major envchk_old envchk_ok",
          "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_old envchk_ok envchk_ok",
-         "major=10 的正常 Win10 会被当成老系统拦下"),
-        ("IfErrors 判据丢失", "    IfErrors envchk_old 0\n", "",
+         "会被当成老系统拦下"),
+        ("minor 那一行删掉（地板只比 major）",
+         "    IntCmp $R7 ${MIN_WIN_MINOR} envchk_sp envchk_old envchk_ok\n", "",
+         "Vista"),
+        ("IfErrors 判据丢失", "    IfErrors envchk_prewin10 0\n", "",
+         "体检链断了"),
+        ("老系统退路读回 envchk_old（10B 前的写法）",
+         "    IfErrors envchk_prewin10 0\n", "    IfErrors envchk_old 0\n",
          "体检链断了"),
         ("InitPluginsDir 删掉", "    InitPluginsDir\n", "",
          "名字就叫「$PLUGINSDIR」的真实目录"),
         ("SetRegView default 删掉", "    SetRegView default\n", "",
          "64 位视图会带进安装段"),
-        ("静默分支删掉", "    IfSilent envchk_old_abort 0\n", "",
+        ("静默分支删掉", "    IfSilent envchk_abort 0\n", "",
          "安装进程会一直挂到被超时杀掉"),
         ("Sysnative 判据删掉",
          '    IfFileExists "$WINDIR\\Sysnative\\vcruntime140.dll" redist_done 0\n', "",
          "缺运行库的机器就会装出双击报错的产物"),
+        # 【需求 10B 新增的四路】每一路都是「构建全绿、只有真机才会知道」那一类：
+        # 拦不住它们的代价不是一句报错，是一个发给用户、在他机器上打不开的图标。
+        ("地板写成直接 !define（-D 会被静默盖掉）",
+         "!ifndef MIN_WIN_MAJOR\n  !define MIN_WIN_MAJOR 10\n!endif",
+         "!define MIN_WIN_MAJOR 10",
+         "静默盖掉"),
+        ("拦下文案写死系统名",
+         'StrCpy $R6 "这台电脑的系统版本低于 ${MIN_WIN_TEXT}',
+         'StrCpy $R6 "这台电脑的系统版本低于 Windows 10',
+         "各说一套"),
+        ("指路那句挪出主包分支",
+         "!ifdef HAS_LEGACY_HINT", "!ifdef HAS_LEGACY_HINT_TYPO",
+         "用户手里拿的就是兼容版"),
+        ("指路那句挪到 !else 那一支（会被编进兼容包）",
+         '    StrCpy $R6 "$R6这个兼容版安装包已经把运行环境降到',
+         '    StrCpy $R6 "兼容版 B2bCollectToolSetup_Win7.exe 也救不了这台；$R6这个兼容版安装包已经把运行环境降到',
+         "在 !else 那一支里"),
+        ("造一个重复标签（本轮真犯过的错）",
+         "envchk_abort:\n", "envchk_abort:\nenvchk_old:\n",
+         "标签重复"),
     )
     for label, old, new, needle in _muts:
         _mut = _real.replace(old, new, 1)
@@ -12293,7 +12471,10 @@ def test_chromedriver_source_gate():
             _fn(_raw)
             _assert(False, f"{_name} 必须报「包里没有我要的那一格」（现在被放过了）")
         except KeyError:
-            print(f"  ✅ {_name}：红在 KeyError，不是静默拿到不相干的文件")
+            # 走 _assert 而不是裸 print：这一行是**判定行**（「红在对的异常上」就是一个结论），
+            # 绕过计数器就会让「✅ 的条数」和「断言条数」两个口径分家——按 ✅ 数断言的人
+            # 多算一条从没发生过的判定，而按计数找漏网的人永远看不见它。
+            _assert(True, f"{_name}：红在 KeyError，不是静默拿到不相干的文件")
 
     # ── 2) 驱动 sanity：名字对了不代表能跑 ──
     for _bad, _why in ((b"MZ" + b"x" * 100, "只拿到页头的空壳"),
@@ -12393,12 +12574,23 @@ def test_artifact_step_cwd_gate():
     #    这件事」；同时它钉住修法本身能被接受，否则这条门会把唯一的正确写法关在门外。
     _assert_eq(gate.check_artifact_step_cwd({"夹具": _ok}), [],
                "规范写法不该被拦（拦了就是把修法本身关在门外）")
-    # 真仓库口径必须绿、而且三处入口各判到一处：少一处就是有一个平台的门在空转。
+    # 真仓库口径必须绿、而且**每个入口恰好一处**：少一处就是有一个平台的门在空转。
+    # 期望值不写死数字：写死「3」的那一版在需求 10B 把兼容通道接进来的当场就红了（实得 4）。
+    # 本仓这一族（写死的数量）已经付过三次学费：依赖清单份数、workflow 份数、这里是调用点数。
+    # 入口名单以 CALLERS 登记表为准，而「哪几个平台必须在场」钉**名字**而不是钉个数：
+    # 名字改了会当场响，个数对了但名单漂了不会。
     _texts, _absent = gate.artifact_gate_texts()
-    _assert_eq(_absent, [], "三处打包入口都必须在位（登记了却读不到＝这个平台的产物没人管）")
-    _assert_eq(sum(len(gate._artifact_calls(s)) for s in _texts.values()), 3,
-               "Windows workflow / Mac workflow / 本机 Mac 脚本各判到一处剪裁+重量调用，"
-               "多出来或少一处都要先看清楚是不是入口写法分叉了")
+    _assert_eq(_absent, [], "登记的打包入口都必须在位（登记了却读不到＝这个平台的产物没人管）")
+    _by_caller = {}
+    for _k in _texts:
+        _by_caller.setdefault(_k.split(" · ")[0], []).append(_k)
+    _assert_eq({k: len(v) for k, v in sorted(_by_caller.items())},
+               {k: 1 for k in _by_caller},
+               "每个打包入口恰好判到一处剪裁+重量调用（两处＝入口写法已经分叉、"
+               "同一产物被量了两遍；零处不会出现在这张表里，由上面那条与「现在没人执行」兜住）")
+    _assert(set(_by_caller) >= {"Windows workflow", gate.LEGACY_WORKFLOW_LABEL,
+                                "Mac workflow", "本机 Mac 打包脚本"},
+            f"四个平台入口都必须在视野里（实得={sorted(_by_caller)}）：少一处就是那个平台的产物没人管")
     _assert_eq(gate.check_artifact_step_cwd(), [], f"真仓库现在就该是绿的：{_texts.keys()}")
 
     # 1) 七路变异：每一路都要红，而且红话里要点名代价（只要求「非空」的门迟早被不相干的
@@ -12479,6 +12671,259 @@ def test_artifact_step_cwd_gate():
         "没带产物旗标的调用不属于这一条的视野（误报就是把门变成噪音）")
 
 
+# ── DF. 第 42 条·乙丙：两条通道「同源」这句话要有牙 ────────────────────
+def test_legacy_channel_gate():
+    """DF. 兼容通道与主通道逐字节同源：单独改一边必须红，而注释不能被当成调用。"""
+    print("\n═══ DF. 第 42 条乙丙：同源对拍（11 路变异 + 3 句话术）═══")
+    # 由来：需求 10B 的兼容通道是从主通道**切片生成**的（debug/gen_legacy_workflow.py）。
+    # 生成只在施工那一刻成立，真正防漂的是这一条门：今后任何一边改了共享步骤，当场红。
+    # 不这么做会得到什么形状的事故，本仓已经付过三次学费（依赖清单、hidden-import、自报对拍）：
+    # 主通道修好了、兼容包还带着旧 bug，而**两条流水都是绿的**。
+    g = _manifest_gate()
+    _main = g.MAIN_WORKFLOW.read_text(encoding="utf-8")
+    _leg = g.LEGACY_WORKFLOW.read_text(encoding="utf-8")
+    _tool = (g.ROOT / g.LEGACY_TOOLCHAIN_SCRIPT).read_text(encoding="utf-8")
+
+    # 0) 真仓库必须绿，接线两件必须在位。登记缺一件，这一条管不到兼容通道的清单/shell。
+    _assert_eq(g.check_legacy_channel(), [], "真仓库现在就该绿（不绿就是两条通道已经漂了）")
+    _assert(g.LEGACY_WORKFLOW_LABEL in g.CALLERS, "兼容通道必须进 CALLERS（不进它的打包清单没人对拍）")
+    _assert(g.LEGACY_WORKFLOW_REL in g.WORKFLOWS, "兼容通道必须进 WORKFLOWS（不进它的 shell 不过真解析器）")
+    # 0b) 同源门红的时候给的修法是一句「重跑生成器即可对齐」——那这条逃生通道本身必须在位。
+    # 只判两份 yml 逐字节相同是不够的：生成器丢了/没提交时这一条门**照样绿**，而 CI 检出的
+    # 是提交态——那里没有未跟踪的文件，于是没人能执行那句修法，只能手改 yml（正是本条门要防的
+    # 动作）。路径从兼容通道头部注释里**读出来**再核对，不在这里抄一遍：以后改名要么连注释
+    # 一起改、要么这一格当场红，不许它静默指向一个不存在的文件。
+    _hdr = re.search(r"由\s+(debug/[\w.]+\.py)\s+从主通道", _leg)
+    _assert(_hdr is not None, "兼容通道头部注释要写明生成器是谁（没写=这一格只能靠人回忆）")
+    if _hdr:
+        _gen_rel = _hdr.group(1)
+        _gen = g.ROOT / _gen_rel
+        # 措辞统一成「被验的性质」而不是「失败描述」：_assert 的 msg 在绿的时候也会原样打印，
+        # 写成「不在位：没人能对齐」就会刷出一行 `✅ …不在位…` 这种自相矛盾的话。
+        _assert(_gen.is_file(),
+                f"修法指向的生成器 {_gen_rel} 在位（同源门红了重跑它就走得通）")
+        _gen_state = g.tracked_state(_gen)
+        # 提交态的话术只在红的时候拼：_state_hint 对 ok 返回的是「从未被跟踪」那一档，
+        # 无条件拼上去就是拿一句错话去描述一个通过的结果。
+        _assert(_gen_state == "ok",
+                f"生成器 {_gen_rel} 与提交态一致（干净克隆里也拿得到那句修法）"
+                + ("" if _gen_state == "ok" else f"：{g._state_hint(_gen_rel, _gen_state)}"))
+    # 注入面与真读盘同结论：不同就是判据偷偷依赖了其它现场状态。
+    _assert_eq(g.check_legacy_channel(main_text=_main, legacy_text=_leg, toolchain_text=_tool), [],
+               "三份文本原样喂进去必须与读盘同结论")
+
+    # 1) 三句红话术各自钉住。上一版这里只会说「行数都不同（14 vs 14）」——一句自相矛盾的
+    #    谎话（splitlines() 丢了尾部换行）；一条说不清真因的红比不红更糟，因为下一个
+    #    人会去改打包参数而不是重跑生成器。
+    _assert("只差**尾部空行**" in g._body_diff_hint("a\nb\n", "a\nb"),
+            "行内容全同、只差尾部换行时要说出真相（不许说成行数不同）")
+    _assert("第 1 行内容不同" in g._body_diff_hint("a\n", "b\n"),
+            "行内容不同要指到具体那一行")
+    _assert("行数不同" in g._body_diff_hint("a\n", "a\nb\n"),
+            "真行数不同要敢说行数")
+
+    # 2) 十一路变异：每一路都要红，而且红话里要点名代价（只要求「非空」的门迟早被噪声哄绿）。
+    #    锚点一律用**程序化变换**而不是抄长字面量：长字面量在主通道改一个字之后会静默失配，
+    #    于是夹具什么也没改、判据什么也没判，而报告显示绿。
+    def _step_cut(text: str, name: str) -> str:
+        r"""整步删掉（含注释与 env），用来模拟「兼容通道漏抄了一步」。
+
+        按行切而不拿正则猜缩进：上一版这里写的是 `(?:    (?:- |)|      |\n)*`，那个分支
+        在步骤体中间的缩进上就停了——删不干净整步，夹具变成「什么都没改」的恒真夹具。
+        步头只有一个口径：四空格加 `- `；步骤内部再怎么缩进也不会撞这个前缀。
+        """
+        out, dropping = [], False
+        for ln in text.splitlines(keepends=True):
+            if ln.startswith("    - "):
+                dropping = ln.strip() == f"- name: {name}"
+            if not dropping:
+                out.append(ln)
+        assert "".join(out) != text, f"夹具没命中步骤「{name}」（锚点漂了，这条变异是恒真的）"
+        return "".join(out)
+
+    def _step_shell_swap(text: str, name: str) -> str:
+        """只把**指定那一步**的 `shell: bash` 换成 pwsh，别的一步不动。
+
+        上一版写的是 `text.replace("      shell: bash", ..., 1)`：全文**第一处**那个缩进根本不
+        在 SHARED_STEPS 的比对视野里——于是夹具什么都没改，判据什么都不判，而报告不会告诉你
+        这件事。这是比「判据没有牙」更糟的形状：**假绿**（实测本轮就是这样，直到我把这一路
+        跑了一遍才逮出来）。
+        """
+        lines = text.splitlines(keepends=True)
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("    - "):
+                if start is not None:
+                    break
+                if ln.strip() == f"- name: {name}":
+                    start = i
+        assert start is not None, f"夹具没找到步骤「{name}」（锚点漂了，这一路变异是恒真的）"
+        for j in range(start, len(lines)):
+            if lines[j].startswith("      shell: bash"):
+                lines[j] = lines[j].replace("shell: bash", "shell: pwsh", 1)
+                return "".join(lines)
+        raise AssertionError(f"步骤「{name}」里没有 shell: bash 那一行（夹具写法已漂）")
+
+    _INJECT = "        python .github/scripts/inject_build_config.py\n"
+    # 每一路 = （标题, 改哪份文本, 怎么改, 红话必须点名代价）。不预先算好文本再塞进表里：
+    # 改成传函数，是为了下面循环里能统一断一句「真的改动了」——上一版只有 _step_cut 自带
+    # 这句保险，其余每一路都可能因为锚点漂掉而变成恒真夹具。
+    _cases = (
+        ("单独改兼容通道的共享步骤", "legacy_text",
+         lambda t: t.replace(_INJECT, "        echo 我先加了一行\n" + _INJECT, 1),
+         "不再逐字节相同"),
+        ("单独改主通道的共享步骤（反向）", "main_text",
+         lambda t: t.replace(_INJECT, _INJECT + "        echo 主通道多加一行\n", 1),
+         "不再逐字节相同"),
+        ("只在兼容通道多一个排版空行", "legacy_text",
+         lambda t: t.replace(_INJECT, _INJECT + "\n", 1), "只差**尾部空行**"),
+        ("共享步骤的 shell 被改成 pwsh", "legacy_text",
+         lambda t: _step_shell_swap(t, "Write bundled config.json from Secrets"), "shell 不同"),
+        ("兼容通道漏抄一步（整步删掉）", "legacy_text",
+         lambda t: _step_cut(t, "Package Windows artifacts"), "兼容通道里没有步骤"),
+        ("PyInstaller 参数漂了一个（归一化不许放过）", "legacy_text",
+         lambda t: t.replace('"$TARGET_PY" -m PyInstaller',
+                             '"$TARGET_PY" -m PyInstaller --noupx', 1),
+         "除解释器 token 外不再相同"),
+        ("驱动上限从 109 漂到 120", "legacy_text",
+         lambda t: t.replace("--max-major 109", "--max-major 120", 1), "109"),
+        ("安装器地板改回 Win10", "legacy_text",
+         lambda t: t.replace('MIN_WIN_MAJOR: "6"', 'MIN_WIN_MAJOR: "10"', 1), "major=6"),
+        ("地板只留在注释里（注释不算在场）", "legacy_text",
+         lambda t: t.replace('        OUT_FILE: "B2bCollectToolSetup_Win7.exe"',
+                             "        # OUT_FILE: \"B2bCollectToolSetup_Win7.exe\"", 1),
+         "B2bCollectToolSetup_Win7.exe"),
+        ("兼容通道真的开始发清单了", "legacy_text",
+         lambda t: t + "    - name: Publish manifest\n      shell: bash\n"
+                       "      run: python .github/scripts/make_release_manifest.py\n",
+         "开始生成发布清单"),
+        ("体检脚本里的目标档漂成 3.9", "toolchain_text",
+         lambda t: t.replace("TARGET_FLOOR = (3, 8)", "TARGET_FLOOR = (3, 9)", 1),
+         "(3, 8)"),
+    )
+    _SRC = {"legacy_text": _leg, "main_text": _main, "toolchain_text": _tool}
+    for label, key, mutate, needle in _cases:
+        _new = mutate(_SRC[key])
+        # 恒真夹具保险：没改动文本的变异，就算判据报红了也不算数（红的原因可能与这一路无关）。
+        _assert(_new != _SRC[key],
+                f"变异「{label}」必须真的改动文本（没改动＝这一路夹具是恒真的）")
+        _got = g.check_legacy_channel(main_text=_new if key == "main_text" else _main,
+                                      legacy_text=_new if key == "legacy_text" else _leg,
+                                      toolchain_text=_new if key == "toolchain_text" else _tool)
+        _assert(_got, f"变异「{label}」必须被杀红（全绿＝这一路判据没有牙）")
+        _assert(any(needle in p for p in _got),
+                f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
+
+    # 3) 本轮真正跑出来的那条**假红**：交付边界说明里写着「不发清单」，里面点名了那两份
+    #    脚本的名字。注释里的指路话不算调用（本仓在陷阱门上早有此约），所以这一路必须绿。
+    _green = _leg + ("    # 这一路不发 OSS 直链也不发清单：make_release_manifest.py 与 "
+                     "upload_release_to_oss.py 都等需求 10C 一起接\n")
+    _assert_eq(g.check_legacy_channel(main_text=_main, legacy_text=_green, toolchain_text=_tool), [],
+               "只在注释里提到那两份脚本不该红（拦了解释性注释，就是拦下「把边界写清楚」这件事）")
+
+
+# ── DG. 第 42 条·甲：3.8 地板门与双解释器体检脚本 ────────────────────
+def _legacy_toolchain_gate():
+    """把双解释器体检脚本当模块载进来（判据本体，不在这里抄一份）。"""
+    global _LEGACY_TC_MOD
+    if _LEGACY_TC_MOD is None:
+        _p = _REPO / ".github" / "scripts" / "check_legacy_toolchain.py"
+        _spec = importlib.util.spec_from_file_location("_legacy_toolchain_gate", _p)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _LEGACY_TC_MOD = _mod
+    return _LEGACY_TC_MOD
+
+
+def test_py38_floor_gate():
+    """DG. 进包源码必须落在 3.8 地板之下；双解释器体检的四档判定逐档验。"""
+    print("\n═══ DG. 第 42 条甲：3.8 地板门 + 双解释器体检（含真跑一次冒烟）═══")
+    g = _manifest_gate()
+    tc = _legacy_toolchain_gate()
+    _p = g.Path("b2bcollect_build/zz_地板夹具.py")
+
+    # 0) 真仓库绿；空视野必须红（在空集合上报「没有不合格」是一句谎话，第 20 条同族）。
+    _assert_eq(g.check_py38_floor(), [], "进包闭包 + 被目标解释器执行的工具脚本现在就该绿")
+    _assert(any("读不到任何进包源码" in x for x in g.check_py38_floor(sources=[])),
+            "空视野不许报绿")
+    # 被目标解释器跑的脚本不在位也要红：兼容通道会红成一句 SyntaxError，而不是「没人判」。
+    _saved = g.FLOOR_BOUND_TOOL_SCRIPTS
+    try:
+        g.FLOOR_BOUND_TOOL_SCRIPTS = (".github/scripts/zz_不存在的工具脚本.py",)
+        _got = g.check_py38_floor(sources=[_p])
+        _assert(any("不在位" in x for x in _got), f"工具脚本缺席必须响：{_got[:1]}")
+    finally:
+        g.FLOOR_BOUND_TOOL_SCRIPTS = _saved
+
+    # 1) 三道检查各自有牙。前两条靠真解析器（feature_version=(3,8)），后两条靠 AST：
+    #    拿本机（比 CI 新）的解释器结论替 3.8 担保，就是这一条要防的事。
+    _assert(any("解析不了" in x for x in g._floor_problems(_p,
+               "x = 1\nmatch x:\n    case 1:\n        pass\n")), "match/case 在 3.8 解析不了→红")
+    _assert(any("PEP 585" in x for x in g._floor_problems(_p,
+               "def f(a: list[str]):\n    return a\n")), "无 future import 的 list[str] 要红")
+    _assert(any("PEP 604" in x for x in g._floor_problems(_p,
+               "def f(a: int | None):\n    return a\n")), "无 future import 的 int | None 要红")
+    _assert(any("ast.unparse" in x for x in g._floor_problems(_p,
+               "import ast\ndef f(t):\n    return ast.unparse(t)\n")), "3.9+ API 要红")
+    _assert(any("graphlib" in x for x in g._floor_problems(_p, "import graphlib\n")),
+            "3.9+ 才有的标准库要红")
+    # 反面（同样是判据的一部分）：三种**写法本身合法**的形状不许红，否则这条门会把修法关在门外。
+    _assert_eq(g._floor_problems(_p,
+               "from __future__ import annotations\ndef f(a: list[str], b: int | None) -> None:\n"
+               "    return None\n"), [], "有 future import 时注解不求值，PEP585/604 无害")
+    _assert_eq(g._floor_problems(_p, "if (n := 3) > 2:\n    pass\ndef f(a, /, b):\n    return a\n"),
+               [], "joker 与只位参数都是 3.8 合法写法，不许误报")
+    _assert_eq(g._floor_problems(_p, "def f(a, b):\n    return a | b\n"), [],
+               "函数体里的 dict | 静态判不出来（这一档诚实边界写在门脚本里，不在这里假装能判）")
+
+    # 2) 双解释器体检：四档判定是纯函数，逐档喂假数据验（不必真有两台解释器）。
+    _T38 = {"version": [3, 8, 18], "bits": 64, "banner": "3.8.18", "executable": "/t/python.exe"}
+    _S311 = {"version": [3, 11, 9], "bits": 64, "banner": "3.11.9", "executable": "/s/python.exe"}
+    _assert_eq(tc.evaluate((3, 11, 9), _T38, _S311, False), [], "四档全对时不许红")
+    for _label, _args, _needle in (
+            ("裸 python 落到 3.8", ((3, 8, 18), _T38, _S311, False), "裸 python"),
+            ("目标是 3.9（Win7 不再支持）", ((3, 11, 9), dict(_T38, version=[3, 9, 13]), _S311, False), "不是 3.9".replace("不是", "是")),
+            ("目标是 32 位", ((3, 11, 9), dict(_T38, bits=32), _S311, False), "32 位"),
+            ("工具链只有 3.10", ((3, 11, 9), _T38, dict(_S311, version=[3, 10, 11]), False), "3.10"),
+            ("两个解释器是同一个", ((3, 11, 9), _T38, _S311, True), "同一个可执行文件"),
+            ("目标解释器问不出话", ((3, 11, 9), {"error": "FileNotFoundError"}, _S311, False), "问不出")):
+        _got = tc.evaluate(*_args)
+        _assert(_got, f"体检变异「{_label}」必须红（不红＝那格判据是空的）")
+        _assert(any(_needle in x for x in _got), f"「{_label}」的红话要说出代价「{_needle}」（实际={_got[:1]}）")
+
+    # 3) 运行时对版：Qt6 / 缺包 / 目标不是 3.8 都要红，正常那一档必须绿。
+    _OK = {"version": [3, 8, 18], "python": "3.8.18", "Qt": "5.15.11", "PyQt5": "5.15.11"}
+    _OK.update({m: "0.0" for m in tc.INVENTORY_MODULES})
+    _assert_eq(tc.evaluate_inventory(_OK), [], "Qt5 + 全部包在位不该红")
+    _assert(any("Qt 5" in x for x in tc.evaluate_inventory(dict(_OK, Qt="6.7.2"))),
+            "带 Qt6 的「Win7 包」必须当场红（runner 是 Win11，下游每一格都会绿）")
+    _assert(any("import 失败" in x for x in tc.evaluate_inventory(
+        dict(_OK, PIL="IMPORT-FAILED ModuleNotFoundError"))), "少装一个包要红（只会少装、不会报错）")
+    _assert(any("不是 3.8" in x or "不是 3.8" in x for x in tc.evaluate_inventory(
+        dict(_OK, version=[3, 11, 9], python="3.11.9"))), "进包环境本身不是 3.8 要红")
+    _assert(any("答不出" in x for x in tc.evaluate_inventory({"error": "boom"})),
+            "读不到运行时不许当「这一格没问题」")
+
+    # 4) 真跑一次冒烟：拿本仓解释器同时当两个参数——分工不成立，必须退 1 并说出哪一档。
+    #    只看单测会放过「脚本根本跑不起来」这一类（argparse 写错、顶层报异常……）。
+    _exe = str(_REPO / ".github" / "scripts" / "check_legacy_toolchain.py")
+    _r = subprocess.run([sys.executable, _exe, "--pin", "--target-py", sys.executable,
+                         "--tool-py", sys.executable], capture_output=True, text=True,
+                        encoding="utf-8", errors="replace")
+    _assert(_r.returncode == 1, f"同一台机器当两个解释器必须退 1（实际 rc={_r.returncode}）")
+    # 子进程原文进文案时由报告层压成一行（`_one_line`）：它们的输出本身就带 `❌ ` 与
+    # `::error::` 前缀，多行直接嵌进来会让日志凭空多出几条「看起来像本套件判定」的行。
+    _assert("同一个可执行文件" in _r.stdout, f"真跑那一趟要说出为什么红：{_one_line(_r.stdout)[-200:]}")
+    # --pin 与 --inventory 都不给：这一格什么都不判，必须自己红（而不是退 0 报绿）。
+    # 两个条件分开断：合在一条里失败时分不清是「退码错」还是「没说为什么」。
+    _r2 = subprocess.run([sys.executable, _exe, "--target-py", sys.executable],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    _assert(_r2.returncode == 1,
+            f"不给判定项的调用不许退 0（实际 rc={_r2.returncode}）：{_one_line(_r2.stdout)[-200:]}")
+    _assert("什么也没判" in _r2.stdout,
+            f"不给判定项的调用要说出它什么都没判：{_one_line(_r2.stdout)[-200:]}")
+
+
 # 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
 # NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
@@ -12505,6 +12950,8 @@ SECTIONS = (
     test_state_file_protection_gate,
     test_package_weight_gate,
     test_artifact_step_cwd_gate,
+    test_legacy_channel_gate,
+    test_py38_floor_gate,
     test_chromedriver_source_gate,
     test_installer_env_gate,
     test_feature_table_gate,

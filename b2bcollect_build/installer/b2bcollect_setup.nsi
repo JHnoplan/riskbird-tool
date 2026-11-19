@@ -110,7 +110,41 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "内部工具"
 ; 所以远程排障只能靠用户拍照——本轮那两张照片才认出是 Win7，代价是一整台机器白装。
 ; 现在不管合格不合格都先写 install_check.log：下一次问一句「你装的那台是什么系统」
 ; 就能直接读出来，不必再猜。
-!define MIN_WIN_MAJOR 10
+; 【需求 10B】地板从「写死」改成「可覆盖 + 有默认」：
+;   · 主通道（Python 3.11）继续用默认 10.0，一句不用传；
+;   · 兼容通道（Python 3.8）在 makensis 那一行传 -DMIN_WIN_MAJOR=6 -DMIN_WIN_MINOR=1，
+;     同一个 .nsi 编出两种地板的安装包。为什么不复制一份 nsi：两份文件会把「缺依赖
+;     当场补装」「体检日志」「旧实例探测」这些已经踩过坑的逻辑再抄一遍，而抄第二遍
+;     的东西一定会漂（同一教训见依赖清单收成一份文件那一格）。
+; !ifndef 而不是直接 !define：makensis 命令行上的 -D 先于脚本生效，直接 !define 会
+; 把传进来的值**静默盖掉**——地板回到 10，兼容包在 Win7 上照样拦，而构建全绿。
+!ifndef MIN_WIN_MAJOR
+  !define MIN_WIN_MAJOR 10
+!endif
+!ifndef MIN_WIN_MINOR
+  !define MIN_WIN_MINOR 0
+!endif
+; 地板的「人话」写法。弹窗与 Abort 文案一律从这里取，**不许在文案里再手写一次**
+; "Windows 10"：兼容包把地板压到 6.1 之后，如果文案还写着「要求 Windows 10」，Win7
+; 用户点开这个**本来就为他的系统打的包**就会看到一句和判据相反的话。判据说什么、
+; 文案就说什么，这件事只能靠「只有一个来源」来保证，不能靠我记得改。
+!ifndef MIN_WIN_TEXT
+  !if ${MIN_WIN_MAJOR} > 6
+    !define MIN_WIN_TEXT "Windows ${MIN_WIN_MAJOR}"
+  !else
+    !if ${MIN_WIN_MINOR} >= 1
+      !define MIN_WIN_TEXT "Windows 7 SP1"
+    !else
+      !define MIN_WIN_TEXT "Windows 7"
+    !endif
+  !endif
+!endif
+; 地板之上的系统该指哪一条出路，也只有地板知道自己是谁：主包可以把用户指向兼容包，
+; 兼容包自己**绝不能**再让用户「去索取兼容包」——那等于让一个已经拿着正确文件的人
+; 回到起点。用 !if 编掉而不是运行时判断，是因为这句话在错误的包里根本不该存在。
+!if ${MIN_WIN_MAJOR} >= 10
+  !define HAS_LEGACY_HINT
+!endif
 !define WIN_NT_KEY "SOFTWARE\Microsoft\Windows NT\CurrentVersion"
 ; 体检日志落在**包外**（与安装目录同级但不由安装程序删）：卸载工具时这段历史还得留着，
 ; 而「下一次也报过同样的错」这条线索只有历史能给。
@@ -142,13 +176,31 @@ Function .onInit
     SetRegView 64
     ClearErrors
     ReadRegDWORD $R0 HKLM "${WIN_NT_KEY}" "CurrentMajorVersionNumber"
-    ; 这个值从 Windows 10 才存在：Win7/8/8.1 上根本没有它，**读不到本身就是系统版本
-    ; 信号**。判据走 error flag 而不是比对某个失败字面量——flag 是唯一稳定的表示法。
-    ; IfErrors 必须紧跟在这一句后面：中间再夹任何一句注册表读取，flag 就被顶掉了。
-    IfErrors envchk_old 0
+    ; 这个值从 Windows 10 才存在。**以前读不到就直接跳 envchk_old**，那一句在需求 10B
+    ; 里是致命的：兼容通道把地板传到 6.1，可 Win7 根本走不到那句比较，安装器会
+    ; **自己把自己拦死**——而构建全绿、文案也挑不出错，只有真机才会知道。
+    ; 现在读不到只说明「这台比 Win10 老」，退去读 Vista 起就一直在的 MajorVersion/MinorVersion。
+    IfErrors envchk_prewin10 0
+    ClearErrors
+    ReadRegDWORD $R7 HKLM "${WIN_NT_KEY}" "CurrentMinorVersionNumber"
+    IfErrors envchk_common 0
+
+envchk_prewin10:
+    ClearErrors
+    ReadRegDWORD $R0 HKLM "${WIN_NT_KEY}" "MajorVersion"
+    IfErrors envchk_common 0
+    ClearErrors
+    ReadRegDWORD $R7 HKLM "${WIN_NT_KEY}" "MinorVersion"
+    IfErrors envchk_common 0
+
+envchk_common:
     ReadRegStr $R1 HKLM "${WIN_NT_KEY}" "CurrentBuildNumber"
     ReadRegStr $R2 HKLM "${WIN_NT_KEY}" "ProductName"
     ReadRegStr $R3 HKLM "${WIN_NT_KEY}" "CurrentVersion"
+    ; 服务包号：Windows 7 上 CSDVersion 是 "Service Pack 1"，裸 SP0 根本没写这个值。
+    ; Python 3.8 依赖的那批系统组件要 SP1，这是「补不了就得在装之前说清楚」那一类。
+    ; 存进 $8、不存 $9：EnvLog 里面拿 $9 当文件句柄（FileOpen $9），跨一句 Call 就没了。
+    ReadRegStr $8 HKLM "${WIN_NT_KEY}" "CSDVersion"
     ReadRegStr $R5 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "PROCESSOR_ARCHITECTURE"
     StrCpy $R4 "图形"
     IfSilent 0 +2
@@ -160,38 +212,92 @@ Function .onInit
     StrCpy $R8 "带了"
 !endif
 
-    StrCpy $R9 "体检：major=$R0 build=$R1 cur=$R3 product=$R2 arch=$R5 方式=$R4 运行库=$R8"
+    StrCpy $R9 "体检：major=$R0 minor=$R7 sp=`$8` build=$R1 cur=$R3 product=$R2 arch=$R5 方式=$R4 运行库=$R8"
     Call EnvLog
 
     ; 先记日志、再下结论——这个顺序本身就是判据（离线门会钉）：日志里没有这台机器的
     ; 底细，「下次装不动再问一句是什么系统」就问不出来。这里再兜一层 flag 之外的失败
     ; 表示法（空串不是任何真实 major，同样按老系统拦）。
     StrCmp $R0 "" envchk_old 0
-    ; IntCmp 的三个跳转依次是「相等 / 小于 / 大于」：major=10 的 Win10 是**相等**，
-    ; 必须落到 envchk_ok。参数顺序由 test_installer_env_gate 逐字钉住——写反一次的
-    ; 代价是全量 Win10 用户被当成老系统拦下，而本机怎么试都试不出来（本机是 Mac，
-    ; makensis 只在云端跑）。
-    IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok
+    ; 【两级比较】IntCmp 的三个跳转依次是「相等 / 小于 / 大于」。只比 major 不够：
+    ; Vista 是 6.0、Win7 是 6.1、Win8 是 6.2、Win8.1 是 6.3，地板 6.1 若只比 major，
+    ; Vista(6.0) 会在「相等」那一格被放过去——而它装不上 Python 3.8 的运行库。
+    ; 参数顺序由 test_installer_env_gate 逐字钉住：写反一次的代价是全量 Win10 用户
+    ; 被当成老系统拦下，而本机怎么试都试不出来（本机是 Mac，makensis 只在云端跑）。
+    IntCmp $R0 ${MIN_WIN_MAJOR} envchk_same_major envchk_old envchk_ok
+
+envchk_same_major:
+    IntCmp $R7 ${MIN_WIN_MINOR} envchk_sp envchk_old envchk_ok
+
+envchk_sp:
+    ; 走到这里表示 (major,minor) 正好落在地板上。只有地板就是 6.1（Windows 7）时
+    ; SP1 才是额外条件；用 !if 编掉而不是运行时判断，Win10 主包不该被这句话影响。
+!if ${MIN_WIN_MAJOR} == 6
+!if ${MIN_WIN_MINOR} == 1
+    StrCmp $8 "" envchk_sp0 envchk_ok
+!endif
+!endif
+    Goto envchk_ok
+
+envchk_sp0:
+    ; Win7 裸 SP0：这一台不是「不能跑这一版」，而是「还差一个微软自己发的服务包」。
+    ; SP1 有几百个补丁、要重启，安装器不该背着它（也不可能在一次静默安装里做完），
+    ; 但必须把这句话讲到人听得懂——那正是需求 10「不用额外自己解决」的另一面：
+    ; 能补的当场补，补不了的在装之前就说清差什么。
+    StrCpy $R6 "这台电脑是 Windows 7，但没有装 Service Pack 1（SP1）。$\n$\n"
+    StrCpy $R6 "$R6本兼容版用的 Python 运行时从 Windows 7 SP1 起才能启动：缺的那批系统组件"
+    StrCpy $R6 "$R6是微软服务包的一部分，不是本安装器能补上的，所以这里没有继续安装。$\n$\n"
+    StrCpy $R6 "$R6两条出路：$\n"
+    StrCpy $R6 "$R6   · 用 Windows 更新装好 Service Pack 1，重启后再双击这个安装包；$\n"
+    StrCpy $R6 "$R6   · 或者换一台 Windows 10/11 的电脑用主版本安装包。$\n$\n"
+    StrCpy $R6 "$R6本次没有写入任何文件，你的登录状态与采集数据都没有被动过。$\n"
+    StrCpy $R6 "$R6详细信息已记进：${CHECK_LOG}"
+    StrCpy $R9 "结论：Windows 7 缺 SP1（CSDVersion 为空），本次安装已拦下"
+    Call EnvLog
+    IfSilent envchk_abort 0
+    MessageBox MB_OK|MB_ICONSTOP "$R6"
+    ; 必须 Goto：下面就是 envchk_old，掉下去会把「缺 SP1」这台机器拿「系统太老」的
+    ; 文案再讲一遍——同一件事给两个原因，排障的人就会两个都不信。
+    Goto envchk_abort
 
 envchk_old:
     ; 老系统：把「为什么装了也打不开」讲完再中止。文案逐句 StrCpy 拼进寄存器，
     ; 不用行尾续行（makensis 会把续行后的引号串当成额外参数，弹窗就只剩第一句）。
-    StrCpy $R6 "这台电脑的系统版本低于 Windows 10（$R2，版本 $R3，内部版 $R1）。$\n$\n"
-    StrCpy $R6 "$R6本工具的运行环境要求 Windows 10 或更高：程序用的 Python 运行时从 Windows 10 起才有那个系统组件，$\n"
+    ; 【地板同源】下面每一句里的系统名都是 ${MIN_WIN_TEXT}，不写死 Windows 10：
+    ; 兼容包把地板压到 6.1 后，弹窗得改成「比 Windows 7 SP1 还老」，否则用户会被
+    ; 一句与自己无关的要求打发走。文案与判据只许一个来源，就在这一句宏上。
+    StrCpy $R6 "这台电脑的系统版本低于 ${MIN_WIN_TEXT}（$R2，版本 $R3，内部版 $R1）。$\n$\n"
+!ifdef HAS_LEGACY_HINT
+    ; 主包（地板 = Win10）：拦下是因为运行时那批系统组件这台根本没有，同时要把用户
+    ; 指到真正能为他的系统打的那一版上去。
+    StrCpy $R6 "$R6本工具的运行环境要求 ${MIN_WIN_TEXT} 或更高：程序用的 Python 运行时从 Windows 10 起才有那个系统组件，$\n"
     StrCpy $R6 "$R6缺的那几个文件不是安装步骤能补上的，所以这里没有继续安装——装完也只会得到一个双击就报错的图标。$\n$\n"
     StrCpy $R6 "$R6两条出路：$\n"
     StrCpy $R6 "$R6   · 换一台 Windows 10/11 的电脑运行这个安装包；$\n"
     StrCpy $R6 "$R6   · 向管理员索取「兼容版安装包」（文件名 B2bCollectToolSetup_Win7.exe），它是专为老系统打的那一版。$\n$\n"
+!else
+    ; 兼容包自己（地板 < Win10）：能补的运行库本包会当场补，走到这一格只能是真的比
+    ; 地板还老（Vista/XP/裸 Win7 之外的系统）。这里绝不能再说「去索取兼容版」——
+    ; 用户手里拿的**就是**兼容版，那句指路等于把他送回起点。
+    StrCpy $R6 "$R6这个兼容版安装包已经把运行环境降到 ${MIN_WIN_TEXT}，你这台比它还要老，$\n"
+    StrCpy $R6 "$R6再往前的系统没有可选的运行时了（工具能用的最老一套 Python 也只支持到 Windows 7 SP1）。$\n$\n"
+    StrCpy $R6 "$R6两条出路：$\n"
+    StrCpy $R6 "$R6   · 先把这台升到 ${MIN_WIN_TEXT}（Windows 更新里能找到），再重跑本安装器；$\n"
+    StrCpy $R6 "$R6   · 或者换一台 Windows 10/11 的电脑，用主版本安装包。$\n$\n"
+!endif
     StrCpy $R6 "$R6本次没有写入任何文件，你的登录状态与采集数据都没有被动过。$\n"
     StrCpy $R6 "$R6详细信息已记进：${CHECK_LOG}"
     StrCpy $R9 "结论：环境不合格（$R2 / $R3 build $R1），本次安装已拦下"
     Call EnvLog
     ; 静默安装（运维推送 /S）里 MessageBox 照样会弹并等人点：没人看得见那个窗口，
     ; 安装进程就一直挂到被超时杀掉，日志里只剩一句「安装没结束」。所以静默只写日志。
-    IfSilent envchk_old_abort 0
+    IfSilent envchk_abort 0
     MessageBox MB_OK|MB_ICONSTOP "$R6"
-envchk_old_abort:
-    Abort "这台电脑的系统低于 Windows 10，本工具需要 Windows 10 及以上；本次安装已拦下（详情见 ${CHECK_LOG}）"
+envchk_abort:
+    ; 两个拦下分支（系统太老 / Win7 缺 SP1）共用这一句出口，正文取自 $R6：
+    ; 控制台与退出日志里的那一句，必须和弹窗里说的是同一句——以前这里另写了一句
+    ; 「低于 Windows 10」，地板一改成 6.1 就会变成弹窗说 A、日志记 B。
+    Abort "$R6"
 
 envchk_ok:
     ; 系统版本合格。VC++ 运行库的补装在主程序安装段里（「整批拷贝之后、拷完校验之前」

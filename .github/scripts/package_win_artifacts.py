@@ -769,7 +769,20 @@ def main(argv=None) -> int:
     ap.add_argument("--root", default="b2bcollect_build",
                     help="b2bcollect_build 目录（默认相对当前目录）")
     ap.add_argument("--skip-zip", action="store_true", help="只校验，不生成 zip")
+    # 【需求 10B】绿色包名可覆盖，默认值不变（主通道一句不用传，行为逐字节同今天）。
+    # 为什么开这一个口子而不是让兼容通道自己 zip：zip 的布局判据（顶层一个
+    # B2bCollectTool/ + 那份 ASCII 条目名的使用说明 + 剔运行期目录）是拿真字节对拍
+    # 出来的，抄第二份 zip 逻辑等于把「Apple unzip 解不下去」那一整族坑重新打开一次。
+    # 名字必须能换是另一件事：兼容包与主包同名会在下载侧互相覆盖。
+    ap.add_argument("--portable-name", default=PORTABLE_NAME,
+                    help=f"绿色版 zip 的文件名（默认 {PORTABLE_NAME}；"
+                         "兼容通道传 B2bCollectTool_Win7_portable.zip）")
     args = ap.parse_args(argv)
+    if not args.portable_name.endswith(".zip"):
+        # 这不是排版洁癖：check_portable_zip 验的就是这份字节，名字少了 .zip 后缀，
+        # 下一步 makensis/upload 按约定名去找会找不到，而装配这一步自己照样报绿。
+        print(f"❌ --portable-name 给出的名字不像一个 zip：{args.portable_name!r}")
+        return 1
 
     root = Path(args.root).resolve()
     if not root.is_dir():
@@ -808,7 +821,7 @@ def main(argv=None) -> int:
         prune_runtime(app, problems)
 
     if not args.skip_zip:
-        portable = root / PORTABLE_NAME
+        portable = root / args.portable_name
         build_portable_zip(root, app, guide, portable, problems)
         # 打完立刻验这份字节：条目名与「本机工具真解一次」都对拍。放在这里而不是
         # 另开一步，是因为这一步跑在 Windows runner 上——那才是用户会用来解压的机器。
