@@ -12135,6 +12135,144 @@ def test_feature_table_gate():
                 f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
 
 
+# ── DE. 老系统那一路的驱动货源（需求 10 / 10B 前置） ────────────────────────
+def _drv_mod():
+    """把 .github/scripts/fetch_chromedrivers.py 当模块载进来（判据对象就是它本身）。
+
+    不抄一份提取逻辑进用例：_manifest_gate 同一课——两边各写一套时，同一颗坑要踩两次。
+    """
+    path = _REPO / ".github" / "scripts" / "fetch_chromedrivers.py"
+    _assert(path.is_file(), f"驱动下载脚本必须在位（不在位这一节就是在空转）：{path}")
+    spec = importlib.util.spec_from_file_location("_fetch_chromedrivers", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_chromedriver_source_gate():
+    """DE. 两套货源、一个命名、一道「别把跑不起来的东西注进包」（需求 10）。"""
+    print("\n═══ DE. 兼容通道的 chromedriver：两套货源与一道驱动 sanity ═══")
+    # 由来：需求 10 要出一个能在 Win7/8 上跑的兼容包。那类机器上 Chrome 最高 109（Google 从
+    # 110 起不支持 Win7/8/8.1），而 Chrome for Testing 只发 115+：拿 141 的驱动去驱动装不上
+    # 的浏览器没有意义，只能去旧存储桶 chromedriver.storage.googleapis.com 取。
+    # 这一节的全部意义都在「同一个运行时只能有一套命名与落点」：crawler._driver_path 是根
+    # 据浏览器实际版本挑 chromedriver.<大版本>.exe，两套货源如果最后注进包里的名字不一样，
+    # 兼容包在用户机器上就是「驱动找不到」——而那正好是需求 10 里「装完用不了」的原形。
+    #
+    # 出处不是背文档：初版这里写的包内名字是 `chromedriver_win32/chromedriver.exe`（照包名
+    # 猜的一层目录），本机拉真包才发现 chromedriver.exe 直接在顶层。同一个错发生在 CI 上
+    # 是一句「构建脚本挂了」，发生在用户机器上就是「装完用不了」，所以下面每一格都用**真布
+    # 局的内存 zip**跑一遍，同时验「结构不对必须红在这里」。
+    import io as _io
+    import zipfile as _zip
+    drv = _drv_mod()
+    _exe = b"MZ" + b"\x00" * (2 * 1024 * 1024)      # 过 sanity 的最小合法形状
+
+    def _mkzip(mapping):
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w") as z:
+            for name, data in mapping.items():
+                z.writestr(name, data)
+        return buf.getvalue()
+
+    # ── 1) 两套包布局各自能取到驱动，而且取的是实测那一格的名字 ──
+    # 比较不交给 _assert_eq：它的红话会 repr 出期望与实际，而这里两边都是 2MB 字节，
+    # 一句 ✅ 就能刷出几 MB 屏（本轮真实撞过：日志 33 行、20MB）。只要不等就点名那一段。
+    _legacy_raw = _mkzip({"chromedriver.exe": _exe, "LICENSE.chromedriver": b"MIT"})
+    _cft_raw = _mkzip({"chromedriver-win64/chromedriver.exe": _exe})
+    _assert(drv.extract_legacy_driver(_legacy_raw) == _exe,
+            "旧桶的包：chromedriver.exe 在顶层（本机拉真包 109.0.5414.74 实测的布局）")
+    _assert(drv.extract_win64_driver(_cft_raw) == _exe,
+            "CfT 的包：驱动在 chromedriver-win64/ 一层目录里")
+    # 反向对照：布局互换必须红。写成「猜个目录」的那一版就是把两套货源当成一套，
+    # 它在真包上永远得不到结果——红的必须是它，不能是安静的空文件。
+    for _fn, _raw, _name in ((drv.extract_legacy_driver, _cft_raw, "旧桶拿到 CfT 布局"),
+                             (drv.extract_win64_driver, _legacy_raw, "CfT 拿到旧桶布局")):
+        try:
+            _fn(_raw)
+            _assert(False, f"{_name} 必须报「包里没有我要的那一格」（现在被放过了）")
+        except KeyError:
+            print(f"  ✅ {_name}：红在 KeyError，不是静默拿到不相干的文件")
+
+    # ── 2) 驱动 sanity：名字对了不代表能跑 ──
+    for _bad, _why in ((b"MZ" + b"x" * 100, "只拿到页头的空壳"),
+                       (b"PK\x03\x04" + b"y" * len(_exe), "根本不是 PE")):
+        try:
+            drv._as_driver(_bad, "夹具")
+            _assert(False, f"{_why}必须被拦下（现在被放过了）")
+        except SystemExit as e:
+            _assert("宁可不打包" in str(e), f"红话要说清代价（实际={str(e)[:60]}）")
+    # 反向的反向：真形状不许被拦，否则这条门会把唯一能用的驱动也挡在包外。
+    _assert(drv._as_driver(_exe, "夹具") == _exe, "正经驱动不该被 sanity 拦下")
+
+    # ── 3) 封顶与货源分界：114/115 这一刀切在对的地方 ──
+    _assert_eq(drv.legacy_majors(109), [109, 108, 107],
+               "Win7/8 那一档取 109 往回三个大版本（与主链路同一跨度）")
+    _assert_eq(drv.CFT_MIN_MAJOR, 115,
+               "两套货源的分界：Chrome for Testing 的第一个大版本就是 115")
+
+    # ── 4) main(--max-major) 的真端到端（网络全部桩掉，落点跟着临时 cwd 走）──
+    _old = (drv.fetch_legacy, drv.fetch_json, drv._bytes)
+    _trace = []
+
+    def _run_main(argv):
+        import os as _os
+        with tempfile.TemporaryDirectory() as td:
+            _cwd = _os.getcwd()
+            _os.chdir(td)
+            try:
+                drv.main(argv)
+                return sorted(_os.listdir(drv.OUT_DIR))
+            finally:
+                _os.chdir(_cwd)
+
+    try:
+        # 旧桶那一路：只伪 fetch_legacy，不伪 main 的分支判定——否则「走哪一路」这一件事
+        # 就没人在判（这一节要拦的正是走错货源）。
+        # 这份伪 JSON 的形状不是编的：2026-11-19 拉真 known-good-versions 验过——
+        # `downloads` 是个 **dict**，键为 chrome / chrome-headless-shell / chromedriver，
+        # 每个键下面才是 [{platform, url}]。初版这里把它写成了 list，当场 AttributeError：
+        # 假夹具的形状与真货源不一致时，报出来的是「构建脚本挂了」而不是驱动不对。
+        drv.fetch_legacy = lambda mj: (_trace.append("legacy") or ("%d.0.0" % mj, _exe))
+        drv.fetch_json = lambda url: _trace.append("cft") or {
+            "channels": {"Stable": {"version": "141.0.7310.0"}},
+            "versions": [{"version": "%d.0.0.1" % mj,
+                          "downloads": {"chromedriver": [{"platform": p, "url": "u"}
+                                                         for p in ("linux64", "win64", "mac-x64")]}}
+                         for mj in (141, 140, 139, 115, 114)],
+        }
+        drv._bytes = lambda url: _cft_raw
+        _names = _run_main(["--max-major", "109"])
+        _assert_eq(_names, ["chromedriver.107.exe", "chromedriver.108.exe", "chromedriver.109.exe"],
+                   "封顶 109 时旧桶那一路必须产出三个注版驱动，命名与主链路一致"
+                   "（crawler._driver_path 只认 chromedriver.<大版本>.exe）")
+        _assert_eq(set(_trace), {"legacy"}, f"≤114 必须只走旧桶（实际={_trace}）")
+        _trace.clear()
+        _names = _run_main(["--max-major", "115"])
+        _assert_eq(_trace, ["cft", "cft"], "115 就是 CfT 的第一档，不许误走旧桶")
+        _assert("chromedriver.115.exe" in _names,
+                f"封顶走 CfT 时要拿到不大于 115 的那一档（实际={_names}）")
+        _assert(not any(n.endswith((".141.exe", ".140.exe")) for n in _names),
+                f"封顶了就不许把 141/140 也带进包（实际={_names}）")
+        # 拿不到足够驱动就中止：兼容包里只揣一个驱动的话，用户的浏览器刚好错开那一版
+        # 就是「工具打不开网页」，而这正是需求 10 要修的那件事。
+        _trace.clear()
+
+        def _only_109(mj):
+            if mj != 109:
+                raise SystemExit("旧桶里没有这个版本（桩）")
+            return "109.0.5414.74", _exe
+
+        drv.fetch_legacy = _only_109
+        try:
+            _run_main(["--max-major", "109"])
+            _assert(False, "只拿到一个驱动时必须中止（现在它打算带着一个驱动出包）")
+        except SystemExit as e:
+            _assert("only 1 drivers bundled" in str(e), f"红话要说清拿到几个（实际={e}）")
+    finally:
+        drv.fetch_legacy, drv.fetch_json, drv._bytes = _old
+
+
 # ── DD. 第 41 条：剪裁/重量门的执行位置契约 ────────────────────────────────
 def test_artifact_step_cwd_gate():
     """DD. 同一行 `dist/...` 在两种基准下指两个位置：第 41 条硬门要有牙。"""
@@ -12266,6 +12404,7 @@ SECTIONS = (
     test_state_file_protection_gate,
     test_package_weight_gate,
     test_artifact_step_cwd_gate,
+    test_chromedriver_source_gate,
     test_installer_env_gate,
     test_feature_table_gate,
     test_suite_exit_code_guard_gate,
