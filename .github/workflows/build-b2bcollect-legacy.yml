@@ -1,0 +1,709 @@
+name: Build B2bCollectTool EXE (Windows 7 兼容通道)
+
+# ── 这条流水是干什么的（需求 10B）────────────────────────────────────────────
+# 由来：2026-11-19 一台纯小白的电脑装完主通道安装包，双击只得到两句系统错误
+# （「丢失 api-ms-win-core-path-l1-1-0.dll」/「Failed to load Python DLL python311.dll」）。
+# 需求 10 那一轮已经把「能自动补的当场补」做完了（VC++ 运行库随包带、缺就静默装），
+# 剩下的是**补不了的那一半**：api set 是操作系统自己的组件，安装步骤造不出来。
+# 所以「任何电脑都无需额外解决问题」这句话要成立，就必须真有一个为老系统打的包。
+#
+# 唯一的机械出路：CPython 官方二进制从 3.9 起不再支持 Windows 7，所以**目标解释器**
+# 必须降到 3.8。这条根据决定了本文件与主通道之间**全部**差异，只有三处：
+#   ① 目标解释器 3.8（工具链解释器仍留 3.11，理由见那一步的注释）；
+#   ② 随包 ChromeDriver 取 109 那一档（Chrome 110 起不再有 Win7 版）；
+#   ③ makensis 传地板 6.1 + 另一个包名（同一份 .nsi 编两种地板，不复制脚本）。
+# 其余步骤与主通道**逐字节相同**（第 42 条按步骤名对拍 run 体字节）。为什么这么较真：
+# 两条通道若差在打包参数上，将来主通道加一个 --hidden-import 而兼容包没加，Win7 用户
+# 就会在一个早已修好的功能上再崩一次，而两条流水都是绿的——本项目在依赖清单、
+# hidden-import、自报对拍上各平等过一次这个教训。
+#
+# 交付边界（这一片**不发** OSS 固定直链、不生成发布清单，是有意的、不是没做完）：
+# 直链登记表 upload_release_to_oss.ALLOWED_NAMES 与更新器 tool_update.ALLOWED_ARTIFACTS
+# 逐项对齐，多一条固定链接必须与更新器的读侧一起改（那是需求 10C：一个链接自动选包）。
+# 宁可这一版只出 GitHub 制品，也不在这里悄悄改白名单让主通道的对拍门冒红。
+#
+# 本文件由 debug/gen_legacy_workflow.py 从主通道切片生成；共享步骤请**改主通道**
+# 再重跑生成器，不要在这里单独改（单独改会被第 42 条按成红）。
+on:
+  push:
+    branches: [ main ]
+    paths:
+      # 与主通道同一批源码目录：这些目录改了不重打包，发出去的兼容包就带着旧代码，
+      # 症状是「修好了但没生效」。判据取自 --add-data 自己（第 6 条触发目录检查），
+      # 不在这里另抄一张表——另立一张迟早和清单分叉。
+      - 'b2bcollect_build/**'
+      - 'enf_clean/**'
+      - 'ali1688_build/**'
+      - 'riskbird_build/**'
+      # 这条通道自己的定义，以及两份**共同**影响产物字节的输入：依赖清单（不钉版本，
+      # 由 pip 按 Requires-Python 给 3.8 挑最新版——它一漂，兼容包就跟着漂）与驱动脚本。
+      - '.github/workflows/build-b2bcollect-legacy.yml'
+      - '.github/requirements/b2bcollect.txt'
+      - '.github/scripts/fetch_chromedrivers.py'
+      # 主通道改了打包参数也要跟着重打：第 42 条会当场比对两份 yml 的字节，比对一红
+      # 这里就必须同步——所以不靠人记得来改这一格。
+      - '.github/workflows/build-b2bcollect.yml'
+      # 注意：**不含** .github/release/** 与 make_release_manifest.py。那两处只影响
+      # 发布清单里的 notes 文案，而本通道不发清单、不改产物字节；把它们放进来只会让
+      # 「改一行说明」白烧一次 15 分钟的老系统打包。
+  workflow_dispatch:  # 允许在 Actions 页面手动只打这一条通道
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # 单独一个并发组：与主通道互不取消。两条通道打的是两个不同的包，谁红了都不该把
+    # 对方正在跑的那一份掐掉——那只会让排障时两条日志同时缺一段。
+    concurrency:
+      group: build-b2bcollect-legacy-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.8 (target interpreter：进包的那一个)
+      # 【整条兼容通道的地基】CPython 官方二进制从 3.9 起不再支持 Windows 7，所以想让
+      # 产物在 Win7 上起得来，唯一机械可行的出路是把**目标解释器**降到 3.8。
+      # architecture 显式写 x64、不吃默认值：默认值哪天变成 arm64，我们得到的是一个连
+      # x86_64 都跑不了的包，而 PE 体检那一步只会说「地板不对」，不会说「架构不对」。
+      uses: actions/setup-python@v5
+      id: targetpy
+      with:
+        python-version: '3.8'
+        architecture: x64
+
+    - name: Set up Python 3.11 (toolchain interpreter：跑门禁的那一个)
+      # 为什么要**两个**解释器，而不是整条流水一起降到 3.8：本仓库的构建前硬门自己用了
+      # `ast.unparse`（Python 3.9+ 才有的标准库函数，实测 14 处）。只留 3.8 的话，兼容
+      # 通道第一秒红的是那把尺子而不是被测的东西——这是「判据在错的解释器上瞎掉」那一族
+      # 缺陷，代价比少一个功能大。所以：门禁跑 3.11、产物用 3.8，两者在下一步分别钉死。
+      # 顺序也是判据的一部分：setup-python 每次把所选解释器**前置**进 PATH，后装的 3.11
+      # 因此成为裸 `python`。所有与主通道逐字节相同的步骤写的都是裸 `python`，于是它们
+      # 天然落在工具链解释器上，共享步骤里不必塞任何分支。
+      uses: actions/setup-python@v5
+      id: toolpy
+      with:
+        python-version: '3.11'
+
+    - name: Pin both interpreters (两个解释器各是谁，在这里说死)
+      # 这一格是整条通道唯一能回答「这个包到底是不是 3.8 打的」的地方（为什么只有这里
+      # 判得掉：setup-python 拿不到指定版本时会退而求其次装一个别的版本，而**构建照样一路
+      # 绿**——3.9 与 3.8 的产物在 PE 地板、窗口冒烟、自报对拍这些格子上长得一模一样）。
+      # 四档判定住在 .github/scripts/check_legacy_toolchain.py 里，不写在 yml 的内联
+      # `python -c` 上：第 34 条（语法地板）只看 .py，内联那一份是它的盲区（它自己的红话就
+      # 写着「本条款只看 .py，这一处它看不到」）；提成脚本后这段逻辑才真进判据视野，
+      # 也才能拿假版本元组跑离线夹具——不必真有两台解释器才测得了一把门。
+      # 路径为空的两个守卫留在**这里**：那时连进程都起不来，让 bash 先说清是哪一步没给出。
+      shell: bash
+      run: |
+        set -u
+        TARGET_PY="${{ steps.targetpy.outputs.python-path }}"
+        TOOL_PY="${{ steps.toolpy.outputs.python-path }}"
+        [ -n "$TARGET_PY" ] || { echo "::error::setup-python 没给出目标解释器路径（3.8 那一步没成功，后面的构建全都不算数）"; exit 1; }
+        [ -n "$TOOL_PY" ] || { echo "::error::setup-python 没给出工具链解释器路径（3.11 那一步没成功，门禁会跑在错误的解释器上）"; exit 1; }
+        # 下面这一行跑在裸 `python` 上——它自己是谁，脚本第一档就要回答（PATH 上若落到
+        # 3.8，共享步骤里那些门禁会炸成一句 SyntaxError，听起来像仓库坏了）。
+        python .github/scripts/check_legacy_toolchain.py --pin --target-py "$TARGET_PY" --tool-py "$TOOL_PY" \
+          || { echo "::error::双解释器分工不成立：上面已经点出是哪一档不对，别打这个包"; exit 1; }
+        echo "TARGET_PY=$TARGET_PY" >> "$GITHUB_ENV"
+        echo "TOOL_PY=$TOOL_PY" >> "$GITHUB_ENV"
+
+    - name: Packaging manifest gate
+      # 构建前硬门：把「产物该有的模块与数据」逐项对拍一遍再开建。
+      # 判据在 b2bcollect_build/site_adapters.py 的 EXTERNAL_MODULES（模块的使用者
+      # 自己声明运行时要去 _MEIPASS 找哪些 .py），这里把它与下面 PyInstaller 命令行
+      # 里的 --add-data/--hidden-import 对拍，另加两条：本地模块新增了却没登记
+      # --hidden-import、清单指向的源码已经不存在。
+      # 为什么值得单独一步（2026-11-12 实测）：riskbird_crawler_v2.py 与
+      # aiqicha_crawler_v2.py 没进包时，构建成功、产物自检也通过（那时自检只验凭证），
+      # 用户拿到的包却在「② 公司名单」里只剩企知道一路——**少一个文件不报错、只少
+      # 一个平台**，而症状和「档位没给这个功能」长得一模一样，第一轮排查必然被带去
+      # 查权限。这类缺陷只能在构建前拦，事后靠用户截图发现要往返几个小时。
+      # 纯标准库（ast + 正则），不装任何依赖，所以放在 Install dependencies 之前。
+      shell: bash
+      run: python .github/scripts/check_packaging_manifest.py
+
+    - name: Write bundled config.json from Secrets
+      # 随包凭证注入：值只从 Secrets 经 env 传进进程，绝不 echo、绝不进产物清单之外
+      # 的地方（跑完这一步后 config.json 就在 runner 的临时工作区里，随 job 结束销毁）。
+      # 缺 OSS 两个 Secret 时**当场失败**：过去正因为这里什么都没有，漏配凭证才会一路
+      # 变成一个「能跑但所有人都是精简版」的包发出去。
+      shell: bash
+      env:
+        OSS_AK_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        OSS_AK_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      run: |
+        python .github/scripts/inject_build_config.py
+
+    - name: Install dependencies (装进**目标** 3.8 环境)
+      # 与主通道同一份清单、同一个安装器（多源回退那套逻辑不抄第二遍），差别只有一个：
+      # 用 "$TARGET_PY" 跑。pip_install.py 按 `sys.executable -m pip` 装包——谁跑它就装进
+      # 谁的环境。这里必须是 3.8：装错解释器的形状是「3.11 有 PyQt5、3.8 没有，
+      # PyInstaller 收不到 Qt，产物开不了界面」，而窗口冒烟会红得看不出根因。
+      # 由此产生一条**前置事实**：pip_install.py 自己必须能在 3.8 下解析。它属于
+      # .github/scripts/（默认按工具链 3.11 写），所以第 42 条把它单独点名判语法——
+      # 不判的话，这条通道会在未来某天 pip_install 用上 3.9 写法之后，红成一句
+      # SyntaxError，而不是红成「依赖没装上」。
+      shell: bash
+      run: |
+        set -u
+        "$TARGET_PY" .github/scripts/pip_install.py --upgrade pip
+        "$TARGET_PY" .github/scripts/pip_install.py -r .github/requirements/b2bcollect.txt
+
+    - name: Target runtime inventory (进包的运行时逐一对版)
+      # 装完立刻问**目标环境自己**装到了什么。清单不钉版本是设计（pip 按 Requires-Python
+      # 给 3.8 自动挑还能装的最新版，省掉一份必然漂移的兼容清单），但设计也要落在日志里：
+      # 三个月后有人问「那个 Win7 包带的哪版 selenium / 哪版 Qt」，重跑一次云打包是问不
+      # 出来的，只有这一格留了字。
+      # Qt 主版本在这里被钉死成 5——是判定，不是记录：Qt 6 官方最低支持 Windows 10，而带
+      # Qt6 的「Win7 包」能在所有门禁里全绿（runner 是 Win11）。判定为什么不住在这一段的
+      # heredoc 里（它第一版就住在这里）：第 34 条的内联 python 正则只认字面量 `python` 打头，
+      # `"$TARGET_PY" - <<PYEOF` 是它的**盲区**——提成脚本才真进判据视野，也才喂得进离线夹具。
+      shell: bash
+      run: |
+        set -u
+        python .github/scripts/check_legacy_toolchain.py --target-py "$TARGET_PY" --inventory
+
+    - name: Download chromedrivers (Win7 那一档：最高 109)
+      # 与主通道同一个脚本，只多一个 --max-major：Google 从 Chrome 110 起不再发
+      # Win7/8/8.1 版，那类机器上能装到的最新浏览器就是 109。装一套 141 的驱动去驱动一台
+      # 装不出来的浏览器没有意义，而症状是「采集 1688/企知道时报 cannot connect」——
+      # 一个和「驱动版本」八竿子打不着的话术。旧桶（109/108/107）的取法、命名、落点全部
+      # 在脚本内部，判据在 fetch_chromedrivers.py 与 DE 节离线门里，不在这里抄一份。
+      run: python .github/scripts/fetch_chromedrivers.py --max-major 109
+
+    - name: Write build stamp (版本单一真源，用**目标**解释器跑)
+      # 与主通道同一份 tool_version.py、同一组参数，差别是用 "$TARGET_PY"：这个模块本身
+      # 要进包（--hidden-import tool_version），在 3.8 上跑这一步顺带证明了「随包那份代码
+      # 在老解释器上真能执行」——比只判语法多走了一步。算不出号就红在这一格，理由与主
+      # 通道那条注释相同（红要红在「生成」那一步，不和一堆打包日志混在一起）。
+      shell: bash
+      run: |
+        set -u
+        "$TARGET_PY" b2bcollect_build/tool_version.py --write-stamp b2bcollect_build/version.json --build "${{ github.run_number }}" --commit "${{ github.sha }}"
+
+    - name: Build EXE with PyInstaller
+      # 【需求 10B】本步骤与主通道**逐字节相同**（第 42 条按步骤名对拍 run 体字节）。
+      # 要改这段就先去改主通道，再重跑 debug/gen_legacy_workflow.py；在这里单独改
+      # 会被那条门按成红——而红话会直接说出「两条通道已经不同源」这件事。
+      # hidden-import 覆盖全部本地模块（跨模块新增 import 未被依赖分析收录会导致
+      # exe 启动即 ModuleNotFoundError）；pip 名≠import 名的两个名字都写
+      # （websocket-client→websocket / websocket_client；beautifulsoup4→bs4；pillow→PIL）。
+      # gys_crawler/solarbe_crawler 已下线，不再打包。keyword_expander 为「智能解析」知识库模块。
+      # 权限三件套必须一起写：access_guard（门禁+名单+设备绑定）、edition（能力矩阵，
+      # 界面每个入口都问它）、acl_admin_dialog（等级 0 的「权限管理」面板）。最后这个是
+      # 函数内延迟 import，界面对它做了「加载失败只提示不崩」的降级——漏收不会启动即崩，
+      # 而是管理员点开面板才发现少模块，这种失败最晚暴露、最难查，所以绝不靠运气。
+      # 维护约定：每次给 b2bcollect_build/*.py 新增 import 或新增本地模块，必须把
+      #   grep -hoE "^(import|from) [a-zA-Z_]+" *.py
+      # 与下面两个清单逐行对一次，而不是凭记忆维护（新增采集站 gi_crawler /
+      # makepolo_crawler / maimaib2b_crawler / province_filter / mk_phone_ocr 一度就这么漏过）。
+      # mk_phone_font.json 是马可波罗图片码的字形字典（运行时零标注成本的全部本钱），
+      # 不 --add-data 进包则打包版手机号识别永远拿不到字典。
+      # 必须显式 shell: bash：Windows runner 上 run 步的**默认** shell 是 pwsh，
+      # 上面那句 `[ -f config.json ] || { ...; exit 1; }` 在 PowerShell 里会被当成
+      # 类型表达式解析，当场 ParserError「Missing type name after '['」——构建连
+      # PyInstaller 都没启动就红了（实机踩过）。声明成 bash 之后这一步与 Mac 版
+      # 同一份脚本，两个平台的差异只剩 --add-data 的分隔符和驱动文件名。
+      #
+      # 【本轮根修：去掉 --onefile，改出 onedir 目录】（2026-11-12 Windows 实机崩溃）
+      #   现场：打开工具正常，切换账号后点界面上的「重启」就报
+      #     FileNotFoundError: ...\Temp\_MEI000025982\base_library.zip
+      #   onefile 每次启动都把整个运行时解包到一个 %TEMP%\_MEI<pid> 目录，**退出时删掉**。
+      #   于是「重启自己」天生要和这个回收过程赛跑：旧实例还没删完、新实例已经在同一个
+      #   临时目录上开始解包（PID 复用时会撞名），解到一半的归档被对方删掉，PyInstaller
+      #   的 zipimport 就在那句「读 base_library.zip」上抛 ENOENT——栈里全是
+      #   importlib/_bootstrap 与 zipimport，用户看到的却是一句和账号、和风鸟都无关的
+      #   「找不到文件」，排查方向极容易被带去查网络或权限。
+      #   第二重代价更隐蔽：onefile 的 ``__file__`` 指向那个退出即删的目录，**所有**按
+      #   「模块所在目录」写的缓存、Cookie、字体字典都会每次归零（本项目里是风鸟/爱企查
+      #   的 Cookie 与 30 天列表缓存），症状不是报错，是「每天白烧一遍查询额度」。
+      #   onedir 把这两件事一起消掉：运行时就是安装目录里的真实文件，不解包、不回收、
+      #   没有赛跑，``sys.executable`` 与数据落点都稳定。这也与 Mac 侧本来就用的 onedir
+      #   对齐——两个平台一种交付形态，打包脚本与校验器也少一套分支。
+      #   代价是产物从「一个 exe」变成「一个目录」，所以必须配安装包（下一步 NSIS），
+      #   并且额外留一份目录 zip 作为「不想装东西」的兜底。
+      shell: bash
+      run: |
+        cd b2bcollect_build
+        # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
+        [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
+        # 构建戳不在位就不开建：少了它产物依然能跑、能过 --acl-doctor、能过窗口冒烟，
+        # 却永远说不出自己是哪一版（需求 2 那两行性质全靠这一份戳）。
+        [ -f version.json ] || { echo "::error::b2bcollect_build/version.json 不存在（上一步 --write-stamp 没成功），不许出一个自报不出版本的包"; exit 1; }
+        "$TARGET_PY" -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all lxml --collect-all bs4 --collect-submodules PIL --exclude-module numpy --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --hidden-import website_contact --hidden-import perf_governor --hidden-import field_evidence --hidden-import enrich_waterfall --hidden-import lead_scoring --hidden-import channel_health --hidden-import text_shape --hidden-import crash_forensics --hidden-import site_discovery --hidden-import pinyin_lite --hidden-import exchange_master --hidden-import download_verify --hidden-import chrome_doctor --hidden-import tool_version --hidden-import tool_update --add-data "config.json;." --add-data "version.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\runtime_paths.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+
+    - name: Prune Qt hook leftovers + Artifact weight gate (剪裁 + 成分账)
+      # 需求 5 的构建后一面（与 Mac workflow 同一份实现、同一份剪裁清单）：
+      # --prune-artifact 删掉 hook 连带收件里本工具永远用不到的那批（Windows 产物
+      # 里是 Qt5Quick.dll/Qt5Qml.dll 等同名连带，剪裁清单两平台共用）；
+      # --artifact-weight 跑第 40 条构建后那一面，红得最快，不浪费自检时间。
+      # 必须 cd 进 b2bcollect_build：上一步 PyInstaller 就是在那里跑的，产物住在
+      # b2bcollect_build/dist/。本步从仓库根执行却传 dist/... 的话，剪裁和重量门都会
+      # 「读不到视野」——真实翻车过（run #69），所以脚本侧另有静态判据钉这条 cwd 契约。
+      shell: bash
+      env:
+        # 【需求 10B】只用于报错时点名是哪一份产物（不参与取上限）；提成 env 是为了
+        # 让兼容通道能逐字节复用下面这一行——run 体相同，第 42 条的字节对拍才成立。
+        ARTIFACT_LABEL: "Windows"
+      run: |
+        set -u
+        cd b2bcollect_build
+        python ../.github/scripts/check_packaging_manifest.py \
+          --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \
+          --artifact-label "$ARTIFACT_LABEL"
+
+    - name: PE floor gate (产物字节里写着的最低 Windows 版本)
+      # 需求 10B 里唯一能在**没有 Win7 实机**的情况下机械量出来的一格。为什么量这个：
+      # Windows 加载器映射镜像时会把可选头里的 MajorSubsystemVersion/MinorSubsystemVersion
+      # 与自身版本比对，镜像要得比系统新就当众拒载——用户看到的就是需求 10 那两句英文
+      # 错误，而 PyInstaller、makensis、CI 全都只关心「我有没有写出这个文件」，**构建一句
+      # 错都不报**。也就是说「能不能在老系统上加载」早就写在字节里了，只是没人去读。
+      # 扫整个 dist 目录而不是只扫主 exe：真实地板由它加载的每一个二进制里最高的那一格
+      # 决定（python38.dll / Qt5Core.dll / 随包 chromedriver / selenium-manager.exe），
+      # 只测入口的结论等于没测。
+      # 诚实边界（脚本里也是这么写的，这里不许拔高）：这一格只证「加载器那一关不拦」，
+      # **不**证「Win7 双击一定可用」——运行库是否装齐、驱动能否起来、字体/显卡回退都不在
+      # 这张表里。前者由安装器体检补装（需求 10 已交付），后者必须回 Win7 实机验收。
+      shell: bash
+      run: |
+        set -u
+        cd b2bcollect_build
+        python ../.github/scripts/check_pe_floor.py --scan-dir dist/B2bCollectTool --floor 6.1
+        python ../.github/scripts/check_pe_floor.py B2bCollectToolSetup_Win7.exe --floor 6.1
+
+    - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
+      # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，
+      # 不通就不许有制品可下。必须走 --windowed 的 exe，所以用 Start-Process -Wait
+      # 拿退出码（GUI 子系统程序在 shell 里不会被自然等待，这是 Windows 上的老坑）；
+      # 报告同时落在包外状态目录 acl_doctor.txt，失败时把原文打出来供远程排障。
+      # 必须带超时：这一步最坏的失败形态不是非零退出，而是**一声不响地卡住**
+      # （参数没被认出来就会走到建界面那条路，runner 上多半也没有可用图形会话），
+      # 一卡就是 job 默认的 6 小时，日志里连一行自检结论都留不下。exe 里的自检
+      # 本身是有界的（网络侧全部带超时与重试上限），这里再兜一层防「没走到那里」。
+      # onedir 之后 exe 住在 dist\B2bCollectTool\ 里，自检报告也落在它同级的
+      # b2bcollect_state 下；这里用递归查找而不是写死路径，将来布局再变（比如
+      # _internal 挪位置）也不会出现「产物是好的、门禁读错了文件」这种假失败。
+      timeout-minutes: 10
+      shell: pwsh
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修这一步再谈交付）"
+          exit 1
+        }
+        $p = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -Wait -PassThru
+        $log = Get-ChildItem -Path "b2bcollect_build\dist" -Recurse -Filter "acl_doctor.txt" |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($log) { Get-Content $log.FullName } else { Write-Host "（没找到 acl_doctor.txt）" }
+        Write-Host "acl-doctor exit code = $($p.ExitCode)"
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::产物自检未通过（退出码 $($p.ExitCode)）：这个包发出去只会是精简版，禁止上传"
+          exit $p.ExitCode
+        }
+
+    - name: Window smoke gate (B2bCollectTool.exe --ui-smoke)
+      # 与 Mac 那一步同一条判据、同一个入口：让**产物自己**把界面真建一遍，退出码 0 才
+      # 许装配交付。（2026-11-12 那份 Windows 崩溃栈停在 ``File "b2bcollect_gui.py",
+      # line 39, in <module>``——正好是「建窗口之前的 import」那一段，而 --acl-doctor
+      # 刻意不碰 Qt：它验凭证、验通道、验落点，唯独不建窗口。于是「双击开不出界面」这一
+      # 整类故障在当天的门禁里是全绿的，只有用户能发现。这一步把那段盲区补成发包判据。）
+      # 这里不再模拟只读卷：Windows 本轮的根因是 onefile 的 _MEI 回收赛跑，改 onedir 之后
+      # 那个目录压根不存在了；「安装目录写不进去」（装在 Program Files、放共享盘、U 盘）
+      # 由 tool_config 与 riskbird_build/runtime_paths 的候选链兜住，那条口径由离线回归
+      # 与 --acl-doctor 的落点纪律（退出码 9）两头钉住，不靠这一仿真的运气。
+      # QT_QPA_PLATFORM 显式给 offscreen：runner 上有没有交互式桌面不是产品的事，赌它输了
+      # 就分不清「包坏了」还是「这台机器没会话」；随包的平台插件收没收到也由这一步的答案
+      # 说话——缺 qoffscreen.dll 会红在这里，而不是红在用户的双击上。
+      # USERPROFILE 指进临时目录有两个作用：门禁不碰 runner 的真实配置，并且「界面开成了
+      # 却留下一份崩溃日志」这种异常被吞掉的半坏状态也能被查出来（只看退出码会放过它）。
+      # 排在装配之前是刻意的：这一步会在安装目录里跑出 b2bcollect_state 等运行期目录，正好
+      # 由下一步（package_win_artifacts.py）统一剔掉——交付物里绝不带 CI 那台机器的状态。
+      timeout-minutes: 10
+      shell: pwsh
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修构建那一步再谈交付）"
+          exit 1
+        }
+        $stage = Join-Path $env:RUNNER_TEMP "ui-smoke-home"
+        if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        $env:QT_QPA_PLATFORM = "offscreen"
+        $env:USERPROFILE = $stage
+        $env:HOME = $stage
+        $p = Start-Process -FilePath $exe -ArgumentList "--ui-smoke" -Wait -PassThru
+        Write-Host "ui-smoke exit code = $($p.ExitCode)"
+        $stray = @(Get-ChildItem -Path $stage -Recurse -Filter "*.log" -ErrorAction SilentlyContinue)
+        foreach ($f in $stray) {
+          Write-Host "—— 崩溃日志 $($f.FullName) ——"
+          Get-Content $f.FullName
+        }
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::窗口没建出来（退出码 $($p.ExitCode)）：用户双击打开就是这个样子，禁止装配交付"
+          exit $p.ExitCode
+        }
+        if ($stray.Count -gt 0) {
+          Write-Host "::error::窗口建成了却留下崩溃日志：启动路径上有异常被吞掉了，两者不能同时成立"
+          exit 1
+        }
+        Write-Host "✅ 窗口冒烟通过：界面建得出、崩溃日志一份都没有"
+
+    - name: Artifact self-report gate (产物必须自报是哪一版)
+      # 需求 2 的第一块在这里合上：不问「上一步做了什么」，而是**问产物自己**「你是哪一版」，
+      # 再与这一步注入的那个号对拍。只信前面那些绿不够：--add-data 漏写、PyInstaller 把数据
+      # 收到另一个位置、_internal 布局改了——三种都会让「CI 说注入了」与「包读到的」不是
+      # 同一个数，而只有后者决定用户机器上的更新提示与远程排障能不能说出真相。
+      # --windowed 的 exe 没有控制台，stdout 收不到，所以走 `--out` 那份 JSON（与
+      # --acl-doctor 把报告落在文件里同一套路子）。
+      # 自报这一步本身恒返 0（连「没能确认」也要能如实打出来），判定由下面的对拍做：
+      # 「自报失败」与「自报不一致」是两种不同的红，混在一个退出码里就查不出是哪种。
+      # 对拍的那六条判定不在本步里写，而在 .github/scripts/check_artifact_selfreport.py：
+      # Mac 那一头跑的是 bash，同样的判定抄两遍就会漂移成「一个平台拦得住、另一个放绿」，
+      # 而屏幕上两个 run 都是绿的（本仓库已在 hidden-import 清单、pip 源、落点口径上各吃过
+      # 一次）；抽成脚本还多一个好处：这一步从此能被离线判据直接调用，pwsh 在内连脚本里可验不了。
+      timeout-minutes: 5
+      shell: pwsh
+      env:
+        EXPECT_BUILD: ${{ github.run_number }}
+        EXPECT_COMMIT: ${{ github.sha }}
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修这一步再谈交付）"
+          exit 1
+        }
+        $rep = Join-Path $env:RUNNER_TEMP "version_selfreport.json"
+        if (Test-Path $rep) { Remove-Item -Force $rep }
+        $p = Start-Process -FilePath $exe -ArgumentList "--print-version","--json","--out",$rep -Wait -PassThru
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::产物连自报版本这一步都退 $($p.ExitCode)：这个包说自己是谁都说不出来，禁止上传"
+          exit 1
+        }
+        # 判定不在这里、也不在 Mac 那头各写一遍（那六条全部写在
+        # .github/scripts/check_artifact_selfreport.py）：两个平台调同一份、红同一句话，
+        # 而且离线判据能直接喂假报告验它（内联在 pwsh 里的话，本机连解释器都没有）。
+        python .github/scripts/check_artifact_selfreport.py --report $rep --expect-build $env:EXPECT_BUILD --expect-commit $env:EXPECT_COMMIT --label B2bCollectTool.exe
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Package Windows artifacts
+      # onedir 交付装配，三道事一并做（判据全在脚本里，不抄在 yml）：
+      #   1) 验布局：dist\B2bCollectTool\ 里 exe + _internal + 随包凭证 + 跨目录采集器
+      #      一项不缺，并且**dist 里不许再躺一个旧的单文件 exe**（那个会把本轮修好的
+      #      onefile 故障原样带回用户机器）；
+      #   2) 剔运行期目录：上一步 --acl-doctor 在 runner 上跑出了 b2bcollect_state 等
+      #      目录，那是「CI 那台机器」的状态，绝不能进任何交付物；
+      #   3) 打绿色版 zip：顶层固定是一个 B2bCollectTool/ 目录 + 一份使用说明，
+      #      给「不让装软件 / 放共享盘」的场景兜底。
+      # 这一步排在安装包之前：makensis 用 File /r 拷整棵 dist 树，先剔干净再拷，
+      # 安装器与 zip 才是同一份干净布局。
+      # 【需求 10B】包名在本步的 env 里钉：兼容通道那份 yml 的这一步 run 体与这里
+      # 逐字节相同（第 42 条按步骤名做字节对拍），只有 env 不同。
+      shell: bash
+      env:
+        PORTABLE_NAME: "B2bCollectTool_Win7_portable.zip"
+      run: python .github/scripts/package_win_artifacts.py --root b2bcollect_build --portable-name "$PORTABLE_NAME"
+
+    - name: Provision NSIS (钉版本 + 校验 sha256)
+      # 第五刀（2026-11-12 Windows 实机）：原来这一步是「在 runner 上找 makensis，
+      # 找不到就报错」，红在**所有**产物步骤之后——exe 打好了、--acl-doctor 过了、
+      # 绿色 zip 也生成了，只差最后这一步，用户手里还是没有安装包。根因不是脚本写错，
+      # 是「工具链依赖这台机器恰好装了什么」：镜像一更新 NSIS 就没了，本机永远复现不了。
+      # 业界对这件事的标准答案是 hermetic 构建：自己下载、钉死版本、校验 sha256、解压即用。
+      # 镜像里就算有 makensis 也不借用——两次构建用同一个编译器，产物才可比。
+      # 下载/校验/解压每一步失败都在这里响，不留给 NSIS 一句谁也看不懂的「文件不存在」。
+      shell: bash
+      env:
+        NSIS_VERSION: "3.10"
+        NSIS_SHA256: "fcdce3229717a2a148e7cda0ab5bdb667f39d8fb33ede1da8dabc336bd5ad110"
+      run: |
+        set -u
+        MAJOR=${NSIS_VERSION%%.*}
+        DEST="$GITHUB_WORKSPACE/.tools/nsis-$NSIS_VERSION"
+        MK="$DEST/Bin/makensis.exe"
+        ZIP="$RUNNER_TEMP/nsis-$NSIS_VERSION.zip"
+        # 两条官方写法（downloads.sourceforge.net 与 /files 页面那条），都走 HTTPS、
+        # 都会被重定向到镜像；一个不通换另一个再试，最后仍用 sha256 收口——
+        # 镜像可以换，字节不能换。
+        URLS="https://downloads.sourceforge.net/project/nsis/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip
+        https://sourceforge.net/projects/nsis/files/NSIS%20$MAJOR/$NSIS_VERSION/nsis-$NSIS_VERSION.zip/download"
+        sha256() {
+          # 格式依据：这里取的不是「sha256sum/certutil 各自行文里的第几列」，而是 SHA-256
+          # 摘要的**定义**——十六进制表示恒为 64 个 hex 字符。所以两条分支同一条规矩：整段
+          # 输出里扫 64 位 hex，谁的话术变了都取不到值（取不到就是空串，下面按不等处理）。
+          # 反面写法是 `| awk '{print $1}'` 或 `sed -n 2p`：certutil 除了哈希还会印一句
+          # 「CertUtil: -hashfile command completed successfully.」，按行号/字段切就有机会
+          # 切到那句话上，而本机没有 certutil，这种红只能在云端第一次出现。
+          # 只从**内容**算哈希，别让文件名参与输出。这不是洁癖：Git Bash 里 $RUNNER_TEMP
+          # 是 `D:\a\...\_temp` 这种带反斜杠的 Windows 路径，而 GNU coreutils 的规定是
+          # 「文件名里含反斜杠或换行时，整行输出前面加一个 \\ 作为转义标记」，于是
+          # `sha256sum … | awk '{print $1}'` 拿到的是 `\fcdce…`——哈希本身完全正确，却和
+          # 钉住的值「对不上」，2026-11-12 那次 CI 就是这么红的。用 < 喂标准输入，输出里
+          # 压根没有文件名可转义；再只取 64 位十六进制兜一层，两条分支同规矩。
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum < "$1" | grep -oE "[0-9a-fA-F]{64}" | head -1 || true
+          else
+            certutil -hashfile "$(cygpath -w "$1")" SHA256 | grep -oE "[0-9a-fA-F]{64}" | head -1 || true
+          fi
+        }
+        if [ ! -f "$MK" ]; then
+          got=""
+          for round in 1 2 3; do
+            for u in $URLS; do
+              rm -f "$ZIP"
+              curl -sSLf --connect-timeout 20 --max-time 180 -o "$ZIP" "$u" \
+                || { echo "· 下载失败（镜像抖动，换下一条）：$u"; continue; }
+              got=$(sha256 "$ZIP")
+              [ "$got" = "$NSIS_SHA256" ] && break 2
+              echo "· 第 $round 轮校验不过（下坏了或没下全）：$got"
+            done
+          done
+          [ "$got" = "$NSIS_SHA256" ] || {
+            echo "::error::nsis-$NSIS_VERSION.zip 的 sha256 与钉住的值不一致（或三轮都没下全）：期望 $NSIS_SHA256 实际 ${got:-无}。宁可不打安装包，也不拿一个来路不明的编译器打用户手上的东西"
+            exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/.tools"
+          # Git Bash 自带 unzip，走不到下面这条；但兜底分支必须是**能跑的**：PowerShell
+          # 不认 /d/... 这种 MSYS 路径，直接把 $ZIP 传给它只会得到一句「路径不存在」，
+          # 而这一步的失败原因看起来会像「NSIS 包坏了」。（同一句里两处都要 cygpath -w，
+          # 别只给 DestinationPath 加——本轮就是这么漏的。）
+          if command -v unzip >/dev/null 2>&1; then unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/.tools"
+          else powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$ZIP")' -DestinationPath '$(cygpath -w "$GITHUB_WORKSPACE/.tools")' -Force" >/dev/null; fi
+        fi
+        [ -f "$MK" ] || { echo "::error::解压后没找到 ${MK}（NSIS 目录布局变了？别改这一步，改钉住的版本并重新校验）"; exit 1; }
+        # 不用 `| head -1`：这个 job 开着 pipefail，head 提前收线会让上游吃一个 SIGPIPE，
+        # 于是「版本打印成功」也能变成「这一步失败」——这种红法谁也想不到是管道干的。
+        # 写法也不许赌一种：makensis 的选项前缀 / 与 - 都算，可 Git Bash 会把以 / 开头的
+        # 参数当**路径**转换（/VERSION → C:/Program Files/Git/VERSION），于是编译器收到的
+        # 是个不存在的文件名，回一句 Usage。2026-11-12 云端就是这么红的：sha256 校验早就
+        # 过了，红在「版本探测」这一步——探测失败与编译器坏了看起来一模一样。
+        # 所以：①几种写法逐个试（统一 MSYS_NO_PATHCONV=1，别LET bash 改写参数）；②探到
+        # 版本号就按钉住的值硬对，探不到**不在这里判死**——真正说了算的是下一步编译时
+        # makensis 自己印的那行横幅，它用的就是交付这个安装包的那台编译器，不会有「探测
+        # 与构建两套结果」的缝隙。
+        VOUT=""
+        VATTEMPTS=""
+        for opt in -VERSION //VERSION /VERSION; do
+          out=$(MSYS_NO_PATHCONV=1 "$MK" "$opt" 2>&1 || true)
+          first=${out%%$'\n'*}
+          VATTEMPTS="${VATTEMPTS}${opt} => ${first}"$'\n'
+          case "$first" in
+            *v[0-9]*) VOUT="$first"; break ;;
+          esac
+        done
+        if [ -n "$VOUT" ]; then
+          case "$VOUT" in
+            *v"$NSIS_VERSION"*) echo "· 安装包编译器：${MK}（${VOUT}，sha256 已校验）" ;;
+            *) echo "::error::makensis 自报的版本不是钉住的 ${NSIS_VERSION}（实际 ${VOUT}）"
+               echo "试过的写法与返回："; printf '%s' "$VATTEMPTS"
+               exit 1 ;;
+          esac
+        else
+          echo "· 版本开关这几种写法都没理人，改由安装包那一步用编译器自己的横幅定版（不是放行，是换一处更硬的判据）"
+          printf '%s' "$VATTEMPTS"
+        fi
+        echo "MAKENSIS=$MK" >> "$GITHUB_ENV"
+        echo "NSIS_PINNED=$NSIS_VERSION" >> "$GITHUB_ENV"
+
+    - name: Provision VC++ redist (钉版本 + 校验 sha256)
+      # 需求 10「任何电脑都无需额外去解决这些问题」的另一半：安装时判出系统缺
+      # vcruntime140.dll 就当场静默补装。安装包里必须真带着它，本步骤在 makensis
+      # 编译之前把微软官方安装器取到 installer\deps\（nsi 里 !if /FileExists 判存在；
+      # 没有这个文件就编出「不带运行库」的包——那一版对纯小白等于没修，所以这一步
+      # 失败就是红，绝不静默出包）。
+      # 与上面 NSIS 同一套纪律：版本化 URL + sha256 钉死。aka.ms/latest 永远指最新版，
+      # 微软一换版字节就变——所以钉的是 download.visualstudio.microsoft.com 的
+      # 版本化地址（历史版本长期不删），哈希对不上就当场红。哈希取法沿用 NSIS 那条
+      # 教训：从标准输入喂 sha256sum，输出里没有文件名可转义，再只收 64 位十六进制。
+      shell: bash
+      env:
+        VC_REDIST_URL: "https://download.visualstudio.microsoft.com/download/pr/e9604e21-4b79-4096-a4b3-1b63d4b55b4d/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe"
+        VC_REDIST_SHA256: "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+      run: |
+        set -u
+        # 哈希取法的格式依据（出处＝SHA-256 的定义本身，不依赖 sha256sum 的行文话术）：
+        # 摘要就是 64 位十六进制，所以只收 64 位十六进制；从标准输入喂 sha256sum 是因为
+        # 输出里没有文件名可转义——GNU 工具在带反斜杠的文件名上会给整行加转义前缀，
+        # `awk '{print $1}'` 会拿到 \fcdce…：哈希没错，却和钉住的值对不上。
+        DEPS="$GITHUB_WORKSPACE/b2bcollect_build/installer/deps"
+        REDIST="$DEPS/VC_redist.x64.exe"
+        mkdir -p "$DEPS"
+        curl -sSLf --retry 3 --connect-timeout 20 --max-time 300 -o "$REDIST" "$VC_REDIST_URL" \
+          || { echo "::error::VC_redist.x64.exe 下载失败（微软官方 CDN 抖动，重跑一次；连红就是钉住的 URL 失效了，换新版本化 URL）"; exit 1; }
+        got=$(sha256sum < "$REDIST" | grep -oE "[0-9a-fA-F]{64}" | head -1 || true)
+        [ "$got" = "$VC_REDIST_SHA256" ] || {
+          echo "::error::VC_redist.x64.exe 的 sha256 与钉住的值不一致：期望 $VC_REDIST_SHA256 实际 ${got:-无}。多半是微软换版了——本机实拉一份重算哈希、连同新版本化 URL 一起重新钉上，绝不带着旧哈希放过新字节"; exit 1; }
+        echo "· VC++ 运行库：$(wc -c < "$REDIST") 字节，sha256 已校验 → installer/deps/"
+
+    - name: Build Windows installer (NSIS, per-user)
+      # 交付形态：目录形态的产物必须靠安装包落到用户机器上，否则「解压到哪都行」会
+      # 变成「用户把文件夹删了一半」。这里按业界主流做法做成**每用户安装**：
+      #   · 默认目录 $LOCALAPPDATA\Programs\B2bCollectTool —— 用户在配置文件里，
+      #     RequestExecutionLevel user 不弹 UAC（VS Code / Slack / Discord 同一路线），
+      #     也保证安装目录本身**可写**：Cookie、缓存、自检报告这些运行期数据按
+      #     riskbird_build/runtime_paths.py 与 tool_config.state_dir 的口径优先落在
+      #     程序同级，装在 Program Files 里就会全部退到用户目录，用户看不见也
+      #     说不清「为什么我的登录状态没保住」。
+      #   · 卸载信息写 HKCU（不是 HKLM），控制面板里能正常卸载、且不污染机器级注册表。
+      # makensis 不在位就直接失败：宁可没有安装包，也绝不静默退化成「只发一个 zip」
+      # 却告诉用户「这就是交付物」（那种降级只有用户会发现）。
+      # B2B_ROOT 用绝对路径传给 NSIS 的 !cd：NSIS 的相对路径基准是 makensis 的启动
+      # 目录而不是脚本目录，靠「反正我 cd 过了」迟早对不上（Git Bash 的 pwd -W 才给
+      # Windows 形式的绝对路径，纯 MSYS 形式 /d/... 传给 Windows 版 makensis 会读错）。
+      shell: bash
+      # 【需求 10B】地板与包名是两条通道之间**唯一**允许不同的东西，所以把它们从命令体
+      # 里提到这里：兼容通道那份 yml 只有这四个值不一样，下面的 run 体逐字节相同。
+      # 主通道继续用 10.0（=Windows 10），与今天的行为一致（今天就是不传 -D、吃 nsi 默认值）。
+      env:
+        OUT_FILE: "B2bCollectToolSetup_Win7.exe"
+        PORTABLE_NAME: "B2bCollectTool_Win7_portable.zip"
+        MIN_WIN_MAJOR: "6"
+        MIN_WIN_MINOR: "1"
+      run: |
+        cd b2bcollect_build
+        # 这四个缺任何一个都不许开编。为什么要在运行时就验、不等 makensis 报错：NSIS 的
+        # !ifndef 允许命令行 -D 覆盖，**漏传一个 -D 不会编不过**——它会安静地用默认值编出
+        # 一个「名字叫 Win7、地板还是 Win10」的包，而那是最坏的形状：用户按文案下载了
+        # 「给他的那台老机器准备的那个包」，安装器却把自己的用户拦在门外，而两条流水线全绿。
+        for _v in OUT_FILE PORTABLE_NAME MIN_WIN_MAJOR MIN_WIN_MINOR; do
+          [ -n "${!_v:-}" ] || { echo "::error::这一步缺 env 变量 ${_v}：地板或包名没钉住，宁可不编安装包"; exit 1; }
+        done
+        # 地板得是整数：它直接喂给 NSIS 的 IntCmp，带一个非数字字符就是拿一句人话去喂
+        # 整数比较（makensis 会回一句用法错误，而日志看着像编译器坏了）。
+        case "$MIN_WIN_MAJOR$MIN_WIN_MINOR" in
+          ""|*[!0-9]*) echo "::error::地板不是纯数字（major=${MIN_WIN_MAJOR} minor=${MIN_WIN_MINOR}）：它要直接进 NSIS 的整数比较"; exit 1 ;;
+        esac
+        # makensis 由上一步现下载、校验、解压，并把路径写进 GITHUB_ENV。这里不再
+        # 「在机器上找」：找得到找不到都不是产品的事，是镜像的事，而镜像会变（本轮就是
+        # 这么红的）。上一步没成功就不该走到这里，走到了也照样停，绝不静默降级成
+        # 「只发一个 zip 却告诉用户这就是交付物」。
+        [ -n "${MAKENSIS:-}" ] || { echo "::error::上一步没把 makensis 的在包路径传下来（GITHUB_ENV 里的 MAKENSIS 是空的），不许出安装包"; exit 1; }
+        [ -f "$MAKENSIS" ] || { echo "::error::makensis 路径不存在：$MAKENSIS"; exit 1; }
+        WIN_ROOT=$(pwd -W 2>/dev/null || pwd)
+        case "$WIN_ROOT" in
+          [A-Za-z]:*) : ;;
+          *) echo "::error::拿不到 Windows 形式的绝对路径（当前 ${WIN_ROOT}），NSIS 会读错相对路径"; exit 1 ;;
+        esac
+        # 权威版本判据就在这一步，不在上一步：上一步是「另外问一句版本号」，这一步是
+        # 真正把交付的这个安装包编出来的那一次调用，makensis 自己印的横幅用的就是这台
+        # 编译器、这一份字节——不会有「探测一套结果、构建另一套结果」的缝隙。
+        # 版本对不上就不出包：宁可没有安装包，也绝不静默降级成「只发一个 zip 却告诉
+        # 用户这就是交付物」（那种降级只有用户会发现）。
+        [ -n "${NSIS_PINNED:-}" ] || { echo "::error::上一步没把钉住的 NSIS 版本号传下来（GITHUB_ENV 里的 NSIS_PINNED 是空的）：包能编出来，但说不清它和校验过的那份编译器是不是同一个，这种交付物不发"; exit 1; }
+        # 版本号必须是四段纯数字（VIProductVersion 只认 X.X.X.X）。2026-11-12 云端就是
+        # 栽在这句上：`/DVER4="1.$APP_VERSION.0"` 拼出来是三段，makensis 报
+        # 「invalid VIProductVersion format」直接 abort —— 编译器、自检、冒烟全绿，最后
+        # 一步没有安装包。这里不再「拼了就算」。
+        # 【本轮改这一刀】以前这里把 run_number 拆成两个 16 位字段自己算四段号，那是
+        # `tool_version.product_version` 同一件事的第二份实现。需求 2 要的是「一个包的
+        # 自己是哪一版只有一个来源」，而两份算法只会在哪天不一致时出问题（而且是
+        # 「安装包文件属性上的版本与随包自报的版本不是同一个数」这种谁都说不准的形状）。
+        # 现在显示号与四段号都问 tool_version，而它读的就是上面那一步写下去、并且随包
+        # 进包的那一份戳：编进 NSIS 的、产物自报的、发布清单里的从此是同一个数。
+        # 算不出来（戳没写、构建号不像数、超出四段可表达范围）就当场停：makensis 收下
+        # 一个它编不了的号只会回一句 invalid format 就 abort，交付里没有安装包，
+        # 而日志看着像编译器坏了。（这句不用 ${VAR:-（空）}：拿非 ASCII 写进参数展开的
+        # 默认值里，bash 3.2 的词法扫描会在右花括号前认错，整步连第一行都跑不到。
+        # 哪一个字节会带跑解析器没人记得住，所以这一段的语法由「shell 语法硬门」
+        # （check_packaging_manifest.py 第 11 条）交给 bash -n 自己判。）
+        DISPLAY_VER=$(python tool_version.py --print-field display) || {
+          echo "::error::显示版本号没能从随包构建戳里读出来（上面那一步 --write-stamp 没成功，或戳不在 b2bcollect_build/version.json）：宁可不编安装包，也不编一个哪版都不是的号"; exit 1; }
+        VER4=$(python tool_version.py --print-field product) || {
+          echo "::error::四段版本号（VIProductVersion）没能从随包构建戳里算出来（构建号不像数，或超出每段 16 位的可表达范围）：makensis 收下它只会回一句 invalid format 就 abort"; exit 1; }
+        # 形状仍按编译器自己的口径验一遍：上面两句绿不等于 makensis 认这个形状，
+        # 而这一步是唯一能把「形状不对」说成「形状不对」的地方。
+        DV_SHOW="$DISPLAY_VER"
+        [ -n "$DV_SHOW" ] || DV_SHOW="（空）"
+        case "$DISPLAY_VER" in
+          1.*) : ;;
+          *) echo "::error::从构建戳里读到的显示版本号「${DV_SHOW}」不是 1.<build> 那一档（戳与版本算法对不上，先查 tool_version 那一步）"; exit 1 ;;
+        esac
+        if ! [[ "$VER4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::tool_version 给出的四段号「${VER4}」不是 makensis 要的 X.X.X.X（它自己拼错了，别等编译器报）"; exit 1
+        fi
+        echo "· 版本：显示 ${DISPLAY_VER} / 文件属性 ${VER4}（两个都由随包构建戳算出，这一步不再自己拆字段）"
+        # 禁掉 Git Bash 的「参数看着像路径就改写」：/DB2B_ROOT=... 这种 NSIS 定义被改写成
+        # C:/Program Files/Git/DB2B_ROOT=... 之后编译器只会回一句 Usage；而日志文件名里
+        # 带反斜杠时 GNU 工具还会给整行输出加转义前缀（上一节 sha256 就是栽在这上面）。
+        export MSYS_NO_PATHCONV=1
+        TMP_DIR=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+        LOG="$TMP_DIR/nsis_build.log"
+        echo "· 安装包编译器：$MAKENSIS  根目录：$WIN_ROOT  钉住版本：$NSIS_PINNED"
+        # -V4：要它把「我是谁」那行横幅和每一步细节都落到日志里。红了好查，绿了也能对版。
+        # 管道接 tee 是为了既让日志上屏（Actions 里能直接读）又留一份文件供判据取用。
+        # 取码要 PIPESTATUS[0]，理由不是「$? 会漏掉编译器的失败」——本机 bash 3.2.57 实测
+        # pipefail 取的是**最右非零**，编译器退 7、tee 成功时 `$?` 同样给 7（Z 节跑真 bash
+        # 自证）。真正的理由是**归因**：tee 自己坏（日志落盘路径不合法，Git Bash 的 cygpath
+        # 转换就可能坏）时 `$?` 拿到的是 tee 的 1，这句 ::error:: 会指着编译器说「编译失败
+        # （退出码 1）」，而编译器其实成功——红了一条谎话。PIPESTATUS[0] 只问首段，谁坏说谁。
+        # 写法用 `cmd || rc=${PIPESTATUS[0]}`（实测 bash 3.2 与 5.x 都成立：|| 分支里
+        # PIPESTATUS 还是刚那条管道的），不再用 `set +e … set -e` 那种把**整段**保护关掉
+        # 的区间——区间里后来人插一条命令，它失败了没人知道，症状与本轮第 15 条一模一样。
+        # 但这个写法自己有个前提：管道整体得能反映首段的失败，也就是 pipefail 必须开着——
+        # 没开时 tee 成功就压根不进 || 分支，编译器退 3 会被当成成功（它代替不了 pipefail，
+        # Z 节跑真 bash 自证）。所以本步**自己声明** pipefail，不赌 runner 的默认 shell
+        # 选项：默认值是别人的实现细节，它哪天变了，坏法是「带着编译错误的安装包发出去」，
+        # 不是红一条日志。（离线仿真「关掉 pipefail 仍要认得编译器」那一味钉的就是这个。）
+        set -o pipefail
+        NSIS_RC=0
+        # /DMIN_WIN_* 与 /DOUT_FILE 都来自上面的 env：同一份 .nsi 编出两种地板、两个包名。
+        # 为什么不在 nsi 里复制一份「兼容版专用脚本」：那会把「缺运行库当场补装」「体检
+        # 日志」「旧实例探测」这些踩过坑的逻辑再抄一遍，而抄第二遍的东西一定会漂。
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="$DISPLAY_VER" /DVER4="$VER4" /DMIN_WIN_MAJOR="$MIN_WIN_MAJOR" /DMIN_WIN_MINOR="$MIN_WIN_MINOR" /DOUT_FILE="$OUT_FILE" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
+        if [ "$NSIS_RC" -ne 0 ]; then
+          echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
+          exit 1
+        fi
+        # 上面取了首段，就得给「只有 tee 坏」这一路单独一句话：编译器成功、日志却没写成时，
+        # 下一节读横幅只会报「读不到横幅」，把一次落盘故障说成编译器行为异常（正是本轮要根治
+        # 的形状——错误的话听起来像别的东西坏了）。留这份文件是判据的输入，输入不在就在这里停。
+        if [ ! -s "$LOG" ]; then
+          echo "::error::makensis 本身是成功的（首段退出码 0），但编译日志 ${LOG} 没写成或为空：坏的是 tee/落盘这一步（Git Bash 把路径转成 ${RUNNER_TEMP} 时不合法就会这样），不是编译器。后面读横幅全靠这份文件，不放行是为了不让你去查一个没坏的编译器。"
+          exit 1
+        fi
+        # 横幅必须按**真编译器自报的写法**找，不能按想象中的写法找。
+        # 2026-11-13 凌晨云端那次红就是这个：这里原来只找 "Nullsoft Install System v…"，
+        # 而 NSIS 3.10 的 makensis 自报的是 "MakeNSIS v3.10 - Copyright 1999-2023 Contributors"
+        # （run 43271171596 / job 131367773604 编译日志第 924 行的原字节，行尾 \r\n）。
+        # 安装包 114MB 已经编出来了，却被这句「读不到横幅」整体拦下——判据猜错格式的代价
+        # 就是交付凭空没有安装包，而且它报的话听起来像是编译器坏了。两种写法都收：老 NSIS
+        # 与 -V1 走的是 Nullsoft 那句，哪天换编译器不至于再瞎一次。
+        # -a 不是可选项：-V4 的日志里混着非 UTF-8 字节（安装包里的中文菜单名是 ANSI 写的），
+        # GNU grep 一旦判定「二进制文件」就只回一句 Binary file matches，横幅照样取不到。
+        # `|| true` 必须留着：这一步是 bash（GitHub 默认给 -e -o pipefail），编译器一字
+        # 不印时 grep 退 1、整条管道就非 0，`set -e` 会在下面那句判据之前把进程带走——
+        # 报错的话术永远说不出口，红成「这一步自己炸了」，比猜错横幅格式更难查。
+        BANNER=$(grep -haoE "(MakeNSIS|Nullsoft Install System) v[0-9][0-9.]*" "$LOG" 2>/dev/null | head -1 || true)
+        if [ -z "$BANNER" ]; then
+          echo "::error::编译日志里读不到 makensis 自报版本那行横幅（连 -V4 都没印，这台编译器的行为和预期不一样），无法证明这个安装包出自校验过的那份 NSIS ${NSIS_PINNED}"
+          # 把日志开头原样贴出来：下一次编译器换措辞，靠这几行就能当场对格式，不用再去猜。
+          echo "::error::横幅判据看到的日志前 5 行（原样，不解释）：$(head -5 "$LOG" 2>/dev/null | tr '\r\n' '  ')"
+          exit 1
+        fi
+        # 版本比对取**全等**而不是通配包含：`*v3.10*` 会放过一个自报 v3.100 的编译器，
+        # 那和「自报 v3.1」是两个方向的错，都不该出安装包。
+        BANNER_VER=${BANNER##* v}
+        if [ "$BANNER_VER" != "$NSIS_PINNED" ]; then
+          echo "::error::安装包是自报 ${BANNER} 的 makensis 编出来的，不是钉住的 ${NSIS_PINNED}——两次构建产物不可比，这一份不发"
+          exit 1
+        fi
+        echo "✅ 安装包出自 makensis ${BANNER}（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）"
+        # 两个产物名都按本步 env 里钉的那一个找：名字写死在这里的话，兼容通道要么改这一行
+        # （两份 yml 从此逐字不同、第 42 条的字节对拍作废），要么要同一个文件叫两个名字。
+        ls -l "$OUT_FILE" "$PORTABLE_NAME"
+
+    - name: Upload artifacts (Win7 兼容包)
+      # 两个产物：安装器（纯小白路径，带运行环境体检与运行库补装）+ 绿色版目录 zip
+      # （不让装软件 / 放共享盘的兜底）。名字一律带 _Win7 后缀，与主通道逐字区分——
+      # 同名的两个包会在下载侧互相覆盖，而覆盖这件事是静默的。
+      # 交付口径：这一版只到 GitHub 制品。固定直链与「一个链接自动选包」是需求 10C，
+      # 它要同时改 upload_release_to_oss.ALLOWED_NAMES 与 tool_update.ALLOWED_ARTIFACTS
+      # /MANIFEST_BY_KEY 两处登记表，那一刀必须一次切完，不能在这里先漏一条链接。
+      uses: actions/upload-artifact@v4
+      with:
+        name: B2bCollectTool_Win7
+        path: |
+          b2bcollect_build/B2bCollectToolSetup_Win7.exe
+          b2bcollect_build/B2bCollectTool_Win7_portable.zip
+        if-no-files-found: error

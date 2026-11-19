@@ -150,10 +150,21 @@
      41 剪裁与重量这两道门的执行位置：workflow 的 run 步之间不继承 cwd，所以调用前最近
         一次 cd 必须是 b2bcollect_build、产物参数只许写 dist/<产物名>、门脚本只许写
         ../.github/scripts/ 那一份（2026-11-19 云端 Windows 与 Mac 两路就是这么同时读不到
-        产物体积视野，而本机无论怎么跑都是绿的））：
-     这二十一条各自的由来与口径写在**它们函数上方**的注释块里——那二十一条都是
-     一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留一句
-     提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了。
+        产物体积视野，而本机无论怎么跑都是绿的）/
+     42 Win7 兼容通道（需求 10B）三件事：甲 进包源码与被目标解释器执行的工具脚本必须能被
+        **CPython 3.8** 解析（地板门，判据在第 34 条那个按角色比的基础上再按「进包闭包」筛
+        一遍）；乙 与主通道共享的十步必须**逐字节相同**（PyInstaller 那一步只许差一个解释器
+        token，其余一字不改）；丙 兼容通道自己的关键参数逐条在场（驱动上限 109、安装器地板
+        major=6、包名 B2bCollectToolSetup_Win7.exe、不发发布清单）。双解释器体检（--pin /
+        --inventory）由 .github/scripts/check_legacy_toolchain.py 执行：这一条存在的根子是
+        「3.8 与 3.9 的产物在 PE 地板、窗口冒烟、自报对拍上**长得一模一样**」（api-ms-win-core-path
+        是运行期延迟加载，不在导入表里），所以「这个包到底是不是 3.8 打的」全链只有解释器
+        自报那一格判得出））：
+     每一条各自的由来与口径写在**它们函数上方**的注释块里——这些条目全部是在
+     一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留两句
+     提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了；而**条目总数故意不写在这
+     里**——写死数字的那一版第二天加一条就变成谎话（与「四份 workflow」那句是同一处缺陷）。
+     要看全集就看 main() 里那一串 check_* 调用序，它才是唯一事实来源。
 
 用法：
   python .github/scripts/check_packaging_manifest.py        # 校验，失败退出码 1
@@ -237,8 +248,15 @@ def _walk(node):
     return got
 
 # 三处打包入口必须同口径：任何一处漏抄，那个平台的产物就少一块功能。
+# 【需求 10B】第四处：Windows 7 兼容通道。它不是「多一个平台」，而是「同一个平台
+# 两个地板」，所以它**必须**进这张表：进表后 --add-data / --hidden-import / 运行期
+# 数据 / 触发目录 / git 跟踪这五项对拍会自动多它一份——主通道加一个模块而兼容包没加，
+# 这里当场响；不加进来，那种缺陷只有 Win7 用户能发现。
+MAIN_WORKFLOW = ROOT / ".github" / "workflows" / "build-b2bcollect.yml"
+LEGACY_WORKFLOW = ROOT / ".github" / "workflows" / "build-b2bcollect-legacy.yml"
 CALLERS = {
-    "Windows workflow": ROOT / ".github" / "workflows" / "build-b2bcollect.yml",
+    "Windows workflow": MAIN_WORKFLOW,
+    "Win7 legacy workflow": LEGACY_WORKFLOW,
     "Mac workflow": ROOT / ".github" / "workflows" / "build-b2bcollect-mac.yml",
     "本机 Mac 打包脚本": ROOT / "debug" / "build_b2bcollect_mac_local.sh",
 }
@@ -989,6 +1007,7 @@ GH_PLACEHOLDER = "GH_EXPR"
 # b2bcollect 的清单，但 shell 语法坏掉的代价一模一样。
 WORKFLOWS = tuple(f".github/workflows/{n}" for n in (
     "build-b2bcollect.yml", "build-b2bcollect-mac.yml",
+    "build-b2bcollect-legacy.yml",
     "build-1688.yml", "build-riskbird.yml"))
 SHELL_SOURCES = tuple(list(HYGIENE_SCRIPTS) + [
     "debug/build_b2bcollect_mac_local.sh",
@@ -7429,7 +7448,14 @@ def check_listing_accountability(files=None) -> list:
 
 _PY_FLOOR_PAT = re.compile(r"python-version:\s*[\"']?(\d+)\.(\d+)")
 # workflow 里的内联 python：`python -c …` / `python - <<'PY'` / `python <<PY`。
-_INLINE_PY_PAT = re.compile(r"python3?\s+(?:-c\b|-\s*<<|<<)")
+# 内联 python 的形状。上一版只认字面量 `python` 打头，于是 `"$TARGET_PY" -c "…"` 与
+# `"$TARGET_PY" - <<'PYEOF'` 整段在它的视野之外——那是需求 10B 兼容通道逼出来的**盲区**：
+# 它连「这一处它看不到」那句自报都不会响（自报也靠同一个正则）。双解释器流水里目标环境
+# 只能靠变量名引用，这一类写法只会越来越多，所以把「解释器存在一个变量里」那一档收进来。
+# 只扩到「名字里带 PY/PYTHON 的变量（可带引号）」，不是「任何命令 + -c」：后者会把 grep -c
+# 、tar -c 、find -clog 全报成内联 python，一条噪声多的门等于没有门。
+_INLINE_PY_PAT = re.compile(
+    r"(?:python3?|\"?\$\{?[A-Za-z_]*(?:PYTHON|PY)[A-Za-z_]*\}?\"?)\s+(?:-c\b|-\s*<<|<<)")
 # AST 节点类型名 → （需要的最低版本，处方）。按名字比而不按 `ast.Match` 比：判据自己也得能在
 # 3.11 上跑——那个版本的 ast 模块里压根没有 MatchStar 之外的某些类，按属性取会先把自己弄爆。
 FLOOR_CONSTRUCTS = {
@@ -7584,29 +7610,51 @@ def _invalid_escape_problems(files) -> tuple:
 
 
 def python_floor() -> tuple:
-    """地板版本从 workflow 的 `python-version` 派生（那里才是「用哪个解释器打包」的真源）。
+    """地板版本从 workflow 的 `python-version` 派生（那里才是「用哪个解释器打包」的真源。
 
     返回 `(floor, problems)`。两个都不许留空：一份都没读到就是「地板悬空」（这一条等于
-    没判，不许报绿）；四份各说一种就是要报的事——那意味着同一个包在两台打包机上语法能力
-    不同。不一致时取**最低**那个当地板（最严的那个说话，判据继续工作而不是眼盲）。"""
+    没判，不许报绿）；打包机解释器各说一种就是要报的事——那意味着同一个包在两台打包机上
+    语法能力不同。不一致时取**最低**那个当地板（最严的那个说话，判据继续工作而不是眼盲）。
+
+    【本轮改的就是下一段】「一份 workflow 里出现两个版本」与「几份 workflow 各说一种」不是
+    同一个病。Win7 兼容通道（需求 10B）**天生**要两个解释器：3.11 跑构建前硬门（它用了
+    `ast.unparse`，3.9+ 才有），3.8 才是进包的那个运行时——setup-python 每次把所选解释器
+    前置进 PATH，后装的 3.11 因此成为裸 `python`。拿「把两档对齐」去要求它，等于叫那条
+    通道消失；而加一个「按文件名豁免」又是给判据开后门（豁免名单会自己长大）。所以按
+    **角色**比：每份 workflow 的最高档 = 跑门禁的那一个，只比这些最高档是否一致；本条的
+    扫描地板 = 这些**门禁档里最低的那一档**（门禁之间仍取最严的说话），而「进包的那一份
+    能不能被 3.8 读懂」另有第 42 条按进包闭包逐份判——那里要的恰好是 3.8，不是 3.11。
+    """
     seen = {}
+    per_workflow_max = {}
     for rel in WORKFLOWS:
         path = ROOT / rel
         if not path.is_file():
             continue
+        mine = []
         for m in _PY_FLOOR_PAT.finditer(path.read_text(encoding="utf-8", errors="replace")):
-            seen.setdefault((int(m.group(1)), int(m.group(2))), []).append(rel)
+            v = (int(m.group(1)), int(m.group(2)))
+            seen.setdefault(v, []).append(rel)
+            mine.append(v)
+        if mine:
+            per_workflow_max[rel] = max(mine)
     if not seen:
         return (0, 0), ["第 34 条从任何一份 workflow 里都没读到 `python-version`：地板悬空，"
-                        "「没有超地板的写法」这句话没有任何含义（四份："
-                        + "、".join(WORKFLOWS) + "）"]
-    floor = min(seen)
+                        "「没有超地板的写法」这句话没有任何含义（%d 份："
+                        % len(WORKFLOWS) + "、".join(WORKFLOWS) + "）"]
+    floor = min(per_workflow_max.values())
     problems = []
-    if len(seen) > 1:
-        problems.append("四份 workflow 声明了不止一种解释器版本："
-                        + "；".join(f"{a}.{b}←{'/'.join(v)}" for (a, b), v in sorted(seen.items()))
-                        + f"——按最低的那档判，但请把它们对齐（打包机语法能力不一致，"
-                        "「本机绿」与「云端绿」就又不是同一件事了）")
+    # 只在「各流水的**门禁**解释器不一致」时报：同一份内部的多档是双解释器分工，不是分叉。
+    # 地板也不取 `min(seen)`（那是全仓最低档 = 进包的 3.8）：拿 3.8 去判只跑在 3.11 上的
+    # 门禁脚本，红话会写着「打包机只有 3.8」——而那个文件的打包机明明是 3.11，**把人指向错的
+    # 子系统**比不红更难查。3.8 那一档由第 42 条按「进包闭包 + 被目标解释器执行的工具脚本」
+    # 逐份判（那里要的恰好是 3.8），两条门各管一段、不重叠也不留缺口。
+    if len(per_workflow_max) > 1 and len(set(per_workflow_max.values())) > 1:
+        problems.append(f"{len(per_workflow_max)} 份 workflow 的**门禁**解释器不止一种："
+                        + "；".join(f"{b}←{a}" for a, b in sorted(per_workflow_max.items()))
+                        + "（同一份里写两档不算：那是兼容通道的双解释器分工，最高的那一档"
+                        "跑门禁、最低的进包）——打包机语法能力不一致，「本机绿」与「云端绿」"
+                        "就又不是同一件事了")
     return floor, problems
 
 
@@ -7831,8 +7879,10 @@ def check_python_floor(files=None) -> list:
             path = ROOT / rel
             if not path.is_file():
                 continue          # 在不在位由第 6/9 条管，这一条只管内联 python
+            # 剥掉整行注释再扫（与第 42 条丙项、陷阱门同一口径）：不剥的话，谁在注释里
+            # 解释「为什么这一段不能写成内联 python」，就会被自己那句解释判红。
             hits = [ln.strip()[:90] for ln in
-                    path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    _strip_comments(path.read_text(encoding="utf-8", errors="replace")).splitlines()
                     if _INLINE_PY_PAT.search(ln)]
             if hits:
                 problems.append(f"{rel} 里出现了内联 python（本条款只看 .py，这一处它看不到）："
@@ -9446,6 +9496,374 @@ def check_artifact_step_cwd(texts=None) -> list:
     return problems
 
 
+# ── 第 42 条：Windows 7 兼容通道的地板，与「两条通道除了地板以外不许不一样」────
+# 由来（2026-11-19 纯小白实机）：主通道产物是 CPython 3.11 打的，而官方二进制从 3.9 起
+# 就不再支持 Windows 7——那台机器上「丢失 api-ms-win-core-path-l1-1-0.dll」与
+# 「Failed to load Python DLL python311.dll」就是这一句的现场。需求 10 已经把「能补的
+# 当场补」（VC++ 运行库随包带）做完，补不了的这一半只剩一个机械出路：另开一条用 3.8 打
+# 目标产物的通道（.github/workflows/build-b2bcollect-legacy.yml）。
+#
+# 多一条流水就多一处「两份实现迟早分叉」。这一条因此管三件事，缺一件都会留下静默缺陷：
+#   甲 **地板够不够老**：进包的每一份源码都必须能在 3.8 下解析。这一格的坏形状不需要任何
+#      人犯错——只要有人在进包模块里写一句 `list[str]`，主通道全绿（3.11 认），兼容包照
+#      打出、PE 体检照过（SyntaxError 发生在运行期点击那个功能时），Win7 用户拿到的是
+#      「装上了、点开就崩」。
+#   乙 **同源**：与主通道共享的那些步骤，run 体必须逐字节相同。允许不同的只有各步自己 env
+#      里的四个值（地板与包名）。为什么按字节比而不按「语义差不多」：这一路复制的是 200 多
+#      行每一行都写着翻车教训的 bash（sha256 从标准输入喂、MSYS 改写参数、PIPESTATUS 归因、
+#      横幅两种写法），手抄一定会在某个字上漂，而漂掉的恰好就是那个字承载的修复。
+#   丙 **兼容通道的关键参数在场**：双解释器各自钉死、驱动取 109 那一档、PE 地板门真在跑、
+#      包名带 _Win7、以及**还没**接进固定直链登记表（那是需求 10C，接早了比不接更糟）。
+# 反向说明（避免这一条被当成它做不到的证据用）：本条判的是源码与流水定义，**不**判
+# 「Win7 双击一定可用」——后者要一台真机。加载器那一格由 check_pe_floor.py 在云端量。
+
+LEGACY_WORKFLOW_LABEL = "Win7 legacy workflow"
+LEGACY_WORKFLOW_REL = ".github/workflows/build-b2bcollect-legacy.yml"
+# 双解释器分工的四档判定（从 yml 里提出来的）：第 34 条只看 `.py`，写在 workflow 里的
+# 内联 `python -c` 是它的盲区（它自己的红话就写着「本条款只看 .py，这一处它看不到」）。
+LEGACY_TOOLCHAIN_SCRIPT = ".github/scripts/check_legacy_toolchain.py"
+# 两份 workflow 的路径在文件顶部与 CALLERS 同源（那里定义了 MAIN_WORKFLOW / LEGACY_WORKFLOW），
+# 不在这再写一遍字面量：同一个路径写两处，改了其中一处就会得到一个“门在判另一个文件”的红。
+PY38_FLOOR = (3, 8)
+# 兼容通道**必须**用目标解释器跑的那份工具脚本：pip_install.py 按 sys.executable 装包，
+# 谁跑它就装进谁的环境，于是它自己也落在 3.8 的地板之下。它住在 .github/scripts/
+# （默认按工具链 3.11 写），所以单独点名判一次——不判就是留给将来某次 SyntaxError。
+FLOOR_BOUND_TOOL_SCRIPTS = (".github/scripts/pip_install.py",)
+# 3.9+ 才有的写法。名单制，**不是全集**：命中=一定红，不命中≠证明兼容。
+# 静态判不出来的那一类写在这里而不是假装没有：`d1 | d2`（dict 合并，3.9+）在 AST 里
+# 与 `a | b`（位运算/集合并，2.x 就有）长得一模一样，只有运行期类型才知道是谁——
+# 2026-11-20 本机第一轮取证就是拿正则数出 24 处 `|=`，逐行看完全是 set/int 的 |=，
+# 归因错一次就会把「方向对、账错」的结论写进交付。
+PY39_PLUS_ATTRS = {
+    "unparse": "ast.unparse（3.9+ 才有）",
+    "removeprefix": "str.removeprefix（3.9+ 才有）",
+    "removesuffix": "str.removesuffix（3.9+ 才有）",
+    "TopologicalSorter": "graphlib.TopologicalSorter（3.9+ 才有的模块）",
+    "lcm": "math.lcm（3.9+ 才有）",
+}
+PY39_PLUS_MODULES = ("zoneinfo", "graphlib")   # 3.9+ 才有的标准库模块名
+PEP585_NAMES = frozenset({"list", "dict", "set", "frozenset", "tuple", "type"})
+
+
+def _has_future_annotations(tree) -> bool:
+    """文件顶部有没有 `from __future__ import annotations`（有则注解不求值，PEP585/604 无害）。"""
+    for node in tree.body:
+        if (isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                and any(a.name == "annotations" for a in node.names)):
+            return True
+    return False
+
+
+def _annotation_nodes(tree):
+    """所有**会在定义时求值**的注解节点（函数签名、变量注解、返回注解）。"""
+    for node in _walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            for x in list(a.args) + list(a.posonlyargs if hasattr(a, "posonlyargs") else []) \
+                    + list(a.kwonlyargs) + ([a.vararg] if a.vararg else []) \
+                    + ([a.kwarg] if a.kwarg else []):
+                if x.annotation is not None:
+                    yield x.annotation
+            if node.returns is not None:
+                yield node.returns
+        elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+            yield node.annotation
+
+
+def _pep585_604_in(node):
+    """这棵注解子树里有没有 3.8 不接受的写法（list[str] / int | None）。返回人话或 None。"""
+    for sub in _walk(node):
+        if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) \
+                and sub.value.id in PEP585_NAMES:
+            return f"{sub.value.id}[...]（PEP 585 泛型，3.9+ 才允许下标）"
+        if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+            return "X | Y（PEP 604 联合类型，3.10+；3.8 会当场 TypeError）"
+    return None
+
+
+def _floor_problems(path: Path, text: str) -> list:
+    """一份源码在 CPython 3.8 下的三道检查：语法、运行期注解、3.9+ API。"""
+    problems = []
+    at = _rel(path)
+    try:
+        ast.parse(text, filename=str(path), feature_version=PY38_FLOOR)
+    except SyntaxError as e:
+        # 不复用 _file_tree 的缓存树：那一份是按**本机解释器**解析的，而本条要问的是
+        # 3.8。拿 3.13 的结论替 3.8 担保，正是这一条要防的事。
+        problems.append(f"{at} 第 {e.lineno} 行在 Python 3.8 下解析不了（{e.msg}）："
+                        "主通道打得绿、兼容包也打得绿，但那句新语法在 Win7 包里是"
+                        "运行期才炸的 SyntaxError——红在这里才对得上代价")
+        return problems        # 解析不了就别再走 AST 判据，否则会叠出一串假告警
+    try:
+        # 后面三道 AST 判据要的是「按本机语法解开的树」，与 `_file_tree` 同一口径，
+        # 所以这里走把手而不是自己解一份：同一个文件在全部门禁里只解一次（AT 节计过的量：
+        # 单次调用 390 万次展开），而上面那一份按 3.8 解的树只用于「能不能解析」那一问，
+        # 不许泄到这一层来（它会把 3.9+ 才有的节点形状当成正常）。
+        tree = _file_tree(str(path), text)
+    except SyntaxError as e:   # 本机解释器都解析不了：那是另一个问题，说清楚
+        problems.append(f"{at} 连本机解释器都解析不了（{e.msg}）")
+        return problems
+    if not _has_future_annotations(tree):
+        for ann in _annotation_nodes(tree):
+            bad = _pep585_604_in(ann)
+            if bad:
+                problems.append(f"{at} 第 {getattr(ann, 'lineno', '?')} 行的注解用了 {bad}，"
+                                "而文件顶部没有 `from __future__ import annotations`："
+                                "注解在定义时求值，3.8 会在这里抛 TypeError/AttributeError")
+    for node in _walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in PY39_PLUS_ATTRS:
+            problems.append(f"{at} 第 {node.lineno} 行调到 {PY39_PLUS_ATTRS[node.attr]}："
+                            "进包源码在 3.8 上没有这个东西（兼容通道会打出一个装得上、"
+                            "用到那条路径才崩的包）")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                head = a.name.split(".")[0]
+                if head in PY39_PLUS_MODULES:
+                    problems.append(f"{at} 第 {node.lineno} 行 import {head}："
+                                    f"`{head}` 是 Python 3.9+ 才有的标准库模块")
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in PY39_PLUS_MODULES:
+            problems.append(f"{at} 第 {node.lineno} 行从 {node.module} 导入："
+                            "那是 Python 3.9+ 才有的标准库模块")
+    return problems
+
+
+def check_py38_floor(sources=None) -> list:
+    """甲：进包源码 + 被目标解释器执行的工具脚本，都必须落在 3.8 地板之下。"""
+    problems = []
+    srcs = list(sources) if sources is not None else _weight_analyzed_sources()
+    if not srcs:
+        # fail-closed：视野为空时「没有不合格」是一句谎话（第 20 条同族：扫到 0 条要红）。
+        return ["3.8 地板门读不到任何进包源码（_weight_analyzed_sources() 是空的）："
+                "这一格等于没判，不许报绿"]
+    for p in srcs:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            problems.append(f"{_rel(p)} 读不出来（{e}）：读不到的源码不能算过了地板门")
+            continue
+        problems.extend(_floor_problems(p, text))
+    for rel in FLOOR_BOUND_TOOL_SCRIPTS:
+        p = ROOT / rel
+        if not p.is_file():
+            problems.append(f"{rel} 不在位：兼容通道用目标解释器跑它，这一格现在没人判")
+            continue
+        problems.extend(_floor_problems(p, p.read_text(encoding="utf-8", errors="replace")))
+    return problems
+
+
+# 与主通道**逐字节共享**的步骤（按步骤名认，不写行号：行号会随上面加删行漂移，
+# 而漂移的期望值就是下一次假红）。想从这张表里删一步，等于宣布「这一步允许两条通道
+# 各写一份」——那需要先想清楚谁来为分叉负责。
+SHARED_STEPS = (
+    "Packaging manifest gate",
+    "Write bundled config.json from Secrets",
+    "Prune Qt hook leftovers + Artifact weight gate (剪裁 + 成分账)",
+    "Artifact doctor gate (B2bCollectTool.exe --acl-doctor)",
+    "Window smoke gate (B2bCollectTool.exe --ui-smoke)",
+    "Artifact self-report gate (产物必须自报是哪一版)",
+    "Package Windows artifacts",
+    "Provision NSIS (钉版本 + 校验 sha256)",
+    "Provision VC++ redist (钉版本 + 校验 sha256)",
+    "Build Windows installer (NSIS, per-user)",
+)
+# 唯一一处**允许**不同、但要按归一化比特的共享步骤：解释器变量名不同（主通道吃 PATH 上
+# 的 python，兼容通道显式点名 "$TARGET_PY"），除此之外整段——两条前置守卫、全部
+# --add-data/--hidden-import、入口脚本——都必须一字不动。归一化只消那一个 token，
+# 不是「语义差不多」的挡箭牌。
+NORMALIZED_STEP = "Build EXE with PyInstaller"
+
+
+def _step_bodies(text: str) -> dict:
+    """步骤名 → [(shell, run 体)]。用第 11 条那份切块器，不在这里再写一个 yml 解析器。"""
+    out = {}
+    for name, _lineno, shell, body in run_blocks_in_workflow(text):
+        out.setdefault(name, []).append((shell, body))
+    return out
+
+
+def _body_diff_hint(a: str, b: str) -> str:
+    r"""把「到底哪里不一样」说一句**真话**，三种形状各说各的。
+
+    上一版这里只会说「行数都不同（14 vs 14）」——而 14 vs 14 明明是相同，谎话的来源是
+    `splitlines()` 会把**尾部换行**丢掉：主通道每两步之间有一个排版空行，切块器把它算进了
+    上一步的 body（YAML 块标量到 dedent 为止），于是「14 行 + 结尾换行」与「14 行」被判不同，
+    而话术里只剩一个自相矛盾的括号。
+    为什么不在比较上放宽（rstrip 掉再比）：那是给判据开一个永久的洞——真正的语义差异同样可以
+    藏在末尾（续行反斜杠、heredoc 收尾）。宁可让它响，但必须响得能一眼看懂：这一句现在会直接
+    说出「只差尾部空行」，处理办法就是重跑生成器。
+
+    分支顺序本身也是一处判据：尾部空行在 `splitlines()` 眼里**同时**长得像「行数不同」
+    （`"a\n"` 是 1 行、`"a\n\n"` 是 2 行），所以「只差尾部空行」这一格必须排在行数那格**前面**，
+    否则它永远走不到，红话又退回那句自相矛盾的「行数不同」。上一版就是这个顺序，实测被 DF 节
+    的排版空行变异当场抓出来（红话指错了方向，人会去改打包参数而不是重跑生成器）。
+    """
+    la, lb = a.splitlines(), b.splitlines()
+    for k, (x, y) in enumerate(zip(la, lb)):
+        if x != y:
+            return f"第 {k + 1} 行内容不同：主通道 {x[:70]!r} / 兼容通道 {y[:70]!r}"
+    if a.rstrip("\n") == b.rstrip("\n"):
+        return (f"行内容全部相同，只差**尾部空行**（主通道 {a.count(chr(10))} 个换行 / "
+                "兼容通道 {b.count(chr(10))} 个）：那是 YAML 步骤之间的排版空行被算进了"
+                "上一步的 body，重跑生成器即可对齐")
+    if len(la) != len(lb):
+        return (f"行数不同（主通道 {len(la)} 行 / 兼容通道 {len(lb)} 行），"
+                f"前 {min(len(la), len(lb))} 行逐行相同——一边多了结尾的几行")
+    return "行内容逐行相同、字符串却不相等（行内有 CR 或不可见字符差异）"
+
+
+def _norm_interpreter_token(body: str) -> str:
+    """只把「用哪个解释器跑 PyInstaller」这一个 token 折成同一个记号，别的一个字节不动。"""
+    return re.sub(r'"?\$?TARGET_PY"? -m PyInstaller', "@PY@ -m PyInstaller",
+                  body.replace('python -m PyInstaller', '@PY@ -m PyInstaller'))
+
+
+def check_legacy_channel(main_text=None, legacy_text=None, toolchain_text=None) -> list:
+    """第 42 条主体：同源（乙）+ 兼容通道自己的关键参数（丙）。
+
+    三份文本都留注入面（第 15/20/34/41 条同一口径）：只能读真仓库的判据只验得出「现在没坏」，
+    验不出「将来坏了会响」——而后者才是判据。
+    """
+    problems = []
+    if main_text is None:
+        main_text = MAIN_WORKFLOW.read_text(encoding="utf-8") if MAIN_WORKFLOW.is_file() else ""
+    if legacy_text is None:
+        legacy_text = LEGACY_WORKFLOW.read_text(encoding="utf-8") if LEGACY_WORKFLOW.is_file() else ""
+    if not main_text:
+        return [f"读不到 {_rel(MAIN_WORKFLOW)}：两条通道同源的判据现在没输入"]
+    if not legacy_text:
+        return [f"读不到 {_rel(LEGACY_WORKFLOW)}：需求 10B 的兼容通道不存在，"
+                "而主通道的老系统文案已经当着用户承诺了这个包名"]
+    if LEGACY_WORKFLOW_LABEL not in CALLERS:
+        problems.append(f"CALLERS 里没有 {LEGACY_WORKFLOW_LABEL}：兼容通道的打包清单不参与对拍，"
+                        "主通道加一个 --hidden-import 它不会跟着加（第 42 条管不到、"
+                        "第 1/2 条也管不到——症状正是「Win7 用户在一个已修好的功能上再崩一次」）")
+    if LEGACY_WORKFLOW_REL not in WORKFLOWS:
+        problems.append(f"WORKFLOWS 里没有 {LEGACY_WORKFLOW_REL}：这条流水的 shell 不过第 11 条的"
+                        "真解析器，语法坏了要等云端才知道")
+
+    # 乙：共享步骤逐字节相同
+    m, l = _step_bodies(main_text), _step_bodies(legacy_text)
+    for title in SHARED_STEPS:
+        if title not in m:
+            problems.append(f"主通道里找不到步骤「{title}」：第 42 条的同源对拍失去了参照，"
+                            "要么步骤被改名/删除，要么该同步改这张表并写下理由")
+            continue
+        if title not in l:
+            problems.append(f"兼容通道里没有步骤「{title}」（主通道有）：那一步的门在这一路没跑，"
+                            "Win7 包会带着「主通道拦住过」的缺陷出厂")
+            continue
+        for i, ((sh_m, body_m), (sh_l, body_l)) in enumerate(zip(m[title], l[title])):
+            if sh_m != sh_l:
+                problems.append(f"步骤「{title}」两条通道的 shell 不同（{sh_m} vs {sh_l}）："
+                                "同一份逻辑在两种 shell 下不是同一份逻辑（bash/pwsh 的引号与"
+                                "退出码口径都不一样）")
+            if body_m != body_l:
+                problems.append(f"步骤「{title}」的 run 体两条通道不再逐字节相同（{_body_diff_hint(body_m, body_l)}）："
+                                "改共享逻辑请先改主通道，再重跑 debug/gen_legacy_workflow.py；"
+                                "单独改一边会让某一条通道悄悄丢掉那一步的修复")
+        if len(m[title]) != len(l[title]):
+            problems.append(f"步骤「{title}」出现次数不同（主通道 {len(m[title])} / "
+                            f"兼容通道 {len(l[title])}）：同名两步在判据视野里会互相顶掉")
+    # PyInstaller 那一步：只允许解释器那一个 token 不同
+    if NORMALIZED_STEP in m and NORMALIZED_STEP in l:
+        a = _norm_interpreter_token(m[NORMALIZED_STEP][0][1])
+        b = _norm_interpreter_token(l[NORMALIZED_STEP][0][1])
+        if a != b:
+            problems.append(f"步骤「{NORMALIZED_STEP}」除解释器 token 外不再相同："
+                            "打包参数就是产物内容，两条通道不一致时兼容包会少一块功能"
+                            "（--add-data/--hidden-import 另由 CALLERS 对拍，这里是第二道）")
+    elif NORMALIZED_STEP not in l:
+        problems.append(f"兼容通道里没有步骤「{NORMALIZED_STEP}」：那这条通道在打什么？")
+
+    # 丙：兼容通道自己的关键参数（每一条都是「缺了它就整条通道的前提不成立」那一类）
+    # 丙项整段都在**剥掉整行注释**的视图上比（复用第 1 条那个 _strip_comments，不另写一把）。
+    # 两个方向都会漏：banned 那一半不剥就会把交付边界说明里那句「不发清单、不改
+    # upload_release_to_oss.ALLOWED_NAMES」当成违规（注释里的指路话不算调用，本仓早有此约）；
+    # need 那一半不剥就更危险——将来有人把 `--max-major 109` 那一行**注释掉**，字面量还在文件里，
+    # 门却报绿。一句不执行的注释既不该红、也不该绿。
+    legacy_code = _strip_comments(legacy_text)
+    main_code = _strip_comments(main_text)
+
+    def need(pattern, why, where=legacy_code):
+        if not re.search(pattern, where):
+            problems.append(why)
+
+    need(r"python-version:\s*['\"]3\.8", "兼容通道没有 setup-python 3.8：目标解释器还是 3.9+，"
+                                          "这条通道与主通道是同一个东西，Win7 依旧打不开")
+    need(r"python-version:\s*['\"]3\.11", "兼容通道没有第二个解释器（工具链 3.11）：门禁脚本里的"
+                                            " ast.unparse 会当场炸，红话听起来像仓库坏了")
+    # 「钉成 3.8」与「钉住 Qt 5」现在都不住在 yml 里：四档判定被提进了
+    # LEGACY_TOOLCHAIN_SCRIPT（第 34 条只看 .py，内联那一份是它的盲区）。于是这一侧要钉
+    # **两件事**：流水真去调它、脚本里那几个常量还在说这件事。只钉一边都不算数：调用被删
+    # 而脚本还在，等于这一步根本没跑；调用还在而常量漂了（(3, 8) 改成 (3, 9)），等于跑了一
+    # 把已经坏了的门——后者比不跑更险，因为它报的是绿。
+    need(r"check_legacy_toolchain\.py[^\n]*--pin",
+         "兼容通道不再调双解释器体检的 --pin：那句「进包的解释器必须是 3.8」的唯一判点消失了，"
+         "setup-python 退而求其次时这条通道会静默变成主通道（PE 地板、窗口冒烟、自报对拍"
+         "全都照样绿——3.8 与 3.9 的产物在那些格子上长得一样）")
+    need(r"check_legacy_toolchain\.py[^\n]*--inventory",
+         "兼容通道不再问目标环境装到了什么：Qt 主版本这一格没人判了，而带 Qt6 的「Win7 包」"
+         "能在所有门禁里全绿（runner 是 Win11）")
+    tool_path = ROOT / LEGACY_TOOLCHAIN_SCRIPT
+    if toolchain_text is None:
+        toolchain_text = (tool_path.read_text(encoding="utf-8", errors="replace")
+                          if tool_path.is_file() else "")
+    if not toolchain_text:
+        problems.append(f"{LEGACY_TOOLCHAIN_SCRIPT} 不在位或读不出：双解释器分工与 Qt 主版本这两格现在没人判")
+    else:
+        tool_code = _strip_comments(toolchain_text)
+        for pat, why in (
+                (r"TARGET_FLOOR\s*=\s*\(3,\s*8\)",
+                 "目标档不再是 (3, 8)：整条兼容通道存在的理由被改掉了，它判的东西会跟着变成别的"),
+                (r"TOOL_MIN\s*=\s*\(3,\s*11\)",
+                 "工具链下限不再是 (3, 11)：构建前硬门用的 ast.unparse 是 3.9+，下限漂走"
+                 "等于那道门没人守"),
+                (r"QT_VERSION_STR", "脚本不再问 Qt 版本：带 Qt6 的「Win7 包」能全绿出厂"),
+                (r'QT_MAJOR|startswith\("5', "脚本里 Qt 主版本那一格判定不见了（只记录不判定）"),
+                (r"maxsize", "脚本不再问位数：随包 PyQt5/ChromeDriver 都是 win64，"
+                             "装进 32 位运行时是启动即崩")):
+            if not re.search(pat, tool_code):
+                problems.append(f"{LEGACY_TOOLCHAIN_SCRIPT}：{why}（第 42 条丙项对拍）")
+    need(r"fetch_chromedrivers\.py\s+--max-major\s+109",
+         "兼容通道的驱动没限到 109：Win7 上装不到 Chrome 110+，随包驱动驱不动任何浏览器，"
+         "而症状是「1688/企知道报 cannot connect」")
+    need(r"check_pe_floor\.py[^\n]*--scan-dir[^\n]*--floor\s+6\.1",
+         "兼容通道没在构建后扫产物目录的 PE 地板：加载器那一关就没人量过（镜像要得比系统新"
+         "时，PyInstaller 与 makensis 一句错都不报）")
+    for pat, why in ((r'MIN_WIN_MAJOR:\s*["\']6["\']', "兼容通道的安装器地板不是 major=6"),
+                     (r'MIN_WIN_MINOR:\s*["\']1["\']', "兼容通道的安装器地板不是 minor=1"),
+                     (r'OUT_FILE:\s*["\']B2bCollectToolSetup_Win7\.exe["\']',
+                      "兼容包的安装包名不是 B2bCollectToolSetup_Win7.exe：主通道安装器的"
+                      "老系统文案当着用户承诺的就是这个名字，名字改了那句话就指向一个不存在的文件"),
+                     (r'PORTABLE_NAME:\s*["\']B2bCollectTool_Win7_portable\.zip["\']',
+                      "兼容包的绿色版名字与主通道相同：两个包会在下载侧互相覆盖，而覆盖是静默的"),
+                     (r"architecture:\s*x64", "兼容通道没写 architecture: x64：吃默认值的话，"
+                                              "镜像哪天换架构，我们打的是一个连 x86_64 都跑不了的包")):
+        need(pat, why + "（这一格由第 42 条丙项判）")
+    # 没接进去的东西也必须「确实没接进去」：接早了比不接更糟。
+    for banned, why in ((r"upload_release_to_oss\.py",
+                         "兼容通道已经在发 OSS 固定直链，但更新器登记表（tool_update."
+                         "ALLOWED_ARTIFACTS/MANIFEST_BY_KEY）还没同步：这一条直链会绕过"
+                         "主通道那条对拍门"),
+                        (r"make_release_manifest\.py",
+                         "兼容通道开始生成发布清单了：清单 schema 里目前没有 win7 这一档，"
+                         "客户端读侧（10C）没准备好之前不许发")):
+        if re.search(banned, legacy_code):
+            problems.append(why)
+
+    # 主通道那一侧：env 钉子必须在位，否则生成器换值会静默失效（run 体里根本没有可换的东西）
+    for pat in (r'OUT_FILE:\s*["\']B2bCollectToolSetup\.exe["\']',
+                r'PORTABLE_NAME:\s*["\']B2bCollectTool_Win_portable\.zip["\']',
+                r'MIN_WIN_MAJOR:\s*["\']10["\']',
+                r'MIN_WIN_MINOR:\s*["\']0["\']',
+                r'--portable-name\s+"\$PORTABLE_NAME"'):
+        if not re.search(pat, main_code):
+            problems.append(f"主通道里少了 env 钉子/参数 {pat}：兼容通道的包名与地板是靠"
+                            "替换这些钉子得到的，主通道一改，生成器就会切出一个与主通道"
+                            "不同源的步骤（它自己也会 raise，但门不能依赖工具跑过）")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -9674,7 +10092,7 @@ def main(argv=None) -> int:
             print(f"   · {p}")
             print(f"::error::pip 安装与依赖清单：{p}")
     else:
-        print("✅ pip 安装冗余：四份 workflow 都走 pip_install.py，多源回退 + 每源有界超时 + "
+        print(f"✅ pip 安装冗余：{len(WORKFLOWS)} 份 workflow 都走 pip_install.py，多源回退 + 每源有界超时 + "
               "全挂才非零；b2bcollect 两个平台读同一份依赖清单（不再是两份各自抄写的包名），"
               "且那份清单覆盖进包源码 import 到的每一个第三方包")
 
@@ -9897,7 +10315,8 @@ def main(argv=None) -> int:
             print(f"::error::语法地板：{p}")
     else:
         _fl, _ = python_floor()
-        print(f"✅ 语法地板：按 {_fl[0]}.{_fl[1]}（读自四份 workflow 的 python-version，不一致就不许绿）"
+        print(f"✅ 语法地板：按 {_fl[0]}.{_fl[1]}（读自 {len(WORKFLOWS)} 份 workflow 的 python-version；"
+              f"各流水的门禁解释器不一致就不许绿）"
               f"扫了 {_FLOOR_FACTS['files']} 份 .py：没用到超出地板的写法（{_FLOOR_FACTS['fstrings']} 个"
               f" f-string 字面量、{_FLOOR_FACTS['fields']} 个替换域逐条走过 Python 自己的分词器；"
               f"f-string 家用法 {len(FLOOR_FSTRING_CASES)} 档、新语法节点 {len(FLOOR_CONSTRUCTS)} 档在表上；"
@@ -9997,6 +10416,30 @@ def main(argv=None) -> int:
         print(f"✅ 剪裁/重量门的执行位置：{_seen} 处调用全部跑在 `cd {BUILD_CWD}` 里，"
               f"参数写成 `dist/<产物名>`、门脚本写成 `../{GATE_SCRIPT_REL}`"
               f"（两个方向都不许错位，本机脚本与两份 workflow 一种写法）")
+
+    floor38 = check_py38_floor()
+    if floor38:
+        bad += 1
+        print("❌ Python 3.8 地板门（第 42 条·甲）不合格：")
+        for p in floor38:
+            print(f"   · {p}")
+            print(f"::error::3.8 地板：{p}")
+    else:
+        print(f"✅ Python 3.8 地板门：进包分析闭包（{len(_weight_analyzed_sources())} 份源码）"
+              f"与被目标解释器执行的 {len(FLOOR_BOUND_TOOL_SCRIPTS)} 份工具脚本，"
+              "语法 / 运行期注解 / 3.9+ API 三道全过（兼容通道的产物才能在 Windows 7 上起来）")
+
+    legacy_probs = check_legacy_channel()
+    if legacy_probs:
+        bad += 1
+        print("❌ Windows 7 兼容通道门（第 42 条·乙丙）不合格：")
+        for p in legacy_probs:
+            print(f"   · {p}")
+            print(f"::error::Win7 兼容通道：{p}")
+    else:
+        print(f"✅ Windows 7 兼容通道：与主通道共享的 {len(SHARED_STEPS)} 步逐字节同源"
+              f"（外加「{NORMALIZED_STEP}」只允许解释器那一个 token 不同），"
+              "双解释器 / 驱动 109 / PE 地板 / 包名与地板钉子全部在场，且尚未接进固定直链")
 
     for label, path in CALLERS.items():
         if not path.exists():

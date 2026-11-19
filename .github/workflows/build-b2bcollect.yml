@@ -172,12 +172,16 @@ jobs:
       # b2bcollect_build/dist/。本步从仓库根执行却传 dist/... 的话，剪裁和重量门都会
       # 「读不到视野」——真实翻车过（run #69），所以脚本侧另有静态判据钉这条 cwd 契约。
       shell: bash
+      env:
+        # 【需求 10B】只用于报错时点名是哪一份产物（不参与取上限）；提成 env 是为了
+        # 让兼容通道能逐字节复用下面这一行——run 体相同，第 42 条的字节对拍才成立。
+        ARTIFACT_LABEL: "Windows"
       run: |
         set -u
         cd b2bcollect_build
         python ../.github/scripts/check_packaging_manifest.py \
           --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \
-          --artifact-label Windows
+          --artifact-label "$ARTIFACT_LABEL"
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，
@@ -305,8 +309,12 @@ jobs:
       #      给「不让装软件 / 放共享盘」的场景兜底。
       # 这一步排在安装包之前：makensis 用 File /r 拷整棵 dist 树，先剔干净再拷，
       # 安装器与 zip 才是同一份干净布局。
+      # 【需求 10B】包名在本步的 env 里钉：兼容通道那份 yml 的这一步 run 体与这里
+      # 逐字节相同（第 42 条按步骤名做字节对拍），只有 env 不同。
       shell: bash
-      run: python .github/scripts/package_win_artifacts.py --root b2bcollect_build
+      env:
+        PORTABLE_NAME: "B2bCollectTool_Win_portable.zip"
+      run: python .github/scripts/package_win_artifacts.py --root b2bcollect_build --portable-name "$PORTABLE_NAME"
 
     - name: Provision NSIS (钉版本 + 校验 sha256)
       # 第五刀（2026-11-12 Windows 实机）：原来这一步是「在 runner 上找 makensis，
@@ -454,8 +462,28 @@ jobs:
       # 目录而不是脚本目录，靠「反正我 cd 过了」迟早对不上（Git Bash 的 pwd -W 才给
       # Windows 形式的绝对路径，纯 MSYS 形式 /d/... 传给 Windows 版 makensis 会读错）。
       shell: bash
+      # 【需求 10B】地板与包名是两条通道之间**唯一**允许不同的东西，所以把它们从命令体
+      # 里提到这里：兼容通道那份 yml 只有这四个值不一样，下面的 run 体逐字节相同。
+      # 主通道继续用 10.0（=Windows 10），与今天的行为一致（今天就是不传 -D、吃 nsi 默认值）。
+      env:
+        OUT_FILE: "B2bCollectToolSetup.exe"
+        PORTABLE_NAME: "B2bCollectTool_Win_portable.zip"
+        MIN_WIN_MAJOR: "10"
+        MIN_WIN_MINOR: "0"
       run: |
         cd b2bcollect_build
+        # 这四个缺任何一个都不许开编。为什么要在运行时就验、不等 makensis 报错：NSIS 的
+        # !ifndef 允许命令行 -D 覆盖，**漏传一个 -D 不会编不过**——它会安静地用默认值编出
+        # 一个「名字叫 Win7、地板还是 Win10」的包，而那是最坏的形状：用户按文案下载了
+        # 「给他的那台老机器准备的那个包」，安装器却把自己的用户拦在门外，而两条流水线全绿。
+        for _v in OUT_FILE PORTABLE_NAME MIN_WIN_MAJOR MIN_WIN_MINOR; do
+          [ -n "${!_v:-}" ] || { echo "::error::这一步缺 env 变量 ${_v}：地板或包名没钉住，宁可不编安装包"; exit 1; }
+        done
+        # 地板得是整数：它直接喂给 NSIS 的 IntCmp，带一个非数字字符就是拿一句人话去喂
+        # 整数比较（makensis 会回一句用法错误，而日志看着像编译器坏了）。
+        case "$MIN_WIN_MAJOR$MIN_WIN_MINOR" in
+          ""|*[!0-9]*) echo "::error::地板不是纯数字（major=${MIN_WIN_MAJOR} minor=${MIN_WIN_MINOR}）：它要直接进 NSIS 的整数比较"; exit 1 ;;
+        esac
         # makensis 由上一步现下载、校验、解压，并把路径写进 GITHUB_ENV。这里不再
         # 「在机器上找」：找得到找不到都不是产品的事，是镜像的事，而镜像会变（本轮就是
         # 这么红的）。上一步没成功就不该走到这里，走到了也照样停，绝不静默降级成
@@ -529,7 +557,10 @@ jobs:
         # 不是红一条日志。（离线仿真「关掉 pipefail 仍要认得编译器」那一味钉的就是这个。）
         set -o pipefail
         NSIS_RC=0
-        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="$DISPLAY_VER" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
+        # /DMIN_WIN_* 与 /DOUT_FILE 都来自上面的 env：同一份 .nsi 编出两种地板、两个包名。
+        # 为什么不在 nsi 里复制一份「兼容版专用脚本」：那会把「缺运行库当场补装」「体检
+        # 日志」「旧实例探测」这些踩过坑的逻辑再抄一遍，而抄第二遍的东西一定会漂。
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="$DISPLAY_VER" /DVER4="$VER4" /DMIN_WIN_MAJOR="$MIN_WIN_MAJOR" /DMIN_WIN_MINOR="$MIN_WIN_MINOR" /DOUT_FILE="$OUT_FILE" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
         if [ "$NSIS_RC" -ne 0 ]; then
           echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
           exit 1
@@ -568,7 +599,9 @@ jobs:
           exit 1
         fi
         echo "✅ 安装包出自 makensis ${BANNER}（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）"
-        ls -l B2bCollectToolSetup.exe B2bCollectTool_Win_portable.zip
+        # 两个产物名都按本步 env 里钉的那一个找：名字写死在这里的话，兼容通道要么改这一行
+        # （两份 yml 从此逐字不同、第 42 条的字节对拍作废），要么要同一个文件叫两个名字。
+        ls -l "$OUT_FILE" "$PORTABLE_NAME"
 
     - name: Generate release manifest (发布清单 latest_windows.json)
       # 需求 2 的最后一块：制品上传之前，先把「这一版叫什么、更新了什么、该下哪一份包、
