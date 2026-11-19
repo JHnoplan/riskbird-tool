@@ -9122,11 +9122,20 @@ def prune_artifact(artifact, label: str = "") -> int:
         for p in artifact_candidate_paths(rel, roots):
             if not p.exists():
                 continue
-            mb = _dir_size_mb(p)
-            if p.is_file():
+            # 符号链接必须单独一档：`shutil.rmtree` 对链接直接抛「Cannot call rmtree on a
+            # symbolic link」（2026-11-19 本机打包实跑崩在 Frameworks/PyQt5/Qt5/translations
+            # 那一格），而 `_dir_size_mb` 拿 rglob 扫链接目录时又会把真身那一侧的字节再算
+            # 一遍（同一份东西在成分账里只许算一次，这里剪两遍就成了报两遍的账）。
+            # 所以：链接只是壳，摘掉即可，字节由真身自己那一格报。
+            if p.is_symlink():
+                mb, how = 0.0, "摘掉链接壳"
                 p.unlink()
-            else:
+            elif p.is_dir():
+                mb, how = _dir_size_mb(p), "剪掉"
                 shutil.rmtree(p)
+            else:
+                mb, how = _dir_size_mb(p), "剪掉"
+                p.unlink()
             total += mb
             # 只报「在产物里的哪一格」：同一份清单在 Frameworks 与 Resources 两侧都命中时，
             # 念全路径才能看出剪了两处（这里不用 Path.is_relative_to：那是 3.9+ 的方法，
@@ -9135,7 +9144,7 @@ def prune_artifact(artifact, label: str = "") -> int:
                 shown = str(p.relative_to(roots[0].parent))
             except ValueError:
                 shown = str(p)
-            print(f"· {tag}剪掉 {shown}（{mb:.0f}MB）")
+            print(f"· {tag}{how} {shown}（{mb:.0f}MB）")
     print(f"✅ {tag}剪裁完成：合计 {total:.0f}MB。这些是 hook 连带收件里本工具永远用不到的"
           f"（webgl 插件拖进来的整条 QML 栈 + 从未生效过的 Qt 翻译）；剪完的产物马上过重量门，"
           f"谁再把它长出来当场红")

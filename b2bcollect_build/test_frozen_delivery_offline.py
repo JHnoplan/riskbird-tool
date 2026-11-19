@@ -3323,7 +3323,11 @@ def test_workflow_shell_syntax():
         return {p.relative_to(shared).as_posix() for p in shared.rglob("*") if p.is_file()} \
             if shared.is_dir() else set()
 
-    def _run_probe(src: str, extra_env: dict | None = None):
+    # `dict | None` 直接写出来是 PEP 604（3.10 起）：这一份是「兼容通道的 Python 3.8 也要
+    # 能整套跑完」那条路的被测对象之一，注解在定义时就会求值，3.8 上直接 TypeError。
+    # 加 `from __future__ import annotations` 也能修，但那是整份文件换个求值口径；
+    # 引号里的前向引用只有这一格受影响，改动面小、也不改别的注解的行为。
+    def _run_probe(src: str, extra_env: "dict | None" = None):
         fixture.write_text(src, encoding="utf-8")
         try:
             env = dict(os.environ)
@@ -11849,6 +11853,38 @@ def test_package_weight_gate():
         for side in ("Frameworks", "Resources"):
             _assert(not (cont / side / "PyQt5" / "Qt5" / "translations").exists(),
                     f"{side} 侧的 translations 必须真被剪掉")
+
+    # 真实产物里两侧不是「两份真字节」，而是「一份真身 + 一个链接目录」：2026-11-19 本机
+    # 打包就崩在这一格（`shutil.rmtree` 对符号链接目录直接抛 Cannot call rmtree on a
+    # symbolic link）。上一段那个夹具造的是两个真目录，恰好碰不到这一档——判据里的
+    # 夹具要按**真产物形状**造，否则「两侧都剪」这句话只覆盖了形状的一半。
+    with tempfile.TemporaryDirectory() as td:
+        cont = Path(td) / "FakeTool.app" / "Contents"
+        real = cont / "Resources" / "PyQt5" / "Qt5" / "translations"
+        real.mkdir(parents=True)
+        (real / "a.qm").write_bytes(b"q" * (2 * 1024 * 1024))
+        (cont / "Frameworks" / "PyQt5" / "Qt5").mkdir(parents=True)
+        _link = cont / "Frameworks" / "PyQt5" / "Qt5" / "translations"
+        # 相对链接的层数基准是「链接所在的那一个目录」：从 Contents/Frameworks/PyQt5/Qt5 往回
+        # 三层才到 Contents。本轮这里先写成了四层，链子虚 → `exists()` 为假 → 整格被跳过，
+        # 看起来像「判据过了」而其实什么也没判——先自己验一句再往下跑。
+        _link.symlink_to(os.path.relpath(real, _link.parent))
+        _assert(_link.is_symlink() and _link.is_dir(),
+                "夹具自证：链接目录要真能解析到真身（虚了就测不到 rmtree 那一格）")
+        _crash = ""
+        try:
+            _cut2 = gate.prune_artifact(Path(td) / "FakeTool.app", "夹具")
+        except OSError as e:
+            _cut2, _crash = -1, f"{type(e).__name__}: {e}"
+        _assert(not _crash, f"链接目录不许让剪裁崩掉（旧写法就是这么崩的，实际={_crash}）")
+        _assert(_cut2 == 2, f"字节只许算真身那一侧（链接壳不重复计费，期望 2，实际={_cut2}）")
+        _assert(not _link.is_symlink(), "链接壳也必须摘掉：留着就是一指向不存在路径的挂链接")
+        _assert(not real.exists(), "真身那一侧要真被剪掉")
+        # 再跑一遍：上一轮只剩「真身已删、链接还在」的挂链接状态时也不许崩
+        # （重量门与剪裁是两次独立调用，挂链接在真产物里长期存在）。
+        _link.symlink_to("./不存在")
+        _again = gate.prune_artifact(Path(td) / "FakeTool.app", "夹具")
+        _assert(_again == 0, f"挂链接那一格不重复计费、也不报错（实际={_again}）")
 
     # 反向对照：把口径改回「只看 Resources」那一版旧写法，同一份夹具必须量出缺项。
     # 这一路证明上面的断言不是恒真：旧口径真的会漏，判据真的能分辨。
