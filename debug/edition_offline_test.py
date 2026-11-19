@@ -162,6 +162,14 @@ def _build(ed, lv=None):
 
     每个组合用各自的沙箱目录：不然 pro 与 pro+等级2 两个窗口会共用同一份任务索引，
     后建的窗口在「接上次的任务」那条路上读到前一个窗口的状态，结论就不是它自己的。
+
+    心跳必须在这里停掉（2026-11-20 本机取证：批跑红 5 条、单跑 166 条全绿）。
+    `_acl_timer` 是 60 秒一拍，每拍走 `_on_acl_event("")`，而那个函数**无条件**调
+    `_acl_sync_level()`——把「此刻进程里全局的账号等级」倒灌进这个窗口。本套件一次造
+    十几个窗口、又反复 processEvents：只要哪一小节的墙钟越过 60 秒（批跑机器比开发机
+    忙，正好越过），后面小节拿到的「按等级 2 建好的干净窗口」其实早被前一拍按更高档
+    重投影过了，于是「前置状态：没建数据池入口」这类前提**悄悄失效**，红的全是它的
+    下游，而报表看上去像产品写坏了。结论不许由墙钟决定：要演练心跳的小节自己 start()。
     """
     tag = ed if lv is None else f"{ed}_lvl{lv}"
     gui.MainWindow._get_desktop_dir = lambda self, _t=tag: Path(TMP) / f"desk_{_t}"
@@ -173,7 +181,11 @@ def _build(ed, lv=None):
     else:
         os.environ[edition.LEVEL_ENV_VAR] = str(lv)
     edition.reset_for_tests()
-    return gui.MainWindow()
+    win = gui.MainWindow()
+    _timer = getattr(win, "_acl_timer", None)      # 见本函数 docstring：停掉墙钟那一拍
+    if _timer is not None:
+        _timer.stop()
+    return win
 
 
 w_pro = _build("pro")
@@ -670,16 +682,18 @@ _pref = _mcall_lines("prefetch_authoritative")
 _warm = _mcall_lines("prefetch_warm")
 _gate = _mcall_lines("_wait_auth_settled")
 _qapp = _mcall_lines("QApplication")
-_build = _mcall_lines("MainWindow")
+# 变量名不许占 `_build`：那是上面造窗口函数的名字（本节曾经把它覆盖成行号列表，
+# 于是本节之后任何一处再调 `_build(...)` 都会拿到 list 报 not callable）。
+_build_lines = _mcall_lines("MainWindow")
 check("开机定档走权威判定（按 AST 数调用点，不挑写法）：prefetch_authoritative 被调、"
       "prefetch_local 一次都没有（副本可能是被删除/降级前的旧等级 = 被删的号还能开机摆全套入口）",
       bool(_pref) and not _mcall_lines("prefetch_local"),
       (_pref, _mcall_lines("prefetch_local")))
 check("需求 6·顺序：定档发生在建主窗口**之前**（入口是按等级创建的，建晚了就只能靠重启补）",
-      bool(_pref) and bool(_build) and max(_pref) < min(_build), (_pref, _build))
+      bool(_pref) and bool(_build_lines) and max(_pref) < min(_build_lines), (_pref, _build_lines))
 check("需求 6·顺序：过场等待也必须在建主窗口之前——等着等着却先把窗口按丐版建出来，"
       "就回到了这次报障的原点（只能重启）",
-      bool(_gate) and bool(_build) and max(_gate) < min(_build), (_gate, _build))
+      bool(_gate) and bool(_build_lines) and max(_gate) < min(_build_lines), (_gate, _build_lines))
 check("需求 6·预算：预热排在 QApplication 构造之前（把网络往返与本地启动重叠，不花用户一秒）",
       bool(_warm) and bool(_qapp) and min(_warm) < min(_qapp), (_warm, _qapp))
 check("需求 6·不阻塞：过场等待靠真事件循环而不是 sleep（sleep 会把这段时间变成"
@@ -1300,6 +1314,16 @@ finally:
 # ② 等也没等到（网络真不通）→ 窗口照旧按基础功能开，而确认随后到达时，最要紧的
 #    那一组入口当场长出来，不再让人去赌那一秒的重启。
 print("\n[D2. 需求 6：身份确认与界面入口的时序]")
+
+# 本节的前提是「w_lvl2 从建好到现在没人重投影过它」。这条前提以前是**隐式**的，
+# 所以它一旦被破（见 `_build` 的 docstring），报出来的 5 条红全是下游，看不出从哪坏的。
+# 这里把它显式钉住：活动心跳意味着「下一拍会把当时全局等级倒灌进来」，本节不接受这种起点。
+# （曾经这里还写了两条「把心跳放回来就会重演红」的自证，当场被自己跑验推翻：
+# `_build` 是用 B2B_ACL_LEVEL 把等级钉在 2 的，环境变量压过 `set_account_level` 的内存覆盖，
+# 所以那个构造根本造不出「倒灌」。因果没被演示出来就不留在文件里——错的注释比没有更坏。）
+check("D2 前提：本节要用的窗口不带活动心跳（结论不许由墙钟决定）",
+      not w_lvl2._acl_timer.isActive() and not w_lvl1._acl_timer.isActive(),
+      (w_lvl2._acl_timer.isActive(), w_lvl1._acl_timer.isActive()))
 
 
 def _pool_pos(win):

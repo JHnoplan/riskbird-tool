@@ -908,18 +908,34 @@ _assert(_cb.get("ok") is False and "不一致" in _cb.get("msg", ""),
 
 # GUI 入口：表格换成推荐结果，文案走同一个 _scope_note
 dlg._recommend_worker = None
-dlg._on_recommend(0, "similar")
-_drain(10.0, until=lambda: dlg._recommend_worker is None
-        or not dlg._recommend_worker.isRunning())
-_assert(dlg._recommend_worker is not None and dlg._recommend_worker.isFinished(),
-        "推荐线程正常收尾")
-_assert(bool(dlg._results) and dlg.table.rowCount() == len(dlg._results),
-        f"推荐结果铺到表格  (rows={dlg.table.rowCount()}, results={len(dlg._results)})")
-_assert("_recommend_type" in (dlg._results[0] if dlg._results else {}),
-        "表格里的推荐结果带标注")
-_assert(all("_recommend_type" not in r for r in MASTER), "GUI 路径同样不污染总表")
-_assert("相似的公司" in dlg.status_lbl.text(),
-        f"状态栏说明这是推荐视图  (实际={dlg.status_lbl.text()!r})")
+# 收工条件不能只看线程状态：`finished` 是跨线程信号，走的是**排队投递**，而
+# `isRunning()`/`isFinished()` 在投递之前就已经为真。旧写法拿它当收工条件，于是
+# 「线程正好在这一拍结束」时 `_drain` 立即返回，回调还躺在事件队列里——表格里的
+# 是粗筛中间态、状态栏停在「⚡ 关键词先粗筛出 60 家」（2026-11-20 批跑红两条、单跑全绿）。
+# 这里接一个真正的地标：界面**收到**了收尾回调。包在实例属性上是成立的——
+# `_on_recommend` 里 `connect(self._on_recommend_finished)` 取的就是实例上的这个名字。
+_called = []
+_real_finished = dlg._on_recommend_finished
+dlg._on_recommend_finished = lambda *a: (_called.append(a), _real_finished(*a))[1]
+try:
+    dlg._on_recommend(0, "similar")
+    _rw = dlg._recommend_worker
+    _rw.wait(10_000)                      # 只把线程join 掉，主线程一拍不走
+    _assert(not _called,
+            "线程结束时界面回调仍未投递（跨线程信号是排队的）：收工条件不许只看线程状态")
+    _drain(10.0, until=lambda: bool(_called))
+    _assert(bool(_called), "推荐收尾回调确实送到了主线程")
+    _assert(dlg._recommend_worker is not None and dlg._recommend_worker.isFinished(),
+            "推荐线程正常收尾")
+    _assert(bool(dlg._results) and dlg.table.rowCount() == len(dlg._results),
+            f"推荐结果铺到表格  (rows={dlg.table.rowCount()}, results={len(dlg._results)})")
+    _assert("_recommend_type" in (dlg._results[0] if dlg._results else {}),
+            "表格里的推荐结果带标注")
+    _assert(all("_recommend_type" not in r for r in MASTER), "GUI 路径同样不污染总表")
+    _assert("相似的公司" in dlg.status_lbl.text(),
+            f"状态栏说明这是推荐视图  (实际={dlg.status_lbl.text()!r})")
+finally:
+    dlg._on_recommend_finished = _real_finished
 
 # 「是否同一家」的判据守卫：空标识绝不参与相等判定（本次 0 家推荐的根因）
 from recommend_engine import _is_anchor
