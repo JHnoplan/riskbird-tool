@@ -15,6 +15,9 @@
 *_secret*.json
 secrets.json
 config.json
+# 随包构建戳（需求 2）：每次打包由 CI 现生成，绝不进仓库。提交它等于把「每次构建都变的
+# 东西」当源码管：本地一份、CI 一份，谁生效看不出来，症状是产物自报的版本与安装包属性对不上。
+version.json
 deepseek_cache.json
 .m
 *.p12

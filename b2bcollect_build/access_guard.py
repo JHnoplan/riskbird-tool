@@ -106,6 +106,14 @@ CACHE_TTL_SECONDS = 60                  # 内存缓存有效期（过期即触�
 DISK_MAX_AGE_SECONDS = 7 * 86400        # 磁盘副本 / 本地认领记录最长可接受年龄
 FIRST_FETCH_WAIT_SECONDS = 3            # 冷启动首次拉取的有界等待（超时先拒绝）
 STARTUP_AUTH_WAIT_SECONDS = 3.0         # 开机「查身份→定档」建界面前的有界权威等待（见 prefetch_authoritative）
+# 开机为了「问到身份」总共奉陪多久（从 prefetch_warm 那一刻算起）。
+# 为什么不是直接把这个数改大就算（旧写法只给 3 秒且全程黑屏）：光把预算拉长，
+# 代价是用户对着什么都没发生的屏幕多等好几秒，而慢网络下照样问不到。所以拆成两段：
+# 先静默等 STARTUP_AUTH_SILENT_SECONDS（快机器上根本看不出有个过场），还没问到就
+# 把等待做成**看得见、说得出原因、可以主动重试也可以放弃**的过场窗口（见 GUI 的
+# _AuthGateNotice / _wait_auth_settled），最多到本常量。等得起，才问得到。
+STARTUP_AUTH_SILENT_SECONDS = 2.0
+STARTUP_AUTH_TOTAL_SECONDS = 8.0
 RECLAIM_COOLDOWN_SECONDS = 60           # 被顶掉后重新认领的最短间隔（防互相顶号）
 _TOAST_INTERVAL = 4.0                   # 拒绝提示最短间隔（防连点刷屏）
 _HISTORY_MAX = 10                       # 换绑轨迹最多留几条（管理员取证用）
@@ -896,6 +904,7 @@ class AccessGuard(QObject):
         self._service_kind = "unknown"
         self._service_detail = ""
         self._inflight = False                       # 后台刷新去重（含冷启动窗口）
+        self._inflight_thread = None                 # 在途那一次刷新的线程句柄（限时等复用）
         self._enrolling: set = set()                 # 自动登记在途的账号（去重）
         self._last_toast = _MONO_NEVER
         self._revoked = ""                           # 待交出去的顶号事件（一次性）
@@ -1279,7 +1288,128 @@ class AccessGuard(QObject):
             finally:
                 with self._lock:
                     self._inflight = False
-        threading.Thread(target=_run, daemon=True).start()
+                    self._inflight_thread = None
+        t = threading.Thread(target=_run, daemon=True)
+        # 句柄必须在 start() 之前登记：刷新快完时 _run 的 finally 会先把这一格清空，
+        # 反过来（先 start 再赋值）会留下一份指向已结束线程的脏句柄，下一个调用方
+        # join 它得不到任何等待，以为「问过了」，而实际那一轮名单并没落到内存里。
+        with self._lock:
+            self._inflight_thread = t
+        t.start()
+
+    # 「问不到」与「问到了但答案是拒绝」是两件事，重试价值也完全不同：前者值得在
+    # 开机后再追几次（新机器首连要付 DNS/TLS/杀软扫描，3 秒常常不够），后者重试一万
+    # 次结果一样，界面必须按结论说话。口径只在这一处定义，界面不许自己分类。
+    _RETRYABLE_KINDS = frozenset({"network", "other", "tls", "clock", "unknown"})
+
+    def refresh_bounded(self, timeout: float = 5.0) -> bool:
+        """限时等一次刷新结果，**优先复用已在途的那一次**（单飞）。
+
+        与 :meth:`refresh_blocking` 的差别就是这一条：旧写法每次调用都自己起一个线程，
+        开机预取与心跳/点击路径的在途请求会同时出网（同一份名单发两次请求，慢网络上
+        互相抢带宽，两份结果谁后到也没有定序）。这里先挂到在途线程上 join，没有在途
+        请求才新起一次。
+
+        返回的是「名单这次有没有拿到」，不是「线程有没有结束」：超时后线程仍在跑并最终
+        拿到名单时，``_fetch`` 末尾的 ``_evaluate``/``refreshed`` 会把等级补上，
+        这条链路不能假装失败。
+
+        除了「挂在在途线程上」，还要认「刚刚落地」那一种：预热的那一轮完全可能在
+        本函数被调用前几百毫秒就成功了，这时再起一轮就是同一次开机问两次 OSS（慢网络
+        上两份结果还会互相抢带宽）。判据用 ``_acl_at``（只在真出网成功时更新）而不是
+        ``_fetched_at``：后者会被磁盘副本路径掺进来，而「开机必须问一次 OSS」防的正是
+        拿陈旧副本定档。从未成功过时 ``_acl_at`` 是 ``-inf``，年龄为无穷大，自然不会复用。
+        """
+        for _ in range(2):
+            with self._lock:
+                if (self._accounts is not None
+                        and _mono_age(self._acl_at) <= timeout):
+                    return True          # 本次开机的那一次已经拿到结果
+                t = self._inflight_thread if self._inflight else None
+            if t is None:
+                self._start_refresh()
+                continue
+            t.join(timeout)
+            break
+        with self._lock:
+            return self._accounts is not None
+
+    def auth_inflight(self) -> bool:
+        """此刻是否还有一轮刷新在途中（界面据此决定是「等它」还是「再催一次」）。"""
+        with self._lock:
+            return bool(self._inflight)
+
+    def auth_worth_retry(self) -> bool:
+        """本轮定档是否属于「值得再问一次」那一类（网络/时钟/TLS/未试过）。
+
+        凭证缺失、模块没加载、密钥被拒这三类是发包方的活儿，用户重试无用，所以不算待确认。
+        """
+        kind, _ = self.service_status()
+        return kind in self._RETRYABLE_KINDS
+
+    def diagnostics(self) -> str:
+        """一页纸的「我为什么只有基础功能」现场（可直接发给开发者）。
+
+        为什么需要它：这一类报障过去只能靠用户截图互相猜（界面只有一行徽章），
+        而定档涉及的现场分散在六个地方（名单/等级/服务分类/在途/本地副本/代理）。
+        这里只**陈述事实**、不重新判定：每个值都直接读现有的状态位，绝不在此
+        再算一遍等级——否则又长出一份权限口径（同“判据只写一处”那条约束）。
+
+        隐私口径：只写账号本身（用户自己已知）、环境变量的**名字**与计数，不写密钥、
+        不写变量值、不写设备完整标识（只给前 8 位）。
+        """
+        import time as _t
+        lines: List[str] = []
+        _add = lines.append
+        try:
+            from tool_version import version_text
+            _add(f"工具版本：{version_text()}")
+        except Exception as e:                       # 取证工具自己不能成为新的故障点
+            _add(f"工具版本：读不到（{type(e).__name__}）")
+        _add(f"运行形态：frozen={'是' if getattr(sys, 'frozen', False) else '否'} "
+             f"platform={sys.platform} python={sys.version.split()[0]}")
+        with self._lock:
+            accounts = self._accounts
+            grants = dict(self._grants)
+            declared = self._grants_declared
+            kind, detail = self._service_kind, self._service_detail
+            inflight = self._inflight
+            acl_age = _mono_age(self._acl_at)
+            bind_age = _mono_age(self._bind_at)
+            binding = self._binding
+            binding_phone = self._binding_phone
+        phone = self._bound_phone()
+        _add(f"账号：{phone or '未绑定'}")
+        _add(f"名单：{'本次未拿到' if accounts is None else f'已拿到（{len(accounts)} 个账号）'}")
+        if accounts is not None:
+            _add(f"本号在名单里：{'是' if phone in accounts else '否'}")
+        _add(f"等级字段：{'名单里已声明' if declared else '未声明（按默认策略定档）'}"
+             + (f"；本号登记值={grants.get(phone)}" if phone in grants else ""))
+        _add(f"当前定档：{_ed.level_label(_ed.account_level())}"
+             f"｜待确认={'是' if _ed.auth_pending() else '否'}")
+        _add(f"定档原因：{_ed.auth_reason() or '（无）'}")
+        _add(f"权限服务分类：{kind}" + (f"｜{detail}" if detail else ""))
+        _add(f"名单成功时刻距今：{acl_age:.0f}s；设备分片成功时刻距今：{bind_age:.0f}s"
+             f"（负值/极大值表示本次从未成功）")
+        _add(f"还有刷新在途：{'是' if inflight else '否'}")
+        if binding is None:
+            _add("设备绑定状态：未确认（本次没读到分片，不等同于未绑定）")
+        else:
+            same = str(binding.get("device_id") or "")[:8] == device_id()[:8]
+            _add(f"设备绑定状态：{binding.get('state') or '未知'}｜"
+                 f"本机是否为当前使用设备：{'是' if same else '否'}（绑定号 {binding_phone or '—'}）")
+        cache = _cache_file()
+        obj = _read_json(cache, None)
+        if isinstance(obj, dict):
+            age = _stamp_age(obj.get("fetched_at", 0))
+            _add(f"本地副本：在位（写入距今 {age:.0f}s，仅作现场参考，不参与定档）")
+        else:
+            _add("本地副本：不在位或读不出来")
+        _px = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                           "ALL_PROXY", "NO_PROXY") if os.environ.get(k)]
+        _add(f"代理环境变量：{'、'.join(_px) if _px else '未设置'}（只报名字，不报地址）")
+        _add(f"系统时间：{int(_t.time())}（时钟偏差类报障靠这一行对账）")
+        return "\n".join(lines)
 
     def _load_disk_once(self):
         """内存无名单时加载磁盘副本（过期副本丢弃，保持 fail-closed）。"""
@@ -1330,7 +1460,23 @@ class AccessGuard(QObject):
             grants = dict(self._grants)
             declared = self._grants_declared
         phone = phone or self._bound_phone()
-        if accounts and phone in accounts:
+        if accounts is None:
+            # 「这次没问到身份」与「问到了、答案是拒绝」必须分开记账（需求 6，
+            # 2026-11-19 实机报障「绑了权限 1 的账号却只有基础功能」）。旧写法让这条
+            # 分支落到下面的 else，代价是双重的：
+            # ① pending 被默认成 False —— 界面的有界重试与当场补齐就此熄火，用户被留在
+            #    丐版上等一个再也不会来的通知，只能重启去赌同一轮超时；
+            # ② 原因写成「已移出白名单或未绑定」—— 对一个其实有权限、只是这台新机器
+            #    首连慢的号说了假话，把用户和开发者一起指向错误的方向。
+            # ``_accounts`` 只在「OSS 真拿到名单」或「读到未过期副本」时被赋值，所以
+            # None 严格等价于「本进程至今没问到」，这个判据才不会随重构漂移。
+            # 能力上限照旧钉死丐版（fail-closed 一寸不让），改的只是说法与还能不能补。
+            kind, _ = self.service_status()
+            _ed.set_account_level(
+                LEVEL_LITE, phone,
+                reason=f"本次没有取回权限名单（{kind or 'unknown'}），暂按丐版",
+                pending=self.auth_worth_retry())
+        elif accounts and phone in accounts:
             level = resolve_level(phone, grants, declared)
             _ed.set_account_level(level, phone,
                                   reason=f"白名单等级 {level}（{LEVEL_NAMES.get(level)}）")
@@ -2085,6 +2231,32 @@ def prefetch_local() -> Optional[int]:
     return level
 
 
+def prefetch_warm() -> bool:
+    """在 QApplication 建起来**之前**就把这一次取名单的请求发出去（不等人）。
+
+    为什么需要它（对应 2026-11-19 实机报障）：定档要联网，而旧口径是在建界面之前
+    才开始请求，于是「界面构建的一到两秒」完全没被利用：新装 Windows 机器首连要付
+    DNS + TLS 握手 + 安全软件首扫，这些加起来常常超过 STARTUP_AUTH_WAIT_SECONDS，
+    高权限号就被钉成丐版；而用户重启后又回到同一个三秒，形成确定性死循环。
+
+    这一手把两条独立的等待**重叠**起来：同样的开机时长里，可用的判定预算多出一到
+    两秒，且不增加任何用户等待。不抢跑、不猜结果：真定档仍然以这次从 OSS 拿回的名单
+    为准，本函数只负责把请求提早发出去。
+
+    返回是否安排了这一次在途刷新（已有一份在途时为 False，单飞去重）。
+    """
+    try:
+        guard = get_guard()
+        if guard.auth_inflight():
+            return False
+        guard._start_refresh()
+        return True
+    except Exception:
+        # 预热只是提前上路，不是必经环节：它扑了空也不能把启动带倒，
+        # 后面 prefetch_authoritative 会自己再起一次
+        return False
+
+
 def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
     """开机建界面**之前**做一次**权威**身份判定：每次都联网查 OSS，据此决定
     第一屏是完整版还是丐版。与 ``prefetch_local``（只读副本、绝不出网）相对。
@@ -2092,9 +2264,9 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
     为什么要它（对齐用户诉求「打开工具→查身份→显示对应 GUI」）：
     · 副本可能是**上一个还没被删除/降级时的旧等级**。只信副本，被管理员删掉的号
       下次开机照样按副本里的旧等级摆出全套入口——正是「被删除的账号还能使用」。
-    · 界面入口在 ``_build_ui`` 一次性按 ``edition`` 建出来，pro 专属入口（数据池四键、
-      企知道/风鸟/爱企查补采、权限管理）建的时候就决定有没有，运行时只能隐不能长。
-      所以**必须在建界面前**把等级定成权威值，才能让高权限号一次看到完整版。
+    · 界面入口按 ``edition`` 档位创建，pro 专属入口（数据池四键、企知道/风鸟/爱企查
+      补采、权限管理）只在创建时看一次等级。所以**必须在建界面前**把等级定成权威值，
+      才能让高权限号一次看到完整版、不需要任何补齐动作。
 
     判定口径（宁严勿宽，与 ``check()`` 的 fail-closed 同源）：
     · 名单这次**确实从 OSS 拿到了**且绑定号**在里面** → 用真实等级（0/1→完整版，2→丐版）。
@@ -2103,17 +2275,26 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
     · 其余一切情况——OSS 连不上/超时、根本没配 OSS、未绑定、号不在名单里——一律按
       **丐版**起界面（显式钉 ``LEVEL_LITE``，而不是留在「未判定」：pro 构建下未判定会被
       ``effective_level()`` 默认成管理员 = 全套入口，那正是要堵的漏）。
-    · 因断网先起成丐版的高权限号，联网后由后台心跳/刷新确认真实等级，再走
-      ``_acl_sync_level`` 的「横幅 + 一键重启」补齐完整版入口（建好的界面长不出新按钮）。
+    · 因断网先起成丐版的高权限号，后台确认（心跳/刷新/有界重试）落到真实等级后，由
+      ``_acl_sync_level`` **当场补齐**入口；``pending`` 为真时才走这条路，
+      为假（未绑定/不在名单）就是结论，界面按结论说话也不该反复催。
+    · 为什么不能靠「重启」补齐（2026-11-19 报障的根）：新机器首连慢是个**稳定复现**
+      的环境特征，重启只是回到同一个预算里再赌一次，赌输的概率不会变。所以把两件事
+      分开：「没问到」记为 ``pending``，界面在确认到达那一刻调
+      ``MainWindow._build_pool_group()`` 就地长出入口——仍是**只在有权时创建**，
+      「没权就不许在界面树里留一个字节」这条不变量由多条判据钉着，本轮一寸没动；
+      「问到是丐版」则记为结论，不催、不重试、也不骗用户说「正在确认」。
 
     返回最终钉到 edition 上的等级（一定是一个具体值，绝不返回 None）。
     """
     guard = get_guard()
-    # 权威来源只有这次 refresh_blocking 从 OSS 取回的内存名单：**不读磁盘副本**，
+    # 权威来源只有这一次从 OSS 取回的内存名单：**不读磁盘副本**，
     # 因为副本正是「被删除的号还能开机看到全套入口」的来源。拿不到 = accounts 仍为
     # None = 未确认 = 丐版，这条判据不能掺任何缓存进来的东西。
     try:
-        guard.refresh_blocking(timeout=timeout)
+        # refresh_bounded 而不是 refresh_blocking：prefetch_warm 已经把请求发出去了，
+        # 这里必须挂到那一次上接着等，而不是另起一个线程重复出网。
+        guard.refresh_bounded(timeout=timeout)
     except Exception:
         pass
     with guard._lock:
@@ -2128,11 +2309,17 @@ def prefetch_authoritative(timeout: float = STARTUP_AUTH_WAIT_SECONDS) -> int:
         # 「这个包压根没带权限凭证」——于是整批外部机器只能靠截图互相猜。
         if accounts is None:
             why = guard._unreachable_reason()
+            # 「还没问到」才置 pending；凭证/模块/密钥被拒这三类重试无用，不能骗用户
+            # 说「正在确认」（那样他会一直等一个永不会来的补齐）。
+            pending = guard.auth_worth_retry()
         elif not phone:
             why = "本机还没有绑定云展动力账号"
+            pending = False
         else:
             why = f"账号 {phone} 不在本次拉取的名单里"
-        _ed.set_account_level(LEVEL_LITE, phone, reason=f"开机按丐版起界面：{why}")
+            pending = False     # 名单拿到了、里面没有这个号：这是结论，不是等待
+        _ed.set_account_level(LEVEL_LITE, phone,
+                              reason=f"开机按丐版起界面：{why}", pending=pending)
         return LEVEL_LITE
     level = resolve_level(phone, grants, declared)
     _ed.set_account_level(level, phone, reason=f"开机 OSS 权威等级 {level}")

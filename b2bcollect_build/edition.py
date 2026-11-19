@@ -391,11 +391,20 @@ def level_matrix() -> Dict[str, Dict[str, bool]]:
 # ── 账号等级回填（只有 access_guard 该调这里）───────────────────────────────
 
 def set_account_level(level: Optional[int], account: str = "",
-                      reason: str = "") -> bool:
+                      reason: str = "", pending: bool = False) -> bool:
     """access_guard 判定出等级后回填；返回**生效档位是否发生变化**（GUI 据此提示重启）。
 
     未知等级值（既不在矩阵里也不是 None）按最保守那一档处理，与 ``resolve()``
     对「档位配错」的口径完全一致：名单被人改坏时，代价是「少看到功能」。
+
+    ``pending=True`` 把两个常被混为一谈的事实分开（2026-11-19 实机报障「绑了权限 1
+    的账号却只有基础功能」）：
+    · 「这次**没问到**身份」（连不上/超时/包里没凭证）——能力上限仍钉在丐版
+      （fail-closed 不变，一个额外能力位也不给），但界面可以、也应该说「正在确认」
+      而不是「你只有基础功能」，并保留一个当场补齐的入口。
+    · 「这次**问到了、答案是丐版**」（号不在名单里/未绑定）——那不是 pending，
+      重试多少次结果一样，界面必须按结论说。
+    这一位只改**说法与能否当场补齐**，不改任何能力判定：读它的一律是展示层。
     """
     global _ACCOUNT
     before = edition()
@@ -406,9 +415,24 @@ def set_account_level(level: Optional[int], account: str = "",
     if lv not in _LEVEL_CAPS:
         lv = UNKNOWN_ACCOUNT_LEVEL
         reason = f"{reason}（等级 {level} 不是已知等级，按最保守档 {lv} 跑）"
+        pending = False       # 名单确实拿到了、只是里面那个值不认识：结论已定，不存在待确认
     _ACCOUNT = {"level": lv, "account": str(account or ""),
-                "reason": reason or f"账号 {account} 等级 {lv}"}
+                "reason": reason or f"账号 {account} 等级 {lv}",
+                "pending": bool(pending)}
     return edition() != before
+
+
+def auth_pending() -> bool:
+    """当前档位是不是「问不到身份而临时按丐版兜底」（见 :func:`set_account_level`）。
+
+    已判定为丐版、未绑定、已确认的高权限号，这里都是 False：只有「还没问到」才是待确认。
+    """
+    return bool(_ACCOUNT.get("pending"))
+
+
+def auth_reason() -> str:
+    """定档原因原文（给横幅/诊断导出用，界面不许自己拼故障话术）。"""
+    return str(_ACCOUNT.get("reason") or "")
 
 
 def clear_account_level() -> None:

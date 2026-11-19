@@ -23,6 +23,7 @@ import ast
 import os
 import re
 import sys
+import textwrap
 import tempfile
 from pathlib import Path
 
@@ -622,10 +623,81 @@ check("退出收尾按「窗口 → 守卫 → QApplication」显式排序（交
       and "_access_guard.shutdown(app)" in _msrc
       and _msrc.index("finally") < _msrc.index("_access_guard.shutdown(app)")
       and "sys.exit(app.exec_())" not in _msrc, _msrc[-300:])
-check("开机建界面前用「联网查 OSS 的权威判定」定档，绝不再用只读副本的 prefetch_local"
-      "（副本可能是被删除/降级前的旧等级 = 「被删除的账号还能开机摆全套入口」）",
-      "prefetch_authoritative()" in _msrc and "prefetch_local()" not in _msrc,
-      _msrc[:400])
+# 需求 6：开机顺序按 AST 判，不按字面串。
+# 为什么不能继续用「prefetch_authoritative() 是否作为子串出现」：这条门的本意是
+# 「建窗口**之前**必须做过权威定档」，可字面串把调用的**写法**（带不带参数、换不换行）
+# 一并钉住了——本轮只是给它传了预算参数，门就红了，报的是一个根本不存在的回归。
+# 同一个原因也适用于「等待必须在建窗前」这类**顺序**判据：只有行号能说清谁先谁后。
+
+
+def _calls_in(_tree, *names):
+    """一棵 AST 里这些名字的**调用**行号（``obj.name(...)`` 与 ``Name(...)`` 两种都认）。
+
+    只取调用节点，不取同名引用，也不拿源码做子串匹配：后者会把注释/docstring 里的
+    字样也算进去（本轮就被抓过一次：函数文档串里写着「用 QEventLoop 而不是 time.sleep」，
+    于是一条「不许 sleep」的门被自己的注释顶红了）。找不到就返回空列表，由调用方判空。
+    """
+    _out = []
+    for _n in ast.walk(_tree):
+        if not isinstance(_n, ast.Call):
+            continue
+        _f = _n.func
+        _nm = _f.attr if isinstance(_f, ast.Attribute) else getattr(_f, "id", "")
+        if _nm in names:
+            _out.append(_n.lineno)
+    return _out
+
+
+def _tree_of(_obj):
+    """取函数/方法的 AST。**必须 dedent**。
+
+    ``inspect.getsource`` 对类里的方法会连同它在源文件里的缩进一起返回
+    （``    def spin(...)``），直接喂给 ``ast.parse`` 就是 IndentationError。
+    本轮先前只把它用在顶层函数上没暴露，接到 ``_AuthGateNotice.spin`` 才炸出来；
+    按仓库既有纪律，这类“判据自己错了”的坑要当场补成结构上的正确，不能只改调用方。
+    """
+    return ast.parse(textwrap.dedent(inspect.getsource(_obj)))
+
+
+_mtree = _tree_of(gui.main)
+
+
+def _mcall_lines(*names):
+    return _calls_in(_mtree, *names)
+
+
+_pref = _mcall_lines("prefetch_authoritative")
+_warm = _mcall_lines("prefetch_warm")
+_gate = _mcall_lines("_wait_auth_settled")
+_qapp = _mcall_lines("QApplication")
+_build = _mcall_lines("MainWindow")
+check("开机定档走权威判定（按 AST 数调用点，不挑写法）：prefetch_authoritative 被调、"
+      "prefetch_local 一次都没有（副本可能是被删除/降级前的旧等级 = 被删的号还能开机摆全套入口）",
+      bool(_pref) and not _mcall_lines("prefetch_local"),
+      (_pref, _mcall_lines("prefetch_local")))
+check("需求 6·顺序：定档发生在建主窗口**之前**（入口是按等级创建的，建晚了就只能靠重启补）",
+      bool(_pref) and bool(_build) and max(_pref) < min(_build), (_pref, _build))
+check("需求 6·顺序：过场等待也必须在建主窗口之前——等着等着却先把窗口按丐版建出来，"
+      "就回到了这次报障的原点（只能重启）",
+      bool(_gate) and bool(_build) and max(_gate) < min(_build), (_gate, _build))
+check("需求 6·预算：预热排在 QApplication 构造之前（把网络往返与本地启动重叠，不花用户一秒）",
+      bool(_warm) and bool(_qapp) and min(_warm) < min(_qapp), (_warm, _qapp))
+check("需求 6·不阻塞：过场等待靠真事件循环而不是 sleep（sleep 会把这段时间变成"
+      "「界面已经出现却按不动」，那两个按钮也就白做了）",
+      bool(_calls_in(_tree_of(gui._AuthGateNotice.spin), "QEventLoop", "exec_"))
+      and not _calls_in(_tree_of(gui._AuthGateNotice.spin), "sleep")
+      and not _calls_in(_tree_of(gui._wait_auth_settled), "sleep"), "")
+# 过场窗口真造一次：它是真 QWidget，只看源码验不出「那一退到底存不存在」。
+_gate_probe = gui._AuthGateNotice("测试原因：本次开机没取回名单")
+_gate_btns = [b.text() for b in _gate_probe.findChildren(QPushButton)]
+check("需求 6·可走：过场窗口给了「先用基础功能」那一退（网络真不通时绝不能把人锁在门口）",
+      "先用基础功能" in _gate_btns, _gate_btns)
+check("需求 6·可按：同样给了「立即重试」，且等待期间时间在走（有秒数提示，不是白屏）",
+      "立即重试" in _gate_btns and "已等" in _gate_probe.elapsed_lbl.text(), _gate_btns)
+check("需求 6·说得出原因：定档原因原文逐字搬到过场窗口上，界面不自己编一套故障话术",
+      _gate_probe.detail.text() == "测试原因：本次开机没取回名单", _gate_probe.detail.text())
+_gate_probe.close()
+app.processEvents()
 check("屏幕窄到装不下整行时不硬撑窗口，而是把横向滚动还回来（宁可要滚动条，"
       "也不要看不见又点不到的按钮）",
       _w1.minimumWidth() <= 900
@@ -814,6 +886,21 @@ check("GUI 里没有任何一处自己比较档位字符串（全都问 edition 
       and not re.search(r'edition\(\)\s*==', _gsrc),
       re.findall(r'.*(?:==\s*["\'](?:lite|pro)["\']|edition\(\)\s*==).*', _gsrc)[:3])
 _calls = sorted(set(re.findall(r"edition\.([a-z_]+)\(", _gsrc)))
+# 真实调用点另算一份：上面那个正则拿的是「文本里提到过哪些名字」，docstring 与注释里的
+# 同一个字串会被算进去（本轮 _build_pool_group 的文档串里提了一句 pool_ui_visible 就被
+# 判成 6 处调用）。交付链在 --hidden-import 那条门上已经踩过同一个坑并写下「注释必须
+# 先剔掉再匹配」，这一族反模式不留在第二处。名字集合仍用文本拿（宽一点安全：多一个名字
+# 只会多要求一次白名单登记），个数一律以 AST 为准。
+import ast as _ast_mod
+_gtree = _ast_mod.parse(_gsrc)
+
+
+def _callsites(_fname):
+    """数「界面上真调了一次 edition._fname()」的次数（只看 Call 节点）。"""
+    return sum(1 for _n in _ast_mod.walk(_gtree)
+               if isinstance(_n, _ast_mod.Call) and isinstance(_n.func, _ast_mod.Attribute)
+               and _n.func.attr == _fname
+               and isinstance(_n.func.value, _ast_mod.Name) and _n.func.value.id == "edition")
 _ALLOWED_CALLS = {"title_suffix", "pool_ui_visible", "silent_sync_enabled",
                   "prompt_sync_enabled", "visible_list_channels", "auto_expand_visible",
                   "auto_expand_default", "clear_seen_visible", "history_visible",
@@ -821,7 +908,11 @@ _ALLOWED_CALLS = {"title_suffix", "pool_ui_visible", "silent_sync_enabled",
                   # 权限等级那一轴只许问这三样：入口有没有（投影函数）、能力位快照
                   # （收口用）、等级文案（管理员徽章用）。**等级数字本身不许进界面**，
                   # 否则界面就开始自己比大小，权限模型又长出第二份。
-                  "acl_admin_visible", "caps_snapshot", "level_label"}
+                  "acl_admin_visible", "caps_snapshot", "level_label",
+                  # 需求 6（2026-11-19）：「没问到身份」与「问到是丐版」必须在界面上分开说，
+                  # 否则高权限号在新机器首启就只能看到一个与无权账号长得一样的界面。这两个
+                  # 都是投影函数（只读、只说原因），能力判定仍然全在 edition 那一份矩阵里。
+                  "auth_pending", "auth_reason"}
 check("GUI 只能问投影函数：界面里一旦出现 is_lite()/has() 这种原始档位判定，"
       "能力矩阵就管不住它（等价于把判据又写了一份）",
       set(_calls) <= _ALLOWED_CALLS, _calls)
@@ -832,26 +923,28 @@ check("GUI 不读等级数字，也不读能力矩阵（account_level/has/effect
                     _gsrc),
       re.findall(r".*edition\.(?:account_level|has|effective_level|level_matrix|matrix)\(.*",
                  _gsrc)[:3])
-check("隐藏点的数量与能力位对得上：每个入口都真在被禁时才不创建",
-      _gsrc.count("edition.pool_ui_visible()") == 5
+check("隐藏点的数量与能力位对得上：每个入口都真在被禁时才不创建（按 AST 数真调用点，"
+      "docstring 里提一句不算调用——上一版拿子串数，本轮就在这一处假报了一条）",
+      # 数据池五处判点：四个动作各一道 _acl_gate + 就地生长入口自己那一道权限前置条件
+      # （「只在当场确认到高权限时才建」是这一组入口存在的唯一条件：已确定为丐版的账号
+      #  永远走不到建它那一行，界面树里一个相关字节也不会多）
+      _callsites("pool_ui_visible") == 5
       # 清空种子库四处判点：④ 的按钮、复位对话框的勾选项、复位按钮 tooltip 末句、
       # 以及清空动作本身（入口比判定先建好时，只有动作层拦得住）
-      and _gsrc.count("edition.clear_seen_visible()") == 4
+      and _callsites("clear_seen_visible") == 4
       # 历史任务两处：按钮建不建 + 「接着采」这条动作
-      and _gsrc.count("edition.history_visible()") == 2
+      and _callsites("history_visible") == 2
       # 扩词两处：④ 的勾选框建不建 + 日志里那句「怎么关掉换词」的说法
-      and _gsrc.count("edition.auto_expand_visible()") == 2
-      # 名单通道：② 的控件集合 + 日志看板的状态行 + 开始采集时的运行时重投影
+      and _callsites("auto_expand_visible") == 2
+      # 名单通道四处：② 的控件集合 + 日志看板的状态行 + 开始采集时的运行时重投影
       # + 缺路判据（「该给却没给」的那几路必须也走同一份投影，否则丐版会在日志里
       #   点名内部平台，等于把藏起来的功能念出来）
-      and _gsrc.count("edition.visible_list_channels(") == 4
+      and _callsites("visible_list_channels") == 4
       # 权限管理入口两处：徽章/按钮建不建 + 打开面板前的复核
-      and _gsrc.count("edition.acl_admin_visible()") == 2,
-      (_gsrc.count("edition.pool_ui_visible()"),
-       _gsrc.count("edition.clear_seen_visible()"),
-       _gsrc.count("edition.history_visible()"),
-       _gsrc.count("edition.visible_list_channels("),
-       _gsrc.count("edition.acl_admin_visible()")))
+      and _callsites("acl_admin_visible") == 2,
+      (_callsites("pool_ui_visible"), _callsites("clear_seen_visible"),
+       _callsites("history_visible"), _callsites("visible_list_channels"),
+       _callsites("acl_admin_visible")))
 _gates = re.findall(r"self\._acl_gate\(edition\.([a-z_]+)\(\)", _gsrc)
 check("每个「建得比等级判定早」的入口都在动作层再问一次（只藏控件不拦动作=一半都没做）",
       sorted(_gates) == sorted(["pool_ui_visible"] * 4 + ["clear_seen_visible",
@@ -1199,6 +1292,171 @@ finally:
     edition.set_account_level(None)
     w_pro._acl_caps = _caps_before
     w_pro._acl_revoked_box_shown = False
+
+# ══════════════════════════ D2. 需求 6：身份确认与界面入口的时序
+# 两条路缺一不可：
+# ① 开机没问到 → 过场等待把确认**等回来**（主修：让主窗口在身份已知之后才创建，
+#    于是所有高级入口天然建全，而不是只能数据池那一组能补）；
+# ② 等也没等到（网络真不通）→ 窗口照旧按基础功能开，而确认随后到达时，最要紧的
+#    那一组入口当场长出来，不再让人去赌那一秒的重启。
+print("\n[D2. 需求 6：身份确认与界面入口的时序]")
+
+
+def _pool_pos(win):
+    """数据池那一组在配置布局里的下标与左右邻居（类型 + 标题/文字）。
+
+    就地生长最怕的不是「没长出来」（看得见的失败），而是「长错了位置」：同一个
+    账号因为网络快慢看到两套排列，那本身就是一次新报障。所以拿开机就建好的窗口
+    当参照，逐项比对同一份布局里它两边的邻居。
+    """
+    if win.btn_pool_search is None:
+        return None
+    grp = win.btn_pool_search.parentWidget()
+    while grp is not None and not isinstance(grp, QGroupBox):
+        grp = grp.parentWidget()
+    if grp is None or grp.parentWidget() is None:
+        return None
+    lay = grp.parentWidget().layout()
+    if lay is None:
+        return None
+
+    def _at(k):
+        if k < 0 or k >= lay.count():
+            return None
+        it = lay.itemAt(k)
+        w = it.widget() if it is not None else None
+        if w is None:
+            return "<间距/拉伸>"
+        if isinstance(w, QGroupBox):
+            return f"group:{w.title()}"
+        return f"{type(w).__name__}:{w.text()[:10] if hasattr(w, 'text') else ''}"
+
+    i = lay.indexOf(grp)
+    return (i, _at(i - 1), _at(i), _at(i + 1))
+
+
+_gate_logs = []
+_prev_log2 = w_lvl2._on_log
+w_lvl2._on_log = lambda m: (_gate_logs.append(m), _prev_log2(m))[1]
+_prev_caps2 = dict(w_lvl2._acl_caps)
+# 就地生长只能在**内部包**里谈：丐版包根本没把这些入口编译进去，等级再怎么升也不该长出来
+# （那正是下面安全边界要反证的另一半）。而此处环境变量还停在上一组用例的 lite 档，
+# 直接跑就会把「档位不许越权」误读成「生长没生效」——本轮第一条红就是这么来的。
+_env_before2 = os.environ.get(edition.ENV_VAR)
+os.environ[edition.ENV_VAR] = "pro"
+edition.reset_for_tests()
+try:
+    check("前置状态：按等级 2 建的窗口确实没建数据池入口（就地生长的前提是先没有）",
+          w_lvl2.btn_pool_search is None and w_lvl2.btn_pool_import is None, "")
+    # 安全边界的 A 面：同一个窗口、同一份环境，只把身份确认结果换成「就是丐版」。
+    # 这一步必须一个字节也不建，否则下一条「确认到等级 1 就长出来」绿得没有意义。
+    edition.set_account_level(edition.LEVEL_LITE, "13800000000",
+                              reason="白名单等级 2（测试：确认结果就是丐版）")
+    check("需求 6·安全边界：确认结果就是丐版时一个字节也不建（「没权就不留在界面树里」"
+          "这条不变量本轮一寸没动）",
+          w_lvl2._build_pool_group() is False and w_lvl2.btn_pool_search is None, "")
+
+    # B 面：身份确认到等级 1，四键当场长出。与上一步唯一的差别就是确认结果，
+    # 所以这两条合起来才能证明「建不建」只由权限决定，不由网络快慢决定。
+    edition.set_account_level(edition.LEVEL_FULL, "13800000000",
+                              reason="白名单等级 1（测试：确认到达）")
+    w_lvl2._acl_sync_level()                                    # 心跳/refreshed 走的就是这条
+    _pool_btns = [w_lvl2.btn_pool_import, w_lvl2.btn_pool_scan,
+                  w_lvl2.btn_pool_sync, w_lvl2.btn_pool_search]
+    check("需求 6：确认到达时数据池四键**当场长出来**（而不是让用户重启）",
+          all(b is not None for b in _pool_btns),
+          [type(b).__name__ if b else None for b in _pool_btns])
+    # 写成 `b is not None and not b.isHidden()`：上一条红的时候这里会直接 AttributeError，
+    # 整套件还没跑到剩下的判据就崩——判据不许把「失败」升级成「崩溃」。
+    check("长出来的四键没被谁继续藏着（登记收口走的是同一套 _acl_reg）",
+          all(b is not None and not b.isHidden() for b in _pool_btns),
+          [None if b is None else b.isHidden() for b in _pool_btns])
+    check("两条路径建出的排列逐项一致：开机就建与确认后才长，同一账号应当看到同一个界面",
+          _pool_pos(w_lvl2) == _pool_pos(w_lvl1) and _pool_pos(w_lvl2) is not None,
+          (_pool_pos(w_lvl2), _pool_pos(w_lvl1)))
+    check("当场补齐要说一句“不用重启”（只默默把按钮变出来，用户会以为刚才界面卡了一下）",
+          any("当场补齐" in m or "已恢复显示" in m for m in _gate_logs), _gate_logs[:3])
+    # 上面的判据只能保证「那句话里提了一嘴」，钉不住本轮真正的缺陷：旧文案把四键已经建好
+    # 这件事整条丢了，只说「需要重启才会补齐」。这里要求两件事出现在同一句里。
+    _said = [m for m in _gate_logs if "权限等级已变更" in m]
+    check("需求 6·说得出部分胜利：同一句里既讲「数据池已当场补齐、现在就能用」，又讲清"
+          "哪些入口仍需重启（把已经好的说成坏的，用户就白重启一次或直接报「功能坏了」）",
+          len(_said) == 1 and "当场补齐" in _said[0] and "现在就能用" in _said[0]
+          and edition.CAP_LABELS[edition.CAP_POOL_UI] in _said[0]
+          and "需重启工具才会出现" in _said[0], _said[:2])
+    check("需求 6·文案不自己编：那句话里被点名的每一项都逐字等于 edition.CAP_LABELS 里的官方能力名"
+          "（矩阵与文案只有一份：GUI 另编一套说法，管理员照着面板授权、用户照着界面报障，"
+          "两边说的就不是同一件事了）",
+          bool(_said) and all(
+              p in set(edition.CAP_LABELS.values())
+              for seg in _said[0].split("；") if "需重启工具才会出现" in seg
+              for p in seg.replace("需重启工具才会出现", "").split("、") if p)
+          and any("需重启工具才会出现" in seg and
+                  seg.replace("需重启工具才会出现", "").strip("、")
+                  for seg in _said[0].split("；")), (_said[:1], sorted(set(edition.CAP_LABELS.values()))))
+    # 剩下的边界如实记名（不假装修好了）：另外几类入口仍要求重启，但它必须**说出来**。
+    _nogrown = [w_lvl2.btn_clear_seen, w_lvl2.btn_history, w_lvl2.chk_auto_kw]
+    check("需求 6·残留边界如实告知：长不出来的那几类仍没建，但必须挂出「重启才补齐」的横幅"
+          "（默默少几个入口才是这次报障的根源）",
+          all(b is None for b in _nogrown) and bool(w_lvl2._acl_pending),
+          ([type(b).__name__ if b else None for b in _nogrown], w_lvl2._acl_pending))
+finally:
+    w_lvl2._on_log = _prev_log2
+    w_lvl2._acl_caps = _prev_caps2
+    if _env_before2 is None:
+        os.environ.pop(edition.ENV_VAR, None)
+    else:
+        os.environ[edition.ENV_VAR] = _env_before2
+    edition.reset_for_tests()
+
+import threading as _thr                                        # noqa: E402
+import time as _tm                                              # noqa: E402
+
+_g = gui._access_guard.get_guard()
+_real_start_refresh = getattr(_g, "_start_refresh", None)
+_g._start_refresh = lambda: None        # 本用例验的是「等待机制」，不许真出网
+os.environ[edition.ENV_VAR] = "pro"     # 同上一段：等待的收获是「能摆全套入口」，只能在内部包计
+edition.reset_for_tests()
+try:
+    # 1) 确认在等待期间到达：必须在到的那一刻收手，而不是把预算耗完
+    edition.set_account_level(edition.LEVEL_LITE, "13800000000",
+                              reason="测试：开机没问到", pending=True)
+
+    def _late_confirm():
+        _tm.sleep(0.35)
+        edition.set_account_level(edition.LEVEL_FULL, "13800000000",
+                                  reason="测试：确认到达")
+        _g._notify_refreshed()          # 与生产同一口径：_fetch 末尾就是这么叫醒界面的
+
+    _thr.Thread(target=_late_confirm, daemon=True).start()
+    _t0 = _tm.monotonic()
+    _outcome, _waited = gui._wait_auth_settled(_tm.monotonic() + 6.0)
+    _spent = _tm.monotonic() - _t0
+    check("需求 6·主修：过场等待在确认到达那一拍就收手（6 秒预算只花了 %.2f 秒）" % _spent,
+          _outcome == "settled" and 0.2 <= _spent < 3.0, (_outcome, round(_waited, 2)))
+    check("需求 6·主修：等到的等级在**建窗口之前**就位（于是所有高级入口天然建全，"
+          "不靠事后补）",
+          edition.pool_ui_visible() and not edition.auth_pending(), "")
+
+    # 2) 一直问不到：必须在预算处收手，并把界面交给“基础功能 + 待确认横幅”
+    edition.set_account_level(edition.LEVEL_LITE, "13800000000",
+                              reason="测试：还是没问到", pending=True)
+    _t1 = _tm.monotonic()
+    _outcome2, _waited2 = gui._wait_auth_settled(_tm.monotonic() + 0.4)
+    check("需求 6·预算：问不到就收手回到基础功能，绝不把人挂在门口",
+          _outcome2 == "timeout" and _tm.monotonic() - _t1 < 3.0, (_outcome2, round(_waited2, 2)))
+    check("需求 6·不越权：等了也不算获得任何额外能力（失败封闭）",
+          edition.account_level() == edition.LEVEL_LITE and not edition.pool_ui_visible(), "")
+finally:
+    if _real_start_refresh is not None:
+        del _g._start_refresh           # 必须 del 而不是赋回：类方法不能被当实例属性还回去
+    edition.set_account_level(None)
+    if _env_before2 is None:
+        os.environ.pop(edition.ENV_VAR, None)
+    else:
+        os.environ[edition.ENV_VAR] = _env_before2
+    edition.reset_for_tests()
+    app.processEvents()
 
 # ══════════════════════════════════════════════════════════════════ E. 收尾
 print("\n" + "=" * 52)

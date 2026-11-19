@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent, QRect
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QEvent, QRect, QEventLoop
 from PyQt5.QtGui import QFont, QPalette, QColor, QPainter, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -2786,6 +2786,16 @@ class MainWindow(QMainWindow):
             # 补一次 1.5s 的轻量收口：只比对当前 edition 与已建入口，不额外出网，把这种
             # 「其实已确认、却被建窄了」的情况当场用横幅 + 一键重启补齐完整入口。
             QTimer.singleShot(1500, self._acl_startup_reconcile)
+            # 需求 6：身份待确认期间的自主重试。用真正的 QTimer 而不是
+            # QTimer.singleShot：后者拿不到句柄、停不下一个已经排下去的定时，而「确认一到
+            # 就彻底收手」是这一条链路的硬要求（无限轮询 = 把服务当敌人打）。
+            self._acl_auth_timer = QTimer(self)
+            self._acl_auth_timer.setSingleShot(True)
+            self._acl_auth_timer.timeout.connect(self._acl_auth_tick)
+            self._acl_auth_tries = 0
+            self._acl_auth_banner_live = False
+            self._acl_auth_banner_text = ""
+            QTimer.singleShot(0, self._announce_auth_pending)
         # 打开工具就接上次的任务：关键词、平台勾选、参数、采到哪儿一并回填（静默）。
         # 延到事件循环开始再做：读回上次数据要一两秒，卡在构造里窗口会先白屏。
         QTimer.singleShot(0, self._restore_last_task)
@@ -3708,37 +3718,17 @@ class MainWindow(QMainWindow):
         self.btn_pool_scan = None
         self.btn_pool_sync = None
         self.btn_pool_search = None
-        if edition.pool_ui_visible():
-            pool_group = QGroupBox("团队数据池")
-            pool_group.setToolTip(
-                "团队共享的历史数据池：把以前采过的表格导进来、把本机散落的相关表格扫出来入池、\n"
-                "把本次采集结果同步上去，也可以直接按行业搜别人池子里的下游采购商。")
-            pl = QHBoxLayout(pool_group)
-            pl.setSpacing(8)
-            self.btn_pool_import = QPushButton("导入历史数据")
-            self.btn_pool_import.setToolTip("选择本地 Excel/CSV 文件，自动转换后批量上传到团队数据池。\n适合把以前采集的大量数据一次性导入，不用就浪费了。")
-            self.btn_pool_sync = QPushButton("同步数据池")
-            self.btn_pool_sync.setToolTip("把本次采集数据上传到团队共享数据池，供所有人搜索使用。")
-            self.btn_pool_search = QPushButton("搜索采购商")
-            self.btn_pool_search.setToolTip("从团队数据池智能搜索下游采购商，支持 DeepSeek 语义匹配。")
-            self.btn_pool_scan = QPushButton("扫描本地表格")
-            self.btn_pool_scan.setToolTip(
-                "全盘扫描本机 Excel/CSV，逐个判断能不能入池，出清单给你勾选后再上传。\n"
-                "已传过的内容、同系列旧快照、说明文档类表格会自动分开标注。")
-            for _b in (self.btn_pool_import, self.btn_pool_scan,
-                       self.btn_pool_sync, self.btn_pool_search):
-                _b.setMinimumHeight(32)
-                _b.setMinimumWidth(max(88, _b.fontMetrics().horizontalAdvance(_b.text()) + 20))
-                pl.addWidget(_b)
-            if not HAS_POOL:
-                self.btn_pool_import.setEnabled(False)
-                self.btn_pool_sync.setEnabled(False)
-                self.btn_pool_search.setEnabled(False)
-                self.btn_pool_scan.setEnabled(False)
-            pl.addStretch()
-            cfg.addWidget(pool_group)
-            self._acl_reg(edition.CAP_POOL_UI, self.btn_pool_import, self.btn_pool_scan,
-                          self.btn_pool_sync, self.btn_pool_search)
+        # 需求 6（2026-11-19 实机报障「绑了权限 1 的账号却只有基础功能」）：这一组入口
+        # 仍旧**只在有权时创建**（「没权就一个字节都不得留在界面树里」是本文件多条安全判据
+        # 钉住的不变量，本轮不动它），但把创建抽成了 _build_pool_group()，并在身份**当场
+        # 确认到高权限**那一刻由 _acl_sync_level 直接长出来。旧写法只有「建界面前那一刻」
+        # 一个机会：新机器首启三秒内没问到身份 → 按丐版建 → 确认随后到了却长不出按钮 →
+        # 只能重启；而重启又回到同一个三秒，确定性复发。
+        # 位置、布局、控件属性全部走同一个方法：两条路径（开机就有 / 确认后才长）建出来的
+        # 界面必须逐项一致，否则「重启前后看到的不一样」会变成新一轮报障。
+        self._pool_layout = cfg
+        self._pool_insert_at = cfg.count()
+        self._build_pool_group()
 
         self.auto_import_check = QCheckBox("采集完自动导入云展客户库")
         self.auto_import_check.setToolTip(
@@ -4270,6 +4260,11 @@ class MainWindow(QMainWindow):
         """
         if link == "#acl-restart":
             self._acl_prompt_restart()
+        elif link == "#acl-recheck":
+            # 需求 6：同样只能由用户点（后台只写横幅与日志，不抢对话）
+            self._acl_auth_recheck()
+        elif link == "#acl-diag":
+            self._acl_export_diagnostics()
         elif link == "#update-show":
             # 需求 2 那两条出口：这里必须是**用户主动点击**才能走到弹框，后台检查
             # 只写横幅（与 #acl-restart 同一条红线，判据由离线套件钉住）
@@ -6985,6 +6980,131 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_log(f"⚠ 开机权限收口异常（不影响已在跑的采集）：{type(e).__name__}: {e}")
 
+    def _announce_auth_pending(self):
+        """开机没问到身份时把「为什么只看到基础功能」说在脸上（需求 6）。
+
+        旧行为才是问题本身：定档失败是**静默**的。高权限号看到的就是「我的工具少了一半
+        功能」，而这个界面与「未绑定」「权限 2」长得一模一样——用户无法区分「我没权限」
+        与「工具没问到」，只能截图来猜。现在三件事分开说：为什么、能不能自己重试、
+        重试不动就导出诊断。
+
+        只写横幅不弹模态（与「权限等级已变更」那一条同一口径）：这条链路是开机自动走的，
+        弹框等于「什么都没点就先欠我一个对话」，而 offscreen 回归里模态框会直接把整批挂住。
+        """
+        if not HAS_ACL_GUARD or not edition.auth_pending():
+            return
+        self._acl_auth_tries = 0
+        reason = edition.auth_reason() or "本次开机没从权限服务取回到名单"
+        self._acl_auth_banner_live = True
+        self._acl_auth_banner_text = (
+            f"账号身份还在确认中，当前先按基础功能显示（新装电脑首次联网要安全软件/代理多过几道，"
+            f"属正常情况）。{reason} "
+            '<a href="#acl-recheck">立即重试连接</a>｜<a href="#acl-diag">导出诊断信息</a>')
+        self._show_banner(self._acl_auth_banner_text, "#cfe9ff", "#0a4a7a")
+        self._on_log("ℹ 身份确认没赶上开机这一班：工具会自己再试几次（最迟 30 秒内），"
+                     "确认一到就把缺的入口当场补齐，不需要重启。")
+        self._acl_auth_schedule_retry()
+
+    def _acl_auth_schedule_retry(self):
+        """待确认期间的**有界**重试：越退越慢，确认到就停，绝不把用户挂在无限轮询上。
+
+        为什么不无限重试：一个真的没权限/真的断网的机器，轮询只会持续吃流量与电量，
+        还每轮把服务当敌人。重试只催一次后台刷新（单飞去重），不自己起线程、不阻塞主线程。
+        """
+        delays = (2_000, 4_000, 8_000, 15_000, 30_000)
+        if self._acl_auth_tries >= len(delays):
+            self._on_log("ℹ 自动重试已试完 " + str(len(delays)) +
+                         " 次都没问到身份（不影响基础功能可用）。网络恢复后点横幅上那条"
+                         "「立即重试连接」，或把「导出诊断信息」发回给开发者。")
+            return
+        delay = delays[self._acl_auth_tries]
+        self._acl_auth_tries += 1
+        self._acl_auth_timer.start(delay)
+
+    def _acl_auth_tick(self):
+        """一轮自动重试：还没确认就再催一次后台刷新，确认到了当场收横幅。"""
+        if not HAS_ACL_GUARD:
+            return
+        try:
+            if not edition.auth_pending():
+                self._acl_auth_settled()
+                return
+            guard = _access_guard.get_guard()
+            if not guard.auth_inflight():
+                guard._start_refresh()
+            self._acl_auth_schedule_retry()
+        except Exception as e:
+            self._on_log(f"⚠ 身份自动重试异常（不影响已在跑的采集）：{type(e).__name__}: {e}")
+
+    def _acl_auth_recheck(self):
+        """横幅上那条「立即重试连接」：用户主动点，所以可以把重试预算重新给一轮。"""
+        if not HAS_ACL_GUARD:
+            return
+        self._acl_auth_tries = 0
+        try:
+            guard = _access_guard.get_guard()
+            if guard.auth_inflight():
+                self._on_log("ℹ 已经有一轮确认在途，等它这一班跑完（没另开一个重复请求）。")
+            else:
+                guard._start_refresh()
+                self._on_log("ℹ 正在重新确认账号身份……（结果一到就写在这条日志与横幅上）")
+            self._acl_auth_schedule_retry()
+        except Exception as e:
+            QMessageBox.warning(self, "重试失败", f"这次确认没能安排上：{type(e).__name__}: {e}")
+
+    def _acl_auth_settled(self):
+        """确认到了：收横幅、停重试，并把新入口的补齐情况说一句。"""
+        try:
+            self._acl_auth_timer.stop()
+        except Exception:
+            pass
+        if self._acl_auth_banner_live:
+            self._acl_auth_banner_live = False
+            # 只收自己那一条：横幅是全工具共用的一块，确认到位时若已被更新提示/Chrome
+            # 体检占走，这里一把 hide 就是把别人的提醒清了账。
+            if self.banner.text() == self._acl_auth_banner_text:
+                self._hide_banner()
+            self._acl_auth_banner_text = ""
+        self._on_log(f"✓ 账号身份已确认：{edition.level_label(_access_guard.get_guard().level())}。"
+                     + ("缺的入口已当场补齐，不用重启。"
+                        if not self._acl_pending else
+                        "部分入口仍需重启才会建全（已按横幅提示）。"))
+
+    def _acl_export_diagnostics(self):
+        """把定档现场导成一份文本（远程排障用）：落点与崩溃日志同一口径。
+
+        为什么排在用户桌面：这一份是要用户自己点开发给开发者的，藏在数据目录里等于
+        多一次「找不到」。写不进去时退回用户目录，两条都失败才报错，不悄悄吃掉。
+        """
+        text = ""
+        try:
+            text = _access_guard.get_guard().diagnostics()
+        except Exception as e:
+            QMessageBox.warning(self, "诊断导出失败",
+                                f"现场信息没收集起来：{type(e).__name__}: {e}")
+            return
+        import datetime
+        name = f"B2B权限诊断_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt"
+        for d in _fatal_log_dirs():
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                f = d / name
+                f.write_text(text + "\n", encoding="utf-8")
+            except OSError:
+                continue
+            self._on_log(f"✓ 诊断信息已导出：{f}")
+            self._on_log("  · 这一份里只有账号、分类结论、时间与路径，没有密钥与代理地址。"
+                         "把它发回给开发者就能定位到是哪一段卡住了。")
+            try:
+                _tool_config.reveal_in_finder([f.parent])
+            except Exception:
+                pass    # 打不开目录不影响文件已经写成了，不能因此报一个假失败
+            return
+        QMessageBox.warning(self, "诊断导出失败",
+                            "桌面与用户目录都写不进去（常见于安全软件拦写入）。"
+                            "界面上已经把现场打在日志里了，请直接把下面这段复制回来：")
+        self._on_log(text)
+
     def _on_acl_event(self, msg: str):
         """顶号与等级变更的统一处理体（心跳、refreshed 信号共用同一份逻辑）。
 
@@ -7041,6 +7161,56 @@ class MainWindow(QMainWindow):
         box.raise_()
         box.activateWindow()
 
+    def _build_pool_group(self) -> bool:
+        """按需建出「团队数据池」那一组入口，返回本次有没有真建出来。
+
+        两个前提缺一不可，否则什么都不做：
+        · ``edition.pool_ui_visible()`` 当场为真——已确定为丐版/未绑定的账号永远进不到
+          这里，界面树里一个相关字节也不会多（那几条安全判据的原意）；
+        · 还没建过（开机那一次已经建好的不重建）。
+        入口建好后照旧走 _acl_reg 登记，因此后面的升降级收口、标题重投影全部复用同
+        一套逻辑，这里不多写一份判断。
+        """
+        if self.btn_pool_search is not None or not edition.pool_ui_visible():
+            return False
+        layout, at = getattr(self, "_pool_layout", None), getattr(self, "_pool_insert_at", -1)
+        if layout is None:
+            return False        # 配置区已被拆掉（理论上到不了）：宁可不建，也不建到错误位置
+        pool_group = QGroupBox("团队数据池")
+        pool_group.setToolTip(
+            "团队共享的历史数据池：把以前采过的表格导进来、把本机散落的相关表格扫出来入池、\n"
+            "把本次采集结果同步上去，也可以直接按行业搜别人池子里的下游采购商。")
+        pl = QHBoxLayout(pool_group)
+        pl.setSpacing(8)
+        self.btn_pool_import = QPushButton("导入历史数据")
+        self.btn_pool_import.setToolTip("选择本地 Excel/CSV 文件，自动转换后批量上传到团队数据池。\n适合把以前采集的大量数据一次性导入，不用就浪费了。")
+        self.btn_pool_sync = QPushButton("同步数据池")
+        self.btn_pool_sync.setToolTip("把本次采集数据上传到团队共享数据池，供所有人搜索使用。")
+        self.btn_pool_search = QPushButton("搜索采购商")
+        self.btn_pool_search.setToolTip("从团队数据池智能搜索下游采购商，支持 DeepSeek 语义匹配。")
+        self.btn_pool_scan = QPushButton("扫描本地表格")
+        self.btn_pool_scan.setToolTip(
+            "全盘扫描本机 Excel/CSV，逐个判断能不能入池，出清单给你勾选后再上传。\n"
+            "已传过的内容、同系列旧快照、说明文档类表格会自动分开标注。")
+        for _b in (self.btn_pool_import, self.btn_pool_scan,
+                   self.btn_pool_sync, self.btn_pool_search):
+            _b.setMinimumHeight(32)
+            _b.setMinimumWidth(max(88, _b.fontMetrics().horizontalAdvance(_b.text()) + 20))
+            pl.addWidget(_b)
+        if not HAS_POOL:
+            self.btn_pool_import.setEnabled(False)
+            self.btn_pool_sync.setEnabled(False)
+            self.btn_pool_search.setEnabled(False)
+            self.btn_pool_scan.setEnabled(False)
+        pl.addStretch()
+        # insertWidget(at) 而不是 addWidget：开机那一路这里紧接在关键词区之后、云展客户库
+        # 之前；确认后才长的这一路如果 append 到末尾，同一个账号就会因「网络快慢」看到
+        # 两套不同排列的界面，那是把随机性当成交付。
+        layout.insertWidget(max(0, at), pool_group)
+        self._acl_reg(edition.CAP_POOL_UI, self.btn_pool_import, self.btn_pool_scan,
+                      self.btn_pool_sync, self.btn_pool_search)
+        return True
+
     def _acl_sync_level(self):
         """等级变了就当场收口：多出来的入口立刻隐掉，缺的入口提示重启补齐。
 
@@ -7049,10 +7219,23 @@ class MainWindow(QMainWindow):
         不该有」，重启解决「本该有的没建出来」——两者都不能省。
         """
         cur = edition.caps_snapshot()
+        # 先结算「待确认」那一笔：确认到了就要停重试、收横幅，不管下面的能力集有没有变
+        # （变不变都要收；早退在那条 return 后面，放到它后面就会漏掉「确认了但仍是丐版」）。
+        if self._acl_auth_banner_live and not edition.auth_pending():
+            self._acl_auth_settled()
         if cur == self._acl_caps:
             return
         lost = [c for c, v in self._acl_caps.items() if v and not cur.get(c)]
         gained = [c for c, v in cur.items() if v and not self._acl_caps.get(c)]
+        # 长出来而不是只点亮：升级方向上那些「开机时等级不够、根本没建」的入口，先就地
+        # 建一次再走下面的显示循环。建得出来的那一部分就不再要求重启。
+        # 按能力名逐条点名，不写「对 gained 里每个没登记的能力都试一次 _build_pool_group」：
+        # 后者能不能把数据池记到正确的能力上取决于 caps_snapshot 的字典序，属于拿不定的写法
+        # （本轮查文案时发现这里即使算对了也没人读，就顺手改成只读不看运气的那种）。
+        grown = []
+        if (edition.CAP_POOL_UI in gained and not self._acl_gated.get(edition.CAP_POOL_UI)
+                and self._build_pool_group()):
+            grown.append(edition.CAP_POOL_UI)
         for cap in lost:
             for w in self._acl_gated.get(cap, []):
                 w.setVisible(False)
@@ -7072,21 +7255,37 @@ class MainWindow(QMainWindow):
         # 顺带补一次缺路播报：按集合去重，正常机器上一条也不会多。
         self._apply_list_channel_hint()
         self._log_channel_health()
-        # 收不掉的那一类：控件当初压根没创建（构建时等级不够），显示不出来
-        need_restart = bool(lost) or any(not self._acl_gated.get(c) for c in gained)
+        # 收不掉的那一类：控件当初压根没创建、本轮也长不出来（没有对应的就地生长入口）
+        pending_caps = [c for c in gained if c not in grown and not self._acl_gated.get(c)]
+        need_restart = bool(lost) or bool(pending_caps)
         if not need_restart:
-            self._on_log(f"ℹ 权限等级已更新，界面无需调整（{'、'.join(gained)} 已恢复显示）")
+            self._on_log("ℹ 权限等级已更新，界面无需调整（"
+                         + "、".join("已当场补齐" if c in grown else "已恢复显示"
+                                    for c in gained) + "）")
             return
+        # 当场长出来了一部分时，这句话必须**分开说**（2026-11-19 实测：数据池四键已经当场
+        # 建好了，旧文案却只讲「缺失的入口需要重启才会补齐」——用户据此以为「搜索采购商」
+        # 还是用不了，要么白重启一次，要么直接报「功能坏了」。交付里最贵的不是少一个入口，
+        # 而是把已经好的说成坏的。文案仍只从 edition.CAP_LABELS 取，不在这里再编一套。）
+        parts = []
+        if grown:
+            parts.append("、".join(edition.CAP_LABELS[c] for c in grown) + "已当场补齐，现在就能用")
+        if pending_caps:
+            parts.append("、".join(edition.CAP_LABELS[c] for c in pending_caps)
+                         + "需重启工具才会出现")
+        if lost:
+            parts.append("多余入口已当场收起")
+        _chg_txt = "账号权限等级已变更：" + "；".join(parts) + "。"
         self._acl_pending = True
-        self._on_log("ℹ 账号权限等级已变更，多余入口已当场收起；缺失的入口需要重启工具才会补齐。")
+        self._on_log("ℹ " + _chg_txt)
         # 这里绝不能再弹 QMessageBox.question：这条链路是后台刷新/心跳唤醒的，
         # 弹窗等于「用户什么都没点，界面自己蹦出一个必须回答的框」——正跑着采集时
         # 它会用嵌套事件循环把主线程接管过去（心跳、进度、停止全在模态里排队），
         # offscreen 回归里更是直接永久挂住（实测把整批拖死 600s 被 SIGABRT）。
         # 提示改在横幅上给一个可点的「重启工具现在生效」，问不问由用户决定。
+        # 锚点 #acl-restart 不动：_on_banner_link 与多条判据都只认这一个写法。
         self._show_banner(
-            "权限等级已变更：多余入口已收起，重启工具后界面才会完整对齐。"
-            '<a href="#acl-restart">重启工具现在生效</a>',
+            _chg_txt + ' <a href="#acl-restart">重启工具现在生效</a>',
             "#fff3cd", "#7a5a00")
 
     def _acl_prompt_restart(self) -> bool:
@@ -8855,6 +9054,171 @@ def _apply_update_entry(argv) -> int:
     return int(_tool_update.main(argv) or 0)
 
 
+class _AuthGateNotice(QWidget):
+    """开机「正在确认账号身份」的过场窗口（需求 6，2026-11-19 实机报障）。
+
+    为什么值得为这几秒专门开一个窗口：主窗口是按等级**创建**的——开机没问到身份
+    就先建窗口，那些高级入口根本不存在，晚到的确认只能要求重启，而重启又回到同
+    一轮超时（新机器上确定性复发）。把等待挑到建窗口**之前**才是根治，前提是这个
+    等待用户等得起，于是它必须同时做到三件事：
+    · 看得见：写清在等什么、已经等了多久，而不是白屏或一个不给解释的转圈；
+    · 可按：「立即重试」只催一次后台刷新（单飞去重，不另开重复请求）；
+    · 可走：「先用基础功能」立刻结束等待——网络真不通时工具必须能开，
+      绝不把人锁在门口（这也是为什么预算用尽后仍照旧建窗口 + 挂待确认横幅）。
+
+    它是非模态的普通窗口：开机这段路上弹模态框等于「用户什么都没点就先欠他一个
+    必须回答的框」，offscreen 回归里也会直接把整批挂住。
+    """
+
+    def __init__(self, reason: str = ""):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.gave_up = False           # 用户按了「先用基础功能」
+        self.retry_requested = False   # 用户按了「立即重试」
+        self._loop = None              # 当前那一转事件循环（按钮要能把它停下）
+        self._started = time.monotonic()
+        # 用 objectName + #选择器而不是类名选择器：这个类名以下划线开头，QSS 类型
+        # 选择器对它的解析不保证——背景没了只是一句美观问题，但它值得写成必然成立的那一种。
+        self.setObjectName("authGate")
+        self.setStyleSheet("#authGate { background: #f7f9fb; border: 1px solid #c2ccd6; }")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 14)
+        v.setSpacing(8)
+        title = QLabel("正在确认账号身份…")
+        _f = QFont(title.font())
+        _f.setBold(True)
+        _f.setPointSize(max(11, _f.pointSize()))
+        title.setFont(_f)
+        v.addWidget(title)
+        tip = QLabel("确认完成后会按这个账号的权限把界面一次开全，不需要重启。"
+                     "新装电脑首次联网要过安全软件与代理那一道，多等几秒属正常。")
+        tip.setWordWrap(True)
+        tip.setMaximumWidth(430)
+        v.addWidget(tip)
+        self.detail = QLabel(reason or "本次开机还没从权限服务取回到名单")
+        self.detail.setWordWrap(True)
+        self.detail.setMaximumWidth(430)
+        self.detail.setStyleSheet("color: #5a6672;")
+        v.addWidget(self.detail)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.elapsed_lbl = QLabel("已等 0 秒")
+        self.elapsed_lbl.setStyleSheet("color: #5a6672;")
+        row.addWidget(self.elapsed_lbl)
+        row.addStretch(1)
+        self.btn_retry = QPushButton("立即重试")
+        self.btn_retry.setToolTip("不等预算，现在就再问一次（已有一轮在途时不会另开重复请求）")
+        self.btn_retry.clicked.connect(self._on_retry)
+        self.btn_go = QPushButton("先用基础功能")
+        self.btn_go.setToolTip("不等了，直接打开工具；后台确认到就会把缺的入口补上")
+        self.btn_go.clicked.connect(self._on_give_up)
+        row.addWidget(self.btn_retry)
+        row.addWidget(self.btn_go)
+        v.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self.adjustSize()
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                g = scr.availableGeometry()
+                self.move(g.center().x() - self.width() // 2,
+                          g.center().y() - self.height() // 2)
+        except Exception:
+            pass      # 定位失败不影响这一轮等待，没屏幕可用时留在系统放的位置就行
+
+    def _tick(self):
+        """每秒只改一句字数：让这个窗口证明「还在动」，而不是一张静态图。"""
+        self.elapsed_lbl.setText(f"已等 {max(0, int(time.monotonic() - self._started))} 秒")
+
+    def _on_retry(self):
+        self.retry_requested = True
+        self._stop_spin()
+
+    def _on_give_up(self):
+        self.gave_up = True
+        self._stop_spin()
+
+    def _stop_spin(self):
+        if self._loop is not None:
+            self._loop.quit()
+
+    def spin(self, ms: int):
+        """真事件等待最多 ms 毫秒：期间窗口能重画、两个按钮能点。
+
+        用 ``QEventLoop`` 而不是 ``time.sleep``：sleep 会把这段时间变成「界面已经
+        出现却按不动」，而这一整个窗口存在的意义就是让用户在等待里仍然有得选。
+        唤醒源是守卫的 ``refreshed`` 信号（后台线程发出，所以走队列连接）。
+        """
+        guard = _access_guard.get_guard()
+        self._loop = QEventLoop()
+        sig = guard.refreshed
+        sig.connect(self._loop.quit, Qt.QueuedConnection)
+        timer = QTimer(self._loop)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._loop.quit)
+        timer.start(max(50, int(ms)))
+        try:
+            self._loop.exec_()
+        finally:
+            timer.stop()
+            try:
+                sig.disconnect(self._loop.quit)
+            except Exception:
+                pass      # 没连上过/已经断了：不影响结论，结论一律回到 edition 重读
+            self._loop = None
+
+
+def _wait_auth_settled(deadline: float) -> tuple:
+    """在建主窗口**之前**把账号身份等到落地（需求 6 的主修）。
+
+    返回 ``(结论, 已等秒数)``。结论是 ``"settled"``（问到了）/ ``"timeout"``（预算用尽）/
+    ``"skipped"``（用户不等）。后两种仍然照常建窗口：身份没问到就按基础功能开
+    （失败封闭一寸不让），同时把待确认横幅与当场补齐留给界面——
+    这一条不拿「开不了机」去换正确性。
+
+    秒数跟着返回值一起交出去（而不是存到守卫身上）：开机到底在哪一段花了多少时间，
+    是下次报障时唯一能分得清「网络慢」与「代码卡」的东西，它应该进台账而不是进隐式状态。
+
+    循环结构：每转叫醒一次「刷新完成」事件，回去重读 edition；还没问到且没有在途
+    那一轮就再催一发，直到落地或预算用尽。不自己起线程、不阻塞主线程。
+    """
+    if not edition.auth_pending():
+        return "settled", 0.0
+    guard = _access_guard.get_guard()
+    notice = _AuthGateNotice(edition.auth_reason())
+    notice.show()
+    result = "timeout"
+    try:
+        while True:
+            if not edition.auth_pending():
+                result = "settled"
+                break
+            if notice.gave_up:
+                result = "skipped"
+                break
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                result = "timeout"
+                break
+            notice.spin(remain * 1000)
+            if notice.gave_up or not edition.auth_pending():
+                continue                 # 下一轮循环统一结算，这里不抢着下结论
+            if not guard.auth_inflight():
+                # 上一轮已经收尾却仍没问到（也包含用户按了「立即重试」这一种）：
+                # 还有预算就再催一发，在途则不并发——重试的价值是再问一次，不是问得更响。
+                try:
+                    guard._start_refresh()
+                except Exception:
+                    break
+    finally:
+        waited = time.monotonic() - notice._started
+        notice._timer.stop()
+        notice.close()
+        QApplication.processEvents()    # 先真收掉过场，再花那一秒建主窗口
+    return result, waited
+
+
 def main():
     # 产物自报与升级交接排在最前（连状态目录之前）：两条都**必须**在没有图形会话的地方
     # 也能跑，而且一旦认成「不认识」就会退化到建界面——那一刻在 Windows 上正占着安装
@@ -8892,6 +9256,28 @@ def main():
         print(f"❌ 没认出这几个参数：{' '.join(wrong)}；"
               f"产物自检的正确写法是 {' 或 '.join(_doctor_flags())}")
         sys.exit(3)
+    # 开机身份预热（需求 6，2026-11-19 实机报障「绑了权限 1 的账号却只有基础功能」）：
+    # 把「取名单」这一趟在**任何本地等待之前**发出去，让它与下面的等前任退出、
+    # QApplication 构造、建窗口重叠。旧口径是建界面前一刻才开始请求，定档只有
+    # STARTUP_AUTH_WAIT_SECONDS 这三秒可用，新装 Windows 机器（DNS + TLS + 安全软件首扫）
+    # 很容易超支——而一旦超支就被钉成丐版，重启后又回到同一个三秒。现在这段时间
+    # 是整段启动里本来就付出去的，等于不花用户一秒把判定预算拉长。
+    # CLI 分派（--version/--doctor/--ui-smoke）必须在它前面：那几条路不该替一个
+    # 取参数的动作去出网。
+    # 预算起点排在预热之前：总额从「第一次出网」算起而不是从 QApplication 算起——
+    # 等上一个实例退出那一段也在付时间，算进去才对得上用户的体感。
+    # 取常量必须躲在 HAS_ACL_GUARD 后面：access_guard 没加载时 `_access_guard` 这个
+    # 名字压根不存在（见上面的 import 失败分支），在这里多引用一次就是把「降级能用」
+    # 造成「开机就 NameError」。
+    _auth_t0 = time.monotonic()
+    _auth_deadline = 0.0
+    _auth_outcome, _auth_waited = "off", 0.0
+    if HAS_ACL_GUARD:
+        _auth_deadline = _auth_t0 + _access_guard.STARTUP_AUTH_TOTAL_SECONDS
+        try:
+            _access_guard.prefetch_warm()
+        except Exception:
+            pass    # 预热失败不影响定档：prefetch_authoritative 会自己起一轮
     # 重启链路的交接：新实例先等前任真退出，再建 QApplication 与共享 Chrome。
     # 放在这里（而不是界面起来之后）的原因：抢同一个调试端口的风险只存在于「两个实例
     # 都在启动」这段时间里，而这段时间正好是 QApplication + 建窗口；等完之后窗口才现身，
@@ -8924,13 +9310,47 @@ def main():
             # 下次开机照样按旧等级摆出全套入口，正是「被删除的账号还能使用」。
             # 判定口径：OSS 拿到名单且本号在里面→按真实等级建（0/1完整、2丐版）；
             # 拿不到/超时/未绑定/不在名单→一律按丐版建（宁严勿宽，与 check() 同源）。
-            # 高权限号若因这次断网先起了丐版，联网后由后台刷新确认真实等级，再走
-            # _acl_sync_level 的「横幅 + 一键重启」补齐完整版入口（建好的界面长不出新按钮）。
-            _access_guard.prefetch_authoritative()
+            #
+            # 需求 6（2026-11-19 实机报障「新 Windows 机器绑了权限 1 的账号却只有基础
+            # 功能」）：旧口径只静默等 STARTUP_AUTH_WAIT_SECONDS，超了就按丐版建窗口。
+            # 而入口是按等级**创建**的，于是那些入口根本不存在，晚到的确认只能要求重启，
+            # 而重启又回到同一轮超时——新机器首连要付 DNS + TLS + 安全软件首扫，这是
+            # 稳定复现而不是偶发。现在的做法分两段：先静默等一小段（快机器上看不出差别），
+            # 还没问到就把剩下的预算做成**看得见、可重试、可放弃**的过场等待（见
+            # :func:`_wait_auth_settled`），让主窗口尽可能在身份已知之后才创建。
+            # 等完仍是待确认（网络真不通）才照旧按基础功能开：届时横幅会说清原因，
+            # 确认一到由 _acl_sync_level 当场补齐能就地长出来的那一部分入口。
+            _access_guard.prefetch_authoritative(
+                timeout=min(_access_guard.STARTUP_AUTH_SILENT_SECONDS,
+                            max(0.0, _auth_deadline - time.monotonic())))
+            _auth_outcome, _auth_waited = _wait_auth_settled(_auth_deadline)
         w = MainWindow()
         if not HAS_ACL_GUARD:
             try:
                 w._on_log("⚠ 权限校验模块（access_guard）未加载，本次运行不做白名单拦截")
+            except Exception:
+                pass
+        # 开机身份这一段花了多少时间要说一句（只在真的花了时间或没问到时出声，
+        # 与「缺路播报」同一口径：正常机器上一条也不会多，不骚扰没碰到这个问题的人）。
+        # 为什么值得占一行日志：报「只有基础功能」的人几乎从来说不清自己这台机器
+        # 当时能不能联网，而这一行直接把「网络慢」与「真没权限」分开。
+        if _auth_outcome == "settled" and _auth_waited >= 0.3:
+            try:
+                w._on_log(f"✓ 账号身份已确认（开机为它多等 {_auth_waited:.1f} 秒）："
+                          "界面已按这个账号的权限一次建全，不需要重启。")
+            except Exception:
+                pass
+        elif _auth_outcome == "skipped":
+            try:
+                w._on_log("ℹ 已按你的选择先用基础功能打开：后台一旦确认到身份，"
+                          "缺的入口会当场补上（补不动的那些才会提示重启）。")
+            except Exception:
+                pass
+        elif _auth_outcome == "timeout":
+            try:
+                w._on_log(f"⚠ 等了 {_auth_waited:.1f} 秒仍没问到账号身份，先按基础功能打开。"
+                          "点横幅上「立即重试连接」可再问一次；「导出诊断信息」那份文本"
+                          "发回给开发者就能定位到卡在哪一段。")
             except Exception:
                 pass
         # 老记录读不出来要说一句（只有 macOS 走得到这条：桌面受系统隐私保护，那一次
@@ -8951,7 +9371,11 @@ def main():
         # 先叫停卡点取证再记账：反过来会留下一次「其实走到了、却同时被记成 stalled」的
         # 自相矛盾记录，而自相矛盾的记录比没有记录更难解释。
         _launch_shown_or_failed.set()
-        _launch_record(LAUNCH_STAGE_SHOWN, _launch_note)
+        # auth= 跟着交付行一起落账：这一行是「窗口真交出去了」的唯一凭据，而需求 6
+        # 这一类报障要区的正是「开界面时到底问到了身份没有、为它等了多久」。
+        # 另开一个阶段只会把台账变成两处都要看，而台账的价值就在「一行能讲完一次开机」。
+        _launch_record(LAUNCH_STAGE_SHOWN,
+                       f"{_launch_note} auth={_auth_outcome}/{_auth_waited:.1f}s")
     except Exception as e:
         _launch_shown_or_failed.set()
         _fatal_log(e)

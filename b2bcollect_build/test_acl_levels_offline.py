@@ -100,10 +100,16 @@ class FakeOSS:
     ``hijack`` 与 ``delete_fail`` 是给竞态用例留的口子：「两台机器同时抢注」和
     「删除分片时网络抖了一下」这两件事在真实 OSS 上无法稳定复现，却又恰好是
     最容易把用户坑到的分支——不替身化就永远测不到。
+
+    ``delay`` 与 ``fail_msg``（需求 6 新增）同理：「新机器首连慢到超过开机预算」与
+    「服务端回了个 403」在真实网络上都不可靠，但需求 6 的整个根因就坐在前者上，
+    而「没问到」与「问到是拒绝」的区别就靠后者才能验到。不开这两个口子，
+    这一类判据只能靠 sleep 碰运气。
     """
 
     def __init__(self, accounts=None, grants=None, shards=None, fail=False,
-                 missing=False, bind_fail=False, hijack=None, delete_fail=False):
+                 missing=False, bind_fail=False, hijack=None, delete_fail=False,
+                 delay=0.0, fail_msg=""):
         self.calls = 0
         self.accounts = list(accounts if accounts is not None else [ADMIN])
         self.grants = grants
@@ -114,6 +120,8 @@ class FakeOSS:
         self.bind_fail = bind_fail
         self.hijack = hijack
         self.delete_fail = delete_fail
+        self.delay = delay
+        self.fail_msg = fail_msg
         self.writes = []
         self.seq = []                 # 请求序列（诊断用：多一次往返一眼就看出来）
 
@@ -138,8 +146,10 @@ class FakeOSS:
     def download_json(self, key):
         self.calls += 1
         self.seq.append(f"GET {key}")
+        if self.delay:
+            time.sleep(self.delay)        # 模拟首连慢：调用方的超时预算会被它吃掉
         if self.fail:
-            raise OSSPoolError("下载失败 HTTP 500")
+            raise OSSPoolError(self.fail_msg or "下载失败 HTTP 500")
         if key == ag.ACL_KEY:
             if self.missing:
                 self.missing = False        # 播种后重读可成功
@@ -925,6 +935,110 @@ def test_prefetch_authoritative():
             "被删除后既不是完整版、也绝不留在未判定")
 
 
+# ══════════════════════════════════ F3. 「没问到」≠「没权限」（需求 6）
+def test_auth_pending_separation():
+    """2026-11-19 实机报障：新 Windows 机器装正式包、绑等级 1 的账号，GUI 却只有基础功能；
+    点重启（或关掉重开）回到同一个开机预算 → 确定性复发。
+
+    这一节钉住修法的地基：把「这次没问到身份」与「问到了、答案是丐版」分开记账。
+    两种情况的**能力上限都钉死丐版**（fail-closed 一寸不让），差别只在说法与
+    能不能当场补齐——前者必须留着 pending 给界面，后者不许骗用户「正在确认」。
+    """
+    print("\n═══ F3. 「没问到身份」≠「没有权限」（需求 6 的记账分界）═══")
+
+    # 1) 断网冷启动：按丐版起界面，但记为「待确认」，且 pending 不得换来任何能力
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}, fail=True))
+    _assert_eq(ag.prefetch_authoritative(), _ed.LEVEL_LITE,
+               "断网 → 仍按丐版起界面（失败封闭不因这条改动松一寸）")
+    _assert(_ed.auth_pending(), "断网属于「还没问到」→ 待确认，界面保留当场补齐的入口")
+    _assert(not _ed.is_pro() and not _ed.pool_ui_visible() and not _ed.acl_admin_visible(),
+            "pending 只改说法：一个额外能力位也不给（权限边界没动）")
+    _assert("已移出白名单" not in _ed.auth_reason(),
+            f"不许对一个其实有权限的号谎称被移出名单：{_ed.auth_reason()}")
+
+    # 2) 后续刷新失败时同样不许抹掉待确认（本轮实测到的真缺陷）：prefetch 只是第一下，
+    #    界面的有界重试与心跳都会再触发刷新，而 _fetch 末尾无条件调 _evaluate——
+    #    旧写法那里会把 pending 写回 False 并谎报「已移出白名单」，补齐链路当场熄火。
+    g = _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}, fail=True))
+    ag.prefetch_authoritative()
+    _assert(_ed.auth_pending(), "前置状态：开机未确认 → 待确认")
+    g.refresh_bounded(timeout=3.0)          # 界面有界重试走的就是这一个入口
+    _assert(_ed.auth_pending(),
+            "失败刷新后仍保持待确认（旧写法在这里抹成 False，用户从此在等一个不会来的补齐）")
+    _assert("已移出白名单" not in _ed.auth_reason(),
+            f"失败刷新也不许谎称被移出名单：{_ed.auth_reason()}")
+
+    # 3) 拿到了名单、里面没有这个号：这是**结论**，不是等待
+    _fresh(LITEACC, FakeOSS(accounts=[ADMIN, STD], grants={ADMIN: 0, STD: 1}))
+    _assert_eq(ag.prefetch_authoritative(), _ed.LEVEL_LITE, "号不在名单 → 丐版")
+    _assert(not _ed.auth_pending(),
+            "重试一万次结果一样的情况不许记为待确认（否则界面会无限催服务）")
+
+    # 4) 未绑定：同样是结论
+    _fresh(None, FakeOSS(grants={ADMIN: 0}))
+    _assert_eq(ag.prefetch_authoritative(), _ed.LEVEL_LITE, "未绑定 → 丐版")
+    _assert(not _ed.auth_pending(), "未绑定不是「问不到」，不需要重试")
+
+    # 5) 凭证被拒（403）：重试无用，必须与网络类分开（同一张替身只改失败原因）
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}, fail=True,
+                         fail_msg="下载失败 HTTP 403 AccessDenied"))
+    ag.prefetch_authoritative()
+    _assert_eq(_ed.account_level(), _ed.LEVEL_LITE, "密钥被拒 → 依旧丐版")
+    _assert(not _ed.auth_pending(), "密钥被拒是发包方的活儿，不许对用户说「正在确认」")
+    _assert("密钥" in _ed.auth_reason() or "开发者" in _ed.auth_reason(),
+            f"原因要把人指向对的处理人：{_ed.auth_reason()}")
+    # 反向对照：同一份替身只把失败换成网络类，就必须是可重试（防止用「一律不重试」交差）
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}, fail=True, fail_msg="下载失败 HTTP 500"))
+    ag.prefetch_authoritative()
+    _assert(_ed.auth_pending(), "反向对照·同构造只换网络类失败 → 必须可重试")
+
+    # 6) 确认晚到（新机器首连慢的真实形状）：先按 pending 起丐版，后台那一轮落地后
+    #    必须把等级修正到位——超时的返回不等于这一轮作废。
+    slow = FakeOSS(grants={ADMIN: 0, STD: 1}, delay=0.9)
+    g = _fresh(ADMIN, slow)
+    _assert_eq(ag.prefetch_authoritative(timeout=0.2), _ed.LEVEL_LITE,
+               "慢网络上超过开机预算 → 先按丐版起界面（不让人干等）")
+    _assert(_ed.auth_pending(), "这一类的本质是「还没问到」→ 待确认")
+    _assert(g.refresh_bounded(timeout=6.0),
+            "挂在预热那一轮上接着等就能拿到名单（单飞复用，不是另起一轮）")
+    _assert_eq(_ed.account_level(), _ed.LEVEL_ADMIN,
+               "晚到的确认必须修正到真实等级（否则界面停在临时档位等重启）")
+    _assert(not _ed.auth_pending(), "确认已落地 → 待确认必须自动消失")
+    _assert(_ed.is_pro() and _ed.pool_ui_visible(),
+            "等级 0 确认后能力到位（界面向这一位取信号就能当场长出入口）")
+
+    # 7) 开机链路只许出网一次：预热 + 定档共用同一次请求（否则慢网络上两轮互抢带宽）
+    cli = FakeOSS(grants={ADMIN: 0, STD: 1})
+    _fresh(ADMIN, cli)
+    _assert(ag.prefetch_warm(), "预热确实安排了在途刷新")
+    _assert_eq(ag.prefetch_authoritative(timeout=6.0), _ed.LEVEL_ADMIN,
+               "预热不抢跑不猜结果：定档仍以这次从 OSS 拿回的名单为准")
+    acl_gets = [s for s in cli.seq if s.endswith(ag.ACL_KEY)]
+    _assert_eq(len(acl_gets), 1,
+               f"一次开机的名单请求必须只有一发（实际 {len(acl_gets)} 次：{cli.seq}）")
+    # 7b) 预热那一轮已经落地时，再调一次限时等待也不许重问（这一条不靠线程时序：
+    #     名单已在手里、距成功时刻接近 0，能不能认出「刚刚那次就是本次开机的那一次」在这里见分晓）
+    _assert(ag.get_guard().refresh_bounded(timeout=2.0), "已经拿到名单 → 直接回报成功")
+    _assert_eq(len([s for s in cli.seq if s.endswith(ag.ACL_KEY)]), 1,
+               "同一开机窗口内重复调用不得再出网（慢网络上每多发一拍，用户就多等一拍）")
+
+    # 8) 诊断页：把分散在六处的现场一次说清，且不泄密
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}))
+    ag.prefetch_authoritative()
+    text = ag.get_guard().diagnostics()
+    for field in ("工具版本", "账号", "名单", "当前定档", "定档原因", "权限服务分类",
+                  "还有刷新在途", "设备绑定状态", "本地副本", "代理环境变量", "系统时间"):
+        _assert(field in text, f"诊断页必须覆盖「{field}」这一行现场")
+    _assert(ag.device_id() not in text,
+            "设备标识只给前 8 位：整份指纹不得出现在可外发的文本里")
+    secrets = [str(v) for k, v in os.environ.items()
+               if any(s in k.upper() for s in ("SECRET", "ACCESS_KEY", "TOKEN", "PASSWORD"))
+               and len(str(v)) > 5 and str(v) in text]
+    _assert(not secrets, f"诊断导出不许写入任何密钥值（命中 {len(secrets)} 项）")
+    _assert("http://" not in text and "://" not in text,
+            "代理只报变量名、不报地址（内网代理地址本身就是敏感信息）")
+
+
 # ══════════════════════════════════════════════════════ G. 管理员命令行
 @contextlib.contextmanager
 def _cli_client(cli):
@@ -1149,6 +1263,7 @@ def main():
     test_account_notes()
     test_prefetch_local()
     test_prefetch_authoritative()
+    test_auth_pending_separation()
     test_guard_teardown()
     test_cli()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
