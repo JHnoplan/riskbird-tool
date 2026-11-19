@@ -161,6 +161,7 @@ import codecs
 import hashlib
 import io
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -9151,6 +9152,161 @@ def prune_artifact(artifact, label: str = "") -> int:
     return int(total)
 
 
+# ── 第 41 条：剪裁/重量门的执行位置契约（这些参数到底是从哪个目录算起的）────────────
+# 由来（2026-11-19 云端 Windows run #69 与 Mac run #73 同时红）：需求 5 的剪裁 + 重量门是我
+# 照着**本机脚本**抄进两份 workflow 的。本机那份开头有 `cd b2bcollect_build`，workflow 里
+# 没抄这一句——于是同一行 `--prune-artifact dist/B2bCollectTool` 在两种基准下指的是两个位置：
+# 本机指 b2bcollect_build/dist/...（真产物），云端指仓库根的 dist/...（从来不存在）。第 40 条
+# 构建后那一面如实念「读不到产物体积视野」，两路一起拦下上传——这一批唯一的一个真缺陷，
+# 被自家门禁拓住了。但当时的判据只能事后在云端红：**静态那一半是空的**——三处入口本可以在
+# 开建之前就说清「这句话在哪一格执行」。这一条就是补那一半。
+# 只认一种规范写法（写法只有一种，判据才不需要猜人意图）：
+#   ① 调用之前最近的一条 cd 必须是 `cd b2bcollect_build`（PyInstaller 就是在那里跑的）；
+#   ② 两个旗标的值必须写成 `dist/<产物名>`（不带仓库根前缀，也不许再往深处）；
+#   ③ 门脚本自己必须写成 `../.github/scripts/check_packaging_manifest.py`（同一个 cwd 下
+#      能在磁盘上落地，这一句是可验的：写错基准就连脚本自己都找不到）。
+# 两个方向都能红：从仓库根执行却写 `dist/...`（这次的缺陷），以及 cd 进去之后还写
+# `b2bcollect_build/dist/...`（同样错位，只是反过来）。认不出目标的 cd（带变量、带运算、
+# pushd、绝对路径）一律算「读不懂」并红在这里——把判据建在猜上，它就只在猜对的时候工作。
+ARTIFACT_FLAGS = ("--prune-artifact", "--artifact-weight")
+# 产物 dist/ 住在哪一格：三处入口都是在 `cd` 进这个目录之后跑 PyInstaller 的。
+BUILD_CWD = "b2bcollect_build"
+GATE_SCRIPT_NAME = "check_packaging_manifest.py"
+# 门脚本在仓库里的真身（也是 ③ 里归一后必须相等的那个写法）。
+GATE_SCRIPT_REL = ".github/scripts/" + GATE_SCRIPT_NAME
+_CD_PLAIN = re.compile(r"^cd\s+([A-Za-z0-9._/-]+)\s*$")
+# 其他形状的 cd：只用来标「从这里开始基准就不明」，不拿它算路径。
+_CD_ANY = re.compile(r"^(?:cd|pushd)(?:\s|$)")
+_CD_UNKNOWN = "\x00unknown"
+
+
+def _norm_shell_path(text: str) -> str:
+    """把 shell 里的路径写法归一成 posix 并化简 `.`/`..`。
+
+    两处必须归一：Windows 的 yml 里同一件事可能写成反斜杠；而 `../.github/...` 这种带
+    `..` 的写法要能和本机路径对上（不归一的话 `b2bcollect_build/../.github` 与
+    `.github` 会被当成两个不同的东西，判据就开始指错方向）。
+    """
+    return posixpath.normpath(text.replace("\\", "/").rstrip("/")) or "."
+
+
+def _artifact_calls(script: str) -> list:
+    """[(调用时最近一次 cd 的目标, 门脚本 token, {旗标: 值}, 行号)]：这段 shell 里每一次
+    「调门脚本并且带了剪裁/重量旗标」。折行先拼回一行（否则旗标在上一行、值在下一行就断了），
+    注释段直接跳过（本机脚本里就有一句解释写在注释里）。
+    """
+    out, last_cd = [], ""
+    for logical, lineno in _logical_lines(script):
+        for seg in _shell_segments(logical):
+            s = seg.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = _CD_PLAIN.match(s)
+            if m:
+                last_cd = _CD_UNKNOWN if posixpath.isabs(m.group(1)) else _norm_shell_path(m.group(1))
+                continue
+            if _CD_ANY.match(s):
+                last_cd = _CD_UNKNOWN        # 认不出目标的 cd：我不猜它把人带去了哪
+                continue
+            toks = _shell_tokens(s)
+            script_tok = next((t for t in toks if t.endswith(GATE_SCRIPT_NAME)), "")
+            if not script_tok:
+                continue
+            got = {}
+            for i, t in enumerate(toks):
+                if t in ARTIFACT_FLAGS and i + 1 < len(toks):
+                    got[t] = toks[i + 1].strip("\"'")
+            if not got:
+                continue                     # 只调了静态那一面（没带产物旗标），这一条不管
+            out.append((last_cd, script_tok, got, lineno))
+    return out
+
+
+def _cd_say(last_cd: str) -> str:
+    """把「最近一次 cd」说得能读：没 cd 过、cd 进产物目录、还有一种是我认不出的。"""
+    if last_cd == "":
+        return "从来没 cd 过（仓库根）"
+    if last_cd == _CD_UNKNOWN:
+        return "一条我认不出目标的 cd"
+    return f"`cd {last_cd}`"
+
+
+def artifact_gate_texts() -> tuple:
+    """({标签: shell 文本}, problems)：三处打包入口里所有**调了**构建后那一面的 shell 段落。
+
+    workflow 按 run 步切（每步有自己的 cwd，这也是这一条要存在的原因）；本机脚本整份就是一个
+    连续执行的文本，它的 cd 会一路带到调用那一行，所以必须整份看而不是逐行看。
+    入口不在位就报：登记了却读不到的入口等于「这个平台的产物没人管」，静默放行比没这条门更危。
+    """
+    texts, problems = {}, []
+    for caller, path in CALLERS.items():
+        if not path.is_file():
+            problems.append(f"{caller}：打包入口 {_rel(path)} 不在位（第 41 条读不到它，"
+                            "就不能说它合格——静默不跑的判据比没有判据更危）")
+            continue
+        rel = _rel_posix(path) or str(path)
+        body = path.read_text(encoding="utf-8", errors="replace")
+        if rel.endswith((".yml", ".yaml")):
+            blocks = [(f"{rel} 第 {lineno} 行「{name}」（{shell}）", script)
+                      for name, lineno, shell, script in run_blocks_in_workflow(body)]
+        else:
+            blocks = [(rel, body)]
+        for where, script in blocks:
+            if GATE_SCRIPT_NAME not in script or not any(f in script for f in ARTIFACT_FLAGS):
+                continue                     # 与第 20 条同一口径：不含这件事的段落不必收
+            texts[f"{caller} · {where}"] = script
+    return texts, problems
+
+
+def check_artifact_step_cwd(texts=None) -> list:
+    """第 41 条主体：每一次剪裁/重量调用都必须在 `b2bcollect_build` 那一格里执行。
+
+    texts 留成注入面（第 15/20 条同一口径）：只能读真仓库的判据只验得出「现在没坏」，
+    验不出「坏了会不会响」，而后者才是这条门的全部价值。
+    """
+    problems = []
+    if texts is None:
+        texts, extra = artifact_gate_texts()
+        problems.extend(extra)
+    # 这一句必须在 `if texts is None` 之外：注入 `{}` 与「三处入口一次都没调」在症状上是
+    # 同一件事，只保护默认口径的话，夹具和将来任何调用方都在保护之外。
+    if not texts:
+        problems.append("三处打包入口里一次都没调到 " + "/".join(ARTIFACT_FLAGS) +
+                        "：剪裁清单 ARTIFACT_PRUNE 与产物重量门的构建后那一面现在没人执行"
+                        "（QML 栈与 Qt 翻译会原样进包，空集合上不许报绿）")
+        return problems
+    for where, script in texts.items():
+        for last_cd, script_tok, got, lineno in _artifact_calls(script):
+            at = f"{where} 第 {lineno} 行"
+            if last_cd != BUILD_CWD:
+                problems.append(
+                    f"{at}：剪裁/重量门跑在 {_cd_say(last_cd)} 之后，而 PyInstaller 是在"
+                    f" `cd {BUILD_CWD}` 里跑的，产物住在 {BUILD_CWD}/dist/ 下。规范写法只有一"
+                    f"种：同一段 shell 里先 `cd {BUILD_CWD}`，参数写 `dist/<产物名>`，脚本路径"
+                    f"写 `../{GATE_SCRIPT_REL}`（云端两路就是红在这一格：参数照抄了本机写法却没"
+                    f"跟着 cd，门读不到视野）")
+            want = f"../{GATE_SCRIPT_REL}"
+            if _norm_shell_path(script_tok) != want:
+                problems.append(f"{at}：门脚本写成 `{script_tok}`——在 `{BUILD_CWD}` 里要念"
+                                f"`{want}`（写错基准连脚本自己都找不到，而不是只错一个参数）")
+            elif not (ROOT / BUILD_CWD / _norm_shell_path(script_tok)).is_file():
+                problems.append(f"{at}：`{script_tok}` 在 {BUILD_CWD} 下落不到磁盘上的真脚本"
+                                f"（这条是可验的：找不到就是路径基准拿错了）")
+            for flag in ARTIFACT_FLAGS:
+                if flag not in got:
+                    problems.append(f"{at}：调了门脚本却没带 {flag}——剪裁与重量是两道门，"
+                                    f"少一件就是少一件（另一件不会替它把关）")
+                    continue
+                norm = _norm_shell_path(got[flag])
+                if norm == got[flag] and norm.startswith("dist/") and len(norm.split("/")) == 2:
+                    continue                 # 规范写法，一字不多一字不少
+                problems.append(
+                    f"{at}：{flag} 写成 `{got[flag]}`。在 `{BUILD_CWD}` 里只许写"
+                    f" `dist/<产物名>`：写 `{BUILD_CWD}/dist/...` 就指到 {BUILD_CWD}/{BUILD_CWD}/dist"
+                    f"（反过来从仓库根写 `dist/...` 就是本次云端那两条红）")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -9687,6 +9843,21 @@ def main(argv=None) -> int:
         banned = "、".join(f"{flag} {value}" for flag, value in WEIGHT_BANNED_FLAGS)
         print(f"✅ 产物重量门（构建前）：三处入口都没用禁名单里的写法（{banned}），"
               f"进包分析闭包（{len(_weight_analyzed_sources())} 份源码）里也没有一处 import 重量包")
+
+    cwd_problems = check_artifact_step_cwd()
+    if cwd_problems:
+        bad += 1
+        print("❌ 剪裁/重量门的执行位置（第 41 条）不合格：")
+        for p in cwd_problems:
+            print(f"   · {p}")
+            print(f"::error::剪裁执行位置：{p}")
+    else:
+        # 数目直接从判据用的同一份输入里算，不在这里另扫一遍（扫两遍就是两个口径迟早分叉）：
+        # 只说「合格」不说「判了几处」，门在空集合上报绿时人看不出来。
+        _seen = sum(len(_artifact_calls(s)) for s in artifact_gate_texts()[0].values())
+        print(f"✅ 剪裁/重量门的执行位置：{_seen} 处调用全部跑在 `cd {BUILD_CWD}` 里，"
+              f"参数写成 `dist/<产物名>`、门脚本写成 `../{GATE_SCRIPT_REL}`"
+              f"（两个方向都不许错位，本机脚本与两份 workflow 一种写法）")
 
     for label, path in CALLERS.items():
         if not path.exists():

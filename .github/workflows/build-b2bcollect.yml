@@ -168,10 +168,14 @@ jobs:
       # --prune-artifact 删掉 hook 连带收件里本工具永远用不到的那批（Windows 产物
       # 里是 Qt5Quick.dll/Qt5Qml.dll 等同名连带，剪裁清单两平台共用）；
       # --artifact-weight 跑第 40 条构建后那一面，红得最快，不浪费自检时间。
+      # 必须 cd 进 b2bcollect_build：上一步 PyInstaller 就是在那里跑的，产物住在
+      # b2bcollect_build/dist/。本步从仓库根执行却传 dist/... 的话，剪裁和重量门都会
+      # 「读不到视野」——真实翻车过（run #69），所以脚本侧另有静态判据钉这条 cwd 契约。
       shell: bash
       run: |
         set -u
-        python .github/scripts/check_packaging_manifest.py \
+        cd b2bcollect_build
+        python ../.github/scripts/check_packaging_manifest.py \
           --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \
           --artifact-label Windows
 

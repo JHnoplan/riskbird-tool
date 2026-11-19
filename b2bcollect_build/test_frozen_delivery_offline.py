@@ -12135,6 +12135,111 @@ def test_feature_table_gate():
                 f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
 
 
+# ── DD. 第 41 条：剪裁/重量门的执行位置契约 ────────────────────────────────
+def test_artifact_step_cwd_gate():
+    """DD. 同一行 `dist/...` 在两种基准下指两个位置：第 41 条硬门要有牙。"""
+    print("\n═══ DD. 剪裁/重量门在哪一格执行：第 41 条硬门要有牙（两个方向都要红）═══")
+    # 由来：2026-11-19 云端 Windows run #69 与 Mac run #73 同时红——剪裁+重量那一步的参数是
+    # 照着本机脚本抄进 workflow 的，却没抄那一句 `cd b2bcollect_build`，于是第 40 条构建后
+    # 那一面在仓库根读 `dist/...`，读不到视野。云端红是**事后**：这一节要的是「开建之前就能
+    # 说清这句话在哪一格执行」，而且两个方向的错位都要红（只红一个方向的门，换个方向写错
+    # 就静默放行）。
+    gate = _manifest_gate()
+    _ok = ("set -u\ncd b2bcollect_build\n"
+           "python ../.github/scripts/check_packaging_manifest.py \\\n"
+           "  --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \\\n"
+           "  --artifact-label Windows\n")
+
+    # 0) 参照自证：规范写法必须绿。没有这一格，下面每一条红都可能只是「判据根本读不懂
+    #    这件事」；同时它钉住修法本身能被接受，否则这条门会把唯一的正确写法关在门外。
+    _assert_eq(gate.check_artifact_step_cwd({"夹具": _ok}), [],
+               "规范写法不该被拦（拦了就是把修法本身关在门外）")
+    # 真仓库口径必须绿、而且三处入口各判到一处：少一处就是有一个平台的门在空转。
+    _texts, _absent = gate.artifact_gate_texts()
+    _assert_eq(_absent, [], "三处打包入口都必须在位（登记了却读不到＝这个平台的产物没人管）")
+    _assert_eq(sum(len(gate._artifact_calls(s)) for s in _texts.values()), 3,
+               "Windows workflow / Mac workflow / 本机 Mac 脚本各判到一处剪裁+重量调用，"
+               "多出来或少一处都要先看清楚是不是入口写法分叉了")
+    _assert_eq(gate.check_artifact_step_cwd(), [], f"真仓库现在就该是绿的：{_texts.keys()}")
+
+    # 1) 七路变异：每一路都要红，而且红话里要点名代价（只要求「非空」的门迟早被不相干的
+    #    噪音哄绿）。
+    _muts = (
+        ("本轮真缺陷：从仓库根执行却写 dist/",
+         "set -u\npython .github/scripts/check_packaging_manifest.py \\\n"
+         "  --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool\n",
+         "从来没 cd 过（仓库根）"),
+        ("反过来：cd 进去之后还写 b2bcollect_build/dist/",
+         "cd b2bcollect_build\npython ../.github/scripts/check_packaging_manifest.py \\\n"
+         "  --prune-artifact b2bcollect_build/dist/B2bCollectTool \\\n"
+         "  --artifact-weight b2bcollect_build/dist/B2bCollectTool\n",
+         "只许写 `dist/<产物名>`"),
+        ("只带剪裁、把重量门摘了",
+         "cd b2bcollect_build\npython ../.github/scripts/check_packaging_manifest.py"
+         " --prune-artifact dist/B2bCollectTool\n",
+         "剪裁与重量是两道门"),
+        ("只带重量、把剪裁摘了",
+         "cd b2bcollect_build\npython ../.github/scripts/check_packaging_manifest.py"
+         " --artifact-weight dist/B2bCollectTool\n",
+         "剪裁与重量是两道门"),
+        ("cd 跟着改了、脚本路径没改",
+         "cd b2bcollect_build\npython .github/scripts/check_packaging_manifest.py \\\n"
+         "  --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool\n",
+         "门脚本写成"),
+        ("认不出目标的 cd（带变量）",
+         'cd "$SOME_DIR" || exit 1\npython ../.github/scripts/check_packaging_manifest.py \\\n'
+         "  --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool\n",
+         "一条我认不出目标的 cd"),
+        ("产物名再往深一层",
+         "cd b2bcollect_build\npython ../.github/scripts/check_packaging_manifest.py \\\n"
+         "  --prune-artifact dist/B2bCollectTool/_internal \\\n"
+         "  --artifact-weight dist/B2bCollectTool\n",
+         "只许写 `dist/<产物名>`"),
+    )
+    for label, script, needle in _muts:
+        _got = gate.check_artifact_step_cwd({f"夹具·{label}": script})
+        _assert(_got, f"变异「{label}」必须被杀红（全绿＝这一路判据没有牙）")
+        _assert(any(needle in p for p in _got),
+                f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
+
+    # 2) 本轮缺陷的**原位**反证：真拿 workflow 的分步口径跑一遍。这一步才是这一条存在的
+    #    理由——PyInstaller 那一步 cd 了，剪裁那一步没 cd：跨步的 cwd 不继承，判据必须按
+    #    「这一步自己的 cd」说话。把它退回修前原样喂进去，必须同时报出两处错位（cd 与
+    #    脚本路径），因为修前那一句两个基准都拿错了。
+    _wf = ("name: probe\non:\n  push: [main]\njobs:\n  build:\n    runs-on: windows-latest\n"
+           "    steps:\n    - name: Build with PyInstaller\n      shell: bash\n"
+           "      run: |\n        cd b2bcollect_build\n        python -m PyInstaller --name X\n"
+           "    - name: Prune + weight\n      shell: bash\n      run: |\n"
+           "        set -u\n        python .github/scripts/check_packaging_manifest.py \\\n"
+           "          --prune-artifact dist/X --artifact-weight dist/X\n")
+    _blocks = gate.run_blocks_in_workflow(_wf)
+    _assert_eq(len(_blocks), 2, "反证夹具必须切出两步（切少了就是分步判据在空转）")
+    _pre = {f"修前·{_n}": _s for _n, _l, _sh, _s in _blocks if "--prune-artifact" in _s}
+    _assert_eq(len(_pre), 1, "剪裁那一步要被读到，不然这一格反证不成立")
+    _got = gate.check_artifact_step_cwd(_pre)
+    _assert(any("从来没 cd 过（仓库根）" in p for p in _got),
+            f"上一步的 cd 不许被当成这一步的 cd（跨步不继承）：{_got[:2]}")
+    _assert(any("门脚本写成" in p for p in _got),
+            f"脚本路径也要在同一格的 cwd 下能落地：{_got[:2]}")
+    # 反向的反向：把修后的写法原样贴回夹具，必须绿——否则上面那一红可能只是「夹具本来就错」。
+    _post = {"修后·Prune + weight":
+             "set -u\ncd b2bcollect_build\n"
+             "python ../.github/scripts/check_packaging_manifest.py \\\n"
+             "  --prune-artifact dist/X --artifact-weight dist/X\n"}
+    _assert_eq(gate.check_artifact_step_cwd(_post), [], "修后写法不该再被拦")
+
+    # 3) 空转保险：注入空表必须红。「三处入口都不调剪裁门」与「判据的视野断了」在症状上
+    #    完全一样，两者都不能在空集合上报绿（第 20/25/34 条同一课）。
+    _got = gate.check_artifact_step_cwd({})
+    _assert(any("现在没人执行" in p for p in _got),
+            f"空视野不许报绿：{_got[:1]}")
+    # 只调门、不带产物旗标（=只跑静态那一面）不算这一条的视野，但也不算绿得没根据：
+    # 它不该被误报，否则真正的错位会被噪音盖住。
+    _assert_eq(gate.check_artifact_step_cwd(
+        {"只跑静态": "python ../.github/scripts/check_packaging_manifest.py\n"}), [],
+        "没带产物旗标的调用不属于这一条的视野（误报就是把门变成噪音）")
+
+
 # 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
 # NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
@@ -12160,6 +12265,7 @@ SECTIONS = (
     test_qt_shutdown_teardown_gate,
     test_state_file_protection_gate,
     test_package_weight_gate,
+    test_artifact_step_cwd_gate,
     test_installer_env_gate,
     test_feature_table_gate,
     test_suite_exit_code_guard_gate,

@@ -111,10 +111,14 @@ jobs:
       # 单一真源在本文件，这里只调不抄，抄一遍就是第二份真源迟早分叉）。
       # 重量：--artifact-weight 跑第 40 条构建后那一面（白拿名单/未登记大成分/
       # 登记上限），放在 doctor/冒烟之前：纯文件系统检查，红得最快，不浪费自检时间。
+      # 必须 cd 进 b2bcollect_build：上一步 PyInstaller 就是在那里跑的，产物住在
+      # b2bcollect_build/dist/。本步从仓库根执行却传 dist/... 的话，剪裁和重量门都会
+      # 「读不到视野」——真实翻车过（run #73），所以脚本侧另有静态判据钉这条 cwd 契约。
       shell: bash
       run: |
         set -u
-        python .github/scripts/check_packaging_manifest.py \
+        cd b2bcollect_build
+        python ../.github/scripts/check_packaging_manifest.py \
           --prune-artifact dist/B2bCollectTool.app --artifact-weight dist/B2bCollectTool.app \
           --artifact-label Mac
 
