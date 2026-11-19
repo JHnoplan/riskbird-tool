@@ -36,6 +36,14 @@ PY=${PY:-.venv/bin/python}
 # 单套件看门狗超时（秒）：gui_smoke_test 曾因为收尾一个模态弹窗 offscreen 永久等待，
 # 把整批回归挂住 20 多分钟。挂死与代码坏是两回事，但都必须当场暴露、不能拖走全批。
 PER_TEST_TIMEOUT=${PER_TEST_TIMEOUT:-600}
+# 看门狗预算按套件给一份（2026-11-20 本机实测）：`test_frozen_delivery_offline.py` 是全部
+# 66 路里最重的一份，单跑就要 529 秒（3176+ 条判定，内含全仓 ast.parse 与多次子进程实跑），
+# 600 秒的统一预算只剩 13% 余量：只要机器上还有第二个活（我这次是并发了几个取证探针），
+# 它就越线被 124 打断，报成 HANG、栈停在 `ast.parse`/GC——那是「跑得慢」被读成「挂死」，
+# 照着那句去找不存在的死循环会白费一整轮。只给这一路加预算，其余一律仍按 600 秒：
+# 这个上限的存在意义就是抓真挂死（2026-11-12 整批回归被一次模态弹窗拖死正是这么抓到的），
+# 全都放宽等于把报警器关掉。
+HEAVY_TEST_TIMEOUT=${HEAVY_TEST_TIMEOUT:-1500}
 
 # 按命名约定自动发现的目录（新增交付目录就在这里加一行）
 DELIVERY_DIRS="b2bcollect_build riskbird_build ali1688_build"
@@ -452,6 +460,10 @@ _pick_reason() {
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
+  suite_timeout=$PER_TEST_TIMEOUT
+  case "$f" in
+    *test_frozen_delivery_offline.py) suite_timeout=$HEAVY_TEST_TIMEOUT ;;
+  esac
   code=0
   if [ -n "$TMO" ]; then
     # < /dev/null：解释器必须自己带 fd 0。批跑常在后台起、起它的终端随后被回收，那时
@@ -463,7 +475,7 @@ for f in $FILES; do
     # ①`cmd` 单独一行、下一行 `code=$?`——在继承来的 errexit 下走不到第二行，套件一红脚本先没；
     # ②中间夹一句 `if [ $? -eq 0 ]` 再在 else 里取 `$?`——那时 `$?` 已经是 `[` 自己的 1，
     #   139（SIGSEGV）会被读成普通断言红，按信号分类那一整支就此失效。
-    "$TMO" -s ABRT -k 10 "$PER_TEST_TIMEOUT" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
+    "$TMO" -s ABRT -k 10 "$suite_timeout" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
   else
     $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
   fi
@@ -528,9 +540,9 @@ for f in $FILES; do
     # 说「见下」，没栈的那几次就等于又造一句「提示与实际行为不一致」的话，而读日志的人照着
     # 那句去找行号，找不到就会开始跳过这一步的 output。
     if printf '%s\n' "$out" | grep -q '^Fatal Python error: '; then
-      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断，挂死点栈见下）\n' "$f" "$PER_TEST_TIMEOUT"
+      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断，挂死点栈见下）\n' "$f" "$suite_timeout"
     else
-      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断；faulthandler 这次没来得及打栈，' "$f" "$PER_TEST_TIMEOUT"
+      printf 'HANG  %-52s 超过 %ss 没跑完（看门狗 124 打断；faulthandler 这次没来得及打栈，' "$f" "$suite_timeout"
       printf '只能看日志末尾）\n'
     fi
     printf '%s\n' "$out" | tail -22 | sed 's/^/        /'
