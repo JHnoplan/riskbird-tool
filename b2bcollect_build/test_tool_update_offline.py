@@ -1820,6 +1820,180 @@ def test_ci_selfreport_gate():
               not _v3, "豁免只能逐格点名；能随手扩表的那张表就是把门改成沉默")
 
 
+# ═════════════════⑲ 发布那头：直链复读与「写进去了 ≠ 发出去了」（build 71）
+class _FakeResp:
+    """够用的响应替身：被读的一面只用得到 status_code / headers / content。"""
+
+    def __init__(self, status=200, headers=None, body=b""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.content = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeHttp:
+    """替身 HTTP：把每一次 HEAD/GET/PUT 都记账，让「有没有重传」能被直接数出来。
+
+    为什么要把 PUT 也记下来：build 71 那一轮真正的代价不只是「报了一句错」，而是外面
+    那层重试把**已经写成功的 98MB** 又传了三遍。只看退出码与文案判不出这件事回归。
+    """
+
+    def __init__(self, head=None, head_status=200, range_status=206, content_range="",
+                 put_etag=None, body=b""):
+        self.head_headers = dict(head or {})
+        self.head_status = head_status
+        self.range_status = range_status
+        self.content_range = content_range
+        self.put_etag = put_etag
+        self.body = body
+        self.head_calls, self.get_calls, self.put_calls = [], [], []
+
+    def head(self, url, headers=None, timeout=None):
+        self.head_calls.append(headers or {})
+        return _FakeResp(self.head_status, dict(self.head_headers))
+
+    def get(self, url, headers=None, stream=False, timeout=None):
+        self.get_calls.append(headers or {})
+        if "Range" in (headers or {}):
+            h = {"Content-Range": self.content_range} if self.content_range else {}
+            return _FakeResp(self.range_status, h, self.body)
+        return _FakeResp(200, dict(self.head_headers), self.body)
+
+    def put(self, url, data=None, headers=None, timeout=None):
+        self.put_calls.append(headers or {})
+        h = {"ETag": '"%s"' % self.put_etag} if self.put_etag else {}
+        return _FakeResp(200, h)
+
+
+def _publish_fixture(tmp, content=b'{"schema":"release-v1"}'):
+    """造一份合法的发布对象（名字必须在白名单里，字节与 md5 由真代码算）。"""
+    path = Path(tmp) / "latest_windows.json"
+    path.write_bytes(content)
+    return path
+
+
+def test_publish_read_back():
+    print("\n═══ ⑲ 发布那头：直链复读（build 71 的 gzip 误判）═══")
+    mod = load_script("upload_release_to_oss.py")
+    _orig_requests, _orig_time = mod.requests, mod.time
+    slept = []
+    mod.time = type("T", (), {"sleep": staticmethod(lambda s: slept.append(s))})
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            path = _publish_fixture(td)
+            size = path.stat().st_size
+            md5 = mod._local_md5(str(path))
+            good_head = {"Content-Length": str(size), "Cache-Control": "no-cache",
+                         "ETag": '"%s"' % md5.upper()}
+
+            # ── 1) 今天的正常形状：HEAD 直接报长度，一次过 ──
+            http = _FakeHttp(head=good_head)
+            mod.requests = http
+            proof = mod._read_back("https://x/latest_windows.json", size, md5)
+            check("HEAD 报得出长度时一次过（取证文本带真实字节数）",
+                  "HEAD 报出 Content-Length" in proof and str(size) in proof, proof)
+            check("复读问的是未压缩的原件（Accept-Encoding: identity）",
+                  http.head_calls and http.head_calls[0].get("Accept-Encoding") == "identity",
+                  http.head_calls[:1])
+
+            # ── 2) build 71 现场：json 被边缘 gzip、HEAD 不给长度 ──
+            # 旧写法在这里比的是 `str(size) != ""` → 必红；而 OSS 对压不动的
+            # .exe/.zip 照常报长度，所以形状是「安装包全绿、发布清单必红」。
+            gz = {k: v for k, v in good_head.items() if k != "Content-Length"}
+            gz["Content-Encoding"] = "gzip"
+            http = _FakeHttp(head=gz, content_range="bytes 0-0/%d" % size)
+            mod.requests = http
+            proof = mod._read_back("https://x/latest_windows.json", size, md5)
+            check("问不出长度不等于内容坏了：用分段 GET 的 Content-Range 兜回来",
+                  "Content-Range" in proof and str(size) in proof, proof)
+            check("分段 GET 也只问原件（不拿压缩包算字节）",
+                  http.get_calls and http.get_calls[0].get("Accept-Encoding") == "identity",
+                  http.get_calls[:1])
+            # 中间层无视 Range（直接回 200 + 整份）时也要能量出字节，不能卡在「问不出长度」
+            http = _FakeHttp(head=gz, range_status=200, body=b"x" * size)
+            mod.requests = http
+            proof = mod._read_back("https://x/latest_windows.json", size, md5)
+            check("无视 Range（回 200 整份）时退到按实际字节量",
+                  "整份 GET" in proof and str(size) in proof, proof)
+            # 两条路都问不出答案，才轮到报错——而不是默默交一份「零问题」的答卷
+            mod.requests = _FakeHttp(head=gz, range_status=416)
+            try:
+                mod._read_back("https://x/latest_windows.json", size, md5)
+                check("两头都问不出字节数时必须响", False, "没拦下来")
+            except Exception as e:
+                check("两头都问不出字节数时必须响", "问不出字节数" in str(e), str(e))
+
+            # ── 3) 该响的一样不许哑 ──
+            for label, head, needle in (
+                    ("字节真不符必须响", {**good_head, "Content-Length": str(size + 1)}, "字节不符"),
+                    ("带了 Content-Encoding 就不许信这一轮字节", 
+                     {**good_head, "Content-Encoding": "gzip"}, "Content-Encoding"),
+                    ("Cache-Control 丢了必须响", 
+                     {k: v for k, v in good_head.items() if k != "Cache-Control"}, "Cache-Control"),
+                    ("ETag 与本地不是同一份必须响", 
+                     {**good_head, "ETag": '"' + "f" * 32 + '"'}, "不是同一份")):
+                mod.requests = _FakeHttp(head=head)
+                try:
+                    mod._read_back("https://x/latest_windows.json", size, md5)
+                    check(label, False, "没拦下来（静静放行了）")
+                except Exception as e:
+                    check(label, needle in str(e), str(e))
+            mod.requests = _FakeHttp(head={}, head_status=404)
+            try:
+                mod._read_back("https://x/latest_windows.json", size, md5)
+                check("直链 404 必须响", False, "没拦下来")
+            except Exception as e:
+                check("直链 404 必须响", "读不到" in str(e), str(e))
+
+            # ── 4) 昂贵行为：写成功的包不许因为复读抖动重传 ──
+            slept.clear()
+            mod.requests = _FakeHttp(head={}, head_status=500, put_etag=md5.upper())
+            try:
+                mod.upload_one(str(path), "ak", "sk")
+                check("复读全挂时整条链要红（不能默许发出去）", False, "居然返回成功")
+            except Exception as e:
+                check("复读全挂时整条链要红，且话说清是「上传成功但复读不过门」",
+                      "上传成功但复读不过门" in str(e), str(e))
+
+            http = _FakeHttp(head={}, head_status=500, put_etag=md5.upper())
+            mod.requests = http
+            try:
+                mod.upload_one(str(path), "ak", "sk")
+            except Exception:
+                pass
+            check("已经写成功的 98MB 只传一次（复读失败不算重传的理由）",
+                  len(http.put_calls) == 1, f"PUT 实际跑了 {len(http.put_calls)} 次")
+            check("复读自己有退避重试（不把一次抖动当结论）", len(slept) >= 3, slept[:6])
+
+            # 服务端回执就不是这一份：这时**才**该重传，不能只传一次就收工
+            http = _FakeHttp(head=good_head, put_etag="a" * 32)
+            mod.requests = http
+            try:
+                mod.upload_one(str(path), "ak", "sk")
+                check("OSS 回执 ETag 与本地 md5 不符时必须红", False, "居然成功了")
+            except Exception as e:
+                check("OSS 回执 ETag 与本地 md5 不符时必须红", "不是同一份" in str(e), str(e))
+            check("回执不对时才重传（三次都要试）", len(http.put_calls) == 3,
+                  f"PUT 实际跑了 {len(http.put_calls)} 次")
+
+            # ── 5) 全链走通：PUT → 复读 → 返回永久直链 ──
+            http = _FakeHttp(head=good_head, put_etag=md5.upper())
+            mod.requests = http
+            url = mod.upload_one(str(path), "ak", "sk")
+            check("写进去且复读得过就该安静放行（不靠重试堆成功）",
+                  url.endswith("/tool_releases/latest_windows.json") and len(http.put_calls) == 1,
+                  (url, len(http.put_calls)))
+            check("上传带了 Cache-Control: no-cache（覆盖更新不被旧缓存顶掉）",
+                  http.put_calls[0].get("Cache-Control") == "no-cache", http.put_calls[:1])
+    finally:
+        mod.requests, mod.time = _orig_requests, _orig_time
+
+
 def main():
     print("═══ tool_update 引擎层离线判据 ═══")
     test_platform()
@@ -1837,6 +2011,7 @@ def main():
     test_single_source()
     test_release_manifest()
     test_ci_selfreport_gate()
+    test_publish_read_back()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 1 if _FAIL else 0
 

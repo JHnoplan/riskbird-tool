@@ -27,7 +27,10 @@
 拿旧版本顶新链接（图床活码踩过同一坑：链接一样、下载到的还是旧包）。
 
 用法：python upload_release_to_oss.py <制品路径>...
-每份制品上传后用匿名 HEAD 校验（200 且大小与本地一致）才算成功；
+每份制品上传后过两道独立的复核才算发出去（口径见 _verify_published）：
+  1) 服务端回执：简单 PUT 的 ETag 就是内容的 MD5，与本地算出的对一次——这一问
+     回答的是「OSS 到底收下了什么」，不受任何中间层影响；
+  2) 匿名复读：公开读直链真能读到、字节数与本地一致、Cache-Control 带上了。
 任何一份不过门则整体退出码 1（CI 里就是这一步红，GitHub 制品已在上一
 步上传，不损失回退通道）。
 """
@@ -94,6 +97,72 @@ def _sign(ak_secret: str, key: str, content_type: str) -> tuple:
     return date, base64.b64encode(digest).decode("utf-8")
 
 
+def _local_md5(path: str) -> str:
+    """流式算本地 MD5（98MB 约 0.3s）：与服务端 ETag 对账用的就是它。"""
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_back(url: str, size: int, md5: str) -> str:
+    """匿名复读公开直链：读不到、字节数不符、Cache-Control 丢失都算不过门。
+
+    返回一句「凭什么算过了」的取证文本（打进日志，发版红时不用猜）。
+
+    为什么每一次复读都带 `Accept-Encoding: identity`（2026-11-19 build 71 的根因，本机已
+    可 100% 复现）：requests 默认发 `Accept-Encoding: gzip, deflate`，而 OSS 会对
+    `application/json` 真的做 gzip 传输编码——响应里只有 `Content-Encoding: gzip`、
+    **没有 Content-Length**；`.exe`/`.zip` 压不动，于是照旧带长度。旧写法拿
+    `str(size) != HEAD 的 Content-Length` 硬比，结果就是「安装包全绿、发布清单必红」，
+    而且红在外面那层重试里会把已经传成功的 98MB 再重传三遍。
+    两个事实必须分开：「问不出长度」是传输层编码问题，「长度不符」才是内容坏了。
+    这里用 identity 直接量**存储的真实字节**（与本地文件同一个口径，也是工具下载后要
+    校验的那个东西）；真遇上不肯报长度的中间层，再用一次 `Range: bytes=0-0` 的 GET 从
+    206 的 Content-Range 里问出总长（一个 1 字节的请求，不下整包）。
+    """
+    plain = {"Accept-Encoding": "identity"}
+    head = requests.head(url, headers=plain, timeout=30)
+    if head.status_code != 200:
+        raise RuntimeError(f"直链读不到：HEAD {head.status_code}")
+    remote = head.headers.get("Content-Length", "").strip()
+    encoded = str(head.headers.get("Content-Encoding", "")).strip().lower()
+    how = "HEAD 报出 Content-Length"
+    if not remote:
+        # 还是问不出长度：不等于内容不对，用一次极小的分段 GET 把真实总长问出来
+        with requests.get(url, headers={"Range": "bytes=0-0", **plain},
+                          stream=True, timeout=30) as part:
+            cr = part.headers.get("Content-Range", "")
+            if part.status_code == 206 and "/" in cr:
+                remote = cr.rsplit("/", 1)[-1].strip()
+                how = "分段 GET 的 Content-Range"
+            elif part.status_code == 200:
+                # 不支持 Range：整份读出来量字节（小文件才走到这里，清单就是这种）
+                remote = str(len(part.content))
+                how = "整份 GET 的字节数"
+            else:
+                raise RuntimeError(
+                    f"直链问不出字节数：HEAD 无 Content-Length，分段 GET 又回 "
+                    f"{part.status_code}（Content-Range {cr!r}）")
+    elif encoded not in ("", "identity"):
+        # 报了长度又说自己被传输层压过：那个长度是压缩包的大小，与本地文件不是
+        # 同一个口径。宁可不采信这一轮数字，也不拿一个对不上的值当「一致」。
+        raise RuntimeError(
+            f"HEAD 的 Content-Length 带着 Content-Encoding={encoded!r}："
+            "它量的是压缩后的字节，与本地文件不可比")
+    if str(size) != str(remote):
+        raise RuntimeError(f"直链字节不符：远端 {remote} 字节 / 本地 {size} 字节（{how}）")
+    cc = head.headers.get("Cache-Control", "")
+    if cc != "no-cache":
+        raise RuntimeError(
+            f"Cache-Control 没带上（实为 {cc!r}）：覆盖更新会被旧缓存顶掉")
+    etag = head.headers.get("ETag", "").strip('"').lower()
+    if etag and etag != md5:
+        raise RuntimeError(f"直链内容与服务端回执不是同一份：ETag {etag} != 本地 md5 {md5}")
+    return f"{how} 一致（{remote} 字节，ETag 对上）"
+
+
 def upload_one(path: str, ak_id: str, ak_secret: str) -> str:
     name = os.path.basename(path)
     if name not in ALLOWED_NAMES:
@@ -107,40 +176,51 @@ def upload_one(path: str, ak_id: str, ak_secret: str) -> str:
     url = f"https://{BUCKET}.{ENDPOINT}/{key}"
 
     last_err = None
+    md5 = _local_md5(path)
+    written = False          # 这一份是否已确认写进 OSS（ETag 对上）
     for attempt in (1, 2, 3):
         try:
-            date, sig = _sign(ak_secret, key, content_type)
-            with open(path, "rb") as fh:
-                resp = requests.put(
-                    url, data=fh,
-                    headers={
-                        "Date": date,
-                        "Content-Type": content_type,
-                        "Cache-Control": "no-cache",
-                        "Content-Length": str(size),
-                        "Authorization": f"OSS {ak_id}:{sig}",
-                    },
-                    timeout=(30, 1800))
-            if resp.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"HTTP {resp.status_code}: {resp.text[:200]}")
-            # 匿名 HEAD 复读：公开读直链真实可下载且字节一致才算发出去
-            head = requests.head(url, timeout=30)
-            remote = head.headers.get("Content-Length", "")
-            if head.status_code != 200 or str(size) != remote:
-                raise RuntimeError(
-                    f"直链校验不过：HEAD {head.status_code}，"
-                    f"远端 {remote} 字节 / 本地 {size} 字节")
-            cc = head.headers.get("Cache-Control", "")
-            if cc != "no-cache":
-                raise RuntimeError(
-                    f"Cache-Control 没带上（实为 {cc!r}）：覆盖更新会被旧缓存顶掉")
-            return url
+            if not written:
+                date, sig = _sign(ak_secret, key, content_type)
+                with open(path, "rb") as fh:
+                    resp = requests.put(
+                        url, data=fh,
+                        headers={
+                            "Date": date,
+                            "Content-Type": content_type,
+                            "Cache-Control": "no-cache",
+                            "Content-Length": str(size),
+                            "Authorization": f"OSS {ak_id}:{sig}",
+                        },
+                        timeout=(30, 1800))
+                if resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"HTTP {resp.status_code}: {resp.text[:200]}")
+                ack = resp.headers.get("ETag", "").strip('"').lower()
+                if ack and ack != md5:
+                    # 只有「服务端收下的就不是这一份」才值得重传；复读到的边缘答案
+                    # 不一致不算——那正是 build 71 重传三遍 98MB 的那条路。
+                    raise RuntimeError(
+                        f"OSS 回执 ETag {ack} 与本地 md5 {md5} 不是同一份")
+                written = True
+            # 写进去了 ≠ 发出去了：公开读直链要自己站得住。边缘一致性给几秒退避，
+            # 不拿它去重传一份已经写好的大文件。
+            for verify_try in (1, 2, 3, 4):
+                try:
+                    proof = _read_back(url, size, md5)
+                    print(f"   └─ 复读取证：{proof}")
+                    return url
+                except Exception as e:
+                    last_err = e
+                    if verify_try < 4:
+                        time.sleep(3 * verify_try)
+            raise RuntimeError(str(last_err))
         except Exception as e:
             last_err = e
             if attempt < 3:
                 time.sleep(5 * attempt)
-    raise RuntimeError(f"{name} 上传失败（3 次）：{last_err}")
+    raise RuntimeError(
+        f"{name} {'上传成功但复读不过门' if written else '上传'}失败（3 次）：{last_err}")
 
 
 def main(argv: list) -> int:
