@@ -392,6 +392,36 @@ jobs:
         echo "MAKENSIS=$MK" >> "$GITHUB_ENV"
         echo "NSIS_PINNED=$NSIS_VERSION" >> "$GITHUB_ENV"
 
+    - name: Provision VC++ redist (钉版本 + 校验 sha256)
+      # 需求 10「任何电脑都无需额外去解决这些问题」的另一半：安装时判出系统缺
+      # vcruntime140.dll 就当场静默补装。安装包里必须真带着它，本步骤在 makensis
+      # 编译之前把微软官方安装器取到 installer\deps\（nsi 里 !if /FileExists 判存在；
+      # 没有这个文件就编出「不带运行库」的包——那一版对纯小白等于没修，所以这一步
+      # 失败就是红，绝不静默出包）。
+      # 与上面 NSIS 同一套纪律：版本化 URL + sha256 钉死。aka.ms/latest 永远指最新版，
+      # 微软一换版字节就变——所以钉的是 download.visualstudio.microsoft.com 的
+      # 版本化地址（历史版本长期不删），哈希对不上就当场红。哈希取法沿用 NSIS 那条
+      # 教训：从标准输入喂 sha256sum，输出里没有文件名可转义，再只收 64 位十六进制。
+      shell: bash
+      env:
+        VC_REDIST_URL: "https://download.visualstudio.microsoft.com/download/pr/e9604e21-4b79-4096-a4b3-1b63d4b55b4d/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe"
+        VC_REDIST_SHA256: "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+      run: |
+        set -u
+        # 哈希取法的格式依据（出处＝SHA-256 的定义本身，不依赖 sha256sum 的行文话术）：
+        # 摘要就是 64 位十六进制，所以只收 64 位十六进制；从标准输入喂 sha256sum 是因为
+        # 输出里没有文件名可转义——GNU 工具在带反斜杠的文件名上会给整行加转义前缀，
+        # `awk '{print $1}'` 会拿到 \fcdce…：哈希没错，却和钉住的值对不上。
+        DEPS="$GITHUB_WORKSPACE/b2bcollect_build/installer/deps"
+        REDIST="$DEPS/VC_redist.x64.exe"
+        mkdir -p "$DEPS"
+        curl -sSLf --retry 3 --connect-timeout 20 --max-time 300 -o "$REDIST" "$VC_REDIST_URL" \
+          || { echo "::error::VC_redist.x64.exe 下载失败（微软官方 CDN 抖动，重跑一次；连红就是钉住的 URL 失效了，换新版本化 URL）"; exit 1; }
+        got=$(sha256sum < "$REDIST" | grep -oE "[0-9a-fA-F]{64}" | head -1 || true)
+        [ "$got" = "$VC_REDIST_SHA256" ] || {
+          echo "::error::VC_redist.x64.exe 的 sha256 与钉住的值不一致：期望 $VC_REDIST_SHA256 实际 ${got:-无}。多半是微软换版了——本机实拉一份重算哈希、连同新版本化 URL 一起重新钉上，绝不带着旧哈希放过新字节"; exit 1; }
+        echo "· VC++ 运行库：$(wc -c < "$REDIST") 字节，sha256 已校验 → installer/deps/"
+
     - name: Build Windows installer (NSIS, per-user)
       # 交付形态：目录形态的产物必须靠安装包落到用户机器上，否则「解压到哪都行」会
       # 变成「用户把文件夹删了一半」。这里按业界主流做法做成**每用户安装**：

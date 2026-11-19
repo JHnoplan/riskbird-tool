@@ -7510,8 +7510,11 @@ def test_curl_bounds_gate():
                "登记表里每一份含 curl 的脚本都要出现在扫描结果里：多一份少一份都是扫描口径"
                "和登记表分叉（第 10 条同族：抄两遍迟早分叉）")
     _assert(any("build-b2bcollect.yml" in k and "Provision NSIS" in k for k in texts),
-            "workflow 那一侧必须收进 NSIS 装工具那一步（云端唯一一处真下载，红过一整轮交付）；"
+            "workflow 那一侧必须收进 NSIS 装工具那一步（云端两处真下载之一，红过一整轮交付）；"
             "这里按步骤名认、不写行号——行号会随上面加删行漂移，漂移的期望就是下一次假红")
+    _assert(any("build-b2bcollect.yml" in k and "Provision VC++ redist" in k for k in texts),
+            "需求 10 之后云端的第二处真下载（VC++ redist provision）也必须在扫描视野里："
+            "缺了它，redist 那一路的 curl 就不在 20a/20b/20c 的判据之下")
     sites = sum(len(gate.curl_sites(t)) for t in texts.values())
     _assert(sites >= 4,
             f"这一条今天看到 {sites} 次 curl：下界只钉 4 次（四族脚本各至少一次），数出 0 次却报 ✅ "
@@ -7612,14 +7615,22 @@ def test_curl_bounds_gate():
                [], "放行：按块 Range 取")
     _got = _one('curl -sS -m 40 -o "$CACHE/a.zip" "$u"\n')
     _assert(any("既不续传" in x for x in _got), f"反向对照：既不续传、近处也没收口 → 红（实际={_got}）")
-    # 云端 NSIS 那一步走的是后者（有界 + 每轮换镜像重下并核哈希，没有 -C）：拿**真字节**钉住
+    # 云端 NSIS / VC++ redist 两步走的是后者（有界 + 就近核 sha256，没有 -C）：拿**真字节**钉住
     # 这条路合法，免得逼人为了消红去补一个用不上的 -C——没核过哈希的续传反而更危险。
     _wf = (_REPO / ".github" / "workflows" / "build-b2bcollect.yml").read_text(encoding="utf-8")
-    _nsis = [s for _, _, sh, s in gate.run_blocks_in_workflow(_wf) if sh == "bash" and "curl" in s]
-    _assert_eq(len(_nsis), 1, f"Windows workflow 里带 curl 的 bash 步应当只有一步（实际 {len(_nsis)} 步）")
-    _assert_eq(_one(_nsis[0]), [], "放行：NSIS 那一步真字节——有界 + 就近核 sha256，没有 -C")
-    _assert("--max-time" in _nsis[0] and "-C " not in _nsis[0],
-            "这一步确实是「有界但不续传」那一类（两个条件缺一个，上面那条放行就没在验这格）")
+    _curl_steps = [s for _, _, sh, s in gate.run_blocks_in_workflow(_wf) if sh == "bash" and "curl" in s]
+    # 登记制（与第 14 条 SHELL_SOURCES 同一纪律）：Windows workflow 里每一次真实网络取件
+    # 都要在这里在案。需求 10 之后是两步——NSIS provision 与 VC++ redist provision：
+    # 两个独立网络依赖各占一步，Actions 页面上失败才归因得开（合并进一步，挂了就分不清
+    # 是编译器还是运行库没取到）。多一步＝没登记的新下载步；少一步＝哪一步被顺手删了。
+    _assert_eq(len(_curl_steps), 2,
+               f"Windows workflow 里带 curl 的 bash 步按登记应当是两步（NSIS + VC++ redist provision），实际 {len(_curl_steps)} 步")
+    for _i, _s in enumerate(_curl_steps, 1):
+        _assert_eq(_one(_s), [], f"第 {_i} 步真字节：有界 + 就近核 sha256，没有 -C")
+        _assert("--max-time" in _s and "-C " not in _s,
+                f"第 {_i} 步确实是「有界但不续传」那一类（两个条件缺一个，上面那条放行就没在验这格）")
+        _assert("sha256" in _s,
+                f"第 {_i} 步必须就地核 sha256（下载进安装包的每一批字节都要当场对哈希）")
     _head = 'curl -sS -m 40 -o "$CACHE/a.zip" "$u"\n'
     _assert_eq(_one(_head + "".join(f"echo {i}\n" for i in range(38))
                    + 'sha256sum "$CACHE/a.zip"\n'), [],
@@ -11506,7 +11517,7 @@ def test_trap_handler_defined_gate():
 
 
 def test_package_weight_gate():
-    print("\n═══ AO. 产物重量门（第 40 条硬门）═══")
+    print("\n═══ BA. 产物重量门（第 40 条硬门）═══")
     # 需求 5「工具减重」的守卫。写这一节的理由和它拦的东西同族：上一轮 pandas 就是
     # 靠着「清单里写了一行 --hidden-import pandas」+「某个进包模块的 `if __name__` 里有一句
     # import pandas」两头一起混进产物的，而当时 39 条硬门全绿——因为 import 对拍那只扫
@@ -11614,6 +11625,152 @@ def test_package_weight_gate():
                 "路径给错时必须开口，不能默默交一份「零问题」的答卷（产物不在就别宣布减重成功）")
 
 
+def test_installer_env_gate():
+    print("\n═══ BB. 安装器运行环境体检门（需求 10）═══")
+    # 需求 10「任何电脑都无需额外去解决这些问题」的守卫。安装器是一段本机编译不了
+    # 的脚本（makensis 只在 Windows CI 上跑），判据只能钉在文本结构上——但钉什么
+    # 有讲究：钉「这行字存在」拦不住写反，钉「执行顺序与参数顺序」才拦得住。本轮
+    # 自己就写反过一次 IntCmp 的三个跳转（相等→老系统），后果是全量 Win10 用户被
+    # 当成老系统拦下，而本机怎么试都绿——所以这一节对那行参数逐字钉死，不只钉存在。
+    nsi = _REPO / "b2bcollect_build" / "installer" / "b2bcollect_setup.nsi"
+    _real = nsi.read_text(encoding="utf-8-sig")
+    _gi = (_REPO / ".gitignore").read_text(encoding="utf-8")
+
+    def _code_lines(text):
+        # 判据剔掉整行注释再判：解释纪律的那行注释里写着旧写法（把「为什么不能这样
+        # 写」判成「这样写了」的门，第 31 条同族教训）。
+        return [(n, ln.strip()) for n, ln in enumerate(text.splitlines(), 1)
+                if ln.strip() and not ln.lstrip().startswith((";", "#"))]
+
+    def _problems(text, gi):
+        got = []
+        code = _code_lines(text)
+        strs = [s for _n, s in code]
+
+        # 0) .onInit 恰好一个：0 个＝体检从没跑过；2 个＝makensis 直接编不过，
+        #    那句报错只在云端看得见，离线先把它说成人话。
+        oi = [i for i, s in enumerate(strs) if s.startswith("Function .onInit")]
+        if len(oi) != 1:
+            got.append(f".onInit 应该恰好一个（实际 {len(oi)} 个）：0 个＝体检从没跑过，"
+                       "2 个＝makensis 编不过，红话只能等云端编译器给")
+            return got
+        oi = oi[0]
+        fe = next((i for i in range(oi + 1, len(strs)) if strs[i] == "FunctionEnd"), None)
+        if fe is None:
+            got.append(".onInit 没有配对的 FunctionEnd")
+            return got
+        body = code[oi + 1:fe]
+
+        # 1) 判据链的执行顺序：切 64 位视图 → 清 flag → 读系统版本 → 立刻判 flag。
+        #    IfErrors 夹在别的注册表读取后面就作废（flag 被顶掉），顺序本身是判据。
+        seq = ["SetRegView 64", "ClearErrors", "ReadRegDWORD $R0", "IfErrors envchk_old"]
+        pos = []
+        for needle in seq:
+            i = next((j for j, (_n, s) in enumerate(body) if s.startswith(needle)), None)
+            if i is None:
+                got.append(f".onInit 里找不到「{needle}」这句：体检链断了，"
+                           "Win7/8 会漏拦或 Win10 会误拦")
+            pos.append(i)
+        if None not in pos and pos != sorted(pos):
+            got.append(f"体检链顺序不对（{' → '.join(seq)} 必须按这个次序执行）："
+                       "IfErrors 不紧跟在读版本那一句后面，error flag 就被中间那句读取顶掉，"
+                       "老系统判据作废")
+        # 2) IntCmp 逐字钉：三个跳转依次「相等/小于/大于」，major=10 的 Win10 是相等。
+        ic = next((s for _n, s in body if s.startswith("IntCmp $R0")), None)
+        if ic != "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok":
+            got.append(f"IntCmp 参数顺序必须逐字是「相等→envchk_ok 小于→envchk_old 大于→envchk_ok」，"
+                       f"实际：{ic}——相等那一格写反，major=10 的正常 Win10 会被当成老系统拦下")
+        # 3) 空串兜底 + 先记日志再下结论
+        if not any(s.startswith('StrCmp $R0 "" envchk_old') for _n, s in body):
+            got.append("IntCmp 前没有「空串也按老系统拦」的兜底：flag 之外的失败表示法"
+                       "（不同 NSIS 版本口径有差异）会让判据漏空")
+        first_log = next((j for j, (_n, s) in enumerate(body) if s.startswith("Call EnvLog")), None)
+        verdict = next((j for j, (_n, s) in enumerate(body) if s.startswith("IntCmp")), None)
+        if first_log is None or verdict is None or first_log > verdict:
+            got.append("体检日志要写在结论之前（第一条 Call EnvLog 必须在 IntCmp 之前）："
+                       "日志里没有这台机器的底细，「下次装不动问一句是什么系统」就问不出来")
+        # 4) 视图还原：64 位视图不许带出 .onInit
+        if not any(s == "SetRegView default" for _n, s in body):
+            got.append(".onInit 结尾没有 SetRegView default：64 位视图会带进安装段，"
+                       "连坐后面所有注册表写入")
+        # 5) 老系统分支：静默不弹窗 + 文案给出的兼容包名不许烂尾
+        om = next((j for j, (_n, s) in enumerate(body)
+                   if s == 'MessageBox MB_OK|MB_ICONSTOP "$R6"'), None)
+        isl = next((j for j, (_n, s) in enumerate(body)
+                    if s.startswith("IfSilent envchk_old_abort")), None)
+        if om is not None and (isl is None or isl > om):
+            got.append("老系统分支里 IfSilent 必须排在 MessageBox 之前：静默安装（运维推送 /S）"
+                       "里没人能点那个「确定」，安装进程会一直挂到被超时杀掉")
+        if "B2bCollectToolSetup_Win7.exe" not in text:
+            got.append("老系统文案里没有兼容版包名（B2bCollectToolSetup_Win7.exe）："
+                       "给用户的出路要么兑现要么删掉，不许留一句指向不存在的东西的话")
+        # 6) redist：在安装段里，InitPluginsDir 先于 $PLUGINSDIR，双目录判据都在
+        sec = [i for i, s in enumerate(strs) if s.startswith("Section ") and "Uninstall" not in s]
+        if not sec:
+            got.append('找不到安装段（Section "主程序"）：redist 补装没有归属')
+        else:
+            s0 = sec[0]
+            se = next((i for i in range(s0 + 1, len(strs)) if strs[i] == "SectionEnd"), None)
+            sbody = code[s0 + 1:se]
+            ipd = next((j for j, (_n, s) in enumerate(sbody) if s == "InitPluginsDir"), None)
+            pusd = next((j for j, (_n, s) in enumerate(sbody)
+                         if "$PLUGINSDIR" in s and s != "InitPluginsDir"), None)
+            if pusd is not None and (ipd is None or ipd > pusd):
+                got.append("InitPluginsDir 必须先于 $PLUGINSDIR 的第一次使用：没有它那个目录"
+                           "还不存在，运行库会被 File 解到一个名字就叫「$PLUGINSDIR」的真实目录里去")
+            for probe in ("$SYSDIR\\vcruntime140.dll", "$WINDIR\\Sysnative\\vcruntime140.dll"):
+                if not any(probe in s for _n, s in sbody):
+                    got.append(f"安装段里没有「{probe}」这条存在性判据：64 位 Windows 的系统目录得从 "
+                               "Sysnative 问（$SYSDIR 在 32 位安装包里指 SysWOW64）——少这一问，"
+                               "缺运行库的机器就会装出双击报错的产物")
+            ex = next((j for j, (_n, s) in enumerate(sbody) if s.startswith("nsExec::ExecToLog")), None)
+            pp = next((j for j, (_n, s) in enumerate(sbody) if s.startswith("Pop $")), None)
+            if ex is not None and (pp is None or pp != ex + 1):
+                got.append("nsExec::ExecToLog 的下一行必须是 Pop：退出码不收走就记不进体检日志，"
+                           "装成没成只剩一句人话")
+        # 7) 编译期开关：包内自带由 !if /FileExists 决定，缺文件走降级而不是编不过
+        if "!if /FileExists" not in text:
+            got.append("没有 !if /FileExists 的编译期开关：本机手工编译没下运行库时 makensis "
+                       "直接编不过，降级分支（记日志继续装）就丢了")
+        # 8) 25MB 的官方二进制不许入库：CI 现取，.gitignore 必须挡住整个 deps 目录
+        if "b2bcollect_build/installer/deps/" not in gi:
+            got.append(".gitignore 没有挡 b2bcollect_build/installer/deps/：25MB 的微软运行库"
+                       "一旦被谁 git add 进来，clone 从此大 25MB，微软换版还要跟二进制 diff 斗")
+        return got
+
+    _assert_eq(_problems(_real, _gi), [],
+               "今天的安装器体检齐全：判据链、视图还原、静默分支、redist 窗口都在位")
+    # 反向对照：改一个与体检无关的字段不许响——这一节拦的是结构漂移，不是「文件被改过」。
+    _assert_eq(_problems(_real.replace('APP_VERSION "0.0"', 'APP_VERSION "0.1"', 1), _gi), [],
+               "改一个与体检无关的字段不许响（误报的门会被当噪音关掉）")
+
+    # ── 变异复验：每一路都必须被杀红，且红话要点名当初的代价 ──
+    _muts = (
+        ("IntCmp 顺序写反",
+         "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok",
+         "IntCmp $R0 ${MIN_WIN_MAJOR} envchk_old envchk_ok envchk_ok",
+         "major=10 的正常 Win10 会被当成老系统拦下"),
+        ("IfErrors 判据丢失", "    IfErrors envchk_old 0\n", "",
+         "体检链断了"),
+        ("InitPluginsDir 删掉", "    InitPluginsDir\n", "",
+         "名字就叫「$PLUGINSDIR」的真实目录"),
+        ("SetRegView default 删掉", "    SetRegView default\n", "",
+         "64 位视图会带进安装段"),
+        ("静默分支删掉", "    IfSilent envchk_old_abort 0\n", "",
+         "安装进程会一直挂到被超时杀掉"),
+        ("Sysnative 判据删掉",
+         '    IfFileExists "$WINDIR\\Sysnative\\vcruntime140.dll" redist_done 0\n', "",
+         "缺运行库的机器就会装出双击报错的产物"),
+    )
+    for label, old, new, needle in _muts:
+        _mut = _real.replace(old, new, 1)
+        _assert(_mut != _real, f"变异「{label}」没有真的改变文本（锚点没对上，变异等于空跑）")
+        _got = _problems(_mut, _gi)
+        _assert(_got, f"变异「{label}」必须被杀红（现在全绿＝这一路判据没有牙）")
+        _assert(any(needle in g for g in _got),
+                f"变异「{label}」的红话要点名代价「{needle}」（实际={_got[:1]}）")
+
+
 # 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
 # NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
@@ -11639,6 +11796,7 @@ SECTIONS = (
     test_qt_shutdown_teardown_gate,
     test_state_file_protection_gate,
     test_package_weight_gate,
+    test_installer_env_gate,
     test_suite_exit_code_guard_gate,
     test_regression_suites_tracked_gate,
     test_no_dev_machine_paths_gate,

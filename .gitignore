@@ -128,3 +128,8 @@ chromedriver
 chromedriver.exe
 chromedriver*.zip
 chromedriver-*/
+# 安装包内自带的微软 VC++ 运行库（需求 10）：约 25MB 的官方安装器二进制，由 CI 在
+# 编译 NSIS 前现取（URL 与 sha256 钉死在 build-b2bcollect.yml），本机手工编译没下它
+# 也不拦（nsi 里 !if /FileExists 走降级分支）。入库只会让 clone 大 25MB，微软换版
+# 还要跟二进制 diff 斗，所以整个 deps 目录挡掉。
+b2bcollect_build/installer/deps/

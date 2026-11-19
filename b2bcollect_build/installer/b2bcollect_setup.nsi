@@ -96,6 +96,114 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "内部工具"
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
+; ── 运行环境体检与自动补齐（需求 10）─────────────────────────────────────
+; 由来：2026-11-19 给一台纯小白的电脑装工具，装完双击只得到两句系统错误：
+;   · 「无法启动此程序，因为计算机中丢失 api-ms-win-core-path-l1-1-0.dll」
+;   · 「Failed to load Python DLL …\_internal\python311.dll。LoadLibrary: 找不到指定的模块」
+; 两句是同一个根因：那个系统组件从 Windows 10 才存在，而产物是 Python 3.11 打的
+; （Python 3.9 起就要求 Win10+）。这条界限决定了本体检的两半：
+;   · **能自动补的就当场补**，不让用户去找东西装——微软 VC++ 运行库就是这一类，
+;     包内自带、只在系统里确实没有时才静默装（用户拍板的口径）；
+;   · **补不了的要在装之前就说清楚**：操作系统没有的 api set 不是安装步骤能补的，
+;     硬装上去只会得到一个双击就报英文错误的桌面图标。这里宁可 Abort，也不留那样一个图标。
+; 以前这一格是空的：本文件从头到尾没查过系统版本、没查过运行库、没留过一行日志，
+; 所以远程排障只能靠用户拍照——本轮那两张照片才认出是 Win7，代价是一整台机器白装。
+; 现在不管合格不合格都先写 install_check.log：下一次问一句「你装的那台是什么系统」
+; 就能直接读出来，不必再猜。
+!define MIN_WIN_MAJOR 10
+!define WIN_NT_KEY "SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+; 体检日志落在**包外**（与安装目录同级但不由安装程序删）：卸载工具时这段历史还得留着，
+; 而「下一次也报过同样的错」这条线索只有历史能给。
+!define CHECK_LOG "$LOCALAPPDATA\B2bCollectTool\install_check.log"
+; 包内自带的微软运行库。CI 把它下到 installer\deps\ 里；本机手工打包没下也不拦，
+; 走下面 !if /FileExists 那条降级分支（工具自己带 app-local 运行库，缺它通常照样能跑）。
+!define VCREDIST_FILE "installer\deps\VC_redist.x64.exe"
+!if /FileExists "${VCREDIST_FILE}"
+  !define HAS_VCREDIST
+!endif
+
+Function EnvLog
+    ; 调用约定：$R9 是要记的那一句话。追加写，不覆盖（理由见上面 CHECK_LOG 的注释）。
+    ; 写不进去不拦安装：日志是给人看的证据，不是功能开关，为它中止安装是本末倒置。
+    CreateDirectory "$LOCALAPPDATA\B2bCollectTool"
+    ClearErrors
+    FileOpen $9 "${CHECK_LOG}" a
+    IfErrors envlog_done
+    FileSeek $9 0 END
+    FileWrite $9 "v${APP_VERSION} | $R9$\r$\n"
+    FileClose $9
+envlog_done:
+FunctionEnd
+
+Function .onInit
+    ; 64 位注册表视图：安装包是 32 位的，默认读到的是 WOW6432Node 那一套，而
+    ; Windows NT\CurrentVersion 的原生数据在 64 位视图里。读完在下面 envchk_ok 里
+    ; 还原——安装段里还有 HKCU 的卸载登记，别让这里的视图选择连坐到它们。
+    SetRegView 64
+    ClearErrors
+    ReadRegDWORD $R0 HKLM "${WIN_NT_KEY}" "CurrentMajorVersionNumber"
+    ; 这个值从 Windows 10 才存在：Win7/8/8.1 上根本没有它，**读不到本身就是系统版本
+    ; 信号**。判据走 error flag 而不是比对某个失败字面量——flag 是唯一稳定的表示法。
+    ; IfErrors 必须紧跟在这一句后面：中间再夹任何一句注册表读取，flag 就被顶掉了。
+    IfErrors envchk_old 0
+    ReadRegStr $R1 HKLM "${WIN_NT_KEY}" "CurrentBuildNumber"
+    ReadRegStr $R2 HKLM "${WIN_NT_KEY}" "ProductName"
+    ReadRegStr $R3 HKLM "${WIN_NT_KEY}" "CurrentVersion"
+    ReadRegStr $R5 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "PROCESSOR_ARCHITECTURE"
+    StrCpy $R4 "图形"
+    IfSilent 0 +2
+    StrCpy $R4 "静默"
+    ; 这一行不能直接写 ${HAS_VCREDIST}：那个宏只在包内真带了 redist 时才 !define，
+    ; 没带的时候 makensis 会因「未定义的宏」不给编——一个日志字段不该有这种权力。
+    StrCpy $R8 "没带"
+!ifdef HAS_VCREDIST
+    StrCpy $R8 "带了"
+!endif
+
+    StrCpy $R9 "体检：major=$R0 build=$R1 cur=$R3 product=$R2 arch=$R5 方式=$R4 运行库=$R8"
+    Call EnvLog
+
+    ; 先记日志、再下结论——这个顺序本身就是判据（离线门会钉）：日志里没有这台机器的
+    ; 底细，「下次装不动再问一句是什么系统」就问不出来。这里再兜一层 flag 之外的失败
+    ; 表示法（空串不是任何真实 major，同样按老系统拦）。
+    StrCmp $R0 "" envchk_old 0
+    ; IntCmp 的三个跳转依次是「相等 / 小于 / 大于」：major=10 的 Win10 是**相等**，
+    ; 必须落到 envchk_ok。参数顺序由 test_installer_env_gate 逐字钉住——写反一次的
+    ; 代价是全量 Win10 用户被当成老系统拦下，而本机怎么试都试不出来（本机是 Mac，
+    ; makensis 只在云端跑）。
+    IntCmp $R0 ${MIN_WIN_MAJOR} envchk_ok envchk_old envchk_ok
+
+envchk_old:
+    ; 老系统：把「为什么装了也打不开」讲完再中止。文案逐句 StrCpy 拼进寄存器，
+    ; 不用行尾续行（makensis 会把续行后的引号串当成额外参数，弹窗就只剩第一句）。
+    StrCpy $R6 "这台电脑的系统版本低于 Windows 10（$R2，版本 $R3，内部版 $R1）。$\n$\n"
+    StrCpy $R6 "$R6本工具的运行环境要求 Windows 10 或更高：程序用的 Python 运行时从 Windows 10 起才有那个系统组件，$\n"
+    StrCpy $R6 "$R6缺的那几个文件不是安装步骤能补上的，所以这里没有继续安装——装完也只会得到一个双击就报错的图标。$\n$\n"
+    StrCpy $R6 "$R6两条出路：$\n"
+    StrCpy $R6 "$R6   · 换一台 Windows 10/11 的电脑运行这个安装包；$\n"
+    StrCpy $R6 "$R6   · 向管理员索取「兼容版安装包」（文件名 B2bCollectToolSetup_Win7.exe），它是专为老系统打的那一版。$\n$\n"
+    StrCpy $R6 "$R6本次没有写入任何文件，你的登录状态与采集数据都没有被动过。$\n"
+    StrCpy $R6 "$R6详细信息已记进：${CHECK_LOG}"
+    StrCpy $R9 "结论：环境不合格（$R2 / $R3 build $R1），本次安装已拦下"
+    Call EnvLog
+    ; 静默安装（运维推送 /S）里 MessageBox 照样会弹并等人点：没人看得见那个窗口，
+    ; 安装进程就一直挂到被超时杀掉，日志里只剩一句「安装没结束」。所以静默只写日志。
+    IfSilent envchk_old_abort 0
+    MessageBox MB_OK|MB_ICONSTOP "$R6"
+envchk_old_abort:
+    Abort "这台电脑的系统低于 Windows 10，本工具需要 Windows 10 及以上；本次安装已拦下（详情见 ${CHECK_LOG}）"
+
+envchk_ok:
+    ; 系统版本合格。VC++ 运行库的补装在主程序安装段里（「整批拷贝之后、拷完校验之前」
+    ; 那一段）：.onInit 跑在欢迎页**之前**，把一个可能要半分钟的静默子安装器放在那里，
+    ; 用户面对的就是一个「双击之后毫无动静」的窗口——足够让小白认定卡死然后杀进程。
+    ; 安装段里有进度条与 DetailPrint，看得见正在做什么。
+    StrCpy $R9 "体检通过（major=$R0 build=$R1），继续安装"
+    Call EnvLog
+    ; 视图还原：开头为读系统版本切到 64 位，这里交还给安装包位数的默认视图，
+    ; 不把这次切换带进后面的安装段（安装段里还有 HKCU 的卸载登记）。
+    SetRegView default
+FunctionEnd
 
 ; ── 安装 ──────────────────────────────────────────────────────────────────
 Section "主程序" SEC_APP
@@ -150,6 +258,42 @@ Section "主程序" SEC_APP
     ; 使用说明进安装目录（完成页有勾选框直接打开；产物 zip 里也带同一份，
     ; 由 .github/scripts/package_win_artifacts.py 放进去，两处只有一份源文件）。
     File /oname=使用说明.txt "installer\usage_guide.txt"
+
+    ; ── 微软 VC++ 运行库：缺了才装（需求 10，用户拍板「包内自带、缺了才装」）────
+    ; 判据问的是「这台机器上有没有 vcruntime140.dll」而不是「我们带没带」：产物里本来
+    ; 就有 app-local 那份（PyInstaller 放进 _internal），这一步是给「系统里干净、又恰好
+    ; 需要系统级那份」的机器补位。$SYSDIR 在 32 位安装包里指 SysWOW64，所以 64 位那份
+    ; 要另问 $WINDIR\Sysnative（这个虚拟目录只在 64 位 Windows 上存在；32 位系统上
+    ; 两问合一——32 位系统的系统目录本来就只有一份）。
+    ; 位置有讲究，不是随手放的：package_win_artifacts 的安装段判据要求所有 File 都排在
+    ; 逐条校验之前、而运行时目录的递归删除又必须排在所有 File 之前——所以这一段只能
+    ; 插在「整批拷贝之后、拷完校验之前」这唯一允许的窗口里。语义上有次序代价，说清楚
+    ; 不算亏：运行库装完之后万一校验拦下（关键文件没装全），系统里已经多了一份 VC++
+    ; 运行库——它是微软的标准系统组件，多装不伤任何软件；为次序好看把解压挪出安装段
+    ; 的方案反而更绕，不值。
+    IfFileExists "$SYSDIR\vcruntime140.dll" redist_done 0
+    IfFileExists "$WINDIR\Sysnative\vcruntime140.dll" redist_done 0
+    DetailPrint "系统里没有 VC++ 运行库，正在补装（微软官方安装包，静默进行，不会重启电脑）……"
+!ifdef HAS_VCREDIST
+    ; 解到 $PLUGINSDIR（安装结束由 NSIS 回收），不进安装目录：它是安装器的工具，不是
+    ; 交付物；留在安装目录里下一次升级还得跟它斗一句「同名覆盖」。InitPluginsDir 必须
+    ; 先于 $PLUGINSDIR 的第一次使用——没有它这个目录还不存在，25MB 的运行库会被 File
+    ; 解到一个名字就叫「$PLUGINSDIR」的真实子目录里去，而 nsExec 找不到 exe。
+    InitPluginsDir
+    SetOutPath "$PLUGINSDIR"
+    File "${VCREDIST_FILE}"
+    ; /quiet /norestart：全程不问人、不自己重启机器。ExecToLog 把它的输出接进安装日志，
+    ; 退出码 Pop 出来记进体检日志：0=刚装好、1638=已有同版或更新版（等于已装好）、
+    ; 3010=装好了要重启才生效——其余才是真失败；失败也不拦安装（app-local 兜底）。
+    nsExec::ExecToLog '"$PLUGINSDIR\VC_redist.x64.exe" /install /quiet /norestart'
+    Pop $7
+    StrCpy $R9 "VC++ 运行库补装退出码 $7（0=刚装好 1638=已有同版或更新版 3010=装好待重启）"
+    Call EnvLog
+!else
+    StrCpy $R9 "安装包内没带 VC_redist.x64.exe（手工打包常见）：程序自带 app-local 运行库照常能用，真缺再让用户联网装"
+    Call EnvLog
+!endif
+    redist_done:
 
     ; ── 拷完回头验一遍：装进机器的那份，必须真是打包时那份关键文件 ──────────
     ; 为什么这一段不能省（两种失败都不报错，而且都只有用户那边看得见）：
