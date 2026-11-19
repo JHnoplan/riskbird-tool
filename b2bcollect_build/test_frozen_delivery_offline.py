@@ -198,6 +198,10 @@ import tool_config as tc                                       # noqa: E402
 import oss_pool_client as oss                                  # noqa: E402
 import text_shape                                              # noqa: E402  第 30 条把手真源
 import deepseek_expander as dse                                # noqa: E402
+# 版本算法真源。这一段的对拍要拿它自己算出的期望值去比「假编译器实收的那一格」，比的
+# 不是算法本身（算法归 test_tool_version 那套判据），比的是**管道**：shell 有没有把模块
+# 给的那一格原样递下去，还是半路又自己拼了一份同样的数字。
+import tool_version as tv                                      # noqa: E402
 from access_guard import AccessGuard                           # noqa: E402
 from oss_pool_client import (OSSPoolError, OSSCredentialError,    # noqa: E402
                              OSSTransportError)
@@ -1158,11 +1162,26 @@ def test_delivery_chain():
     for label, pattern in (("--hidden-import", _HIDDEN_RE), ("--collect-*", _COLLECT_RE)):
         _assert_eq(_cli_values(local, pattern), _cli_values(mac, pattern),
                    f"本机脚本与 Mac workflow 的 {label} 清单一致")
-    ci_data = {v for v in _cli_values(mac, _ADD_DATA_RE) if "chromedriver" not in v}
+    # version.json 是这一格里唯一**该不同**的项，理由与驱动那条同样硬：构建号只能来自
+    # CI 计数器（github.run_number）。本机构造若要注一份戳就得自己编一个号，而那个号
+    # 会与某次真实 CI 构建同号却不是同一份代码——冒名。后果不是难看：更新提示按它比
+    # 大小、「这版先不提示」的免打扰按它记账，两处都会串到别人的档上。所以本机产物按
+    # 设计自报「版本未能确认」（tool_version.UNKNOWN_BUILD），打包清单硬门里那条
+    # CI_ONLY_DATA 记的是同一个判断。两处必须同时成立，所以两边都要反着钉：只把集合
+    # 放宽的话，日后真有人在 Mac workflow 里漏注这一格，这条门也跟着一起绿。
+    ci_data = {v for v in _cli_values(mac, _ADD_DATA_RE)
+               if "chromedriver" not in v and not v.startswith("version.json")}
     local_data = {v for v in _cli_values(local, _ADD_DATA_RE)
                   if "chromedriver" not in v and "$DRIVER" not in v}
     _assert_eq(local_data, ci_data,
-               "本机脚本与 Mac workflow 的 --add-data 清单一致（驱动按架构各取所需）")
+               "本机脚本与 Mac workflow 的 --add-data 清单一致（驱动按架构各取所需，"
+               "构建戳只由 CI 注入）")
+    _assert(not any("version.json" in v for v in _cli_values(local, _ADD_DATA_RE)),
+            "本机脚本不许注入 version.json：本地包自报「版本未能确认」是有理由的设计，"
+            "不是漏了同步（理由见上一段；与硬门的 CI_ONLY_DATA 同一条判断）")
+    _assert(any(v.startswith("version.json") for v in _cli_values(mac, _ADD_DATA_RE)),
+            "反过来，Mac workflow 必须注入 version.json：CI 少注这一格就是产物说不出自己"
+            "是哪一版，这句不能跟着本机的豁免一起放宽")
     _assert(any("chromedriver" in v for v in _cli_values(mac, _ADD_DATA_RE))
             and "$DRIVER" in local,
             "两边都带内置驱动：CI 写死 arm64 路径，本机按架构探测")
@@ -2937,8 +2956,15 @@ def test_workflow_shell_syntax():
             f"从真 workflow 切出来的 bash 字节非空（切空了下面两条就是空的；实得 {len(_win_exe)} 字符）")
     _assert("${APP_VERSION:-（空）" not in _win_exe,
             "要执行的脚本里没有 ${VAR:-中文} 这种把非 ASCII 写进参数展开的写法")
-    _assert("AV_SHOW=" in _win_exe and 'VER4="1.$((APP_VERSION / 65536))' in _win_exe,
-            "版本号那一段（空值兜底 + 两个 16 位字段）仍在案——修语法不是把判据删掉")
+    # 版本号那一段的「在案」现在长这样：两格都问 tool_version，而且**不许**再出现 shell
+    # 自己拆 16 位的算式。后半句必须显式判「不在」：只判前一句在的话，有人把老算式加回来
+    # 当兜底（两份实现同时在场、哪天算出两个数）这条门照样是绿的，而本轮拆掉的就是它。
+    _assert("DV_SHOW=" in _win_exe
+            and "--print-field display" in _win_exe
+            and "--print-field product" in _win_exe
+            and "$((APP_VERSION" not in _win_exe,
+            "版本号那一段（问 tool_version 拿两格 + 展示用的空值兜底）仍在案，且 shell 不再"
+            "自己拆 16 位字段——修语法不是把判据删掉，也不是把老算式留在原地当兜底")
     # 登记表本身也要在案：新增 workflow 忘了登记=那条流水线的 shell 没人判，
     # 而磁盘上明明有文件，看上去像「都验过了」。
     _wf_on_disk = {p.relative_to(_REPO).as_posix()
@@ -3556,7 +3582,7 @@ def test_workflow_shell_syntax():
 
     def _run_installer_gate(banner: str, stub_rc: int, pinned: str = "3.10",
                             pipefail: bool = True, crlf: bool = False,
-                            app_version: str = "999", script: str = "",
+                            stamp_build: str = "999", script: str = "",
                             binary: bool = False, bad_temp: bool = False):
         """在临时目录里真跑一遍安装步骤的版本判据，返回 (退出码, 合并后的输出)。
 
@@ -3576,15 +3602,44 @@ def test_workflow_shell_syntax():
         这个形状）。取码只看 $? 时这一路会红成「makensis 编译失败」，而编译器明明没坏。
         路径挂在本次的临时目录下（不是系统 /tmp 里一个固定名）：并发批跑时别人碰不到它，
         「这次到底写没写成」只由本次夹具决定。
+        stamp_build 是**随包构建戳里的那个构建号**，不是环境变量：本轮把版本号那一段从
+        「shell 自己拆 16 位字段」改成「问 tool_version --print-field」以后，这一步真正
+        的输入就只剩 tempdir 里那一份 version.json。所以夹具在这里得自己摆好三样东西——
+        模块本体（`stamp_file()` 源码态是按 `__file__` 所在目录找戳的，只 cd 过去不搬模块
+        就拿不到戳，那种红会假装成「上一步没写戳」）、戳本身、以及一个把 `python` 递进
+        PATH 的转发脚本（CI 那台 runner 上 python 在 PATH 里，判据不许赌镜像上有什么，
+        所以这一格由夹具自己给）。stamp_build=None 表示「上一步压根没写出戳」，那是本轮
+        新增的一味反例，形状与「戳里是个非数字」不同：前者连文件都不存在。
+        APP_VERSION 仍然传，但它现在只剩 legacy 那一句反例在用（本轮那种三段拼法）。正例
+        一律不再读它——「正例还吃得下 APP_VERSION」就意味着 shell 还在自己拼版本号，而那
+        正是本轮要拆掉的第二份实现（上一条文本判据同时判了它不在场，这里判它在场时只
+        服务于反例，两头合起来才封得住）。
         """
         root = Path(tempfile.mkdtemp(prefix="b2b_nsis_gate_"))
         try:
+            shutil.copy(_REPO / "b2bcollect_build" / "tool_version.py", root)
+            if stamp_build is not None:
+                # 原样写进去，不经 json.dumps 之前不洗值：CI 那一步也是这么把 run_number
+                # 的字节直接递过去的，像不像数、带不带引号都由 tool_version 自己判。
+                (root / "version.json").write_text('{"build": "%s"}' % stamp_build,
+                                                   encoding="utf-8")
+            py = root / "python"
+            py.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            py.chmod(0o755)
             stub = root / "makensis"
             eol = r"\r\n" if crlf else r"\n"
             head = 'printf "\\200\\377\\n"\n' if binary else ""
             head += (f'printf "{banner}{eol}"\n' if banner
                      else "echo 'Processing config: installer/b2bcollect_setup.nsi'\n")
             stub.write_text("#!/bin/sh\n"
+                            # 先把它**实际收到**的两格 /D 值原样念回来，再按真编译器口径判
+                            # 格式：顺序反过来就只剩「被拒了，但收下的是什么」这种问不出口的
+                            # 证据，而下面那组正例要的恰恰是「模块算出的那一格 == 编译器吃下
+                            # 的那一格」。
+                            'for a in "$@"; do case "$a" in /DVER4=*) '
+                            'echo "STUB-VER4=${a#/DVER4=}";; '
+                            '/DAPP_VERSION=*) echo "STUB-APPV=${a#/DAPP_VERSION=}";; '
+                            'esac; done\n'
                             # 与真实 makensis 同口径：VIProductVersion 必须是四段数字
                             'for a in "$@"; do case "$a" in /DVER4=*) '
                             'v=${a#/DVER4=}; '
@@ -3598,7 +3653,12 @@ def test_workflow_shell_syntax():
             stub.chmod(0o755)
             env = dict(os.environ, MAKENSIS=str(stub), NSIS_PINNED=pinned,
                        RUNNER_TEMP=(str(root / "nope") if bad_temp else str(root)),
-                       APP_VERSION=app_version, WIN_ROOT=str(root))
+                       APP_VERSION=(stamp_build if stamp_build is not None else ""),
+                       WIN_ROOT=str(root),
+                       # 环境变量这一格必须清空：它是 tool_version 的第二来源，留着宿主上
+                       # 可能存在的值就等于让夹具之外的东西决定版本号，红了也说不清是谁。
+                       B2B_BUILD_NUMBER="",
+                       PATH=str(root) + os.pathsep + os.environ.get("PATH", ""))
             cmd = _bash_or_die("-e") + (["-o", "pipefail"] if pipefail else []) + \
                   ["-c", script or gate_script]
             # errors="replace"：binary=True 时子进程的输出里就是非法 UTF-8 字节，
@@ -3683,24 +3743,36 @@ def test_workflow_shell_syntax():
     #   冒烟全部通过，最后一步 makensis 回一句「invalid VIProductVersion format,
     #   should be X.X.X.X」就 abort —— 旧拼法 `/DVER4="1.$APP_VERSION.0"` 凑出来的是
     #   三段。这种红只在编译器那一步出现，本机没有 makensis，所以把这条口径搬进假
-    #   编译器：拿本轮真实用过的那句拼法喂它，必须被拒；现在这句对任意 run_number
-    #   都拼得出合法版本（含会撑爆单个 16 位字段的大数，那种直接在开建前停下来说话）。
+    #   编译器：拿本轮真实用过的那句拼法喂它，必须被拒；现在这两格都不再由 shell 自己算，
+    #   而是问 tool_version（它读的就是 CI 上一步写下去、并且随包进包的那一份戳），所以
+    #   这里喂的是**戳里的那个构建号**，非法输入的形状也跟着从「环境变量」换成了「戳」：
+    #   没写、空、不像数、超出四段可表达范围——四种都在下面，每种都要停下来说清是谁坏了。
     legacy = gate_script.replace('/DVER4="$VER4"', '/DVER4="1.$APP_VERSION.0"')
     _assert(legacy != gate_script,
             "安装步骤里找得着那句 makensis 调用（找不着=这段判据在跟着代码一起漂）")
     _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, script=legacy)
     _assert(_rc != 0 and "invalid VIProductVersion" in _out and "✅" not in _out,
             f"反向对照：本轮那种三段版本号必须被编译器拒掉（rc={_rc}，尾部 {_out[-120:]}）")
-    for _tag, _av in (("常规 run_number", "999"), ("跨过 16 位边界", "65536"),
+    for _tag, _n in (("常规 run_number", "999"), ("跨过 16 位边界", "65536"),
                       ("七位数", "1234567")):
-        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, app_version=_av)
-        _assert_eq(_rc, 0, f"{_tag}（APP_VERSION={_av}）也要拼得出合法版本号（尾部 {_out[-110:]}）")
-    for _tag, _av, _said in (("非数字", "1.2.3-beta", "必须是纯数字"),
-                             ("空值", "", "必须是纯数字"),
-                             ("大到四段装不下", "5000000000", "装不下")):
-        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, app_version=_av)
-        _assert(_rc != 0 and _said in _out and "✅" not in _out,
-                f"反例·{_tag}的 APP_VERSION：不开建就停下来说清后果（rc={_rc}，尾部 {_out[-110:]}）")
+        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, stamp_build=_n)
+        _assert_eq(_rc, 0, f"{_tag}（戳里 build={_n}）也要拼得出合法版本号（尾部 {_out[-110:]}）")
+        # 只判 rc=0 不够：shell 用另一种写法**重新拼一遍同样的数字**也会绿，而第二份实现
+        # 就是这么长回来的。要比的是编译器实收的字节 == 模块导出的字节。
+        _assert(f"STUB-VER4={tv.product_version(int(_n))}\n" in _out
+                and f"STUB-APPV={tv.version_text(int(_n))}\n" in _out,
+                f"{_tag}：编进安装包的版本字节必须逐字等于 tool_version 的导出值，"
+                f"不是 shell 再算一遍（实收 {_out[-170:]}）")
+    for _tag, _n, _said in (("非数字", "1.2.3-beta", "没能从随包构建戳里读出来"),
+                             ("空值", "", "没能从随包构建戳里读出来"),
+                             ("戳压根没写", None, "没能从随包构建戳里读出来"),
+                             ("大到四段装不下", "5000000000", "没能从随包构建戳里算出来")):
+        _rc, _out = _run_installer_gate(NSIS_V4_HEAD, 0, stamp_build=_n)
+        # 「停下」还不够，还得**没递出去**：假编译器收不到号才是真的不开建。少了这半句，
+        # 「先调用 makensis、再补一句错误」也会绿，而那正是 makensis abort 掉以后的形状。
+        _assert(_rc != 0 and _said in _out and "✅" not in _out and "STUB-VER4=" not in _out,
+                f"反例·{_tag}的构建戳：不开建就停下来说清是谁坏了，且不把号递到编译器手上"
+                f"（rc={_rc}，尾部 {_out[-110:]}）")
 
     # 5-f) 注解必须是「本步 shell 打出来的单行文本」。跨行或引号没闭合，GitHub 不认这条
     # ::error::，于是失败原因静默消失，屏幕上只剩一个说不清的退出码——本轮写上面那段时就
@@ -4569,7 +4641,8 @@ def test_windows_onedir_delivery():
     # !ifndef 里的兜底值（版本 0.0 / 1.0.0.0、!cd 不生效）——那是另一份「编得出来、
     # 装得上、版本信息与字节对不上」的安装包，和本轮 VIProductVersion 同一族。
     _NSIS_CI_DEFINES = {"B2B_ROOT": "b2bcollect_build 的绝对路径（!cd 的基准）",
-                        "APP_VERSION": "显示版本号 1.<run_number>（Name 里那一段）",
+                        "APP_VERSION": "显示版本号 1.<build>（Name 里那一段；这一格由随包构建戳"
+                                       "经 tool_version 给出，不是 shell 自己拼出来的）",
                         "VER4": "文件属性四段版本号（makensis 只认 X.X.X.X）"}
 
     def _nsi_var_problems(text: str, cmdline=frozenset()) -> list:
@@ -10241,7 +10314,7 @@ def test_listing_accountability_gate():
     # 改窄的人当场看见有几格哑掉。
     for _f33 in ("cdp_base.py", "b2b168_crawler.py", "gys_crawler.py", "solarbe_crawler.py",
                  "gi_crawler.py", "qihuo11467_crawler.py", "maimaib2b_crawler.py",
-                 "makepolo_crawler.py", "aipage_crawler.py", "gongchang_crawler.py",
+                 "makepolo_crawler.py", "aipage_crawler.py",
                  "ali1688_crawler.py"):
         _src33 = next(v for k, v in _rs.items() if str(k).endswith(_f33))
         _old33 = next((l for l in _src33.splitlines() if "self._note_listed(" in l), "")

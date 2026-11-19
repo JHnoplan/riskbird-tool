@@ -266,7 +266,35 @@ REQUIRED_DATA = {
     "config.json": "随包凭证（缺它 = 外部机器一律精简版）",
     "mk_phone_font.json": "马可波罗图片码字形字典（缺它 = 手机号整列空白）",
     "enf_clean": "清洗子包源码目录（缺它 = enhanced_cleaner 整条链路降级）",
+    # 版本单一真源（需求 2）：漏了它不会报错、不会崩，只会得到一个「连自己是哪一版
+    # 都说不出来」的包：更新提示永远闭嘴，远程排障也拿不到那个号。
+    "version.json": "随包构建戳（缺它 = 版本未能确认，新版提示与自动更新一起失效）",
 }
+
+# 只向**云端那两条流水**要求的进包数据：本机入口不注入，也不许被当作「漏了」给补上。
+# 为什么要有这一张表而不是「三道入口同规矩」：构建号只有一个诚实的来源，就是 CI 那次的
+# run_number。本机构造如果也要带一份戳，它就得自己编一个整数，而那个整数在 tool_update 的
+# 比较里与同名的 CI 构建「同号不同物」——本地那份会伪装成一次真实发版，更新提示与
+# 「这版先不提示」的免打扰记录都会跟着错到人身上。所以本机的产物按设计自报「版本未能
+# 确认」（tool_version.certain()=False，读侧不给结论），只用于本机验证。每一项都必须写
+# 清理由：「不该要」与「忘了要」在屏幕上长得一样，只有理由能把它们分开。
+CI_ONLY_DATA = {
+    "version.json": "构建号只能来自 CI 计数器：本机构造若也注一份戳，就要自己编一个号，"
+                    "而那会与真实 CI 构建同号不同物（冒名）。本机产物按设计说「版本未能确认」",
+}
+
+
+def _is_ci_caller(label: str) -> bool:
+    """这个打包入口是不是云端那两条流水（按登记表里的文件类型判，不另立一份名单）。
+
+    用「是不是 .yml」而不是写死两个名字：以后加第三个平台的 workflow，它自动按 CI 的
+    规矩被要求，而「新增一个入口忘了归类」恰好是本仓库反复出现的那类缺陷。
+    合成标（离线判据喂的假 label）不在 CALLERS 里，按「不是 CI」处理——判据想测哪一路
+    就把那一路的名字真登记进 CALLERS，而不是靠默认值猜。
+    """
+    path = CALLERS.get(label)
+    return bool(path and path.suffix in (".yml", ".yaml"))
+
 
 # 进包但不该被 git 跟踪的输入：构建时现生成、或 CI 现场下载。与 NOT_PACKAGED 同理，
 # 每一项都要写清理由——「忘了提交」和「有意不提交」在 CI 上的症状完全一样，只有理由
@@ -276,6 +304,9 @@ GENERATED_AT_BUILD = {
     "config.json": "Actions Secrets 现写（见 inject_build_config.py），密钥绝不入仓库",
     "chromedriver": "CI 现场下载的二进制驱动，不提交",
     "drivers": "CI 现场下载的驱动目录，不提交",
+    # 构建戳里带着当次 run_number 与 commit：提交它等于把一个旧号锁在仓库里，
+    # 那比没有更坏（产物会自报一个它并不是的那个版本）。.gitignore 已收它。
+    "version.json": "打包前由 tool_version.py --write-stamp 现生成（构建号取 CI 计数器），不入库",
 }
 
 # 目录型 --add-data 里会混进来的本地垃圾：既不要求入库，也不该跟着进包。
@@ -368,6 +399,13 @@ def _flag_values(text: str, flag: str) -> list:
 
     刻意不依赖 YAML 或 shell 解析器：三处入口的写法各不相同（yml 里是一整行 bash、
     本机脚本是反斜杠续行），能稳定取到「flag 后面那个 token」就够了。
+
+    但「flag 后面那个 token」不等于「就是取值」：本函数扫的是**整份 workflow 文本**
+    （只剥了注释），所以错误文案里写一句 `--add-data 少了 version.json` 就会被读成
+    「构建命令把『少了』放进了包」——门禁报出一条谁都不能照着修的话，比它想拦的缺陷
+    更难查。因此裸 token（不带引号）必须长成路径/模块名的字符集才算取值；**带引号的
+    取值不受这一条限制**（仓库里每一条真 `--add-data` 都是引号包住的，字符集因此不会
+    把它拦掉），这样中文文案只能被跳过，真实参数不会被漏看。
     """
     values = []
     for m in re.finditer(re.escape(flag) + r"[\s=]+", text):
@@ -378,6 +416,8 @@ def _flag_values(text: str, flag: str) -> list:
             token = rest[1:end if end > 0 else len(rest)]
         else:
             token = re.split(r"[\s\\]+", rest, maxsplit=1)[0]
+            if token and not re.fullmatch(r"[\w.\-/\\:*?;\[\]]+", token):
+                continue        # 不像取值：那是一句人读的文案
         if token:
             values.append(token.strip())
     return values
@@ -2415,6 +2455,8 @@ def check_caller(label: str, text: str, externals: tuple, modules: list,
     # 4) 运行期数据文件
     dst_names = {Path(src).name for src, _ in add_data} | {src for src, _ in add_data}
     for key, why in REQUIRED_DATA.items():
+        if key in CI_ONLY_DATA and not _is_ci_caller(label):
+            continue      # 本机入口不注入是有理由的设计（见 CI_ONLY_DATA 那一段）
         if not any(d == key or d.endswith("/" + key) or Path(d).name == key
                    for d in dst_names):
             problems.append(f"--add-data 缺运行期数据 {key}：{why}")

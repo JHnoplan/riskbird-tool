@@ -4,9 +4,16 @@
 
 固定 key 方案（链接永不变，每次发版只更新对象内容）：
   https://images6396289.oss-cn-shenzhen.aliyuncs.com/0817899624/tool_releases/<文件名>
-只允许白名单内的三个文件名上链——文件名打错就等于私开一条新的永久链接，
+只允许白名单内的文件名上链——文件名打错就等于私开一条新的永久链接，
 永久链的锚点是文件名，必须收紧：
   B2bCollectToolSetup.exe / B2bCollectTool_Win_portable.zip / B2bCollectTool_Mac_arm64.zip
+  latest_windows.json / latest_mac_arm64.json
+
+清单（latest_*.json）与制品走同一个前缀、同一套「覆盖 + no-cache」：工具是照着
+清单里的直链去下载制品的，清单本身若不是一条永久地址，整个自动更新就只能靠人
+每次发版手工改客户端里写死的地址——那不是发版，是给每一台机器埋一个待修的点。
+**每个平台一份自己的清单**，不是全仓一份 latest.json：两个 workflow 的 run_number
+是两个独立计数器，一份清单装两个计数器必然有一边说错话（见 tool_update.MANIFEST_BY_KEY）。
 
 为什么放 0817899624/tool_releases/：与数据池前缀 0817899624/company_pool
 同目录不同前缀——数据池读取端 list_keys 只列自己前缀下的对象，制品物理上
@@ -36,14 +43,23 @@ import requests
 BUCKET = "images6396289"
 ENDPOINT = "oss-cn-shenzhen.aliyuncs.com"
 RELEASE_PREFIX = "0817899624/tool_releases"
+# 与 b2bcollect_build/tool_update.py 里的 ALLOWED_ARTIFACTS + MANIFEST_BY_KEY 逐项对齐；
+# 这里**故意**留一份字面量而不是 import 那个模块：这一份是「允许往永久桶里写哪些
+# key」的安全边界，必须能被 grep 直接看清，也不该因为读取端模块导入失败就连发布都发
+# 不出去。两处各写一份的代价由离线判据 ⑯ 组逐字对拍兜住（少一个名字=有新版本却装不上）。
 ALLOWED_NAMES = (
     "B2bCollectToolSetup.exe",
     "B2bCollectTool_Win_portable.zip",
     "B2bCollectTool_Mac_arm64.zip",
+    "latest_windows.json",
+    "latest_mac_arm64.json",
 )
 CONTENT_TYPES = {
     ".exe": "application/octet-stream",
     ".zip": "application/zip",
+    # 清单必须是 application/json：中间层（CDN/浏览器/代理）按 Content-Type 决定要不要
+    # 缓存与怎么解析，给成 octet-stream 时它会把它当一份可缓存的普通文件对待。
+    ".json": "application/json",
 }
 
 

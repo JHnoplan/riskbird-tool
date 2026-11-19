@@ -180,6 +180,12 @@ Section "主程序" SEC_APP
     IfFileExists "$INSTDIR\_internal\base_library.zip" 0 copy_missing
     StrCpy $7 "_internal\config.json"
     IfFileExists "$INSTDIR\_internal\config.json" 0 copy_missing
+    ; 构建戳单独占一对，理由与其余每一条都不同：其余那些没落地会**崩**或少一路功能，
+    ; 而这一份没落地时程序照开、采集照跑、界面照用——只有「自己是哪一版」这件事从此说不清：
+    ; 更新提示永远闭嘴（它拿不到本机基准），远程支持也只能猜。一个安静失效的版本号比一个
+    ; 报错的文件更难被发现，所以这一格只能在装完的那一刻验一次，别的地方没有第二次机会。
+    StrCpy $7 "_internal\version.json（随包构建戳）"
+    IfFileExists "$INSTDIR\_internal\version.json" 0 copy_missing
     StrCpy $7 "_internal\mk_phone_font.json"
     IfFileExists "$INSTDIR\_internal\mk_phone_font.json" 0 copy_missing
     StrCpy $7 "_internal\riskbird_build\runtime_paths.py"

@@ -107,7 +107,7 @@ check("2d 三条渠道的翻页循环都必须走集合差分，而且「公司�
 import ast as _ast2
 import inspect as _ins2
 _iter_fns, _off2e = [], []
-for _m2 in ("cdp_base", "gongchang_crawler", "gi_crawler", "maimaib2b_crawler", "makepolo_crawler",
+for _m2 in ("cdp_base", "gi_crawler", "maimaib2b_crawler", "makepolo_crawler",
             "b2b168_crawler", "gys_crawler", "qihuo11467_crawler", "aipage_crawler",
             "solarbe_crawler", "ali1688_crawler"):
     _mod2 = importlib.import_module(_m2)
@@ -181,9 +181,12 @@ _c3 = empty_page_triage(_big)
 _c3b = _a1688.empty_page_triage(_big)
 check("3f 1688 镜像那一份与 cdp_base 同判（两套尺子就会有两套结论）",
       _c3[0] == _c3b[0], f"{_c3} ↔ {_c3b}")
-_src3 = (_ROOT / "b2bcollect_build" / "gongchang_crawler.py").read_text(encoding="utf-8")
-check("3g 世界工厂网那一页确实走 `_no_result_line`（分诊要落在真链路上，不是只活在函数里）",
-      "_no_result_line" in _src3, "世界工厂网没接分诊")
+_src3 = (_ROOT / "b2bcollect_build" / "qihuo11467_crawler.py").read_text(encoding="utf-8")
+check("3g 顺企网那一页确实走 `_no_result_line`（分诊要落在真链路上，不是只活在函数里）",
+      "_no_result_line" in _src3, "顺企网没接分诊")
+# 探针原来是世界工厂网（那句「抱歉，没有找到」就是它实机取证的）：那一形状在任何接了
+# 分诊把手的站上同构，世界工厂网下站后换顺企网接着跑。换探针不能把这一格换成「只查
+# cdp_base 里有那个函数」：那正是「活在函数里、没人调用」那个本仓记过账的缺陷形状。
 
 # ── ④ 相关性：同域词模型只否决误砍 ────────────────────────────────────
 KW = "耐压舱"

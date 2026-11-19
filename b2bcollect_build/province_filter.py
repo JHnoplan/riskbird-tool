@@ -73,13 +73,12 @@ MIC_EN = {
     "香港": "Hongkong", "澳门": "Macao", "台湾": "Taiwan",
 }
 # 参数直筛站（slug）：这些站选中省份后把省份拼进搜索 URL（服务端筛）
-# gongchang：单省时用 areaid 参数（已实机核实），多省走数据层过滤
-PARAM_SITES = {"mic", "makepolo", "1688", "gongchang"}
+# gongchang 已下站，故不在此列（世界工厂网的 areaid 参数本身实机核实过是有效的，
+# 下线原因在 parallel_session 的 SITE_ORDER 注释里，不是参数问题）
+PARAM_SITES = {"mic", "makepolo", "1688"}
 # 参数直筛站的本地核验强度（口径见模块 docstring ③）：
 #   lenient = 只砍 miss（确认外省）；strict = miss/unknown 都砍；未登记的参数站默认 strict。
-# gongchang 用 lenient：站方 areaid 参数已核实有效，且公司名开头的地级市是强属地信号。
-PARAM_VERIFY = {"mic": "lenient", "makepolo": "lenient", "1688": "strict",
-                "gongchang": "lenient"}
+PARAM_VERIFY = {"mic": "lenient", "makepolo": "lenient", "1688": "strict"}
 
 # ── 数据层匹配的属地词表：每省 = 短名 + 简称 + 全部地级行政区名 ──
 # 短名自带唯一性；单字简称（贵/广/黑）歧义大，一律不入表。

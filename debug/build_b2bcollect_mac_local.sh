@@ -127,6 +127,14 @@ if [ ! -f config.json ]; then
   echo "❌ b2bcollect_build/config.json 不存在（第 1 步没成功），不许出包"
   exit 1
 fi
+# 本机构建**故意**不带随包构建戳（version.json），也不把它 --add-data 进包：那个构建号
+# 只有一个诚实的来源——CI 那一次的 run_number。本地自己编一个，就会造出一个「与真实
+# 发版同号、却不是那份代码」的包，而更新通路比的正是这个号（免打扰记录也会跟着串档）。
+# 于是这份产物会自报「版本未能确认」：它能开、能采、能过全部自检，只是不参与更新提示。
+# 要出可对外发的版本：推一次 main 或在 Actions 里 dispatch 那条 workflow。
+if [ -f version.json ]; then
+  echo "⚠️  工作区里留着上一份 version.json：本次不注入进包（本机产物按设计自报「版本未能确认」）"
+fi
 
 EXE_ARGS=()
 if [ "${B2B_LOCAL_KEEP_OLD:-}" != "1" ]; then
@@ -145,7 +153,7 @@ fi
   --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler \
   --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr \
   --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies \
-  --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler \
+  --hidden-import keyword_expander --hidden-import deepseek_expander \
   --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner \
   --hidden-import enf_clean.normalize --hidden-import enf_clean.phone \
   --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd \
@@ -162,6 +170,8 @@ fi
   --hidden-import text_shape \
   --hidden-import site_discovery --hidden-import pinyin_lite \
   --hidden-import exchange_master \
+  --hidden-import download_verify --hidden-import chrome_doctor \
+  --hidden-import tool_version --hidden-import tool_update \
   --add-data "config.json:." --add-data "mk_phone_font.json:." \
   --add-data "../enf_clean:enf_clean" \
   --add-data "../ali1688_build/ali1688_crawler.py:ali1688_build" \

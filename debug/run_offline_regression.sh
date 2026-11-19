@@ -47,8 +47,10 @@ DIR_WITHOUT_SUITES="$DIR_WITHOUT_SUITES 与 riskbird_build/test_*_offline.py 覆
 # 手写清单：debug/ 下命名不规则的套件 + 不符合 *_offline.py 约定的那一个
 FILES="
 debug/aipage_offline_test.py
+debug/acl_note_panel_offline_test.py
 debug/b2b_offline_test.py
 debug/block_guard_offline_test.py
+debug/chrome_env_offline_test.py
 debug/contact_field_offline_test.py
 debug/contact_selfheal_offline_test.py
 debug/edition_offline_test.py
@@ -61,6 +63,7 @@ debug/position_smart_offline_test.py
 debug/qihuo_offline_test.py
 debug/province_offline_test.py
 debug/quality_fix_offline_test.py
+debug/update_offline_test.py
 debug/test_stats_status_flags.py
 debug/verify_gys_offline.py
 debug/gi_mp_offline_check.py

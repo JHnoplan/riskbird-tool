@@ -42,6 +42,7 @@ OSS 的条件写在本站客户端（v1 头签名）里没有实现，多个客�
     python -m access_guard --show                      看名单/等级/本机设备
     python -m access_guard --add 13800138000=1         加账号并指定等级
     python -m access_guard --set-level 13800138000=2   改等级
+    python -m access_guard --note 13800138000=张三的号  改备注（这是谁的号）
     python -m access_guard --remove 13800138000        移出白名单（连设备绑定一起删）
     python -m access_guard --devices                   看每个号绑了哪台机器
     python -m access_guard --kick 13800138000          强制解绑（所有设备掉线）
@@ -729,14 +730,110 @@ def resolve_level(phone: str, grants: Dict[str, int], declared: bool) -> int:
     return grants.get(phone, _ed.UNKNOWN_ACCOUNT_LEVEL)
 
 
+# 备注最长多少字：这一列要上表格，而备注的真实用途是「这是谁的号」。
+# 截断而不是拒写：管理员粘了一长串进来时，报错只会让他在提权流程里卡住。
+ACCOUNT_NOTE_MAX = 40
+
+
+def _parse_account_notes(data) -> Dict[str, str]:
+    """解析「号码 → 备注」：只留合法号码与非空文字，脏条目丢弃。
+
+    这是一层**投影**而不是第二份真源：备注只是给人看的标注，**绝不参与任何权限判定**
+    （判定只看 accounts/grants 与设备分片）。所以读侧一律宽容：旧名单没有这个字段就是
+    「没人写过备注」，不是「名单坏了」；一个号的备注写成列表、写成数字、带换行，都不能
+    把整份名单的读取带崩。
+
+    向后兼容与 grants 同一个口径：加字段不改老字段，旧 exe 读到多出来的键只会把它当
+    不认识的结构丢掉（见 :func:`_new_document` 那段注释），所以 schema 不必升到 v4。
+    """
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("account_notes")
+    items: List[Tuple[object, object]] = []
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, list):        # 兼容 [{"phone":...,"note":...}] 手写形状
+        for one in raw:
+            if isinstance(one, dict):
+                items.append((one.get("phone") or one.get("account"),
+                              one.get("note") or one.get("notes") or one.get("备注")))
+    out: Dict[str, str] = {}
+    for k, v in items:
+        phone = _normalize_account(k)
+        if not phone or not _MOBILE_RE.match(phone):
+            continue
+        # 人手编辑 JSON 时把一个号写成备注列表（["张三", "市场部"]）很常见：拼成一句
+        # 比丢掉好，也比把 ``['张三', '市场部']`` 这种 Python 字面量映到表格里好。
+        if isinstance(v, (list, tuple)):
+            v = " ".join(" ".join(str(x).split()) for x in v if str(x).strip())
+        # 备注是给管理员自己看的标注，不执行任何转义/模板；只把换行类空白压成空格，
+        # 免得一份备注把表格里这一行顶成多行（那是显示层的事，不该由显示层再回改数据）
+        text = " ".join(str(v if v is not None else "").split())[:ACCOUNT_NOTE_MAX]
+        if text:
+            out[phone] = text
+    return out
+
+
+def _clean_account_notes(notes, accounts) -> Dict[str, str]:
+    """写回前的收敛：号码必须在名单里、空文字 = 删这条备注。
+
+    「从名单里移除了一个号、备注还留在文件里」不是无害的残留：以后同一个手机号
+    发给了另一个人，那条写着别人名字的备注会直接回到表格里——那比没有备注更坑。
+    """
+    kept = _parse_account_notes({"account_notes": notes or {}})
+    allow = {_normalize_account(a) for a in (accounts or [])}
+    return {k: v for k, v in kept.items() if k in allow}
+
+
+def _strict_note(phone: str, text) -> str:
+    """写侧的单条备注口径：压平空白 + 超长直接报错（空串 = 删这条）。
+
+    读侧为什么不能同样严格：旧名单里可能真的存着超长备注，报错就会把整份名单读崩、
+    让所有人都用不了工具。写侧为什么不能宽容：截下来的是「前半句」，而下一次读回来正好
+    卡在字数上限上，管理员看不出自己丢了什么。
+    """
+    flat = " ".join(str(text if text is not None else "").split())
+    if len(flat) > ACCOUNT_NOTE_MAX:
+        raise ValueError(
+            f"备注最长 {ACCOUNT_NOTE_MAX} 个字，现在 {len(flat)} 个："
+            f"请缩短 {phone} 的备注（工具不替你截断——截一半的备注比没有备注更容易误导人）")
+    return flat
+
+
+def _parse_note_entries(entries) -> Dict[str, str]:
+    """把「手机号=备注」这一串写法收敛成 {号码: 文字}；写法有误当场抛。
+
+    命令行与界面两条路共用这一份解析：否则「备注留空就是删这条」那条口径会在
+    界面里长成另一种说法。返回的字典里空串 = 删，非空 = 覆盖写。
+
+    **读侧宽容、写侧严格**：读到的旧数据超长就截着显示（不能因为上限改过就把整份
+    名单读崩），但写新备注超长是直接报错。静默截断存的是「前半句」，而下一次读回来
+    正好是 40 字，管理员看不出自己丢了什么——备注的全部价值就在于它可信。
+    """
+    out: Dict[str, str] = {}
+    for raw in (entries or []):
+        phone, sep, text = str(raw or "").partition("=")
+        phone = _normalize_account(phone)
+        if not _MOBILE_RE.match(phone) or not sep:
+            raise ValueError(f"写法应为 手机号=备注（备注留空 = 删这条备注）：{raw}")
+        # 写法、号码、长度三类报错全部收敛在 :func:`_strict_note`：命令行与面板
+        # 两条路报的是同一句话，不会出现「界面上被拦、命令行却能干」的缝隙。
+        out[phone] = _strict_note(phone, text)
+    return out
+
+
 def _new_document(grants: Dict[str, int], version: int = 1) -> dict:
     """生成 accounts / grants 两份都齐的名单：accounts 给旧客户端读，grants 给新的。
 
     只发一份字段会在灰度期出事故——旧 exe 拿到只含 dict 的 accounts 会把所有条目
     当脏数据丢掉，全公司瞬间没人能用工具。加字段不改老字段，是这份名单从 v1
     升到 v3 仍然要求向后兼容的全部原因。
+
+    ``account_notes`` 恒为空字典而不是缺席：新播种的名单本来就没有备注，但字段在场
+    能让读侧（与人工编辑 OSS 的管理员）看出「这是结构的一部分」而不是拼错了名字。
     """
     return {"accounts": sorted(set(grants)), "grants": dict(grants),
+            "account_notes": {},
             "schema": ACL_SCHEMA, "updated_at": _now_text(), "version": int(version)}
 
 
@@ -1611,13 +1708,16 @@ class AccessGuard(QObject):
                 accounts.append(a)
         return ({"accounts": accounts, "grants": grants, "schema": ACL_SCHEMA,
                  "updated_at": doc.get("updated_at") or "", "_grants_declared": declared,
+                 "account_notes": _parse_account_notes(doc),
                  "version": int(doc.get("version") or 0)},
                 int(doc.get("version") or 0))
 
     @classmethod
     def _put_document(cls, doc: dict, grants: Dict[str, int],
                       extra_accounts: Optional[List[str]] = None,
-                      drop_accounts: Optional[List[str]] = None, client=None) -> dict:
+                      drop_accounts: Optional[List[str]] = None,
+                      account_notes: Optional[Dict[str, str]] = None,
+                      client=None) -> dict:
         """合并写回：version 单调 +1，accounts 与 grants 同步生成。
 
         历史实现把 version 硬编码成 2，改多少次都是 2——那样这份文件就没有
@@ -1625,25 +1725,43 @@ class AccessGuard(QObject):
 
         ``drop_accounts`` 是删除账号用的：只从 accounts 里减不够，因为 grants 也会被
         并进来，「删掉的号还留在 grants 里」等于没删。所以最终集合一律再减一次。
+
+        ``account_notes`` 是**增量覆盖**而不是全量替换：没提的号沿用远端已有备注，
+        提了但文字为空的是「删这条备注」。写成全量替换的话，两个管理员同时开面板
+        就是一个后提交的人把前一个人写的备注整片洗掉——与等级那边「只改我改过的」
+        是同一条纪律。
         """
         own = cls._must_client(client)
         version = int(doc.get("version") or 0)
         drop = {_normalize_account(a) for a in (drop_accounts or [])}
         accounts = sorted((set(doc.get("accounts") or []) | set(grants)
                            | set(extra_accounts or [])) - drop)
+        notes = dict(_parse_account_notes(doc))
+        for phone, text in (account_notes or {}).items():
+            key = _normalize_account(phone)
+            if text is None or not str(text).strip():
+                notes.pop(key, None)
+            else:
+                notes[key] = str(text)
         new_doc = {"accounts": accounts, "grants": {k: v for k, v in grants.items()
                                                    if k not in drop},
+                   "account_notes": _clean_account_notes(notes, accounts),
                    "schema": ACL_SCHEMA, "updated_at": _now_text(),
                    "version": max(version, 1) + 1}
         own.upload_json_atomic(ACL_KEY, new_doc)
         return new_doc
 
     @classmethod
-    def add_accounts(cls, entries: List[str], client=None) -> dict:
+    def add_accounts(cls, entries: List[str], account_notes: Optional[Dict[str, str]] = None,
+                     client=None) -> dict:
         """把账号加入白名单，支持 ``手机号`` 或 ``手机号=等级`` 两种写法。
 
         只给号码不给等级时：已有等级沿用，新号取最保守那一档——管理员忘了写
         等级，后果是「这个号先按受限版用」，而不是「这个号把内部功能全看到了」。
+
+        ``account_notes`` 是可选的「号码 → 备注」（这是谁的号、哪个部门的）：备注
+        只能在显式提供时写进去，没有任何路径会替管理员猜一句备注——猜错了它就是一条
+        看起来比真实情况更可信的假记号。
         """
         own = cls._must_client(client)
         doc, version = cls.load_document(own)
@@ -1660,19 +1778,40 @@ class AccessGuard(QObject):
                 lv = grants.get(phone, _ed.UNKNOWN_ACCOUNT_LEVEL)
             wanted[phone] = lv
         grants.update(wanted)
-        new_doc = cls._put_document(doc, grants, client=own)
+        # 备注走与 --note / 面板同一条写入口径：号码、长度两类校验在这一层就要做完，
+        # 而不是存下去以后再由读侧慢慢收敛。这里拿 dict 而不是「手机号=备注」那种文本：
+        # 备注里的 ``=`` 是合法字符（「张三=市场部」这种写法很常见），不能再拆一次。
+        note_writes = {_normalize_account(k): _strict_note(_normalize_account(k), v)
+                       for k, v in (account_notes or {}).items()}
+        new_doc = cls._put_document(doc, grants, account_notes=note_writes, client=own)
         cls._sync_local(own)
         return {"doc": new_doc, "added": sorted(wanted), "grants": grants,
+                "account_notes": new_doc["account_notes"],
                 "version": new_doc["version"]}
 
     @classmethod
-    def set_levels(cls, entries: List[str], client=None) -> dict:
-        """批量改等级：``手机号=等级``。号码必须已在名单里（不在就先 --add）。"""
+    def apply_changes(cls, level_entries: Optional[List[str]] = None,
+                      note_entries: Optional[List[str]] = None, client=None) -> dict:
+        """一次读、一次写：把「改等级」与「改备注」合成**同一个**名单 version。
+
+        为什么值得单开这一路（而不是让界面连着调 set_levels + set_account_notes）：
+        ① 拆成两次就是两个 version，而 version 是管理员判断「谁在什么时候动了名单」
+           唯一的锚点——一次点「应用改动」冒出两个版本，这份编号就不能解读了；
+        ② 两次写回中间有一段**别人看得见**的半成品状态：A 管理员已经把号从 0 降到 2、
+           备注里还写着「实习生（勿删）」没落盘，这段时间里另一个人看到的名单是自相
+           矛盾的；③ 第一次成功、第二次失败时，界面只能说「改了一半」，按钮状态、
+           重读、汇报全都要为这个第三种结果另写一套。
+        命令行里 ``--add`` 与 ``--note`` 合并成一次写入是同一条纪律，这里向它对齐。
+
+        校验规则**逐字沿用最下面两个单用途入口**：号码不在名单里、写法缺 ``=``、
+        等级不在矩阵内，报的都是同一句话——界面上被拦、命令行却能干，或者同一个
+        错在两条路上给出两种说法，都是权限后台最难查的那类差异。
+        """
         own = cls._must_client(client)
         doc, _ = cls.load_document(own)
         grants = dict(doc["grants"])
-        changed: Dict[str, int] = {}
-        for raw in entries:
+        levels: Dict[str, int] = {}
+        for raw in (level_entries or []):
             phone, sep, lvl = str(raw or "").partition("=")
             phone = _normalize_account(phone)
             if not _MOBILE_RE.match(phone) or not sep:
@@ -1681,11 +1820,56 @@ class AccessGuard(QObject):
             if phone not in doc["accounts"] and phone not in grants:
                 raise ValueError(f"该号码不在白名单里，请先 --add {phone}={lv}")
             grants[phone] = lv
-            changed[phone] = lv
-        new_doc = cls._put_document(doc, grants, client=own)
+            levels[phone] = lv
+        notes = _parse_note_entries(note_entries or [])
+        for phone in notes:
+            if phone not in doc["accounts"]:
+                raise ValueError(f"该号码不在白名单里，先 --add {phone} 再写备注")
+        new_doc = cls._put_document(doc, grants, account_notes=notes, client=own)
         cls._sync_local(own)
-        return {"doc": new_doc, "changed": changed, "grants": grants,
+        return {"doc": new_doc, "levels": levels, "notes": notes,
+                "grants": new_doc["grants"], "account_notes": new_doc["account_notes"],
                 "version": new_doc["version"]}
+
+    @classmethod
+    def set_levels(cls, entries: List[str], client=None) -> dict:
+        """批量改等级：``手机号=等级``。号码必须已在名单里（不在就先 --add）。
+
+        判据全在 :meth:`apply_changes` 里，这里只是命令行 ``--set-level`` 那一个
+        用途的名字与返回形状（``changed`` = 号码→等级）。
+        """
+        res = cls.apply_changes(level_entries=entries, client=client)
+        return {"doc": res["doc"], "changed": res["levels"],
+                "grants": res["grants"], "version": res["version"]}
+
+    @classmethod
+    def set_account_notes(cls, entries: List[str], client=None) -> dict:
+        """批量改备注：``手机号=备注文字``；备注为空（写到 ``手机号=`` 就停）= 删这条备注。
+
+        为什么单独一个入口而不往 ``set_levels`` 里夹：两者写回的是不同字段、不同的
+        合法性判据（等级必须是矩阵里的一档，备注是一串自由文本）。合在一起的话，
+        「改完等级没动备注」与「备注被等级那一路洗掉」就再也分不出来。界面上一屏
+        同时改两者时走 :meth:`apply_changes`，那才是「一次编辑 = 一个 version」。
+
+        号码必须在名单里（与 set_levels 同一条口径）：给一个不存在的号留备注看不出
+        来是拼错了号码还是手动删过号。
+        """
+        res = cls.apply_changes(note_entries=entries, client=client)
+        return {"doc": res["doc"], "changed": res["notes"],
+                "grants": res["grants"], "account_notes": res["account_notes"],
+                "version": res["version"]}
+
+    @classmethod
+    def describe_account_notes(cls, doc: Optional[dict] = None,
+                              client=None) -> Dict[str, str]:
+        """备注的唯一读口径（与 :meth:`describe_levels` 同一位置）：面板、命令行、
+        自检都问这里，不在显示层再解析一遍 JSON——否则「旧名单没这个字段算不算错」
+        这句话会长成三份。"""
+        if doc is None:
+            doc, _ = cls.load_document(client)
+        elif "account_notes" not in doc:
+            return _parse_account_notes(doc)
+        return dict(doc.get("account_notes") or {})
 
     @classmethod
     def remove_accounts(cls, phones: List[str], force: bool = False,
@@ -2535,8 +2719,11 @@ def _fmt_level(grants: Dict[str, int], declared: bool, phone: str) -> str:
 def _print_grants(doc: dict):
     grants = doc["grants"]
     declared = doc["_grants_declared"]
+    notes = AccessGuard.describe_account_notes(doc=doc)
     for p in doc["accounts"]:
-        print(f"   · {p}  等级 {_fmt_level(grants, declared, p)}")
+        line = f"   · {p}  等级 {_fmt_level(grants, declared, p)}"
+        note = notes.get(p) or ""
+        print(line + (f"  备注 {note}" if note else ""))
 
 
 def _cli(argv: Optional[List[str]] = None):
@@ -2547,6 +2734,8 @@ def _cli(argv: Optional[List[str]] = None):
                     help="加账号：手机号 或 手机号=等级（0管理员 1标准 2受限）")
     ap.add_argument("--set-level", nargs="*", default=None,
                     help="改等级：写法 手机号=等级")
+    ap.add_argument("--note", nargs="*", default=None,
+                    help="改备注（这是谁的号）：写法 手机号=备注；备注留空 = 删这条备注")
     ap.add_argument("--remove", nargs="*", default=None,
                     help="把账号移出白名单（连等级记录和设备绑定一起删）")
     ap.add_argument("--force", action="store_true",
@@ -2567,11 +2756,15 @@ def _cli(argv: Optional[List[str]] = None):
     # 参数组合校验：--force 只在移除时有意义，别让它默默被忽略（管理员以为生效了）
     if args.force and not args.remove:
         ap.error("--force 需要配合 --remove 一起用")
+    # --add 与 --note 同时给是有意支持的写法（一次写入、一个 version）：拆成两条命令
+    # 看着简单，代价却是两份可观察中间态与两次网络写回，而管理员要的就是
+    # 「加这个号并标好是谁的」。下面那段 if/elif 分派只保留一条能同时接住两者的路。
     # nargs="*" 不带值时 argparse 给的是**空列表**，而下面全按真值分派：
     # "python -m access_guard --add" 会一路掉到 else，什么都没改却打印一份名单，
     # 管理员看到名单就以为加成功了。带旗标必须同时带参数，当场报错才算说清楚。
     # （--devices 是唯一例外：不带号码=看全部，是有意设计的默认。）
     for _flag, _val in (("--add", args.add), ("--set-level", args.set_level),
+                        ("--note", args.note),
                         ("--remove", args.remove), ("--kick", args.kick)):
         if _val is not None and not _val:
             ap.error(f"{_flag} 至少要带一个参数")
@@ -2579,27 +2772,36 @@ def _cli(argv: Optional[List[str]] = None):
     if args.doctor:
         # 自检是**只读**动作，和任何写操作混在一起时结论就不可信了（比如同一次
         # 调用里先改了名单，自检读到的就是刚写下去的东西），所以必须单独跑。
-        if (args.add or args.set_level or args.remove or args.kick
+        if (args.add or args.set_level or args.note or args.remove or args.kick
                 or args.claim is not None):
             ap.error("、".join(DOCTOR_FLAGS) + " 只读，不能与 "
-                     "--add/--set-level/--remove/--kick/--claim 同时使用")
+                     "--add/--set-level/--note/--remove/--kick/--claim 同时使用")
         code = run_doctor()
         if code != DOCTOR_EXIT_OK:
             sys.exit(code)
         return
 
     if args.add:
-        res = AccessGuard.add_accounts(args.add)
+        notes = _parse_note_entries(args.note) if args.note else None
+        res = AccessGuard.add_accounts(args.add, account_notes=notes)
         print(f"✅ 已写入白名单（version {res['version']}），本次加入/更新："
               f"{'、'.join(res['added'])}")
         for p in res["added"]:
             lv = res["grants"][p]
-            print(f"   · {p} → {lv}（{LEVEL_NAMES.get(lv)}）")
+            note = res["account_notes"].get(p) or ""
+            print(f"   · {p} → {lv}（{LEVEL_NAMES.get(lv)}）"
+                  + (f"  备注 {note}" if note else ""))
     elif args.set_level:
         res = AccessGuard.set_levels(args.set_level)
         print(f"✅ 等级已更新（version {res['version']}）")
         for p, lv in sorted(res["changed"].items()):
             print(f"   · {p} → {lv}（{LEVEL_NAMES.get(lv)}）")
+    elif args.note:
+        res = AccessGuard.set_account_notes(args.note)
+        print(f"✅ 备注已更新（version {res['version']}）")
+        for p, text in sorted(res["changed"].items()):
+            # 空文字必须在输出里看得见：它就是「这条备注被删了」，与「没改过」不是一件事
+            print(f"   · {p} → {text or '（已清空）'}")
     elif args.remove:
         res = AccessGuard.remove_accounts(args.remove, force=args.force)
         print(f"✅ 已移出白名单（version {res['version']}）："

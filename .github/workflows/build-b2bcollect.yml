@@ -31,6 +31,12 @@ on:
       # 判据由构建前硬门反查（见 check_packaging_manifest.py 的触发目录检查）。
       - 'ali1688_build/**'
       - 'riskbird_build/**'
+      # 发布说明改了不改代码也要重发一次：latest_windows.json 里的 `notes` 就是这份文件
+      # 的内容，不改触发条件的话，改了说明得等到下一次有代码改动才会发出去，而用户看到的
+      # 还是旧的那一句。（生成与上传都在这条流水里，没有另一条只发清单的路。）
+      - '.github/release/**'
+      # 清单生成那一头改了同理：不触发就只能手工 dispatch 才会重发 latest_windows.json。
+      - '.github/scripts/make_release_manifest.py'
   workflow_dispatch:  # 允许在 Actions 页面手动只打包这个工具
 
 jobs:
@@ -100,6 +106,15 @@ jobs:
       # 实际版本挑配套的驱动（驱动大版本与浏览器不匹配时新版报 cannot connect）。
       run: python .github/scripts/fetch_chromedrivers.py
 
+    - name: Write build stamp (版本单一真源)
+      # 需求 2 的第一块在 CI 上的落点：打包前现生成随包构建戳，构建号取本次 run 的计数器，
+      # commit 一并留在戳里。下一步靠 --add-data 把这份戳带进包。
+      # 为什么要单独一步、而不是在 PyInstaller 那行里拼：它拼不出来时必须红在
+      # 「生成」那一格（run_number 为空、被引号吃了、超出四段可表达范围），而不是与
+      # 一堆打包日志混在一起。下面「产物自报」那一步对拍的就是这里写下去的那一个数。
+      shell: bash
+      run: python b2bcollect_build/tool_version.py --write-stamp b2bcollect_build/version.json --build "${{ github.run_number }}" --commit "${{ github.sha }}"
+
     - name: Build EXE with PyInstaller
       # hidden-import 覆盖全部本地模块（跨模块新增 import 未被依赖分析收录会导致
       # exe 启动即 ModuleNotFoundError）；pip 名≠import 名的两个名字都写
@@ -143,7 +158,10 @@ jobs:
         cd b2bcollect_build
         # 随包配置必须真的存在才许开建：少了它，产物就是个「外部机器一律精简版」的包
         [ -f config.json ] || { echo "::error::b2bcollect_build/config.json 不存在（上一步注入没成功），不许出包"; exit 1; }
-        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import gongchang_crawler --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --hidden-import website_contact --hidden-import perf_governor --hidden-import field_evidence --hidden-import enrich_waterfall --hidden-import lead_scoring --hidden-import channel_health --hidden-import text_shape --hidden-import site_discovery --hidden-import pinyin_lite --hidden-import exchange_master --add-data "config.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\runtime_paths.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
+        # 构建戳不在位就不开建：少了它产物依然能跑、能过 --acl-doctor、能过窗口冒烟，
+        # 却永远说不出自己是哪一版（需求 2 那两行性质全靠这一份戳）。
+        [ -f version.json ] || { echo "::error::b2bcollect_build/version.json 不存在（上一步 --write-stamp 没成功），不许出一个自报不出版本的包"; exit 1; }
+        python -m PyInstaller --noconfirm --clean --windowed --name B2bCollectTool --collect-all selenium --collect-all PyQt5 --collect-all lxml --collect-all bs4 --collect-submodules PIL --hidden-import requests --hidden-import websocket --hidden-import websocket_client --hidden-import openpyxl --hidden-import cdp_base --hidden-import shared_chrome --hidden-import parallel_session --hidden-import mic_crawler --hidden-import b2b168_crawler --hidden-import qihuo11467_crawler --hidden-import aipage_crawler --hidden-import maimaib2b_crawler --hidden-import gi_crawler --hidden-import makepolo_crawler --hidden-import mk_phone_ocr --hidden-import province_filter --hidden-import site_adapters --hidden-import pending_companies --hidden-import keyword_expander --hidden-import deepseek_expander --hidden-import customer_library_cleaner --hidden-import enhanced_cleaner --hidden-import enf_clean.normalize --hidden-import enf_clean.phone --hidden-import phonenumbers --hidden-import pandas --hidden-import xlrd --hidden-import local_scan --hidden-import yzd_client --hidden-import task_registry --hidden-import oss_pool_client --hidden-import data_pool --hidden-import pool_matcher --hidden-import pool_dialogs --hidden-import access_guard --hidden-import edition --hidden-import acl_admin_dialog --hidden-import feedback_store --hidden-import search_suggest --hidden-import recommend_engine --hidden-import dedup_engine --hidden-import mapping_recommender --hidden-import audit_logger --hidden-import search_optimizer --hidden-import pool_merge --hidden-import ingest_cleaning --hidden-import pool_store --hidden-import tool_config --hidden-import website_contact --hidden-import perf_governor --hidden-import field_evidence --hidden-import enrich_waterfall --hidden-import lead_scoring --hidden-import channel_health --hidden-import text_shape --hidden-import site_discovery --hidden-import pinyin_lite --hidden-import exchange_master --hidden-import download_verify --hidden-import chrome_doctor --hidden-import tool_version --hidden-import tool_update --add-data "config.json;." --add-data "version.json;." --add-data "mk_phone_font.json;." --add-data "..\enf_clean;enf_clean" --add-data "..\ali1688_build\ali1688_crawler.py;ali1688_build" --add-data "..\riskbird_build\qizhidao_crawler.py;riskbird_build" --add-data "..\riskbird_build\block_guard.py;riskbird_build" --add-data "..\riskbird_build\chrome_driver.py;riskbird_build" --add-data "..\riskbird_build\riskbird_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\aiqicha_crawler_v2.py;riskbird_build" --add-data "..\riskbird_build\runtime_paths.py;riskbird_build" --add-data "..\ali1688_build\drivers;drivers" b2bcollect_gui.py
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，
@@ -222,6 +240,43 @@ jobs:
           exit 1
         }
         Write-Host "✅ 窗口冒烟通过：界面建得出、崩溃日志一份都没有"
+
+    - name: Artifact self-report gate (产物必须自报是哪一版)
+      # 需求 2 的第一块在这里合上：不问「上一步做了什么」，而是**问产物自己**「你是哪一版」，
+      # 再与这一步注入的那个号对拍。只信前面那些绿不够：--add-data 漏写、PyInstaller 把数据
+      # 收到另一个位置、_internal 布局改了——三种都会让「CI 说注入了」与「包读到的」不是
+      # 同一个数，而只有后者决定用户机器上的更新提示与远程排障能不能说出真相。
+      # --windowed 的 exe 没有控制台，stdout 收不到，所以走 `--out` 那份 JSON（与
+      # --acl-doctor 把报告落在文件里同一套路子）。
+      # 自报这一步本身恒返 0（连「没能确认」也要能如实打出来），判定由下面的对拍做：
+      # 「自报失败」与「自报不一致」是两种不同的红，混在一个退出码里就查不出是哪种。
+      # 对拍的那六条判定不在本步里写，而在 .github/scripts/check_artifact_selfreport.py：
+      # Mac 那一头跑的是 bash，同样的判定抄两遍就会漂移成「一个平台拦得住、另一个放绿」，
+      # 而屏幕上两个 run 都是绿的（本仓库已在 hidden-import 清单、pip 源、落点口径上各吃过
+      # 一次）；抽成脚本还多一个好处：这一步从此能被离线判据直接调用，pwsh 在内连脚本里可验不了。
+      timeout-minutes: 5
+      shell: pwsh
+      env:
+        EXPECT_BUILD: ${{ github.run_number }}
+        EXPECT_COMMIT: ${{ github.sha }}
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        if (-not (Test-Path $exe)) {
+          Write-Host "::error::产物没生成到位：${exe}（onedir 布局变了？先修这一步再谈交付）"
+          exit 1
+        }
+        $rep = Join-Path $env:RUNNER_TEMP "version_selfreport.json"
+        if (Test-Path $rep) { Remove-Item -Force $rep }
+        $p = Start-Process -FilePath $exe -ArgumentList "--print-version","--json","--out",$rep -Wait -PassThru
+        if ($p.ExitCode -ne 0) {
+          Write-Host "::error::产物连自报版本这一步都退 $($p.ExitCode)：这个包说自己是谁都说不出来，禁止上传"
+          exit 1
+        }
+        # 判定不在这里、也不在 Mac 那头各写一遍（那六条全部写在
+        # .github/scripts/check_artifact_selfreport.py）：两个平台调同一份、红同一句话，
+        # 而且离线判据能直接喂假报告验它（内联在 pwsh 里的话，本机连解释器都没有）。
+        python .github/scripts/check_artifact_selfreport.py --report $rep --expect-build $env:EXPECT_BUILD --expect-commit $env:EXPECT_COMMIT --label B2bCollectTool.exe
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Package Windows artifacts
       # onedir 交付装配，三道事一并做（判据全在脚本里，不抄在 yml）：
@@ -353,8 +408,6 @@ jobs:
       # 目录而不是脚本目录，靠「反正我 cd 过了」迟早对不上（Git Bash 的 pwd -W 才给
       # Windows 形式的绝对路径，纯 MSYS 形式 /d/... 传给 Windows 版 makensis 会读错）。
       shell: bash
-      env:
-        APP_VERSION: ${{ github.run_number }}
       run: |
         cd b2bcollect_build
         # makensis 由上一步现下载、校验、解压，并把路径写进 GITHUB_ENV。这里不再
@@ -377,27 +430,35 @@ jobs:
         # 版本号必须是四段纯数字（VIProductVersion 只认 X.X.X.X）。2026-11-12 云端就是
         # 栽在这句上：`/DVER4="1.$APP_VERSION.0"` 拼出来是三段，makensis 报
         # 「invalid VIProductVersion format」直接 abort —— 编译器、自检、冒烟全绿，最后
-        # 一步没有安装包。这里不再「拼了就算」：先把 run_number 拆成两个 16 位字段
-        # （版本号要能唯一且单调递增，直接放进一段迟早超过 65535 被编译器拒掉），
-        # 再按编译器自己的口径验一遍格式，验不过就不开建。
-        # 注意这句为什么不用 ${APP_VERSION:-（空）}：把非 ASCII 写进参数展开的默认值里，
-        # bash 3.2 的词法扫描会在右花括号前认错（报 unexpected EOF looking for matching `"'），
-        # 整步连第一行都跑不到。哪一个字节会带跑解析器没人记得住，所以这一段现在由
-        # 「shell 语法硬门」（check_packaging_manifest.py 第 11 条）交给 bash -n 自己判。
-        AV_SHOW="$APP_VERSION"
-        [ -n "$AV_SHOW" ] || AV_SHOW="（空）"
-        case "${APP_VERSION:-}" in
-          ''|*[!0-9]*) echo "::error::APP_VERSION 必须是纯数字（它要参与拼 VIProductVersion 的四段版本号），实际拿到「${AV_SHOW}」；拼错的版本号 makensis 只回一句 invalid format 就 abort，交付里根本没有安装包"; exit 1 ;;
+        # 一步没有安装包。这里不再「拼了就算」。
+        # 【本轮改这一刀】以前这里把 run_number 拆成两个 16 位字段自己算四段号，那是
+        # `tool_version.product_version` 同一件事的第二份实现。需求 2 要的是「一个包的
+        # 自己是哪一版只有一个来源」，而两份算法只会在哪天不一致时出问题（而且是
+        # 「安装包文件属性上的版本与随包自报的版本不是同一个数」这种谁都说不准的形状）。
+        # 现在显示号与四段号都问 tool_version，而它读的就是上面那一步写下去、并且随包
+        # 进包的那一份戳：编进 NSIS 的、产物自报的、发布清单里的从此是同一个数。
+        # 算不出来（戳没写、构建号不像数、超出四段可表达范围）就当场停：makensis 收下
+        # 一个它编不了的号只会回一句 invalid format 就 abort，交付里没有安装包，
+        # 而日志看着像编译器坏了。（这句不用 ${VAR:-（空）}：拿非 ASCII 写进参数展开的
+        # 默认值里，bash 3.2 的词法扫描会在右花括号前认错，整步连第一行都跑不到。
+        # 哪一个字节会带跑解析器没人记得住，所以这一段的语法由「shell 语法硬门」
+        # （check_packaging_manifest.py 第 11 条）交给 bash -n 自己判。）
+        DISPLAY_VER=$(python tool_version.py --print-field display) || {
+          echo "::error::显示版本号没能从随包构建戳里读出来（上面那一步 --write-stamp 没成功，或戳不在 b2bcollect_build/version.json）：宁可不编安装包，也不编一个哪版都不是的号"; exit 1; }
+        VER4=$(python tool_version.py --print-field product) || {
+          echo "::error::四段版本号（VIProductVersion）没能从随包构建戳里算出来（构建号不像数，或超出每段 16 位的可表达范围）：makensis 收下它只会回一句 invalid format 就 abort"; exit 1; }
+        # 形状仍按编译器自己的口径验一遍：上面两句绿不等于 makensis 认这个形状，
+        # 而这一步是唯一能把「形状不对」说成「形状不对」的地方。
+        DV_SHOW="$DISPLAY_VER"
+        [ -n "$DV_SHOW" ] || DV_SHOW="（空）"
+        case "$DISPLAY_VER" in
+          1.*) : ;;
+          *) echo "::error::从构建戳里读到的显示版本号「${DV_SHOW}」不是 1.<build> 那一档（戳与版本算法对不上，先查 tool_version 那一步）"; exit 1 ;;
         esac
-        VER4="1.$((APP_VERSION / 65536)).$((APP_VERSION % 65536)).0"
-        if [ "$APP_VERSION" -ge 4294967296 ]; then
-          echo "::error::run_number 已经到 ${APP_VERSION}，四段版本号（每段 16 位）装不下了：这一步不能悄悄放过，否则 makensis 收下一个它编不了的版本号，交付里根本没有安装包"
-          exit 1
-        fi
         if ! [[ "$VER4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "::error::拼出来的版本号「${VER4}」不是 makensis 要的 X.X.X.X（这一步自己算错了，别等编译器报）"; exit 1
+          echo "::error::tool_version 给出的四段号「${VER4}」不是 makensis 要的 X.X.X.X（它自己拼错了，别等编译器报）"; exit 1
         fi
-        echo "· 版本：显示 1.${APP_VERSION} / 文件属性 ${VER4}（四段，每段都在 16 位范围内）"
+        echo "· 版本：显示 ${DISPLAY_VER} / 文件属性 ${VER4}（两个都由随包构建戳算出，这一步不再自己拆字段）"
         # 禁掉 Git Bash 的「参数看着像路径就改写」：/DB2B_ROOT=... 这种 NSIS 定义被改写成
         # C:/Program Files/Git/DB2B_ROOT=... 之后编译器只会回一句 Usage；而日志文件名里
         # 带反斜杠时 GNU 工具还会给整行输出加转义前缀（上一节 sha256 就是栽在这上面）。
@@ -422,7 +483,7 @@ jobs:
         # 不是红一条日志。（离线仿真「关掉 pipefail 仍要认得编译器」那一味钉的就是这个。）
         set -o pipefail
         NSIS_RC=0
-        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="1.$APP_VERSION" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
+        "$MAKENSIS" -V4 /DB2B_ROOT="$WIN_ROOT" /DAPP_VERSION="$DISPLAY_VER" /DVER4="$VER4" installer/b2bcollect_setup.nsi 2>&1 | tee "$LOG" || NSIS_RC=${PIPESTATUS[0]}
         if [ "$NSIS_RC" -ne 0 ]; then
           echo "::error::makensis 编译安装包失败（退出码 ${NSIS_RC}，完整日志 ${LOG}）：没有安装包就不交付，绝不静默退化成只发一个 zip"
           exit 1
@@ -463,6 +524,21 @@ jobs:
         echo "✅ 安装包出自 makensis ${BANNER}（与钉住的 ${NSIS_PINNED}、sha256 已校验的那份一致）"
         ls -l B2bCollectToolSetup.exe B2bCollectTool_Win_portable.zip
 
+    - name: Generate release manifest (发布清单 latest_windows.json)
+      # 需求 2 的最后一块：制品上传之前，先把「这一版叫什么、更新了什么、该下哪一份包、
+      # 指纹多少」写成一份清单。字段名、平台键、档名、直链全部从 tool_update 取（不在这里
+      # 拼第二份），生成完立刻用读侧口径回读自己——自己写的清单被自己的读侧拒收，就在这
+      # 一步红，而不是等用户机器上来读（那时已经发出去了）。
+      # 排在上传之前是刻意的：清单没生成成功就不该进入「制品已发布、客户端却读不到有新版」
+      # 这种半吊子状态。构建号也在这里再确认一次（没能确认就不许发）。
+      shell: bash
+      run: |
+        python .github/scripts/make_release_manifest.py --platform win \
+          --artifact b2bcollect_build/B2bCollectToolSetup.exe \
+          --artifact b2bcollect_build/B2bCollectTool_Win_portable.zip \
+          --notes .github/release/b2bcollect_notes.md \
+          --out b2bcollect_build
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -470,13 +546,16 @@ jobs:
         path: |
           b2bcollect_build/B2bCollectToolSetup.exe
           b2bcollect_build/B2bCollectTool_Win_portable.zip
+          b2bcollect_build/latest_windows.json
         if-no-files-found: error
 
     - name: Publish to fixed OSS download links
-      # 固定直链机制（2026-11-17 用户拍板）：三份制品的下载链接永久不变，
+      # 固定直链机制（2026-11-17 用户拍板）：制品的下载链接永久不变，
       # 每次打包成功就覆盖同一批 key；上传后脚本用匿名 HEAD 自校验，
       # 不过门则本步红（GitHub 制品已在上面上传，不损失回退通道）。
+      # 清单排在最后两个参数位：上传脚本按命令行顺序一份一份传，旧清单多活几秒只是
+      # 「还没人知道有新版」，新清单先到位却指向还没上去的制品，才是真的装不上。
       env:
         OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
         OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-      run: python .github/scripts/upload_release_to_oss.py b2bcollect_build/B2bCollectToolSetup.exe b2bcollect_build/B2bCollectTool_Win_portable.zip
+      run: python .github/scripts/upload_release_to_oss.py b2bcollect_build/B2bCollectToolSetup.exe b2bcollect_build/B2bCollectTool_Win_portable.zip b2bcollect_build/latest_windows.json

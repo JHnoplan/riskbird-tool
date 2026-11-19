@@ -2,9 +2,9 @@
 b2bcollect_gui.py —— B2B 多平台企业数据自动采集工具（PyQt5 GUI）
 
 一个共享 Chrome，需浏览器的站各占一个标签并行采集：
-  · 关键词并行（9 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
+  · 关键词并行（8 站）：中国制造网 made-in-china.com / 八方资源网 b2b168.com /
     顺企网 11467.com / 爱采购 b2b.aipage.com / 麦麦B2B maimaib2b.com /
-    跨国采购网 globalimporter.net / 马可波罗 cn.makepolo.com / 世界工厂网 qiye.gongchang.com
+    跨国采购网 globalimporter.net / 马可波罗 cn.makepolo.com
     （除中国制造网外均纯 HTTP 不占标签）/ 1688（需登录，默认不勾）；
   · 名单驱动（企知道）：从「待采集公司名单」逐家补采，看门狗语义——名单空则休眠，
     关键词采集清洗掉的无联系方式废数据会自动回流到名单、唤醒企知道补采（变废为宝）。
@@ -101,6 +101,42 @@ def _fatal_log(exc):
             continue
 
 
+def _fatal_log_append(title: str, body: str = "") -> str:
+    """往同一份启动错误日志**追加**一条现场记录，返回真正落到的路径（写不进就空串）。
+
+    为什么需要「追加」这一手而不是复用 :func:`_fatal_log`：那条路是「启动即崩」，
+    整份覆盖写才对；这里要留的是**程序已经跑起来、窗口即将关掉**那一刻的故障
+    （自动重启没拉起来就是这一类）——界面日志还写得到，但窗口已经没了，没人会看到。
+    落点与崩溃日志同一个文件，是因为使用说明里只教了用户一处「把这份日志发回来」，
+    多一个文件名就等于多一次「找不到」。
+    """
+    import datetime
+    line = f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {title}"
+    if body:
+        line += f"\n    {body}"
+    for d in _fatal_log_dirs():
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / FATAL_LOG_NAME
+            with f.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            return str(f)
+        except OSError:
+            continue
+    return ""
+
+
+def _headless_session() -> bool:
+    """这一趟有没有可用的图形会话（CI 的 offscreen、无头机器都算没有）。
+
+    判定口径必须只有一份写法：「后台事件能不能弹模态」取决于屏幕前有没有人，判错的
+    两种后果都是卡死——一种是 CI 永久等一次不会来的点击（实测把整批拖到超时被 SIGABRT），
+    一种是用户当场看不到必须让他选的那一句。多个调用点各写一次 `os.environ.get(...)`
+    迟早会有一处忘了判，而那一处只能在流水线上才暴露。
+    """
+    return "offscreen" in str(os.environ.get("QT_QPA_PLATFORM") or "").lower()
+
+
 def _report_fatal_startup(exc) -> None:
     """把「工具起不来」这件事实说人话，并在用户找得到的地方留下一份日志。
 
@@ -117,7 +153,7 @@ def _report_fatal_startup(exc) -> None:
                 "详细堆栈见这份日志——先看第一个位置，找不到就看第二个：\n" + paths)
         # 没有可用图形会话时（CI 的 offscreen、无头机器）绝不弹模态框：弹了就等于
         # 等一次永远不会来的点击，症状从「起不来」变成「卡死」，比原故障更难查。
-        if "offscreen" in str(os.environ.get("QT_QPA_PLATFORM") or "").lower():
+        if _headless_session():
             print(f"❌ 工具启动失败（无图形会话，日志见下）：\n{body}", flush=True)
         else:
             QMessageBox.critical(None, "工具启动失败", body)
@@ -196,6 +232,30 @@ try:
     HAS_TOOL_CONFIG = True
 except ImportError:
     HAS_TOOL_CONFIG = False
+
+# Chrome 体检/安装通路（需求 3）：可选依赖同一套写法。它坏了只能退回「一句人工提示」，
+# 绝不能因为「想提醒用户装浏览器」这件事本身把工具带崩（本轮 Mac 崩溃的形状就是提醒
+# 链路里出了未捕获异常）。
+try:
+    import chrome_doctor as _chrome_doctor
+    HAS_CHROME_DOCTOR = True
+except ImportError:
+    HAS_CHROME_DOCTOR = False
+
+# 版本与升级通路（需求 2）：同一套可选依赖写法。它们坏了的唯一后果是「不提更新、
+# 说不清自己是哪一版」，绝不能因为「想提醒用户升级」这件事本身把工具带崩（与上面
+# Chrome 那一条同一理由、同一族事故形状）。界面每一处都要先看 HAS_* 再开口。
+try:
+    import tool_version as _tool_version
+    HAS_TOOL_VERSION = True
+except ImportError:
+    HAS_TOOL_VERSION = False
+
+try:
+    import tool_update as _tool_update
+    HAS_TOOL_UPDATE = True
+except ImportError:
+    HAS_TOOL_UPDATE = False
 
 # ── 启动台账：每一次「打开工具」都留下一行进程自己说得出真话的证据 ─────────────
 # 文件名与行格式只许有一份写法：交付门禁、离线测试、远程支持三方读的都是这一份。
@@ -846,13 +906,10 @@ SITE_TIPS = {
               "也不猜一个地址出来，免得把你的邮件发到陌生人邮箱里；⑤有的商家把手机号的前缀当成区号写进“电话”栏"
               "（如手机 19352178592 被写成“0193-52178592”），这种号看着像固话但全国没有这个区号、一定拨不通，"
               "工具会对着真实长途区号表核一遍再决定入库，手机号仍留在手机那一列。",
-    "gongchang": "世界工厂网 qiye.gongchang.com（全行业企业库）：关键词公司搜索→列表页取基本信息→"
-                "进店铺详情页补电话/邮箱/地址。纯 HTTP 不占浏览器标签。\n"
-                "列表页每页 20 家，每词最多 10 页（200 家），但电话覆盖率只有 28%，"
-                "所以工具会自动进每家店铺详情页补全联系方式（电话 100%、邮箱 60%、地址 20%）。\n"
-                "防采：连续请求过快会触发频控（返薄壳），工具自动重建会话并退避重试，已采数据不丢。\n"
-                "省份精准：选中一个省份时工具会把省份参数拼进搜索 URL（服务端筛），"
-                "选多个省时退回数据层核验（用公司名+地址判定属地）。",
+    # 世界工厂网（gongchang）已按用户指令下线（2026-11-19）：该站对重工业/科研院所类
+    # 主体几乎不收录（实测 132 家全称连续 0 命中），节流也撑不住（间隔 2 秒仍有 1/3
+    # 请求只返薄壳），留着只会白烧请求并拖慢整轮吞吐。采集器与注册面已一并删除；
+    # 不再留一份 tips 在此：留着就是「界面词表里还有一站、采集器里没有」那种对不上账的口径。
     "1688": "1688 www.1688.com：关键词→商品/店铺搜索→公司详情页。需先登录（有登录限制，故默认不勾选）；"
             "勾选后会弹窗提示并可一键打开 1688 登录页，请先在浏览器里确认已登录再开始采集。\n"
             "与其它需浏览器的站共享同一个 Chrome（各占自己标签），绝不会另开浏览器。",
@@ -1395,6 +1452,71 @@ class YzdBindWorker(QThread):
             self.finished_bind.emit(False, str(e))
         except Exception as e:
             self.finished_bind.emit(False, f"校验手机号异常：{e}")
+
+
+class ChromeDoctorWorker(QThread):
+    """Chrome 的体检与安装都走这一条后台路（两种动作共用一个 worker）。
+
+    为什么不在界面线程里直接跑：① 安装要跑 winget/brew 或下载官方包，实测 1-3 分钟，
+    在 GUI 线程里跑就是整窗冻结（用户会以为工具崩了，而本轮要消的正是这类误判）；
+    ② 体检在 Linux 上会起一次 `chrome --version` 子进程，10 秒上限内窗口同样得等；
+    ③ 装完必须**重新体检**才算数，这一步要能把逐条台账带回界面，而不是只返一个 bool。
+    """
+
+    logged = pyqtSignal(str)
+    # (动作名, 结果对象, 本层自身的失败原因)：第三格非空代表连问都没问出口
+    finished_doctor = pyqtSignal(str, object, str)
+
+    def __init__(self, mode="inspect", only=None):
+        super().__init__()
+        self.mode = mode
+        self.only = only
+
+    def run(self):
+        try:
+            if self.mode == "install":
+                res = _chrome_doctor.install(log=lambda m: self.logged.emit(m),
+                                             only=self.only)
+                self.finished_doctor.emit("install", res, "")
+                return
+            self.finished_doctor.emit("inspect", _chrome_doctor.inspect(), "")
+        except Exception as e:
+            # 这一句不省：任何未捕获异常都会让界面那侧的「正在检查」永远挂在屏幕上，
+            # 而屏幕上不会有一句话承认自己坏了（同批跑入口 _pick_reason 那条教训）
+            self.finished_doctor.emit(self.mode, None, f"{type(e).__name__}: {e}")
+
+
+class UpdateWorker(QThread):
+    """「有没有新版本」与「把新包下下来」都走这一条后台路（与 ChromeDoctorWorker 同族）。
+
+    为什么绝不能在界面线程里跑，这里比 Chrome 那一条更硬：清单请求的超时上限是
+    (10, 20) 秒，而制品是几百 MB，在 GUI 线程里跑就是整窗冻结几分钟——用户会把它当成
+    「工具崩了」，而本轮需求原话要的偏偏是「傻瓜式自动执行」：自动不能以冻结为代价，
+    否则用户学到的第一件事就是「别点那个按钮」。
+
+    与 Chrome 那一条共用同一个约定：第三格非空 = **连问都没问出口**（异常也必须回填），
+    因为界面那侧「正在检查更新…」需要一个能收账的出口，不然它永远挂在屏幕上。
+    """
+
+    logged = pyqtSignal(str)
+    # (动作名, 结果对象, 本层自身的失败原因)
+    finished_update = pyqtSignal(str, object, str)
+
+    def __init__(self, mode="check", artifact=None):
+        super().__init__()
+        self.mode = mode
+        self.artifact = artifact or {}
+
+    def run(self):
+        try:
+            if self.mode == "download":
+                res = _tool_update.download(self.artifact,
+                                            log=lambda m: self.logged.emit(m))
+                self.finished_update.emit("download", res, "")
+                return
+            self.finished_update.emit("check", _tool_update.check(), "")
+        except Exception as e:
+            self.finished_update.emit(self.mode, None, f"{type(e).__name__}: {e}")
 
 
 class YzdGroupsWorker(QThread):
@@ -2100,30 +2222,153 @@ def _ui_prefs_path() -> Path:
     return Path.home() / ".b2bcollect" / "ui_prefs.json"
 
 
-def _load_log_expanded_pref() -> bool:
-    """上次是展开还是收起；读不到一律按默认（收起）。"""
+def _load_ui_prefs() -> dict:
+    """整份界面偏好；读不到/读坏一律给空字典（每一项都有自己的默认值，缺项不是错误）。"""
     try:
         raw = json.loads(_ui_prefs_path().read_text(encoding="utf-8"))
-        return bool(raw.get(_LOG_PREF_KEY, _LOG_DEFAULT_EXPANDED))
+        return raw if isinstance(raw, dict) else {}
     except Exception:
-        return _LOG_DEFAULT_EXPANDED
+        return {}
 
 
-def _save_log_expanded_pref(expanded: bool) -> None:
+def _save_ui_pref(key: str, value) -> bool:
+    """写**一项**偏好：先读现值、只改这一格、再整份写回。
+
+    读-改-写不是保守而是必需：直接拿一份新字典盖上去会把别人那几项抹掉——只有一项
+    偏好时这个 bug 是隐身的（文件里本来就只住着它自己），加到第二项（这里的「这一版
+    先不提示」）就变成「勾了记住展开、下次却回到收起」这种两项互相顶掉的症状，而且
+    只能在使用一阵子之后才会被看到。
+    """
     try:
         p = _ui_prefs_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        try:
-            cur = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(cur, dict):
-                data = cur
-        except Exception:
-            data = {}
-        data[_LOG_PREF_KEY] = bool(expanded)
+        data = _load_ui_prefs()
+        data[str(key)] = value
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _load_log_expanded_pref() -> bool:
+    """上次是展开还是收起；读不到一律按默认（收起）。"""
+    return bool(_load_ui_prefs().get(_LOG_PREF_KEY, _LOG_DEFAULT_EXPANDED))
+
+
+def _save_log_expanded_pref(expanded: bool) -> None:
+    """只写那一项（落盘链路走上面那份读-改-写，不另开一份写法）。"""
+    _save_ui_pref(_LOG_PREF_KEY, bool(expanded))
+
+
+# ── 版本号：标题、常驻状态行、自报三处必须出自同一个函数（需求 2 第一块）──
+def _version_display() -> str:
+    """给人看的本机构建号。
+
+    模块没加载上也要照实说（而不是退回一个看起来合法的 `1.0`）：随包戳漏收、tool_version
+    没进包这两种形状的表现都是「版本号看起来没问题」，而远程支持第一句就是「你那版是几」。
+    """
+    if not HAS_TOOL_VERSION:
+        return "版本未知（版本模块没加载上）"
+    try:
+        return _tool_version.version_text()
+    except Exception as e:
+        return f"版本未知（读版本号出了错：{type(e).__name__}）"
+
+
+def _version_title_suffix() -> str:
+    """标题栏那一段版本号：远程支持时「你说的那版」得有个可指的地方。"""
+    return f"  ·  {_version_short()}"
+
+
+def _version_short() -> str:
+    """短到能钉在标题栏与状态行上的那一句；长句留给弹窗与日志（见 :func:`_version_display`）。
+
+    为什么不能直接把长句铺到界面上：「1.0-dev（未注入构建号，本机版本未能确认）」在开发机
+    上是常态，而 QLabel 的自然宽度会参与窗口最小宽计算——等于让一句诊断文案决定整个界面
+    的体型（同一族事故就是「日志里一行长路径把主按钮顶出屏幕」）。这里只负责短，长句照旧
+    完整出现在弹窗、日志与 --print-version 里，一个字都不少。
+    """
+    text = _version_display()
+    if not HAS_TOOL_VERSION:
+        return text
+    try:
+        if not _tool_version.certain():
+            return "版本未能确认"
+    except Exception:
+        return "版本未知"
+    return text
+
+
+def _update_state_line(eval_res: dict) -> str:
+    """五种状态各自那一句（纯函数：离线判据逐态钉得住，也不许在调用点各拼一份）。
+
+    为什么不能只留一句「检查完了」：五种答案对应五种完全不同的下一步——没网可以重试，
+    清单坏了要找发布人，本机不适配只能手动下载，本机版本未能确认要去查随包戳。把它们
+    汇成一句「检查完成」就是拿一个框的代价换回一堆猜。另外两个不许串档的口径：
+    「没能确认」≠「已是最新」，「没适配本机」≠「没有新版」。
+    """
+    state = str((eval_res or {}).get("state") or "")
+    cur = str(eval_res.get("current") or "（没能确认）")
+    latest = str(eval_res.get("latest") or "")
+    why = str(eval_res.get("why") or "")
+    if state == "update-available":
+        return f"🆕 有新版本可装：{latest or '（未知）'}（你现在是 {cur}）"
+    if state == "up-to-date":
+        return f"✅ 已经是最新版：{cur}（远端最新 {latest or '（没拿到）'}）"
+    if state == "unsupported":
+        return (f"ℹ 有新版 {latest or '（未知）'}，但这条自动通路没适配本机："
+                + (why or "不猜一个别的平台的包来装") + f"（本机现在：{cur}）")
+    if state == "bad-manifest":
+        return ("⚠ 发布那头留下的清单读不出可用内容，这不是你这台机器坏了：" + why
+                + "（请把这一句反馈给发布人；重试没用，修发布才有用）")
+    return ("⚠ 这次没能确认有没有新版本：" + (why or "没拿到远端信息")
+            + "（这是「问不出」，不是「没有新版」；过一会儿再点一次就行）")
+
+
+def _update_report_line(rep: dict) -> str:
+    """交接报告 → 那一句人话（同样纯函数：要验证它，不必真把工具装坏一次）。
+
+    报告里 `fell_back` 与 `verified` 两格必须分开说：前者是「没换成、但旧版本给你重新
+    打开了」（工具还能用），后者是「装上了但没能再确认一次新包自报的号」——把后者说成
+    「装好了」就是把一个发布缺陷藏起来，把前者说成「工具没了」就是凭空多一个工单。
+    """
+    if not rep:
+        return ""
+    ok = bool(rep.get("ok"))
+    fell = bool(rep.get("fell_back"))
+    why = str(rep.get("why") or "")
+    exp = int(rep.get("expect_build") or 0)
+    if ok and not fell:
+        tail = "" if rep.get("verified") else (
+            "（但没能再对一次新包自报的构建号：如果界面底下的版本号不是"
+            f"{exp or '目标那一版'}，请把这一句反馈给发布人）")
+        return (f"✅ 上一次升级已经装上{f'，目标版本构建号 {exp}' if exp else ''}{tail}"
+                "。这一版就是它，不用再做任何事。")
+    head = "⚠ 上一次升级没换成新版本"
+    if fell:
+        head += "（已经先把原来的版本重新打开了，工具照常能用）"
+    return head + "：" + (why or "交接进程没留下原因")
+
+
+# 「这一版先不提示」以外还需要一项记忆：上一次升级的报告已经回播过一次（见
+# :meth:`MainWindow._announce_update_report`），否则同一条失败每次开机都要重说一遍。
+_UPDATE_REPORT_PREF_KEY = "update_report_shown_ts"
+
+# 交接与自报那几个命令行开关。名字只有一个真源（tool_update 自己那几个常量），这边
+# 只在模块没加载上时才用一份同字面量的兼容默认值——注意不能直接 `getattr(_tool_update, ...)`：
+# import 失败时那个名字根本不存在，取它自己在导入阶段就会 NameError，把「升级模块没装好」
+# 升级成「工具根本起不来」。两处拼不出同一个名字时，症状是「参数认不出、于是静悄悄去
+# 建界面」（离线判据逐字对拍这一组常量）。
+UPDATE_APPLY_FLAG = "--apply-update"
+UPDATE_WAIT_PID_FLAG = "--wait-pid"
+UPDATE_EXPECT_BUILD_FLAG = "--expect-build"
+UPDATE_RELAUNCH_FLAG = "--relaunch"
+PRINT_VERSION_FLAG = "--print-version"
+if HAS_TOOL_UPDATE:
+    UPDATE_APPLY_FLAG = _tool_update.APPLY_FLAG
+    UPDATE_WAIT_PID_FLAG = _tool_update.WAIT_PID_FLAG
+    UPDATE_EXPECT_BUILD_FLAG = _tool_update.EXPECT_BUILD_FLAG
+    UPDATE_RELAUNCH_FLAG = _tool_update.RELAUNCH_FLAG
 
 
 # ── 带角标的按钮（收起面板上的「有几条没看」）────────────────────
@@ -2385,7 +2630,10 @@ class MainWindow(QMainWindow):
         # 工具名单独存一份：等级变更后界面形态会变（全功能号被降到受限档 = 精简版
         # 那一组能力），标题必须跟着重投影，不能只在构造时定一次就再也不过问。
         self._base_title = "B2B 多平台企业数据自动采集工具"
-        self.setWindowTitle(self._base_title + edition.title_suffix())
+        # 版本号跟着进标题（需求 2）：远程支持的第一句总是「你那版是几」，而在此之前
+        # 这个仓库里唯一能回答它的地方是安装包属性（产物自己不知道）。未能确认时也要写
+        # 出来（不写 = 把「没注戳的包」与「没人报障的包」看成同一件事）。
+        self.setWindowTitle(self._base_title + edition.title_suffix() + _version_title_suffix())
         # 小屏自适应：初始高度绝不超出可用屏高。写死尺寸在 13 寸笔电上会把
         # 底部日志裁到屏幕外（就是「输出日志看不到、得把窗口拉大」的另一半原因）。
         self.setMinimumSize(880, 620)
@@ -2474,7 +2722,6 @@ class MainWindow(QMainWindow):
         self._acl_caps = {}              # 建界面那一刻的能力位快照
         self._acl_pending = False        # 已收口、等待重启彻底生效（只提示一次）
         self._acl_stopped = False        # 被顶号后已走过优雅停止，不重复触发
-        self._acl_restart_asked = False  # 等级变更的重启询问只问一次（不成骚扰）
         self._acl_revoked_box_shown = False   # 顶号模态只弹一次（弹窗期间心跳仍在跑）
         self._relaunch_pending = None    # 落盘链路走完才拉起新实例
         self._build_ui()
@@ -2550,6 +2797,32 @@ class MainWindow(QMainWindow):
         # 都属于「界面已经开起来了，但用户该知道眼下是什么状态」，见两个方法本身。
         QTimer.singleShot(0, self._announce_relaunch)
         QTimer.singleShot(0, self._warn_read_only_runtime)
+        # Chrome 体检（需求 3，2026-11-19 实录）：给新用户装工具时对方没装 Chrome，
+        # 而界面只留了一句「请确认已安装 Google Chrome」——这把「有没有、去哪儿下、
+        # 装完怎么让工具发现」三个判断全推给了人。现在这三问由工具自己答，并递一个能点的
+        # 出口。只走后台、只出横幅：开屏就弹模态会把「先看一眼界面」这个动作变成「先关掉
+        # 一个窗」，而且装了 Chrome 的机器一条也不会多。
+        self._chrome_worker = None
+        self._chrome_info = None
+        self._chrome_banner_live = False
+        self._chrome_recheck_pending = False
+        QTimer.singleShot(0, self._check_chrome_env)
+        # 版本提示与升级（需求 2）：开机那一次延后几秒——启动回填、权限解析、Chrome 体检
+        # 都在这一刻抢磁盘与网络，而更新提示既不是最紧急的、也不该把前几件挤慢。只起一个
+        # 后台 worker；开机自动那一次只在真有新版时开口，而且那一句开在弹窗里（由人决定），
+        # 不在日志里隔一天重复刷同一条（见 _on_update_checked）。
+        self._update_worker = None
+        self._update_eval = None
+        self._update_banner_live = False
+        # 已交给交接进程的命令与兼容旧版本的启动命令（两种都只在这一条链路里有意义）：
+        # 前者由 closeEvent 的 accepted 分支拉起，后者只在交接进程都没起来时兼用。
+        self._update_handoff_cmd = None
+        self._update_handoff_fallback = None
+        QTimer.singleShot(self.UPDATE_CHECK_DELAY_MS,
+                          lambda: self._check_app_update(False))
+        # 上一次升级到底成了没有，由这一次开窗口说（交接进程的 stdout 进黑洞，不说就是
+        # 「点了确定、工具没了、没人知道为什么」）：见 :meth:`_announce_update_report`。
+        QTimer.singleShot(0, self._announce_update_report)
         # 窗口最小宽的校准留到首次显示：那时视口宽度才是真的（见 showEvent /
         # _apply_width_floor），构造阶段量出来的是默认尺寸，算出来的闸口是假的。
         self._width_floor_done = False
@@ -3613,7 +3886,34 @@ class MainWindow(QMainWindow):
             "展开/收起输出日志。采集进度、各路家数、保存结果都在上面那行常驻显示，"
             "日志里是逐条明细，需要排查时再展开。")
         self.btn_log_toggle.clicked.connect(self._toggle_log_area)
-        lay.addWidget(self.btn_log_toggle)
+        # 日志行那一排：折叠开关在左，版本与「检查更新」靠右（需求 2）。
+        # 为什么放这里而不是主操作行：升级与日志都属于「偶发的诊断/维护区」，而主操作行
+        # 已经被「开始采集/停止/导出」占住——天天点的按钮与几个月点一次的按钮挤在同一行，
+        # 前者会被顶窄、后者会被当成主流程的一部分。版本号就在底下常驻，远程支持
+        # 时对方念得出；「检查更新」点一次就能拿到五种答案里的那一个（不会静默）。
+        log_head = QHBoxLayout()
+        log_head.addWidget(self.btn_log_toggle)
+        log_head.addStretch()
+        self.lbl_version = QLabel(_version_short())
+        _vf = self.lbl_version.font()
+        _vf.setPointSize(9)
+        self.lbl_version.setFont(_vf)
+        self.lbl_version.setStyleSheet(_muted_style())
+        self.lbl_version.setToolTip(
+            "本机工具版本号（随包构建号）。报障时请连着这一句一起发回来。\n"
+            + _version_display())
+        log_head.addWidget(self.lbl_version)
+        self.btn_update_check = QPushButton("检查更新")
+        self.btn_update_check.setFlat(True)
+        self.btn_update_check.setCursor(Qt.PointingHandCursor)
+        self.btn_update_check.setMinimumHeight(22)
+        self.btn_update_check.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.btn_update_check.setToolTip(
+            "问一次有没有新版本。有新版本时会说明更新了什么、点确定之后会发生什么；\n"
+            "提示不是强制的，选了「这一版先不提示」就只在这一版上闭嘴，下次出新的还会提。")
+        self.btn_update_check.clicked.connect(lambda: self._check_app_update(True))
+        log_head.addWidget(self.btn_update_check)
+        lay.addLayout(log_head)
 
         # 日志用 QPlainTextEdit 而不是 QTextEdit：后者是富文本编辑器，每行 append 都要
         # 走一遍 HTML/段落解析 + 文档布局。本机 offscreen 实测（debug/perf_gui_probe.py
@@ -3970,8 +4270,18 @@ class MainWindow(QMainWindow):
         """
         if link == "#acl-restart":
             self._acl_prompt_restart()
+        elif link == "#update-show":
+            # 需求 2 那两条出口：这里必须是**用户主动点击**才能走到弹框，后台检查
+            # 只写横幅（与 #acl-restart 同一条红线，判据由离线套件钉住）
+            self._offer_update_show()
+        elif link == "#update-recheck":
+            self._check_app_update(True)
         elif link == "#app-relocate":
             self._offer_app_relocation()
+        elif link == "#chrome-fix":
+            self._offer_chrome_fix()
+        elif link == "#chrome-recheck":
+            self._check_chrome_env()
         # 其余未知动作静默忽略：横幅文案由别处拼装，将来加新链接不该在这里炸界面
 
     def _on_login_required(self, msg):
@@ -4651,9 +4961,9 @@ class MainWindow(QMainWindow):
         if not browser_ok[0]:
             self.btn_start.setEnabled(True)
             self.btn_start.setText("开始采集")
-            QMessageBox.warning(self, "浏览器启动失败",
-                                "共享浏览器未能启动，请确认已安装 Google Chrome。\n"
-                                "如果 Chrome 正在运行，请关闭后重试。")
+            # 不再只留一句「请确认已安装 Google Chrome」：这一句在本机真没装 Chrome 的
+            # 机器上等于把一个必须由程序完成的判断推给了人（需求 3 的原始事故）
+            self._on_browser_launch_failed()
             return
         self._on_log("✅ 共享浏览器已就绪")
         self.btn_start.setText("开始采集")
@@ -6753,7 +7063,7 @@ class MainWindow(QMainWindow):
         # 标题跟着生效档位重新投影：降到受限档后界面就是「精简版那一组能力」，标题还
         # 写着全功能版，用户会以为是功能坏了；反过来外部用户看到无后缀的标题，会以为
         # 拿到的是完整版并向你要更新。文案与入口必须由同一份投影给出（见 edition 第 5 条）。
-        new_title = self._base_title + edition.title_suffix()
+        new_title = self._base_title + edition.title_suffix() + _version_title_suffix()
         if new_title != self.windowTitle():
             self.setWindowTitle(new_title)
         # ② 的标题/tooltip 与「选择省份」的 tooltip 跟着重投影：它们报的都是「现在
@@ -6780,15 +7090,19 @@ class MainWindow(QMainWindow):
             "#fff3cd", "#7a5a00")
 
     def _acl_prompt_restart(self) -> bool:
-        """问一次要不要重启，返回 True = 已安排重启。同一进程只问一次，
-        不然每次心跳都弹一回就成了骚扰（用户拒了之后就靠横幅与日志提示）。
+        """问一次要不要重启，返回 True = 已安排重启。
 
         调用点只有一个：横幅上那条「重启工具现在生效」链接（用户主动点击）。
         后台链路一律不许走到这里——判据由 debug/edition_offline_test.py 钉住。
+
+        这里**绝不能**留一个「同一进程只问一次」的闸门（2026-11-19 实机报告的
+        「换绑后点重启无反应」正是它）：那个写法是后台骚扰时代的遗产，当时这条链路
+        会被心跳反复唤醒；现在唯一能走到这里的只有用户的一次点击。一次性闸门把
+        「用户刚才拒过」当成「用户再也不想重启」，而默认按钮就是「否」（Esc、✕ 也算「否」），
+        于是一次误触就永久废掉了这个进程里唯一的重启入口：横幅还在、链接还在那里、
+        点下去一个字都不说。实测取证：连点三次，弹窗只出现过一次。
+        防骚扰由**结构**保证（只有主动点击才问），而不是由一个会忘掉上下文的状态位保证。
         """
-        if getattr(self, "_acl_restart_asked", False):
-            return False
-        self._acl_restart_asked = True
         ret = QMessageBox.question(
             self, "权限等级已变更",
             "当前账号的权限等级与界面已建好的入口不一致：\n"
@@ -6799,6 +7113,9 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.Yes:
             self._relaunch_tool()
             return True
+        # 拒了必须把「改主意的入口仍在」说一句：不然下一条链接在用户眼里就是坏的
+        self._on_log("ℹ 已按你说的先不重启。横幅上那条「重启工具现在生效」随时可以再点，"
+                     "点一次问一次；不重启不影响已经在跑的采集，只是新权限的入口还没长出来。")
         return False
 
     def _relaunch_tool(self):
@@ -6866,7 +7183,18 @@ class MainWindow(QMainWindow):
             else:
                 subprocess.Popen(cmd, start_new_session=True, **kwargs)
         except Exception as e:
-            self._on_log(f"⚠ 自动重启失败（请手动重新打开工具）：{type(e).__name__}: {e}")
+            # 这一句只写进界面日志等于没写：走到这里时旧窗口已按「即将重启」关了，
+            # 新进程又没起来，屏幕上什么都不剩。所以同一件事必须留一份到用户自己
+            # 找得到的地方（与启动崩溃日志同一个文件、同一个「发回来给我们看」的口径）。
+            path = _fatal_log_append(
+                "自动重启没能拉起新实例（旧窗口已关闭，请手动重新打开工具）",
+                f"启动命令={cmd!r}\n    异常={type(e).__name__}: {e}")
+            self._on_log(f"⚠ 自动重启失败，请手动重新打开工具：{type(e).__name__}: {e}"
+                         + (f"（已记入：{path}）" if path else "（连日志也写不进去）"))
+
+    # 成功那一侧不在此处报话：这一行已经落在一个关掉了的窗口里，没人看得到。
+    # 闭环由新实例的 _announce_relaunch 说（「工具已重启，上一个实例 PID=… 已退出」），
+    # 那才是用户实际能看到的一句，也是「点了到底有没有生效」的唯一回销。
 
     def _announce_relaunch(self):
         """被重启链路拉起来时道一声「已经生效了」：闭环必须合上。
@@ -7030,6 +7358,613 @@ class MainWindow(QMainWindow):
             _tool_config.reveal_in_finder(paths)
         except Exception:
             pass
+
+    # ── 版本提示与一键升级（需求 2）───────────────────────────────
+    # 开机那一次延后的时长：启动回填、权限权威解析、Chrome 体检都在这一刻抢磁盘与网络，
+    # 而更新提示既不是最紧急的，也不该把前几件挤慢（上限同样别大到「用户已经开干了还没提」）。
+    UPDATE_CHECK_DELAY_MS = 6000
+
+    def _check_app_update(self, manual: bool = False, forced=None):
+        """问一次「有没有新版本」。`forced` 只给离线判据用：递一份现成结论，不走网络。
+
+        开机自动那一次与用户点「检查更新」那一次走同一个入口、同一个回调，差别只在
+        **说完之后**：手动那一次五种状态都要出声（点下去什么都没发生与按钮坏了，在人眼里
+        是同一件事）；自动那一次只在「真有新版、且这一版没被跳过」时才弹那一句。
+        """
+        if forced is not None:
+            self._on_update_checked("check", forced, "", manual=manual)
+            return
+        if not HAS_TOOL_UPDATE:
+            # 连模块都没加载上（打包清单漏收那一形）：只说这一句，不拿一个猜的版本号冒充结论
+            self._on_log("ℹ 升级模块（tool_update）没能加载，这一版不提更新；"
+                         "不影响其他功能（远程排障可跑 tool_update.py --check）")
+            return
+        if self._update_worker is not None and self._update_worker.isRunning():
+            if manual:
+                self._on_log("ℹ 上一个动作还在路上（检查或下载），等它回来就行："
+                             "同时问两次只会互相抢同一份清单与同一个临时文件")
+            return
+        if manual:
+            self._on_log("ℹ 正在检查有没有新版本…")
+        worker = UpdateWorker("check")
+        worker.logged.connect(self._on_log)
+        # manual 随参数一起带回来，而不是存一个「这次是手动」的状态位：状态位会被下一次
+        # 检查覆盖，而「谁按的钮」这件事只属于这一次调用。
+        worker.finished_update.connect(
+            lambda mode, res, err, m=manual: self._on_update_checked(mode, res, err, manual=m))
+        self._update_worker = worker
+        worker.start()
+
+    def _on_update_checked(self, mode: str, res, err: str, manual: bool = False):
+        """检查/下载回来的唯一落点：只按 tool_update 那五种互斥状态分派，这里不再判一遍。"""
+        if err:
+            # 连问都没问出口：最坏的做法是以工具的名义说「你已经是最新版」（那一格在
+            # 引擎里叫 unknown，叫不出「有」也叫不出「没有」）
+            self._on_log(f"⚠ 这一步没跑成：{err}（不影响已经在用的功能，"
+                         "稍后可以再点一次「检查更新」）")
+            return
+        if mode == "download":
+            self._after_update_download(res or {})
+            return
+        eval_res = res or {}
+        self._update_eval = eval_res
+        state = str(eval_res.get("state") or "")
+        # 出声的口径只有一份：手动那一次五态都要出声（点了没反应与按钮坏了在人眼里是同一
+        # 件事）；自动那一次只在「真有新版」时留一行结论（CI 与无头机器靠这一行知道结果），
+        # 其余四态保持安静。**每一态最多一行**：同一句在手动那一路打两遍，日志里就成了噪音，
+        # 而日志是远程排障时唯一能发回来的东西。
+        if manual or state == "update-available":
+            self._on_log(_update_state_line(eval_res))
+        if state != "update-available":
+            # 其余四态一律不弹「有更新」那个框：拿「没能确认」弹成「有新版本」是本模块从
+            # 第一行起就在避免的那一形。unsupported/bad-manifest 只在**人主动问过**之后留一条
+            # 横幅：开机自动那一次对四态闭嘴是对的——清单坏了是发布那头的事，天天挂一条黄条
+            # 只会让人以为是自己机器坏了，而这件事他本来无事可做；但人主动点了「检查更新」却
+            # 只留一行小字，就与「按钮坏了」分不出来，所以那两态当场补一条常显出口。
+            if state == "up-to-date" or (manual and state in ("unsupported", "bad-manifest")):
+                # 前一个是「先前那条已经不成立了，收掉」（不收起就是挂一条假提示过冬），
+                # 后两个是「人主动问过了，得给一条能点的出口」：两者都走同一个拼装口。
+                self._show_update_banner(eval_res)
+            return
+        if not manual and not _tool_update.should_prompt(eval_res, _load_ui_prefs()):
+            return      # 这一版已经说过「先不提示」：对它闭嘴，下次出更新的版本照旧会提
+        self._prompt_update(eval_res)
+
+    def _prompt_update(self, eval_res: dict):
+        """那个「非强制」的框：结论先说，会发生什么再说，同意发生在信息之后。
+
+        标题在 macOS 上常以 sheet 呈现、标题栏根本看不到（windowTitle() getter 还恒返空串），
+        所以**正文首行**就是结论本身。按钮按「本机能不能自动装」分派：不适配时**不许**在场
+        摆一个「现在就装」——那是一句兑现不了的承诺（同一族红线见结果弹窗那条）。
+        """
+        art = eval_res.get("artifact") or {}
+        # 「能不能自动装」只能问**这份制品自己**（有地址、有指纹才谈得上下载与校验），不能
+        # 问本机是什么平台：下面 `_offer_update_show` 会把「不适配」「清单坏了」那两态的结论
+        # 也送到这一带来，那时 artifact 是空的——按本机一判就会摆出一个「现在就装」，点下去只
+        # 能拿一句「缺少可用的下载地址」回报用户，那正是本模块反复承诺不写的那类话。
+        usable = bool(art.get("url") and art.get("sha256"))
+        kind = _tool_update.handoff_kind(art) if usable else "none"
+        head = (f"发现新版本：{eval_res.get('latest') or '（未知）'}\n"
+                f"你现在用的是：{eval_res.get('current') or '（没能确认）'}\n\n"
+                f"这次更新的内容：\n{_tool_update.notes_view(eval_res)}")
+        if kind == "none":
+            # 没有自动通路时，本机那几步一步也走不通，把它们列成「可走的路」同样是句假话；
+            # 这里只留「为什么不能」与「去哪儿自己下」，按钮也跟着只给下载页。
+            why = str(eval_res.get("why") or "").strip()
+            body = (head + "\n\n这一版没有能替你自动安装的做法（不猜一个别的平台的包来装）。"
+                    + (f"\n为什么：{why}" if why else "")
+                    + "\n想装的话点「打开新版下载页」，自己下载、自己放回原来的位置即可；"
+                      "不装也照常能用现在这一版。")
+        else:
+            steps = _tool_update.install_steps(art)
+            body = (head + "\n\n点「现在就装」之后，工具会自己走完这几步：\n"
+                    + "\n".join(f"{i}）{s.get('label')}\n    {s.get('detail')}"
+                                for i, s in enumerate(steps, 1)))
+        if _headless_session():
+            # CI / 无头机器：模态等于等一次永远不会来的点击（整批会挂到超时被收掉）。
+            # 结论那一行上面已经进日志了，这里只把出口留在屏幕上（不再重复打一遍）。
+            self._show_update_banner(eval_res)
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("有新版本可以装" if kind != "none" else "有新版本")
+        box.setText(body)
+        btn_now = None
+        btn_page = None
+        if kind != "none":
+            btn_now = box.addButton("现在就装（下载、装上、再自动打开）",
+                                    QMessageBox.AcceptRole)
+        else:
+            # 没有自动通路那一类机器（解压版、没适配的平台）照样值得知道「去哪儿下」：
+            # 工具知道这个地址，就递到人手上，而不是只说一句不行。
+            btn_page = box.addButton("打开新版下载页", QMessageBox.ActionRole)
+        btn_snooze = box.addButton("这一版先不提示", QMessageBox.RejectRole)
+        box.addButton("先不装（下次有新版还会提）", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if btn_now is not None and clicked is btn_now:
+            self._start_update_download(art, eval_res)
+            return
+        if clicked is btn_snooze:
+            latest = str(eval_res.get("latest") or "")
+            _save_ui_pref(_tool_update.SNOOZE_KEY, latest)
+            self._on_log("ℹ 好，这一版（" + (latest or "未知版本") + "）不再自动提示。"
+                         "出了更新的版本照旧会说；现在想装也可以点下面那行「检查更新」。")
+            return
+        if btn_page is not None and clicked is btn_page:
+            self._open_update_page()
+            return
+        # 两个「不」的区别要说清：取消只是这次先不装（下次开机还会提），不是永久关掉。
+        self._on_log("ℹ 这次先不装，工具照旧用现在这一版；下次开机还会照常提一次，"
+                     "也可以随时点下面那行「检查更新」。")
+
+    def _show_update_banner(self, eval_res: dict):
+        """需要人自己动手的那几态：只走横幅，不抢那个唯一的告警位。"""
+        state = str((eval_res or {}).get("state") or "")
+        latest = str((eval_res or {}).get("latest") or "（未知）")
+        if state == "update-available":
+            text = (f"有更新的版本 {latest}（不强制，不影响现在用）。"
+                    '<a href="#update-show">看更新说明，点一下就自动装好</a> · '
+                    '<a href="#update-recheck">先不装，回头再检查一次</a>')
+        elif state == "unsupported":
+            text = (f"新版本 {latest} 没适配本机的自动安装。"
+                    '<a href="#update-show">看更新说明与手动下载</a> · '
+                    '<a href="#update-recheck">再检查一次</a>')
+        elif state == "bad-manifest":
+            text = ("新版清单没读出可用的内容（这是发布那头的事，不是你这台机器坏了）。"
+                    '<a href="#update-show">看怎么说</a> · '
+                    '<a href="#update-recheck">再检查一次</a>')
+        else:
+            text = ''
+        if not text:
+            # 已是最新时该把先前那条收掉；unknown 不动（拿一个「问不出」去抹掉刚刚
+            # 说过的「有新版」，只会让人以为那个新版从来不存在）
+            if state == "up-to-date":
+                self._show_update_banner_text("")
+            return
+        if self._update_banner_live or self.banner.isHidden():
+            # 自己那条可以重写；别人的（欠登录、没 Chrome、要重启）不抢：日志里照旧有一句，
+            # 用户采集那一撞还会再看到（与 Chrome 那一条完全同一个口径：isHidden 不是 isVisible）。
+            self._show_update_banner_text(text)
+
+    def _show_update_banner_text(self, text: str):
+        """把升级那条话占到横幅上（空串 = 收回）。只由上面那一个拼装口进来。"""
+        if not text:
+            if self._update_banner_live:
+                self._hide_banner()
+            self._update_banner_live = False
+            return
+        self._show_banner(text, "#fff3cd", "#7a5a00")
+        self._update_banner_live = True
+
+    def _offer_update_show(self):
+        """横幅那条「看更新说明」的落点：有当场结论就用当场结论，没有就先问一次。"""
+        if not HAS_TOOL_UPDATE:
+            self._check_app_update(True)
+            return
+        if self._update_banner_live:
+            # 用户已经按这句话点进来了：这条横幅的使命完成，当场让位给弹窗
+            self._show_update_banner_text("")
+        ev = self._update_eval
+        if not ev:
+            self._check_app_update(True)
+            return
+        if str(ev.get("state") or "") != "update-available":
+            # 横幅那句话是按当前结论写的：「不适配本机」「清单坏了」这两态压根没有「装」
+            # 可言，不能拿升级弹窗那个壳去装它们——壳里那两个按钮在这两态一个都不该存在。
+            # 给的是把话说完的一段话：状态行 + 发布那头写的说明，出口交给那行「检查更新」。
+            text = (_update_state_line(ev) + "\n\n"
+                    "发布那头写的说明（原样给你，工具不替你编）：\n"
+                    + _tool_update.notes_view(ev))
+            if _headless_session():
+                self._on_log("ℹ " + text.replace("\n", " "))
+                return
+            QMessageBox.information(self, "版本检查", text)
+            return
+        self._prompt_update(ev)
+
+    def _start_update_download(self, art: dict, eval_res: dict):
+        """下载放后台：几百 MB、几分钟，在界面线程里跑就是整窗冻结。"""
+        if self._update_worker is not None and self._update_worker.isRunning():
+            self._on_log("⚠ 上一个动作还在路上（检查或下载），请等它结束")
+            return
+        # 正在采集时要先说清「装新版要先关掉工具」：closeEvent 会把本轮数据落盘，但
+        # 「跑了一半被升级打断」必须让人在点之前就知道，而不是事后从日志里发现。
+        if self.worker is not None and self.worker.isRunning():
+            if not self._confirm_update_while_crawling():
+                self._on_log("ℹ 好，先不动这次采集。装新版的入口仍在横幅上，"
+                             "等这轮跑完再点也可以。")
+                self._show_update_banner(eval_res)
+                return
+        self._on_log(f"ℹ 开始下载新版本 {eval_res.get('latest') or ''}：下到哪、下多大、"
+                     "指纹对不对都会逐行写在这里；期间可以继续用其他功能。")
+        worker = UpdateWorker("download", art)
+        worker.logged.connect(self._on_log)
+        worker.finished_update.connect(self._on_update_checked)
+        self._update_worker = worker
+        worker.start()
+
+    def _confirm_update_while_crawling(self) -> bool:
+        """采集进行中要点装新版时那一句确认：默认按钮是「否」（Esc/✕ 也算否）。"""
+        if _headless_session():
+            self._on_log("ℹ 现在正在采集，这一轮先不打断（无图形会话时不弹确认框）。")
+            return False
+        ret = QMessageBox.question(
+            self, "现在正在采集",
+            "装上这一版需要先把工具关掉：\n"
+            "· 本轮已采的数据与进度会在关掉之前落盘，不会丢；\n"
+            "· 但正在跑的那几家会停下，升级后可以按历史任务接着采。\n\n"
+            "现在升级并重启吗？（选「否」就等这轮跑完再装）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return ret == QMessageBox.Yes
+
+    def _after_update_download(self, res: dict):
+        """下载回来的落点：**只有校验通过**才允许进入交接，一步都不许提前。"""
+        if not res.get("ok"):
+            # 下一句里必须带上重试的出口：无图形会话时下面那个框根本不弹（在那里弹框
+            # 就是等一次永远不会来的点击），日志那一行就是唯一能递到人手上的东西。
+            self._on_log("❌ 这次没能拿到可用的安装包：" + str(res.get("why") or "下载没成功")
+                         + "。本机版本一个字没动，工具可以照常继续用；"
+                         "稍后再点一次「检查更新」重试就行。")
+            if not _headless_session():
+                QMessageBox.warning(
+                    self, "安装包没拿到",
+                    "没拿到可用的安装包，所以没有开始安装（本机版本没变）：\n"
+                    + str(res.get("why") or "下载没成功")
+                    + "\n\n现在可以照常继续用工具；稍后再点一次「检查更新」重试就行。")
+            return
+        ev = self._update_eval or {}
+        self._begin_update_handoff(str(res.get("path") or ""), int(ev.get("build") or 0))
+
+    def _begin_update_handoff(self, package: str, expect_build: int):
+        """把「等这个进程退出 → 装上 → 打开新工具」交给一个独立的交接进程。
+
+        为什么必须由另一个进程来做：正在跑的 exe 与它加载的 DLL 都不能被就地覆盖，
+        「自己换掉自己」在 Windows 上不是难而是做不到；macOS 虽然可以 unlink，但旧实例
+        也必须先真退出，bundle 才不会被写坏。所以这里只负责**安排**，动手的是走
+        `--apply-update` 重新进来的那一个进程（与命令行完全同一份实现，见 tool_update）。
+        """
+        base_cmd = self._relaunch_command()
+        if not base_cmd:
+            self._on_log("⚠ 没能确定本工具的启动方式，升级这一步先停下。安装包已经在这里了，"
+                         f"重开工具后再点「现在就装」即可：{package}")
+            return
+        package = str(package or "").strip()
+        if not package:
+            # 上一行说「下成了」却没递路径：两个自相矛盾的信号同时在场时，本模块的口径
+            # 一贯是「读不到 ≠ 有」——拿空路径去起交接进程，症状是屏幕上多出一个报错窗口，
+            # 而本机版本一个字没动，没人能从那个窗口看出发生了什么。
+            self._on_log("⚠ 下载回报成功了却没给出安装包路径，升级这一步先停下（本机版本"
+                         "一个字没动）。请再点一次「检查更新」重试；还是这样请把日志发回")
+            return
+        self._update_handoff_fallback = list(base_cmd)
+        # 最后那个路径是「装完之后拉起谁」：冻结态 base_cmd 就是那个 exe 本身，源码态是脚本
+        # （解释器不能当目标，否则弹出来的是一个解释器而不是工具）。
+        self._update_handoff_cmd = list(base_cmd) + [
+            UPDATE_APPLY_FLAG, str(package),
+            UPDATE_WAIT_PID_FLAG, str(os.getpid()),
+            UPDATE_EXPECT_BUILD_FLAG, str(int(expect_build or 0)),
+            UPDATE_RELAUNCH_FLAG, str(base_cmd[-1])]
+        # 旧的「重启」意图必须在这里让位：两个进程同时被拉起来的话，一个在装、一个在
+        # 抢同一个 Chrome 调试端口，症状就是「升级完反而打不开」。
+        self._relaunch_pending = None
+        self._on_log("ℹ 安装包已就位（下载与指纹校验都过了）。下面三件事按顺序自动做完："
+                     "① 本轮数据与进度落盘 → ② 关掉这个窗口 → ③ 由交接进程装上并打开新版本。"
+                     "装的过程大约半分钟到几分钟，其间屏幕上会短暂无工具，请别手动再开。")
+        self.close()
+
+    def _spawn_update_handoff(self):
+        """closeEvent 收尾之后调用：把交接进程丢出去（脱节于本进程），本进程随后退出。
+
+        与 :meth:`_spawn_relaunch` 同三条实测教训（工作目录不在包内、不用 shell、不靠猜
+        延时），差别只在这里多一层兼用：连交接进程都没起来时，屏幕上不能只剩「工具不见了」。
+        """
+        cmd = self._update_handoff_cmd
+        self._update_handoff_cmd = None
+        if not cmd:
+            return
+        import subprocess
+        kwargs = {"cwd": _relaunch_workdir(), "close_fds": True,
+                  "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                  "stderr": subprocess.DEVNULL}
+        try:
+            if sys.platform.startswith("win"):
+                flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+                subprocess.Popen(cmd, creationflags=flags, **kwargs)
+            else:
+                subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        except Exception as e:
+            # 两件事一起做：① 把这一句写进升级报告，下一个实例开窗时会读它说话（交接进程
+            # 自己连都没起来，不会有人替它写）；② 按普通重启把**当前这一版**先拉起来，
+            # 工具照常在——这一句只进日志等于没写，因为这一刻窗口已经关了。
+            if HAS_TOOL_UPDATE:
+                try:
+                    _tool_update.write_report({
+                        "ok": False, "kind": "none", "relaunched": False,
+                        "why": f"升级交接进程没能起来：{type(e).__name__}: {e}"})
+                except Exception:
+                    pass
+            path = _fatal_log_append(
+                "自动升级没能交出去（已按普通方式重新打开当前版本）",
+                f"启动命令={cmd!r}\n    异常={type(e).__name__}: {e}")
+            fb = self._update_handoff_fallback
+            self._update_handoff_fallback = None
+            if fb:
+                self._relaunch_pending = list(fb)
+                self._spawn_relaunch()
+            self._on_log(f"⚠ 自动升级没能交出去，正在按普通方式重新打开当前版本："
+                         f"{type(e).__name__}: {e}" + (f"（已记入：{path}）" if path else "（连日志也写不进去）"))
+
+    def _announce_update_report(self):
+        """上一次升级成没成，由这一次开窗口说：交接进程的话没人听得到（stdio 进黑洞）。
+
+        按报告里的 `ts` 记住已经播过哪一次，而不是「只要文件在就说」：否则同一条失败
+        每天开机都要重说一遍，那条日志不久就会被当成背景噪声划掉——而它真正有用的那一
+        次恰恰是紧接升级的那一次。成功那条只进日志（不需要任何人再做什么），失败那条
+        同时挂上横幅（用户此刻想知道的是「那我怎么办」）。
+        """
+        if not HAS_TOOL_UPDATE:
+            return
+        try:
+            rep = _tool_update.read_report()
+        except Exception as e:
+            self._on_log(f"⚠ 读上一次升级的结果出了错：{type(e).__name__}: {e}")
+            return
+        if not rep:
+            return
+        ts = str(rep.get("ts") or "")
+        if not ts:
+            return
+        if str(_load_ui_prefs().get(_UPDATE_REPORT_PREF_KEY) or "") == ts:
+            return
+        _save_ui_pref(_UPDATE_REPORT_PREF_KEY, ts)
+        line = _update_report_line(rep)
+        if not line:
+            return
+        self._on_log(line)
+        if not (rep.get("ok") and not rep.get("fell_back")):
+            self._show_update_banner_text(
+                "上一次升级没换成新版本，工具还是现在这一版（原因就在上面那行日志里）。"
+                '<a href="#update-recheck">再检查一次</a>')
+
+    def _open_update_page(self):
+        """自动通路不适配本机时的出口：把地址递到人手上，而不是只说一句「不行」。"""
+        url = _tool_update.portable_url() if HAS_TOOL_UPDATE else ""
+        if not url:
+            self._on_log("ℹ 没能从升级模块里拿到下载地址（模块没加载上），"
+                         "请联系发布人取当前版本的安装包")
+            return
+        import webbrowser
+        try:
+            webbrowser.open(url)
+            self._on_log("✅ 已在系统默认浏览器里打开下载地址：" + url)
+            return
+        except Exception as e:
+            self._on_log(f"⚠ 默认浏览器没能打开：{type(e).__name__}: {e}\n{url}")
+        try:
+            # 连浏览器都拉不起来时，至少让人能粘贴：地址进剪贴板比再造一遗文字强
+            QApplication.clipboard().setText(url)
+            self._on_log("   已经把地址复制到剪贴板了，粘贴到任意能上网的地方就能打开")
+        except Exception as e2:
+            self._on_log(f"   （剪贴板也没写成：{type(e2).__name__}: {e2}，"
+                         "请手动把上面那行地址贴到浏览器地址栏）")
+
+    # ── Chrome 体检与一键安装（需求 3）──────────────────────────────
+    def _check_chrome_env(self):
+        """起一次后台体检。已经在路上就复用，不并发起第二次。"""
+        if not HAS_CHROME_DOCTOR:
+            # 连体检模块都没加载上（打包清单漏收就是这一形）：继续用人工提示，不报崩栈
+            self._on_log("ℹ Chrome 环境检查模块没能加载，这一版只能继续用人工提示；"
+                         "不影响其他功能（远程排障可跑 chrome_doctor.py）")
+            return
+        if self._chrome_worker is not None and self._chrome_worker.isRunning():
+            return
+        worker = ChromeDoctorWorker("inspect")
+        worker.logged.connect(self._on_log)
+        worker.finished_doctor.connect(self._on_chrome_doctor)
+        self._chrome_worker = worker
+        worker.start()
+
+    def _on_chrome_doctor(self, mode: str, res, err: str):
+        """体检/安装回来的唯一落点：结论一律以**刚拿回来的那份**为准，不信「刚才说成功了」。"""
+        if err:
+            # 连问都没问出口。这时最不该做的事就是以工具的名义说「这台机器没装 Chrome」
+            self._on_log(f"⚠ Chrome 体检没跑成：{err}（不影响其他功能，"
+                         "稍后可以点横幅上的「再确认一次」）")
+            return
+        if mode == "install":
+            self._after_chrome_install(res or {})
+            return
+        info = res or {}
+        self._chrome_info = info
+        if info.get("installed"):
+            if self._chrome_recheck_pending:
+                self._chrome_recheck_pending = False
+                self._on_log("✅ 确认到了：" + str(info.get("launch_path") or ""))
+            if self._chrome_banner_live:
+                self._hide_banner()
+                self._chrome_banner_live = False
+            return
+        if not info.get("certain", True):
+            self._on_log("⚠ 这次没能确认本机有没有 Chrome："
+                         f"{info.get('probe_error', '')}——这是「读不到」不是「没装」，"
+                         "所以不劝你重装；关掉工具再打开一次多数会好")
+            return
+        self._show_chrome_banner(info)
+
+    def _show_chrome_banner(self, info: dict):
+        """没 Chrome 时的那条横幅：先说清后果，再给两个能点的出口。"""
+        self._on_log("⚠ " + _chrome_doctor.summary_text(info))
+        # isHidden 而不是 isVisible：isVisible 还要求整条祖先链都已经 show 过，
+        # 无头/未开窗时恒为 False，等于「不抢别人横幅」这条规矩永远测不到（离线判据
+        # 就是这么红的）；isHidden 记录的正是 setVisible 那一次动作本身。
+        if not self.banner.isHidden() and not self._chrome_banner_live:
+            # 已经有别的提示在场（欠登录、被拦、要重启）：不抢别人的横幅。
+            # 这句话仍然留在日志里，用户采集那一撞还会再看到一次。
+            return
+        self._show_banner(
+            "这台机器没找到 Google Chrome，浏览器采集那几路现在跑不了。"
+            '<a href="#chrome-fix">看怎么装（能代装就代装）</a> · '
+            '<a href="#chrome-recheck">我已经装好了，再确认一次</a>',
+            "#fff3cd", "#7a5a00")
+        self._chrome_banner_live = True
+
+    def _offer_chrome_fix(self):
+        """横幅那条「看怎么装」的落点：先问清再动手（装软件必须在用户当场同意之后）。"""
+        if not HAS_CHROME_DOCTOR:
+            self._check_chrome_env()
+            return
+        info = self._chrome_info
+        if info is None:
+            self._check_chrome_env()      # 还没量过：先量，量完横幅会把出口递上
+            self._on_log("正在确认这台机器有没有 Chrome，几秒就好…")
+            return
+        if info.get("installed"):
+            self._on_log("ℹ 已经确认本机有 Chrome：" + str(info.get("launch_path") or ""))
+            if self._chrome_banner_live:
+                self._hide_banner()
+                self._chrome_banner_live = False
+            return
+        steps = list(_chrome_doctor.install_plan(info))
+        lines = []
+        for i, step in enumerate(steps, 1):
+            detail = str(step.get("detail") or "").replace("\n", "\n    ")
+            lines.append(f"{i}）{step.get('label')}\n    {detail}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("这台机器没有 Google Chrome")
+        box.setText("工具可以替你把它装上。装之前先说清楚现在看到什么、每一步会发生什么：\n\n"
+                    + _chrome_doctor.summary_text(info) + "\n\n可走的路：\n" + "\n".join(lines))
+        head = steps[0] if steps and steps[0].get("how") != "page" else None
+        btn_auto = None
+        if head is not None:
+            # 按钮名字直接用通路自己的 label：「自动安装」这种统一说法在「先重新确认」
+            # 那一条上是假话（点了不会装任何东西）
+            btn_auto = box.addButton(str(head.get("label")), QMessageBox.AcceptRole)
+        btn_page = box.addButton("打开 Chrome 官网", QMessageBox.ActionRole)
+        box.addButton("先不装", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if btn_auto is not None and clicked is btn_auto:
+            if head.get("how") == "recheck":
+                self._check_chrome_env()   # 先重读一次，不拿读不到的结论去动用户的机器
+            else:
+                self._start_chrome_install([s.get("how") for s in steps
+                                            if s.get("how") != "page"])
+        elif clicked is btn_page:
+            self._open_chrome_page()
+
+    def _start_chrome_install(self, hows):
+        """把安装放到后台跑：这一步动辄几分钟，在界面线程里跑就是整窗冻结。"""
+        if self._chrome_worker is not None and self._chrome_worker.isRunning():
+            self._on_log("⚠ Chrome 的体检/安装还在跑，请等它结束（同时跑两次只会互相抢）")
+            return
+        self._on_log("ℹ 开始安装 Chrome（可能弹一次系统授权窗，约 1-3 分钟；"
+                     "期间可以继续用其他功能）")
+        worker = ChromeDoctorWorker("install", only=hows)
+        worker.logged.connect(self._on_log)
+        worker.finished_doctor.connect(self._on_chrome_doctor)
+        self._chrome_worker = worker
+        worker.start()
+
+    def _after_chrome_install(self, res: dict):
+        """安装回来的台账逐条播报；成败一律以**重新体检**为准，不信命令退出码。"""
+        info = res.get("info") if isinstance(res.get("info"), dict) else {}
+        if info:
+            self._chrome_info = info
+        for item in res.get("tried") or []:
+            self._on_log("   · " + str(item.get("label") or item.get("how")) + "："
+                         + ("成功" if item.get("ok") else "没走通：" + str(item.get("why") or "")))
+        if res.get("ok"):
+            if self._chrome_banner_live:
+                self._hide_banner()
+                self._chrome_banner_live = False
+            done = ("✅ Chrome 已就位：" + str(info.get("launch_path") or "")
+                    + "\n现在直接点「开始采集」就行，不用重启工具。")
+            self._on_log(done)
+            # 用户等了几分钟，得当场告诉他，不能只留一行日志让人自己翻
+            QMessageBox.information(self, "Chrome 装好了", done)
+            return
+        if res.get("note"):
+            self._on_log("ℹ " + str(res["note"]))
+        tail = "；".join(f"{t.get('label')}：{t.get('why')}"
+                          for t in (res.get("tried") or []) if not t.get("ok"))
+        self._on_log("⚠ 自动安装没走通：" + (tail or "这台机器上没有可走的自动通路"))
+        page = str(res.get("page") or _chrome_doctor.PAGE_OFFICIAL)
+        self._chrome_banner_live = False
+        self._show_banner(
+            "自动安装没走通（上面逐条写了为什么）。还是可以用官方地址手动下载："
+            f"{page} 装完点 "
+            '<a href="#chrome-recheck">我已经装好了，再确认一次</a>',
+            "#fff3cd", "#7a5a00")
+        self._chrome_banner_live = True
+
+    def _open_chrome_page(self):
+        """兜底出口：打开官网；打不开就连地址一起复制走（那正是没装浏览器的机器）。"""
+        if not HAS_CHROME_DOCTOR:
+            return
+        res = _chrome_doctor.open_official_page()
+        if res.get("ok"):
+            self._on_log("✅ 已在本机默认浏览器里打开 Chrome 官网："
+                         f"{res.get('url', '')}\n装完回到工具点「我已经装好了，再确认一次」即可")
+            return
+        url = _chrome_doctor.PAGE_OFFICIAL
+        self._on_log("⚠ " + str(res.get("why") or "官网没打开") + f"\n{url}")
+        try:
+            # 系统浏览器都拉不起来时，至少让人能粘贴：地址复制到剪贴板比再造一遍文字强
+            QApplication.clipboard().setText(url)
+            self._on_log("   已经把官方地址复制到剪贴板了，粘贴到任意能上网的地方就能打开")
+        except Exception as e:
+            self._on_log(f"   （剪贴板也没写成：{type(e).__name__}: {e}，"
+                         "请手动把上面那行地址贴到浏览器地址栏）")
+
+    def _on_browser_launch_failed(self):
+        """共享浏览器起不来：分三种人说，每一种都带一个能点的动作。
+
+        旧写法只有一句把判断推回给人工的话，而本次实际发生的就是人替人下载
+        Chrome 并调半小时（需求 3 的原始事故）。现在三岔各说各的：
+        - 已经量过且确实没有 ⇒ 不再重复那句没用的话，直接递处置；
+        - 还没量过 ⇒ 先起后台体检，这一句照旧说，并给一个当场重问的按钮；
+        - 本机确认装着 ⇒ 说的是「先完全关掉再试」，不劝人再下一遍。
+        """
+        info = self._chrome_info
+        if not HAS_CHROME_DOCTOR:
+            # 体检模块没进包（打包清单漏收就是这一形）：退回人工确认那句话。这时候绝不能
+            # 提「横幅里会给出看怎么装」，因为那条横幅根本不会出现——许一个不在场的出口
+            # 比不许诺更坏（用户会盯着一条永远不出现的提示等）。
+            QMessageBox.warning(
+                self, "浏览器启动失败",
+                "共享浏览器未能启动。\n"
+                "· 如果 Chrome 正在运行，请先把它完全关掉再点一次「开始采集」；\n"
+                "· 请确认已安装 Google Chrome，没装的话去 google.com/chrome 下载。\n"
+                "（这一版的 Chrome 自动检查模块没能加载，只能人工确认，不影响其他功能）")
+            return
+        if info is not None and not info.get("installed"):
+            # 已经知道没有：直接递处置（recheck / 代装 / 官网都在那一路里分清）
+            self._offer_chrome_fix()
+            return
+        if info is None:
+            # 还没量过（启动那一次没回、或刚重开工具）：先起后台体检，这句话照旧说
+            self._check_chrome_env()
+        lines = ["共享浏览器未能启动。",
+                 "· 如果 Chrome 正在运行，请先把它完全关掉再点一次「开始采集」。"]
+        if info is not None and info.get("installed"):
+            lines.append("· 本机已确认装着 Chrome：" + str(info.get("launch_path") or "")
+                         + "，这一步不用你再去下载。先把它完全退出再点一次「开始采集」，"
+                           "还不行就把日志最后几行发回来。")
+        else:
+            lines.append("· 工具上方横幅里会给出「看怎么装」（能代装就代装）。")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("浏览器启动失败")
+        box.setText("\n".join(lines))
+        btn_probe = box.addButton("确认一下本机有没有 Chrome", QMessageBox.AcceptRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is btn_probe:
+            self._chrome_recheck_pending = True
+            self._check_chrome_env()
 
     def _open_acl_admin(self):
         """权限管理面板（只有等级 0 的账号能看到这个入口）。"""
@@ -7235,14 +8170,18 @@ class MainWindow(QMainWindow):
                             self._acl_stopped = False
                         _guard.refresh_blocking(timeout=6.0)
                         allowed, reason = _guard.check()
-                        # 等级与界面不一致时（换了个不同等级的账号）当场收口 + 提示重启
-                        self._acl_sync_level()
                     except Exception as e:
                         # 异常也是一次失败的登记：必须进弹窗口径。旧版在这里只记
                         # 日志、弹窗照旧「绑定成功」——同一个缺陷的第二个入口。
                         claimed, claim_msg = False, f"登记过程出错（{type(e).__name__}）"
                 else:
                     claim_msg = "账号没能保存到本地，未进行设备登记"
+            # 等级收口不搭设备登记-success 的车：旧写法把它放在 try 里、又是最后一步，
+            # claim_device 一抛异常就连带跳过——症状正是「换了个不同等级的号，界面还是
+            # 旧号那一套入口，也没人叫我去重启」。换绑带来的入口差异只跟等级有关，
+            # 跟这台机器能不能登记上设备是两个问题，必须各自算完。
+            if HAS_ACL_GUARD and saved:
+                self._acl_sync_level()
             title, body, warn = self._bind_result_dialog(
                 msg, saved, claimed, claim_msg, allowed, reason,
                 acl=HAS_ACL_GUARD)
@@ -7462,10 +8401,35 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _announce_close_blocked(self):
+        """这次关窗被拦下了：把「你是为了什么才关的」连起来说。
+
+        需求 4 那一族的全部证据只在这一刻：上面那些拒绝路径各自弹了框（「请等一下」），
+        但没人把它们与「你是为了重启/为了升级才关窗的」连起来；不连上就是当场没人认领
+        的静默。本函数必须在**每一个**提前 return 的拒绝路径上调用——只在函数结尾调用的
+        写法会漏掉上面那一条：拦下得越早，那句交代越不该缺席（离线判据直接盯这一点）。
+        """
+        if self._relaunch_pending:
+            self._on_log("⚠ 没能重启：这次关窗被拦下了（上面那句就是拦下它的原因）。"
+                         "等当前动作结束后再点一次横幅上那条「重启工具现在生效」就行。")
+        if self._update_handoff_cmd:
+            # 需求 4 的同一口径：这一次关窗是用户点了「现在就装」才关的，拦下关窗
+            # 却不交代，屏幕上就只剩「点了确定、没装上、也没一句话」。好消息是现成的：
+            # 安装包已经下载并校验过了，所以那句给的是可执行的下一步（不必重下）。
+            self._on_log("⚠ 没能开始升级：这次关窗被拦下了（上面那句就是原因）。"
+                         "安装包已经下好并核对过，等当前动作结束后再点一次「检查更新」→"
+                         "「现在就装」就行，不必重下。")
+        self._relaunch_pending = None
+        self._update_handoff_cmd = None
+        self._update_handoff_fallback = None
+
     def closeEvent(self, ev):
         if self._yzd_importing:
             QMessageBox.information(self, "请等一下", "正在导入云展客户库，请等导入完成后再关闭程序。")
             ev.ignore()
+            # 这一支也必须把「你是为了升级/重启才关的」说出来：它比下面那一支更早 return，
+            # 把交代只写在函数结尾就等于给这条路留了一个静默洞（症状就是需求 4 那条）。
+            self._announce_close_blocked()
             return
         # 断开 refreshed 连接：守卫是进程级单例，比本窗口活得久。窗口析构后后台线程
         # 再发一次信号，排队的槽调用就落在一个已经销毁的 QObject 上。心跳定时器挂在
@@ -7523,9 +8487,15 @@ class MainWindow(QMainWindow):
         # 放在 closeEvent 开头会变成「新进程已经起来、旧进程还没把 Chrome 和
         # 这批数据放下来」，两个实例抢同一个调试端口，谁都不确定谁能活下来。
         if not ev.isAccepted():
-            self._relaunch_pending = None
+            self._announce_close_blocked()
         else:
-            self._spawn_relaunch()
+            if self._update_handoff_cmd:
+                # 升级那一条排在普通重启之前：_begin_update_handoff 已经把自己那份旧重启
+                # 意图清掉了，两个交接进程同时拉起只会互抢安装目录与 Chrome 调试端口。
+                # 新工具由交接进程装完之后负责拉起，这里绝不另起一份（起了就是旧版本）。
+                self._spawn_update_handoff()
+            else:
+                self._spawn_relaunch()
 
 
 def _app_stylesheet():
@@ -7851,7 +8821,49 @@ def _state_dir_entry() -> int:
     return 1
 
 
+def _print_version_entry(argv) -> int:
+    """产物自报版本号（发包门禁 + 远程排障）：**不建界面、不联网**，只说运行时真读到的那一份。
+
+    为什么必须让产物自己说：开发机上跑源码量到的永远是源码，不是发货那个包；--add-data
+    漏收 version.json 这一族事故只有让包自己开口才查得出来（与 --acl-doctor 同一条理由）。
+    本步**只负责如实报**，「对不对」由 CI 拿注入值与这份输出对拍——两处各自判一次就会
+    出现「CI 绿着而包里的模块读出另一个号」。参数原样转给模块自己的 CLI（不剥 --print-version：
+    剩个空列表会被模块当成「打帮助」，反而把一个取证请求变成了无结论的 0）。不建界面、不联网。
+    """
+    if HAS_TOOL_CONFIG:
+        _tool_config.force_utf8_stdout()
+    if not HAS_TOOL_VERSION:
+        print("❌ 版本模块（tool_version）没能加载：这个包连自己是哪一版都说不出来，"
+              "这是打包清单漏收，按红处理", flush=True)
+        return 3
+    return int(_tool_version.main(argv) or 0)
+
+
+def _apply_update_entry(argv) -> int:
+    """升级交接进程的本体：认得 --apply-update 就**绝不建界面**，装完拉起新工具再退出。
+
+    实现整个转给 tool_update.main：那里已经有同一份参数解析、同一条 run_handoff、同一份
+    报告落盘。界面上「点确定」之后发生的事必须能在命令行上逐字复现；两处各写一份的话，
+    线上永远只会跑到其中一份（而这一条直接写在用户硬盘上）。
+    """
+    if HAS_TOOL_CONFIG:
+        _tool_config.force_utf8_stdout()
+    if not HAS_TOOL_UPDATE:
+        print("❌ 升级模块（tool_update）没能加载：这个包不能自动升级。"
+              "请手动打开下载好的安装包，并把这句话反馈给发布人", flush=True)
+        return 3
+    return int(_tool_update.main(argv) or 0)
+
+
 def main():
+    # 产物自报与升级交接排在最前（连状态目录之前）：两条都**必须**在没有图形会话的地方
+    # 也能跑，而且一旦认成「不认识」就会退化到建界面——那一刻在 Windows 上正占着安装
+    # 目录，交接因此永远装不动；在 CI 上则挂在没有显示会话的启动里。宁可先退一句红，
+    # 也不能多开一个窗。
+    if PRINT_VERSION_FLAG in sys.argv[1:]:
+        sys.exit(_print_version_entry(sys.argv[1:]))
+    if UPDATE_APPLY_FLAG in sys.argv[1:]:
+        sys.exit(_apply_update_entry(sys.argv[1:]))
     # 状态目录查询排在自检之前：它只要一个路径，连权限服务都不必碰。放在后面就会被
     # doctor 的联网判定拖慢，门禁取落点这一步也不该依赖「这台机器连得上 OSS」。
     if STATE_DIR_FLAG in sys.argv[1:]:

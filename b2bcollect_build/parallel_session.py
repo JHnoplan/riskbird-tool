@@ -2,13 +2,13 @@
 
 职责：
   · mic / b2b168 / 顺企网(11467) / 爱采购(aipage) / 麦麦B2B(maimaib2b)
-    / 跨国采购网(globalimporter) / 马可波罗(makepolo) / 世界工厂网(gongchang)
-    / 1688 九个**关键词并行**采集器
+    / 跨国采购网(globalimporter) / 马可波罗(makepolo)
+    / 1688 八个**关键词并行**采集器
     ＋ 企知道(qzd) 一个**名单驱动**通道（从待采集公司名单逐家补采，看门狗语义：
     名单空则休眠，废数据回流后自动苏醒），按界面开关决定谁参与本轮；
   · crawl(keywords) 在**各自的线程**里并行推进各站点（裸 CDP 命令通道彼此独立，
     每条命令显式带本站标签 ws 地址，故各线程真并行、互不抢活动标签；
-    纯 HTTP 站 b2b168/11467/aipage/maimaib2b/globalimporter/makepolo/gongchang 不占标签（其中两站被反采质询时才临时
+    纯 HTTP 站 b2b168/11467/aipage/maimaib2b/globalimporter/makepolo 不占标签（其中两站被反采质询时才临时
     借一个标签过盾）；1688/企知道用 Selenium 附加同一
     共享 Chrome，各占自己的标签/窗口，绝不起第二个浏览器实例）；
   · 把各采集器的信号汇聚到 session 级信号，界面只连一处即可；
@@ -60,7 +60,6 @@ from aipage_crawler import AipageCrawler
 from maimaib2b_crawler import Maimaib2bCrawler
 from gi_crawler import GiCrawler
 from makepolo_crawler import MakepoloCrawler
-from gongchang_crawler import GongchangCrawler
 from pending_companies import PendingCompanyList, extract_company_names
 import site_adapters as _adapters
 # 性能治理（资源探测 + 线程退出广播）。本文件只用 DoneBoard：等待各路采集线程时
@@ -80,16 +79,24 @@ except Exception:
 #   goepe 关键词公司搜索是 JS 后加载（纯 HTTP 只会拿到全关键词相同的固定推荐位）；
 #   b2b818 真实但易触发对端 WAF 出口 IP 封锁；qympw 名片库对深度工业词覆盖过薄——
 #   三者数据质量不达要求，已从工具移除，采集器文件一并删除）
+# （gongchang 世界工厂网按用户指令下线（2026-11-19「质量太差了」）：不是主观印象，是
+#   两轮实测都打回——用中国海洋装备展 833 家展商全称逐家反查时 qiye.gongchang.com 连续
+#   132 家**全部 0 命中**（HTTP 200 正常页但解析不出条目），www 侧各路径一律 404 或固定
+#   22KB 海外空壳页；节流实测同 Session 连续 15 次请求，间隔 0.5s 成功率仅 27%、1.0s 仅
+#   40%、2.0s 也只有 67%（其余返薄壳）。该站商户库以消费品/通用制成品供应商为主，对
+#   重工业与科研院所类主体几乎不收录：命中率低到「白烧上百次请求拖慢整轮吞吐」的地步。
+#   采集器文件一并删除，不留「保留但不注册」的中间态——gys 那一族留着是因为将来可能攻坚，
+#   这一站没有那个前提。）
 SITE_ORDER = ["mic", "b2b168", "11467", "aipage", "maimaib2b",
-              "globalimporter", "makepolo", "gongchang"]
+              "globalimporter", "makepolo"]
 SITE_CLASSES = {"mic": MicCrawler, "b2b168": B2b168Crawler,
                 "11467": Qihuo11467Crawler, "aipage": AipageCrawler,
                 "maimaib2b": Maimaib2bCrawler, "globalimporter": GiCrawler,
-                "makepolo": MakepoloCrawler, "gongchang": GongchangCrawler}
+                "makepolo": MakepoloCrawler}
 SITE_NAMES = {"mic": "中国制造网", "b2b168": "八方资源网",
               "11467": "顺企网", "aipage": "爱采购",
               "maimaib2b": "麦麦B2B", "globalimporter": "跨国采购网",
-              "makepolo": "马可波罗", "gongchang": "世界工厂网"}
+              "makepolo": "马可波罗"}
 # Selenium 附加通道（共享同一 Chrome，各自管自己的标签/窗口）
 if _adapters.HAS_1688:
     SITE_ORDER.append("1688")

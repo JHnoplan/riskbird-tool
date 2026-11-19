@@ -688,6 +688,144 @@ def test_management():
             "whoami 同时报出「在不在名单」和「远端认的是不是本机」")
 
 
+def _acl_writes(c):
+    """只数**名单文件**的写回次数。
+
+    不能直接拿 ``len(c.writes)``：每个管理动作背后会走一次 ``_sync_local``，那一步会
+    顺手把本机设备分片登记上去（写的是 ``acl/devices/*.json``）。把那个也算进来，
+    「一次编辑 = 一个 version」这条判据就永远绿不了，而且它报的数也不能解读。
+    """
+    return sum(1 for k, _ in c.writes if k == ag.ACL_KEY)
+
+
+# ══════════════════════════════════════════════════════ E2. 账号备注
+
+def test_account_notes():
+    """备注（这是谁的号）：存储字段、不参与判定、与等级共用一次写回。
+
+    备注看起来是功能里最无关痛痒的一栏，它恰好也是最能埋事故的一栏：它住在名单文件里，
+    所以上面每一条写回都可能把它洗掉或把它变成假记号。下面每组都盯着一个具体事故：
+    旧名单读崩、两个管理员互相洗备注、号删了备注留下复用、备注影响权限、一次编辑两个
+    version。
+    """
+    print("\n═══ E2. 名单备注（这是谁的号） ═══")
+    long_note = "市场部张三"
+    limit = ag.ACCOUNT_NOTE_MAX
+
+    # ── 向后兼容：旧名单根本没这个字段 ──
+    old = FakeOSS(accounts=[ADMIN, STD], grants={ADMIN: 0, STD: 1})
+    _fresh(ADMIN, old)
+    doc0, _ = AccessGuard.load_document(old)
+    _assert("account_notes" in doc0,
+            "读侧永远带 account_notes 键（面板不用为旧名单写一套 if）")
+    _assert_eq(AccessGuard.describe_account_notes(doc=doc0), {},
+               "旧名单没备注字段 = 「没人写过」，不是「名单坏了」")
+    _assert(doc0["grants"] == {ADMIN: 0, STD: 1}, "读侧补字段不动等级那份真源")
+
+    # ── 脏数据宽容：备注写成人手搓的形状也不许把整份名单读崩 ──
+    dirty = {"accounts": [ADMIN, STD], "grants": {ADMIN: 0, STD: 1},
+             "account_notes": {
+                 ADMIN: "  张三   离职前勿删  ",        # 多空格/换行类空白
+                 STD: ["李四", "市场部"],                # 写成了列表
+                 "1390013900": "号码少一位不该出现",
+                 "23900139000": "不以 1 开头不该出现"}}
+    got = ag._parse_account_notes(dirty)
+    _assert_eq(got.get(ADMIN), "张三 离职前勿删", "换行类空白压成空格（表格不被顶成多行）")
+    _assert_eq(got.get(STD), "李四 市场部",
+               "列表形状按顺序拼成一句（而不是把 ['李四', '市场部'] 这种字面量映到表格里）")
+    _assert("1390013900" not in got and "23900139000" not in got,
+            "非法号码的备注直接丢掉（留着就是一条没人能对上的孤条目）")
+    _assert_eq(ag._parse_account_notes(None), {}, "备注解析对 None 也不抛")
+    _assert_eq(len(ag._parse_account_notes({"account_notes": {ADMIN: "啊" * 200}})[ADMIN]),
+               limit, f"读侧按上限截到 {limit} 字（旧数据不能因为改动上限而读崩）")
+
+    # ── 一次写入：加号 + 备注 = 一个 version ──
+    cli = FakeOSS(accounts=[ADMIN], grants={ADMIN: 0})
+    _fresh(ADMIN, cli)
+    r = AccessGuard.add_accounts([f"{STD}=1"], account_notes={STD: long_note}, client=cli)
+    _assert_eq(_acl_writes(cli), 1, "加号带备注只写回一次（两次写=两份可观察中间态）")
+    _assert_eq(r["version"], 2,
+               "没有 version 的旧名单按 1 起算、写回就是 2（一次编辑只抬一个编号，不是两个）")
+    _assert_eq(r["account_notes"].get(STD), long_note, "备注与新号同批落盘")
+    doc1, _ = AccessGuard.load_document(cli)
+    _assert_eq(doc1["grants"][STD], 1, "备注不参与权限判定：等级仍是提交的那一档")
+
+    # ── 备注绝不允许影响判定（这一条被破坏的后果是「换了句备注就把人降了」） ──
+    levels, declared = AccessGuard.describe_levels(doc=doc1)
+    _assert_eq(levels, {ADMIN: 0, STD: 1}, "写了备注之后 describe_levels 一个字节都没变")
+
+    # ── 增量覆盖：两个管理员各写各的号，不许互相洗掉 ──
+    r2 = AccessGuard.set_account_notes([f"{ADMIN}=本机主用"], client=cli)
+    _assert_eq(r2["account_notes"].get(STD), long_note,
+               "改一个号的备注不许洗掉别人的备注（全量替换就是这个后果）")
+    _assert_eq(r2["changed"], {ADMIN: "本机主用"}, "changed 只包含本次真正改过的号")
+    _assert_eq(AccessGuard.load_document(cli)[0]["account_notes"],
+               {STD: long_note, ADMIN: "本机主用"}, "写后重读与返回体一致")
+
+    # ── 「清空」与「没动」是两件事 ──
+    r3 = AccessGuard.set_account_notes([f"{ADMIN}="], client=cli)
+    _assert_eq(r3["changed"], {ADMIN: ""}, "删备注在返回值里看得见（空串不是「没改」）")
+    _assert(ADMIN not in AccessGuard.load_document(cli)[0]["account_notes"],
+            "清空后条目真的从文件里消失（留一条空备注=表格里一个没内容的格子）")
+
+    # ── 写侧上限：拒绝超长而不是悄悄截（读侧可以截，写进来的不能是「前半句」） ──
+    _assert_raises(ValueError, lambda: ag._parse_note_entries([f"{STD}={'啊' * 100}"]),
+                   "--note 那种写法超长当场报错")
+    _w = _acl_writes(cli)
+    _assert_raises(ValueError,
+                   lambda: AccessGuard.add_accounts([f"{STD}=1"],
+                                                     account_notes={STD: "啊" * 100},
+                                                     client=cli),
+                   "加号时带的备注也走同一条长度口径（不是只有面板会拦）")
+    _assert_eq(_acl_writes(cli), _w,
+               "超长备注那次写入被拒后，名单一个字节也没多写（部分提交在后台最难查）")
+    _assert_eq(ag._parse_note_entries([f"{STD}={'啊' * limit}"])[STD], "啊" * limit,
+               f"正好 {limit} 个字必须能写（把边界误判成超长会把管理员挡在正常用法外）")
+
+    # ── 号不在名单里：备注不能凭空存在 ──
+    _assert_raises(ValueError,
+                   lambda: AccessGuard.set_account_notes(["13900139000=隔壁老王"], client=cli),
+                   "不在名单里的号拒绝写备注（看不出是拼错号还是手动删过号）")
+
+    # ── 删号必清备注：防「同一个号发给下一个人，别人的备注假复活」 ──
+    _fresh(ADMIN, cli)
+    r4 = AccessGuard.remove_accounts([STD], force=True, client=cli)
+    _assert(STD not in r4["doc"]["accounts"], "用例前提：号已被移出名单")
+    _assert(STD not in r4["doc"]["account_notes"],
+            "移号时备注一并删（留着就是下一个用这个号的人头上顶别人的名字）")
+
+    # ── 改完备注重新加回同一个号：必须是干净的，不能拾回旧备注 ──
+    r5 = AccessGuard.add_accounts([f"{STD}=1"], client=cli)
+    _assert(STD not in r5["account_notes"],
+            "重新加回来的号不拾旧备注（备注跟人不跟号）")
+
+    # ── apply_changes：等级 + 备注 一次写回（面板「应用改动」就是这一路） ──
+    cli2 = FakeOSS(accounts=[ADMIN, STD], grants={ADMIN: 0, STD: 1})
+    _fresh(ADMIN, cli2)
+    rc = AccessGuard.apply_changes(level_entries=[f"{STD}=2"],
+                                   note_entries=[f"{STD}=转岗到供应链"], client=cli2)
+    _assert_eq(_acl_writes(cli2), 1, "等级+备注同屏改动只写回一次")
+    _assert_eq(rc["version"], 2, "一次应用改动 = 一个 version")
+    _assert_eq(rc["levels"], {STD: 2}, "apply_changes 报出改了哪些等级")
+    _assert_eq(rc["notes"], {STD: "转岗到供应链"}, "apply_changes 报出改了哪些备注")
+    doc2, _ = AccessGuard.load_document(cli2)
+    _assert_eq((doc2["grants"][STD], doc2["account_notes"][STD]), (2, "转岗到供应链"),
+               "两路改动都落了盘（只落一路就是「界面说改了、名单没改」）")
+    # 单用途入口向 apply_changes 收敛：两条路的报错原文必须一模一样
+    _assert_raises(ValueError, lambda: AccessGuard.apply_changes(
+        level_entries=["13900139000=1"], client=cli2),
+        "apply_changes 沿用「不在名单就拒绝改级」那条口径")
+    _assert_raises(ValueError, lambda: AccessGuard.apply_changes(
+        note_entries=["13900139000=张三"], client=cli2),
+        "apply_changes 沿用「不在名单就拒绝写备注」那条口径")
+    _assert_eq(_acl_writes(cli2), 1,
+               "校验失败时一个字节也没写出去（部分提交是后台最坏的故障）")
+
+    # ── _new_document 恒带空备注字段：人工编辑 OSS 时能看出它是结构的一部分 ──
+    seeded = ag._new_document({ADMIN: 0})
+    _assert_eq(seeded["account_notes"], {}, "新播种名单带空 account_notes")
+
+
 # ══════════════════════════════════════════════════════ F. 开机预取
 def test_prefetch_local():
     print("\n═══ F. 建界面前的本地预取 ═══")
@@ -886,7 +1024,7 @@ def test_cli():
         # 任何一个参数都不给（含 --help）都会 ValueError，整套管理命令直接不可用。
         rc, out, _ = _cli_run(["--help"])
         _assert_eq(rc, 0, "--help 正常退出（曾经因 nargs/const 组合当场 ValueError）")
-        for _f in ("--add", "--set-level", "--remove", "--show", "--devices",
+        for _f in ("--add", "--set-level", "--note", "--remove", "--show", "--devices",
                    "--kick", "--whoami", "--claim", "--force"):
             _assert(_f in out, f"help 里列出了 {_f}")
 
@@ -901,6 +1039,38 @@ def test_cli():
         _assert_eq(rc, 0, "--show 退出码 0")
         _assert(all(p in out for p in (ADMIN, STD, LITEACC)), "名单三个号都列出来")
         _assert("等级" in out and "管理员" in out, "每个号带上等级人话名称")
+
+        # 备注的命令行通路：管理员在 SSH 里加号时也要能一句把「这是谁的号」写上，
+        # 不然这个字段只有面板能维，命令行加进来的号永远是 unlabeled。
+        _w0 = _acl_writes(cli)
+        rc, out, _ = _cli_run(["--add", "13700137000=1", "--note", "13700137000=新人试用"])
+        _assert_eq(rc, 0, "--add 与 --note 同时给可以走（不能拒绝界面能做的事）")
+        _assert_eq(_acl_writes(cli) - _w0, 1,
+                   "加号并写备注 = 一次写回、一个 version（拆两次就会留个「有号无主」的中间态）")
+        _assert("新人试用" in AccessGuard.load_document(cli)[0]["account_notes"].get(
+            "13700137000", ""), "备注真的落盘")
+        rc, out, _ = _cli_run(["--note", f"{STD}=张三（市场部）"])
+        _assert_eq(rc, 0, "--note 改已有号的备注退出码 0")
+        _assert("张三" in out, f"改完把内容复述一遍：{out.strip()[:40]}")
+        rc, out, _ = _cli_run(["--show"])
+        _assert("张三" in out and "备注" in out, "--show 把备注打出来（不显示=管理员以为没存上）")
+        rc, out, _ = _cli_run(["--note", f"{STD}="])
+        _assert_eq(rc, 0, "--note 手机号= 是合法的「删这条备注」")
+        _assert("已清空" in out, f"删备注在输出里看得见，与「没改过」不是一件事：{out.strip()[:40]}")
+        _assert(STD not in AccessGuard.load_document(cli)[0]["account_notes"],
+                "清空后条目真的从名单里消失")
+        rc, _, err = _cli_run(["--note"])
+        _assert_eq(rc, 2, "--note 不带参数也当场拒（不许掉到默认分支假装列名单）")
+        rc, _, err = _cli_run(["--note", STD])
+        _assert_eq(rc, 1, "--note 缺了等号就报错（写成 手机号=备注）")
+        _assert("手机号=备注" in err, f"拒绝文案带上正确写法：{err.strip()[:50]}")
+        rc, _, err = _cli_run(["--note", "13900139001=隔壁老王"])
+        _assert_eq(rc, 1, "不在名单里的号拒绝写备注（命令行与面板同一条口径）")
+        rc, _, err = _cli_run(["--note", f"{ADMIN}={'啊' * 60}"])
+        _assert_eq(rc, 1, "超长备注拒绝写入而不是静默截断")
+        _assert("截" in err, f"报错里说清为什么不替你截：{err.strip()[:60]}")
+        rc, _, err = _cli_run(["--acl-doctor", "--note", f"{ADMIN}=张三"])
+        _assert_eq(rc, 2, "只读的自检不许和写备注拼在同一次调用里")
 
         rc, out, _ = _cli_run(["--set-level", f"{LITEACC}=1"])
         _assert_eq(rc, 0, "--set-level 退出码 0")
@@ -976,6 +1146,7 @@ def main():
     test_refreshed_signal()
     test_simulated_device()
     test_management()
+    test_account_notes()
     test_prefetch_local()
     test_prefetch_authoritative()
     test_guard_teardown()

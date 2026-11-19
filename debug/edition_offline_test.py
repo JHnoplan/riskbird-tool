@@ -243,10 +243,28 @@ check("丐版公司名单区标题改口成「企知道逐家补采」（内部�
       any("公司名单（企知道逐家补采）" in g.title() for g in w_lite.findChildren(QGroupBox))
       and any("公司名单（三平台逐家补采）" in g.title() for g in w_pro.findChildren(QGroupBox)),
       [g.title() for g in w_lite.findChildren(QGroupBox) if "公司名单" in g.title()])
+
+
+def _title_parts(win) -> list:
+    """标题按「·」拆段：gui 里那一句是「产品名 + 档位后缀 + 版本后缀」拼出来的。
+
+    为什么不再写 endswith：需求 2 在档位后面追了一段版本（`· 版本 1.234` /
+    `· 版本未能确认`），那三条 endswith 会同时坏在两个方向上——该带「精简版」的那侧红，
+    不该带的那侧**真空满足**（没有任何标题以它结尾，这一半等于根本没在跑）。按段核既放得
+    下新增的版本段，又把「档位那一段在不在」问得准。
+    """
+    return [s.strip() for s in str(win.windowTitle()).split("·")]
+
+
 check("丐版标题栏带「精简版」，内部版不带（跑的是哪版必须一眼可辨）",
-      w_lite.windowTitle().endswith("精简版")
-      and "精简版" not in w_pro.windowTitle(),
+      "精简版" in _title_parts(w_lite) and "精简版" not in _title_parts(w_pro),
       (w_lite.windowTitle(), w_pro.windowTitle()))
+check("标题栏段序是「产品名 · 档位 · 版本」（版本段插在档位前面就会把档位挤成中间态；"
+      "两档除档位那一段以外必须完全相同，否则「一眼可辨」辨的是两件不同的事）",
+      _title_parts(w_lite)[0] == _title_parts(w_pro)[0]
+      and _title_parts(w_lite)[-1] == _title_parts(w_pro)[-1]
+      and _title_parts(w_lite)[1] == "精简版" and len(_title_parts(w_pro)) == 2,
+      (_title_parts(w_lite), _title_parts(w_pro)))
 
 # ── 布局不许塌：藏完不能留一行空白 ──────────────────────────────
 def _group(win, key):
@@ -476,8 +494,7 @@ check("内部包 + 等级2：数据池/种子库/历史任务/扩词/权限管�
       and w_lvl2.chk_auto_kw is None and w_lvl2.btn_acl_admin is None
       and w_lvl2.acl_status_lbl is None)
 check("内部包 + 等级2：标题带「精简版」（档位级文案跟着生效档位走，不是只跟着包走）",
-      w_lvl2.windowTitle().endswith("精简版")
-      and not w_lvl1.windowTitle().endswith("精简版"),
+      "精简版" in _title_parts(w_lvl2) and "精简版" not in _title_parts(w_lvl1),
       (w_lvl2.windowTitle(), w_lvl1.windowTitle()))
 _hits_lvl2 = _tip_hits(w_lvl2, BANNED_TIPS)
 check("内部包 + 等级2：整窗 tooltip 也不交底（受限账号看到的就是丐版那一套说法）",
@@ -506,7 +523,7 @@ check("等级0 的入口当前可见（建出来却被能力表藏起来=管理�
 check("丐版包 + 等级0：仍然是丐版界面（等级不能替包长出它没编译进来的入口）",
       w_lite0.btn_pool_sync is None and w_lite0.btn_acl_admin is None
       and w_lite0.btn_clear_seen is None
-      and w_lite0.windowTitle().endswith("精简版"),
+      and "精简版" in _title_parts(w_lite0),
       _labels(w_lite0, QPushButton)[:6])
 os.environ[edition.ENV_VAR] = "pro"
 os.environ[edition.LEVEL_ENV_VAR] = str(edition.LEVEL_ADMIN)
@@ -1100,14 +1117,30 @@ try:
           and '#acl-restart' in w_pro.banner.text(), w_pro.banner.text())
     check("收口的同时标题也重投影（受限档就不能还写着内部版的标题）",
           edition.title_suffix() in w_pro.windowTitle(), w_pro.windowTitle())
-    # 用户主动点那条链接时才允许问一次，且只问一次
+    # 用户主动点那条链接时才允许问：**点一次问一次**（2026-11-19 实机报告的「换绑后点
+    # 重启无反应」正是旧那个「同进程只问一次」的闸门：默认按钮是「否」，Esc/✕ 也算否，
+    # 于是一次误触就永久废掉了这个进程里唯一的重启入口。防骚扰由结构保证——只有主动
+    # 点击才问；后台心跳那条链路仍然一个框都不弹，那是上面两条判据盯的事。）
     _asks = []
     gui.QMessageBox.question = staticmethod(
         lambda *a, **k: (_asks.append(1), gui.QMessageBox.No)[1])
-    w_pro._on_banner_link("#acl-restart")
-    w_pro._on_banner_link("#acl-restart")
-    check("横幅链接→用户点击→问一次要不要重启（同一进程只问一次，第二次成骚扰）",
-          len(_asks) == 1, len(_asks))
+    # 这一段的日志必须自己收：上面 B 节把 w_pro._on_log 换成了「只进列表」，界面那个
+    # 日志控件从那时起就不会再长字，拿 `w_pro.log` 取证只会收到一个空串，反而把判据读成假红。
+    _refuse_logs = []
+    _prev_on_log = w_pro._on_log
+    w_pro._on_log = lambda m: (_refuse_logs.append(m), _prev_on_log(m))[1]
+    try:
+        w_pro._on_banner_link("#acl-restart")
+        w_pro._on_banner_link("#acl-restart")
+    finally:
+        w_pro._on_log = _prev_on_log
+    check("横幅链接→用户点击→每次都问得到（点了没反应就是需求 4 那一族缺陷："
+          "宁可在这里多问一次，也不许留一个会忘掉上下文的一次性闸门）",
+          len(_asks) == 2, len(_asks))
+    check("拒过之后也要出声：每一次都要把「先不重启」与「这条链接随时可以再点」一起说",
+          len(_refuse_logs) == 2
+          and all("先不重启" in m and "重启工具现在生效" in m for m in _refuse_logs),
+          _refuse_logs)
     # 只看代码行：注释里写出 QMessageBox 是**故意的**（说明为什么不能用），
     # 判据必须是「函数体里没有这条调用」，不是「文件里没出现这个词」。
     _sync_code = [ln.strip() for ln in

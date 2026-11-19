@@ -1390,13 +1390,32 @@ _hook_srcs = dict(_HTTP_SRC)
 _hook_srcs.pop("website_contact.py", None)
 _hook_bad = {n: r for n, r in ((n, _fetch_hook_problems(s)) for n, s in _hook_srcs.items()) if r}
 _pure = sorted(n for n, s in _hook_srcs.items() if _pure_http_classes(s))
+# 纯 HTTP 站那一个下限不能写成一个字面数：上一版写的就是 `>= 8`，而 8 是当时扫描集里
+# 恰好有八份声明了 NEEDS_BROWSER=False 的源码算出来的——世界工厂网下站（文件已删）它就
+# 当场哑响，响的原因却不是「谁没挂熔断」。换成从注册表现推：凡在 SITE_ORDER 里且类上
+# 声明 NEEDS_BROWSER=False 的平台，都必须在这轮的扫描集里被真扫到，加一站少一站都不必
+# 改这个数，而「glob 被改窄只认某几份」依旧会被拓下来。
+from parallel_session import SITE_ORDER as _SO12, SITE_CLASSES as _SC12
+_registry_pure = sorted({f"{_SC12[s].__module__.split('.')[-1]}.py" for s in _SO12
+                         if _SC12.get(s) is not None
+                         and getattr(_SC12[s], "NEEDS_BROWSER", True) is False})
+_missing_pure = [n for n in _registry_pure if n not in _pure]
+# 同一句话的完整版：扫描集必须覆盖注册表里的**每一路关键词平台**（不只纯 HTTP 那几路）。
+# 上一版这里写的是字面个数（`len(_tag_srcs) >= 11`），它与 12d 那个 8 是同一个坑：数字对
+# 不上时门会响，但响的原因不是「谁没挂前缀闸」而是「今天有几份文件」，下站/加站都得改数。
+_registry_srcs = sorted({f"{_SC12[s].__module__.split('.')[-1]}.py" for s in _SO12
+                         if _SC12.get(s) is not None})
+check("12d= 纯 HTTP 站范围从注册表现推，不靠字面数：界上有的每一路纯 HTTP 关键词平台"
+      "都要真进扫描集（写死个数会在下站/加站时哑响或哑掉）",
+      not _missing_pure and len(_registry_pure) >= 5,
+      f"注册表={_registry_pure}｜没扫到={_missing_pure}")
 _http_fns = sum(len(_http_calls_in(s, n))
                 for s in _hook_srcs.values()
                 for n in (m for m in _ast.walk(_ast.parse(s)) if isinstance(m, _ast.FunctionDef)))
 check(f"12d 每一处真发 HTTP 请求的取页函数都先问了主机熔断（{len(_hook_srcs)} 份采集器、"
       f"{_http_fns} 个发请求的函数）",
-      not _hook_bad and _http_fns >= 20 and len(_pure) >= 8,
-      f"{_hook_bad}｜纯 HTTP 站={_pure}")
+      not _hook_bad and _http_fns >= 20 and not _missing_pure,
+      f"{_hook_bad}｜纯 HTTP 站={_pure}｜注册表里该在却没被扫到的={_missing_pure}")
 check("12d--- 熔断名单是从基类现推的：本体与探测那层封装都在内（写死名单＝加一层就判不到）",
       "_skip_dead_host" in _FUSE and "_skip_dead_host_probe" in _FUSE,
       f"现推名单={sorted(_FUSE)}")
@@ -1888,8 +1907,9 @@ _tag_bad = {n: [x.lineno for x in _ast.walk(_ast.parse(s))
                 if isinstance(x, _ast.Name) and x.id == "NET_FAIL_TAG"] for n, s in _tag_srcs.items()}
 _tag_bad = {n: v for n, v in _tag_bad.items() if v}
 check("12n= NET_FAIL_TAG 只在基类那几把把手里拼一次（各站自己挂前缀＝把代码异常也说成断网，"
-      "而且不给熔断账记连击）",
-      not _tag_bad and len(_tag_srcs) >= 11, str(_tag_bad))
+      "而且不给熔断账记连击）；范围从注册表现推：每一路在册平台都要被扫到",
+      not _tag_bad and not [n for n in _registry_srcs if n not in _tag_srcs],
+      f"{str(_tag_bad)}｜该扫却没扫到的平台={[n for n in _registry_srcs if n not in _tag_srcs]}")
 check("12n=- 反向对照：gi 探测里那句 `f\"{NET_FAIL_TAG}{type(e).__name__}\"` 的原样写法必须响",
       bool([1 for x in _ast.walk(_ast.parse(
           'def once():\n    try:\n        r = s.get(u)\n'
@@ -1924,7 +1944,9 @@ _DEEP_AWARE = {                      # 会产生深链请求的站：这些 help
 _DEEP_WAIVED = {
     "gi_crawler.py": "详情是纯本地组装，一个请求都不发（站方对详情/内容页吃 IP 配额）",
     "mic_crawler.py": "详情走共享 Chrome 标签，整条路径根本不写通道级 _block_reason",
-    "gongchang_crawler.py": "频控自成一套 _thin_shell_streak，同样不写通道级 _block_reason",
+    # 世界工厂网那一路不在这张表里了：已按用户指令下站、采集器文件一并删除。
+    # 登记表跟着代码走：文件不在位时这一格必须一起摘，否则「反向登记表」会在一堆不存在
+    # 的名字上转圈，而它该报的是「今天真在跑的那些站里谁没分账」。
 }
 # 全站「会写通道级 `_block_reason`（非清空）」的函数总表。这张表由下面的判据从源码
 # **现算再逐字对照**：多一处（新增升级通道账的地方没登记）或少一处（那条路被删了却没
