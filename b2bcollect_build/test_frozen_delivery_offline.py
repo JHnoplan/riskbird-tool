@@ -11599,7 +11599,7 @@ def test_package_weight_gate():
         (root / "PyQt5" / "Qt5" / "translations").mkdir(parents=True)
         for rel, mb in (("pandas/in.csv", 1), ("PyQt5/Qt5/qml/a", 1),
                         ("PyQt5/Qt5/translations/b", 1), ("stranger/c", 4),
-                        ("selenium/d", gate.WEIGHT_BUDGET_MB["selenium"][0] + 2)):
+                        ("selenium/d", gate.WEIGHT_BUDGET_MB["selenium"]["win"] + 2)):
             f = root / rel
             f.parent.mkdir(parents=True, exist_ok=True)
             with f.open("wb") as fh:                 # 稀疏文件：只花逻辑字节，不落盘真数据
@@ -11609,8 +11609,9 @@ def test_package_weight_gate():
                 f"pandas/qml/translations 三处白拿各响一条（实际={_got}）")
         _assert(any("stranger" in x and "却没登记" in x for x in _got),
                 "超过披露线却没登记的新成分要指名道姓（这就是「包为什么胖了」那句问句的答案）")
-        _assert(any("selenium" in x and "超过登记的" in x for x in _got),
-                "已登记的成分长过自己的上限也要响：登记一次不是永久通行证")
+        _assert(any("selenium" in x and "登记的上限" in x and "Windows" in x for x in _got),
+                f"已登记的成分长过自己的上限也要响，而且要点名是哪一平台的上限（实得 {_got}）："
+                "登记一次不是永久通行证")
         _assert(any("合计" in x for x in _rep) and any("未登记" in x for x in _rep),
                 f"不管红绿都要把成分账打出来（实际报告={_rep[:2]}）")
         # 干净产物：只留一份在簿的小成分，两面都不许响
@@ -11900,18 +11901,118 @@ def test_package_weight_gate():
     finally:
         gate.artifact_measure_roots = _orig_roots
 
-    # 本轮实测回填的账要钉住：上限不是拍脑袋，是量出来的；谁改回旧数字就得解释。
-    for name, cap, why_in_cap in (("PyQt5", 45, "framework"), ("B2bCollectTool", 18, "bootloader"),
-                                  ("python3__dot__13", 8, "libpython"),
-                                  ("libcrypto.3.dylib", 8, "OpenSSL")):
-        _assert(name in gate.WEIGHT_BUDGET_MB,
-                f"成分账里有 {name}（实测），登记表却把它弄丢了——丢一次就红一次构建")
-        _assert(gate.WEIGHT_BUDGET_MB[name][0] == cap and why_in_cap in gate.WEIGHT_BUDGET_MB[name][1],
-                f"{name} 的上限与理由要停在实测那一档（{cap}MB，理由含「{why_in_cap}」）："
-                f"旧上限 95 是 --collect-all 时代的整包 Qt，拿它当今日上限＝这道门对 PyQt5 永不生效")
+    # 本轮实测回填的账要钉住：上限不是拍脑袋，是**两平台各自量出来的**；谁改回旧数字就得解释。
+    # 2026-11-19 云端两路同红之后，这一格的形状本身就是判据对象：旧写法把「本机那一份」的名字
+    # 与数字抄进表里，换一台打包机（Mac runner 是 Python 3.11，本机是 3.13）或换一个平台形状
+    # （Windows 的 OpenSSL 叫 libcrypto-3.dll），门就报「未登记」——而拦住的正是交付。
+    for name, mac_cap, win_cap, why_in_cap in (
+            ("PyQt5", 45, 70, "framework"),          # mac 是 framework，win 是 bin 下一排 dll
+            ("B2bCollectTool", 18, None, "bootloader"),
+            ("python3NN", 10, 10, "CPython"),
+            ("libcryptoN", 8, 8, "OpenSSL")):
+        entry = gate.WEIGHT_BUDGET_MB.get(name)
+        _assert(isinstance(entry, dict),
+                f"成分账里 {name} 必须是「mac/win/why」那一格（实得 {type(entry).__name__}）："
+                f"退回旧写法（只填本机一套数字）就是那一轮云端两路红的形状")
+        if not isinstance(entry, dict):
+            continue
+        _assert(entry["mac"] == mac_cap and entry["win"] == win_cap,
+                f"{name} 的两平台上限要停在实测那一档（mac {mac_cap} / win {win_cap}，"
+                f"实得 mac {entry['mac']} / win {entry['win']}）：旧上限 95 是 --collect-all 时代的"
+                f"整包 Qt，拿它当今日上限＝这道门对 PyQt5 永不生效；只填一台＝另一平台必红")
+        _assert(why_in_cap in entry["why"],
+                f"{name} 的理由要念得出它凭什么值这几兆（要含「{why_in_cap}」，实得 {entry['why']}）")
     _assert(not any("/" in k for k in gate.WEIGHT_BUDGET_MB),
             "登记表全部用「视野下第一段」的成分名：写带斜杠的路径永远碰不到 measure_artifact 的键，"
             "那条登记就是挂着但从不生效的空账")
+
+    # ── 7) 两平台各量各的账：拿同一份超过 mac 上限、但 win 允许的数字，两边结果必须不同 ──
+    # 为什么这一路非验不可：「表里有两列」不算修好，只有当查账真的按产物那一侧取上限，
+    # 云端那两路才不会再被同一把错误的尺卡住。反向也验：mac 专属那一格长到 Windows 里必须响。
+    _selenium_win = gate.WEIGHT_BUDGET_MB["selenium"]["win"]      # 32
+    _selenium_mac = gate.WEIGHT_BUDGET_MB["selenium"]["mac"]      # 26
+    # 夹具取的值：严格大于 mac 上限、又不超 win 上限。拿「正好等于 mac 上限」造现场是假绿：
+    # 门的判据是严格大于，那一路永远不响，看上去验了其实什么都没验。
+    _probe = _selenium_mac + 2
+    _assert(_probe <= _selenium_win,
+            f"夹具要拿得到「两边不一样」的那一档（mac {_selenium_mac} / win {_selenium_win}，"
+            f"探针 {_probe}）：两边相等就验不出尺用错了哪一列")
+    with tempfile.TemporaryDirectory() as td:
+        # Windows 形状（_internal）：selenium 取超过 mac 上限那一档→ 按 win 尺子必须放行
+        win = Path(td) / "WinTool"
+        (win / "_internal" / "selenium").mkdir(parents=True)
+        with (win / "_internal" / "selenium" / "a").open("wb") as fh:
+            fh.truncate(int(_probe * 1024 * 1024))
+        _assert_eq(gate._artifact_platform(win), "win", "_internal 布局判为 Windows 形状")
+        _assert_eq(gate.check_package_weight_artifact(win, "夹具")[0], [],
+                   f"Windows 产物里 selenium {_probe}MB（超 mac 上限、未超 win 上限）"
+                   f"→ 按 win 那一格放行：拿 mac 的尺卡 win 就是云端那一路报的假话")
+        # 同一数字装进 macOS 形状（Contents/*）：必须响，而且要点名是哪个平台
+        mac = Path(td) / "MacTool.app"
+        (mac / "Contents" / "Resources" / "selenium").mkdir(parents=True)
+        with (mac / "Contents" / "Resources" / "selenium" / "a").open("wb") as fh:
+            fh.truncate(int(_probe * 1024 * 1024))
+        _assert_eq(gate._artifact_platform(mac), "mac", "Contents 布局判为 macOS 形状")
+        _mp, _mr = gate.check_package_weight_artifact(mac, "夹具")
+        _assert(any("selenium" in x and "macOS" in x for x in _mp),
+                f"同一份数字在 macOS 侧必须按 mac 上限响（实得 {_mp}）：两平台共用一把尺"
+                f"就是把刚修好的那一半再弄坏")
+        _assert(any("macOS 形状" in x for x in _mr),
+                f"成分账抬头要念得出这是哪一份产物（实得 {_mr[:1]}）")
+        # mac 专属那一格长到 Windows 里：必须响，且不许说成「未登记」（说错方向就没人能修）
+        _cd = gate.WEIGHT_BUDGET_MB["chromedriver"]["win"]
+        _assert(_cd is None, "前置：chromedriver 在 Windows 这一格登记的是 None")
+        (win / "_internal" / "chromedriver").mkdir(parents=True)
+        with (win / "_internal" / "chromedriver" / "a").open("wb") as fh:
+            fh.truncate(int(18 * 1024 * 1024))
+        _wp, _ = gate.check_package_weight_artifact(win, "夹具")
+        _assert(any("chromedriver" in x and "从没量到过" in x for x in _wp),
+                f"mac 专属成分长进 Windows 要说清是「这一平台没登记上限」（实得 {_wp}）："
+                f"报成「未登记」或「白拿」都会把人往剪掉它那一刀带——剪掉就是没功能")
+
+    # 别名必须认得两平台、两版本形状（这一格就是云端那一红的直接根因）
+    for _real, _alias in (("python3__dot__11", "python3NN"), ("python3__dot__13", "python3NN"),
+                         ("python311.dll", "python3NN"), ("python313.dll", "python3NN"),
+                         ("libcrypto.3.dylib", "libcryptoN"), ("libcrypto-3.dll", "libcryptoN")):
+        _assert(gate._budget_key(_real) == _alias,
+                f"产物里的 `{_real}` 要归到 `{_alias}` 那一格（实得 {gate._budget_key(_real)}）："
+                f"归一化只认本机那一台机器看到的名字，就是云端那一轮的红")
+        _assert(_alias in gate.WEIGHT_BUDGET_MB,
+                f"别名 `{_alias}` 必须在成分账里在册")
+    for _un in ("python3.11", "libcrypto10", "python3abc"):
+        _assert(gate._budget_key(_un) == _un,
+                f"别的成分名一律照原名对账（{_un} 被动了＝归一化正则泄到了不该管的地方）")
+
+    # 静态那一半：拿合成账本喂四形，每形都要响（只靠构建后那一面，本机永远绿、云端才红）
+    _orig_budget = gate.WEIGHT_BUDGET_MB
+    _orig_callers2 = gate.CALLERS
+    _orig_sources2 = gate._weight_analyzed_sources
+    try:
+        gate.CALLERS = {}
+        gate._weight_analyzed_sources = lambda: []
+        _base = gate.check_package_weight_static()
+        _assert_eq(_base, [], "今天的成分账形状合格（基线先坐实，下面比的是只多不少那一条）")
+        for _tag, _mut, _needle in (
+            ("旧形状：只填本机一套数字",
+             {"PyQt5": (45, "framework")}, "形状不对"),
+            ("把某个平台上限改成「不限」（0）",
+             {"PyQt5": {"mac": 0, "win": 70, "why": "x"}}, "大于零的正整数"),
+            ("两平台都写 None（这一格事实上消失了）",
+             {"PyQt5": {"mac": None, "win": None, "why": "x"}}, "都登记 None"),
+            ("理由空白（忘了登记与有意带这几兆分开）",
+             {"PyQt5": {"mac": 45, "win": 70, "why": "  "}}, "没写登记理由"),
+            ("登记了带版本号的具体名字（云端那一红的形状）",
+             {"python3__dot__13": {"mac": 8, "win": 8, "why": "libpython"}}, "会被归一成"),
+            ("别名被从账本里删掉（归一化指向一个没登记格）",
+             {"PyQt5": {"mac": 45, "win": 70, "why": "framework"}}, "python3NN")):
+            gate.WEIGHT_BUDGET_MB = _mut
+            _got = gate.check_package_weight_static()
+            _assert(any(_needle in x for x in _got),
+                    f"{_tag}：静态那一半要响得出（实得 {_got}）")
+    finally:
+        gate.WEIGHT_BUDGET_MB = _orig_budget
+        gate.CALLERS = _orig_callers2
+        gate._weight_analyzed_sources = _orig_sources2
 
 
 def test_installer_env_gate():

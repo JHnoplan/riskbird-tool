@@ -8839,30 +8839,92 @@ WEIGHT_FORBIDDEN_ARTIFACT = {
                               "这几兆从第一版起就没生效过（界面中文靠我们自己的 文案）；"
                               "构建后由 ARTIFACT_PRUNE 剪裁清单剪掉，再出现＝入口没调 --prune-artifact",
 }
-# 超过这个字节数（MB）的顶层成分必须在 WEIGHT_BUDGET_MB 里登记理由；登记了也不许长过自己的上限。
+# 超过这个字节数（MB）的顶层成分必须登记理由；登记了也不许长过自己的上限。
 WEIGHT_DISCLOSE_MB = 3.0
-# 上限按 2026-11-19 本机产物的**真身字节**回填（measure_artifact：同一 realpath 只算一次，
-# 符号链接不重复计费）。为什么每项都留几兆余量：重量上限留得太紧，下一次正常的依赖升级
-# 就会先撞门，而撞了门的人多半是把上限改大而不是去查为什么长了。
+# 成分账形状：名字 -> {"mac": 上限或 None, "win": 上限或 None, "why": 凭什么值这几兆}。
+# 为什么要拆成两平台上限（2026-11-19 云端两路同红，这一条才是那轮真正欠下的账）：旧表只有
+# 一套数字，而它是照**本机那一份产物**量出来回填的。同一格东西在两平台的真身本来就不是同一
+# 个大小：Qt 在 macOS 是 framework（实测 39MB），在 Windows 是 bin 下一整排 dll（实测 62MB）；
+# selenium 实测 mac 23MB / win 27MB。拿 Mac 的尺去卡 Windows，门念出来的是「重量不会自己长，
+# 是某次改动让它长的」——那是**假话**：什么都没改，只是换了台机器。把假话念得再接地气也还是
+# 假话，所以这里按平台各量各登记。
+# None 不是「不限」，是「这一平台的产物里从没量到过这一格」：它真长出来了就要响，因为此时没人
+# 知道那几兆该不该进包（当白拿一剪就没功能）。
+# 上限为什么普遍留几兆余量：留得太紧，下一次正常的依赖升级就会先撞门，而撞了门的人多半是把
+# 上限改大而不是去查为什么长了。
 WEIGHT_BUDGET_MB = {
     # 旧上限 95MB 是去掉 --collect-all PyQt5 之前量到的整包 Qt；现在只剩真在用的
     # Widgets/Gui/Core 三个绑定与其 framework（Frameworks 与 Resources 两侧同源，只算一次）。
-    "PyQt5": (45, "界面框架：Qt5 的 Widgets/Gui/Core 三个绑定与其 framework 真身"),
-    "selenium": (26, "风鸟/爱企查/企知道三路列表通道用它驱动 Chrome"),
-    "PIL": (16, "手机号图片码识别（mk_phone_ocr）与截图处理"),
-    "lxml": (13, "bs4 的解析器加速"),
-    "chromedriver": (22, "随包 macOS 驱动：新电脑首启不必联网下载（用户口径：影响首启体验就不砍）"),
-    "drivers": (80, "随包 Windows 最近 3 个大版本驱动，同上（不足 2 个时 fetch_chromedrivers.py 会中止）"),
-    # 下面三项是「体积视野补全」才露出来的真身：旧口径只看 Contents/Resources，它们一直在
+    "PyQt5": {"mac": 45, "win": 70,
+               "why": "界面框架：Qt5 的 Widgets/Gui/Core 三个绑定与其真身。mac 侧是 framework"
+                      "（本机实测 39MB），win 侧是 PyQt5/Qt5/bin 下那一排 dll（云端实测 62MB）"
+                      "——两平台不是一个形状，要剪的 QML 栈也各有一套名字"},
+    "selenium": {"mac": 26, "win": 32,
+                  "why": "风鸟/爱企查/企知道三路列表通道用它驱动 Chrome（实测 mac 22～23MB、"
+                         "win 27MB）"},
+    "PIL": {"mac": 16, "win": 16,
+             "why": "手机号图片码识别（mk_phone_ocr）与截图处理（两平台实测都是 13MB）"},
+    "lxml": {"mac": 13, "win": 13,
+              "why": "bs4 的解析器加速（实测 mac 10～11MB、win 9MB）"},
+    # 驱动只在一平台长这一格：mac 是一个 chromedriver，win 是一整目录 drivers
+    "chromedriver": {"mac": 22, "win": None,
+                      "why": "随包 macOS 驱动：新电脑首启不必联网下载（用户口径：影响首启体验就"
+                             "不砍）。Windows 的驱动在 drivers 那一格，不长这个名字"},
+    "drivers": {"mac": None, "win": 80,
+                 "why": "随包 Windows 最近 3 个大版本驱动，同上（不足 2 个时"
+                        "fetch_chromedrivers.py 会中止）。macOS 产物里不长这一格"},
+    # 下面几项是「体积视野补全」才露出来的真身：旧口径只看 Contents/Resources，它们一直在
     # 包外（MacOS 与 Frameworks）——不是新长出来的重量，是以前的账本看不见。
-    "B2bCollectTool": (18, "主程序与 PyInstaller bootloader（MacOS/ 下那份可执行）"),
-    "Python.framework": (8, "随包 CPython 解释器框架本体：产物自带解释器，这是任何 "
-                          "PyInstaller 包都省不掉的那一块"),
-    "python3__dot__13": (8, "libpython 本体（名字里的 __dot__ 是 PyInstaller 对「.」的转义）："
-                            "同上，随包解释器自带"),
-    "libcrypto.3.dylib": (8, "OpenSSL：requests 与 OSS 上传走的就是它——随包才不依赖系统那" 
-                            "个版本（老 Windows 的系统 TLS 正是需求 10 里的一类故障）"),
+    "B2bCollectTool": {"mac": 18, "win": None,
+                        "why": "主程序与 PyInstaller bootloader（MacOS/ 下那份可执行，实测"
+                               " 13～14MB）。Windows 的主 exe 不在体积视野里（那里只量 _internal）"},
+    "Python.framework": {"mac": 8, "win": None,
+                          "why": "随包 CPython 解释器框架本体（实测 5～7MB）：产物自带解释器，这是"
+                                 "任何 PyInstaller 包都省不掉的那一块；仅 macOS 长这一格"},
+    # 随包解释器与 OpenSSL 按**别名**登记（键里不写版本号），两平台形状共用同一格，见
+    # WEIGHT_VERSION_ALIASES。为什么这也是硬要求：同一轮里 Mac runner 的 Python 是 3.11，而本机
+    # 量到的是 python3__dot__13；Windows 产物里的 OpenSSL 叫 libcrypto-3.dll。
+    "python3NN": {"mac": 10, "win": 10,
+                   "why": "随包 CPython 本体：mac 是 python3__dot__NN（PyInstaller 把「.」转义成"
+                          " __dot__，实测 5～8MB），win 是 python3NN.dll（实测 6MB）——任何"
+                          " PyInstaller 包都省不掉，长多少只由打包机上的 Python 小版本决定"},
+    "libcryptoN": {"mac": 8, "win": 8,
+                    "why": "OpenSSL：requests 与 OSS 上传走的就是它——随包才不依赖系统那个版本（老"
+                           " Windows 的系统 TLS 正是需求 10 里的一类故障）。mac 叫"
+                           " libcrypto.N.dylib（实测 3～5MB），win 叫 libcrypto-N.dll（实测 5MB）"},
 }
+# 成分名 → 账本别名的归一化表：只有「同一格东西在不同机器上换名字」这一族需要归一，
+# 所以按形状精确匹配（整名匹配，不是搜索），别的成分一律照原名对账。
+# 每项是 (匹配成分名的正则, 账本里的别名)。
+WEIGHT_VERSION_ALIASES = (
+    (re.compile(r"python3(?:__dot__)?\d{1,2}(?:\.dll)?\Z"), "python3NN"),
+    (re.compile(r"libcrypto[._-]\d+(?:\.(?:dylib|dll))?\Z"), "libcryptoN"),
+)
+
+
+def _budget_key(name: str) -> str:
+    """把带版本号的那几族成分名归到不写版本的别名上，其余原名返回。
+
+    归一化只用于**查账**（上限与在册判定），报告里仍念产物里的真名：修门的人要看得到
+    「产物里那一份到底叫什么」，念别名会把「Windows 上叫 python311.dll」这件事藏起来。
+    """
+    for pattern, alias in WEIGHT_VERSION_ALIASES:
+        if pattern.match(str(name)):
+            return alias
+    return name
+
+
+def _artifact_platform(artifact) -> str:
+    """这一份产物是哪个平台的形状："mac" 或 "win"。
+
+    只问目录布局，不看文件名里的字样、也不看跑在哪个 OS 上——云端那两路就是在自己的
+    runner 上量自己那一份，拿 os.name 判会永远是「本机」。口径与
+    ``artifact_measure_roots`` 完全一致（那里就是按这两套布局取视野的），两处各判一套
+    迟早漂：账按哪一平台上限查、必须与「量的是哪套目录」同一把尺。
+    """
+    p = Path(artifact)
+    return "mac" if (p / "Contents").is_dir() else "win"
+
 
 # 需求 5：PyInstaller Qt hook 的连带收件里，「本工具永远用不到」的那一批，构建后剪掉。
 # 由来（2026-11-19 产物 otool 实测）：platforms/libqwebgl.dylib（Qt 的 WebGL 平台插件，
@@ -8937,8 +8999,53 @@ def _weight_analyzed_sources() -> list:
 
 
 def check_package_weight_static() -> list:
-    """构建前那一面：参数与源码闭包都不许把白拿的重量带回来。"""
+    """构建前那一面：参数与源码闭包都不许把白拿的重量带回来。
+
+    还顺带问账本自己两件事（2026-11-19 云端两路同红后才补上的静态那一半）：
+    上限表里不许出现带版本号的具体成分名，而归一化表里每一族都必须有登记好的上限。
+    只靠构建后那一面信不过：它只在真产物上过，也就是说只有打包机换了一台、
+    交付被拦住那一刻才会响——那一格叫「本机绿、云端红」，本仓付过多少次账都记得。
+    """
     problems = []
+    # 账本自己：带版本号的那几族必须走别名，不许再写回某一台机器的具体名字
+    for name in WEIGHT_BUDGET_MB:
+        alias = _budget_key(name)
+        if alias != name:
+            problems.append(
+                f"WEIGHT_BUDGET_MB 里登记了 `{name}`——它会被归一成 `{alias}`，这一格永远查不到"
+                f"（除非别名表被改坏）：换一台打包机、升一个 Python 小版本就会重新红，"
+                f"请直接登记成 `{alias}`")
+    for _pattern, alias in WEIGHT_VERSION_ALIASES:
+        if alias not in WEIGHT_BUDGET_MB:
+            problems.append(
+                f"归一化表把成分归到 `{alias}`，但 WEIGHT_BUDGET_MB 里没有这一格："
+                f"产物里那一块会永远报「未登记」而拦住出包")
+    # 账本形状：每格都要写出两个平台的上限（没量到过那一侧要显式写 None）与一句理由。
+    # 只填一台就是这一轮云端两路红的形状：本机那一份永远绿，另一路只在出包时被拦住。
+    for name, entry in WEIGHT_BUDGET_MB.items():
+        if not isinstance(entry, dict) or set(entry) != {"mac", "win", "why"}:
+            problems.append(
+                f"`{name}` 的登记形状不对：必须只有 mac / win / why 三个键"
+                f"（两平台上限各一个，没量到过的那一侧显式写 None，再加一句理由），"
+                f"实得 {type(entry).__name__} {sorted(entry) if isinstance(entry, dict) else ''}。"
+                f"少一个键就是少一个平台的账")
+            continue
+        if not str(entry["why"] or "").strip():
+            problems.append(
+                f"`{name}` 没写登记理由：「忘了登记」与「有意带这几兆」在症状上完全一样，"
+                f"只有理由能把它们分开")
+        for plat in ("mac", "win"):
+            cap = entry[plat]
+            if cap is None:
+                continue        # 显式 None：这一平台从没量到过这一格（长出来了就响）
+            if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
+                problems.append(
+                    f"`{name}` 的 {plat} 上限写成了 {cap!r}：要么是一个大于零的正整数，"
+                    f"要么是明确的 None——「不限」不是一个选项，那一格就是没账")
+        if entry["mac"] is None and entry["win"] is None:
+            problems.append(
+                f"`{name}` 两个平台都登记 None：这一格事实上已从账本里消失，"
+                f"要么真删了它（连键一起删），要么把量到的上限填回来")
     for label, path in CALLERS.items():
         if not path.exists():
             continue
@@ -9087,6 +9194,8 @@ def check_package_weight_artifact(artifact, label: str = "") -> tuple:
         return [f"{tag}重量门读不到产物体积视野：{'、'.join(str(r) for r in roots)}"
                 f"（产物不在就别宣布减重成功）"], []
     comps, total = measure_artifact(artifact)
+    platform = _artifact_platform(artifact)
+    plat = "macOS" if platform == "mac" else "Windows"
     problems = []
     # ① 白拿名单：每一条都在**全部视野**里问过（只查一侧会漏：真身可能在 Frameworks）
     for rel, why in WEIGHT_FORBIDDEN_ARTIFACT.items():
@@ -9094,25 +9203,48 @@ def check_package_weight_artifact(artifact, label: str = "") -> tuple:
             if hit.exists():
                 problems.append(f"{tag}产物里有 `{rel}`（约 {_dir_size_mb(hit):.0f}MB）：{why}")
                 break
-    # ② 成分账：每一份超过披露线的都得在册，且不许长过自己登记的上限
+    # ② 成分账：每一份超过披露线的都得在册，且不许长过**本平台**登记的上限
+    #   （查账用归一化后的别名，念出来用产物里的真名——见 _budget_key 的由来）
     for name, mb in sorted(comps.items(), key=lambda kv: -kv[1]):
         if mb < WEIGHT_DISCLOSE_MB:
             continue
-        cap = WEIGHT_BUDGET_MB.get(name)
-        if cap is None:
+        key = _budget_key(name)
+        entry = WEIGHT_BUDGET_MB.get(key)
+        if entry is None:
             problems.append(
                 f"{tag}产物里冒出 {mb:.0f}MB 的成分 `{name}` 却没登记："
                 f"要么砍掉它，要么在 WEIGHT_BUDGET_MB 写清它凭什么值这几兆"
                 f"（下一人才不会又问一遍「包为什么这么大」）")
-        elif mb > cap[0]:
+            continue
+        cap = entry[platform]
+        alias_note = f"（按 `{key}` 登记）" if key != name else ""
+        if cap is None:
+            # 这一格在**另一个平台**量到过、这一平台从没量到过：它真长出来了，
+            # 没人知道该不该进包。这里不递一个「那就删了它」的结论：白拿名单才是
+            # 说那句话的地方，而它得拿着理由进去（chromedriver 被当白拿剪掉就是事故）。
+            other = "win" if platform == "mac" else "mac"
             problems.append(
-                f"{tag}`{name}` 现在 {mb:.0f}MB，超过登记的 {cap[0]}MB 上限"
-                f"（登记理由：{cap[1]}）：重量不会自己长，是某次改动让它长的")
-    report = [f"{tag}产物体积（真实磁盘字节、同一真身只算一次）：合计 {total:.0f}MB，"
+                f"{tag}`{name}`{alias_note} 在 {plat} 产物里占了 {mb:.0f}MB，"
+                f"而账本在 {plat} 这一格登记的是 None（＝这一平台的产物里从没量到过它，"
+                f"只在另一平台量到 {entry[other]}MB）。登记理由：{entry['why']}——"
+                f"要么按 {plat} 的真身量一个上限登记上去，要么说清它不该出现在这里")
+        elif mb > cap:
+            problems.append(
+                f"{tag}`{name}`{alias_note} 在 {plat} 登记的上限 {cap}MB，现在 {mb:.0f}MB："
+                f"重量不会自己长，是某次改动让它长的（登记理由：{entry['why']}）")
+    report = [f"{tag}产物体积（{plat} 形状、真实磁盘字节、同一真身只算一次）：合计 {total:.0f}MB，"
               f"成分账（≥{WEIGHT_DISCLOSE_MB:.0f}MB 全部列出）："]
     for name, mb in sorted(comps.items(), key=lambda kv: -kv[1]):
         if mb >= WEIGHT_DISCLOSE_MB:
-            mark = "" if name in WEIGHT_BUDGET_MB else "  ←未登记"
+            key = _budget_key(name)
+            entry = WEIGHT_BUDGET_MB.get(key)
+            cap = entry[platform] if entry else None
+            if entry is None:
+                mark = "  ←未登记"
+            elif cap is None:
+                mark = f"  ←{plat} 这一格没登记上限"
+            else:
+                mark = f"  （{plat} 上限 {cap}MB）" if key != name else ""
             report.append(f"   · {mb:6.0f}MB  {name}{mark}")
     return problems, report
 
