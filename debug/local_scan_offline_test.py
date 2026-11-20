@@ -723,8 +723,14 @@ def _run_worker():
 
 
 _res = _run_worker()
+# 异常不能只变成一个空汇总：`ScanWorker.run()` 的兜底会把原因塞进 note（ok=False、stats={}），
+# 而旧写法只看 ok——于是屏幕上只剩一句 `([], {})`，拿到原因的人只能重跑一次去猜（云端
+# 那一红就是这么浪费掉一整轮的）。这里先把「有没有拿到结论」单独判一格，再把 note
+# 带进 ⑨ 的详情：失败不可怕，失败不说为什么才可怕。
+check("⑨ 扫描入口必须给出结论（失败也要带着原因回来，不许只交一个空汇总）",
+      bool(_res) and "ok" in _res, _res)
 check("⑨ 本机没有总表缓存时不构造池内比对（点扫描不会先等几分钟网络）",
-      _res.get("ok") and not _tried, (_tried, _res.get("stats")))
+      _res.get("ok") and not _tried, (_tried, _res.get("stats"), _res.get("note")))
 check("⑨ 没比对必须在汇总里如实说明（不能把「没比对」装成「池里都有」）",
       bool(_res.get("stats", {}).get("pool_note"))
       and "池内比对" in ls.summary_line(_res["stats"]),

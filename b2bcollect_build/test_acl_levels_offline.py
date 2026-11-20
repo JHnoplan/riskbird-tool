@@ -191,7 +191,16 @@ class FakeOSS:
 # whoami 直接取快照），只顶其中一个就会出现「分片里是 DEV_A、自报身份是真机」这种
 # 测试自己造出来的假矛盾：它把用例搞得像有 bug，也把真 bug 藏起来。
 _REAL_IDENTITY_FN = ag.device_identity    # D3 要回到真链路验 B2B_DEVICE_ID，先留原件
-_REAL_IDENTITY = ag.device_identity()     # 真实指纹（本进程不写盘，只读一次）
+# ── 先把默认落点钉到临时目录，再读真机指纹 ────────────────────────────────
+# `ag.device_identity()` 在一台**没有** .acl_device.json 的机器上是首调即写（第一次认识
+# 这台机器，要把生成的指纹落盘）。上一版这里直接读，注释写着「本进程不写盘，只读一次」——
+# 那句只在开发机成立（那份文件早就在位，走的是纯读）：2026-11-20 干净检出泳道上，一路
+# 304/0 全绿的套件就是这样在仓库里建出了 b2bcollect_build/acl/.acl_device.json，
+# 被批跑的状态对拍点了名。判据不许依赖磁盘上碰巧有什么，所以先钉住，下面再由
+# test_state_isolation 当场自证（只钉不证，下一轮改动会把钉这一步默默删掉）。
+_STATE_PIN = Path(tempfile.mkdtemp(prefix="acl_pin_"))
+ag._state_dir = lambda: _STATE_PIN
+_REAL_IDENTITY = ag.device_identity()     # 真机指纹（写盘那一步已经接在临时目录里）
 _DEV = ["DEV_A"]
 
 
@@ -581,7 +590,11 @@ def test_simulated_device():
                 del sys.frozen
             else:
                 sys.frozen = frozen_before
-        _assert(ag.device_identity()["source"] != "env" or True,
+        # 这一格本段刚从恒真断言改回来：上一版写的是 `!= "env" or True`——`or True` 让它生下来就绿，
+        # 而就算剔掉 `or True`，方向也是反的（这句要守的是「解冻后**回到**模拟身份」，
+        # 那在 _sim_machine 里就是 source == "env"）。拿掉 or True 后它在干净检出当场变红，
+        # 才看见这两层错都在这儿（同一类错本项目已经第四次撞上：顺手补的那格最容易是永真）。
+        _assert(ag.device_identity()["source"] == "env",
                 "解冻后继续按模拟身份走（上面那次冻结检查没把状态留在进程里）")
 
     # 端到端：真实设备先绑定，再用模拟的第二台设备接管，看被顶的那台收不收到事件
@@ -1430,8 +1443,26 @@ def test_cli():
             "CLI 用例结束后类级补丁原样收回（漏收会污染后面所有用例）")
 
 
+# ═════════════════════════════════════════ 0. 状态落点隔离（本套件自己不许碰开发机）
+def test_state_isolation():
+    """两条一起判才有牙。
+
+    只判「仓库里没多出文件」，在一台早就有那份文件的开发机上永远绿（看不出钉没钉）；
+    只判「临时目录里有文件」，把落点改回默认也会红，但红的原因是「默认落点上碰巧没有」——
+    那又是一句只有新机器才成立的话。所以两条分开写清各自负责什么，缺一就不算自证。
+    """
+    print("\n═══ 0. 状态落点隔离：判据不许把开发机当工作目录 ═══")
+    _assert(str(ag._state_dir()) == str(_STATE_PIN),
+            f"默认状态目录已被钉到临时目录（实际={ag._state_dir()}）：没这一句，"
+            "下面那条「指纹落在临时目录」就是在判空气")
+    _assert((_STATE_PIN / ag.DEVICE_FILE_NAME).is_file(),
+            "读真机指纹那一步**确实写过一份**设备指纹，而且写在临时目录里："
+            "它同时推翻旧注释「本进程不写盘」，又证明落点真的接住了那次写")
+
+
 def main():
     print("═══ 权限等级 + 单点登录顶号 离线测试 ═══")
+    test_state_isolation()
     test_level_matrix()
     test_level_parsing()
     test_level_backfill()
