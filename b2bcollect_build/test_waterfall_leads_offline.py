@@ -1547,12 +1547,47 @@ def _o_tier_offenders():
     return _by_pkg, _out
 
 
+def _o_tracked_counts():
+    """git 在库的顶层 .py 份数——一条与机器无关的视野下限。
+
+    为什么需要它：下面那条门过去写的是「扫到 ≥100 份」，那个 100 是**这台开发机的
+    未跟踪脚本堆**撑出来的数字，不是仓库的性质：本机 58+85+7=150 过，干净 clone
+    58+18+5=81 必红（2026-11-20 首轮 clone 全量批跑 13 条红之一）。riskbird_build
+    本地 85 份里只有 18 份在库——一条量「仓库」的门不该拿某台机器的桌面当标尺。
+    读不到 git（无仓库、无 git 命令）就返回空表，下面退回「每个目录都非空」那一条，
+    仍然拦得住「扫了个空目录」。
+    """
+    import subprocess
+    _root = Path(fe.__file__).resolve().parent.parent
+    out = {}
+    _self = Path(fe.__file__).name
+    for _pkg in ("b2bcollect_build", "riskbird_build", "ali1688_build"):
+        try:
+            r = subprocess.run(["git", "-C", str(_root), "ls-files", "--", f"{_pkg}/*.py"],
+                               capture_output=True, text=True, timeout=20)
+        except Exception:
+            return {}
+        if r.returncode:
+            return {}
+        out[_pkg] = len([ln for ln in r.stdout.splitlines()
+                         if ln.count("/") == 1 and not Path(ln).name.startswith("test_")
+                         and Path(ln).name != _self])
+    return out
+
+
 _o_by_pkg, _o_hits = _o_tier_offenders()
 _o_scan_n = sum(_o_by_pkg.values())
-_assert("/b2bcollect_build/" in Path(fe.__file__).as_posix()
-        and all(_o_by_pkg.values()) and _o_scan_n >= 100,
+_o_floor = _o_tracked_counts()
+_assert("/b2bcollect_build/" in Path(fe.__file__).as_posix() and all(_o_by_pkg.values()),
         f"门禁确实量到了三个交付目录的顶层代码（{_o_by_pkg}，共 {_o_scan_n} 份，注册表取的是 "
         f"{Path(fe.__file__).parent.name}）——路径错一个层级就会变成「扫了个空目录、永远绿」")
+# 视野下限拿在库份数说话，而不是拿某台机器上堆了多少未跟踪脚本说话：
+# 扫到的必须不少于在库的（在库文件正常都在磁盘上；差出来说明过滤条件在吃文件，
+# 或者根目录指错了地方）。
+_assert((not _o_floor) or all(_o_by_pkg[p] >= _o_floor[p] for p in _o_floor),
+        f"实扫份数不许低于 git 在库份数（在库 {sum(_o_floor.values()) if _o_floor else '读不到 git'} 份"
+        f"／实扫 {_o_scan_n} 份｜{_o_by_pkg} vs {_o_floor}）：差一份就是在吃文件，"
+        f"而视野下限不许拿某台机器上堆了多少未跟踪脚本当标尺")
 _assert(not _o_hits,
         f"除层级注册表本身，三份产物代码里没有任何一处把层级名手抄进会渲染的字符串"
         f"（一律走 stage_name / TIER_LABEL）：{_o_hits}")

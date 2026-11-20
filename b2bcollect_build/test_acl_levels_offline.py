@@ -967,6 +967,16 @@ def test_auth_pending_separation():
     ag.prefetch_authoritative()
     _assert(_ed.auth_pending(), "前置状态：开机未确认 → 待确认")
     g.refresh_bounded(timeout=3.0)          # 界面有界重试走的就是这一个入口
+    # 先有界等在途那一轮落地，再断言。``refresh_bounded`` 返回的是「名单这次有没有
+    # 拿到」，不是「线程结束了没有」（它自己的注释就这么写）：超时后在途线程还会跑完
+    # 并在末尾调 ``_evaluate``——而那恰好是本条要量的时刻。不等它就断言，「通过」可能
+    # 只是「迟到回调还没到」：旧写法把 pending 抹成 False 也照样绿过去，这比红更糟——
+    # 它不是噪声，是一条没有观察到的证词。
+    _dl = time.monotonic() + 5.0
+    while g.auth_inflight() and time.monotonic() < _dl:
+        time.sleep(0.02)
+    _assert(not g.auth_inflight(),
+            "在途那一轮已在有界等待内落地（不然下面两条量的是「还没发生」而不是「不发生」）")
     _assert(_ed.auth_pending(),
             "失败刷新后仍保持待确认（旧写法在这里抹成 False，用户从此在等一个不会来的补齐）")
     _assert("已移出白名单" not in _ed.auth_reason(),
