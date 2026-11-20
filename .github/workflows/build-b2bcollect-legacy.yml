@@ -254,6 +254,24 @@ jobs:
           --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \
           --artifact-label "$ARTIFACT_LABEL"
 
+    - name: Swap in Win7-compatible UCRT (装配期换掉 Win11 版运行库)
+      # 由来（2026-11-21 取证，legacy run#4）：42 项存根红只是第一层——包内那份 Win11 版
+      # ucrtbase.dll 自己就静态依赖 api-ms-win-core-synch-l1-2-0.dll（Win8 才有的契约
+      # 模块）：存根在位时 PE 门按「随包桩导出表实测」放行，存根一剪它立刻变红；真 Win7
+      # 上没装 KB2999226 的机器连这个模块名都解析不到。所以光剪存根不够，必须把
+      # ucrtbase + api-ms-win-crt-* 整套换成 Win7 兼容版（SDK 的 app-local redist）。
+      # 为什么不在安装器里补 KB2999226 而要在装配期换：绿色版 zip 不经过安装器，
+      # app-local 替换让两种交付形态都不依赖用户机器上装没装过那个补丁。
+      # 替换件自己先过 check_pe_floor 同一把尺子（地板 6.1、最严口径），不合格就
+      # fail-closed 红在这一步——不凭记忆写 Windows 行为，用字节说话。
+      # 为什么不走构建期排除：PyInstaller 那一步是共享步骤（第 42 条对拍），而 UCRT
+      # 是它从 runner 的 System32 扫依赖带进来的，排除参数拦不住；这一整步只在兼容
+      # 通道存在，主通道根本不跑（Win10 不需要）。
+      shell: bash
+      run: |
+        set -u
+        python .github/scripts/swap_win7_ucrt.py --dist-dir b2bcollect_build/dist/B2bCollectTool
+
     - name: PE floor gate (产物字节里写着的最低 Windows 版本)
       # 需求 10B 里唯一能在**没有 Win7 实机**的情况下机械量出来的一格。为什么量这个：
       # Windows 加载器映射镜像时会把可选头里的 MajorSubsystemVersion/MinorSubsystemVersion
@@ -276,12 +294,19 @@ jobs:
       # 兼容通道存在，主通道根本不跑 PE 地板门（Win10 不需要）。
       # --prune-keep 是「哪怕通配命中也不许剪」的那道框：入口 exe 被剪掉的话，剩下的
       # 就是一堆开不了的零件。
+      # 【实测剪 api-ms-win-core-* 存根】run#4 实测：30 个 core 存根全是 PyInstaller 从
+      # Win11 System32 扫依赖带进来的（地板 10.0，Win7 加载器当场拒载）。上一步把 UCRT
+      # 换成 Win7 版后它们失去了唯一的依赖方，剪掉不影响任何镜像；crt 转发器不在剪名单
+      # 里——它们已被换成 Win7 版，要留在包里给 python38.dll 用。--max-prune 抬到 40：
+      # 实测 30 个 core 存根 + selenium-manager 共 31 件，默认 4 会当场停下来问人；
+      # 四道安全框不动（只剪实测不合格且命中通配的、剪后必复检、超限先问人）。
       shell: bash
       run: |
         set -u
         cd b2bcollect_build
         python ../.github/scripts/check_pe_floor.py --scan-dir dist/B2bCollectTool --floor 6.1 \
-          --prune-match selenium-manager.exe --prune-keep B2bCollectTool.exe
+          --prune-match selenium-manager.exe --prune-match api-ms-win-core-*.dll \
+          --prune-keep B2bCollectTool.exe --max-prune 40
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，

@@ -9861,6 +9861,13 @@ def check_legacy_channel(main_text=None, legacy_text=None, toolchain_text=None) 
     need(r"check_pe_floor\.py[^\n]*--scan-dir[^\n]*--floor\s+6\.1",
          "兼容通道没在构建后扫产物目录的 PE 地板：加载器那一关就没人量过（镜像要得比系统新"
          "时，PyInstaller 与 makensis 一句错都不报）")
+    # 由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，包内 Win11 版
+    # ucrtbase 自己就依赖 Win8 契约模块——光剪存根不够，必须装配期整套换 Win7 版 UCRT。
+    # 这一步被摸掉的话，PE 门会在 42 项存根红上原地踏步，而红话听起来像「存根没剪干净」，
+    # 没人会想到是替换那一步根本不在了。
+    need(r"swap_win7_ucrt\.py[^\n]*--dist-dir",
+         "兼容通道不再在装配期替换 Win7 兼容 UCRT：Win11 版 ucrtbase 与 api-ms 存根会留在包里，"
+         "Win7 加载器当场拒载（台账第 11 项；这一步必须排在 PE 地板门之前，见 DH 节判据）")
     for pat, why in ((r'MIN_WIN_MAJOR:\s*["\']6["\']', "兼容通道的安装器地板不是 major=6"),
                      (r'MIN_WIN_MINOR:\s*["\']1["\']', "兼容通道的安装器地板不是 minor=1"),
                      (r'OUT_FILE:\s*["\']B2bCollectToolSetup_Win7\.exe["\']',
