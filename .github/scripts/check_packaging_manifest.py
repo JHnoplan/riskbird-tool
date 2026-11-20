@@ -160,6 +160,13 @@
         「3.8 与 3.9 的产物在 PE 地板、窗口冒烟、自报对拍上**长得一模一样**」（api-ms-win-core-path
         是运行期延迟加载，不在导入表里），所以「这个包到底是不是 3.8 打的」全链只有解释器
         自报那一格判得出））：
+     43 密钥泄漏防线：**能进 git 历史的内容**（索引里的 + 未跟踪未忽略的）里不许出现密钥形态；
+        命中只报「文件:行 + 形态 + 掩码后长度」，绝不把原文打进 CI 日志（2026-11-20 整理交接
+        资料时实测：三份中文复盘文档里各躺着一枚真实 DeepSeek Key，而我当时写的处置建议是
+        「不含密钥，可直接 git add」——差一句话就永久进历史；同日首跑又抓到三处
+        `os.environ.get('OSS_ACCESS_KEY_ID', '真实 ID')` 形态的硬写兜底。范围分两档：
+        自家写的东西命中=硬红，第三方存盘页面「读不动/含 NUL」=点名报数但不红
+        （判据 debug/secret_gate_offline_test.py 乙10~乙13 钉住这条分界）
      每一条各自的由来与口径写在**它们函数上方**的注释块里——这些条目全部是在
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留两句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了；而**条目总数故意不写在这
@@ -9877,6 +9884,128 @@ def check_legacy_channel(main_text=None, legacy_text=None, toolchain_text=None) 
     return problems
 
 
+# ── 第 43 条：能被 add 进历史的内容里不许出现密钥 ──────────────────────────────
+# 由来（2026-11-20 整理交接资料时实测）：我在 docs/07 里把根目录 5 份未入库的中文复盘
+# 写成「不含密钥，可直接 git add」——**那句话是错的**。文档卫生扫描在三份文档里各抓到
+# 一枚真实 DeepSeek Key（`sk-` + 32 位十六进制）。它当时还没进过任何提交（`git log -S` 全空），
+# 所以只改文件就来得及；一旦照我那句话执行，密钥就永久写进历史，而
+# **历史里的密钥删不掉，只能作废重发**（根 `.gitignore` 文件头写的正是这一句）。
+#
+# 这一条判的不是「工作区有没有密钥」——那必然有，`b2bcollect_build/config.json` 就是它的
+# 正确落点，且已被 ignore（本条不报它，报了就是把门禁变成噪音）。判的是
+# 「**有没有一份能够进入 git 历史的内容带着密钥**」，所以范围取两类：
+#   ① 索引里的（`_tracked_sets()`，中文名的坑由 `-z` 兜住，见 `_path_set` 注释）；
+#   ② 未跟踪但**也未被忽略**的——本仓库实测 1.1 万份，那正是 `git add -A` 的事故半径。
+# 已知判不到的形状（写在案上，别让人以为「所有密钥都管住了」）：
+#   · 行里带**强脱敏标记**（`已脱敏`/`example`/`fake`/`placeholder`…）就放行——文档里提一句
+#     密钥格式、离线夹具都不该被咬；代价是一枚恰好写在脱敏词同一行的真密钥会漏。
+#     2026-11-20 判据（`debug/secret_gate_offline_test.py` 丙2/丙3）收口：这张表里原来还放着
+#     `<`、`$`、`{{`、`...`、`env ` 一类**结构字符**，而判定是整行匹配——`.html`/`.xml` 本就在
+#     扫描扩展名里，而标签里的值必然被尖括号包着，等于把整类文件永久免检。弱标记一律删掉：
+#     豁免的理由必须是「这串本身是假的」，不能是「这一行还有别的东西」。
+#   · 不认没有固定形态的口令（人写在注释里的明文口令）；那由 review 与 `.gitignore` 负责。
+#   · 二进制、超过 _SECRET_MAX_BYTES 的文件、以及非文本扩展名一律不读（读不动的不能算扫过）。
+
+_SECRET_TEXT_EXT = (".py", ".md", ".sh", ".bash", ".yml", ".yaml", ".json", ".txt", ".bat",
+                    ".cmd", ".ps1", ".nsi", ".ini", ".cfg", ".toml", ".js", ".html", ".xml",
+                    ".command", ".spec")
+_SECRET_MAX_BYTES = 4_000_000
+# 第三方页面层：采集/探针从别人网站上存下来的 HTML/JS/XML。本仓库实测 295 份，里面是别人的
+# 混淆代码（形如 "$f_lsk-cem…_U-El41…":3694 的 webpack 标识符会被 sk- 那条正则整段咬住）。
+# 这一层照扫，但读不动/含 NUL 的单独计数报出来，不当「确认没有」（见主体注释）。
+_SECRET_PAGE_EXT = (".html", ".xml", ".js")
+# 凭据 token 必须「到此为止」：后面紧跟单词字符或连字符，说明它只是个更长的标识符的碎片。
+# 这一格是 2026-11-20 实测逼出来的——收紧豁免表之后，抓来的页面里立刻冒出两枚 sk- 假密钥。
+_TAIL = r"(?![\w\-])"
+
+SECRET_PATTERNS = (
+    ("DeepSeek / OpenAI 风格 API Key", re.compile(r"sk-[A-Za-z0-9]{20,}" + _TAIL)),
+    ("GitHub 令牌", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9]{20,}" + _TAIL)),
+    ("阿里云 AccessKey ID", re.compile(r"\bLTAI[A-Za-z0-9]{12,24}" + _TAIL)),
+    ("AWS 风格 AccessKeyId", re.compile(r"\bAKIA[0-9A-Z]{16}" + _TAIL)),
+    ("私钥文件体", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("密钥/口令写成字面量", re.compile(
+        r"(?i)\b(access[_-]?key[_-]?secret|accesskeysecret|secret[_-]?access[_-]?key"
+        r"|api[_-]?key|auth[_-]?token|client[_-]?secret|passwd|password)\b"
+        r"\s*[:=]\s*[\x22\x27][^\x22\x27\n]{16,}[\x22\x27]")),
+)
+
+# 占位与脱敏标记：命中就当示例放行（见上面「已知判不到的形状」第一条）。
+# 只收「**明确表达这串是假的**」的强标记；结构字符（`<` `$` `{{` `...`）和「这一行提到环境变量」
+# 都不算豁免理由——详见上面注释与 debug/secret_gate_offline_test.py 丙2/丙3。
+_SECRET_REDACT_MARKS = ("已脱敏", "占位", "placeholder", "example", "your_", "your-", "YOUR_",
+                        "xxx", "XXX", "dummy", "fake", "sample", "redacted", "****", "‹")
+
+
+def _secret_scope() -> list:
+    """本条要读的文本清单：索引里的 + 未跟踪未忽略的，再按扩展名与体积筛。"""
+    index, _head = _tracked_sets()
+    others = _path_set(["ls-files", "--others", "--exclude-standard"])
+    out = []
+    for rel in sorted(index | others):
+        if not rel.endswith(_SECRET_TEXT_EXT):
+            continue
+        path = ROOT / rel
+        try:
+            if path.is_file() and path.stat().st_size <= _SECRET_MAX_BYTES:
+                out.append(rel)
+        except OSError:
+            continue
+    return out
+
+
+def _mask(value: str) -> str:
+    """只暴露「形态 + 长度」，绝不把密钥原文打进日志——门禁自己泄密是最难堪的一种坏。"""
+    head = value[:6] if len(value) > 6 else value[:2]
+    return f"{head}…(共 {len(value)} 字符，已折叠不外传)"
+
+
+def check_history_secrets(files=None, report=None) -> list:
+    """第 43 条主体：返回问题清单（空=合格）。`files` 是给离线判据喂夹具用的。
+
+    `report` 由调用方传一个字典进来，领走「扫不动」那份计数。
+    """
+    scan = _secret_scope() if files is None else list(files)
+    if not scan:
+        # 原来这一格只在 `files is None` 时自红，显式传空清单就静默报绿——那等于给调用方
+        # 留了一条「传个空数组就能买到绿灯」的路，判据戊1 就是来钉它的（2026-11-20）。
+        return ["第 43 条一份文本内容都没读到（git 不可用？仓库刚初始化？扩展名筛歪了？清单传空？）："
+                "范围断了的时候，「没有密钥」这句话没有任何含义"]
+    problems = []
+    for rel in scan:
+        path = ROOT / rel if not isinstance(rel, Path) else rel
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            problems.append(f"{rel}：读不出内容（{e}）——读不到不等于没有，这一格不许安静略过")
+            continue
+        if chr(0) in text:   # 不写 "\x00"：写作者用的生成脚本会把它解成真 NUL（本项目踩过）
+            # 含 NUL 的"文本"根本不是文本：原来是逐行 continue，等于给「密钥和 NUL 写在同一行」
+            # 开了免检口。改成整份点名（实测本仓库已跟踪文本零 NUL，所以 fail-closed 不带噪音）。
+            # 但也不能一律硬红：实测四份命中全是第三方页面存盘（三份尾部 46 个 NUL 补齐、
+            # 一份开头就是替换字符），它们属于用户要保存的采集数据，按根 .gitignore 的原则
+            # 不许被 ignore 掉；红它们 = 逼下一个人把整条门禁关掉。折法是「分格说清楚」：
+            # 自家写的东西含 NUL 硬红，第三方页面含 NUL 点名报数，两者都不许装作没看见。
+            if str(rel).endswith(_SECRET_PAGE_EXT):
+                if report is not None:
+                    report.setdefault("第三方页面扫不动", []).append(str(rel))
+                continue
+            problems.append(f"{rel}：自家写的文本里出现 NUL 字节——先确认它是不是二进制；"
+                            f"扫不动不等于没扫到，这一格不许安静略过")
+            continue
+        for no, line in enumerate(text.splitlines(), 1):
+            for what, pat in SECRET_PATTERNS:
+                m = pat.search(line)
+                if not m:
+                    continue
+                hit = m.group(0)
+                if any(k in line for k in _SECRET_REDACT_MARKS):
+                    continue
+                problems.append(f"{rel}:{no} 发现{what} {_mask(hit)}"
+                                f"——它在「能进 git 历史」的内容里；进历史后删不掉，只能作废重发")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -10453,6 +10582,27 @@ def main(argv=None) -> int:
         print(f"✅ Windows 7 兼容通道：与主通道共享的 {len(SHARED_STEPS)} 步逐字节同源"
               f"（外加「{NORMALIZED_STEP}」只允许解释器那一个 token 不同），"
               "双解释器 / 驱动 109 / PE 地板 / 包名与地板钉子全部在场，且尚未接进固定直链")
+
+    _secret_report = {}
+    secret_probs = check_history_secrets(report=_secret_report)
+    if secret_probs:
+        bad += 1
+        print("❌ 历史可见内容里发现疑似密钥（第 43 条）：")
+        for p in secret_probs:
+            print(f"   · {p}")
+            print(f"::error::密钥泄漏防线：{p}")
+    else:
+        _unscanned = _secret_report.get("第三方页面扫不动", [])
+        _note = ""
+        if _unscanned:
+            # 「没扫」和「扫了没有」是两句话——界面/日志口径里这两格不许混用。
+            _note = (f"；另有 {len(_unscanned)} 份第三方页面含 NUL、按文本读会失真，"
+                     f"本条**没有**扫它们（这不叫「确认没有」）："
+                     + "、".join(_unscanned[:3])
+                     + (" 等" if len(_unscanned) > 3 else ""))
+        print(f"✅ 密钥泄漏防线：{len(_secret_scope())} 份「可被 add 进历史」的文本内容"
+              "（索引里的 + 未跟踪未忽略的）没有密钥形态；config.json 那类真值落点由"
+              ".gitignore 守着，不在本条范围内" + _note)
 
     for label, path in CALLERS.items():
         if not path.exists():
