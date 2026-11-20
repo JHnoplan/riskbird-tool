@@ -8088,8 +8088,14 @@ def test_qt_shutdown_teardown_gate():
     _watch = ("b2bcollect_gui.py", "riskbird_gui.py", "ali1688_gui.py", "phone_verifier_gui.py",
               "wechat_helper_gui.py", "test_keyword_resume_offline.py",
               "test_site_enrich_offline.py", "test_waterfall_leads_offline.py",
-              "test_integration_offline.py", "test_gui.py", "gen_guide_images.py",
-              "debug_dual_open_check.py")
+              "test_integration_offline.py", "test_gui.py", "gen_guide_images.py")
+    # 名单里只放**随仓库走**的文件。原先还带着 debug_dual_open_check.py，而它命中
+    # riskbird_build/.gitignore 的 `debug_*` 规则（本地临时复现脚本，本来就不交付）：
+    # 于是这条「不许靠登记表」的点名在干净克隆里永远满足不了（2026-11-20 实测：
+    # 克隆里 AE 节就在 phone_verifier_gui.py 这一步响，而同一份代码本机绿）。
+    # 拿不存在的文件当证人，比不列它更糟——它让「克隆跑不通」看起来像产品写坏了。
+    # （同期发现：phone_verifier_build/ 与 wechat_helper_build/ 两个工具整体没入库，
+    # 已于本日补回；那条才是真正该红的——产品代码进不了仓库就不是「登记不全」而是「少交工具」。）
     for _n in _watch:
         _assert(_n in _by_name, f"{_n} 在门视野里（按目录发现，挪目录或改名要在这里响，不许靠登记表）")
         _t = _by_name[_n]
