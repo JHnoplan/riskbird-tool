@@ -31,7 +31,9 @@
 运行：QT_QPA_PLATFORM=offscreen .venv/bin/python debug/chrome_env_offline_test.py
 """
 import os
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -39,9 +41,26 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "b2bcollect_build"))
 
+# 状态落点钉进沙箱（2026-11-20 批跑实测）：本套件刻意用**真 MainWindow**，而真建窗口就会
+# 真走一次权限定档——`.acl_cache.json` 的开发态落点在 `b2bcollect_build/acl/`，于是这一路
+# 把开发机那份缓存改写了一遍（`fetched_at` 每跑必刷新，所以字节一定变）。它被批跑收尾的
+# 状态对拍门逐套件归属点名，拦停了一轮「69 通过 / 0 失败」的批跑。写脏缓存比留个临时目录严重：
+# 它替下一台真开工具的机器担保了一个“刚刚问过 OSS”的谎言。
+# 同一族的上一次事故见 `debug/acl_note_panel_offline_test.py` 里那段注释（那一路写的是
+# 设备指纹，后果是用户看到「该账号已在另一台设备使用」）。
+_STATE_SANDBOX = Path(tempfile.mkdtemp(prefix="chromeenv_state_"))
+os.environ["B2B_STATE_DIR"] = str(_STATE_SANDBOX)
+
 from PyQt5.QtWidgets import QApplication, QMessageBox                    # noqa: E402
 
 import b2bcollect_gui as gui                                             # noqa: E402
+
+# 隔离必须**当场自证**：只写一句「用完删掉沙箱」无论隔离有没有生效都恒真（沙箱是
+# 自己造的，删了当然不存在），那是判据的装饰而不是证据。落点真的跟着环境变量走，
+# 这一路才不会碰到开发机那份缓存。
+import access_guard as _ag_boot                                         # noqa: E402
+assert str(_ag_boot._state_dir()).startswith(str(_STATE_SANDBOX)), (
+    f"隔离没生效：权限状态目录指向 {_ag_boot._state_dir()}（沙箱是 {_STATE_SANDBOX}）")
 
 app = QApplication.instance() or QApplication(sys.argv[:1])
 
@@ -266,6 +285,11 @@ def main():
         modals.restore()
         (gui._chrome_doctor, gui.HAS_CHROME_DOCTOR,
          gui.ChromeDoctorWorker) = saved
+        # 沙箱用完即回收，且放在 finally 里——判据红了也一样收，别让一次失败顺手
+        # 留下永久残留（批跑骂过「/var 下没人认领的目录」，自己造的临时目录自己收）。
+        shutil.rmtree(_STATE_SANDBOX, ignore_errors=True)
+        check("状态沙箱用完回收（不在 /var 下留没人认领的目录）",
+              not _STATE_SANDBOX.exists(), str(_STATE_SANDBOX))
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 
