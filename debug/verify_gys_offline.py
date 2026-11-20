@@ -16,6 +16,13 @@ c = GysCrawler()
 
 SUBS = sorted({p.name.split("_", 1)[1].replace(".html", "")
                for p in CACHE.glob("shop_*.html")})
+if not SUBS:
+    # 本套件整段靠 glob 驱页：目录空了循环一次也不跑，退出码仍是 0——屏幕上会写「PASS」，
+    # 而它其实一项都没验（2026-11-20 干净 clone 首轮就是这一格静默空跑）。
+    # 靠 glob 驱页的套件都必须先把「读到多少页」变成显式断言或显式跳过。
+    print(f"⏭ SKIP-FIXTURE 缺实机夹具：{CACHE.name}/ 下一份 shop_*.html 也没有　"
+          "取回方式：git checkout -- debug/probe_gys_cache；仍缺则跑 debug/probe_gys_contact.py 重新取页")
+    sys.exit(0)
 
 # 独立真值判据：可见文本里出现「联系人/姓名/职　位/职务」标签，或 linkman/position class
 LABEL_SCAN = re.compile(r"(联系人|联\s*系\s*人|姓\s*名|职\s*位|职务|岗\s*位)")

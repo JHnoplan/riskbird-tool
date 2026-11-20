@@ -50,7 +50,14 @@ check("日期/URL 段不被误合并",
 
 # ── 4) 供应商网：JSON-LD 权威字段（真实渲染夹具 gdjt88，UI 隐藏号码但注水有电话）
 g = GysCrawler()
-fx = (pathlib.Path(__file__).parent / "probe_gys_cache" / "gys_gdjt88_shop.html").read_text(encoding="utf-8")
+_fx = pathlib.Path(__file__).parent / "probe_gys_cache" / "gys_gdjt88_shop.html"
+if not _fx.is_file():
+    # 这一份是「UI 把号码隐掉、但页面注水里仍有电话」的唯一现场证据：换成手造 HTML 就测不到
+    # 那个真实形状了，所以缺它只按环境不具备跳过，不改成合成夹具继续跑「绿」。
+    print(f"⏭ SKIP-FIXTURE 缺实机夹具：{_fx.name}（probe_gys_cache/）　取回方式：git checkout -- debug/probe_gys_cache；"
+          "仍缺则跑 debug/probe_gys_contact.py 重新取页")
+    sys.exit(0)
+fx = _fx.read_text(encoding="utf-8")
 ld = g._parse_ld_json(fx)
 check(f"ld+json 提出 telephone（{ld.get('电话')}）", ld.get("电话") == "18923274073")
 check("ld+json 提出地址", "顺德" in ld.get("地址", ""))

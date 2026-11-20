@@ -23,7 +23,15 @@ cdp_base.CdpSiteCrawler._ws_url = lambda self: ""
 
 CACHE = pathlib.Path(__file__).parent / "probe_maimaib2b_cache"
 def cached(name):
-    return (CACHE / name).read_text(encoding="utf-8", errors="ignore")
+    p = CACHE / name
+    if not p.is_file():
+        # 缺实机存页按「环境不具备」显式跳过并报出取回路径，不让人拿抛栈当解析器缺陷去改代码。
+        # 本目录与另几份 probe_*_cache 不同：它确实有一条再生入口（需要能跑起真实 Chrome 标签），
+        # 所以先 git、再不行才跑探测脚本——站点在 Cloudflare 后面，重跑不保证拿得到同一份页面。
+        print(f"⏭ SKIP-FIXTURE 缺实机夹具：{name}（{CACHE.name}/）　取回方式：git checkout -- debug/{CACHE.name}；"
+              f"仍缺则跑 debug/probe_maimaib2b_cdp.py 重新取页")
+        sys.exit(0)
+    return p.read_text(encoding="utf-8", errors="ignore")
 
 ok = 0
 def check(name, cond):

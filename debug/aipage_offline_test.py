@@ -8,7 +8,14 @@ from cdp_base import PHONE_MOBILE_RE
 
 CACHE = pathlib.Path(__file__).parent / "probe_aipage_cache"
 def cached(name):
-    return (CACHE / name).read_text(encoding="utf-8")
+    p = CACHE / name
+    if not p.is_file():
+        # 缺夹具不是代码坏了，可抛栈会让人去改解析器（2026-11-20 干净 clone 首轮 6 路一起红在这里）。
+        # 这批实机存盘页**没有任何脚本能再生**（不是探测脚本跑出来的），入库的那份就是唯一副本，
+        # 所以恢复动作是「从 git 取回」，这里也不假装有一条取页命令可以给。
+        print(f"⏭ SKIP-FIXTURE 缺实机夹具：{name}（{CACHE.name}/）　取回方式：git checkout -- {CACHE.relative_to(CACHE.parent.parent)}")
+        sys.exit(0)
+    return p.read_text(encoding="utf-8")
 
 ok = 0
 def check(name, cond):

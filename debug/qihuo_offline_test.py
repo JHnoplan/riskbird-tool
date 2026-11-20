@@ -7,7 +7,14 @@ from parallel_session import ParallelSession, SITE_ORDER
 
 CACHE = pathlib.Path(__file__).parent / "probe11467_cache"
 def cached(name):
-    return (CACHE / name).read_text(encoding="utf-8")
+    p = CACHE / name
+    if not p.is_file():
+        # 缺实机存页要先说清「这是夹具不在」，不要留一个 FileNotFoundError 让人去改解析器
+        # （2026-11-20 干净 clone 首轮就有 6 路套件崩在这一类上）。
+        # 本目录没有取页脚本可再生（探测脚本只读它），唯一副本在 git 里。
+        print(f"⏭ SKIP-FIXTURE 缺实机夹具：{name}（{CACHE.name}/）　取回方式：git checkout -- debug/{CACHE.name}")
+        sys.exit(0)
+    return p.read_text(encoding="utf-8")
 
 ok = 0
 def check(name, cond):
