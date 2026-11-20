@@ -7732,13 +7732,17 @@ def test_curl_bounds_gate():
     # 逐份点名「这一份里确实有一句真在取凭证」，而不是钉一个总数：总数会随交付链加减而假红
     # （同一格里 20a 的份数就是这么红的），而逐份的期望只在自己担保的那一路失效时才响。
     for _rel in ("debug/dispatch_b2bcollect_builds.sh", "debug/fetch_b2bcollect_artifacts.sh",
-                 "debug/poll_b2bci.sh", "debug/fetch_run_log.sh"):
+                 "debug/poll_b2bci.sh", "debug/fetch_run_log.sh",
+                 # 2026-11-20 交接段加进来的一路：Win7 兼容通道不在 poll_b2bci.sh 的名单里，
+                 # 它跑到第几步只能靠这份脚本现敲 API。手工结论不可复跑，但它照样取凭证，
+                 # 所以必须在这张表里点名——「多一路要写进这张表」就是这个意思。
+                 "debug/ci_status.sh"):
         _n = sum(1 for logical, _ln in
                  gate._logical_lines(gate._drop_comment_lines(_hang_texts[_rel]))
                  if "credential fill" in logical)
         _assert(_n >= 1, f"{_rel} 里那句真取凭证的调用还在扫描视野里（数出 {_n} 句）")
-    _assert_eq(sum(1 for x in _hang_texts if x.endswith(".sh")), 4,
-               "今天取凭证的就是派发/取制品/轮询/取证这四份脚本：少一路没人知道，多一路要写进这张表")
+    _assert_eq(sum(1 for x in _hang_texts if x.endswith(".sh")), 5,
+               "今天取凭证的就是派发/取制品/轮询/取证/看状态这五份脚本：少一路没人知道，多一路要写进这张表")
 
     def _hang(sh: str) -> list:
         return gate.check_no_prompt_hang({"ad": sh})
