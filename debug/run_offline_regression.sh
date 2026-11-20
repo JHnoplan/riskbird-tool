@@ -275,6 +275,71 @@ pass=0; fail=0; skip=0; failed=""; hung=""; total=0
 # errexit 的调用方拉起来（本轮 Windows 云端就是这么死的）。取不到看门狗下面有明确的降级路，
 # 不该由这一句的退出码决定整批跑不跑。
 TMO=$(command -v timeout || command -v gtimeout || true)
+# 看门狗可以**主动选**内置那一条：B2B_WATCHDOG=builtin。这不是给测试开的后门，而是一个真实
+# 可用的配置项（不想依赖 brew 的机器就该这么跑）；有了它，「没有 coreutils 的那一支」在任何
+# 开发机上都能被确定性地验一次——否则这一支只能在恰好缺 coreutils 的机器上跑到，而开发机
+# 装过 brew，永远跑不到（本轮 CI 那 6 条红就是这一格没人验出来的）。
+if [ "${B2B_WATCHDOG:-auto}" = "builtin" ]; then TMO=""; WD_FORCED=1; else WD_FORCED=0; fi
+#
+# 没有 timeout/gtimeout 时也**必须有**看门狗（2026-11-20 干净检出泳道实测出来的真缺陷）。
+# 旧写法在这台机器上退到「裸跑」，而裸跑的含义是：一个真的挂死 20 秒的套件，批跑照样报
+# `PASS … 套件：1 通过 / 0 失败 … ALL SUITES PASS`（实测复现，见 frozen 5c-IIC）。也就是说
+# 「有没有挂死」这件事在缺 coreutils 的机器上从来没被判过，而屏幕上写的还是通过——
+# 2026-11-12 那次整批被一个模态弹窗拖住 20 多分钟，正是靠这道看门狗才抓得到的。
+# macOS 自带 PATH 里就是没有 timeout（coreutils 是 keg-only），CI runner 与一台干净的
+# 新 Mac 都落在这一支，而开发机因为装过 brew 反而永远看不到这个洞。
+#
+# 退出码必须与 coreutils 对齐，否则下面按 124/137 分类那两支会分叉（判外部工具的返回值
+# 就得当场实测它的格式——第 14 道硬门同一口径）：到点用 SIGABRT 打断→124；ABRT 叫不应、
+# 10 秒后升级 SIGKILL→137。
+run_with_builtin_watchdog() {
+  local log="$1" lim="$2"; shift 2
+  local marker="$log.wd" donef="$log.wd.done" pid wpid code i
+  rm -f "$marker" "$donef"
+  "$@" >"$log" 2>&1 < /dev/null &
+  pid=$!
+  # 看门狗按 1 秒一跳走，并且每跳先看一眼「主进程是否已经自己收工」的旗子：
+  # 一路套件正常只要几秒，让它带着一个活着的 sleep 继续跑完整批，等于把「按 PID 发信号」
+  # 的窗口一直开着——PID 会被复用，那就不再是保护而是随时可能误杀别人的把手。
+  # 残留窗口 = 最多 1 跳，且发信号前还会 `kill -0` 复查一次；这是 bash 能做到的上限，
+  # 换不来真原子性，所以宁可写下这一点，也不假装它不存在。
+  (
+    i=0
+    while [ "$i" -lt "$lim" ]; do
+      sleep 1; i=$((i + 1))
+      [ -f "$donef" ] && exit 0
+    done
+    if [ ! -f "$donef" ] && kill -0 "$pid" 2>/dev/null; then
+      printf abrt >"$marker" 2>/dev/null
+      kill -ABRT "$pid" 2>/dev/null
+      i=0
+      while [ "$i" -lt 10 ]; do
+        sleep 1; i=$((i + 1))
+        kill -0 "$pid" 2>/dev/null || exit 0
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        printf kill >"$marker" 2>/dev/null
+        kill -KILL "$pid" 2>/dev/null
+      fi
+    fi
+  ) &
+  wpid=$!
+  code=0
+  wait "$pid" || code=$?
+  printf done >"$donef" 2>/dev/null
+  kill "$wpid" 2>/dev/null
+  wait "$wpid" 2>/dev/null
+  if [ -f "$marker" ]; then
+    # 只有看门狗真的动过手才改写退出码：套件被 SIGABRT 自己打死（134）与「看门狗到点打断」
+    # 是两件事，前者归 CRASH，后者才归 HANG。
+    case "$(cat "$marker" 2>/dev/null)" in
+      kill) code=137 ;;
+      *)    code=124 ;;
+    esac
+  fi
+  rm -f "$marker" "$donef"
+  return $code
+}
 # 每套件的完整输出都落盘：失败时「tail -N」只能看到最后几行，而断言失败的那一行
 # （`  FAIL xxx`）通常埋在中间——上次 gui_store 批跑红 2 条、单跑全绿，就是因为
 # 看不到具体哪两条，只能靠猜。留档 + 只打 FAIL 行，才能定位抖动。
@@ -494,6 +559,17 @@ _pick_reason() {
   printf '没有汇总行、没有异常行、没有任何非空输出：这条判定只能靠日志文件本身'
 }
 
+# 降级要当场说出口，不能默默换一条路跑：旧写法就是在这一步不吭声，于是「这台机器上
+# 根本没在测挂死」这件事只能靠人想到去查——而它本应是屏幕上第一行就该看到的话。
+if [ -z "$TMO" ]; then
+  if [ "$WD_FORCED" = "1" ]; then
+    echo '⚠ 按 B2B_WATCHDOG=builtin 主动选了内置看门狗（到点 SIGABRT→124、叫不应升级 KILL→137）。'
+  else
+    echo '⚠ 这台机器 PATH 里没有 timeout/gtimeout：改用内置看门狗（同样到点 SIGABRT→124、叫不应升级 KILL→137）。'
+    echo '  挂死保护仍在，但与打包机不同构；装一份 coreutils（brew install coreutils）可让两边走同一条路，不装也不影响结论。'
+  fi
+fi
+
 for f in $FILES; do
   total=$((total+1))
   log="$LOG_DIR/$(basename "${f%.py}").log"
@@ -514,7 +590,8 @@ for f in $FILES; do
     #   139（SIGSEGV）会被读成普通断言红，按信号分类那一整支就此失效。
     "$TMO" -s ABRT -k 10 "$suite_timeout" $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
   else
-    $PY -u -X faulthandler "$f" >"$log" 2>&1 < /dev/null || code=$?
+    # 内置看门狗接上（同一个文件、同一个日志、同一个 stdin 约定），不再裸跑。
+    run_with_builtin_watchdog "$log" "$suite_timeout" $PY -u -X faulthandler "$f" || code=$?
   fi
   # `|| true` 且把 2>/dev/null 留着：日志不见了的处置就在下面 `if [ ! -f "$log" ]` 那一支，
   # 让 cat 的非零先把脚本带走，就等于「有证据说它为什么没跑成」的那一支永远不会被执行。

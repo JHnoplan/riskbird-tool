@@ -1698,6 +1698,19 @@ def test_delivery_chain():
         # 路径的普通文件）。对拍只问「这条路径在不在」，不猜工具把链接解成了什么——猜就又
         # 回到「拿计数差异推断包坏」那个坑。
         os.symlink("__dot__dylibs", _dt_app / "Contents" / "Frameworks" / "PIL" / ".dylibs")
+        # 侧车不是「本机碰巧带着元数据」才有的东西：夹具自己把元数据写上去。
+        # 不这么写的后果本轮在云端看到了：干净检出里那些文件不带任何扩展属性，那台
+        # runner 的 ditto 一个侧车都不产（实测 0 个），于是下面「正例必须走侧车被吸收那一格」
+        # 从来就没被执行过——本机绿是因为开过 brew/下载过的文件带 com.apple.provenance。
+        _xa = subprocess.run(["xattr", "-w", "com.apple.b2bcollect.sidecar", "1",
+                              str(_dl / "libPIL.dylib")],
+                             capture_output=True, text=True, timeout=30,
+                             stdin=subprocess.DEVNULL)
+        for _xf in (_dt_app / "Contents" / "MacOS" / "B2bCollectTool",
+                    _dt_app / "Contents" / "Resources" / "config.json"):
+            subprocess.run(["xattr", "-w", "com.apple.b2bcollect.sidecar", "1", str(_xf)],
+                           check=False, timeout=30, stdin=subprocess.DEVNULL,
+                           capture_output=True)
         os.symlink("../Frameworks/PIL", _dt_app / "Contents" / "Resources" / "numpy")
         os.symlink("config.json", _dt_app / "Contents" / "Resources" / "link_to_file")
         os.symlink("PIL", _dt_app / "Contents" / "Frameworks" / "link_to_dir")
@@ -1749,10 +1762,22 @@ def test_delivery_chain():
         # 不认识侧车，原样落下来。少了这一格自证，上面的 ✅ 只说明「两边都全量落地」，云端
         # 那种分歧压根没跑到——那正是本轮第 5 次犯的错：正例没覆盖到出问题的那一格。
         _side = [n for n in _entries if n.rsplit("/", 1)[-1].startswith("._")]
-        _assert(_side and not (set(_side) & _ld),
-                f"夹具自证：ditto 造的包里有 {len(_side)} 个 AppleDouble 侧车条目，而 ditto 自己解完"
-                f"一个都不留（读回成元数据）——正例走的必须是这一格（实际落地含侧车="
-                f"{sorted(x for x in _ld if x.rsplit('/', 1)[-1].startswith('._'))}）")
+        if not _side:
+            # 夹具已经显式写了扩展属性，这台机器的 ditto 还是不产侧车：那就是它把元数据存在
+            # zip 自己的扩展字段里。这种包在交付链上是另一种真形状，上面的正例照样得对拍得上；
+            # 但「侧车被 ditto 吸收」这一格今天确实没验到，必须当场念出来（与上面「这台机器
+            # 没有 unzip：跳过那几步」同一口径）——把没验到写成验过，正是这一族判据反复付的学费。
+            _assert(_xa.returncode == 0,
+                    f"夹具自己写扩展属性这一步就失败了，下面那句「这台机器不产侧车」就没有出处"
+                    f"（xattr 退出码 {_xa.returncode}：{_xa.stderr.strip()[:120]}）")
+            print("   · 这台机器的 ditto 不产 AppleDouble 侧车（已显式写扩展属性仍为 0）："
+                  "侧车吸收那一格今天没验到，上面的正例只覆盖了无侧车那一支")
+        else:
+            _assert(_side and not (set(_side) & _ld),
+                    f"夹具自证：ditto 造的包里有 {len(_side)} 个 AppleDouble 侧车条目（由夹具"
+                    f"自己写的扩展属性产生，不依赖本机碰巧有什么），而 ditto 自己解完"
+                    f"一个都不留（读回成元数据）——正例走的必须是这一格（实际落地含侧车="
+                    f"{sorted(x for x in _ld if x.rsplit('/', 1)[-1].startswith('._'))}）")
 
         # 顶层那一格的判据按「层级 + 条目身份」，不按尾斜杠的拼写（`_is_under`）。这里造的
         # 是结构、不是交付字节：真 ditto 与真 unzip 都拒绝「目录条目不带斜杠」的包（实测
@@ -3462,6 +3487,44 @@ def test_workflow_shell_syntax():
             _assert(_promised == _delivered,
                     f"「{_tag}」承诺与证据必须同源：有栈才说「见下」（{_delivered}），"
                     f"没栈就得当场改口（{_promised}）（实际：{_proc.stdout.strip()[-200:]}）")
+
+    # 5c-IIC) 没有 timeout/gtimeout 的那一支也必须抓得住挂死（2026-11-20 干净检出泳道实测）。
+    # 来由：入口旧写法在取不到 timeout 时退成「裸跑」，而裸跑就是把挂死读成通过——本机手工
+    # 复现过一份真挂死 20 秒的夹具在那种环境下的输出：`PASS … 套件：1 通过 / 0 失败 …
+    # ALL SUITES PASS`。云端那 6 条红只是它的影子：挂死分类那两支在 runner 上压根没执行，
+    # 于是「必须算失败 / 要报成 HANG / 要报成 124(137)」三条各红一次。真正贵的不是那 6 条红，
+    # 是 2026-11-12 那次「整批被一个模态弹窗拖死 20 多分钟」——保护它的看门狗在一台干净的新
+    # Mac 上其实并不存在，而屏幕上照样写着通过。
+    # 这一支用 B2B_WATCHDOG=builtin 把「缺席」造出来，所以开发机（装过 brew）与 runner 跑的是
+    # 同一条断言；退出码必须仍是 124/137 那一套，否则上面按码分类的两支就分叉了。
+    for _tag, _src, _want in (
+            ("内置看门狗·到点打断", 'import time\nprint("结果：0 通过 / 0 失败")\ntime.sleep(60)\n',
+             ["HANG", "看门狗 124 打断"]),
+            ("内置看门狗·叫不应升级 KILL",
+             'import signal, time\nsignal.signal(signal.SIGABRT, signal.SIG_IGN)\n'
+             'print("结果：0 通过 / 0 失败")\ntime.sleep(120)\n',
+             ["HANG", "升级 KILL 才停（137）"]),
+    ):
+        _p = _run_probe(_src, {"B2B_WATCHDOG": "builtin", "PER_TEST_TIMEOUT": "2"})
+        _assert_eq(_p.returncode, 1, f"{_tag}：挂死必须算失败（尾部：{_p.stdout.strip()[-120:]}）")
+        for _w in _want:
+            _assert(_w in _p.stdout,
+                    f"{_tag}：要报成「{_w}」这一类死法（实际：{_p.stdout.strip()[-240:]}）")
+        # 降级必须当场说出口：默默换一条路跑，就等于「这台机器上挂死是怎么判的」这句话
+        # 没有出处——下一轮再红就只能从头猜。
+        _assert("内置看门狗" in _p.stdout,
+                f"{_tag}：选了内置看门狗要在屏幕上承认（实际：{_p.stdout.strip()[-240:]}）")
+        _assert("zz_regression_probe.py" in _p.stdout.split("HANG:")[-1],
+                f"{_tag}：要进收工的 HANG 清单（实际：{_p.stdout.strip()[-160:]}）")
+    # 正控·auto 模式不许把外部 timeout 丢掉（丢了就等于全批悄悄换成另一套保护）：
+    # 只在装了 coreutils 的机器上判这一格，没装的机器上这句本身就是废话，得当场念出来。
+    if shutil.which("timeout") or shutil.which("gtimeout"):
+        _p = _run_probe('print("结果：1 通过 / 0 失败")\n')
+        _assert("内置看门狗" not in _p.stdout,
+                f"本机有 timeout/gtimeout 时默认仍须走外部看门狗（实际：{_p.stdout.strip()[-200:]}）")
+    else:
+        print("   · 这台机器没有 timeout/gtimeout：上面那条 auto 模式对照跳过（CI 就是这样；"
+              "内置那两支已经跑过，不影响结论）")
 
     # 5c-III) 污染要报在**犯错的套件名下**：只在收工那句「改动了 N 份」里说总数，接下来
     # 就得靠人回想这一批跑了什么——上一轮那两份「爱企查_结果页证据_*.txt」正是这么找的，
@@ -10960,10 +11023,28 @@ def test_python_floor_gate():
     _first = gate.check_python_floor()               # 第一次全量
     _ff = dict(gate._FLOOR_FACTS)                    # 必须**复制**读数：拿引用比＝自己跟自己比，永真
     _second = gate.check_python_floor()              # 第二次全量
-    _assert(_ff["files"] > 100 and _ff["fstrings"] > 100,
+    # 「真有量」这一格不许把**跑门禁的那台解释器**当成常数（2026-11-20 干净检出泳道实测）。
+    # 交付链的地板就是 workflow 里那份 3.11，而 3.11 的 tokenize 没有 FSTRING_START：门本体
+    # 有一条写明了的降级路（fstring_mode 那句「本机判不了」），走它时 fstrings 恒为 0。
+    # 旧断言无条件要求 >100，等于要求「跑门禁的机器必须比自家地板更先进」：本机 3.13 绿，
+    # 而真正的门禁档 3.11 必红（实测得 173 份 / 0 个字面量，与云端逐字节相同）。
+    # 这里要守的性质是「这一路真的接触过现场」，而不是「用了哪一套读法」；所以换一条
+    # 与版本无关的同路证据（escape_files：转义那一路同一圈里编译过的份数）兼做下限，
+    # 再把 f-string 那一档按本机分词器到底认不认得分情形要求——两边都不许静默地拿
+    # 「本机判不了」顶替「扫过且没问题」（那正是门自己写在注释里禁止的事）。
+    _assert(_ff["files"] > 100 and _ff["escape_files"] > 100,
             "全量跑一遍后事实表里真有量（实得 " + str(_ff["files"]) + " 份 .py / "
-            + str(_ff["fstrings"]) + " 个 f-string 字面量）："
-            "这一路真的接触过现场，不是在空转")
+            + str(_ff["escape_files"]) + " 份编译过转义）：这一路真的接触过现场，不是在空转")
+    if hasattr(tokenize, "FSTRING_START"):
+        _assert(_ff["fstrings"] > 100,
+                "本机分词器认得 PEP 701（有 FSTRING_START），就必须真扫到 f-string（实得 "
+                + str(_ff["fstrings"]) + " 个 / 口径=" + str(_ff["fstring_mode"]) + "）："
+                "认得却报 0 就是这一路默默断了")
+    else:
+        _assert("FSTRING_START" in str(_ff["fstring_mode"]),
+                "本机分词器不认 PEP 701（地板那一档就是这样）：必须走门本体那条写明了的"
+                "降级路并把理由留在口径里（实际口径=" + str(_ff["fstring_mode"])
+                + "）；拿「本机判不了」冒充「扫过且没问题」就是这条门要治的病")
     _assert(_ff["fstring_mode"],
             "f-string 那一路的口径要留痕（是 tokenize 扫的还是本机判不了，✅ 那行会原样念出来）")
     _assert_eq(_ff, dict(gate._FLOOR_FACTS),
