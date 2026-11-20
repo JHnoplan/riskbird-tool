@@ -57,9 +57,42 @@ G = __import__(mod_name)
 
 import access_guard as _ag  # noqa: E402
 import edition as _ed       # noqa: E402
+import task_registry as _tr  # noqa: E402
 
 _ag._state_dir = lambda: _STATE_TMP
 assert _ag._state_dir() == _STATE_TMP, "状态目录没接上：三份 .acl_*.json 会写到真实桌面目录"
+
+# 同一族的第二个写入口：会话目录与任务索引都挂在 _get_desktop_dir() 下，而
+# task_registry.tool_dir() 自己就写着「不存在则创建」。今天实测桌面那个目录没被动
+# （deleteLater 不走 closeEvent，所以 _persist_progress 没被触发），但那是「当前
+# 实现恰好没踩到」而不是「构造上不可能」：GUI 侧加一句建窗期落盘就会变成真写盘，
+# 后果是用户真实采集会话被指向临时目录（2026-11-04 实案， 89 条数据险丢）。
+# 仓库里其它建真实 MainWindow 的套件（waterfall / site_enrich / keyword_resume /
+# province / edition）都已经重定向了这一处，本脚本不能豁免。
+_DESK_SANDBOX = _STATE_TMP / "desktop"
+_DESK_SANDBOX.mkdir()
+_desk_patch = lambda self: _DESK_SANDBOX   # noqa: E731  留着引用只为收尾能比对身份
+G.MainWindow._get_desktop_dir = _desk_patch
+
+# 对拍用指纹，不是「存在性检查」：新建一个会话夹、改写一份索引都会体现在这里。
+# 目录本身不在时得到空指纹，这也要对拍——体检不该把它顺手建出来。
+_DESK_REAL = pathlib.Path.home() / "Desktop" / _tr.TOOL_DIR_NAME
+
+
+def _desk_fingerprint():
+    rows = []
+    if _DESK_REAL.exists():
+        for p in sorted(_DESK_REAL.rglob("*")):
+            rel = p.relative_to(_DESK_REAL).as_posix()
+            if p.is_dir():
+                rows.append(f"D|{rel}")
+            else:
+                st = p.stat()
+                rows.append(f"F|{rel}|{st.st_size}|{st.st_mtime_ns}")
+    return rows
+
+
+_desk_before = _desk_fingerprint()
 
 app = QApplication(sys.argv)
 
@@ -199,6 +232,15 @@ print(f"\n[{mod_name}] RESULT:", "ALL FIT（0 处挤压）" if not all_bad else 
 # 出网尝试只报数、不改判定：拦停本身已经消除了危害（写脏真名单、烧真额度），
 # 而这个数字要让人看见——它从 0 变成非 0，说明开机路径上多了一处建窗即取网络。
 print(f"· 体检期间出网尝试 {len(_net_attempts)} 次（已全部拦停）")
+# 用户真实桌面工具目录必须逐字节没动过：这一句把上面那个「恰好没踩到」钉成不变量，
+# 以后谁在建窗路径上加一句落盘，这里就会红（而不是等到用户的采集数据找不到）。
+_desk_after = _desk_fingerprint()
+assert _desk_after == _desk_before, (
+    f"体检改动了用户真实桌面目录 {_DESK_REAL}："
+    f"新增 {sorted(set(_desk_after) - set(_desk_before))}｜"
+    f"消失 {sorted(set(_desk_before) - set(_desk_after))}")
+print(f"· 真实桌面目录指纹未变（{_DESK_REAL.name if _DESK_REAL.exists() else '目录不在'}，"
+      f"{_desk_before and len(_desk_before) or 0} 项）")
 # 临时状态目录当场回收：本套件的收尾走 os._exit（见下面那段说明），Qt 析构与
 # atexit 都不会替我们删；而批跑每天要建 6 个形状 × 若干份 .acl_*.json，留在 /var
 # 下就是「没人认领的目录」——判据 ㊴ 骂的正是这一格，不能只对探针生效、对体检豁免。
@@ -206,6 +248,7 @@ shutil.rmtree(_STATE_TMP, ignore_errors=True)
 assert not _STATE_TMP.exists(), f"临时状态目录没回收：{_STATE_TMP}"
 assert _ag._state_dir() == _STATE_TMP, "状态目录中途被换回去了（守卫自己重新判定了落点）"
 assert socket.getaddrinfo is _blocked_getaddrinfo, "DNS 硬闸被拆了——收尾前不该有人恢复它"
+assert G.MainWindow._get_desktop_dir is _desk_patch, "桌面重定向中途被拆了（下面就要收临时目录）"
 # 判定到此为止：屏幕上这句和批跑读到的退出码必须是同一个来源。这套件自己建过
 # QApplication，而 Qt/线程在解释器收尾时的析构会随机段错误（本机实测：keyword_resume
 # 全绿 88 项之后 rc=139，被批跑读成一次失败，单跑又绿——真红就是这么被当成抖动的）。
