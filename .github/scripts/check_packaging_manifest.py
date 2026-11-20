@@ -10115,7 +10115,7 @@ def _sibling_import_gaps() -> list:
         if not path.is_file():
             continue              # HEAD 里有、磁盘上没有：那是删除未提交，第 24 条管
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            tree = _file_tree(str(path), path.read_text(encoding="utf-8", errors="replace"))
         except (OSError, SyntaxError, ValueError):
             continue
         parent = path.parent
@@ -10146,7 +10146,7 @@ def _swallowed_assertions(rels) -> list:
             continue
         try:
             src_text = path.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(src_text)
+            tree = _file_tree(str(path), src_text)
         except (OSError, SyntaxError, ValueError):
             continue
         for node in _walk(tree):          # 只许走单一真源（第 26 条）
@@ -10157,7 +10157,7 @@ def _swallowed_assertions(rels) -> list:
             handled = False
             for h in node.handlers:
                 seg = ast.get_source_segment(src_text, h) or ""
-                if any(isinstance(n, ast.Raise) for n in ast.walk(h)):
+                if any(isinstance(n, ast.Raise) for n in _walk(h)):   # 只许走单一真源（第 26 条）
                     handled = True
                 elif _handover_called_names(h.body):
                     handled = True
