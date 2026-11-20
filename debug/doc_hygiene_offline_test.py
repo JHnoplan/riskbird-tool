@@ -84,6 +84,11 @@ def tracked_text():
                          capture_output=True, text=True, encoding="utf-8", errors="replace",
                          timeout=120, stdin=subprocess.DEVNULL).stdout
     files = [x for x in out.split("\0") if x.endswith((".py", ".md"))]
+    # 判据不许把自己的反例吃成语料：本文件里写着错字示例与造出来的假英文词，
+    # 它一旦入库，不排除就是「自己发的坏样本把全局语料污染」——
+    # 本轮 乙2 不再响直接就是这个原因（zebraquuxfizz 只存在于本文件）。
+    here = str(Path(__file__).resolve().relative_to(ROOT))
+    files = [x for x in files if x != here]
     text = []
     for rel in files:
         p = ROOT / rel
@@ -135,6 +140,11 @@ def scan(text, cjk_corpus, latin_corpus):
 
 
 corpus_files, corpus = tracked_text()
+# 语料侧必须与扫描侧**同一个口径**（都过 strip_code）：
+# 反引号里的内容在扫描侧永远不报，那它就不该在语料侧发放豁免；
+# 否则「把错字示例用反引号括起来」等于给它发一张全球通行证，
+# 而 docs/06 正是这么写反例的（本轮 乙1 不再响的直接原因）。
+corpus = strip_code(corpus)
 cjk_corpus = set(CJK.findall(corpus))
 latin_corpus = set(LATIN.findall(corpus))
 
@@ -148,6 +158,12 @@ check("甲3 语料里的英文词够多（同上：拉丁侧空视野同样是�
 
 # ── 乙) 反向对照：两类坏样本都必须响 ────────────────────────────────────────────
 _fake = "这句话里出现了一个仓库从没见过的貁字，还有裸英文 zebraquuxfizz 混在中文里。\n"
+# 先验反例本身还有效：它们一旦进了语料，下面两条就会「因为语料里已有而不报」——
+# 那不是没测出问题，而是**自检已经停转却仍然显示在跑**，比一条 FAIL 更误导人。
+check("乙0 两个反例 token 仍在语料之外（否则乙1/乙2 属于假绿，排查时先看本条）",
+      "貁" not in cjk_corpus and "zebraquuxfizz" not in latin_corpus,
+      {"貁 进了语料": "貁" in cjk_corpus, "zebraquuxfizz 进了语料": "zebraquuxfizz" in latin_corpus,
+       "处置": "语料口径被改宽了（查 strip_code 与 tracked_text 里的自排除），先修口径再读乙1/乙2"})
 c, l = scan(_fake, cjk_corpus, latin_corpus)
 check("乙1 形近错字（貁）必须被抓出来", "貁" in c, c)
 check("乙2 中英夹杂（语料外裸英文词）必须被抓出来", "zebraquuxfizz" in l, l)
@@ -169,13 +185,9 @@ check(f"丙1 目标文档在视野里（读到 {len(targets)} 份，含 AGENTS.m
 # 但绝不能写成「未入库的都免检」——那等于给以后每份新文档自动发免检证。所以用**点名表**：
 # 只有列在这里、且带理由的份数享受只判错字不判夹杂；不在表里的未入库文档照样全判。
 # 这批文档入库之后，点名表就该空掉（丙5 会盯着它别变成常驻豁免）。
-LEGACY_NO_LATIN = {
-    "打包说明.md": "交接前写的打包复盘，含 Visual Studio/UPX/UTM 等专名；入库后从本表删",
-    "DeepSeek_API使用指南.md": "交接前写的 AI 功能说明，含 ChatGLM/Prompt 等专名",
-    "DeepSeek_API智能解析优化总结.md": "交接前写的优化复盘，引用了行业英文关键词表",
-    "企知道搜索失败问题修复总结_20261105.md": "交接前写的故障复盘，含 XPath 等术语",
-    "验证码处理优化总结_20261105.md": "交接前写的优化复盘，含 Captcha/Prompt 等术语",
-}
+# 2026-11-20：5 份已全部入库，表按约定清空。保留空表与下面那段口径，
+# 是为了让「以后再点名」必须重新写理由，而不是往现成表里添一行。
+LEGACY_NO_LATIN: dict[str, str] = {}
 tracked_set = set(corpus_files)
 offenders, latin_offenders, legacy_hits = {}, {}, {}
 for p in targets:
@@ -197,7 +209,7 @@ check("丙3 中文资产里没有语料外的裸英文词（夹杂；点名表�
                              "处置": "该加反引号的加反引号，是术语的进 LATIN_ALLOWED 并写理由"})
 check(f"丙4 点名表确实在承托（本次放过 {len(legacy_hits)} 份）：表里每一份都真在扫描范围内，"
       "写错名字的豁免等于无效豁免",
-      all(str(ROOT / k).replace(str(ROOT) + "/", "") in {str(p.relative_to(ROOT)) for p in targets}
+      all(k in {p.relative_to(ROOT).as_posix() for p in targets}
           for k in LEGACY_NO_LATIN), sorted(LEGACY_NO_LATIN))
 check("丙5 点名表不许变成常驻豁免：已经入库的那份必须从表里删掉（留着就是骗人的安全垫）",
       not (set(LEGACY_NO_LATIN) & tracked_set), sorted(set(LEGACY_NO_LATIN) & tracked_set))
@@ -236,6 +248,31 @@ for p in targets:
                                f"往下只有 {len(body)} 行实质内容")
 check("丁2 提到待办的地方必须有实质内容（禁的是空段，不是这个词）",
       empty_spots == [], empty_spots)
+
+# ── 戊) 文档不许把「易变计数」抄进正文 ──────────────────────────────────
+# 本轮真实踩过：三份文档里抄着「仓库里 223 份跟踪文件」，交接这一轮补入库 28 份
+# 之后全过期——而过期那一刻没有任何东西会报红：**散文里的数字没有对账对象**。
+# 口径：可以写命令让读者当场跑，不可以替命令回答。
+# 为什么是「行级合取」而不是一个相邻搭配的宽正则：旧 docs/07 写的是
+#   「层次一：仓库里已跟踪 ──── 223 份」
+# 数字与「跟踪」隔着一串破折号，相邻型正则根本抽不到——那正是需要它抽到的那条。
+_NFUN = re.compile(r"[0-9][0-9,]{1,8}\s*[份个]")   # 量词一并管：只管「份」会漏掉「png 7,132 个」那一类
+_SCOPE_WORDS = ("跟踪", "git clone", "层次一", "层次二", "层次三", "危险区", "可再生")
+stale_counts = []
+for p in targets:
+    for i, ln in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        if _NFUN.search(ln) and any(w in ln for w in _SCOPE_WORDS):
+            stale_counts.append(f"{p.relative_to(ROOT)}:第{i}行 {ln.strip()[:64]}")
+check("戊1 文档里不许出现「跟踪/层次/危险区 + N 份」这种抄死的计数（要口径就给命令）",
+      stale_counts == [], stale_counts)
+# 正控：上面那条如果因为正则改坏而恒不匹配，会变成最隐蔽的假绿——它自己必须先能抓到样本。
+_prose = "仓库里 223 份跟踪文件才是项目"
+_diagram = "层次一：仓库里已跟踪 ──────────── 223 份  ← 这才是「项目」"
+_unit = "危险区里 png 7,132 个 + gif 1,216 个"
+_hits = [s for s in (_prose, _diagram, _unit) if _NFUN.search(s) and any(w in s for w in _SCOPE_WORDS)]
+check("戊2 戊1 的规则对三种真实写法都能开火（叙事体 + 层次图体 + 按量词「个」计数体）；"
+      "抽不到＝那条判据是假的", _hits == [_prose, _diagram, _unit],
+      {"抓到": len(_hits), "漏了": [s for s in (_prose, _diagram, _unit) if s not in _hits]})
 
 print(f"\n═══ 文档中文卫生：{_ok} 通过 / {len(_failed)} 失败 ═══")
 if _failed:

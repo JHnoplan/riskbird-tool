@@ -67,9 +67,17 @@ check("甲2 扫描范围按扩展名筛过（图片/可执行不许进文本清�
 # （29 字符、不含任何凭据）顶红——那是判据自己筛歪，不是门禁漏了：断言要钉住**那一个**落点。
 LANDING = "b2bcollect_build/config.json"
 ignored = subprocess.run(["git", "check-ignore", "-q", LANDING], cwd=str(ROOT)).returncode == 0
-check(f"甲3 真值落点 {LANDING}：文件在 + 确实被 ignore + 不在本条范围内（三件缺一都不算管住）",
-      (ROOT / LANDING).is_file() and ignored and LANDING not in scope,
-      {"存在": (ROOT / LANDING).is_file(), "被ignore": ignored, "在范围内": LANDING in scope})
+exists = (ROOT / LANDING).is_file()
+# 本条曾多写了一个「文件必须在位」，它在干净 clone 里当场假红：那个前提说的是
+# 「这台开发机配过密钥」，不是「交付链正确」——新机器 clone 下来还没录密钥完全合法
+# （运行时会 fail-closed 点名缺哪个，那是另一格在守）。而 git check-ignore 对不存在的
+# 路径同样能答规则，所以「在不在」对这一格本就是多余信息：只钉【被 ignore + 不进门禁范围】
+# 这两件——它们在任何一台机器上都必须成立。
+check(f"甲3 真值落点 {LANDING}：确实被 ignore 且不在本条范围内（在位与否只记录不判定："
+      f"新机器 clone 后未录密钥是合法态）",
+      ignored and LANDING not in scope,
+      {"当前状态": "已配置（在位）" if exists else "未配置（干净克隆/新机器）",
+       "被ignore": ignored, "在范围内": LANDING in scope})
 
 # ── 乙) 六种形态逐个必须响 ─────────────────────────────────────────────────────
 BODY = _tok("", 40)

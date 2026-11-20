@@ -20,22 +20,36 @@
 
 ---
 
-## 2. 拿代码（**别只 clone**）
+## 2. 拿代码（**现在只 clone 就够了**）
 
 ```bash
-# 方式 A（推荐）：clone + 手工补带未入库资料
 git clone <你的仓库地址> PythonDemo && cd PythonDemo
+```
 
-# 方式 B：整目录拷贝——必须排除这几类，否则会把垃圾带过去
+这一条是 2026-11-20 改的，**上一版写的是「别只 clone」**，理由是仓库外还有该入库
+却没入库的资料。那个前提已经不成立了：交接文档、IDE 规则、`AGENTS.md`、
+5 份历史故障复盘、判据用的 7 份夹具已全部提交（逐条见 `07` 第 2 节）。
+
+而且本节的口径不是“把仓库读一遍推出来的”，是**真的建了一份干净 clone 跑通的**：
+`git clone` → 建 `.venv` → 装 `b2bcollect.txt` → 跑离线批跑。就是这条流程把
+「solarbe 夹具没入库」与「交接文档没入库」两个缺口现场抓出来的（见 `06`）。
+
+唯一**不随 git 走**的东西是凭据：`b2bcollect_build/config.json`（被 `.gitignore` 拦着），
+只能带外复制，见第 6 节与第 8 节。
+
+如果坚持用整目录拷贝（不推荐），必须排除这几类，否则会把 741MB 的 `.venv`
+和过期日志、调试截图一起带过去：
+
+```bash
 rsync -a --exclude '.venv/' --exclude '__pycache__/' --exclude '.pytest_cache/' \
       --exclude 'backups/' --exclude 'b2bcollect_build_backup_*/' \
       --exclude '*_run.log' --exclude '*_progress.json' --exclude 'debug/batch_*.log' \
       旧机:/Users/xxx/Desktop/PythonDemo/ ./
 ```
 
-**关键**：仓库里 223 份跟踪文件是"项目"，但旧机工作区里还有**少量该入库却没入库**的
-资料（`打包说明.md` 等）。逐条清单与处置见 `07-文件边界与打包卫生.md`。
-只 clone 会漏掉它们；整目录全拷又会带上 741MB 的 `.venv` 和过期日志。
+> 为什么仍不建议整目录拷贝：它会把「危险区」（未跟踪且未被 ignore 的那批）
+> 一起带过去，本机看起来一切正常，而你永远不知道哪些文件其实没在版本里——
+> 本轮两个入库缺口就是这种“看起来正常”攒出来的。
 
 ---
 
