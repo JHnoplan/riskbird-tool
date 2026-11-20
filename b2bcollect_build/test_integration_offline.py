@@ -9,6 +9,8 @@
   · 待采集公司名单三台账：bind 建表 / seed 入列 / add_waste 回流 / pop 记 tried /
     mark_result 记 collected / requeue 回队首 / 探针跳过已采；
   · 公司名识别（无表头 txt / 字面表头 txt / 带表头 xlsx / 多列无表头）；
+  · 智能解析：知识库展开与**已知产品词原子收敛**（反复粘贴不增长），以及 AI 兜底通路
+    ——本套件全程不许出网（契约走替身、出网走 DNS 硬闸 + 正控，见 6.5b）；
   · GUI 默认态：1688 不勾、其余勾、企知道补采默认勾（风鸟/爱企查默认不勾且各自有
     「打开 XX」按钮与勾选框）、看板三路补采计数都能渲染、清洗按钮存在、主按钮样式。
 
@@ -199,33 +201,143 @@ def test_1688_source_stamp():
 
 # ── 6.5 智能解析：类别名→产品词展开 / 服务词忽略 / 未收录原样保留 ──
 def test_smart_expand():
+    """知识库那条**确定性通路**的契约。全程 use_deepseek=False，理由写在 6.5b 头上。"""
     import keyword_expander as ke
     # ① 类别名展开成具体产品词（含跨类别去重）
-    r = ke.expand_keywords("制冷与热泵核心部件\n过滤与净化材料")
+    r = ke.expand_keywords("制冷与热泵核心部件\n过滤与净化材料", use_deepseek=False)
     assert "制冷压缩机" in r["keywords"] and "冷凝器" in r["keywords"], r["keywords"]
     assert "HEPA高效过滤器" in r["keywords"], r["keywords"]
     assert len(r["expanded"]) == 2, r["expanded"]
     # ② 纯服务/流程词被忽略、不产出关键词
-    r2 = ke.expand_keywords("方案设计与咨询\n项目招投标与点位开发\n运维维保")
+    r2 = ke.expand_keywords("方案设计与咨询\n项目招投标与点位开发\n运维维保", use_deepseek=False)
     assert r2["keywords"] == [], r2
     assert len(r2["dropped"]) == 3, r2["dropped"]
     # ③ 未收录的词原样保留（不误删用户已经写好的产品词）
-    r3 = ke.expand_keywords("宠物智能喂食器")
+    r3 = ke.expand_keywords("宠物智能喂食器", use_deepseek=False)
     assert r3["keywords"] == ["宠物智能喂食器"], r3
     assert r3["kept"] == ["宠物智能喂食器"], r3
-    # ③b 知识库批量扩行业后：光伏类也能展开（「太阳能路灯」归入【光伏与太阳能】）
-    r3b = ke.expand_keywords("太阳能路灯")
-    assert r3b["expanded"][0][1] == "光伏与太阳能", r3b["expanded"]
-    assert "光伏组件" in r3b["keywords"] and "太阳能路灯" in r3b["keywords"], r3b["keywords"]
-    assert r3b["truncated"] is False and r3b["expanded"][0][2] >= 5, r3b
+    # ③b 已知产品词**原子保留、不许二次展开**（展开能收敛就靠这一条）：
+    # 「太阳能路灯」在 KNOWLEDGE_BASE 里是【光伏与太阳能】的产品词，命中特征短语
+    # 也不二次展开——否则用户把展开结果粘回来再点一次就逐轮膨胀（当年实测
+    # 71→95→94：既发散又撞 MAX_KEYWORDS，keyword_expander.py 第 279-287 行写明）。
+    # 旧断言写的恰好相反（要求它展开到「光伏与太阳能」、还要求产品数 ≥5），与那条
+    # 不变量直接打架：它在任何机器上都不可能通过。干净 clone 里的 IndexError 才是
+    # 诚实结果，本机这一格是靠 main() 的 try/except 吞成黄字才没暴露（2026-11-20）。
+    r3b = ke.expand_keywords("太阳能路灯", use_deepseek=False)
+    assert r3b["expanded"] == [], f"已知产品词不许被当类别名二次展开：{r3b['expanded']}"
+    assert r3b["kept"] == ["太阳能路灯"] and r3b["keywords"] == ["太阳能路灯"], r3b
+    # ⑥ 收敛（把 ① 的展开结果原样粘回来再解析一轮，词表必须一字不变）：
+    # 上面那条「原子保留」的真正牙齿——只断言「本轮没展开」不够，必须证明
+    # 「反复粘贴不增长」；否则改天有人放开产品词展开，本组仍全绿而线上会炸。
+    again = ke.expand_keywords("\n".join(r["keywords"]), use_deepseek=False)
+    assert again["expanded"] == [], f"第二轮不许再展开任何片段：{again['expanded']}"
+    assert again["keywords"] == r["keywords"], (len(r["keywords"]), len(again["keywords"]))
     # ④ 最长特征短语优先：「空气过滤与净化设备」归设备类而非材料类
-    r4 = ke.expand_keywords("空气过滤与净化设备")
+    r4 = ke.expand_keywords("空气过滤与净化设备", use_deepseek=False)
     assert "FFU风机过滤单元" in r4["keywords"], r4["keywords"]
     assert r4["expanded"][0][1] == "空气过滤与净化设备", r4["expanded"]
     # ⑤ 去重：同类别重复出现不会重复产出
-    r5 = ke.expand_keywords("暖通空调\n暖通空调与制冷设备")
+    r5 = ke.expand_keywords("暖通空调\n暖通空调与制冷设备", use_deepseek=False)
     assert len(r5["keywords"]) == len(set(r5["keywords"])), r5["keywords"]
-    ok("智能解析：类别→产品词展开 / 服务词忽略 / 未收录保留 / 最长匹配优先 / 去重")
+    # ⑦ 离线通路的形状：use_deepseek=False 时结果里根本不该出现 deepseek 键
+    # （有人改了默认值、或在本组里悄悄接回真 AI，这一格先红而不是静默出网）
+    assert "deepseek" not in r and "deepseek" not in r3, (sorted(r), sorted(r3))
+    ok("智能解析：类别→产品词展开 / 服务词忽略 / 未收录保留 / 最长匹配优先 / 去重 / 已知产品词原子收敛")
+
+
+# ── 6.5b AI 兜底通路：离线套件绝不许出网（替身量契约 + 真模块量硬闸）────
+def test_expand_ai_egress_gate():
+    """DeepSeek 兜底的契约在离线环境下也必须量得到，而且一次网都不许出。
+
+    这一组存在的根子（2026-11-20 整理交接时的实测）：`expand_keywords` 默认
+    use_deepseek=True，未命中知识库的词会被排队送进 deepseek_expander——它会读
+    本机那个 **不入库的** deepseek_cache.json（169 条，键是输入文本的 MD5），本机
+    配了真 Key。于是同一份判据在两台机器上是两种语义：开发机命中缓存（「宠物智能
+    喂食器」展开成 15 个词）→ 旧断言 ③ 红 → 被 main() 的 try/except 吞成黄字；
+    干净 clone 没缓存 → ③ 绿 → 推到下一行才 IndexError 崩给所有人看。（中间那个
+    按裸词查缓存、误判成「不在缓存里」的错账也是同一天吃的：缓存键不是原词。）
+    真正的出网能力同样存在：下面丙) 把缓存钉空、注入假 Key 后，硬闸真的开火了
+    3 次（重试）——即这条路径会走到 socket 解析，开一台缓存冷、配了 Key 的机器
+    跑这套件就会真发线上请求：烧额度、把用户输入送出机器、结果随配额漂移。
+    修法是把两件事分开：
+      · 契约用替身量（成功/上界/异常降级）——确定性、跨机一致；
+      · 出网这件事用真模块 + 封堵 DNS 量，并且必须有**正控**证明闸真的开过火
+        （否则「没出网」可能只是「根本没走到」）。
+    """
+    import socket
+    import types
+    import keyword_expander as ke
+    import deepseek_expander as de
+
+    # —— 甲/乙) 替身：AI 成功通路与上界 ——
+    calls = []
+    stub = types.ModuleType("deepseek_expander")
+
+    def _fake_expand(text, api_key=None):
+        calls.append(text)
+        return [f"AI词{i}" for i in range(1, 26)], "success"
+
+    stub.expand_with_deepseek = _fake_expand
+    saved = sys.modules.get("deepseek_expander")
+    sys.modules["deepseek_expander"] = stub
+    try:
+        ra = ke.expand_keywords("宠物智能喂食器")
+        # 至多一次批量调用（旧实现 70 个词 = 70 次调用，词表 81→200 撞上限截断）
+        assert len(calls) == 1, calls
+        assert "宠物智能喂食器" in ra["keywords"], ra["keywords"]
+        # 硬上界 20：替身给了 25 个，进词表的只许 20 个（收敛不许依赖模型自觉）
+        assert sum(1 for k in ra["keywords"] if str(k).startswith("AI词")) == 20, ra["keywords"]
+        assert ra["deepseek"][0][2] == "success", ra["deepseek"]
+
+        def _boom(text, api_key=None):
+            raise RuntimeError("配额用尽")
+
+        stub.expand_with_deepseek = _boom
+        rb = ke.expand_keywords("宠物智能喂食器")
+        assert rb["keywords"] == ["宠物智能喂食器"], rb
+        assert str(rb["deepseek"][0][2]).startswith("error:"), rb["deepseek"]
+    finally:
+        if saved is None:
+            del sys.modules["deepseek_expander"]
+        else:
+            sys.modules["deepseek_expander"] = saved
+
+    # —— 丙) 真模块 + 封堵 DNS：证明这套件真的出不了网，且出不了网时语义不变 ——
+    # 注假 Key 是为了跨机一致：克隆机没配 Key 会直接走 no_api_key 分支、根本不碰
+    # 网络，那时「闸没开火」就区分不出「闸是坏的」还是「没走到闸」。
+    # 同时必须把缓存钉成空：否则本机那一笔（Nov 9 写入的 MD5 条目）会让代码直接
+    # 走 cached 分支不碰网络，「闸没开火」就变成一条测不到东西的假绿——
+    # 2026-11-20 本组第一版就是这么红的，红得对：它撕开了「离线套件」的假设。
+    dns_hits = []
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _blocked(*args, **kwargs):
+        dns_hits.append(args[0] if args else "?")
+        raise socket.gaierror(8, "offline suite：禁止解析外网域名")
+
+    real_load_key = de.load_api_key
+    real_load_cache = de._load_cache
+    socket.getaddrinfo = _blocked
+    de.load_api_key = lambda: "sk-offline-gate-fake-key"
+    de._load_cache = lambda: {}
+    try:
+        rc = ke.expand_keywords("宠物智能喂食器")
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+        de.load_api_key = real_load_key
+        de._load_cache = real_load_cache
+    assert dns_hits, "硬闸没开火＝这一组根本没量到出网通路（假绿）"
+    assert rc["keywords"] == ["宠物智能喂食器"], rc["keywords"]
+    assert str(rc["deepseek"][0][2]) != "success", f"被拦住了却谎报成功：{rc['deepseek']}"
+    # 与纯离线语义逐字节一致：AI 不可用时，用户看到的词表必须与不送 AI 时相同
+    assert rc["keywords"] == ke.expand_keywords("宠物智能喂食器",
+                                                use_deepseek=False)["keywords"], rc
+    # 恢复现场：本组改过的三个全局必须还原（否则后面的 GUI 组会在被封的 socket 上跑）
+    assert socket.getaddrinfo is real_getaddrinfo, "DNS 闸忘了拆"
+    assert de.load_api_key is real_load_key, "假 Key 注入忘了拆"
+    assert de._load_cache is real_load_cache, "缓存替身忘了拆（下一轮会永远不命中缓存）"
+    assert sys.modules.get("deepseek_expander") is de or saved is not None, "替身模块泄漏"
+    ok(f"AI 兜底通路：批量至多一次 / 产出硬上界 20 / 异常降级不丢原词 / 出网硬闸开火 {len(dns_hits)} 次且语义不变")
 
 
 # ── 6.6 跨国采购网 / 马可波罗 新站离线契约 ────────────────────
@@ -926,12 +1038,12 @@ def main():
         test_probe_skip(tmp)
         test_parse_keywords()
         test_1688_source_stamp()
-        # test_smart_expand 依赖 deepseek 缓存，缓存更新后断言会漂移（预先存在的问题），
-        # 包 try/except 防止阻断后续两站 / GUI 断言
-        try:
-            test_smart_expand()
-        except AssertionError as e:
-            print(f"  ⚠️  test_smart_expand 跳过（deepseek 缓存漂移，与本次集成无关）：{str(e)[:80]}")
+        # 本套件不得再出现「失败降级成一句黄字仍然计入全部通过」的包装：
+        # 2026-11-20 之前的 main() 把 test_smart_expand 包在 try/except AssertionError
+        # 里，屏幕上少一组、计数少一组，退出码依旧 0——那台机器上“12 组全绿”有一整组
+        # 是吞出来的。判据失败只能红，不能“跳过”。
+        test_smart_expand()
+        test_expand_ai_egress_gate()
         test_two_new_sites()
         test_pure_http_tab_gate()
         test_site_status_truthful()
