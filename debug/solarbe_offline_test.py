@@ -22,12 +22,20 @@ CACHE = pathlib.Path(__file__).parent / "probe_solarbe_cache"
 # 所以缺文件不是「代码坏了」。按 docs/03 第 3 节既定纪律：缺夹具必须如实报
 # SKIP-FIXTURE 并点名要哪几份，不许抛栈——一屏 FileNotFoundError 会把
 # 「这一路今天没保护」这个事实埋掉（干净 clone 里曾就是直接崩栈）。
-FIXTURES = ("list_inverter.html", "contact_bomo_mobile.html")
+FIXTURES = (
+    "list_inverter.html",
+    "c_com_search_php_keyword_E7_BB_84_E4_BB_B6",      # 无扩展名，按后缀 grep 夹具名时抽不到这一份
+    "contact_lucky24_mobile.html",
+    "contact_whqtxny_mobile.html",
+    "contact_renjiangpv_mobile.html",
+    "contact_citicbohai_mobile.html",
+    "contact_bomo_mobile.html",
+)
 _missing = [n for n in FIXTURES if not (CACHE / n).is_file()]
 if _missing:
-    print(f"⏭ SKIP-FIXTURE 缺实机夹具：{'、'.join(_missing)}　"
-          f"取回方式：从 solarbe 逆变器列表页与 bomo 联系页（手机版 UA）另存为同名文件，"
-          f"放进 {CACHE}/；本套件断言自动恢复")
+    print(f"⏭ SKIP-FIXTURE 缺实机夹具（{len(_missing)}/{len(FIXTURES)} 份）：{'、'.join(_missing)}　"
+          f"取回方式：逐份从 solarbe 对应的列表页/联系页（联系页必须用手机版 UA，"
+          f"桌面版联系方式被图片化）另存为同名文件，放进 {CACHE}/；本套件断言自动恢复")
     sys.exit(0)
 
 
