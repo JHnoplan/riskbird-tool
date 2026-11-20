@@ -81,6 +81,9 @@ debug/local_scan_offline_test.py
 debug/qzd_channel_offline_test.py
 debug/batch_runner_offline_test.py
 debug/check_gui_fit.py
+debug/qoder_rules_offline_test.py
+debug/doc_hygiene_offline_test.py
+debug/secret_gate_offline_test.py
 b2bcollect_build/test_optimizations.py
 "
 
