@@ -18,6 +18,19 @@ from parallel_session import SITE_ORDER                                       # 
 from cdp_base import strip_country_code                          # noqa: E402
 
 CACHE = pathlib.Path(__file__).parent / "probe_solarbe_cache"
+# 夹具是两份真实存盘页面，下面「列表解析出 20 家/页」这类判定直接读它们的内容，
+# 所以缺文件不是「代码坏了」。按 docs/03 第 3 节既定纪律：缺夹具必须如实报
+# SKIP-FIXTURE 并点名要哪几份，不许抛栈——一屏 FileNotFoundError 会把
+# 「这一路今天没保护」这个事实埋掉（干净 clone 里曾就是直接崩栈）。
+FIXTURES = ("list_inverter.html", "contact_bomo_mobile.html")
+_missing = [n for n in FIXTURES if not (CACHE / n).is_file()]
+if _missing:
+    print(f"⏭ SKIP-FIXTURE 缺实机夹具：{'、'.join(_missing)}　"
+          f"取回方式：从 solarbe 逆变器列表页与 bomo 联系页（手机版 UA）另存为同名文件，"
+          f"放进 {CACHE}/；本套件断言自动恢复")
+    sys.exit(0)
+
+
 def cached(name):
     return (CACHE / name).read_text(encoding="utf-8", errors="ignore")
 
