@@ -464,6 +464,110 @@ check(f"庚6 庚5 的视野非空（本次扫到桥上的文档 {len(_bridge_sco
       "这一份为庚5 兜底：目标口径一旦改坏（比如 glob 失效），未跟踪列表会变成空的而看起来像全绿",
       len(_bridge_scope) >= 12, {"读到": [str(p.relative_to(ROOT)) for p in _bridge_scope]})
 
+# ── 辛) 已知错字样本黑名单：每一轮人工抓到的形近错替都固化成不可回退的一条 ──────
+# 为什么丙2 不够：它只报「仓库从没用过的字」。2026-11-20 本轮我在 docs/08 里写了
+# 「拒绍放行」（绍→绝），而「绍」在两份 customer_library_cleaner.py 里早就在用——
+# 于是丙2 当场 29/0 全绿放行。这类错字的字本身合法，错的是位置，**只能靠样本名单**。
+# 同一形状已经在本仓库反复出现，不先把它们钉住，下一轮还会从手里漏过去。
+KNOWN_TYPOS: dict[str, str] = {
+    "拒绍": "拒绝（本轮 docs/08；丙2 实测放过的那一条）",
+    "跑断据": "跑判据（本轮 docs/06 §11）",
+    "兵底": "兜底（本轮 docs/06 §11）",
+    "一声不呐": "一声不响（本轮 docs/06 §11）",
+    "只取不拄": "只取不抄（本轮 docs/06 §11）",
+    "噪咅": "噪音（本轮；上一版先误改成「噪响」才改对——连改错字都能再错一个）",
+    "貁免": "豁免（docs/06 第 5 节记录的三次之一）",
+    "进住": "接住（同上）",
+    "讫不": "绝不（同上）",
+    "只抱一把": "只靠一把（本轮写 `06` 第 12 节标题时犯的）",
+    "拓不到": "抓不到（同上；形近且都是常用字）",
+}
+
+
+def strip_real_code(text):
+    """只剥「真的是代码」的那部分：```bash / ```python 等带语言标的围栏 + 行内反引号。
+
+    为什么辛 不能用上面那个 strip_code：变异台实测（本轮 M1）——docs/08 的开场话术整块写在
+    ```text 围栏里，而 `strip_code` 不分语言一律剥掉，于是「拒绍」注进话术本体后辛1 一声不响。
+    那份块是**给人（和接手会话）读的正文**，只是形式上套了围栏；拿处理代码的口径去处理
+    它，等于给交接话术本身开了一个免疫区。口径：`text` 与空语言标的围栏算正文，其余算代码。
+    """
+    out, fence = [], None
+    for line in text.splitlines(keepends=True):
+        m = re.match(r"\s*```\s*([A-Za-z0-9_+\-]*)\s*$", line)
+        if m and fence is None:
+            fence = m.group(1).lower()
+            continue
+        if m and fence is not None:
+            fence = None
+            continue
+        if fence is not None and fence not in ("", "text"):
+            continue
+        out.append(line)
+    return re.sub(r"`[^`\n]*`", " ", "".join(out))
+
+
+def typo_hits(text):
+    """正文里命中的已知错字（口径见 strip_real_code：话术块算正文，真代码块与行内反引号不算）。
+
+    行内反引号仍豁免：文档里拿反引号引着的「错字示例」（如 docs/06 那句「豁→`貁`」）是
+    **被讨论的字符**，不是正文写错，不该把自己的事故记录判成故障。
+    """
+    stripped = strip_real_code(text)
+    return [bad for bad in KNOWN_TYPOS if bad in stripped]
+
+
+_typo_hits = {str(p.relative_to(ROOT)): v for p in targets
+              if (v := typo_hits(p.read_text(encoding="utf-8")))}
+check(f"辛1 中文资产里没有已知错字样本黑名单里的字（收录 {len(KNOWN_TYPOS)} 条，每条都带本轮出处）",
+      _typo_hits == {}, {"文件:命中": _typo_hits,
+                        "处置": "按字典里的正确写法改文档；改完再跑本判据"})
+# 正控：逐条把样本喂给判定本身——不生下来命中一条的黑名单就是装饰（本项目反复出现的假绿形状）
+_fake_hits = {bad: typo_hits(f"这段中文里把词写坏了：{bad}，后面还有正文。")
+              for bad in KNOWN_TYPOS}
+check("辛2 正控：黑名单里每一条字面都必须能把自己判出来（抽不到＝那条规则永不命中）",
+      all(v == [bad] for bad, v in _fake_hits.items()),
+      {k: v for k, v in _fake_hits.items() if v != [k]})
+check("辛3 正控的夹具不污染真判定：那些假句子只存在于内存里，一份真文档都没被写进样本句",
+      not any("这段中文里把词写坏了" in strip_real_code(p.read_text(encoding="utf-8")) for p in targets),
+      "假样本泄进了真文档，两条判据从此互相掩盖")
+# 辛5 负控（与辛2 方向相反）：辛2 管「条目永不命中」（空名单也能过），辛5 管「条目过宽」。
+# 底文是一句**不含任何错字**的真中文，它必须一个都不命中；命中了就是名单里有合法词当错字
+# （那种名单会把人直接淹没，然后被关掉——噪音过多的门禁比没有门禁更糟）。
+_CLEAN_PROSE = "这段中文写得完全正确：打包链路拒绝放行，判据也必须真的跑过一遍。"
+_wide = typo_hits(_CLEAN_PROSE)
+check("辛5 负控：一段干净的中文正文必须一个都不命中（命中＝那条名单把合法词当成了错字）",
+      _wide == [], {"误杀": _wide, "底文": _CLEAN_PROSE})
+# 辛6 辛5 的底文本身要能承托它判的那两件事：它既得含「拒绝」（防有人把合法词列进名单），
+# 又得真的一句都不命中（否则上面那条是在判空气）。没有这一格，辛5 的「空」可能是底文写空了。
+check("辛6 辛5 的底文真在判事：里面确实出现了「拒绝／判据」这类高频词（底文一旦写空，辛5 就变成装饰）",
+      "拒绝" in _CLEAN_PROSE and "判据" in _CLEAN_PROSE and len(_CLEAN_PROSE) >= 20, _CLEAN_PROSE)
+# 辛4 把「为什么需要第二把把手」钉成可执行事实：拿本轮那条真实事故串去问丙2 的语料，
+# 如果哪天「绍」变成了生面孔（语料口径改了、或仓库重组了），丙2 就能自己管住它，
+# 那时这条辛4 会红——提醒重新读一遍两把把手的分工，而不是默默多一条无用规则。
+check("辛4 本轮那条被丙2 放过的错字，其错用字确实在既有语料里（这就是辛存在的理由）",
+      "绍" in cjk_corpus,
+      "「绍」已不在语料里：丙2 现在能自己抓住它了，请重新评估辛4 要不要跟着换样本")
+# 辛7 辛1 的视野非空：`strip_real_code` 一旦碰上不配平的围栏，fence 会一直开着并把后面全文
+# 当代码剥掉——那时辛1 读到的是空气而看起来全绿。拿剥完还剩多少字符当证人，口径同庚2。
+_in_scope = sum(len(strip_real_code(p.read_text(encoding="utf-8"))) for p in targets)
+_raw = sum(len(p.read_text(encoding="utf-8")) for p in targets)
+check(f"辛7 辛1 真读到东西（剥完代码后还剩 {_in_scope} / {_raw} 字符）：视野塌了不会假装全绿",
+      _in_scope >= 4000 and _in_scope * 4 >= _raw,
+      {"读到": _in_scope, "原文": _raw,
+       "处置": "检查是否有不配平的 ``` 围栏，或语言标口径被改坏"})
+# 辛8 把豁免边界本身写成可执行判据（本轮变异台实测：拿真文档当锚点靠不住——
+# docs/08 §2 那个 ```bash 块**嵌在 ```text 话术块里面**，按 Markdown 真实语义它本来就还是
+# 话术文字，于是「不该报」的期望从一开始就错了）。这里改用自造样本逐块判，不依赖仓库写法。
+check("辛8 豁免边界：顶层代码块不判、正文与 ```text 话术块都判（三种形状各自对拍）",
+      [typo_hits("```bash\n这里面的拒绍不该报\n```"),
+       typo_hits("正文里写了一个拒绍。"),
+       typo_hits("```text\n话术块里的拒绍要报\n```")]
+      == [[], ["拒绍"], ["拒绍"]],
+      {"代码块": typo_hits("```bash\n拒绍\n```"),
+       "正文": typo_hits("正文里写了一个拒绍。"),
+       "话术块": typo_hits("```text\n拒绍\n```")})
+
 print(f"\n═══ 文档中文卫生：{_ok} 通过 / {len(_failed)} 失败 ═══")
 if _failed:
     print("失败项：")
