@@ -445,6 +445,25 @@ check("庚4 正控的证人本身在位（docs/04 确实有 §7；否则庚3 的
       _has_heading((ROOT / "docs/04-打包发布链路与云端配置.md").read_text(encoding="utf-8"), "7"),
       "docs/04 的章节结构变了，庚3 的样本要跟着换")
 
+# 庚5：交接文档自己必须在仓库里。这不是凑数的一条：本次交接的对象是**另一个 AI 客户端**，
+# 而两个客户端的会话历史与 IDE 记忆实测互相隔离（~/.qoder 与 ~/.qoder-cn）——唯一的桥就是
+# 仓库里的文件。桥没入库，交接就不是「信息少一点」，而是**整个通道不存在**。
+# 只管 docs/ 与 .qoder/rules/：根目录那批零散 .md（如 `打包说明.md`）有各自的入库判定与
+# 台账（docs/05 §3 第 4 项、docs/07 第 2 节），在这里一并判会把已知待办变成常亮故障灯。
+untracked_docs = [str(p.relative_to(ROOT)) for p in targets
+                  if (p.relative_to(ROOT).as_posix().startswith("docs/")
+                      or p.relative_to(ROOT).as_posix().startswith(".qoder/rules/"))
+                  and p.relative_to(ROOT).as_posix() not in tracked_set]
+check(f"庚5 交接文档与 IDE 规则全部已入 git（读到未跟踪 {len(untracked_docs)} 份）——"
+      "接手方看不到会话历史，只看得见仓库；桥没入库等于交接通道不存在",
+      untracked_docs == [], {"未跟踪": untracked_docs,
+                            "处置": "git add <那份文档>（点名 add，不许 -A）后提交"})
+_bridge_scope = [p for p in targets
+                 if p.relative_to(ROOT).as_posix().startswith(("docs/", ".qoder/rules/"))]
+check(f"庚6 庚5 的视野非空（本次扫到桥上的文档 {len(_bridge_scope)} 份：docs/ + .qoder/rules/）——"
+      "这一份为庚5 兜底：目标口径一旦改坏（比如 glob 失效），未跟踪列表会变成空的而看起来像全绿",
+      len(_bridge_scope) >= 12, {"读到": [str(p.relative_to(ROOT)) for p in _bridge_scope]})
+
 print(f"\n═══ 文档中文卫生：{_ok} 通过 / {len(_failed)} 失败 ═══")
 if _failed:
     print("失败项：")
