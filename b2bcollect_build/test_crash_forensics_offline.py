@@ -68,6 +68,18 @@ os.environ["HOME"] = _TMP_HOME
 if os.name == "nt":                      # Windows 上 expanduser 认 USERPROFILE
     os.environ["USERPROFILE"] = _TMP_HOME
 
+# ── 光钉 HOME 还漏一路：权限本地状态不住在 HOME 里 ──────────────────────
+# 2026-11-13 起 `_state_dir()` 的首选落点既不在桌面也不在 HOME，而是从 tool_config
+# 的 state_dir() 往下推——开发机上就是 `b2bcollect_build/acl/`。取证的 `_identity()`
+# 按「只走 access_guard 公开出口」取设备标识，而 `device_identity()` 在一台**没有**
+# `.acl_device.json` 的机器上是**首调即写**（第一次认识这台机器要把指纹落盘）。
+# 2026-11-20 干净检出泳道上，本套件就是这样在检出树里建出了 `b2bcollect_build/acl/`，
+# 被批跑的逐套件状态对拍点了名（开发机那份早就在位，走的是纯读，本机永远验不出来——
+# 形状同 test_acl_levels_offline）。接落点用仓里既有的那一个把手（与 test_site_enrich_offline
+# 等四份同源），实测它会接成 `<沙箱>/acl`；下面 section_state 当场自证钉住了且真写过。
+_STATE_PIN = Path(tempfile.mkdtemp(prefix="cf_state_"))
+os.environ["B2B_STATE_DIR"] = str(_STATE_PIN)
+
 import crash_forensics as cf              # noqa: E402
 from PyQt5.QtCore import Qt               # noqa: E402
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout,  # noqa: E402
@@ -126,6 +138,26 @@ def _frame_files(text: str):
     真实不变量只有一条：没有一帧落在取证模块这个文件上。
     """
     return [m for m in re.findall(r'File "([^"]+)", line \d+, in ', text)]
+
+
+# ── S. 权限状态落点隔离（读真机指纹不许把检出树写脏）──────────────────
+
+def section_state():
+    print("\n[S] 权限状态落点隔离：取身份那一步必须写在沙箱里，而且要能证明它真写过")
+    import access_guard as ag
+    _assert_eq(os.environ.get("B2B_STATE_DIR"), str(_STATE_PIN),
+               "S1 本套件的沙箱仍接在 B2B_STATE_DIR 上（被谁覆盖走，下面两条就都在判空气）")
+    here = Path(ag._state_dir()).resolve()
+    _assert(_STATE_PIN.resolve() in [here] + list(here.parents),
+            f"S2 权限本地状态落点确实落在沙箱里（实际={here}）：钉的是「接上了」这个事实，"
+            "不是「目录名叫得对」——落点没接上时，沙箱里也可能恰好有别的文件在位")
+    _ident = cf._identity()
+    _assert(_ident.startswith("账号=") and "设备=" in _ident,
+            f"S3 取证身份行真走通了 access_guard 那条公开出口（实得 {_ident!r}）："
+            "它退回「身份=?(…)」时 S4 也可能因为隔壁步骤写过而绿，那是拿异常当通过")
+    _assert((here / ag.DEVICE_FILE_NAME).is_file(),
+            f"S4 取身份那一步**确实写过一份**设备指纹，而且写在沙箱里（{here}）："
+            "没有这条正控，S1/S2 只能证明「没往仓库写」，证不了「这一路真被走过」")
 
 
 # ── A. 落点与界面启动崩溃日志同源 ───────────────────────────────────────────
@@ -1072,6 +1104,7 @@ def _cleanup():
                 os.environ["USERPROFILE"] = _ORIG_HOME
         import shutil
         shutil.rmtree(_TMP_HOME, ignore_errors=True)
+        shutil.rmtree(_STATE_PIN, ignore_errors=True)   # 权限状态沙箱也不留现场
     except BaseException:               # noqa: BLE001
         pass
 
@@ -1083,9 +1116,9 @@ def main():
         print("  ❌ HOME 重定向没生效，后面每一条 report 都会污染真实桌面，直接收工")
         print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL + 1} 失败 ═══")
         return 1                      # 不用 sys.exit 收尾：下面 `__main__` 统一按同一口径退出
-    for fn in (section_a, section_b, section_c, section_d, section_e, section_f,
-               section_g, section_h, section_i, section_j, section_k, section_l,
-               section_m, section_n):
+    for fn in (section_state, section_a, section_b, section_c, section_d, section_e,
+               section_f, section_g, section_h, section_i, section_j, section_k,
+               section_l, section_m, section_n):
         fn()
     _cleanup()
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
