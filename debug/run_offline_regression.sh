@@ -347,7 +347,7 @@ PY
 }
 _state_snapshot() {   # $1 = 输出文件，$2 = 上面那份声明名单
   $PY - "$ROOT" "$1" "$2" <<'PY'
-import hashlib, sys
+import hashlib, os, sys
 from pathlib import Path
 root, out, declared = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 WATCHED_DIRS = ("b2bcollect_build", "riskbird_build", "ali1688_build")
@@ -358,11 +358,44 @@ for d in WATCHED_DIRS:                          # 开发态数据目录（Cookie
             if f.is_file():
                 names.add(str(f.relative_to(root / d)))
 rows = []
+visited = 0
 for d in WATCHED_DIRS:
-    for name in sorted(names):
-        f = root / d / name
-        if f.is_file():
-            rows.append(f"{f.relative_to(root)}\t{hashlib.sha256(f.read_bytes()).hexdigest()}")
+    base = root / d
+    if not base.is_dir():
+        continue
+    # 扫树筛名字，而不是拿声明的裸名去拼路径。旧写法只看得到目录第一层
+    # （`root / d / 裸名`），于是**住在子目录里的状态文件**从来没进过快照：
+    # b2bcollect_build/acl/.acl_cache.json 就是这么躲过对拍的——2026-11-20 批跑
+    # 中途 check_gui_fit.py 用本机真凭据拉回真名单写脏了它，屏幕上却写着
+    # 「没改动 70 份」——一条只会说「没事」的门比没有门更糟，因为它就是用来
+    # 让人安心跳过这一问的。
+    for dirpath, _dirnames, filenames in os.walk(base):
+        visited += len(filenames)
+        for fn in filenames:
+            f = Path(dirpath) / fn
+            rel = f.relative_to(base).as_posix()
+            if rel in names or fn in names:
+                try:
+                    digest = hashlib.sha256(f.read_bytes()).hexdigest()
+                except OSError as e:        # 读不动也要进表：宁可报成「变了」也不许静默溜过
+                    digest = f"读不到:{type(e).__name__}"
+                rows.append(f"{f.relative_to(root).as_posix()}\t{digest}")
+rows.sort()
+# 三种「扫不到东西」必须分开说，它们是完全不同的事：
+#   · 名单空 / 走了三个目录却一个文件都没碰到 → 门的口径断了，这一轮不算做过对拍；
+#   · 口径没断、只是本机确实还没有任何运行态文件（干净克隆的第一轮就是这样：
+#     acl/ 与 *_data/ 都是跑起来才建的）→ 合法现场，红它等于把新机器第一次批跑
+#     拦在门外。但这句话必须上屏：只默默往表里写 0 行，下一个人分不清
+#     「还没有」与「没在看」，那与旧写法的空视野假绿只差一层窗户纸。
+if not names:
+    sys.stderr.write("❌ 状态文件声明名单是空的：监视范围从哪来这一问断了\n")
+    sys.exit(3)
+if visited == 0:
+    sys.stderr.write("❌ 三个交付目录都在位，却一个文件都没走到：遍历口径断了\n")
+    sys.exit(3)
+if not rows:
+    print("⚠️ 状态对拍：0 份运行态文件在位（本机还没跑过这些东西）——"
+          "本轮只能靠「跑完新冒出来的文件」说话")
 out.write_text("\n".join(rows) + "\n", encoding="utf-8")
 PY
 }

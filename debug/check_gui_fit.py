@@ -15,18 +15,51 @@ QLabel 折行、按钮文字被裁这类问题，肉眼看截图容易误判，�
 必须钉在滚动容器之外、且在窗口可见区内**完整可见**——用户不用滚就能开工。这一条挂了
 就不再是「看着挤」的体验问题，而是回归。
 用法：python check_gui_fit.py [模块名]（默认 b2bcollect_gui，可传改动前的临时副本做对照）
-     档位/等级用环境变量换着跑：B2B_EDITION=lite B2B_ACL_LEVEL=2 python debug/check_gui_fit.py
-     （丐版创建的控件少、内容最小宽不同，只测 pro 等于只测了一半形状）"""
+     完整/受限两档形状由本脚本自己逐档量（见下面 _SHAPES 那段），不需要调用方
+     带环境变量——以前那句「档位/等级用环境变量换着跑」写在头上却从来没人带，
+     等于每轮批跑只量了一个形状。构建档位仍可换：B2B_EDITION=lite python debug/check_gui_fit.py"""
 import os
+import pathlib
+import shutil
+import socket
 import sys
+import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "b2bcollect_build"))
+
+# ── 体检自己必须是只读旁观者（不做到这一步，下面的数字都不可信）─────────────
+# 建真实 MainWindow 会连带起权限心跳（QTimer，间隔 max(15s, CACHE_TTL)）和 1.5s
+# 开机收口；而下面每档屏都要 processEvents()，两档形状 × 三档屏跑下来早过 15 秒
+# ——心跳就会拿**本机绑定的真凭据**去 OSS 拉真名单，把真实手机号写进工具状态目录
+# 里的 acl/.acl_cache.json，顺便让这条名字里带着 offline 的批跑出一次真网。
+# 后果不止是脏：test_acl_levels_offline 随后会读到那份真名单，同一份代码在本机红、
+# 在干净 clone 绿（2026-11-20 实测：批跑 10:33:35 起、缓存写于 10:35:13，正对
+# check_gui_fit.log 的 mtime）。而换一台没绑账号、没 OSS 凭据的机器（交接后的新
+# Mac），这一格量的又是另一种形状——几何体检到底在量哪套控件全凭现场状态。
+# 所以三件事一起做：状态目录整体挪进临时目录、封掉域名解析、把要量的等级
+# 写进循环（完整/受限两档都量，见下），让体检只依赖声明、不依赖现场。
+_STATE_TMP = pathlib.Path(tempfile.mkdtemp(prefix="gui_fit_state_"))
+_net_attempts = []
+
+
+def _blocked_getaddrinfo(*args, **kwargs):
+    _net_attempts.append(args[0] if args else "?")
+    raise socket.gaierror(8, "check_gui_fit：布局体检不许出网")
+
+
+socket.getaddrinfo = _blocked_getaddrinfo
 
 from PyQt5.QtWidgets import QApplication, QScrollArea  # noqa: E402
 
 mod_name = sys.argv[1] if len(sys.argv) > 1 else "b2bcollect_gui"
 G = __import__(mod_name)
+
+import access_guard as _ag  # noqa: E402
+import edition as _ed       # noqa: E402
+
+_ag._state_dir = lambda: _STATE_TMP
+assert _ag._state_dir() == _STATE_TMP, "状态目录没接上：三份 .acl_*.json 会写到真实桌面目录"
 
 app = QApplication(sys.argv)
 
@@ -61,14 +94,30 @@ def _in_scroll_area(wd) -> bool:
 # 三档屏 × 两档窗口高：本机 Retina 逻辑 1280x800（可用 ~775）、常见 13 寸笔电
 # 1280x775、小屏笔电 1024x640（低于配置内容最小宽，验证退路是「横向滚动条」而不是
 # 「按钮被压扁」）。窗口尺寸取源码里那套自适应公式，测的就是用户实际会看到的形状。
-CASES = [
+_SCREEN_CASES = [
     ("本机1280x800", 1280, 775, min(1120, max(880, 1280 - 100)), min(940, max(640, 775 - 80))),
     ("笔电1280x775", 1280, 775, 1000, 700),
     ("小屏1024x640", 1024, 640, 1000, 620),
 ]
 
+# 两档形状都量，而不是只量 pro：文件开头自己就写着「只测 pro 等于只测了一半
+# 形状」，可批跑从来不带环境变量——那句话于是只是一句用法备注，从未被执行。
+# 等级走 B2B_ACL_LEVEL 这个声明式接缝（仅源码运行生效），而不是靠本机绑定关系
+# 碰运气：开发机拉到真名单是 pro 形状，新机器什么也没有就是另一种形状，
+# 同一份判据在两台机器上量两套控件——那比不量更容易骗人。
+_SHAPES = ((_ed.LEVEL_ADMIN, "完整"), (_ed.LEVEL_LITE, "受限"))
+CASES = [(f"{shape}·{tag}", lvl, scr_w, scr_h, ww, hh)
+         for lvl, shape in _SHAPES
+         for (tag, scr_w, scr_h, ww, hh) in _SCREEN_CASES]
+
 all_bad = []
-for tag, scr_w, scr_h, ww, hh in CASES:
+_prev_lvl = None
+for tag, lvl, scr_w, scr_h, ww, hh in CASES:
+    if lvl != _prev_lvl:            # 同一等级内切屏不必反复重定档
+        os.environ[_ed.LEVEL_ENV_VAR] = str(lvl)
+        _ed.reset_for_tests()       # 等级挂在模块全局上，不清会把上一档带到下一档
+        _prev_lvl = lvl
+        print(f"\n【等级 {lvl}｜{_ed.LEVEL_NAMES.get(lvl, '?')}】")
     # 每档屏重新构造一个窗口：最小宽地板在首次 show 时按屏宽定死，复用同一个窗口
     # 改 cap 只会让「已经抬起来的地板」赖着不走，测出来的是混合状态。
     G.MainWindow._width_floor_cap = lambda self, _w=scr_w: _w
@@ -147,6 +196,16 @@ for tag, scr_w, scr_h, ww, hh in CASES:
     app.processEvents()
 
 print(f"\n[{mod_name}] RESULT:", "ALL FIT（0 处挤压）" if not all_bad else f"挤压 -> {all_bad}")
+# 出网尝试只报数、不改判定：拦停本身已经消除了危害（写脏真名单、烧真额度），
+# 而这个数字要让人看见——它从 0 变成非 0，说明开机路径上多了一处建窗即取网络。
+print(f"· 体检期间出网尝试 {len(_net_attempts)} 次（已全部拦停）")
+# 临时状态目录当场回收：本套件的收尾走 os._exit（见下面那段说明），Qt 析构与
+# atexit 都不会替我们删；而批跑每天要建 6 个形状 × 若干份 .acl_*.json，留在 /var
+# 下就是「没人认领的目录」——判据 ㊴ 骂的正是这一格，不能只对探针生效、对体检豁免。
+shutil.rmtree(_STATE_TMP, ignore_errors=True)
+assert not _STATE_TMP.exists(), f"临时状态目录没回收：{_STATE_TMP}"
+assert _ag._state_dir() == _STATE_TMP, "状态目录中途被换回去了（守卫自己重新判定了落点）"
+assert socket.getaddrinfo is _blocked_getaddrinfo, "DNS 硬闸被拆了——收尾前不该有人恢复它"
 # 判定到此为止：屏幕上这句和批跑读到的退出码必须是同一个来源。这套件自己建过
 # QApplication，而 Qt/线程在解释器收尾时的析构会随机段错误（本机实测：keyword_resume
 # 全绿 88 项之后 rc=139，被批跑读成一次失败，单跑又绿——真红就是这么被当成抖动的）。

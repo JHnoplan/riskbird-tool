@@ -22,7 +22,9 @@ import ast
 import contextlib
 import io
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -452,6 +454,63 @@ _neg = _gate_mod.check_requirements_coverage(
 check("㊵b 负夹具自证：清单里没有的那只必须被这条对拍点名——不验这一句，㊵ 的「空表」有可能"
       "只是因为「它压根没扫到东西」（能在空集上通过的判据就是没有判据）",
       bool(_neg) and any("this_pkg_is_not_declared" in x for x in _neg), _neg)
+
+# ── F. 状态对拍门的视野（这份门自己对我们撒过一次谎）──────────────────
+# 2026-11-20 之前 `_state_snapshot` 拿「声明的裸名」去拼 `<交付目录>/<裸名>`，只看得
+# 到目录第一层：住在子目录里的 `b2bcollect_build/acl/.acl_cache.json` 从来没进过快
+# 照，于是批跑中途把它写脏之后，屏幕上照样是「没改动 70 份」。下面把抽出来的那段
+# python **真跑一遍**：拼路径与扫树在文本上看不出差别，跑一次就现形——判据不许只
+# 对文本形状说话（与「函数写了没人调」同族：长得对不等于跑得动）。
+_m = re.search(r"_state_snapshot\(\) \{.*?<<'PY'\n(.*?)\nPY\n\}", _sh, re.S)
+check("㊹ 能从批跑入口里抽出状态快照那段 python（抽不出来，下面几条行为判据就全是空判）",
+      _m is not None, "_state_snapshot 的 heredoc 形状变了就要同步这里")
+
+
+def _run_snapshot(files, declared, kill_dirs=False):
+    """在一座临时仓库里真跑一次抽出来的快照逻辑：返回（退出码，表里的路径，输出）。"""
+    tmp = _fixture(**files)
+    if kill_dirs:
+        for d in ("b2bcollect_build", "riskbird_build", "ali1688_build"):
+            shutil.rmtree(os.path.join(tmp, d))
+    names = os.path.join(tmp, "declared.txt")
+    Path(names).write_text("".join(n + "\n" for n in declared), encoding="utf-8")
+    script = os.path.join(tmp, "_snap_extracted.py")
+    Path(script).write_text(_m.group(1) if _m else "", encoding="utf-8")
+    out = os.path.join(tmp, "snap.tsv")
+    r = subprocess.run([sys.executable, script, tmp, out, names],
+                       capture_output=True, text=True)
+    paths = {ln.split("\t")[0] for ln in Path(out).read_text(encoding="utf-8").splitlines()
+             if "\t" in ln} if os.path.isfile(out) else set()
+    return r.returncode, paths, r.stdout + r.stderr
+
+
+_rc, _paths, _msg = _run_snapshot(
+    {"b2bcollect_build/acl/.acl_cache.json": "x",
+     "b2bcollect_build/.acl_device.json": "x",
+     "b2bcollect_build/main.py": "x"},
+    [".acl_cache.json", ".acl_device.json"])
+check("㊺ 住在子目录里的状态文件必须进表（这就是旧口径漏掉的那一格：拼路径只看得见"
+      "第一层，acl/.acl_cache.json 永远躲得过对拍）",
+      "b2bcollect_build/acl/.acl_cache.json" in _paths, sorted(_paths))
+check("㊻ 顶层那份仍要在（改成扫树不许把老能力反弄坏），且表里用的是相对仓库根的路径",
+      "b2bcollect_build/.acl_device.json" in _paths, sorted(_paths))
+_rc, _paths, _msg = _run_snapshot({"riskbird_build/riskbird_data/cookies.json": "x",
+                                   "riskbird_build/main.py": "x"},
+                                  ["riskbird_data/cookies.json"])
+check("㊼ 相对路径形态的声明（*_data 那一条口径）仍然认：只按 basename 筛会把这份变成"
+      "「靠名字巧合对上」，两种声明形态都得支持",
+      _paths == {"riskbird_build/riskbird_data/cookies.json"}, sorted(_paths))
+_rc, _paths, _msg = _run_snapshot({"b2bcollect_build/main.py": "x"}, [".never_created.json"])
+check("㊽ 干净克隆的第一轮不许被拦：三个目录都走着、只是运行态文件还没建过 → 退 0 但"
+      "必须上屏说自己视野为 0（默默写空表与旧写法的空视野假绿只差一层窗户纸）",
+      _rc == 0 and not _paths and "0 份" in _msg, f"rc={_rc}｜输出={_msg.strip()[:90]}")
+_rc, _paths, _msg = _run_snapshot({"b2bcollect_build/main.py": "x"}, [])
+check("㊾ 声明名单空了必须拦停（退 3）：「监视范围从哪来」断了，这一轮不算做过对拍",
+      _rc == 3, f"rc={_rc}")
+_rc, _paths, _msg = _run_snapshot({"debug/keep.py": "x"}, [".acl_cache.json"], kill_dirs=True)
+check("㊿ 三个交付目录全不在位也要拦停（退 3）：目录改名/路径口径漂了都会退化成「永远"
+      "没改动」那种假绿，与上面那条合法现场正好相反，不许共用一个结论",
+      _rc == 3, f"rc={_rc}")
 
 for _d in _TMP:
     shutil.rmtree(_d, ignore_errors=True)
