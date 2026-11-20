@@ -238,9 +238,11 @@ B2B_LOCAL_KEEP_OLD=1 bash debug/build_b2bcollect_mac_local.sh   # 保留旧包
   不放这一份的后果很明确也很安静：AI 智能解析与图片上传功能直接不可用——
   程序会 fail-closed 报"缺少密钥"并告诉你去哪配（第 43 条密钥门就是为守住这条而加的：
   密钥**只允许**待在这个文件里，写进任何文档或脚本都会让构建红）。
-  另注：`qcollect/`、`qrcode_landing/` 两份小工具还有一条兜底路径指向工作区外的 iOS 工程
-  常量文件（`~/Desktop/AI云展/…/AliyunOSSUpload.m`），新机器上没有那个工程，
-  所以那两份必须靠 `export OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` 才跑得起来。
+  另注：`qrcode_landing/`（横幅活码部署与换图）与 `qcollect/`（历史展会采集脚本堆）是
+  两个开发辅助目录。前者的密钥只读环境变量（`OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET`）；
+  它以前还有一条兜底路径写死了旧开发机上那个**不属于本仓库的** iOS 工程位置，
+  2026-11-20 已改成 `export IOS_OSS_CONST_M=<AliyunOSSUpload.m 绝对路径>` 才走那条兜底——
+  新机器上没那个工程是正常的，不配就行，两个 OSS 变量齐了就能跑。
 - MCP / 用户级设置：属于账号与本机，项目不携带。
 - 若要 IDE 能跑测试：确认右下角解释器选的是 `.venv/bin/python`（不是系统 python3）。
   这一点和 `.command` 脚本同源——**"解释器在位"和"这个包能跑"是两格**，

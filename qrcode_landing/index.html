@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>扫码进群</title>
+<style>
+  body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:#f2f3f5;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+  .card{background:#fff;margin:16px;padding:36px 24px 28px;border-radius:16px;
+        box-shadow:0 4px 24px rgba(0,0,0,.08);text-align:center;max-width:420px;width:100%;box-sizing:border-box;}
+  h1{font-size:20px;color:#1aad19;margin:0 0 6px;}
+  p.tip{color:#888;font-size:14px;margin:14px 0 0;line-height:1.6;}
+  .qr-box{margin:18px auto 0;padding:14px;border:1px solid #ececec;border-radius:12px;display:inline-block;background:#fff;}
+  img{width:260px;height:260px;display:block;}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>欢迎加入交流群</h1>
+  <p class="tip">在微信内<strong>长按下方二维码</strong>，识别后即可进群</p>
+  <div class="qr-box"><img id="qr" alt="群二维码"></div>
+  <p class="tip">若提示二维码已过期，请联系群主更新</p>
+</div>
+<script>
+  // 每次打开强制拉取最新图片，避免缓存导致展示旧群码
+  document.getElementById('qr').src = 'qr.png?t=' + Date.now();
+</script>
+</body>
+</html>
