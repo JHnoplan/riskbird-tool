@@ -10095,6 +10095,34 @@ def _doc_pointers(texts: dict) -> dict:
     return found
 
 
+def _ignored_by_rules(relpaths) -> set:
+    """按**忽略规则**判定哪些路径被 .gitignore 拦住（与磁盘上此刻有没有这个文件无关）。
+
+    为什么不用 `ls-files --others --ignored`：那份清单只列磁盘上真实存在的被忽略文件。
+    干净检出里 `b2bcollect_build/config.json` 根本没被 checkout（它就是被拦着才不入库的）→
+    不在清单里 → 第 44 条把这条**设计上正确**的凭据指路判成死路。本机全绿、CI 四条发版通道
+    一起堵死就是这么来的（2026-11-20）。`check-ignore --no-index` 只查规则、既不查磁盘也不
+    查索引，开发机与 runner 因此必然同一答案——本条门自己也不许再犯「本机才有」这个错。
+
+    `-z` 与 `_path_set` 同一口径：中文路径不做八进制转义，否则逐字节对不上。
+    返回 None = git 明确报错（128 一类），由调用方按「范围断了」响；这里不许退化成空集，
+    因为空集的含义是「这些路径都没被忽略」，拿它当结论会把 git 故障说成交接闭包缺陷。
+    """
+    paths = sorted({p for p in relpaths if p})
+    if not paths:
+        return set()
+    try:
+        r = subprocess.run(["git", "check-ignore", "--no-index", "--stdin", "-z"],
+                           cwd=str(ROOT), input=b"\0".join(p.encode("utf-8") for p in paths),
+                           capture_output=True)
+    except OSError:
+        return None
+    if r.returncode not in (0, 1):        # 0=有命中, 1=一个都没命中（都是正常答复）
+        return None
+    names = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return {n for n in names if n}
+
+
 def _doc_named_dirs(texts: dict) -> set:
     """被交接文档以 `name/` 形式点名的顶层目录名。"""
     names = set()
@@ -10204,17 +10232,24 @@ def check_handover_closure(texts=None, suites=None) -> list:
     if not texts:
         return [f"第 44 条一份交接文档都没读到（HANDOVER_DOC_GLOBS={list(HANDOVER_DOC_GLOBS)} 落空？）："
                 "文档闭包这一半根本没判"]
-    ignored = _path_set(["ls-files", "--others", "--ignored", "--exclude-standard"])
+    # 甲的豁免按「忽略规则」判，一次算完（见 `_ignored_by_rules` 的由来）。
+    pointers = _doc_pointers(texts)
+    ignored = _ignored_by_rules([rel for rel in pointers
+                                 if rel not in head and rel not in index])
+    if ignored is None:
+        problems.append("第 44 条问不出「哪些路径被 .gitignore 拦着」（git check-ignore 失败）："
+                        "凭据那一类指路没法豁免，继续判只会响成一屏假红，先判这一格")
+        ignored = set()
 
     # ── 甲：文档指路的路径闭包 ──
-    for rel, srcs in sorted(_doc_pointers(texts).items()):
+    for rel, srcs in sorted(pointers.items()):
         top = rel.split("/")[0]
         if rel in head or rel in index:
             continue
         if rel in HANDOVER_POINTER_EXEMPT:
             continue
         if rel in ignored:
-            # 在忽略名单里 = 「本机运行期产物 / 密钥落点」，这本身就是仓库对它的处置（第 43 条
+            # 被忽略规则拦住 = 「本机运行期产物 / 密钥落点」，这本身就是仓库对它的处置（第 43 条
             # 写的就是「密钥只允许待在 config.json 里」）。这里如果还喊 `git add`，门禁自己就在
             # 催一次密钥入历——2026-11-20 首跑就是这样响在 b2bcollect_build/config.json 上的。
             # 代价：文档指到一个「新机器上需要自己建」的忽略文件时本条不报，那种靠 docs/02 自己讲清。
@@ -10239,7 +10274,13 @@ def check_handover_closure(texts=None, suites=None) -> list:
         disk = [p for p in path.rglob("*") if p.is_file() and "__pycache__" not in p.parts]
         if not disk:
             continue              # 空目录：没有东西需要闭包
-        probe = next((_rel_posix(p) for p in disk if _rel_posix(p) not in ignored), None)
+        # 与甲同一个口径（`_ignored_by_rules`）：本格扫的是**本机磁盘**上的真实文件，
+        # 但「算不算已被处置」依旧只看规则——一个口径只留一处实现，当初就是两处口径
+        # 各写各的，才有「甲靠磁盘清单豁免、乙也抄那份」这种连带缺陷。
+        ignored_here = _ignored_by_rules([_rel_posix(p) for p in disk])
+        if ignored_here is None:
+            continue              # git 报错已由甲那一格单独响过，这里不许拿它再编一条假红
+        probe = next((_rel_posix(p) for p in disk if _rel_posix(p) not in ignored_here), None)
         if probe is not None:
             problems.append(f"文档点名了 {name}/，可它整目录 0 份入库、且有东西不在忽略名单里"
                             f"（如 {probe}；本目录实测 {len(disk)} 份文件）：这就是 `git add -A` 的事故"

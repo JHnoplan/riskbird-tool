@@ -10,6 +10,9 @@ r"""handover_closure_offline_test.py —— 给「第 44 条交接闭包」做�
 四格坏形状，每格都要有夹具：
   甲  文档指路的路径不随仓库走（本机有/压根不存在 两种分开报；在忽略名单里的那种**不许**
       喊 git add——本门首跑就在 b2bcollect_build/config.json 上喊错过一次，那是催密钥入历）。
+      而「在忽略名单里」这句话必须只看**规则**、不看磁盘：`ls-files --others --ignored` 只列
+      本机存在的文件，干净检出里密钥文件根本不存在 → 豁免蒸发 → 本机绿、CI 红（甲6b 是这一格的
+      永久证人，它验的就是旧实现必然响红的那个世界）。
   乙1 被文档点名的顶层目录整目录不在库、又不在忽略名单（= `git add -A` 的事故半径）。
   乙2 已入库 .py import 同目录未入库的兄弟（今日 0 命中，纯防回归：它坏了就是产物缺模块）。
   丙  判据被宽容的 except 咽掉（「依赖没装」与「自家文件没入库」在 ImportError 这层同形）。
@@ -21,6 +24,7 @@ r"""handover_closure_offline_test.py —— 给「第 44 条交接闭包」做�
 """
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -55,7 +59,8 @@ class _world:
     覆盖面）就在同一个进程里跑。补丁不摘干净，后面读到的就是上一个夹具的世界。
     """
 
-    def __init__(self, g, tmp, files, head=None, index=None, ignored=(), texts=None, suites=None):
+    def __init__(self, g, tmp, files, head=None, index=None, ignored=(), texts=None, suites=None,
+                 real_ignored=False):
         self.g = g
         self.tmp = Path(tmp)
         # 默认世界必须是「其它三格都成立」的世界：不递文档与套件时，门禁会在
@@ -70,6 +75,7 @@ class _world:
         self.head = set(files) if head is None else set(head)
         self.index = set(index if index is not None else files)
         self.ignored = set(ignored)
+        self.real_ignored = real_ignored          # 真值=不替代豁免助手，让真实现跑
         self.suites = list(suites) if suites is not None else ["debug/clean_offline_test.py"]
         self.texts = {"docs/00-交接总览与验收清单.md": DOC} if texts is None else texts
         self._saved = {}
@@ -81,11 +87,23 @@ class _world:
     def __enter__(self):
         g = self.g
         self._saved = {k: getattr(g, k) for k in
-                       ("ROOT", "_tracked_sets", "_path_set", "in_work_tree", "regression_suites",
+                       ("ROOT", "_tracked_sets", "_path_set", "_ignored_by_rules",
+                        "in_work_tree", "regression_suites",
                         "_handover_doc_texts", "HANDOVER_POINTER_EXEMPT")}
         g.ROOT = self.tmp
         g._tracked_sets = lambda: (self.index, self.head)
-        g._path_set = lambda *a, **k: set(self.ignored)
+        # 这条补丁必须复刻旧命令的**关键语义**：`ls-files --others --ignored` 只列磁盘上
+        # 真实存在的被忽略文件。打成「无条件返回声明集」的话，夹具就比旧实现更宽容，
+        # 甲6b 那类「文件不存在」的世界根本测不到（变异复验 M1 第 1 轮就是这样验空的）。
+        g._path_set = lambda *a, **k: {p for p in self.ignored if (self.tmp / p).exists()}
+        # 「被忽略」在这里是一份**声明**，不依赖磁盘上有没有那个文件——这正是新口径与旧口径
+        # 的分界线：旧实现拿 `ls-files --others --ignored` 当答案，那份清单只列磁盘上存在的
+        # 文件，于是夹具（会先把文件写到临时磁盘）与实现共用同一个错假设，甲6 首跑就绿了，
+        # 而干净检出里同一个豁免直接蒸发（2026-11-20 堵死四条发版通道）。
+        if self.real_ignored:
+            pass    # 不动它：临时目录不是 git 工作树，真助手会在那里跑出「范围断了」那条回答
+        else:
+            g._ignored_by_rules = lambda paths: set(self.ignored) & set(paths)
         g.in_work_tree = lambda: True
         g.regression_suites = lambda *a, **k: (0, self.suites, "", "", "夹具")
         if self.texts is not None:
@@ -140,6 +158,63 @@ with _world(g, tempfile.mkdtemp(), {},
     probs = g.check_handover_closure()
     check("甲6 在忽略名单里的=仓库已明确处置，**不许**喊 git add（密钥入历就是这门自己造的）",
           not any("config.json" in p for p in probs), probs[:2])
+
+# 甲6b：上面那格的**干净检出版本**——路径被规则拦住、但磁盘上压根没有这个文件。
+# 这才是 runner 上的真实世界（它就是因为不入库才不存在的），而旧实现只在这个世界里报红。
+# 少了这一格，夹具与旧实现共用「文件在磁盘上」这个假设，本缺陷在原机器上永远不会响。
+with _world(g, tempfile.mkdtemp(), {},
+            ignored={"b2bcollect_build/config.json"},
+            texts={"docs/02.md": "密钥放在 `b2bcollect_build/config.json`。"}):
+    probs = g.check_handover_closure()
+    check("甲6b 被规则忽略但磁盘上没有（=干净检出态）：依旧不许响（CI 四条通道堵死的根）",
+          not any("config.json" in p for p in probs), probs[:2])
+    check("甲6b-证 夹具自洽：这份世界里磁盘上确实没有该文件（否则与甲6 同形、白测）",
+          not (g.ROOT / "b2bcollect_build" / "config.json").exists(), str(g.ROOT))
+
+# 甲6c：豁免助手读不出结论（git check-ignore 报错）时，必须明说「范围断了」，
+# 不许退化成「这些路径都没被忽略」——那是拿 git 故障编一屏交接缺陷。
+# 这一格走**真助手**（real_ignored）：上一版这里把助手整个替成 lambda: None，于是真实现里
+# `rc → None` 那条分支根本没跑过——实测把真分支改成 `return set()`，判据 34/0 全绿（假绿）。
+# 临时目录不是 git 工作树，真助手在那里会跑出 128，正好把那条分支踩一遍。
+with _world(g, tempfile.mkdtemp(), {}, real_ignored=True,
+            texts={"docs/02.md": "密钥放在 `b2bcollect_build/config.json`。"}):
+    probs = g.check_handover_closure()
+    check("甲6c 真助手在 git 外跑不出结论：响「范围断了」，不是静默当合格",
+          any("check-ignore 失败" in p or "范围断了" in p for p in probs), probs[:2])
+
+# 甲6d：真助手本体——规则命中与磁盘存在性无关。这里**真的** `git init` 一份小仓库：
+# 它不吃夹具的方便答案，验的是实现本体「文件不存在时还认不认得出被忽略」——
+# 即本段那条 CI 事故的直接反向证人。临时目录不写那个文件，就是干净检出态。
+_repo = Path(tempfile.mkdtemp())
+(_repo / "sub").mkdir(parents=True, exist_ok=True)
+(_repo / ".gitignore").write_text("secret.json\n", encoding="utf-8")
+_init = subprocess.run(["git", "init", "-q"], cwd=str(_repo), capture_output=True, text=True)
+assert _init.returncode == 0, f"夹具自己没站起来（git init 失败）：{_init.stderr[:120]}"
+with _world(g, str(_repo), {}, real_ignored=True):
+    check("甲6d-前提 该文件磁盘上确实不存在（否则与甲6 同形、白测）",
+          not (_repo / "sub" / "secret.json").exists(), str(_repo / "sub" / "secret.json"))
+    check("甲6d-1 真助手：不存在但被规则拦住的=被忽略（旧实现就是在这里蒸发成死路）",
+          g._ignored_by_rules(["sub/secret.json"]) == {"sub/secret.json"},
+          str(g._ignored_by_rules(["sub/secret.json"])))
+    check("甲6d-2 真助手：没被规则拦住的=不被忽略（豁免不是一张大白布）",
+          g._ignored_by_rules(["sub/keep.py"]) == set(), str(g._ignored_by_rules(["sub/keep.py"])))
+with _world(g, tempfile.mkdtemp(), {}, real_ignored=True):   # 这份临时目录没有 `git init`
+    check("甲6d-3 真助手在 git 工作树外报 None（不是空集——空集的含义是「都没被忽略」）",
+          g._ignored_by_rules(["sub/secret.json"]) is None,
+          repr(g._ignored_by_rules(["sub/secret.json"])))
+
+# 甲6e：钉住本次根因的调用形式——豁免不得回到「只列磁盘上存在的文件」那份清单。
+# 这是一条反向对照：谁把旧实现抄回来（哪怕是“两种都兼容”地加一行），本格就红。
+with _world(g, tempfile.mkdtemp(), {}, ignored={"a/b.json"}):
+    _body = Path(GATE).read_text(encoding="utf-8")
+    _seg = _body[_body.index("def check_handover_closure"):]
+    _cut = _seg.find("\ndef ", 60)                 # 下一个顶层 def = 本函数体的右边界
+    if _cut > 0:
+        _seg = _seg[:_cut]
+    check("甲6e 甲/乙1 的忽略豁免只许走 _ignored_by_rules：`ls-files --others --ignored` 不许复活",
+          "--others" not in _seg and _body.count("def _ignored_by_rules") == 1
+          and _seg.count("_ignored_by_rules(") >= 2,
+          [ln.strip()[:90] for ln in _seg.splitlines() if "ignored" in ln][:3])
 
 with _world(g, tempfile.mkdtemp(), {},
             texts={"docs/02.md": "见 `debug/never_written.py`。"}):
