@@ -223,10 +223,12 @@ import ast as _ast_e                                                 # noqa: E40
 _ROOT_E = os.path.dirname(os.path.abspath(__file__))
 _DUP_COLS = set(__import__("yzd_client").IMPORT_HEADERS)
 _off_e, _scanned_e = [], 0
+_seen_e = {"b2bcollect_build": set(), "ali1688_build": set(), "riskbird_build": set()}
 for _pkg in ("b2bcollect_build", "ali1688_build", "riskbird_build"):
     for _fp in sorted(Path(_ROOT_E, "..").joinpath(_pkg).glob("*.py")):
         if _fp.name.startswith("test_"):
             continue
+        _seen_e[_pkg].add(_fp.name)
         _scanned_e += 1
         _tr = _ast_e.parse(_fp.read_text(encoding="utf-8"))
         for _nd in _ast_e.walk(_tr):
@@ -243,6 +245,38 @@ for _pkg in ("b2bcollect_build", "ali1688_build", "riskbird_build"):
             if _rep:
                 _off_e.append(f"{_pkg}/{_fp.name}:{_nd.lineno} 把 {'、'.join(_rep)} 写了两遍")
 check("E4 交付链里只有一份入库表列结构（没有任何 .py 再写一份重复列名的表头字面量）",
-      _scanned_e >= 100 and not _off_e, f"扫了 {_scanned_e} 份；命中：{_off_e}")
+      not _off_e, f"扫了 {_scanned_e} 份；命中：{_off_e}")
+
+# E4b 把「判的是什么」与「看得见的范围」分成两条。旧写法把两者合在一条里：
+# `_scanned_e >= 100 and not _off_e`——那个 100 是**开发机的未跟踪脚本堆**撑出来的数字，
+# 不是仓库的性质：本机 150 份过得去，干净 clone 只有 81 份就必红（2026-11-20 实测，
+# 与 test_waterfall_leads_offline 的 `_o_tracked_counts` 那一处同一个根）。
+# 换成与机器无关的口径：三个目录都得非空，且 git 在库的顶层非 test 文件一份不许漏出扫描范围。
+def _tracked_top_e(pkg):
+    """git 在库的顶层非 test .py 文件名集合；读不到 git 返回 None（不许当成空集）。"""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", str(Path(_ROOT_E).parent), "ls-files", "--", f"{pkg}/*.py"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if r.returncode:
+        return None
+    return {ln.rsplit("/", 1)[1] for ln in r.stdout.splitlines()
+            if ln.count("/") == 1 and not ln.rsplit("/", 1)[1].startswith("test_")}
+
+
+_gaps_e, _git_ok_e = [], True
+for _pkg, _names in _seen_e.items():
+    _t = _tracked_top_e(_pkg)
+    if _t is None:
+        _git_ok_e = False
+        continue
+    _gaps_e += [f"{_pkg}/{x}" for x in sorted(_t - _names)]
+check("E4b E4 的扫描范围必须真的盖住三份产物代码（每个目录非空 + git 在库的顶层文件一份不漏）："
+      "视野断掉时「没命中」只是一句空话（拿绝对份数当下限等于拿某台机器的桌面当标尺）",
+      all(_seen_e.values()) and (_git_ok_e is False or not _gaps_e),
+      f"实扫 {  {k: len(v) for k, v in _seen_e.items()} }｜漏：{_gaps_e}｜"
+      f"git 读不到＝{_git_ok_e is False}（读不到时只按「非空」这一条判）")
 
 print(f"\n全部通过：{len(PASS)} 组断言")

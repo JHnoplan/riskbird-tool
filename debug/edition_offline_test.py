@@ -188,8 +188,60 @@ def _build(ed, lv=None):
     return win
 
 
-w_pro = _build("pro")
-w_lite = _build("lite")
+def _pin_level(value):
+    """把等级环境变量钉成 value，返回进来时的原值给 `_unpin_level` 恢复用。
+
+    这一对存在的理由：等级环境变量是**建窗那一刻的输入**，不是持久状态。本节钉它、
+    收尾不恢复，就等于替后面的节改了来路（2026-11-20 实测：留着它会压过
+    `set_account_level()` 的内存覆盖，把一条本来能红的等式判据修成恒真）。
+    """
+    prev = os.environ.get(edition.LEVEL_ENV_VAR)
+    if value is None:
+        os.environ.pop(edition.LEVEL_ENV_VAR, None)
+    else:
+        os.environ[edition.LEVEL_ENV_VAR] = str(value)
+    return prev
+
+
+def _unpin_level(prev):
+    """恢复 `_pin_level` 记下的原值。
+
+    本文件开头（第 57 行那一句）已经进来先清过等级环境变量，所以今天 `prev` 实际上
+    永远是 None——保留「恢复」而不是写成 `pop` 是为了不把两个语义绑死：将来若有人改了
+    开头那句清场策略，这一对助手仍然是「本节不渗到后节」，而不是「本节替全文件做主」。
+    """
+    if prev is None:
+        os.environ.pop(edition.LEVEL_ENV_VAR, None)
+    else:
+        os.environ[edition.LEVEL_ENV_VAR] = prev
+
+
+# 两个根窗口的等级必须**声明**，不能留给现场（2026-11-20 干净 clone 实测：同一份
+# 代码本机绿、clone 红一项）。`lv=None` 会让 `_build` 把 B2B_ACL_LEVEL 从环境里**清掉**，
+# 于是 pro 窗口里那三路名单补采平台（企知道/风鸟/爱企查）建不建得出来，取决于这台
+# 机器此刻有没有绑定账号、acl/ 里有没有拉到真名单：开发机上永远是「管理员」，clone 里
+# 就只剩企知道——「内部版同一句仍报全三平台」那条断言量的其实是「这台机器是谁」。
+# 本文件后面的节早就逐条显式钉了等级（`_build("pro", edition.LEVEL_LITE)` 等），只有
+# 这两个被全文件复用的根窗口漏了。钉成 ADMIN 与开发机此前一直拿到的值一致，
+# 所以不会把别的节改坏；而 lite 也钉 ADMIN，是为了让「藏起来」这一结论只可能由
+# 档位造成，不是由权限造成（那正是本套件要证的命题）。
+_level_env_before = os.environ.get(edition.LEVEL_ENV_VAR)
+w_pro = _build("pro", edition.LEVEL_ADMIN)
+w_lite = _build("lite", edition.LEVEL_ADMIN)
+# 建完立刻把等级环境变量恢复到本节之前的状态：`_build` 是把它**留在环境里**的，
+# 而它压过 `set_account_level()` 的内存覆盖（后面「能力矩阵」那一节正好依赖这个
+# 压过语义）。留着不擦，「pro+等级2 == lite 包」这条等式两边会被同钉成同一个等级，
+# 于是一条本来能红的判据变成恒真——机器无关性是修好了，判据自己却被修死。
+_unpin_level(_level_env_before)
+# 这一格只问「有没有恢复到进来时那一副环境」，而不是「环境变量一定不在」：两者今天
+# 等价（开头那句清场让 `_level_env_before` 事实上恒为 None），但后一种写法把「本套件自己
+# 接管等级」这条局部分工写成了全局断言——将来有人改了开头那句，判据就会红在一件
+# 根本不是缺陷的事上。（上一版这里写的理由是错的：它说“外部带着变量会被抹掉”，
+# 而第 57 行根本不让那种变量活到这一格——记错的因比缺判据更容易误导下一个人。）
+check("根窗口的等级靠声明而不是靠现场（建完就把环境变量恢复原样，"
+      "不拿它去污染后面的节）",
+      os.environ.get(edition.LEVEL_ENV_VAR) == _level_env_before,
+      f"进来时={_level_env_before}｜现在={os.environ.get(edition.LEVEL_ENV_VAR)}")
 
 
 def _labels(win, cls):
@@ -418,6 +470,11 @@ for _tag, _ed, _win in (("丐版", "lite", w_lite), ("内部版", "pro", w_pro))
 # 触发条件在丐版完全能走到：只选公司名单、不填关键词、再取消勾选企知道 →
 # 「请至少勾选一个名单补采平台（…）」。清单若照内部版写死，丐版就会报出两个
 # 界面上根本不存在的平台。这条只能真点一次才知道，扫 tooltip 扫不到它。
+# 钉之前先记一笔原值，而且**在循环外**记：放在循环里，第二轮读到的是第一轮刚钉的
+# ADMIN，收尾就变成「把 ADMIN 恢复成 ADMIN」——那一句「恢复」读起来像在做清洁，实际上
+# 什么都没恢复。本套件进来就清了等级变量（见文件开头），所以今天这份原值是 None；
+# 记值的写法不依赖这一点，后节才能按自己看到的现场拿环境。
+_lv_env_before = os.environ.get(edition.LEVEL_ENV_VAR)
 for _tag, _ed, _win in (("丐版", "lite", w_lite), ("内部版", "pro", w_pro)):
     _msgs = []
 
@@ -427,6 +484,12 @@ for _tag, _ed, _win in (("丐版", "lite", w_lite), ("内部版", "pro", w_pro))
 
     gui.QMessageBox.information = staticmethod(_info)
     os.environ[edition.ENV_VAR] = _ed
+    # 这句 reset 会重算全局等级：现场不同机器不一样，而窗口里的平台文案是建窗
+    # 那一刻投影好的——两边不同步就会变成「本机绿、clone 红」（2026-11-20 实例）。
+    # 这里显式钉到与建窗同一档，让这一节只问「档位会不会把藏起来的平台名念出来」。
+    # 逐轮钉而不只在循环前钉一次：本轮里 `_on_start()` 走过的那一段有权碰环境，
+    # 拿返回值没用（收尾统一按循环外记下的那份恢复）。
+    _pin_level(edition.LEVEL_ADMIN)
     edition.reset_for_tests()
     _win.kw_text.setPlainText("")
     _win.keywords = []
@@ -443,6 +506,9 @@ for _tag, _ed, _win in (("丐版", "lite", w_lite), ("内部版", "pro", w_pro))
         check("内部版同一句仍报全三平台（文案是同源投影出来的，不是把内部版改坏了）",
               len(_hit) == 1
               and all(n in _hit[0] for n in ("企知道", "风鸟", "爱企查")), _hit)
+# 同样的道理：这一节钉的等级不能渗到后面的节去（上面那段建窗处的注释写了为什么）。
+# 走 `_unpin_level` 而不是直接 pop：这一节只该还回自己借走的那一份环境。
+_unpin_level(_lv_env_before)
 gui.QMessageBox.information = staticmethod(lambda *a, **k: gui.QMessageBox.Cancel)
 _hb_lite = [b.text() for b in w_lite.findChildren(QPushButton)
             if b.text() in ("开始采集", "暂停", "停止", "清洗数据", "导出 Excel", "开始新任务")]

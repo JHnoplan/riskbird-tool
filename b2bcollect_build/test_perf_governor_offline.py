@@ -14,13 +14,23 @@
 # 不是「真等 20 秒看它涨不涨」（那种断言既慢又抖，还会在 CI 上随机红）。
 # DNS 与 requests 都装了硬闸：真发一次查询/请求就判红（2026-11-10 记过账的老坑）。
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 状态落点钉进沙箱（与 test_waterfall_leads_offline 同一口径）：本套件走 website_contact
+# 的 DNS 预检，那份缓存的真实落点由 tool_config.state_file() 定，开发态就落在
+# b2bcollect_build/ 里。2026-11-20 干净 clone 批跑实测：跑完凭空多出一份
+# b2bcollect_build/site_dns_cache.json，被状态对拍门点名并压红总判定——离线用例在
+# 开发机源码树里造运行态文件，换一台机器就是另一种现场，而那些现场从来没人核对过。
+_STATE_SANDBOX = Path(tempfile.mkdtemp(prefix="perf_state_"))
+os.environ["B2B_STATE_DIR"] = str(_STATE_SANDBOX)
 
 import perf_governor as pg
 import website_contact as wc
@@ -865,6 +875,12 @@ finally:
         _rq.get = _real_requests
     pg.drop_gate()
     wc.reset_caches()
+
+# 沙箱用完即回收：状态对拍门盯着的是源码树，/var 下那些没人认领的目录同样不该越堆越多
+# （本套件上面那条临时目录注释里写的就是这个道理，自己造的就要自己收）。
+shutil.rmtree(_STATE_SANDBOX, ignore_errors=True)
+check("状态沙箱用完回收（不在 /var 下留没人认领的目录）",
+      not _STATE_SANDBOX.exists(), str(_STATE_SANDBOX))
 
 # ══════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)

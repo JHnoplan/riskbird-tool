@@ -27,12 +27,22 @@
 """
 import copy
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "b2bcollect_build"))
+
+# 状态落点钉进沙箱：本套件真建权限管理面板、真走设备顶号那一段，而
+# `.acl_device.json` 的开发态落点就在 b2bcollect_build/acl/ 里。2026-11-20 干净 clone
+# 批跑实测：这一路凭空新建了那份文件（开发机上那是老文件，即使被改也看不出来），
+# 被批跑的状态对拍门点名并压红总判定。改写设备指纹比写脏缓存严重：它会让下一次
+# 真开工具自认新设备，用户看到的是「该账号已在另一台设备使用」。
+_STATE_SANDBOX = Path(tempfile.mkdtemp(prefix="aclnote_state_"))
+os.environ["B2B_STATE_DIR"] = str(_STATE_SANDBOX)
 
 from PyQt5.QtCore import Qt                                        # noqa: E402
 from PyQt5.QtWidgets import (                                      # noqa: E402
@@ -178,6 +188,11 @@ def main():
         aad.AclAdminDialog._run = saved["run"]
         aad._ed.acl_admin_visible = saved["visible"]
         aad._ag.get_guard = saved["get_guard"]
+        # 沙箱用完即回收：状态对拍门骂过「/var 下没人认领的目录」，自己造的临时目录要自己
+        # 收干净。放在 finally 里——判据红了也一样收，别让一次失败顺手留下永久残留。
+        shutil.rmtree(_STATE_SANDBOX, ignore_errors=True)
+        check("状态沙箱用完回收（不在 /var 下留没人认领的目录）",
+              not _STATE_SANDBOX.exists(), str(_STATE_SANDBOX))
     print(f"\n═══ 结果：{_PASS} 通过 / {_FAIL} 失败 ═══")
     return 0 if _FAIL == 0 else 1
 
