@@ -13213,6 +13213,48 @@ def _pe_said(fn, *a, **kw):
     return got, buf.getvalue()
 
 
+_SWAP_PATH = _REPO / ".github" / "scripts" / "swap_win7_ucrt.py"
+
+
+def _swap_ns(text=None):
+    """把 swap_win7_ucrt.py 当模块执行（与 _pe_ns 同一口径：判据对象必须是脚本自己）。"""
+    src = _SWAP_PATH.read_text(encoding="utf-8") if text is None else text
+    ns = {"__name__": "_swap_ucrt_under_test", "__file__": str(_SWAP_PATH)}
+    exec(compile(src, str(_SWAP_PATH), "exec"), ns)
+    return ns
+
+
+def _ucrt_wiring_problems(leg_text):
+    """UCRT 替换的接线判据（12c 与变异复验共用同一个把手，不写两份）。
+
+    由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，Win11 版 ucrtbase
+    自己就依赖 Win8 契约模块——替换必须发生在 PE 地板门**之前**，否则门先红在
+    存根上，替换根本没机会跑；core 存根的剪名单也必须写在脸上（只看 yml 就该知道
+    包里少了什么、为什么少）。返回问题列表，空 = 接线合格。
+    """
+    probs = []
+    steps = [(m.group(1), m.start()) for m in
+             re.finditer(r"^    - name: (.+)$", leg_text, re.M)]
+    idx = {n: i for i, (n, _) in enumerate(steps)}
+    swap = next((n for n in idx if n.startswith("Swap in Win7-compatible UCRT")), "")
+    pe_step = next((n for n in idx if n.startswith("PE floor gate (")), "")
+    if not swap:
+        probs.append("兼容通道没有「装配期换 Win7 UCRT」那一步：Win11 版 ucrtbase 与 api-ms "
+                     "存根会留在包里，Win7 加载器当场拒载（台账第 11 项）")
+        return probs
+    if not pe_step:
+        probs.append("找不到 PE 地板门那一步：UCRT 替换的先后顺序没了参照")
+        return probs
+    if idx[swap] >= idx[pe_step]:
+        probs.append("UCRT 替换排在了 PE 地板门之后：门会先红在 42 项存根上，替换根本没机会跑")
+    i = idx[pe_step]
+    body = leg_text[steps[i][1]:steps[i + 1][1]] if i + 1 < len(steps) else leg_text[steps[i][1]:]
+    if "--prune-match api-ms-win-core-*.dll" not in body:
+        probs.append("PE 地板门的实测剪名单里没有 api-ms-win-core-*.dll：换完 UCRT 后那 30 个"
+                     "失去依赖方的 Win11 存根（地板 10.0）会留在包里继续红")
+    return probs
+
+
 def test_pe_floor_gate():
     print("\n═══ DH. PE 地板门自己的地板：合成 PE 夹具（兼容通道第 14 步那道门）═══")
     # 由来：第 14 步那道 PE 地板门是本轮新加的，交付时**一条离线判据也没有**，云端首运
@@ -13491,6 +13533,64 @@ def test_pe_floor_gate():
                       f"两边分别 {len(_before)}/{len(_after)} 字节——只改 yml 不改生成器的话，"
                       "下次重跑生成器会把那一改整个抹掉")
 
+    # ── 12c) UCRT 替换的接线：必须在 PE 地板门之前，core 存根剪名单写在脸上 ──
+    #     由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，Win11 版 ucrtbase
+    #     自己就依赖 Win8 契约模块——光剪存根不够，必须装配期整套换 Win7 版 UCRT。
+    _wprobs = _ucrt_wiring_problems(leg)
+    _assert_eq(_wprobs, [], "UCRT 替换的接线不合格：" + "；".join(_wprobs))
+
+    # ── 12d) 替换脚本自己的行为：合成 PE 夹具，不合格替换件不许进包 ──
+    sw = _swap_ns()
+    _assert(_SWAP_PATH.is_file(), f"UCRT 替换脚本必须在位（不在位这一组就是在空转）：{_SWAP_PATH}")
+
+    def _ucrt_src(d, major=6, minor=1, imports=None):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "ucrtbase.dll").write_bytes(_pe_build(major=major, minor=minor, imports=imports))
+        for n in ("api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll"):
+            (d / n).write_bytes(_pe_build())
+        return d
+
+    def _ucrt_dist(d):
+        (d / "_internal").mkdir(parents=True, exist_ok=True)
+        (d / "_internal" / "ucrtbase.dll").write_bytes(_pe_build(major=10, minor=0))
+        for n in ("api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll"):
+            (d / "_internal" / n).write_bytes(_pe_build(major=10, minor=0))
+        return d
+
+    _sw_root = Path(tempfile.mkdtemp(prefix="ucrt_swap_"))
+    _good_src = _ucrt_src(_sw_root / "src_good", imports={"kernel32.dll": ["Sleep"]})
+    _d = _ucrt_dist(_sw_root / "dist_ok")
+    _old_bytes = (_d / "_internal" / "ucrtbase.dll").read_bytes()
+    _rc, _out = _pe_said(sw["swap"], _d, _good_src)
+    _assert_eq(_rc, 0, f"合格替换件（地板 6.1、只依赖 kernel32）必须放行（实际 rc={_rc}）：{_one_line(_out)[-160:]}")
+    _assert((_d / "_internal" / "ucrtbase.dll").read_bytes() == (_good_src / "ucrtbase.dll").read_bytes()
+            and (_d / "_internal" / "ucrtbase.dll").read_bytes() != _old_bytes,
+            "替换必须真的落到字节上：只改日志不改文件等于没换")
+    _assert((_d / "_internal" / "api-ms-win-crt-runtime-l1-1-0.dll").read_bytes()
+            == (_good_src / "api-ms-win-crt-runtime-l1-1-0.dll").read_bytes(),
+            "crt 转发器也要整套换：留一个 Win11 版（地板 10.0）PE 门照样红")
+    _assert("已替换 _internal/ucrtbase.dll" in _out, "逐件报账：换了哪几件要写在日志里")
+
+    _bad10 = _ucrt_src(_sw_root / "src_win10", major=10, minor=0)
+    _rc, _out = _pe_said(sw["swap"], _ucrt_dist(_sw_root / "dist_bad10"), _bad10)
+    _assert_eq(_rc, 1, "替换件自己要求 Win10 时必须 fail-closed：把没量过的 DLL 塞进包就是静默降级")
+    _assert("过不了 Win7 地板门" in _out, "拒绝替换件要说清是哪一格（地板高了），不许只给一个退出码")
+
+    _bad8 = _ucrt_src(_sw_root / "src_win8dep",
+                      imports={"api-ms-win-core-synch-l1-2-0.dll": ["Sleep"]})
+    _rc, _out = _pe_said(sw["swap"], _ucrt_dist(_sw_root / "dist_bad8"), _bad8)
+    _assert_eq(_rc, 1, "替换件仍依赖 Win8 契约模块时必须 fail-closed：这正是 run#4 那第二层雷的形状")
+    _assert("api-ms-win-core-synch-l1-2-0.dll" in _out, "拒绝话术要点名是哪个模块（照着能查）")
+
+    _half = _ucrt_src(_sw_root / "src_half")
+    (_half / "api-ms-win-crt-stdio-l1-1-0.dll").unlink()
+    _rc, _out = _pe_said(sw["swap"], _ucrt_dist(_sw_root / "dist_half"), _half)
+    _assert_eq(_rc, 1, "src 缺 crt 转发器时不许做半套替换：留下的 Win11 存根会继续红")
+    _assert("api-ms-win-crt-stdio-l1-1-0.dll" in _out, "缺哪几个转发器要点名")
+
+    _rc, _out = _pe_said(sw["swap"], _sw_root / "dist_nolayout", _good_src)
+    _assert_eq(_rc, 1, "产物目录没有 _internal 时必须红：布局变了先查 PyInstaller，不许静默跳过")
+
     # ── 13) 变异复验：上面每一格都要能被「退回修前原样」精准杀红 ──
     #     只验新代码通过是不够的：那 43 条假红当初也是「绿的」。这里把源码改回出事那一版
     #     （以及改坏比较方向、拆掉 API 筛查、拆掉 NUL 保护、拆掉排序兜底），逐条要求判据转红。
@@ -13551,6 +13651,56 @@ def test_pe_floor_gate():
             lambda m: "退回最严口径" in _pe_said(
                 m["main"], ["--scan-dir", str(x3), "--floor", "6.1"])[1],
             False, "会让「读不出」静默退成 None：日志里看不到这一格为什么按最严口径判红")
+
+    # 13b) UCRT 替换那三条新判据（12c/12d）同样要能被打红：从未红过的判据等于没有判据。
+    #      接线两条的变异对象是生成器（yml 是生成物，只改 yml 会被 12b 抹掉）：改完重跑
+    #      生成器再判，判完逐字节还原两份文件（不用 git checkout，备份还原法）。
+    _gen_path = _REPO / "debug" / "gen_legacy_workflow.py"
+
+    def _mutate_gen(old, new, label, probe, expect, note):
+        gsrc = _gen_path.read_bytes()
+        ysrc = leg_path.read_bytes()
+        if gsrc.decode("utf-8").count(old) != 1:
+            _assert(False, f"变异「{label}」的锚点在生成器里出现 "
+                           f"{gsrc.decode('utf-8').count(old)} 次（不是 1 次就不知道改到哪一格）")
+            return
+        try:
+            _gen_path.write_bytes(gsrc.decode("utf-8").replace(old, new, 1).encode("utf-8"))
+            _r = subprocess.run([sys.executable, str(_gen_path)], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace")
+            if _r.returncode != 0:
+                _assert(False, f"变异「{label}」重跑生成器失败（rc={_r.returncode}）："
+                               f"{_one_line(_r.stdout + _r.stderr)[-160:]}")
+                return
+            got = probe(leg_path.read_text(encoding="utf-8"))
+            _assert_eq(got, expect, f"变异「{label}」{note}")
+        finally:
+            _gen_path.write_bytes(gsrc)
+            leg_path.write_bytes(ysrc)
+        _assert(_gen_path.read_bytes() == gsrc and leg_path.read_bytes() == ysrc,
+                f"变异「{label}」还原后必须逐字节回到原样（还原不干净＝下一节的输入被污染）")
+
+    _mutate_gen("        UCRT_SWAP,\n        PE_FLOOR,", "        PE_FLOOR,",
+                "拆掉装配期换 UCRT 那一步（退回 run#4 原样）",
+                lambda t: len(_ucrt_wiring_problems(t)), 1,
+                "必须让 12c 精准报出「没有那一步」——否则替换被摸掉时没人知道")
+    _mutate_gen(" --prune-match api-ms-win-core-*.dll", "",
+                "拆掉 core 存根的实测剪名单",
+                lambda t: len(_ucrt_wiring_problems(t)), 1,
+                "必须让 12c 报出「剪名单缺 core 存根」：换完 UCRT 不剪存根，42 项红原地踏步")
+
+    def _swap_mutate(old, new, label, probe, expect, note):
+        src = _SWAP_PATH.read_text(encoding="utf-8")
+        if src.count(old) != 1:
+            _assert(False, f"变异「{label}」的锚点出现 {src.count(old)} 次（不是 1 次就不知道改到哪一格）")
+            return
+        got = probe(_swap_ns(src.replace(old, new, 1)))
+        _assert_eq(got, expect, f"变异「{label}」{note}")
+
+    _swap_mutate("    if problems:", "    if False:",
+                 "拆掉替换件的地板体检（没量过也敢往包里塞）",
+                 lambda m: _pe_said(m["swap"], _ucrt_dist(_sw_root / "dist_mut10"), _bad10)[0],
+                 0, "必须让 12d 那格 Win10 替换件重新被放行——fail-closed 是这一步存在的理由")
 
 
 def _raises(fn) -> bool:
