@@ -16,7 +16,7 @@
 | 想知道为什么某处写法很别扭 | `docs/06-缺陷目录与可复用教训.md` |
 | 想知道哪些文件能删能提交 | `docs/07-文件边界与打包卫生.md` |
 
-**本项目 42 道硬门与 66 路离线判据，几乎全部来自真实故障**（`docs/06`）。
+**本项目的构建前硬门与离线判据，几乎全部来自真实故障**（条数/路数一律以 `docs/03` §1-§2 的命令现取，`docs/06`）。
 看到"多余"的约束、"绕远"的写法，先查由来再动，不要凭直觉简化。
 
 ## 1. 这是什么
@@ -34,11 +34,11 @@ macOS 上不能交叉编译 `.exe`。改 Windows 交付链 = 推到 `main` 让�
 # 建环境（只用这一份清单，它是交付链单一真源）
 python3 -m venv .venv && .venv/bin/pip install -r .github/requirements/b2bcollect.txt
 
-# ① 构建前硬门（42 道；改任何交付链代码后先跑这个，秒级）
+# ① 构建前硬门（全集；改任何交付链代码后先跑这个，秒级）
 .venv/bin/python .github/scripts/check_packaging_manifest.py
 .venv/bin/python .github/scripts/check_packaging_manifest.py --list   # 只看清单不判定
 
-# ② 全量离线批跑（66 路，约 6 分钟；这是「跑绿」唯一的机器口径）
+# ② 全量离线批跑（清单由脚本自己展开；这是「跑绿」唯一的机器口径）
 bash debug/run_offline_regression.sh
 B2B_REGRESSION_ONLY="b2bcollect_build/test_xxx_offline.py" bash debug/run_offline_regression.sh  # 排障单跑
 
