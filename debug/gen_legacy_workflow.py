@@ -202,11 +202,36 @@ PE_FLOOR = '''    - name: PE floor gate (产物字节里写着的最低 Windows 
       # 诚实边界（脚本里也是这么写的，这里不许拔高）：这一格只证「加载器那一关不拦」，
       # **不**证「Win7 双击一定可用」——运行库是否装齐、驱动能否起来、字体/显卡回退都不在
       # 这张表里。前者由安装器体检补装（需求 10 已交付），后者必须回 Win7 实机验收。
+      # 【实测剪 selenium-manager.exe】run#2 实测：它静态导入
+      # kernel32!GetSystemTimePreciseAsFileTime（Win8 起）——Win7 的加载器会当场拒掉它。
+      # 为什么剪掉而不是把门调松：这个 helper 只在「随包驱动都不配套、要联网现下」那一支
+      # 用到，而 Win7 上 Chrome 最高 109、本通道已随包 107/108/109 三档；即使落到那一支，
+      # 它在 Win7 上也跑不起来——留着一个开不了的二进制只会多一处 0xc0000139。
+      # 为什么不走构建期排除：PyInstaller 那一步是**共享步骤**（第 42 条只允解释器那一
+      # 个 token 不同），在它那里加排除会连带改掉正在出货的主通道；而这一整步只在
+      # 兼容通道存在，主通道根本不跑 PE 地板门（Win10 不需要）。
+      # --prune-keep 是「哪怕通配命中也不许剪」的那道框：入口 exe 被剪掉的话，剩下的
+      # 就是一堆开不了的零件。
       shell: bash
       run: |
         set -u
         cd b2bcollect_build
-        python ../.github/scripts/check_pe_floor.py --scan-dir dist/B2bCollectTool --floor 6.1
+        python ../.github/scripts/check_pe_floor.py --scan-dir dist/B2bCollectTool --floor 6.1 \\
+          --prune-match selenium-manager.exe --prune-keep B2bCollectTool.exe
+
+'''
+
+PE_FLOOR_SETUP = '''    - name: PE floor gate on the installer (安装包自己的地板)
+      # 为什么不和上面那一步一起检：安装包是**这一步才**由 makensis 造出来的。生成器
+      # 早期版本把这两条写在了一起（第 14 步去检一个还不存在的文件），那只会得到一句
+      # 「文件不在位」——那是顺序错，不是产物错，而且它被 run#2 那 49 项假红盖住了：
+      # 不先修假红，这一条还要再藏一轮。
+      # NSIS 写的子系统版本比 6.1 还老（这一格脚本对「早于登记表」的形状不误伤，判据在
+      # test_frozen_delivery_offline.py 的 DH 节）；真高起来时该问的是编译器参数而不是产物。
+      shell: bash
+      run: |
+        set -u
+        cd b2bcollect_build
         python ../.github/scripts/check_pe_floor.py B2bCollectToolSetup_Win7.exe --floor 6.1
 
 '''
@@ -311,6 +336,7 @@ def main() -> int:
                         'PORTABLE_NAME: "B2bCollectTool_Win7_portable.zip"',
                         'MIN_WIN_MAJOR: "10"': 'MIN_WIN_MAJOR: "6"',
                         'MIN_WIN_MINOR: "0"': 'MIN_WIN_MINOR: "1"'}),
+        PE_FLOOR_SETUP,
         UPLOAD,
     ]
     text = "".join(parts)

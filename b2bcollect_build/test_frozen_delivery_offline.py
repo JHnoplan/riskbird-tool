@@ -12935,6 +12935,476 @@ def test_py38_floor_gate():
             f"不给判定项的调用要说出它什么都没判：{_one_line(_r2.stdout)[-200:]}")
 
 
+# ── DH. PE 地板门自己的地板（合成 PE，需求 10B 第 14 步） ────────────────────
+_PE_PATH = _REPO / ".github" / "scripts" / "check_pe_floor.py"
+
+
+def _pe_ns(text=None):
+    """把 check_pe_floor.py 当模块执行，返回它的命名空间。
+
+    给 text 就是执行一份**被改过的源码**（变异复验用）。判据对象必须是脚本自己：
+    在测试里另抄一份 PE 解析逻辑，两边各自演化时这一节就只在「证明自己和自己一致」。
+    """
+    src = _PE_PATH.read_text(encoding="utf-8") if text is None else text
+    ns = {"__name__": "_pe_floor_under_test", "__file__": str(_PE_PATH)}
+    exec(compile(src, str(_PE_PATH), "exec"), ns)
+    return ns
+
+
+def _pe_build(major=6, minor=1, subsystem=3, bits=64, imports=None, exports=None,
+              cut=0, bad_import_rva=False) -> bytes:
+    """合成一个**字段位置严格按 PE 规范**的最小镜像（本机是 Mac，没有真 Windows 二进制可扫）。
+
+    布局照 COFF 规范：e_lfanew → PE 签名 → 20 字节 COFF 头 → 可选头 → 节表 → 节数据。
+    两格刻意跟着「文件自己声明的字节数」走而不是写死：SizeOfOptionalHeader（决定节表
+    在哪）与数据目录起点（PE32 在 96、PE32+ 在 112）——这两格正是本脚本真栽过的地方。
+    imports: {dll 名: [函数名…]}，列表里放 None 表示**按序号导入**（名字读不出那一形）。
+    """
+    magic = 0x20B if bits == 64 else 0x10B
+    size_opt = 240 if bits == 64 else 224
+    machine = 0x8664 if bits == 64 else 0x14C
+    pe_off, sec_va, sec_ptr = 0x80, 0x1000, 0x400
+    tsz = 8 if bits == 64 else 4
+    ordinal_flag = 1 << (63 if bits == 64 else 31)
+    imports = imports or {}
+    exports = exports or []
+    desc_len = 20 * (len(imports) + 1)          # 每个描述符 20 字节 + 一个全零终止项
+    pos, blobs, plan = desc_len, {}, []
+    for dll, funcs in imports.items():
+        ilt = pos
+        pos += tsz * (len(funcs) + 1)
+        name = pos
+        pos += len(dll.encode("ascii")) + 1
+        vals = []
+        for f in funcs:
+            if f is None:                        # 序号导入：最高位为 1，低 16 位是序号
+                vals.append(ordinal_flag | 1)
+            else:
+                hn = pos
+                rec = struct.pack("<H", 0) + f.encode("ascii") + b"\x00"
+                rec += b"\x00" if len(rec) % 2 else b""
+                blobs[hn] = rec
+                pos += len(rec)
+                vals.append(sec_va + hn)
+        plan.append((dll, ilt, name, vals))
+    # 导出表（数据目录[0]）：IMAGE_EXPORT_DIRECTORY 40 字节 + 三张平行表 + 名字串。
+    exp_at = fn_at = nm_at = ord_at = 0
+    name_at = []
+    if exports:
+        exp_at = pos
+        pos += 40
+        fn_at = pos
+        pos += 4 * len(exports)
+        nm_at = pos
+        pos += 4 * len(exports)
+        ord_at = pos
+        pos += 2 * len(exports)
+        for x in exports:
+            name_at.append(pos)
+            blob = x.encode("ascii") + b"\x00"
+            blob += b"\x00" if len(blob) % 2 else b""
+            blobs[pos] = blob
+            pos += len(blob)
+    body = bytearray(pos)
+    for i, (dll, ilt, name, vals) in enumerate(plan):
+        struct.pack_into("<IIII", body, 20 * i, sec_va + ilt, 0, 0, sec_va + name)
+        struct.pack_into("<I", body, 20 * i + 16, sec_va + ilt)
+        for k, v in enumerate(vals):
+            body[ilt + k * tsz:ilt + k * tsz + tsz] = struct.pack("<Q" if tsz == 8 else "<I", v)
+        nb = dll.encode("ascii")
+        body[name:name + len(nb)] = nb
+    for off, rec in blobs.items():
+        body[off:off + len(rec)] = rec
+    if exports:
+        # 名字表才是被测那一格（parse_pe 只读它）；Name RVA / 函数 RVA 本工具不读，留零。
+        struct.pack_into("<II", body, exp_at + 20, len(exports), len(exports))
+        struct.pack_into("<III", body, exp_at + 28, sec_va + fn_at, sec_va + nm_at, sec_va + ord_at)
+        for i, off in enumerate(name_at):
+            body[nm_at + i * 4:nm_at + i * 4 + 4] = struct.pack("<I", sec_va + off)
+            struct.pack_into("<H", body, ord_at + i * 2, i)
+    data = bytearray(sec_ptr + len(body) + 16)
+    data[0:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, pe_off)
+    data[pe_off:pe_off + 4] = b"PE\x00\x00"
+    struct.pack_into("<HHIIIHH", data, pe_off + 4, machine, 1, 0, 0, 0, size_opt, 0x102)
+    opt = pe_off + 24
+    struct.pack_into("<H", data, opt, magic)
+    struct.pack_into("<HH", data, opt + 48, major, minor)      # Major/MinorSubsystemVersion
+    struct.pack_into("<H", data, opt + 68, subsystem)
+    dd = opt + (96 if magic == 0x10B else 112)
+    if exports:
+        struct.pack_into("<II", data, dd, sec_va + exp_at, 40)
+    if imports:                                                # 不给 imports = 数据目录[1] 全零
+        struct.pack_into("<II", data, dd + 8, 0x9FFF0000 if bad_import_rva else sec_va, desc_len)
+    sec = pe_off + 24 + size_opt
+    data[sec:sec + 6] = b".text"
+    struct.pack_into("<IIII", data, sec + 8, len(body), sec_va, len(body), sec_ptr)
+    data[sec_ptr:sec_ptr + len(body)] = body
+    return bytes(data[:cut]) if cut else bytes(data)
+
+
+def _pe_said(fn, *a, **kw):
+    """跑一个会 print 的判定函数，返回 (返回值, 它说过的话)。
+
+    「说过什么」必须一起拿：这一节的多数判据说的是**话术**（少判一格要说出来、读不出
+    要点名文件），只看返回值会把「静默跳过」和「判过且合格」读成同一件事。
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        got = fn(*a, **kw)
+    return got, buf.getvalue()
+
+
+def test_pe_floor_gate():
+    print("\n═══ DH. PE 地板门自己的地板：合成 PE 夹具（兼容通道第 14 步那道门）═══")
+    # 由来：第 14 步那道 PE 地板门是本轮新加的，交付时**一条离线判据也没有**，云端首运
+    # 就暴露了 43 条假红——api-ms-win-crt-*.dll 这类 API-set 契约桩与 python3.dll 这类
+    # 转发 DLL 结构上就没有导入表，旧写法一律 raise 成「读不出地板」。交付链上别的门都有
+    # 夹具，只有这道靠云端真跑当测试，而云端的代价是一个还没打出来的 Win7 包。
+    # 2026-11-20 兼容通道 run#2 实测：检了 123 个镜像报 49 项，其中 43 项是这一格判错。
+    _assert(_PE_PATH.is_file(), f"PE 地板门脚本必须在位（不在位这一节就是在空转）：{_PE_PATH}")
+    pe = _pe_ns()
+
+    # ── 1) 无导入表的镜像：标出来，不抛异常，地板字段照读 ──
+    stub = _pe_build()                                  # api-ms-win-crt-*.dll 的真实形状
+    d = pe["parse_pe"](stub)
+    _assert(d["no_imports"] is True, "无导入表要标成 no_imports（旧写法在这里 raise，43 条假红的起点）")
+    _assert_eq(len(d["dlls"]), 0, "无导入表 ⇒ 依赖集合是空集（不许凭空造一个依赖出来）")
+    _assert_eq((d["subsystem_major"], d["subsystem_minor"]), (6, 1),
+               "无导入表也要把子系统版本读出来：地板判定只需要 OptionalHeader")
+
+    # ── 2) 地板内的契约桩判为达标，而且必须把「这一格筛不到」说出来 ──
+    p, said = _pe_said(pe["check_one"], Path("api-ms-win-core-file-l1-2-0.dll"), stub, (6, 1))
+    _assert_eq(p, [], "地板内的无导入表镜像必须判为达标（run#2 那 43 项假红就判在这一格）")
+    _assert("不声明导入表" in said, "契约桩那一行要说明它为什么不声明导入表（读日志的人不必再去翻规范）")
+    _assert("地板这一格照判" in said,
+            "少判一格必须说出来：静默给个 ✅ 会让「API 名单筛过了」这句话没人能核对")
+
+    # ── 3) 无导入表 ≠ 免检：同一形状但要求 Win10 的镜像仍然必须红 ──
+    p, _ = _pe_said(pe["check_one"], Path("needs10.exe"), _pe_build(major=10, minor=0), (6, 1))
+    _assert(any("要求 Windows 10.0" in x for x in p),
+            "修假红时不许把地板判定一起免掉（那样这一格就从假红翻成假绿，更贵）")
+
+    # ── 4) 整目录扫描：43 个契约桩 + 一个正常主程序必须全绿（run#2 现场的直接复现） ──
+    root = Path(tempfile.mkdtemp(prefix="pe_floor_"))
+    payload = root / "payload"
+    payload.mkdir()
+    # 真空目录单独建一个：--scan-dir 是**递归**扫的，拿 root 当「没有 PE」那一格的输入，
+    # 测的其实是「root 下面那个 payload 能不能扫干净」（第一版就写错了这一格）。
+    empty = root / "empty"
+    empty.mkdir()
+    for i in range(43):
+        (payload / f"apiset_stub_{i}.dll").write_bytes(_pe_build())
+    (payload / "B2bCollectTool.exe").write_bytes(_pe_build(
+        imports={"kernel32.dll": ["Sleep"], "python38.dll": ["Py_Main"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(payload), "--floor", "6.1"])
+    _assert_eq(rc, 0, f"43 个契约桩 + 主程序整目录扫描必须退 0（实际 rc={rc}）")
+    _assert("全部达标" in out and "::error::" not in out,
+            f"这一趟一条 ::error:: 都不许有——它就是 run#2 第 14 步那 43 项：{_one_line(out)[-160:]}")
+
+    # ── 5) 真缺陷照样必须红：run#2 那 6 项 B 类的形状逐条钉住 ──
+    #     这一组的立场是「不许为了消红放宽门」：下面两条正是云端报出来的真发现，
+    #     判据先把它们钉成红，将来任何白名单改动都必须同时改这条判据（改一半就红）。
+    p, _ = _pe_said(pe["check_one"], Path("selenium-manager.exe"), _pe_build(
+        imports={"kernel32.dll": ["GetSystemTimePreciseAsFileTime", "WaitOnAddress"]}), (6, 1))
+    _assert(any("GetSystemTimePreciseAsFileTime" in x and "0xc0000139" in x for x in p),
+            "导入 Win8 才有的函数必须红并给出错误码（老系统上是「找不到入口点」，构建机上一句错都不报）")
+    p, _ = _pe_said(pe["check_one"], Path("ucrtbase.dll"), _pe_build(
+        imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}), (6, 1))
+    _assert(any("api-ms-win-core-synch-l1-2-0.dll" in x and "连模块都加载不到" in x for x in p),
+            "依赖 Win8+ 才存在的契约模块必须红：这一格比「函数找不到」更早发生")
+
+    # ── 6) 同一个 DLL 里「按序号」与「按名字」混在一起时不许炸 ──
+    #     2026-11-20 拿线上安装包首跑就栽在这里：排序键比较到 None 与 str 不可比。
+    #     夹具必须把两种导入放在**同一个 DLL 名**下：排序键先比 DLL 名，名字不同就
+    #     永远走不到比较函数名那一步——第一版这里写成两个 DLL，下面那条「拆掉排序
+    #     兜底」的变异于是杀不红，本组判据其实是假绿（由变异复验当场逮住的）。
+    mixed = _pe_build(imports={"kernel32.dll": [None, "Zed", "Aaa"]})
+    try:
+        _, said = _pe_said(pe["check_one"], Path("mixed.dll"), mixed, (6, 1))
+        _assert("按序号导入" in said, "按序号导入的项要说「名字读不出、API 名单筛查对它们瞎」")
+    except TypeError as e:
+        _assert(False, f"排序键遇到序号导入的 None 不许抛 TypeError（{e}）")
+
+    # ── 7) 两个「看起来可疑但不该拦」与「看起来正常但必须拦」的版本号 ──
+    p, _ = _pe_said(pe["check_one"], Path("packed.exe"), _pe_build(major=0, minor=0), (6, 1))
+    _assert(any("0.00" in x for x in p), "子系统版本 0.00（被壳/被改过的常见形态）必须红：这句话不能替它担保")
+    p, said = _pe_said(pe["check_one"], Path("setup.exe"), _pe_build(major=4, minor=0), (6, 1))
+    _assert_eq(p, [], "NSIS 写的 4.00 不许误伤：它比任何还在卖的 Windows 都老，语义是更宽不是更严")
+    _assert("早于本表登记的最老一项" in said, "名字表没登记就直说没登记，不许猜一个系统名")
+
+    # ── 8) 畸形镜像：三类截断 + 一类越界都要落成「带文件名的红话」，一条都不许抛栈 ──
+    #     探这一组时当场抓到一条真缺陷：DLL 名被切断时 bytes.index(b"\x00") 抛 ValueError
+    #     把整道门炸掉——日志里既没文件名也没「哪一格不合格」。判据自己抛栈比误判更贵。
+    full = _pe_build(imports={"kernel32.dll": ["Sleep"]})
+    cases = (
+        ("没有 PE 签名", 0x40, "找不到 PE 签名"),
+        ("节区头越界", 360, "节区头越界"),
+        ("导入表 DLL 名被切断", 1069, "没有 NUL 结束符"),
+        ("导入函数名被切断", 1096, "没有 NUL 结束符"),
+    )
+    for label, cut, needle in cases:
+        try:
+            p, _ = _pe_said(pe["check_one"], Path("t.dll"), _pe_build(
+                imports={"kernel32.dll": ["Sleep"]}, cut=cut), (6, 1))
+            _assert(any(needle in x for x in p), f"{label}要判红并点名「{needle}」（实际={p}）")
+        except Exception as e:
+            _assert(False, f"{label}不许把门炸掉：抛的是 {type(e).__name__}: {_one_line(e)}")
+    _assert(len(full) > 1096,
+            f"夹具自身得真的比第 8 组最大的那个 cut 还长（否则那四条是在比空气）：{len(full)} 字节")
+    p, _ = _pe_said(pe["check_one"], Path("r.dll"), _pe_build(
+        imports={"a.dll": ["f"]}, bad_import_rva=True), (6, 1))
+    _assert(any("落在任何节区之外" in x for x in p), "导入表 RVA 指向节区外要判红：镜像被改过不能算扫过")
+
+    # ── 9) 命令行层：五种「没输入 / 输入读不到」的调用都不许退 0 ──
+    for label, argv, needle in (
+        ("一个目标都没给", [], "一个目标都没给"),
+        ("--floor 写法错", [str(payload / "B2bCollectTool.exe"), "--floor", "6,1"], "--floor 写法不对"),
+        ("目标文件不在位", [str(root / "不存在.exe")], "文件不在位"),
+        ("--scan-dir 目录不在位", ["--scan-dir", str(root / "没有这个目录")], "指向的目录不在位"),
+        ("--scan-dir 里没有 PE", ["--scan-dir", str(empty)], "没有任何 PE"),
+    ):
+        rc, out = _pe_said(pe["main"], argv)
+        _assert_eq(rc, 1, f"{label}必须退 1（喊了错还退 0，workflow 只看退出码）")
+        _assert(needle in out, f"{label}要说清为什么红：{_one_line(out)[-140:]}")
+    rc, out = _pe_said(pe["main"], [str(payload / "apiset_stub_0.dll")])
+    _assert_eq(rc, 0, "只给一个契约桩文件（不带 --scan-dir）也要退 0：同一条判据不该认两种口径")
+
+    # ── 10) 随包交叉核对：把「加载不到」这句话拿包里的字节对拍 ──
+    #     由来：run#2 那 6 项 B 类里有 5 项说的是 api-ms-win-core-synch-l1-2-0.dll
+    #     「连模块都加载不到」，而同一次扫描显示**这个桩自己就在包里**。“加载不到”
+    #     于是从一句要靠回忆微软 API-set 支持矩阵才敢说出的话，变成一个可实测的事实。
+    xdir = root / "xcheck"
+    xdir.mkdir()
+    _stub_exports = ["WaitOnAddress", "WakeByAddressAll", "WakeByAddressSingle"]
+    (xdir / "api-ms-win-core-synch-l1-2-0.dll").write_bytes(_pe_build(exports=_stub_exports))
+    (xdir / "ucrtbase.dll").write_bytes(_pe_build(
+        imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(xdir), "--floor", "6.1"])
+    _assert_eq(rc, 0, f"依赖名能在随包桩的导出表里实测到 → 不该判红（实际 rc={rc}）：{_one_line(out)[-200:]}")
+    _assert("随包桩实测**导出了这一格**" in out, "放行那几格要把实测依据打出来，不能只留一个绿")
+    _assert("1 格经随包桩导出表实测放行" in out, "结论行要报出实测放行了几格（区分「筛过了」与「筛不到」）")
+    _assert("随包交叉核对：开" in out, "本地扇扫要声明交叉核对是开着的")
+
+    # 10b) 实测不到就照红：随包桩在位、但名字表里根本没这一格
+    x2 = root / "xcheck_missing"
+    x2.mkdir()
+    (x2 / "api-ms-win-core-synch-l1-2-0.dll").write_bytes(_pe_build(exports=["SomethingElse"]))
+    (x2 / "ucrtbase.dll").write_bytes(_pe_build(
+        imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(x2), "--floor", "6.1"])
+    _assert_eq(rc, 1, "随包桩在位但导出表里没有这一格，必须照红（在位≠放行）")
+    _assert("它的导出表里没有这一格" in out, f"红话要说清是「实测过了、没有」：{_one_line(out)[-160:]}")
+
+    # 10c) 系统 DLL 不随包 → 交叉核对救不了它（这就是 selenium-manager.exe 的真结局）
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(payload), "--floor", "6.1"])
+    _assert("包里没有同名模块可比对，按最严口径判" not in out,
+            "这一扫里没有命中项，不许凭空报出一句「按最严口径」（话只能为真事说）")
+    k2 = root / "kernel32_case"
+    k2.mkdir()
+    (k2 / "helper.exe").write_bytes(_pe_build(imports={"kernel32.dll": ["GetSystemTimePreciseAsFileTime"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(k2), "--floor", "6.1"])
+    _assert_eq(rc, 1, "kernel32 不随包 → 交叉核对不替它兜底，这一格必须还是红")
+    _assert("包里没有同名模块可比对" in out, "红话要分清是「实测没有」还是「没东西可实测」——后者才能推出去剪")
+
+    # 10d) 随包桩在位但读不出 → 退回最严口径，不许当成「筛过了」
+    x3 = root / "xcheck_unreadable"
+    x3.mkdir()
+    (x3 / "api-ms-win-core-synch-l1-2-0.dll").write_bytes("这不是一个 PE 镜像".encode("utf-8"))
+    (x3 / "ucrtbase.dll").write_bytes(_pe_build(
+        imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(x3), "--floor", "6.1"])
+    _assert_eq(rc, 1, "随包桩自己读不出时不许退成绿：读不出是「筛不到」，不是「通得了」")
+    # 三条红话各自钉死。上一版这里只断言了「导出表读不出」这几个字，而**函数级与模块级
+    # 两条分支都会打出含这几个字的话** —— 那条判据分不清是谁放的红，拆掉其中一条它照样绿。
+    # 这是变异复验逐条打回去时暴露的（本段第 6 条假绿）。
+    _assert("随包桩的导出表读不出" in out,
+            f"函数名那一格要说清是「读不出」而不是「实测没有」：{_one_line(out)[-160:]}")
+    _assert("随包桩在位但导出表读不出" in out,
+            "模块名那一格同样要退回红并说明原因（两条分支各自一条红话，不许共用一句含糊的）")
+    _assert("交叉核对这一格退回最严口径" in out,
+            "「读不出」这条路径本身要留一行日志：静默缓存 None 与报错后缓存 None 在产物里长得一样")
+
+    # ── 11) 实测剪：只在显式给了名单时才动产物，四道框逐道验 ──
+    def _fresh_prune(tag):
+        d = root / tag
+        d.mkdir()
+        (d / "B2bCollectTool.exe").write_bytes(_pe_build(imports={"python38.dll": ["Py_Main"]}))
+        (d / "selenium-manager.exe").write_bytes(_pe_build(imports={"kernel32.dll": ["WaitOnAddress"]}))
+        return d
+
+    d = _fresh_prune("prune_ok")
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(d), "--floor", "6.1",
+                                    "--prune-match", "selenium-manager.exe",
+                                    "--prune-keep", "B2bCollectTool.exe"])
+    _assert_eq(rc, 0, f"实测剪掉那块加载不了的 helper 后复检必须退 0（实际 rc={rc}）")
+    _assert(not (d / "selenium-manager.exe").exists() and (d / "B2bCollectTool.exe").exists(),
+            "只该剪掉实测加载不了的那一个，入口 exe 一个字节都不能动")
+    _assert("实测剪：selenium-manager.exe —— 依据" in out,
+            "剪之前要把**剪它的实测依据**一同打出来（只说「剪了」等于静默改产物）")
+    _assert("复检剩下 1 个镜像" in out, "剪完必须真的复检一次，而不是剪了就把本趟结论改成绿")
+
+    d = _fresh_prune("prune_none")
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(d), "--floor", "6.1",
+                                    "--prune-match", "这一版不存在的名字.exe"])
+    _assert_eq(rc, 1, "名单没命中不等于合格：那块加载不了的还在包里，就得还是红")
+    _assert("一个都没命中" in out, "名单今天没做上要说出来（将来 selenium 换布局/不再随包时只看绿区分不出来）")
+
+    d = _fresh_prune("prune_keep")
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(d), "--floor", "6.1",
+                                    "--prune-match", "*.exe", "--prune-keep", "B2bCollectTool.exe"])
+    _assert((d / "B2bCollectTool.exe").exists(), "入口 exe 即使被通配命中也不许剪")
+
+    d = _fresh_prune("prune_over")
+    for i in range(6):
+        (d / f"helper_{i}.exe").write_bytes(_pe_build(imports={"kernel32.dll": ["WaitOnAddress"]}))
+    rc, out = _pe_said(pe["main"], ["--scan-dir", str(d), "--floor", "6.1",
+                                    "--prune-match", "helper*.exe", "--max-prune", "4"])
+    _assert_eq(rc, 1, "一次要剪超过上限必须停下来问人，而不是接着删")
+    _assert(all((d / f"helper_{i}.exe").exists() for i in range(6)),
+            "上限触发时一个字节都不该被删（问人之前先把东西删了，就不是问人了）")
+
+    d = _fresh_prune("prune_named")
+    rc, out = _pe_said(pe["main"], [str(d / "selenium-manager.exe"), "--floor", "6.1",
+                                    "--prune-match", "selenium-manager.exe"])
+    _assert_eq(rc, 1, "被明确点名的单个文件不许被剪（那是要判的目标，不是产物目录里的零件）")
+    _assert((d / "selenium-manager.exe").exists(), "上面那条不能只是嘴上说，文件得真的还在")
+
+    # ── 12) 流水线接线：安装包必须在**它被编出来之后**才检，剪的名单要写在脸上 ──
+    #     由来（2026-11-20 取证时读到）：生成器把「扫 dist 目录」与「检安装包」写在了同
+    #     一步（第 14 步），可安装包是第 21 步才由 makensis 造出来的——那一行只能得到一句
+    #     「文件不在位」。那是**顺序错**，不是产物错，而且它被那 49 项假红盖住了：不先修
+    #     假红，这一条还要再藏一轮。这里把顺序钉成判据，否则下次合并又会被摸回去。
+    leg_path = _REPO / ".github" / "workflows" / "build-b2bcollect-legacy.yml"
+    leg = leg_path.read_text(encoding="utf-8")
+    _steps = [(m.group(1), m.start()) for m in
+              re.finditer(r"^    - name: (.+)$", leg, re.M)]
+    _idx = {n: i for i, (n, _) in enumerate(_steps)}
+    _pe_step = next((n for n in _idx if n.startswith("PE floor gate (")), "")
+    _pe_setup = next((n for n in _idx if "PE floor gate on the installer" in n), "")
+    _assert(bool(_pe_step) and bool(_pe_setup),
+            f"兼容通道要同时有「扫产物目录」与「检安装包」那两步（实际={_pe_step!r}/{_pe_setup!r}）")
+    if _pe_step and _pe_setup:
+        _assert(_idx[_pe_setup] > _idx[next(n for n in _idx if n.startswith("Build Windows installer"))],
+                "安装包的 PE 地板门必须排在「编安装包」之后：在第 14 步检一个还不存在的文件，"
+                "得到的只会是一句「文件不在位」这种假红")
+        # 只取那一步**自己的**正文（到下一步起点为止）。上一版这里一路切到「检安装包」
+        # 那一步，中间隔着 doctor / 窗口冒烟 / 编安装包三步——编安装包那步当然合法地写
+        # 着 OUT_FILE，于是这条判据把别人的正文当成嫌疑对象，报出一条假红：「前提超出
+        # 适用范围」这一族缺陷，判据自己也躲不过。
+        def _body(name):
+            i = _idx[name]
+            return leg[_steps[i][1]:_steps[i + 1][1]] if i + 1 < len(_steps) else leg[_steps[i][1]:]
+
+        _scan_body = _body(_pe_step)
+        _assert("B2bCollectToolSetup" not in _scan_body,
+                "扫目录那一步不该再检安装包：那一步跑的时候它还没被编出来，只能得到一句「文件不在位」")
+        _assert("--prune-match selenium-manager.exe" in _scan_body
+                and "--prune-keep B2bCollectTool.exe" in _scan_body,
+                "实测剪的名单要写在流水线上：只看 yml 就该知道包里少了一个什么、为什么少")
+        _out_file = re.search(r'OUT_FILE:\s*"([^"]+)"',
+                              leg[_steps[_idx[next(n for n in _idx if n.startswith("Build Windows installer"))]][1]:
+                                  _steps[_idx[_pe_setup]][1]])
+        _assert(_out_file is not None,
+                "编安装包那一步要把产出文件名钉在 env 里（否则下一句对拍没有参照）")
+        if _out_file:
+            _assert(_out_file.group(1) in _body(_pe_setup),
+                    f"安装包 PE 门检的名字要和流水线自己声明的 OUT_FILE 是同一个（{ _out_file.group(1)}）："
+                    "改名只改一边就是「检了一个不存在的包」")
+
+    # 12b) yml 是生成物的真值：重跑生成器不许让工作区改动（改了就是两边已经飘了）
+    _before = leg_path.read_bytes()
+    _gen = _REPO / "debug" / "gen_legacy_workflow.py"
+    _r = subprocess.run([sys.executable, str(_gen)], capture_output=True, text=True,
+                        encoding="utf-8", errors="replace")
+    _after = leg_path.read_bytes()
+    if _after != _before:                       # 红也要把工作区还原：这一节不改交付物
+        leg_path.write_bytes(_before)
+    _assert_eq(_r.returncode, 0, f"重跑生成器要成功（实际 rc={_r.returncode}）：{_one_line(_r.stdout)[-160:]}")
+    # 不能用 _assert_eq 比两个大字节对象：它把两边都 !r 打进日志、**通过也打**，
+    # 等于每跑一次就往交付日志里灌两遍整份 workflow（将近 800 行）。这里只保留
+    # 「一致 / 不一致 + 第一个差异字节号」，后者才是修东西的人需要的那一格。
+    if _after == _before:
+        _assert(True, "兼容通道 yml 与生成器输出逐字节一致（不一致=有人只改了 yml，下次重跑生成器会把它抹掉）")
+    else:
+        _d = next((i for i, (a, b) in enumerate(zip(_before, _after)) if a != b),
+                  min(len(_before), len(_after)))
+        _assert(False, f"兼容通道 yml 与生成器输出不再逐字节一致：第一个差异在第 {_d} 字节、"
+                      f"两边分别 {len(_before)}/{len(_after)} 字节——只改 yml 不改生成器的话，"
+                      "下次重跑生成器会把那一改整个抹掉")
+
+    # ── 13) 变异复验：上面每一格都要能被「退回修前原样」精准杀红 ──
+    #     只验新代码通过是不够的：那 43 条假红当初也是「绿的」。这里把源码改回出事那一版
+    #     （以及改坏比较方向、拆掉 API 筛查、拆掉 NUL 保护、拆掉排序兜底），逐条要求判据转红。
+    def _mutate(old, new, label, probe, expect, note):
+        src = _PE_PATH.read_text(encoding="utf-8")
+        if src.count(old) != 1:
+            _assert(False, f"变异「{label}」的锚点出现 {src.count(old)} 次（不是 1 次就不知道改到哪一格）")
+            return
+        got = probe(_pe_ns(src.replace(old, new, 1)))
+        _assert_eq(got, expect, f"变异「{label}」{note}")
+
+    _mutate('    out["no_imports"] = not imp_rva\n    if out["no_imports"]:',
+            '    if not imp_rva:\n        raise PeError("导入表 RVA 为 0：真产物不可能这样")\n    if False:',
+            "退回「无导入表就 raise」那一版",
+            lambda m: _pe_said(m["main"], ["--scan-dir", str(payload), "--floor", "6.1"])[1].count("::error::"),
+            43, "必须让那 43 个契约桩重新报红（否则第 4 组是在自我证明）")
+    _mutate("if got > tuple(floor):", "if got < tuple(floor):",
+            "把地板比较方向反过来",
+            lambda m: len(_pe_said(m["check_one"], Path("needs10.exe"), _pe_build(major=10, minor=0), (6, 1))[0]),
+            0, "会让要求 Win10 的镜像被判为达标——本轮取证时我先入为主怀疑的就是这一格，反着改才发现方向本来就是对的")
+    _mutate("if fn and fn in POST_WIN7_API:", "if False and fn in POST_WIN7_API:",
+            "拆掉 Win8+ API 名单筛查",
+            lambda m: len(_pe_said(m["check_one"], Path("selenium-manager.exe"), _pe_build(
+                imports={"kernel32.dll": ["GetSystemTimePreciseAsFileTime"]}), (6, 1))[0]),
+            0, "会让 run#2 那 6 项 B 类真发现一起消失（假绿比假红贵）")
+    _mutate('    end = data.find(b"\\x00", off)\n    if end < 0:',
+            '    end = data.index(b"\\x00", off)\n    if False:',
+            "把 NUL 保护退回裸 index",
+            lambda m: "raised" if _raises(lambda: m["check_one"](Path("t.dll"), _pe_build(
+                imports={"kernel32.dll": ["Sleep"]}, cut=1069), (6, 1))) else "red",
+            "raised", "会让第 8 组那两条截断判据重新变成炸栈")
+    _mutate('key=lambda x: (x[0], x[1] or "")', 'key=lambda x: (x[0], x[1])',
+            "拆掉排序键对 None 的兜底",
+            lambda m: "raised" if _raises(lambda: m["check_one"](Path("mixed.dll"), mixed, (6, 1))) else "ok",
+            "raised", "会让线上安装包首跑那次 TypeError 复现（第 6 组必须接住它）")
+
+    # 交叉核对那几格是本轮新写的，越新越要按同一套规矩复验：绿不算数，坏回去必须红。
+    _mutate("            if exps is not None and fn.lower() in exps:",
+            "            if exps is not None:",
+            "实测放行只看「桩在位且读得出来」，不看名字表里到底有没有这一格",
+            lambda m: _pe_said(m["main"], ["--scan-dir", str(x2), "--floor", "6.1"])[0],
+            0, "会让 10b 那格退成绿——把「在位」当成「有这一格」正是这一族缺陷的原形")
+    _mutate("            if in_bundle and exps is not None:",
+            "            if False:",
+            "拆掉模块级（POST_WIN7_DLL）的随包实测放行",
+            lambda m: _pe_said(m["main"], ["--scan-dir", str(xdir), "--floor", "6.1"])[0],
+            1, "会让 10 那格重新报红：函数名实测到了、模块名却仍靠名单猜，等于只修了一半")
+    _mutate('                    else "随包桩的导出表读不出" if in_bundle',
+            '                    else "" if in_bundle',
+            "把「读不出」那一格的红话抹成空串",
+            lambda m: "随包桩的导出表读不出" in _pe_said(
+                m["main"], ["--scan-dir", str(x3), "--floor", "6.1"])[1],
+            False, "会让红话重新变成一句含糊的尾巴，读日志的人分不清是实测没有还是读不出")
+    _mutate('                print(f"· 随包桩 {dll_lower} 的导出表读不出（{type(e).__name__}: "\n'
+            '                      f"{str(e).strip()}）：交叉核对这一格退回最严口径")',
+            '                pass  # 变异：读不出时静默缓存',
+            "读不出时不再说明原因（把那一行日志整段拆掉）",
+            lambda m: "退回最严口径" in _pe_said(
+                m["main"], ["--scan-dir", str(x3), "--floor", "6.1"])[1],
+            False, "会让「读不出」静默退成 None：日志里看不到这一格为什么按最严口径判红")
+
+
+def _raises(fn) -> bool:
+    """只为变异复验服务：把「抛异常」折成一个可比较的事实（判据自己不许靠抛栈报结论）。"""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fn()
+    except Exception:
+        return True
+    return False
+
+
 # 小节表放在所有 test_ 定义之后：上一版它在这里而新小节插在它下面，模块顶层求值时就
 # NameError，整份套件一条也没跑（而只盯「有没有报红」的人会把这条读成「没红＝通过」）。
 SECTIONS = (
@@ -12984,6 +13454,7 @@ SECTIONS = (
     test_page_ledger_gate,
     test_human_wait_lamp_gate,
     test_trap_handler_defined_gate,
+    test_pe_floor_gate,
 )
 
 
