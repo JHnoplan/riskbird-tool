@@ -143,9 +143,20 @@ check("makepolo 未选省不带 ae", "ae=" in _mp.build_search_url("泵", 1), Fa
 # 现场取证判死——同一个 query 里 keywords 是 GBK、province 是 UTF-8 时，服务端按 GBK
 # 解出来的是乱码，省份筛选直接失效；见 ali1688_crawler._urlencode_gbk）。这一条期望
 # 在这里独立写死，不去 import 那个函数：拿实现验实现就永远测不出「编码又被改回 UTF-8」。
+# 跳过的范围只限**第三方那一格**：`ali1688_crawler` 是我们自己的模块，它 import 不进来是
+# 「文件没入库 / 被改名」级别的事故（2026-11-20 干净克隆第二轮就是被一份从未提交的
+# riskbird 套件坑的），一律不许被同一个 `except ImportError` 顺手咽掉——那正是第 44 条
+# 丙格判的形状：一个宽容的 handler 能把「交付闭包破了」长期伪装成「本环境没装依赖」。
 try:
+    import selenium  # noqa: F401  第三方：这台机器上可能真没装
+    _has_selenium = True
+except ImportError:
+    _has_selenium = False
+if not _has_selenium:
+    print("  (跳过 1688 URL 用例：本环境无 selenium)")
+else:
     sys.path.insert(0, os.path.join(BASE, "ali1688_build"))
-    import ali1688_crawler as _m1688
+    import ali1688_crawler as _m1688          # ← 自家模块：不在就该让整套件红在这里
     _a = _m1688.Ali1688Crawler.__new__(_m1688.Ali1688Crawler)
     _a.province = "广东"
     from urllib.parse import quote
@@ -153,8 +164,6 @@ try:
           "&province=" + quote("广东".encode("gbk")))
     _a.province = ""
     check("1688 未选省无后缀", _a._province_suffix(), "")
-except ImportError:
-    print("  (跳过 1688 URL 用例：本环境无 selenium)")
 
 print("\n=== D 数据层站的入库关卡（cdp_base._apply_province_filter）===")
 from gi_crawler import GiCrawler            # noqa: E402

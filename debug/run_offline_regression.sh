@@ -84,6 +84,7 @@ debug/check_gui_fit.py
 debug/qoder_rules_offline_test.py
 debug/doc_hygiene_offline_test.py
 debug/secret_gate_offline_test.py
+debug/handover_closure_offline_test.py
 b2bcollect_build/test_optimizations.py
 "
 

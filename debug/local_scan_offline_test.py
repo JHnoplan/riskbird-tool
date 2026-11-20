@@ -25,8 +25,23 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 BASE = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, os.path.join(BASE, "b2bcollect_build"))
+# 状态落点钉进临时目录：本套件真建 MainWindow，而 access_guard 会按现行落点写
+# `.acl_cache.json`。2026-11-20 全量批跑实测：这一路把开发机那份**真缓存**改脏了
+# （批跑收尾的状态对拍点名「开工前 X → 收工后 Y」），后果有两层——① acl_levels 下一轮
+# 就在脏缓存上判，红得查不出理由；② 干净克隆上凭空多出这份文件，被同一道门压红总判定。
+# 唯一的开关是 B2B_STATE_DIR（实现见 tool_config 的 _STATE_DIR_ENV_VAR 那一级，实测对
+# 开发态同样生效）。**钉完必须当场自证落点真在沙箱里**：只设环境变量不证明，等于把
+# 「哪天这个杠杆失效」再交给下一轮批跑去发现（那一路套件里就留着一句只删不证的假自证）。
+_STATE_SANDBOX = tempfile.mkdtemp(prefix="locscan_state_")
+os.environ["B2B_STATE_DIR"] = _STATE_SANDBOX
+
 
 import local_scan as ls  # noqa: E402
+import access_guard as _ag_boot                                   # noqa: E402
+assert str(_ag_boot._state_dir()).startswith(str(_STATE_SANDBOX)), (
+    f"隔离没生效：权限状态目录指向 {_ag_boot._state_dir()}（沙箱是 {_STATE_SANDBOX}）"
+    "——上面那句 B2B_STATE_DIR 白设了，本套件仍会写脏开发机的 .acl_cache.json")
+
 from openpyxl import Workbook  # noqa: E402
 
 ok = 0

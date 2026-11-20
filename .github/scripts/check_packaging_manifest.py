@@ -167,6 +167,12 @@
         `os.environ.get('OSS_ACCESS_KEY_ID', '真实 ID')` 形态的硬写兜底。范围分两档：
         自家写的东西命中=硬红，第三方存盘页面「读不动/含 NUL」=点名报数但不红
         （判据 debug/secret_gate_offline_test.py 乙10~乙13 钉住这条分界）
+     44 交接闭包：文档与判据**指路的每一个名字**都得真的随仓库走（2026-11-20 发另一台 Mac
+        前实测：本机全量连续几轮 0 失败，同一份提交在干净克隆里第一轮红 13 路、第二轮红 1 路，
+        红的全是「这台机器上恰好有」被当成「仓库里有」：一份从未 git add 的注入证人、一句
+        写成「已跟踪」而 `git ls-files` 为空的表格、一个把「自家模块没入库」咽进「本环境没装
+        依赖」的 except）：四格——甲 文档指路路径闭包、乙1 被点名的顶层目录要么在库要么在忽略
+        名单、乙2 已入库 .py 的同目录 import 闭包、丙 判据不许被宽容的 except 吞掉；
      每一条各自的由来与口径写在**它们函数上方**的注释块里——这些条目全部是在
      一次真实故障之后补的，故障经过比摘要长，写在这里会让这份文件一半是故事。此处只留两句
      提醒：**这张编号表不是全集**，只看到 20 的人会以为后面没有了；而**条目总数故意不写在这
@@ -1015,6 +1021,11 @@ GH_PLACEHOLDER = "GH_EXPR"
 WORKFLOWS = tuple(f".github/workflows/{n}" for n in (
     "build-b2bcollect.yml", "build-b2bcollect-mac.yml",
     "build-b2bcollect-legacy.yml",
+    # 不产交付物，但产「换台机器照文档跑不跑得通」这句话的证据（交接段实测：首轮干净
+    # 克隆 54 过 / 13 红，而批判据从未在干净检出上跑过）。登记而不是豁免的理由与
+    # SHELL_SOURCES 里那几份一致：进了登记表，bash 语法 / errexit / pip 冗余 / 行尾
+    # / python 地板这几类格才会真的管到它；不进表就是一份没人对账的裸 workflow。
+    "offline-regression.yml",
     "build-1688.yml", "build-riskbird.yml"))
 SHELL_SOURCES = tuple(list(HYGIENE_SCRIPTS) + [
     "debug/build_b2bcollect_mac_local.sh",
@@ -10006,6 +10017,256 @@ def check_history_secrets(files=None, report=None) -> list:
     return problems
 
 
+# ── 第 44 条：交接闭包——「这台机器上有」不等于「仓库里有」───────────────────────
+# 由来（2026-11-20 整理交接资料 + 干净克隆两轮实测）：把项目发到另一台 Mac 之前，本机
+# 全量回归已连续几轮 0 失败；而**同一份提交**在干净克隆里第一轮红 13 路、第二轮红 1 路。
+# 红的是同一件事的四个外壳——判据与文档把「这台机器上恰好有」当成了「仓库里有」：
+#   · 第 25 条写死一份注入证人（riskbird_build/test_qizhidao.py），那文件从未 git add；本机
+#     绿只是因为视野的磁盘 glob 恰好捐到它（同批还补齐了四批从未入库的工具源码，见 be159a6）；
+#   · docs/07 把 qcollect/ 写成「已跟踪」，`git ls-files qcollect/` 当场为空；
+#   · 一个 `except ImportError: print("跳过")` 把「自家模块没入库」伪装成「本环境没装依赖」。
+# 这一类缺陷的共同点是**在这台机器上永远不会响**，所以必须有人反复对拍「文档/判据指路的
+# 每一个名字是否真的随仓库走」，而不是等到换机器那天把它当成「克隆坏了」重新排查一遗。
+# 四格各自的射程：
+#   甲 文档指路的相对路径→必须在 HEAD（未入库未忽略 / 磁盘也没有 两种情形分开报）
+#   乙1 被文档点名的顶层目录→要么在库、要么被 .gitignore 忽略（忽略理由写在那一块注释里，
+#      不另开一份登记——两份台账早晚会漂移，这里只靠仓库自身性质）
+#   乙2 已入库的 .py import 同目录兄弟模块→兄弟也必须在库（今日 0 命中，纯防回归）
+#   丙  批跑清单里的判据套件→不许用宽容的 except 把判据咽掉
+# 已知判不到的形状（说不清边界的判据会被当成全能的）：
+#   · 甲只看带斜杠且扩展名在册的路径；正文里裸写的文件名（无目录前缀）不在视野，歧义太大；
+#   · 乙2 只看同目录兄弟；跳目录的 import（site_adapters.EXTERNAL_MODULES 那一类）由第 8 条
+#     跳目录依赖链闭合管，两边不重叠也不互相推诿；
+#   · 丙是 AST 启发式：handler 里 raise / 调判据 / 点名异常对象 三种都算「交出去了」，
+#     它判不了「把异常记到一份没人看的日志里」；那种继续靠 review。
+
+HANDOVER_DOC_GLOBS = ("docs/*.md",)          # 甲的视野：交接文档（不是全仓库扫描）
+HANDOVER_EXT = (".py", ".sh", ".md", ".json", ".yml", ".yaml", ".html", ".nsi", ".spec",
+                ".command", ".bat", ".txt", ".ttf", ".otf", ".xlsx")
+# 运行期产物与被忽略目录里的东西不该伪装成路标，但确实会在叙事里出现：这里只留
+# 「确实是在讲故事」的那几条，理由写完整（与 DEV_PATH_EXEMPT 同一口径）。
+HANDOVER_POINTER_EXEMPT = {
+    "debug/ci_status.json": "docs/06 C5 讲的是这个脚本**当年**把响应写坏的故事；那是运行期"
+                            "产物、从来不该入库，不是让读者去打开的路标",
+}
+# 甲：前面不能是单词字符/CJK/`.`/`-`/`/`——这一格是实测逼出来的：少了 CJK 排除，中文句子里
+# 被引号包住的路径会被词中间切一刀（「构与模块地图.md」「动B2B…command」「_offline.py」），
+# 粗版因此报出 172 条假红。误报的代价是人开始跳过这一条，比没门更糟。
+_DOC_PATH_RX = re.compile(
+    r"(?<![A-Za-z0-9_.\-\u4e00-\u9fff/])"
+    r"((?:[A-Za-z0-9_.\-\u4e00-\u9fff]+/)+[A-Za-z0-9_.\-\u4e00-\u9fff]+"
+    r"\.(?:" + "|".join(e[1:] for e in HANDOVER_EXT) + r"))")
+# 乙1：文档里以 `name/` 形式点名的顶层目录（反引号包整目录）
+_DOC_DIR_RX = re.compile(r"`([A-Za-z0-9_][A-Za-z0-9_.\-]*)/`")
+# 丙：哪些名字算「在记账」。只认判据函数名，不认裸 assert：仓库里的套件全靠这几个助手计数。
+HANDOVER_ASSERT_NAMES = ("check", "_assert", "_assert_eq", "_assert_raises")
+
+
+def _handover_doc_texts() -> dict:
+    """甲/乙1 的输入：交接文档原文（{仓库相对路径: 文本}）。读不到就交空表，由调用方响。"""
+    out = {}
+    for glob in HANDOVER_DOC_GLOBS:
+        for path in sorted(ROOT.glob(glob)):
+            if not path.is_file():
+                continue
+            rel = _rel_posix(path)
+            if rel not in _tracked_sets()[1]:
+                continue          # 没入库的草稿文档不配给仓库指路（它也确实随时会被删）
+            try:
+                out[rel] = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+    return out
+
+
+def _doc_pointers(texts: dict) -> dict:
+    """文档里指路的仓库相对路径 → {rel: [出处……]}（已按实测口径滤掉占位与省略写法）。"""
+    found = {}
+    for src, text in texts.items():
+        for m in _DOC_PATH_RX.finditer(text):
+            rel = m.group(1)
+            # 占位写法（latest_*.json、docs/02-…md、a/?b.py）不需要一道额外的过滤器：上面的
+            # 字符类里就没有 `*`/`?`/`…`，它们**本就被切成不匹配**。这里曾写着一行
+            # `if "…" in rel or "*" in rel …: continue`，实测把整行删掉判据也不红（甲4 依旧绿）——
+            # 那是一条杀不死的装饰，删。真正的地板是字符类本身，判据甲4 是它的永久证人：
+            # 谁哪天把通配符放进字符类，甲4 就当场红。
+            found.setdefault(rel, []).append(
+                f"{src}:{text[:m.start()].count(chr(10)) + 1}")
+    return found
+
+
+def _doc_named_dirs(texts: dict) -> set:
+    """被交接文档以 `name/` 形式点名的顶层目录名。"""
+    names = set()
+    for text in texts.values():
+        for m in _DOC_DIR_RX.finditer(text):
+            names.add(m.group(1))
+    return names
+
+
+def _sibling_import_gaps() -> list:
+    """乙2：已入库的 .py import 了同目录兄弟模块，而那个兄弟没入库。返回 [(引用方, 兄弟, 落点)]。"""
+    index, head = _tracked_sets()
+    gaps = []
+    for rel in sorted(head & index):
+        if not rel.endswith(".py"):
+            continue
+        path = ROOT / rel
+        if not path.is_file():
+            continue              # HEAD 里有、磁盘上没有：那是删除未提交，第 24 条管
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        parent = path.parent
+        names = set()
+        for node in _walk(tree):          # 只许走单一真源（第 26 条）
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        for nm in sorted(names):
+            sib_py, sib_pkg = parent / (nm + ".py"), parent / nm
+            if sib_py.is_file():
+                if _rel_posix(sib_py) not in head:
+                    gaps.append((rel, nm, _rel_posix(sib_py)))
+            elif sib_pkg.is_dir() and not any(t.startswith(_rel_posix(sib_pkg) + "/") for t in head):
+                gaps.append((rel, nm, _rel_posix(sib_pkg) + "/"))
+    return gaps
+
+
+def _swallowed_assertions(rels) -> list:
+    """丙：判据套件里「try 直接调了判据，except 却把异常吞了」的位置。"""
+    out = []
+    for rel in sorted(rels):
+        if not rel.endswith(".py"):
+            continue
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            src_text = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(src_text)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in _walk(tree):          # 只许走单一真源（第 26 条）
+            if not isinstance(node, ast.Try) or not node.handlers:
+                continue          # try/finally 没有 handler：异常照往上传，那正是我们要的形状
+            if not _handover_called_names(node.body):
+                continue
+            handled = False
+            for h in node.handlers:
+                seg = ast.get_source_segment(src_text, h) or ""
+                if any(isinstance(n, ast.Raise) for n in ast.walk(h)):
+                    handled = True
+                elif _handover_called_names(h.body):
+                    handled = True
+                elif isinstance(h.name, str) and re.search(r"\b" + re.escape(h.name) + r"\b", seg):
+                    handled = True   # 把异常对象本身交了出去（信号第三参、problems.append(f"{e}")……）
+                elif "HANDOVER-OK" in seg:
+                    handled = True
+            if not handled:
+                out.append((rel, node.lineno, sorted(_handover_called_names(node.body))))
+    return out
+
+
+def _handover_called_names(stmts) -> set:
+    """这批语句里**直接**调到的判据函数名；不降进嵌套函数/类定义（那是另一个作用域）。
+
+    不能写成 `for node in ast.walk(st): if isinstance(node, FunctionDef): continue`——
+    `continue` 只是跳过这一个节点本身，ast.walk 的队列里它的孩子照旧会被访问。第 44 条首版
+    就是这个形状，被自己的判据套件（丙「判据在嵌套函数里」那一格）当场逮住：try 里只定义了
+    一个内含 check 的函数、调用根本不在 try 体内，门却报「判据被 except 咽了」。**写 AST
+    遍历的人必须先把「剪枝」当成一个待测命题**，否则误报会把整条门变成噪音。
+    """
+    names = set()
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue                      # 真剪枝：这一整支都不看（孩子的孩子也不看）
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in HANDOVER_ASSERT_NAMES:
+            names.add(node.func.id)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def check_handover_closure(texts=None, suites=None) -> list:
+    """第 44 条主体：返回问题清单（空=合格）。两个参数都是给离线判据喂夹具用的。"""
+    problems = []
+    index, head = _tracked_sets()
+    if not head and in_work_tree():
+        return ["第 44 条读不到任何 HEAD 清单（仓库还没有提交？）：范围断了时“交接闭包完整”"
+                "这句话没有任何含义"]
+    if texts is None:
+        texts = _handover_doc_texts()
+    if not texts:
+        return [f"第 44 条一份交接文档都没读到（HANDOVER_DOC_GLOBS={list(HANDOVER_DOC_GLOBS)} 落空？）："
+                "文档闭包这一半根本没判"]
+    ignored = _path_set(["ls-files", "--others", "--ignored", "--exclude-standard"])
+
+    # ── 甲：文档指路的路径闭包 ──
+    for rel, srcs in sorted(_doc_pointers(texts).items()):
+        top = rel.split("/")[0]
+        if rel in head or rel in index:
+            continue
+        if rel in HANDOVER_POINTER_EXEMPT:
+            continue
+        if rel in ignored:
+            # 在忽略名单里 = 「本机运行期产物 / 密钥落点」，这本身就是仓库对它的处置（第 43 条
+            # 写的就是「密钥只允许待在 config.json 里」）。这里如果还喊 `git add`，门禁自己就在
+            # 催一次密钥入历——2026-11-20 首跑就是这样响在 b2bcollect_build/config.json 上的。
+            # 代价：文档指到一个「新机器上需要自己建」的忽略文件时本条不报，那种靠 docs/02 自己讲清。
+            continue
+        if top in _doc_named_dirs(texts) and not any(t.startswith(top + "/") for t in head):
+            continue              # 整目录级的处理交给乙1（那边要求它要么在库要么被忽略）
+        where = "、".join(srcs[:3])
+        if (ROOT / rel).is_file():
+            problems.append(f"{where} 指路 {rel}：本机磁盘上有，可它**不在仓库里**——换一台机器"
+                            f"按文档去找就是文件不存在（症状长得像文档在撒谎）：git add {rel}")
+        else:
+            problems.append(f"{where} 指路 {rel}：磁盘上没有、也不在仓库里（死路）：要么把文件"
+                            f"补回来，要么改掉文档里这一句，要么在 HANDOVER_POINTER_EXEMPT 登记理由")
+
+    # ── 乙1：被文档点名的顶层目录，整目录不在库就必须被忽略 ──
+    for name in sorted(_doc_named_dirs(texts)):
+        path = ROOT / name
+        if not path.is_dir():
+            continue              # 文档写了一个本机根本没有的目录：那是甲格的事（不在这判）
+        if any(t.startswith(name + "/") for t in head):
+            continue
+        disk = [p for p in path.rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+        if not disk:
+            continue              # 空目录：没有东西需要闭包
+        probe = next((_rel_posix(p) for p in disk if _rel_posix(p) not in ignored), None)
+        if probe is not None:
+            problems.append(f"文档点名了 {name}/，可它整目录 0 份入库、且有东西不在忽略名单里"
+                            f"（如 {probe}；本目录实测 {len(disk)} 份文件）：这就是 `git add -A` 的事故"
+                            f"半径——要么真入库，要么在 .gitignore 收掉并写明为什么不随仓库走")
+
+    # ── 乙2：已入库源码的同目录 import 闭包 ──
+    for src, mod, dst in _sibling_import_gaps():
+        problems.append(f"{src} import 了同目录模块 {mod}（落在 {dst}），可那份兄弟**不在仓库里**："
+                        f"本机 import 得到、干净检出那一刻 ImportError（打包产物里就是缺模块）：git add {dst}")
+
+    # ── 丙：判据不许被 except 咽掉 ──
+    if suites is None:
+        rc, files = regression_suites()[:2]
+        if rc != 0 or not files:
+            problems.append("第 44 条丙格拿不到批跑清单（退出码 {0}）：判据闭包这一半根本没跑，"
+                            "不许按「没发现问题」过去".format(rc))
+            suites = []
+        else:
+            suites = files
+    for rel, lineno, calls in _swallowed_assertions(suites):
+        problems.append(f"{rel}:{lineno} 在 try 里调了 {'/'.join(calls)}，except 既不 raise、也不记账、"
+                        f"也不把异常对象交出去：那条判据在这台机器上可以永远不执行而套件依旧退 0"
+                        f"（「依赖没装」与「自家文件没入库」在 ImportError 这一层长得一模一样）。"
+                        f"请只包住真正会缺的那一个第三方依赖，自家模块的 import 放到外面让它响")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="b2bcollect 打包清单硬门（构建前；带 --artifact-weight 时兼做产物重量门）")
     ap.add_argument("--list", action="store_true", help="只打印当前清单与判定，不改退出码语义")
@@ -10603,6 +10864,21 @@ def main(argv=None) -> int:
         print(f"✅ 密钥泄漏防线：{len(_secret_scope())} 份「可被 add 进历史」的文本内容"
               "（索引里的 + 未跟踪未忽略的）没有密钥形态；config.json 那类真值落点由"
               ".gitignore 守着，不在本条范围内" + _note)
+
+    # 第 44 条：交接闭包。与第 24/25 条同族（本机绿不等于检出后绿），但判的是「文档与判据
+    # 点名的名字随不随仓库走」，与打包清单无关，所以放在密钥门之后、CALLERS 之前。
+    handover_probs = check_handover_closure()
+    if handover_probs:
+        bad += 1
+        print("❌ 交接闭包破了（第 44 条：文档/判据指路的东西不随仓库走）：")
+        for p in handover_probs:
+            print(f"   · {p}")
+            print(f"::error::交接闭包：{p}")
+    else:
+        _h_texts = _handover_doc_texts()
+        print(f"✅ 交接闭包：{len(_h_texts)} 份交接文档里 {len(_doc_pointers(_h_texts))} 条指路路径"
+              "全部在库（或已被 .gitignore 明确处置），文档点名的顶层目录要么在库要么在忽略名单，"
+              "已入库源码的同目录 import 闭得上，批跑清单里的判据没被 except 咽掉")
 
     for label, path in CALLERS.items():
         if not path.exists():

@@ -51,6 +51,13 @@ from PyQt5.QtWidgets import (                                      # noqa: E402
 
 import acl_admin_dialog as aad                                     # noqa: E402
 
+# 这里补一句**真的**自证（原来那份只有「删掉沙箱后沙箱不存在」，那句无论隔离有没有生效
+# 都恒真——是判据的装饰，2026-11-20 复核时定性为假自证）：本套件建的权限面板会走设备
+# 顶号那一段，落点必须真在沙箱里，否则它就是下一个写脏开发机状态的套件。
+import access_guard as _ag_boot                                    # noqa: E402
+assert str(_ag_boot._state_dir()).startswith(str(_STATE_SANDBOX)), (
+    f"隔离没生效：权限状态目录指向 {_ag_boot._state_dir()}（沙箱是 {_STATE_SANDBOX}）")
+
 app = QApplication.instance() or QApplication(sys.argv[:1])
 
 ADMIN = "15088131371"       # 本机管理员号（避开「降级自己」那扇确认门要用的号）

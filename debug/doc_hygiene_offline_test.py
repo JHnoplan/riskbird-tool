@@ -21,7 +21,11 @@ r"""doc_hygiene_offline_test.py —— 给「交接文档的中文」做判据�
     而不是关掉这条判据。
 
 跑法：`.venv/bin/python debug/doc_hygiene_offline_test.py`（在批跑清单 FILES 里，每轮批跑都跑）。
+
+本文件后半的 `己` 节管的是另一件事：**文档抄代码的那一面**（门禁清单、批跑口径）有没有
+与代码逐字对拍。甲/乙/丙 管中文用词，丁/戊/己 管文档与现实是否一致。
 """
+import ast
 import os
 import re
 import subprocess
@@ -273,6 +277,173 @@ _hits = [s for s in (_prose, _diagram, _unit) if _NFUN.search(s) and any(w in s 
 check("戊2 戊1 的规则对三种真实写法都能开火（叙事体 + 层次图体 + 按量词「个」计数体）；"
       "抽不到＝那条判据是假的", _hits == [_prose, _diagram, _unit],
       {"抓到": len(_hits), "漏了": [s for s in (_prose, _diagram, _unit) if s not in _hits]})
+
+# ── 己) 文档抄代码的那一面：清单不许手抄、口径不许抄死 ───────────────────────────
+# 这一节是被本轮的真实缺陷逼出来的：docs/03 §1 那张门名表是**手抄**的，抄的对象是
+# `main()` 里的 `check_*` 调用序——每加一道门就漂一次。重生成时实测到已经漂走两处：
+# 表里写着 `check_section_pointer_refs`（真名是 `check_section_pointer_references`，
+# 照旧表去 grep 会找不到文件），且整表序号与真序错位。`戊` 节管的是散文里的**数字**
+# 没有对账对象，清单是同一个病的另一种形状（**名字**没有对账对象），所以分开判。
+GATE_DOC = "docs/03-测试门禁与回归批跑.md"
+GATE_SCRIPT = ".github/scripts/check_packaging_manifest.py"
+_GATE_ROW = re.compile(r"^\s*(\d+)\s+(check_\w+)$")
+
+
+def _fence_blocks(text):
+    """按**行**取代码围栏内容，返回每块的行列表。
+
+    故意不用 ```…``` 一整段匹配的正则：docs/03 第一个块带 `bash` 语言标注，那种正则
+    匹配不上它的开栅栏，栅栏奇偶整个错位——实测它对本文命中 0 块。而「0 块」往下走只有
+    两种结局，两种都比一条 FAIL 更隐蔽：取 cand[0] 是崩在判据里，对空列表跑 all() 是恒真。
+    """
+    blocks, cur = [], None
+    for line in text.splitlines():
+        if re.fullmatch(r"```(\w*)\s*", line):
+            if cur is None:
+                cur = []
+            else:
+                blocks.append(cur)
+                cur = None
+        elif cur is not None:
+            cur.append(line)
+    return blocks
+
+
+def _gates_in_main():
+    """门禁本体 `main()` 里 `check_*` 的真实调用序（按书写顺序去重）；找不到 main 返回 None。"""
+    tree = ast.parse((ROOT / GATE_SCRIPT).read_text(encoding="utf-8"))
+    entry = next((n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+    if entry is None:
+        return None
+    seen = []
+    for node in ast.walk(entry):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id.startswith("check_") and node.func.id not in seen):
+            seen.append(node.func.id)
+    return seen
+
+
+_gate_lists = [b for b in _fence_blocks((ROOT / GATE_DOC).read_text(encoding="utf-8"))
+               if b and all(_GATE_ROW.match(ln) for ln in b)]
+check(f"己1 门禁清单能被读出来（{GATE_DOC} 的围栏里恰好 1 个纯 `check_` 清单，实读 {len(_gate_lists)} 个）",
+      len(_gate_lists) == 1,
+      {"处置": "读不到输入必须响，不许静默按空清单判绿：查表格是否被改成非 `N check_xxx` 形状"
+              "、栅栏是否闭合、语言标注行是否顶格"})
+_real_gates = _gates_in_main()
+check("己2 门禁本体里能取到 `main()` 的调用序（取不到＝本节全部对拍都是空闸）",
+      bool(_real_gates), {"实际": None if _real_gates is None else len(_real_gates),
+                          "文件": GATE_SCRIPT})
+if len(_gate_lists) == 1 and _real_gates:
+    _rows = [(_m.group(1), _m.group(2)) for _m in map(_GATE_ROW.match, _gate_lists[0])]
+    _doc_names = [n for _, n in _rows]
+    _first_diff = next((f"第 {i + 1} 行：文档 `{a}` ≠ 代码 `{b}`"
+                        for i, (a, b) in enumerate(zip(_doc_names, _real_gates)) if a != b),
+                       f"长度不同：文档 {len(_doc_names)} 条 / 代码 {len(_real_gates)} 条")
+    check(f"己3 清单门名序列与 `main()` 调用序逐字相同（共 {len(_real_gates)} 道，顺序也算）",
+          _doc_names == _real_gates, {"首个不同": _first_diff,
+                                     "只在文档里有": sorted(set(_doc_names) - set(_real_gates)),
+                                     "只在代码里有": sorted(set(_real_gates) - set(_doc_names)),
+                                     "处置": "重跑 docs/03 §1 那条取数命令，不要手改表"})
+    check("己4 清单序号从 1 连续（序号错位＝名字与号各说各话，按号找门会找到隔壁那条）",
+          [int(i) for i, _ in _rows] == list(range(1, len(_real_gates) + 1)),
+          {"文档行数": len(_rows), "代码门数": len(_real_gates)})
+
+# 己5：禁「替命令回答」的库存口径。为什么不用一个相邻搭配的宽正则：同一句里
+# 「第 2 道硬门 `check_shared_source`」是**编号引用**（指向文件头那张编号表的某一条），
+# 不是总数；把它一起判红只会逼人把编号引用删掉，那是门禁把文档推向更难读的形状。
+# 历史取证里的规模（「DH 节 74 条判据」「9 路变异全开火」）也不管：量词「条/路」后面
+# 跟的是「判据/变异」而不是「硬门/批跑」，事件快照本身不需要与今天的机器对账。
+_INVENTORY = re.compile(r"\d[\d,]*\s*(道|路|项)\s*(构建前硬门|硬门|门禁|检查|离线回归|回归批跑|批跑)")
+_ORDINAL_TAIL = re.compile(r"第[\d\s/、,，\-~—和或及至]*$")
+inventory = []
+for p in targets:
+    for i, ln in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        for m in _INVENTORY.finditer(ln):
+            if not _ORDINAL_TAIL.search(ln[:m.start()]):
+                inventory.append(f"{p.relative_to(ROOT)}:第{i}行 「{m.group(0)}」 {ln.strip()[:52]}")
+check("己5 文档里不许抄死库存口径（「N 道硬门 / N 路批跑 / N 项检查」这类总数要写成取数命令）",
+      inventory == [], inventory)
+# 正控与豁免正控：两条都必要。少了正控，己5 只要正则改坏就恒不匹配（最隐蔽的假绿）；
+# 少了豁免正控，下一轮为了「改好一点」把序数引用一并关掉，视野就静默空了一半。
+_bad_writings = ["硬门：42 项检查全部通过才算绿",
+                 "跑一遍 66 路离线回归",
+                 "三条 workflow 第一步都是 44 道构建前硬门"]
+_fired = [s for s in _bad_writings
+          if any(not _ORDINAL_TAIL.search(s[:m.start()]) for m in _INVENTORY.finditer(s))]
+check("己6 己5 对三种真实坏写法都开火（叙事体 / 命令体 / 总量体）；抽不到＝那条判据是假的",
+      _fired == _bad_writings, {"抓到": len(_fired),
+                                "漏了": [s for s in _bad_writings if s not in _fired]})
+_ordinal_writings = ["——第 2 道硬门 check_shared_source 与尾门",
+                     "三处对拍由第 1/2 道硬门负责",
+                     "| ④ 第 42 条硬门 + CALLERS/WORKFLOWS 登记 | ✅ |"]
+_wrongly = [s for s in _ordinal_writings
+            if any(not _ORDINAL_TAIL.search(s[:m.start()]) for m in _INVENTORY.finditer(s))]
+check("己7 编号引用不许误伤（「第 N 道」「第 1/2 道」指的是那一条，不是总数）",
+      _wrongly == [], _wrongly)
+
+# ── 庚) 「§N」级指路必须落到真实标题 ──────────────────────────────────────
+# 丁1 只判「那份文档在不在」，判不到「那一节在不在」。本轮的真实空头支票：docs/02 §5.1
+# 写「开启步骤见 `04-…md`」，可 docs/04 里根本没有 required status check 那一节——
+# 文件在、内容不在，丁1 结构上全绿。补实那一节之后把指路升级成带章节号的形式，
+# 再让下面这条盯着它：以后谁写一句走不到的 §，当场红。
+_SECTION_PTR = re.compile(r"§\s*([0-9]+(?:\.[0-9]+)*)")
+_PREV_DOC = re.compile(r"(?:docs/)?`?(\d{2})(?:-[0-9A-Za-z\u4e00-\u9fff_.\-]+)?`?|`(\d{2})`")
+
+
+def _has_heading(text, num):
+    """目标文档里有没有编号为 num 的章节标题。
+
+    后面那个字符集是故意列出来的：允许 `## 1. x`（点号分隔）与 `### 3.1 x`，
+    但不允许拿 `§1` 匹配到 `## 10`（下一位是数字就否掉）。
+    """
+    return re.search(r"^#{2,4}\s*" + re.escape(num) + r"(?=$|[\s.、:：,，\-—])", text, re.M) is not None
+
+
+def _section_pointers(path, text):
+    """把这份文档里的 `§N` 解析成 (编号, 目标文档, 是否点名了别的文档)。
+
+    目标文档靠「§ 前 60 字符内出现过的最后一个 NN 号」推断，这是启发式：一句长话里
+    先提了 `03` 再写一个属于本文档的 §2，会被算到 03 那边去。它可能让个别指路**查错了
+    文档**（两文档章节号大量重合，误判概率低但不为零），所以视野计数交给庚2 单独兜底：
+    解析口径一旦整体失效，红的是「读到 0 处」，而不是「全部走得通」。
+    """
+    out = []
+    for m in _SECTION_PTR.finditer(text):
+        target, resolved = path, False
+        hits = list(_PREV_DOC.finditer(text[max(0, m.start() - 60):m.start()]))
+        if hits:
+            key = hits[-1].group(1) or hits[-1].group(2)
+            found = sorted((ROOT / "docs").glob(f"{key}-*.md"))
+            if found:
+                target, resolved = found[0], True
+        out.append((m.group(1), target, resolved))
+    return out
+
+
+_ptrs, dangling = [], []
+for p in targets:
+    text = p.read_text(encoding="utf-8")
+    for num, tgt, resolved in _section_pointers(p, text):
+        _ptrs.append((p, num, tgt, resolved))
+        if not _has_heading(tgt.read_text(encoding="utf-8"), num):
+            dangling.append(f"{p.relative_to(ROOT)} 的「§{num}」→ {tgt.relative_to(ROOT)} 里没有这一级标题")
+check(f"庚1 全部 § 级指路都落到真实存在的章节标题（读到 {len(_ptrs)} 处）",
+      dangling == [], {"断链": dangling})
+_named = [x for x in _ptrs if x[3]]
+check(f"庚2 扫描视野非空（{len(_ptrs)} 处指路、其中点名跨文档 {len(_named)} 处）："
+      "读不到输入不许判绿——§ 写法一改这条就会先红，而不是默默变成恒真",
+      len(_ptrs) >= 8 and len(_named) >= 3,
+      {"读到": len(_ptrs), "跨文档": len(_named)})
+# 正控：拿一句真不存在的指路验这台机器会开火（少了它，庚1 只要解析坏就永远绿）
+_probe = "本节内指路见 §7。\n开启步骤另见 `04` §99。\n"
+_found = _section_pointers(ROOT / "docs/04-打包发布链路与云端配置.md", _probe)
+check("庚3 正控：不存在的章节（`04` §99）必须被判为断链，未点名文档的 §7 必须按本文档判为存在",
+      [(n, _has_heading(t.read_text(encoding="utf-8"), n)) for n, t, _ in _found] ==
+      [("7", True), ("99", False)], _found)
+check("庚4 正控的证人本身在位（docs/04 确实有 §7；否则庚3 的「True」是碰运气）",
+      _has_heading((ROOT / "docs/04-打包发布链路与云端配置.md").read_text(encoding="utf-8"), "7"),
+      "docs/04 的章节结构变了，庚3 的样本要跟着换")
 
 print(f"\n═══ 文档中文卫生：{_ok} 通过 / {len(_failed)} 失败 ═══")
 if _failed:

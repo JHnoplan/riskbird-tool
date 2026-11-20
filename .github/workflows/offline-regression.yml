@@ -1,0 +1,109 @@
+name: Offline Regression Clean Checkout
+
+# 这条泳道判的**不是**「代码能不能打包」，而是「换一台机器 clone 下来，能不能照着
+# docs/02 把项目跑起来」。它是这次交接最该有、却一直没有的那道门。
+#
+# 为什么必须单独开一条（2026-11-20 交接段实测，不是推测）：
+# 那一轮我第一次真的 `git clone` 出一份干净目录跑全量离线批跑，结果是
+# **54 通过 / 13 失败**——而同样的批跑在本机是全绿。13 条红逐条取证后全部落在同一族：
+# 判据要用的夹具或**证人自己没进提交**（solarbe 的页面夹具、一份从未提交的 riskbird
+# 套件、交接文档写着「qcollect（已跟踪）」而仓库里一份没有）。
+# 也就是说：在此之前，「干净检出跑得通」这句话只是文档里的一句承诺，**没有任何对账
+# 对象**；三条发版流水都只做 `actions/checkout` 然后打包，批判据一次都没在干净检出上
+# 跑过。本机绿是因为磁盘上有那些文件，而磁盘状态不进 git——这正是 `docs/06` 里 A 族
+# 反复付的那笔学费，只不过这次欠的是判据链自己。
+#
+# 两条设计约束：
+#  1) **逐字执行 docs/02 教给读者的命令**（§2 拿代码 → §3 建环境 → §5 前三条验收）。
+#     文档写错一步、或者某条命令只在开发机成立，这条泳道当场红。文档与现实因此
+#     不可能各走各的——这比"再补一段说明"可靠得多，因为它有对账对象。
+#  2) **验收口径不抄数字**：判「失败数必须为 0」和「跳过只能是因为缺实机夹具」，
+#     而不是「65 通过 / 1 跳过」这种会随清单增长而过期的快照（`docs/07` 戊类同一口径：
+#     可以写命令让读者当场跑，不可以替命令回答）。
+#
+# 它不阻断打包：与三条发版流水并行，红了就修自己这条。要让红真的挡住合入，需要在
+# 仓库设置里把它加成 main 分支的 required status check——那是仓库配置、不能从代码里
+# 打开，开启步骤与影响面写在 `docs/04-打包发布链路与云端配置.md`。
+#
+# runner 选 macos-latest（Apple Silicon）而不是 windows：交接目标是另一台 M4 Mac，
+# 这条泳道要模拟的就是那台机器；Windows 侧的等价验证由三条发版流水里的构建前硬门
+# 与产物门承担（它们跑在 windows-latest 上），这里不重复占一份 Windows 时长。
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # 手动触发时允许指定要不要跑重型那一节（frozen 那一路约占总时长一半，见批跑头部计时）
+  workflow_dispatch:
+
+# 同一分支的新提交取消仍在排队/运行的旧泳道：这条链的结论只对**最新提交**有意义，
+# 让旧 run 跑完只是把 runner 时长换成一句过期话。
+concurrency:
+  group: offline-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    runs-on: macos-latest
+    timeout-minutes: 45        # 上限而非口径：本机 2026-11-20 实测量级是「分钟级」，这里只防 runner 挂死
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      # 3.11 = 本仓库交付链的门禁解释器档位（与三条发版流水一致，由第 34 条按
+      # 「各流水门禁档取最低」对拍；进包代码能否被 3.8 读懂是第 42 条的事，不归这里）
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Build venv exactly as docs/02 §3 tells a reader to
+      # 刻意不在 runner 的全局 Python 上 pip install：docs/02 教的是
+      # `python3 -m venv .venv` + 装 `.github/requirements/b2bcollect.txt`，
+      # 而批跑脚本默认解释器就是 `.venv/bin/python`。这条泳道的全部价值在于
+      # 走读者会走的那条路——它跑绿了，"另一台 Mac 照文档能跑起来"这句话才有证据。
+      # 装包走 pip_install.py（多源 + 每源有界超时）：2026-11-13 单一清华源超时
+      # 曾让 Mac 与 Windows 两条流水同时没有制品。
+      shell: bash
+      run: |
+        python3 -m venv .venv
+        .venv/bin/python .github/scripts/pip_install.py --upgrade pip
+        .venv/bin/python .github/scripts/pip_install.py -r .github/requirements/b2bcollect.txt
+        .venv/bin/python -V
+        .venv/bin/python -m pip list > /tmp/pip-list.txt
+        cat /tmp/pip-list.txt
+
+    - name: docs/02 §5-1 pre-build hard gate
+      # 读者验收的第一条，原样跑：构建前硬门全集（具体多少条由脚本自己报，这里不抄）。
+      # 这里的「工作区 == 提交」是天然成立的对拍条件，本机那些"改过没提交"的噪音
+      # 会全部消失，剩下的红一定是真的随仓库走的问题。
+      shell: bash
+      run: .venv/bin/python .github/scripts/check_packaging_manifest.py
+
+    - name: docs/02 §5-2 GUI smoke (offscreen)
+      # 单列而不是只靠下面批跑里那一路：真红的时候，"界面根本起不来"和"某条判据过期"
+      # 必须一眼能分开——两者修法完全不同，混在一个日志尾巴里会让人先去查错的那一侧。
+      shell: bash
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: .venv/bin/python debug/gui_smoke_test.py
+
+    - name: docs/02 §5-3 full offline regression
+      # 本泳道的主判定。批跑自己负责三件事：展开清单、逐路超时看门狗、
+      # 收工后与开工前的**状态文件对拍**（判据不许把开发机的真缓存写脏）。
+      shell: bash
+      run: bash debug/run_offline_regression.sh
+
+    - name: On failure, hand over the scope evidence
+      # 干净检出红最常见的一句话是"这一路今天到底展不展开、清单对不对得上"。
+      # 这里只**交出**证据（--list 原文 + HEAD），不做任何算术判定：批跑结束时
+      # 已经打印过「本轮共展开 N 项」，在这里再数一遍只会多一个可能过期的口径。
+      if: failure()
+      shell: bash
+      run: |
+        echo "── 本轮清单（--list 原文）──"
+        bash debug/run_offline_regression.sh --list
+        echo "── HEAD ──"
+        git rev-parse HEAD
+        git status --short
