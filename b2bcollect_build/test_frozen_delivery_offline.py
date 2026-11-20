@@ -8657,6 +8657,41 @@ def test_regression_suites_tracked_gate():
             f"空清单喂给门：不许按「合格」返回（范围断了与没问题必须是两回事）（实际={_got}）")
 
 
+def _list_only_probe(gate, files, build_rels):
+    """第 25 条注入实验的**证人选择**：只走批跑清单进视野、且这份证人随仓库走。
+
+    由来（2026-11-20 干净克隆第二轮）：这里原来写死 `riskbird_build/test_qizhidao.py`。那一份
+    从未进过 git（`riskbird_build/` 顶层本机 111 份 .py，HEAD 里只有 32 份），本机之所以侥幸绿，
+    是 `_dev_path_inputs()` 按磁盘 glob 收 `*_build/*.py` 时恰好捞到了它——它进视野压根不是走
+    清单，这一格当时判的已经不是它声称的那条通道；换到干净克隆上证人直接不存在，症状长成
+    「克隆坏了」，把排查方向带到相反的一侧。**判据的证人自己不出货，比少一条判据更误导人。**
+    三条筛选各挡一种假绿，缺一格就有一格白判：
+      ① 出自批跑清单——本节验的就是「清单」这条通道能不能把文件送进门的视野；
+      ② 不在 `*_build/` 下——那种文件走不走清单都在视野里，拿它当证人等于没有证人；
+      ③ 必须在 HEAD 里（`ok`/`dirty`）——否则换一个检出证人就消失。（`dirty` 算通过：内容改过
+         没提交由第 24 条单独管，这里只问「这台机器之外它还在不在」。）
+    返回 `(证人, 落选原因)`：落选原因跟着红话一起报出去，别让人对着 sorted() 的第一个名字猜。
+    这个函数放在模块级而不是塞回节里，是因为下面两格反向对照要复用同一份实现：选择规则如果
+    在判据里复刻一遍，「改了真的、判了假的」这类变异就永远红不了。
+    """
+    kept, drops = [], []
+    for rel in sorted(files):
+        top = rel.split("/")[0] if "/" in rel else ""
+        state = gate.tracked_state(_REPO / rel)
+        if not top:
+            drops.append(f"{rel}：裸在仓库根，不是清单通道要验的那种文件")
+        elif rel in build_rels:
+            # 只拿门禁真正的磁盘 glob 集合做判据，不用「目录名后缀」启发式：后者与前者今天
+            # 完全等价（互相替换跑不出差分），等于一条杀不死的分支；而哪一天 `_dev_path_inputs()`
+            # 改了收法，跟着集合走的那份会自动跟进，跟着名字走的那份就开始替一个不存在的规则背书。
+            drops.append(f"{rel}：在 {top}/ 下，磁盘 glob 本来就会把它收进视野（与清单无关）")
+        elif state not in ("ok", "dirty"):
+            drops.append(f"{rel}：不在 HEAD 里（tracked_state={state}），换台机器这份证人就不存在")
+        else:
+            kept.append(rel)
+    return (kept[0] if kept else None), drops
+
+
 def test_no_dev_machine_paths_gate():
     print("\n═══ AI. 只对一台机器成立的绝对路径：交付链禁止写死路径（第 25 条硬门）═══")
     # 由来（2026-11-14 本轮自审）：批跑入口的第 20 行曾经写死一个开发机绝对路径再 `|| exit 1`
@@ -8790,13 +8825,45 @@ def test_no_dev_machine_paths_gate():
                                f"坏的是**构建机**上那一步，不是本机")
     _assert(".github/scripts/check_packaging_manifest.py" in _rels,
             "门禁脚本自己也在视野内（它自己写死一台机器，其余 26 条判据就全都在那台机器上）")
-    _probe = "riskbird_build/test_qizhidao.py"
-    _assert(_probe in _rels, f"取一份「只从批跑清单进视野」的套件做注入：{_probe}")
-    _txt = _inputs[next(p for p in _inputs if gate._rel_posix(p) == _probe)]
-    _got = gate.check_no_dev_machine_paths(
-        {_probe: _txt + '\nLEAK = "' + _shape("/", "Users", "/someone/Desktop/x.py") + '"\n'})
-    _assert_eq(len(_got), 1, f"反向对照：往真套件文本里注一行开发机路径要响（实际={_got}）")
-    _assert(_probe in _got[0], f"要报到文件名（实际={_got[0][:80]}）")
+    # 证人不再写死文件名，改成从批跑清单里现场选（选择规则与它的由来均见 `_list_only_probe`）。
+    _probe, _drops = _list_only_probe(gate, _files, _build)
+    if _probe is None:
+        # 这一格响了下面三格就没证人；按「没发现问题」过去是最阴的一类假绿，所以单独响一条后
+        # 直接跳过，而不是让下一行 `next(...)` 抛 StopIteration 把整节掩成 traceback。
+        _assert(False, "批跑清单里取不到合规证人（① 出自清单 ② 不在 *_build/ 下 ③ 在 HEAD 里）："
+                       + "；".join(_drops[:4]) + "——下面三格失去证人，不许当成「没有开发机路径」")
+    else:
+        _assert(_probe in _rels and _probe not in _build,
+                f"证人必须「只从批跑清单进视野」：{_probe}｜在视野里={_probe in _rels}｜"
+                f"磁盘 glob 也捞到它={_probe in _build}——后者为真时这一格判的不是清单那条通道")
+        _txt = _inputs[next(p for p in _inputs if gate._rel_posix(p) == _probe)]
+        _got = gate.check_no_dev_machine_paths(
+            {_probe: _txt + '\nLEAK = "' + _shape("/", "Users", "/someone/Desktop/x.py") + '"\n'})
+        _assert_eq(len(_got), 1, f"反向对照：往真套件文本里注一行开发机路径要响（实际={_got}）")
+        _assert(_probe in _got[0], f"要报到文件名（实际={_got[0][:80]}）")
+
+    # ── 7b) 上面那三条筛选都得**承重**：不合格的种类喂进选择函数，它要拒、且要点名 ──
+    # 没有这一节，`_list_only_probe` 退化成「sorted() 的第一个名字」：筛选删干净它也绿着返回。
+    _fake_rel = "debug/zz_handover_probe_offline_test.py"
+    (_REPO / _fake_rel).write_text("# 交接闭包反向对照夹具：本机有、HEAD 里没有\n", encoding="utf-8")
+    try:
+        # 条件 ③：一份「没提交」的套件不许当证人——这就是本轮干净克隆里踩中的那一坑。
+        # 这里只喂它一份（而不是拼在真清单前面）：拼-list 时证人取 sorted() 的第一个，
+        # 伪造项排在后面就永远选不中，那一格会变成「只有名字捣乱时才响」的位置依赖判据。
+        _p2, _d2 = _list_only_probe(gate, [_fake_rel], _build)
+        _assert(_p2 is None,
+                f"反向对照：只有一份「没提交」的套件时必须选不出证人（实际={_p2}）"
+                "——收下它就是「本机绿、换台机器证人消失」")
+        _assert(any(_fake_rel in x for x in _d2), f"落选要点名到具体文件（实际={_d2[:2]}）")
+        # 条件 ②：拿真清单里的 *_build/ 条目做正控（不造假货），它必须被拒。
+        _b_rel = sorted(r for r in _files if "/" in r and r.split("/")[0].endswith("_build"))
+        _assert(_b_rel, "夹具：批跑清单里本来就该有 *_build/ 下的套件（没有则下面这一格在判空气）")
+        if _b_rel:
+            _p3, _d3 = _list_only_probe(gate, [_b_rel[0]], _build)
+            _assert(_p3 is None, f"反向对照：*_build/ 下的套件不许当「清单通道」的证人（实际={_p3}）")
+            _assert(any(_b_rel[0] in x for x in _d3), f"落选要点名到具体文件（实际={_d3[:2]}）")
+    finally:
+        (_REPO / _fake_rel).unlink(missing_ok=True)
 
     # ── 8) fail-open 不许：一份源码都没读到时，「没有开发机路径」这句话没有含义 ──
     _got = gate.check_no_dev_machine_paths({})
