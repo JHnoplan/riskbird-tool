@@ -14,6 +14,7 @@ Selenium Manager，并且明确打出这一次慢在哪一步、用的是哪个�
 import atexit
 import contextlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -503,6 +504,66 @@ def sm_source_reachable(timeout: float = 4.0) -> bool:
     return False
 
 
+def sm_binary():
+    """Selenium Manager 那个 helper 在本包里在不在位。返回 **(状态, 路径或 None)**。
+
+    为什么要先问一句：兼容通道（Win7）的产物里这个 helper 被 PE 地板门**实测剪掉**了
+    —— 它静态导入 kernel32!GetSystemTimePreciseAsFileTime，Win7 的加载器当场拒载
+    （2026-11-20 首运实测）。剪掉它是对的：Win7 上 Chrome 最高 109，本通道随包
+    107/108/109 三档驱动，正常永远走不到「联网现下」这一支。但代码侧不能继续照着
+    「还有 SM 可退」说话：那两句日志会指挥用户去等一次永远不会发生的下载，而真实结局
+    是 Selenium 自己抛一句英文异常——对小白来说这就是「卡在 6 分钟然后报错」。
+
+    三格状态必须分开（与构建期 PE 地板门「实测没有 / 读不出 / 没东西可实测」同一条规矩）：
+      present —— 本平台那一份在位；
+      absent  —— selenium 装得起、包目录找得到、而本平台那一份**确实没有**：这就是 Win7
+                 兼容包的情形，调用方不能再念「交给 SM」，要当场开口给真能走通的出路；
+      unknown —— 问不到（selenium 导不进来 / 包结构不认识 / 目录读不了）。
+                 **unknown 不许拦停**：拿一个测不准当「确认没有」，就会在那些 selenium
+                 装法不在我预期里的机器上，把用户唯一的联网兜底整条关掉——为了少说一句
+                 谎而弄没了功能，方向是反的。拦停只在 absent 那一格。
+
+    只问「在不在位」，不猜「能不能跑」：能不能跑由构建期的 PE 地板门量，那是构建期口径。
+
+    必须按**本平台**筛：selenium 的 wheel 把所有平台的 helper 一起装机（macos/、
+    windows/、linux-x86_64/、linux-arm64/ 全在），拿目录名随便排个序取第一个就会在 macOS
+    上读到 linux-arm64 那一份（本机实测跳出来的就是这个）——那就是拿一个本机器根本
+    跑不了的文件说「退路在位」，与我们要消除的那句谎话同一类。
+    """
+    try:
+        from selenium.webdriver.common import selenium_manager as _sm
+    except Exception:
+        return "unknown", None                # 问不到 ≠ 没有：这一格不许拦停
+    env = os.environ.get("SE_MANAGER_PATH")
+    if env:                                   # 官方优先认这个环境变量，我们也先认它
+        # 这里能拿到一个明确答案，所以算 absent（不是 unknown）：指错了文件就是没在位。
+        return ("present", Path(env)) if Path(env).is_file() else ("absent", None)
+    exe = "selenium-manager.exe" if os.name == "nt" else "selenium-manager"
+    try:
+        base = Path(_sm.__file__).parent
+    except Exception:
+        return "unknown", None
+    try:
+        if not base.is_dir():
+            return "unknown", None
+    except OSError:
+        return "unknown", None
+    if (base / exe).is_file():                # setuptools-rust 现编那一份（模块同层）
+        return "present", base / exe
+    mach = (platform.machine() or "").lower()
+    if sys.platform == "darwin":
+        want = ("macos",)
+    elif os.name == "nt":
+        want = ("windows",)
+    else:
+        want = ("linux-arm64" if mach in ("aarch64", "arm64", "armv8l") else "linux-x86_64",)
+    for d in want:
+        cand = base / d / exe
+        if cand.is_file():
+            return "present", cand
+    return "absent", None                     # 目录看清了、本平台那一份就是没有
+
+
 # ── 子进程回收：quit() 只删会话，chromedriver 得我们自己收 ──────────────────
 # Selenium 4.51 的 `driver.quit()` 里已经没有 `service.stop()` 了：整包里搜下来，
 # 只有「建会话失败」那一条异常路径会 stop（remote/webdriver.py new_session 的 except
@@ -722,11 +783,32 @@ def create(options, log=None, ports=None, retries: int = 3):
             f"（本机 Chrome {cver}，能用到的驱动 {mine}）。"
             f"两条路：把 Chrome 升到最新；或放一份配套驱动进 {_cache_root()} "
             "（下次开机就直接可用，不用联网）")
+    # 只问一次：下面两格（拦不拦、带不带那句补充）共用同一个事实，分两次读磁盘就可能读到
+    # 两个答案（中途装上了/卸了），一条日志里就会同时出现「已拦停」与「在位」两种口径。
+    sm_state = sm_binary()[0]
+    if sm_state == "absent":
+        # 本包根本没有这个 helper（Win7 兼容通道按 PE 地板实测剪掉了）：不能再念那两句
+        # 「交给 Selenium Manager」——那会把人指向一个不存在的组件，而它后面跟着的是一句
+        # Selenium 自己的英文异常。这里当场开口，并只给**这个包里真能走通**的那条出路。
+        # 注意只拦 absent 那一格：unknown（问不到）照旧往下走——把兜底关掉比多说一句谎贵。
+        cver = chrome_major(ports) or "?"
+        mine = ", ".join(x for x in (driver_version(p) for p in paths) if x) or "一份都没找到"
+        where = "本机 ChromeDriver 都没能建会话" if paths else "本机没找到可用的 ChromeDriver"
+        raise RuntimeError(
+            f"创建浏览器会话失败：{where}（本机 Chrome {cver}，能用到的驱动 {mine}），"
+            "而这个版本的应用包不带「联网现下驱动」那个组件（老系统兼容包只保留实测"
+            f"加载得了的那些）。怎么办：装一份与本机 Chrome 大版本（{cver}）配套的 "
+            f"chromedriver，把那个 exe 放进 {_cache_root()} 就行（下次直接可用，不用联网）；"
+            "或者把 Chrome 换成随包驱动里有的那一档。")
+    # 问不到（unknown）时那两句不能照念：它们把一次未验证的尝试保证成了一次成功的退路。
+    caveat = "" if sm_state == "present" else "（本机问不到它在不在位，能不能成看这一次的结果）"
     if paths:
-        log("⚠ 本机可用的 ChromeDriver 都没能建会话，回退 Selenium Manager（可能要联网查版本，会慢）")
+        log("⚠ 本机可用的 ChromeDriver 都没能建会话，回退 Selenium Manager（可能要联网查版本，会慢）"
+            + caveat)
     else:
         log("⚠ 本机没有 ChromeDriver，交给 Selenium Manager 现场获取"
-            "（首次要联网下载配套驱动，本机实测约 6 分钟；下完进本地缓存，以后每次都是秒级）")
+            "（首次要联网下载配套驱动，本机实测约 6 分钟；下完进本地缓存，以后每次都是秒级）"
+            + caveat)
     t0 = time.monotonic()
     try:
         # 联网这一路必须绕过 PATH 上那些不配套的旧驱动，否则 SM 会拿它们去连浏览器，
