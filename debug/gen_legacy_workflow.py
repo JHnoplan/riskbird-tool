@@ -424,6 +424,41 @@ DIAG_BEFORE_DOCTOR = '''    - name: Legacy crash forensics (doctor 前的取证�
           $p3b = Start-Process -FilePath $exe3 -ArgumentList "--version" -Wait -PassThru
           Write-Host "[戊3-半项目构建] rc=$($p3b.ExitCode)"
         }
+        Write-Host "── 戊4：四路参数二分（run#12 戊3 红已在半项目规模复现，这一枪夹开参数与代码闭包）──"
+        # run#12 实测读数：[戊2] rc=0（windowed 产物带参的自检形状无罪）、
+        # [戊3-半项目构建] rc=-1073740791——戊3 的参数面（三个 collect-all + 5 个
+        # hidden-import + 4 个 add-data + 全量入口 import）能在半项目规模打红 fastfail。
+        # 戊4 从戊3 基准逐组减参数（每路都同形：同解释器同 PyInstaller 同 exclude 基准，
+        # 表驱动一个把手产判定行）：
+        # W1 只加 collect-all selenium（头号嫌疑：它把整个包和随包驱动二进制一起收）；
+        # W2 只加 collect-all lxml + bs4（lxml 自带 libxml2 一类原生 DLL）；
+        # W3 只加 add-data + hidden-import（不收 collect-all，剩下是目录拷贝与代码闭包）；
+        # W4 纯入口（只按 b2bcollect_gui.py 的 import 闭包——戊最小那支是 hello.py 不碰
+        # 项目代码，「项目代码自己在 3.8 下被扫出什么」这一路此前从没量过）。
+        # 读数判定：哪路先红，炸点就在那组参数的作用面里；W4 红 → 与 collect-all/add-data
+        # 无关，在入口 import 闭包；四路全绿 → 炸点在戊3 比戊4 多出的组合交互，下轮加组合档。
+        # 每路顺手产一行「产物里 api-ms-* / exe 文件计数」：collect-all 扫进什么桩，这里见数。
+        $q = @(
+          @{t='w1sel'; x=@('--collect-all','selenium')},
+          @{t='w2lxml'; x=@('--collect-all','lxml','--collect-all','bs4')},
+          @{t='w3data'; x=@('--add-data','config.json;.','--add-data','version.json;.','--add-data','../enf_clean;enf_clean','--add-data','../ali1688_build/drivers;drivers','--hidden-import','requests','--hidden-import','phonenumbers','--hidden-import','access_guard','--hidden-import','edition','--hidden-import','text_shape','--hidden-import','tool_version')},
+          @{t='w4gui'; x=@()}
+        )
+        foreach ($c in $q) {
+          Push-Location "$env:GITHUB_WORKSPACE/b2bcollect_build"
+          & $env:TARGET_PY -m PyInstaller --noconfirm --clean --windowed --exclude-module numpy --name $c.t --distpath "$mini/d_$($c.t)" --workpath "$mini/w_$($c.t)" $c.x b2bcollect_gui.py 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
+          Pop-Location
+          $edir = Join-Path (Join-Path $mini "d_$($c.t)") $c.t
+          $eqx = Join-Path $edir "$($c.t).exe"
+          if (-not (Test-Path $eqx)) {
+            Write-Host "[戊4-$($c.t)] 构建没出产物：取证工具故障，原因看上面最后两行，这一路读数无效"
+            continue
+          }
+          $pe = Start-Process -FilePath $eqx -ArgumentList "--version" -Wait -PassThru
+          $am = @(Get-ChildItem -Path $edir -Recurse -Filter "api-ms-win-*.dll" -ErrorAction SilentlyContinue).Count
+          $ex = @(Get-ChildItem -Path $edir -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue).Count
+          Write-Host "[戊4-$($c.t)] rc=$($pe.ExitCode) api-ms桩计数=$am exe计数=$ex"
+        }
         Pop-Location
         if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面甲乙丙丁戊的取证与读数就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
 
