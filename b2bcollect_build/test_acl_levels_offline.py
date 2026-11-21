@@ -230,6 +230,29 @@ def _machine(name, state_dir):
         ag._state_dir = old_dir
 
 
+_HANDED_OFF: list = []      # 上一批用例交棒的守卫（下一次换格前要把在途轮排干）
+
+
+def _drain_inflight(timeout=5.0):
+    """把交棒守卫的在途刷新轮全部落地，才允许重定向状态目录。必需（2026-11-21
+    批跑实发两族形状：ACL F3 的 pending/谎称被移出、access_guard §2 的出网预算 2≠3）：
+    刷新轮跑在守护线程里，join 超时/高负载时会跨过用例边界落地；而 `_state_dir` 是
+    模块级 lambda（旧线程写盘时刻读到的是本格 tmp），`edition` 的迟到尺又是「同号
+    放行」——上一格留下的轮会把它自己的名单写进本格 tmp，并以同一号合法改写本格
+    的待确认记账。轮落地的唯一可靠信号是 auth_inflight（_evaluate 之后的 finally
+    才清）。超时无降落地就如实报红：静默放行等于这条收口变成摆设。
+    """
+    deadline = time.monotonic() + timeout
+    stuck = []
+    for g in _HANDED_OFF:
+        while g.auth_inflight() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if g.auth_inflight():
+            stuck.append(g)
+    _HANDED_OFF.clear()
+    return len(stuck)
+
+
 def _fresh(account=ADMIN, client=None, ttl=60.0, state_dir=None, build="pro",
            device="DEV_A"):
     """构造完全隔离的守卫：账号读取、OSS 替身、本地状态目录、等级起点、设备指纹。
@@ -239,6 +262,10 @@ def _fresh(account=ADMIN, client=None, ttl=60.0, state_dir=None, build="pro",
     同时把模块单例 ``ag._guard`` 指向测试实例——管理面（add/set/remove）内部走
     ``get_guard()._sync_local()``，不重定向就会拿真实桌面副本去刷新。
     """
+    # 换格第一件事：把上一格交棒的守卫在途轮排干（解释与由来见 _drain_inflight）。
+    _assert(_drain_inflight() == 0,
+            "上一格交棒的守卫在途轮都在有界等待内落地（没落地的每一只都会跨过"
+            "本格边界改写本格的记账，批跑高负载下实发过两族偶发红）")
     tmp = Path(state_dir or tempfile.mkdtemp(prefix="acl_lvl_"))
     ag._state_dir = lambda: tmp
     g = AccessGuard(ttl=ttl)
@@ -253,6 +280,7 @@ def _fresh(account=ADMIN, client=None, ttl=60.0, state_dir=None, build="pro",
     os.environ[_ed.ENV_VAR] = build
     _ed.reset_for_tests()
     _DEV[0] = device
+    _HANDED_OFF.append(g)     # 本格交出的守卫进入下一格的排干名单
     return g
 
 
@@ -1048,6 +1076,24 @@ def test_auth_pending_separation():
     _assert(ag.get_guard().refresh_bounded(timeout=2.0), "已经拿到名单 → 直接回报成功")
     _assert_eq(len([s for s in cli.seq if s.endswith(ag.ACL_KEY)]), 1,
                "同一开机窗口内重复调用不得再出网（慢网络上每多发一拍，用户就多等一拍）")
+
+    # 8) 换格排干：上一格不许留任何在途轮跨过边界改写本格的记账（2026-11-21 批跑
+    #    实发：高负载下 join 超时留下的旧轮在本格窗口落地，靠「同号放行」把本格的
+    #    pending 定档翻成「已移出白名单」假话，偶发红两格）。排干本身是 _fresh 的
+    #    第一行收口，这一格是收口的常驻正控：抽掉 drain 它会确定性变红。
+    g_slow_prev = _fresh(ADMIN, FakeOSS(accounts=[STD], grants={STD: 1}, delay=0.35))
+    ag.prefetch_authoritative(timeout=0.01)      # 故意留一轮在途（join 超时的形状）
+    _assert(g_slow_prev.auth_inflight(),
+            "前置状态：上一格那一轮确实还在途（不成立时下面判的就是空气）")
+    _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}, fail=True))   # 换格：此处必须排干
+    ag.prefetch_authoritative()
+    tdl = time.monotonic() + 3.0                 # 让「本该被排干掉」的轮无论迟到多久都能落地
+    while g_slow_prev.auth_inflight() and time.monotonic() < tdl:
+        time.sleep(0.02)
+    _assert(_ed.auth_pending(),
+            "断网冷启动的待确认记账不许被上一格的迟到轮改写")
+    _assert("已移出白名单" not in _ed.auth_reason(),
+            f"本格的原因不许被上一格的旧名单顶掉：{_ed.auth_reason()}")
 
     # 8) 诊断页：把分散在六处的现场一次说清，且不泄密
     _fresh(ADMIN, FakeOSS(grants={ADMIN: 0}))

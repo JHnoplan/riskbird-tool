@@ -64,11 +64,13 @@ class FakeClient:
     """
 
     def __init__(self, accounts=None, fail=False, missing=False, grants=None,
-                 fail_msg=None):
+                 fail_msg=None, delay=0.0):
         self.calls = 0
         self.accounts = accounts if accounts is not None else ["15088131371"]
         self.grants = grants            # None = 名单里根本没有等级字段（旧版）
         self.fail = fail
+        self.delay = delay              # 慢网络口子：和 ACL 套件 FakeOSS.delay 同源先例，
+                                        # 不开这个口子，「上一格留一轮在途」的收口判据只能靠 sleep 碰运气
         # 故障文案可指定：5xx（服务端异常）与超时（网络）在分类上是两类，
         # 都写成同一句话就等于放弃了这次修复要守住的区分
         self.fail_msg = fail_msg
@@ -85,6 +87,8 @@ class FakeClient:
 
     def download_json(self, key):
         self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)        # 慢网络：让这一轮能被后继换格撞见在途
         # 用真实 OSSPoolError：走生产代码的 except 分支（错误口径同源）
         if self.fail:
             raise OSSPoolError(self.fail_msg or "下载失败 HTTP 500")
@@ -114,6 +118,28 @@ class FakeClient:
         self.shards.pop(key.split("/")[-1][:-5], None)
 
 
+_HANDED_OFF: list = []      # 上一批用例交棒的守卫（下一次换格前要把在途轮排干）
+
+
+def _drain_inflight(timeout=5.0):
+    """把交棒守卫的在途刷新轮全部落地，才允许重定向状态目录。必需（2026-11-21
+    批跑实发：高负载下 §2「首次 check 出网 3 次」实测 2 次 + 同一格不放行——上一格
+    的 check/预取内部 _start_refresh 留轮跨用例边界落地，把它自己的认领/副本经
+    模块级 _state_dir lambda 写进本格 tmp，本格 check 因此误判「本机已登记」而
+    省掉登记那一发。落地信号用 auth_inflight（_fetch 收尾的 finally 才清）。
+    超时无降落地如实报红，静默放行等于收口变摆设。
+    """
+    deadline = time.monotonic() + timeout
+    stuck = 0
+    for g in _HANDED_OFF:
+        while g.auth_inflight() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if g.auth_inflight():
+            stuck += 1
+    _HANDED_OFF.clear()
+    return stuck
+
+
 def _make_guard(account="15088131371", client=None, ttl=60.0, state_dir=None):
     """构造隔离守卫：注入账号读取、OSS 替身、临时状态目录。
 
@@ -121,6 +147,10 @@ def _make_guard(account="15088131371", client=None, ttl=60.0, state_dir=None):
     （名单副本 / 设备指纹 / 认领记录），只挪其中一份会让另外两份写到真实桌面目录，
     用例之间还会通过「同一台机器、同一份认领记录」互相污染。
     """
+    # 换格第一件事：把上一格交棒的守卫在途轮排干（由来见 _drain_inflight）。
+    _assert(_drain_inflight() == 0,
+            "上一格交棒的守卫在途轮都在有界等待内落地（批跑高负载下 §2 两格偶发"
+            "红的根就是这条收口缺失）")
     g = AccessGuard(ttl=ttl)
     g._account_reader = (lambda: account) if account is not None else None
     if account is None:
@@ -129,6 +159,7 @@ def _make_guard(account="15088131371", client=None, ttl=60.0, state_dir=None):
         g._build_client = staticmethod(lambda: client)
     tmp = Path(state_dir or tempfile.mkdtemp(prefix="acl_test_"))
     ag._state_dir = lambda: tmp   # 重定向全部本地状态，绝不碰真实桌面目录
+    _HANDED_OFF.append(g)         # 本格交出的守卫进入下一格的排干名单
     return g
 
 
@@ -186,6 +217,19 @@ def test_check():
     g = _make_guard(account="13700137000", client=FakeClient(accounts=["15088131371"]))
     ok, reason = g.check()
     _assert(not ok and "联系管理员获得使用权限" in reason, "不在白名单 → 拒绝并提示联系管理员")
+
+    # 换格排干收口的常驻正控（2026-11-21 批跑实发：高负载下本节开头两格偶发红——
+    # 上一格 check/预取内部 _start_refresh 留的轮跨过换格边界落地，把它的认领/
+    # 副本经模块级 _state_dir lambda 写进本格 tmp，本格 check 误判「本机已登记」
+    # 省掉登记往返：预算 3→2 且设备对不上不放行）。这一格直接量不变量本身：
+    # _make_guard 返回之后，上一格的在途轮必须已落地——抽掉 drain 它必红。
+    slow_prev = FakeClient(accounts=["15088131371"], delay=0.4)
+    g_slow = _make_guard(account="15088131371", client=slow_prev)
+    g_slow._start_refresh()                       # 故意留一轮在途（批跑里的 join 超时形状）
+    _assert(g_slow.auth_inflight(), "前置状态：上一格那一轮确实还在途（不成立时下面判的是空气）")
+    _make_guard(account="15088131371", client=FakeClient(accounts=["15088131371"]))
+    _assert(not g_slow.auth_inflight(),
+            "换格 helper 返回时上一格的在途轮必须已落地（排干收口生效；抽掉 drain 这一格红）")
 
     # +86 归一后仍可命中
     g = _make_guard(account="+8615088131371", client=FakeClient(accounts=["15088131371"]))
