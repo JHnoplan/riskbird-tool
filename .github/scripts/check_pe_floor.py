@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""PE 地板体检：这个 exe 拿给老 Windows，加载器会不会当场拒掉。
+r"""PE 地板体检：这个 exe 拿给老 Windows，加载器会不会当场拒掉。
+
+（raw docstring：正文里照抄了 `Redist\ucrt` 这个字面路径，普通串会把 \u 解成
+unicode 转义直接 SyntaxError——与下面 _cstr 那条 raw docstring 同一族坑。）
 
 需求 10B（Win7 兼容通道）唯一能在**没有 Win7 实机**的情况下机械量出来的一格。
 为什么量这个：Windows 加载器在映射镜像时会把可选头里的 `MajorSubsystemVersion /
@@ -12,6 +15,14 @@ MinorSubsystemVersion` 与自身版本比对，镜像要得比系统新就直接
 口径与边界（写在脸上，免得这一格被当成它做不到的证据用）：
   · 这一格证的是**加载器那一关**：子系统版本 + 导入表里有没有 Win7 之后才出现的
     API。两关都过，说明这个镜像不是被系统「凭什么都不让跑」地挡在门外。
+  · **子系统版本地板只量 EXE（进程主镜像）**：加载器在创建进程时校验主镜像的
+    子系统版本，DLL 走的是另一条映射路径，不按这一格拒载。2026-11-21 修正（台账
+    第 11 项，用户拍板）：旧版对 DLL 也量子系统地板，而微软官方给 Win7 的 app-local
+    UCRT 转发器（VS2015U3 redist 附加容器、SDK Redist\ucrt、.NET 官方 win7 ApiSets
+    NuGet 包，三条渠道本机实测）**子系统版本全是 10.0**——若加载器真按这一格拒载
+    DLL，微软自己的三条 Win7 部署渠道全是坏的。旧判据入库时 74 条样本全是手工造的
+    （docs/06 在案），这一格从没拿真 Windows 二进制对过。诚实边界：本机无 Win7 实机，
+    依据是三条官方发布渠道的行为证据；DLL 的导入表黑名单与随包桩实测一格不松。
   · 这一格**不**证明「在 Win7 上双击一定可用」：UCRT/VC++ 运行库是否装齐、驱动能否
     起来、显卡/字体回退，都不在这张表里。前者由安装器体检补装（需求 10 已交付，
     见 b2bcollect_setup.nsi 的 deps 段），后者必须回 Win7 实机验收。
@@ -131,7 +142,7 @@ def parse_pe(data: bytes) -> dict:
     # 那三个 4 字节字段共 12 字节，不能按「两个 short」跳——本机首跑就是栽在这里：
     # 错读到的 size_opt=0 让判据在自己造的那道检查上拦下真产物（偏移类错误读代码读
     # 不出来，只能拿真字节对）。
-    machine, nsec, _, _, _, size_opt, _chars = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
+    machine, nsec, _, _, _, size_opt, chars = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
     if size_opt < 70:
         raise PeError(f"可选头只有 {size_opt} 字节，读不到子系统版本字段（需要 ≥70）")
     opt = pe_off + 24
@@ -144,6 +155,8 @@ def parse_pe(data: bytes) -> dict:
     out = {
         "machine": {0x8664: "x64", 0x14C: "x86", 0xAA64: "ARM64"}.get(machine, f"0x{machine:X}"),
         "bits": 32 if magic == 0x10B else 64,
+        # IMAGE_FILE_DLL（0x2000）：加载器走哪条映射路径由这一位定，不由文件名定。
+        "is_dll": bool(chars & 0x2000),
         "subsystem_major": mj,
         "subsystem_minor": mn,
         "subsystem": subsys,
@@ -280,16 +293,24 @@ def check_one(path, raw: bytes, floor, bundle=None) -> list:
         print(f"· {path.name}: {pe['machine']} PE{pe['bits']}，子系统版本 "
               f"{got[0]}.{got[1]:02d}（≈最早 {label}），子系统号 {pe['subsystem']}，"
               f"不声明导入表（API-set 契约桩/转发 DLL 的正常形态）："
-              f"地板这一格照判，API 名单筛查对这一格没有输入")
+              f"API 名单筛查对这一格没有输入")
     else:
         print(f"· {path.name}: {pe['machine']} PE{pe['bits']}，子系统版本 "
               f"{got[0]}.{got[1]:02d}（≈最早 {label}），子系统号 {pe['subsystem']}，"
               f"导入 {len(pe['dlls'])} 个模块 / {len(named)} 个具名函数"
               + (f" / {by_ordinal} 项按序号导入（名字读不出，API 名单筛查对它们瞎）" if by_ordinal else ""))
     if got > tuple(floor):
-        problems.append(
-            f"{path.name}: 要求 Windows {got[0]}.{got[1]}，高于兼容通道地板 "
-            f"{floor[0]}.{floor[1]}——老系统的加载器会**当场拒载**，而构建一句错都不报")
+        if pe["is_dll"]:
+            # DLL 豁免子系统地板（由来见文件头「口径与边界」，2026-11-21 用户拍板）。
+            # 豁免必须说出来：静默给绿会让「地板筛过了」这句话没人能核对；DLL 的
+            # 导入表黑名单与随包桩实测在下面照常跑，一格不松。
+            print(f"· {path.name}: 子系统版本 {got[0]}.{got[1]:02d} 高于地板，但它是 DLL"
+                  f"（IMAGE_FILE_DLL 在位）——加载器不按这一格拒载 DLL（微软官方 Win7 "
+                  f"app-local UCRT 转发器就是 10.0）：地板这一格对 DLL 不适用，导入表照筛")
+        else:
+            problems.append(
+                f"{path.name}: 要求 Windows {got[0]}.{got[1]}，高于兼容通道地板 "
+                f"{floor[0]}.{floor[1]}——老系统的加载器会**当场拒载**，而构建一句错都不报")
     if got == (0, 0):
         problems.append(f"{path.name}: 子系统版本是 0.00（被壳/被改过的常见形态），"
                         "这句话不能替它担保能在老系统上加载")
