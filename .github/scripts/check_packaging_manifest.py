@@ -2040,6 +2040,46 @@ def check_line_ending_stance(sources: tuple = None, texts: tuple = ()) -> list:
     return problems
 
 
+def check_workflow_yaml_ctrl(workflows: tuple = None, texts: tuple = ()) -> list:
+    """第 45 条：workflow 里不许有 YAML 拒收的控制字符（换页/竖 tab 等，除 tab/换行/回车）。
+
+    由来（2026-11-21 legacy run#6 实发）：生成器注释里的示例字节 `\\fcdce…` 写在普通
+    三引号串里，反斜杠+f 被 Python 解成换页符 0x0C 写进 yml——YAML 解析器拒收控制字符，
+    整条流水 **jobs=0 静默失败**（run 名退化成文件路径，连 job 都没展开）。第 11 条的
+    bash -n 只量步骤里的 shell，量不到 yml 本身；这一条补的就是「workflow 作为 YAML
+    能不能被读懂」那一格。口径诚实边界：这里只普查控制字符（本轮缺陷族），不做完整
+    YAML 语法解析（不引 pyyaml 进门禁依赖）；结构错由云端首跑兑底，控制字符这一族
+    必须在构建前就拦住。texts 是内存夹具 [(标签, 内容)]，离线判据拿它做反向对照。
+    """
+    scope = WORKFLOWS if workflows is None else tuple(workflows)
+    problems = []
+    checked = 0
+
+    def _scan(label: str, text: str):
+        for i, ch in enumerate(text):
+            if ord(ch) < 0x20 and ch not in "\n\t\r":
+                line = text[:i].count("\n") + 1
+                problems.append(
+                    f"{label} 第 {line} 行有 YAML 拒收的控制字符 U+{ord(ch):04X}："
+                    "整条流水会 jobs=0 静默失败（run 名退化成文件路径，连 job 都不展开）。"
+                    "多半是生成器/手写串里的转义序列漏成了真字节——先查那一份的字符串"
+                    "转义（反斜杠要双写），改完重跑生成器再过硬门")
+
+    for rel in scope:
+        path = ROOT / rel
+        if not path.is_file():
+            continue                        # 不在位由第 11 条点名，这里不重复报
+        checked += 1
+        _scan(rel, path.read_text(encoding="utf-8", errors="replace"))
+    for label, text in texts:
+        checked += 1
+        _scan(label, text)
+    if not checked:
+        return ["第 45 条一份 workflow 都没读到（登记表落空或夹具为空）："
+                "这时「YAML 干净」没有任何含义，不许报绿"]
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # 第 16 条：同一份仓库里不许有两个「在大小写不敏感文件系统上其实是同一个文件」的路径。
 #
@@ -10458,6 +10498,20 @@ def main(argv=None) -> int:
     else:
         print("✅ 行尾立场：交付链的 shell、脚本、workflow 都不带 CR，且 eol=lf 由仓库里的 "
               ".gitattributes 定死（换一台 autocrlf=true 的机器也一样检出成 LF）")
+
+    # workflow 作为 YAML 本身能不能被读懂（第 45 条）：第 11 条只量步骤里的 shell，
+    # 量不到 yml 里的控制字符——legacy run#6 就是换页符写进 yml，整条流水 jobs=0
+    # 静默失败，本机所有门全绿（它们量的都是 shell 那一层）。
+    yaml_ctrl = check_workflow_yaml_ctrl()
+    if yaml_ctrl:
+        bad += 1
+        print("❌ workflow 里有 YAML 拒收的控制字符（整条流水会 jobs=0 静默失败，连 job 都不展开）：")
+        for p in yaml_ctrl:
+            print(f"   · {p}")
+            print(f"::error::workflow 控制字符：{p}")
+    else:
+        print(f"✅ workflow 控制字符：{len(WORKFLOWS)} 份 workflow 都没有 YAML 拒收的控制字符"
+              "（换页/竖 tab 那一族；完整 YAML 语法由云端首跑兑底）")
 
     # 大小写·变体不敏感文件系统上的同名路径（第 16 条）：这一条管的是「同一份仓库在不同
     # 平台上不是同一棵树」。云端 Linux 检得出两份、开发机 mac 只有一份，且留哪一份取决于

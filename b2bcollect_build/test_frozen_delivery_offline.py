@@ -9644,6 +9644,78 @@ def test_line_ending_stance_gate():
         shutil.rmtree(_tmpR, ignore_errors=True)
 
 
+def test_workflow_yaml_ctrl_gate():
+    print("\n═══ AM2. workflow 作为 YAML 必须能被读懂：第 45 条硬门要有牙 ═══")
+    # 由来（2026-11-21 legacy run#6 实发）：生成器注释里的示例字节 \\fcdce… 写在普通
+    # 三引号串里，反斜杠+f 被 Python 解成换页符 0x0C 写进 yml——YAML 拒收控制字符，
+    # 整条流水 jobs=0 静默失败（run 名退化成文件路径，连 job 都不展开）。而本机所有门
+    # 全绿：第 11 条 bash -n 量的是步骤里的 shell，量不到 yml 本身。这一节钉的就是
+    # 「shell 都合格、workflow 却读不懂」那一段空白。
+    gate = _manifest_gate()
+    gate_src = (_REPO / ".github" / "scripts" / "check_packaging_manifest.py").read_text(
+        encoding="utf-8")
+
+    # ── 1) 接线：判据在、main 真调、调了进退出码、云端 annotation 能照做 ──
+    _assert(callable(getattr(gate, "check_workflow_yaml_ctrl", None)),
+            "硬门模块里有第 45 条这个函数（能被单独喂夹具，才谈得上反向对照）")
+    _at = gate_src.find("yaml_ctrl = check_workflow_yaml_ctrl()")
+    _assert(_at > 0, "硬门 main() 里真的调了第 45 条（函数在而不调＝这条门从没跑过）")
+    _assert("bad += 1" in gate_src[_at:_at + 900],
+            "第 45 条报出来的问题要并进不合格计数（只 print 不改退出码的门等于公告栏）")
+    _assert("::error::workflow 控制字符" in gate_src[_at:_at + 900],
+            "云端 annotation 要能直接照做：写明缺的是哪一格，不是「重跑一次」")
+
+    # ── 2) 承重：每一份真 workflow 注入一个换页符喂进去，必须当场响在这一份上 ──
+    for rel in gate.WORKFLOWS:
+        _clean = (_REPO / rel).read_text(encoding="utf-8")
+        _assert_eq(gate.check_workflow_yaml_ctrl(workflows=(), texts=((rel, _clean),)), [],
+                   f"{rel} 干净字节喂进去不许响（红了说明判的是文件名而不是字节）")
+        _dirty = _clean.replace("\n", "\n\x0c", 1)
+        _got = gate.check_workflow_yaml_ctrl(workflows=(), texts=((rel, _dirty),))
+        _assert_eq(len(_got), 1,
+                   f"{rel} 注入一个换页符必须响（不响＝真仓库那条 ✅ 只是在判一个空集合）")
+        if _got:
+            _assert(rel in _got[0] and "U+000C" in _got[0] and "第 2 行" in _got[0],
+                    f"响的那句要点名哪一份、哪一行、哪个字符（实际={_got[0][:130]}）")
+
+    # ── 3) 空视野不许绿；tab/换行/回车是合法空白不许误伤 ──
+    _assert(any("一份 workflow 都没读到" in p
+                for p in gate.check_workflow_yaml_ctrl(workflows=(), texts=())),
+            "视野是空的却不许报绿（这时「YAML 干净」没有任何含义）")
+    _assert_eq(gate.check_workflow_yaml_ctrl(workflows=(), texts=(("fx", "a:\n\tb\r\nc\t"),)), [],
+               "tab/换行/回车是 YAML 合法空白，误伤它们等于把正常 workflow 拦在门外")
+
+    # ── 4) 真仓库今天：六份 workflow 一个控制字符都不许有 ──
+    _assert_eq(gate.check_workflow_yaml_ctrl(), [],
+               "第 45 条：交付链的 workflow 里没有 YAML 拒收的控制字符（红了就照那句查生成器转义）")
+
+    # ── 5) 变异复验：把生成器的修复退回原样（双写反斜杠→单写），重跑生成器，
+    #      第 45 条必须精准红在 legacy 那一份上；判完逐字节还原两份文件 ──
+    _gen_path = _REPO / "debug" / "gen_legacy_workflow.py"
+    _leg_path = _REPO / ".github" / "workflows" / "build-b2bcollect-legacy.yml"
+    _gsrc, _ysrc = _gen_path.read_bytes(), _leg_path.read_bytes()
+    _anchor = "\\\\fcdce"          # 生成器里的双写反斜杠（修复态）
+    if _gsrc.decode("utf-8").count(_anchor) != 1:
+        _assert(False, f"变异锚点在生成器里出现 {_gsrc.decode('utf-8').count(_anchor)} 次"
+                       "（不是 1 次就不知道改到哪一格）")
+    else:
+        try:
+            _gen_path.write_bytes(_gsrc.decode("utf-8").replace(_anchor, "\\fcdce", 1).encode("utf-8"))
+            _r = subprocess.run([sys.executable, str(_gen_path)], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace")
+            _assert_eq(_r.returncode, 0,
+                       f"变异后重跑生成器必须能跑（rc={_r.returncode}）：{_one_line(_r.stdout + _r.stderr)[-160:]}")
+            _got = gate.check_workflow_yaml_ctrl(workflows=(".github/workflows/build-b2bcollect-legacy.yml",))
+            _assert_eq(len(_got), 1,
+                       "把双写反斜杠退回单写（run#6 原样），第 45 条必须精准红一条——"
+                       "否则换页符再漏进 yml 时没人知道，整条流水又是 jobs=0 静默失败")
+        finally:
+            _gen_path.write_bytes(_gsrc)
+            _leg_path.write_bytes(_ysrc)
+        _assert(_gen_path.read_bytes() == _gsrc and _leg_path.read_bytes() == _ysrc,
+                "变异还原后必须逐字节回到原样（还原不干净＝下一节的输入被污染）")
+
+
 def test_forensic_job_log_channel_gate():
     print("\n═══ AN. 取证脚本判「日志拿到没有」必须按 HTTP 状态，不许按魔法字节 ═══")
     # 由来（本轮本机实发）：debug/fetch_run_log.sh 用 `[ "$(head -c 2 落点)" = "PK" ]`
@@ -13898,6 +13970,7 @@ SECTIONS = (
     test_module_name_binding_gate,
     test_shell_errexit_posture_gate,
     test_line_ending_stance_gate,
+    test_workflow_yaml_ctrl_gate,
     test_forensic_job_log_channel_gate,
     test_reason_one_handle_gate,
     test_tab_body_identity_gate,
