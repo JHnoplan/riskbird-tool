@@ -13307,10 +13307,12 @@ def _ucrt_wiring_problems(leg_text):
 
     由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，Win11 版 ucrtbase
     自己就依赖 Win8 契约模块——替换必须发生在 PE 地板门**之前**，否则门先红在
-    存根上，替换根本没机会跑；core 存根的剪名单也必须写在脸上（只看 yml 就该知道
-    包里少了什么、为什么少）。第二轮（run#5 证伪 SDK 来源后）再加三格：替换源必须
+    存根上，替换根本没机会跑。第二轮（run#5 证伪 SDK 来源后）再加三格：替换源必须
     先经钉死 sha256 的下载步、下载在替换之前、替换真走 --redist（不许退回自动找
-    SDK 那条已被云端证伪的路）。返回问题列表，空 = 接线合格。
+    SDK 那条已被云端证伪的路）。第三轮（run#8）把 core 剪枝那一格反向：替换步已从
+    a10 redist 整套覆盖 core 桩，其中 synch 转发器是替换后 ucrtbase 的加载依赖，
+    PE 门里再留同一条 glob 会把刚带进包的支撑桩剪掉（run#8 门绿而产物自检
+    fastfail 0xC0000409，首嫌即此）。返回问题列表，空 = 接线合格。
     """
     probs = []
     steps = [(m.group(1), m.start()) for m in
@@ -13345,9 +13347,11 @@ def _ucrt_wiring_problems(leg_text):
                      "（runner 只有 26100 一档，那份 ucrtbase 是 Win10 构建）")
     i = idx[pe_step]
     body = leg_text[steps[i][1]:steps[i + 1][1]] if i + 1 < len(steps) else leg_text[steps[i][1]:]
-    if "--prune-match api-ms-win-core-*.dll" not in body:
-        probs.append("PE 地板门的实测剪名单里没有 api-ms-win-core-*.dll：换完 UCRT 后那 30 个"
-                     "失去依赖方的 Win11 存根（地板 10.0）会留在包里继续红")
+    if "--prune-match api-ms-win-core-*.dll" in body:
+        probs.append("PE 地板门里还留着 api-ms-win-core-*.dll 剪枝：换完 UCRT 后 dist 里那些文件"
+                     "是替换源 a10 整套带进来的支撑转发器（ucrtbase 加载就依赖其中的 synch 桩），"
+                     "同一条 glob 会反手剪掉刚带进包的东西——run#8 门绿而产物自检 fastfail，"
+                     "首嫌就是这条剪枝把 UCRT 掹空（第三轮反转，台账第 11 项）")
     return probs
 
 
@@ -13659,9 +13663,10 @@ def test_pe_floor_gate():
                       f"两边分别 {len(_before)}/{len(_after)} 字节——只改 yml 不改生成器的话，"
                       "下次重跑生成器会把那一改整个抹掉")
 
-    # ── 12c) UCRT 替换的接线：必须在 PE 地板门之前，core 存根剪名单写在脸上 ──
+    # ── 12c) UCRT 替换的接线：必须在 PE 地板门之前，且 core 剪枝不许复活 ──
     #     由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，Win11 版 ucrtbase
     #     自己就依赖 Win8 契约模块——光剪存根不够，必须装配期整套换 Win7 版 UCRT。
+    #     run#8 又证伪了反方向：替换已整套覆盖 core 桩，留着剪枝反倒剪掉支撑桩。
     _wprobs = _ucrt_wiring_problems(leg)
     _assert_eq(_wprobs, [], "UCRT 替换的接线不合格：" + "；".join(_wprobs))
 
@@ -13881,10 +13886,12 @@ def test_pe_floor_gate():
                 "拆掉装配期换 UCRT 那一步（退回 run#4 原样）",
                 lambda t: len(_ucrt_wiring_problems(t)), 1,
                 "必须让 12c 精准报出「没有那一步」——否则替换被摸掉时没人知道")
-    _mutate_gen(" --prune-match api-ms-win-core-*.dll", "",
-                "拆掉 core 存根的实测剪名单",
+    _mutate_gen("          --prune-match selenium-manager.exe \\\\\n",
+                "          --prune-match selenium-manager.exe \\\\\n"
+                "          --prune-match api-ms-win-core-*.dll \\\\\n",
+                "把退役的 core 存根剪枝加回去（退回 run#4 形状）",
                 lambda t: len(_ucrt_wiring_problems(t)), 1,
-                "必须让 12c 报出「剪名单缺 core 存根」：换完 UCRT 不剪存根，42 项红原地踏步")
+                "必须让反转后的 12c 精准报出「剪枝还留着」：加回去就会剪掉 swap 带进来的 a10 支撑桩")
     _mutate_gen("        UCRT_REDIST,\n        UCRT_SWAP,", "        UCRT_SWAP,",
                 "拆掉钉死 sha256 的 redist 下载步（退回自动找 SDK 那条被证伪的路）",
                 lambda t: len(_ucrt_wiring_problems(t)), 1,
