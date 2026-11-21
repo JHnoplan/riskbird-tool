@@ -9670,7 +9670,10 @@ def test_workflow_yaml_ctrl_gate():
         _clean = (_REPO / rel).read_text(encoding="utf-8")
         _assert_eq(gate.check_workflow_yaml_ctrl(workflows=(), texts=((rel, _clean),)), [],
                    f"{rel} 干净字节喂进去不许响（红了说明判的是文件名而不是字节）")
-        _dirty = _clean.replace("\n", "\n\x0c", 1)
+        # 这里故意不用字面转义：真实换页字节写进源码字符串会被第 34 条那个
+        # 「反斜杠已被解掉一次」自查扫到（它拦的就是本仓库自己踩过的 0x0C 那族）；
+        # chr(0x0C) 语义相同、意图显式，且不会让判据套件自己被自己的门拦停。
+        _dirty = _clean.replace("\n", "\n" + chr(0x0C), 1)
         _got = gate.check_workflow_yaml_ctrl(workflows=(), texts=((rel, _dirty),))
         _assert_eq(len(_got), 1,
                    f"{rel} 注入一个换页符必须响（不响＝真仓库那条 ✅ 只是在判一个空集合）")
