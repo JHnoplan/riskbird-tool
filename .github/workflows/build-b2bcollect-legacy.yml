@@ -274,7 +274,10 @@ jobs:
         # 哈希取法的格式依据（出处＝SHA-256 的定义本身，不依赖 sha256sum 的行文话术，
         # 与主通道 Provision VC++ redist 那一步同源）：摘要就是 64 位十六进制，所以只收
         # 64 位十六进制；从标准输入喂 sha256sum 是因为输出里没有文件名可转义——GNU 工具
-        # 在带反斜杠的文件名上会给整行加转义前缀，awk '{print $1}' 会拿到 cdce…。
+        # 在带反斜杠的文件名上会给整行加转义前缀，awk '{print $1}' 会拿到 \fcdce…。
+        # （这里必须双写反斜杠：本常量是普通三引号串，单反斜杠紧跟 f 会被 Python
+        # 解成换页符 0x0C 写进 yml——YAML 拒收控制字符，整条流水 jobs=0 静默失败，
+        # legacy run#6 实发；连这句注释本身都不能写出那个转义序列，否则它自己就是雷。）
         REDIST="$GITHUB_WORKSPACE/vc2015u3_x64.exe"
         curl -sSLf --retry 3 --connect-timeout 20 --max-time 300 -o "$REDIST" "$WIN7_UCRT_REDIST_URL" \
           || { echo "::error::VS2015U3 vc_redist.x64.exe 下载失败（微软官方 CDN 抖动，重跑一次；连红就是钉住的 URL 失效了，找新的版本化地址重钉）"; exit 1; }
