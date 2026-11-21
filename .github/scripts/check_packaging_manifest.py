@@ -9864,10 +9864,18 @@ def check_legacy_channel(main_text=None, legacy_text=None, toolchain_text=None) 
     # 由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，包内 Win11 版
     # ucrtbase 自己就依赖 Win8 契约模块——光剪存根不够，必须装配期整套换 Win7 版 UCRT。
     # 这一步被摸掉的话，PE 门会在 42 项存根红上原地踏步，而红话听起来像「存根没剪干净」，
-    # 没人会想到是替换那一步根本不在了。
+    # 没人会想到是替换那一步根本不在了。第二轮（run#5 证伪 SDK 来源后）：替换源钉死
+    # VS2015U3 redist（只有它的 a10 才是完整 Win7 UCRT），--redist 与 sha256 各钉一格：
+    # 摘掉 --redist 会退回「自动找 SDK」那条已被云端证伪的路，哈希漂了则替换源字节不再可信。
     need(r"swap_win7_ucrt\.py[^\n]*--dist-dir",
          "兼容通道不再在装配期替换 Win7 兼容 UCRT：Win11 版 ucrtbase 与 api-ms 存根会留在包里，"
          "Win7 加载器当场拒载（台账第 11 项；这一步必须排在 PE 地板门之前，见 DH 节判据）")
+    need(r"--redist\s+\"\$GITHUB_WORKSPACE/vc2015u3_x64\.exe\"",
+         "UCRT 替换没走钉死的 VS2015U3 redist（--redist）：退回自动找 SDK 那条路已被云端 "
+         "run#5 证伪（runner 只有 26100 一档，那份 ucrtbase 是 Win10 构建）——台账第 11 项")
+    need(r"WIN7_UCRT_REDIST_SHA256:\s*\"da66717784c192f1004e856bbcf7b3e13b7bf3ea45932c48e4c9b9a50ca80965\"",
+         "Win7 UCRT 替换源的 sha256 钉不见了或被改：这份钉的是 VS2015U3 历史版（字节不该变），"
+         "换值必须连同本机实拉重算的证据一起进台账第 11 项，不许静默漂")
     for pat, why in ((r'MIN_WIN_MAJOR:\s*["\']6["\']', "兼容通道的安装器地板不是 major=6"),
                      (r'MIN_WIN_MINOR:\s*["\']1["\']', "兼容通道的安装器地板不是 minor=1"),
                      (r'OUT_FILE:\s*["\']B2bCollectToolSetup_Win7\.exe["\']',

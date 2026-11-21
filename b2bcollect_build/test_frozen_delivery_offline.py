@@ -13110,13 +13110,15 @@ def _pe_ns(text=None):
 
 
 def _pe_build(major=6, minor=1, subsystem=3, bits=64, imports=None, exports=None,
-              cut=0, bad_import_rva=False) -> bytes:
+              cut=0, bad_import_rva=False, dll=False) -> bytes:
     """合成一个**字段位置严格按 PE 规范**的最小镜像（本机是 Mac，没有真 Windows 二进制可扫）。
 
     布局照 COFF 规范：e_lfanew → PE 签名 → 20 字节 COFF 头 → 可选头 → 节表 → 节数据。
     两格刻意跟着「文件自己声明的字节数」走而不是写死：SizeOfOptionalHeader（决定节表
     在哪）与数据目录起点（PE32 在 96、PE32+ 在 112）——这两格正是本脚本真栽过的地方。
     imports: {dll 名: [函数名…]}，列表里放 None 表示**按序号导入**（名字读不出那一形）。
+    dll: 置位 IMAGE_FILE_DLL（0x2000）。子系统地板豁免按**这一位**判、不按文件名判
+    （2026-11-21 台账第 11 项），所以夹具必须能把这一位单独拨出来，两个方向都要能造。
     """
     magic = 0x20B if bits == 64 else 0x10B
     size_opt = 240 if bits == 64 else 224
@@ -13184,7 +13186,8 @@ def _pe_build(major=6, minor=1, subsystem=3, bits=64, imports=None, exports=None
     data[0:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, pe_off)
     data[pe_off:pe_off + 4] = b"PE\x00\x00"
-    struct.pack_into("<HHIIIHH", data, pe_off + 4, machine, 1, 0, 0, 0, size_opt, 0x102)
+    struct.pack_into("<HHIIIHH", data, pe_off + 4, machine, 1, 0, 0, 0, size_opt,
+                     0x102 | (0x2000 if dll else 0))
     opt = pe_off + 24
     struct.pack_into("<H", data, opt, magic)
     struct.pack_into("<HH", data, opt + 48, major, minor)      # Major/MinorSubsystemVersion
@@ -13230,7 +13233,9 @@ def _ucrt_wiring_problems(leg_text):
     由来（2026-11-21 legacy run#4 取证）：42 项存根红只是第一层，Win11 版 ucrtbase
     自己就依赖 Win8 契约模块——替换必须发生在 PE 地板门**之前**，否则门先红在
     存根上，替换根本没机会跑；core 存根的剪名单也必须写在脸上（只看 yml 就该知道
-    包里少了什么、为什么少）。返回问题列表，空 = 接线合格。
+    包里少了什么、为什么少）。第二轮（run#5 证伪 SDK 来源后）再加三格：替换源必须
+    先经钉死 sha256 的下载步、下载在替换之前、替换真走 --redist（不许退回自动找
+    SDK 那条已被云端证伪的路）。返回问题列表，空 = 接线合格。
     """
     probs = []
     steps = [(m.group(1), m.start()) for m in
@@ -13247,6 +13252,22 @@ def _ucrt_wiring_problems(leg_text):
         return probs
     if idx[swap] >= idx[pe_step]:
         probs.append("UCRT 替换排在了 PE 地板门之后：门会先红在 42 项存根上，替换根本没机会跑")
+    dl = next((n for n in idx if n.startswith("Provision VS2015U3 redist")), "")
+    if not dl:
+        probs.append("兼容通道没有钉死 sha256 的 VS2015U3 redist 下载步：替换源字节不再可信"
+                     "（run#5 证伪 SDK 来源后，完整 Win7 UCRT 只剩这一条路，台账第 11 项）")
+    else:
+        if idx[dl] >= idx[swap]:
+            probs.append("redist 下载排在了 UCRT 替换之后：替换那一步拿不到原件")
+        j = idx[dl]
+        dbody = leg_text[steps[j][1]:steps[j + 1][1]] if j + 1 < len(steps) else leg_text[steps[j][1]:]
+        if "da66717784c192f1004e856bbcf7b3e13b7bf3ea45932c48e4c9b9a50ca80965" not in dbody:
+            probs.append("redist 下载步没钉住 VS2015U3 的 sha256：历史版字节不该变，哈希漂了就是替换源被换了")
+    s = idx[swap]
+    sbody = leg_text[steps[s][1]:steps[s + 1][1]] if s + 1 < len(steps) else leg_text[steps[s][1]:]
+    if '--redist "$GITHUB_WORKSPACE/vc2015u3_x64.exe"' not in sbody:
+        probs.append("UCRT 替换没走 --redist 钉死的原件：退回自动找 SDK 那条路已被云端 run#5 证伪"
+                     "（runner 只有 26100 一档，那份 ucrtbase 是 Win10 构建）")
     i = idx[pe_step]
     body = leg_text[steps[i][1]:steps[i + 1][1]] if i + 1 < len(steps) else leg_text[steps[i][1]:]
     if "--prune-match api-ms-win-core-*.dll" not in body:
@@ -13277,7 +13298,7 @@ def test_pe_floor_gate():
     p, said = _pe_said(pe["check_one"], Path("api-ms-win-core-file-l1-2-0.dll"), stub, (6, 1))
     _assert_eq(p, [], "地板内的无导入表镜像必须判为达标（run#2 那 43 项假红就判在这一格）")
     _assert("不声明导入表" in said, "契约桩那一行要说明它为什么不声明导入表（读日志的人不必再去翻规范）")
-    _assert("地板这一格照判" in said,
+    _assert("API 名单筛查对这一格没有输入" in said,
             "少判一格必须说出来：静默给个 ✅ 会让「API 名单筛过了」这句话没人能核对")
 
     # ── 3) 无导入表 ≠ 免检：同一形状但要求 Win10 的镜像仍然必须红 ──
@@ -13332,6 +13353,36 @@ def test_pe_floor_gate():
     p, said = _pe_said(pe["check_one"], Path("setup.exe"), _pe_build(major=4, minor=0), (6, 1))
     _assert_eq(p, [], "NSIS 写的 4.00 不许误伤：它比任何还在卖的 Windows 都老，语义是更宽不是更严")
     _assert("早于本表登记的最老一项" in said, "名字表没登记就直说没登记，不许猜一个系统名")
+
+    # ── 7b) DLL 豁免子系统地板：只豁这一格，而且必须说出来（2026-11-21 用户拍板）──
+    #     由来（台账第 11 项第二轮取证）：微软官方给 Win7 的 app-local UCRT 转发器
+    #     （VS2015U3 redist 附加容器 / SDK Redist\ucrt / .NET win7 ApiSets NuGet，三条
+    #     渠道本机实测）子系统版本全是 10.0——加载器创建进程时只校验主镜像（EXE）的
+    #     子系统版本，DLL 走另一条映射路径。旧版对 DLL 也量地板，会把微软自己的
+    #     Win7 部署件全判红。这一组把豁免的**边界**钉死：只豁 DLL、只豁地板这一格。
+    _dll10 = _pe_build(major=10, minor=0, dll=True)
+    _assert(pe["parse_pe"](_dll10)["is_dll"] is True,
+            "IMAGE_FILE_DLL 位要真被读出来（这一位是豁免的唯一依据）")
+    _assert(pe["parse_pe"](_pe_build(major=10, minor=0))["is_dll"] is False,
+            "没置位的镜像不许被读成 DLL（否则豁免会漏到 EXE 上）")
+    p, said = _pe_said(pe["check_one"], Path("api-ms-win-crt-runtime-l1-1-0.dll"), _dll10, (6, 1))
+    _assert_eq(p, [], "官方 Win7 转发器的真实形状（DLL、子系统 10.0）必须放行——旧版在这里假红")
+    _assert("地板这一格对 DLL 不适用" in said and "IMAGE_FILE_DLL" in said,
+            "豁免必须说出来并点名依据：静默给绿会让「地板筛过了」这句话没人能核对")
+    # 判的是 COFF 那一位，不是文件名：两个方向各造一个「名字与位不符」的镜像。
+    p, _ = _pe_said(pe["check_one"], Path("forwarder.exe"), _dll10, (6, 1))
+    _assert_eq(p, [], "名字叫 .exe 但 IMAGE_FILE_DLL 在位 → 按位豁免（判名字就是两份真相）")
+    p, _ = _pe_said(pe["check_one"], Path("fake.dll"), _pe_build(major=10, minor=0), (6, 1))
+    _assert(any("要求 Windows 10.0" in x for x in p),
+            "名字叫 .dll 但没置 DLL 位 → 照红：豁免不许按文件名发（被壳改名的 EXE 就钻过去了）")
+    # 豁免只豁地板这一格：导入表黑名单、0.00 兜底一格不松。
+    p, _ = _pe_said(pe["check_one"], Path("bad.dll"), _pe_build(
+        major=10, minor=0, dll=True,
+        imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}), (6, 1))
+    _assert(any("0xc0000139" in x for x in p) and any("连模块都加载不到" in x for x in p),
+            "DLL 豁免不许把导入表黑名单一起免掉：Win8+ 函数与模块两格都还要红")
+    p, _ = _pe_said(pe["check_one"], Path("packed.dll"), _pe_build(major=0, minor=0, dll=True), (6, 1))
+    _assert(any("0.00" in x for x in p), "DLL 的 0.00（被壳/被改过）照红：豁免范围只有「高于地板」那一格")
 
     # ── 8) 畸形镜像：三类截断 + 一类越界都要落成「带文件名的红话」，一条都不许抛栈 ──
     #     探这一组时当场抓到一条真缺陷：DLL 名被切断时 bytes.index(b"\x00") 抛 ValueError
@@ -13540,21 +13591,27 @@ def test_pe_floor_gate():
     _assert_eq(_wprobs, [], "UCRT 替换的接线不合格：" + "；".join(_wprobs))
 
     # ── 12d) 替换脚本自己的行为：合成 PE 夹具，不合格替换件不许进包 ──
+    #     第二轮重设计（2026-11-21 用户拍板修门后）：旧 _bad10 格拿「DLL 子系统 10.0」
+    #     当拒因——新门下 DLL 豁免地板（微软官方 Win7 转发器就是 10.0），那一格语义已失效。
+    #     fail-closed 改钉仍然成立的形状：替换件导入 Win8+ 函数而随包桩喂不饱、依赖
+    #     Win8 契约模块而桩不在、半套替换、布局缺失；另加「带桩表放行」正格与覆盖差分格。
     sw = _swap_ns()
     _assert(_SWAP_PATH.is_file(), f"UCRT 替换脚本必须在位（不在位这一组就是在空转）：{_SWAP_PATH}")
 
-    def _ucrt_src(d, major=6, minor=1, imports=None):
+    def _ucrt_src(d, major=6, minor=1, imports=None, synch=False):
         d.mkdir(parents=True, exist_ok=True)
-        (d / "ucrtbase.dll").write_bytes(_pe_build(major=major, minor=minor, imports=imports))
+        (d / "ucrtbase.dll").write_bytes(_pe_build(major=major, minor=minor, dll=True, imports=imports))
         for n in ("api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll"):
-            (d / n).write_bytes(_pe_build())
+            (d / n).write_bytes(_pe_build(dll=True))
+        if synch:   # a10 的真实形状：自带 synch 桩（实测导出 sleep/waitonaddress 等 17 个名字）
+            (d / "api-ms-win-core-synch-l1-2-0.dll").write_bytes(_pe_build(dll=True, exports=["WaitOnAddress"]))
         return d
 
     def _ucrt_dist(d):
         (d / "_internal").mkdir(parents=True, exist_ok=True)
-        (d / "_internal" / "ucrtbase.dll").write_bytes(_pe_build(major=10, minor=0))
+        (d / "_internal" / "ucrtbase.dll").write_bytes(_pe_build(major=10, minor=0, dll=True))
         for n in ("api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll"):
-            (d / "_internal" / n).write_bytes(_pe_build(major=10, minor=0))
+            (d / "_internal" / n).write_bytes(_pe_build(major=10, minor=0, dll=True))
         return d
 
     _sw_root = Path(tempfile.mkdtemp(prefix="ucrt_swap_"))
@@ -13568,18 +13625,38 @@ def test_pe_floor_gate():
             "替换必须真的落到字节上：只改日志不改文件等于没换")
     _assert((_d / "_internal" / "api-ms-win-crt-runtime-l1-1-0.dll").read_bytes()
             == (_good_src / "api-ms-win-crt-runtime-l1-1-0.dll").read_bytes(),
-            "crt 转发器也要整套换：留一个 Win11 版（地板 10.0）PE 门照样红")
+            "crt 转发器也要整套换：留一个 Win11 版 PE 门照样红")
     _assert("已替换 _internal/ucrtbase.dll" in _out, "逐件报账：换了哪几件要写在日志里")
 
-    _bad10 = _ucrt_src(_sw_root / "src_win10", major=10, minor=0)
+    # 带桩表放行（run#5 教训的正面那一半）：VS2015 版 ucrtbase 也依赖 synch-l1-2-0，
+    # 但 a10 自带那个桩——无桩表的最严口径会把微软官方件误判成不合格。
+    # 真实 a10 里 ucrtbase 导入的是 Sleep（老函数，不走函数级黑名单，靠模块在位+覆盖对拍放行）；
+    # 这里故意造「导入 WaitOnAddress（Win8 起）且桩导出它」的合成形状，才能量到函数级
+    # 放行话术那一格——拿 Sleep 造夹具量不到它（首版就造错了，真跑当场逮到）。
+    _bsrc = _ucrt_src(_sw_root / "src_bundle", imports={"api-ms-win-core-synch-l1-2-0.dll": ["WaitOnAddress"]}, synch=True)
+    _bdist = _ucrt_dist(_sw_root / "dist_bundle")
+    # 真实 dist 里 42 个存根都在（PyInstaller 收进来的），synch 桩也在、只是 Win11 版
+    # 没导出——夹具必须照这个形状造：dist 里没有桩的话 core 替换不会发生（只换 dist 已有的），
+    # 那不是 a10 的场景，是另一族问题。
+    (_bdist / "_internal" / "api-ms-win-core-synch-l1-2-0.dll").write_bytes(_pe_build(major=10, minor=0, dll=True))
+    _rc, _out = _pe_said(sw["swap"], _bdist, _bsrc)
+    _assert_eq(_rc, 0, f"替换件依赖 synch 但随包桩实测导出 WaitOnAddress → 必须放行（实际 rc={_rc}）：{_one_line(_out)[-160:]}")
+    _assert("随包桩实测**导出了这一格**" in _out, "放行要把实测依据打出来（与 PE 门同一句话术，不抄第二份）")
+
+    # 旧 _bad10 格的新形状：DLL 地板豁免后，fail-closed 钉在「导入 Win8+ 函数而桩喂不饱」。
+    # 选 WakeByAddressSingle（同为 Win8 起、与桩导出的 WaitOnAddress 不同名）：桩在位但
+    # 没有这一格，函数级黑名单是唯一拦它的层——体检拆掉后红改由覆盖对拍报（13b 探针靠这个）。
+    _bad10 = _ucrt_src(_sw_root / "src_badfn",
+                       imports={"api-ms-win-core-synch-l1-2-0.dll": ["WakeByAddressSingle"]}, synch=True)
     _rc, _out = _pe_said(sw["swap"], _ucrt_dist(_sw_root / "dist_bad10"), _bad10)
-    _assert_eq(_rc, 1, "替换件自己要求 Win10 时必须 fail-closed：把没量过的 DLL 塞进包就是静默降级")
-    _assert("过不了 Win7 地板门" in _out, "拒绝替换件要说清是哪一格（地板高了），不许只给一个退出码")
+    _assert_eq(_rc, 1, "替换件导入 Win8+ 函数而随包桩没有那一格时必须 fail-closed：没量过的 DLL 不许进包")
+    _assert("过不了 Win7 地板门" in _out and "0xc0000139" in _out,
+            "拒绝替换件要说清是哪一格（函数级红话带错误码），不许只给一个退出码")
 
     _bad8 = _ucrt_src(_sw_root / "src_win8dep",
                       imports={"api-ms-win-core-synch-l1-2-0.dll": ["Sleep"]})
     _rc, _out = _pe_said(sw["swap"], _ucrt_dist(_sw_root / "dist_bad8"), _bad8)
-    _assert_eq(_rc, 1, "替换件仍依赖 Win8 契约模块时必须 fail-closed：这正是 run#4 那第二层雷的形状")
+    _assert_eq(_rc, 1, "替换件依赖 Win8 契约模块而桩不在时必须 fail-closed：这正是 run#4 那第二层雷的形状")
     _assert("api-ms-win-core-synch-l1-2-0.dll" in _out, "拒绝话术要点名是哪个模块（照着能查）")
 
     _half = _ucrt_src(_sw_root / "src_half")
@@ -13590,6 +13667,28 @@ def test_pe_floor_gate():
 
     _rc, _out = _pe_said(sw["swap"], _sw_root / "dist_nolayout", _good_src)
     _assert_eq(_rc, 1, "产物目录没有 _internal 时必须红：布局变了先查 PyInstaller，不许静默跳过")
+
+    # 覆盖差分：dist 里有一张嘴替换前喂不饱（存量）、替换后仍喂不饱 → 不是新增，放行但报数；
+    # 换进去的桩把存量那张嘴喂上了、却又新增另一张喂不饱的嘴 → 必须红。
+    _gap_dist = _ucrt_dist(_sw_root / "dist_gap")
+    (_gap_dist / "_internal" / "helper.dll").write_bytes(_pe_build(
+        dll=True, imports={"api-ms-win-crt-heap-l1-1-0.dll": ["malloc"]}))
+    _rc, _out = _pe_said(sw["swap"], _gap_dist, _good_src)
+    _assert_eq(_rc, 0, f"存量缺口替换前后一模一样 → 不是这一步的责任，放行（实际 rc={_rc}）：{_one_line(_out)[-160:]}")
+    _assert("存量缺口" in _out, "存量要如实报数不吞：静默放过等于把另一族问题藏进这一步的绿里")
+    _gap_src = _ucrt_src(_sw_root / "src_gap")
+    (_gap_src / "api-ms-win-crt-heap-l1-1-0.dll").write_bytes(_pe_build(dll=True, exports=["malloc"]))
+    _gap_dist2 = _ucrt_dist(_sw_root / "dist_gap2")
+    # 存量那张嘴替换前必须真喂得饱（dist 的 heap 桩导出 malloc+calloc），换进去的 src 桩
+    # 只导出 malloc——calloc 才是**新增**缺口。若 dist 桩本来就没导出，calloc 替换前后
+    # 都是同一条存量，差分口径放行是对的（首版夹具就造错了这个前提，真跑当场逮到）。
+    (_gap_dist2 / "_internal" / "api-ms-win-crt-heap-l1-1-0.dll").write_bytes(
+        _pe_build(major=10, minor=0, dll=True, exports=["malloc", "calloc"]))
+    (_gap_dist2 / "_internal" / "helper.dll").write_bytes(_pe_build(
+        dll=True, imports={"api-ms-win-crt-heap-l1-1-0.dll": ["malloc", "calloc"]}))
+    _rc, _out = _pe_said(sw["swap"], _gap_dist2, _gap_src)
+    _assert_eq(_rc, 1, "替换把存量喂上了却又新增缺口（calloc 没人导出）→ 必须 fail-closed")
+    _assert("新增" in _out and "calloc" in _out, "红话要说清是「新增」并点名缺的那一格（照着能查）")
 
     # ── 13) 变异复验：上面每一格都要能被「退回修前原样」精准杀红 ──
     #     只验新代码通过是不够的：那 43 条假红当初也是「绿的」。这里把源码改回出事那一版
@@ -13627,6 +13726,29 @@ def test_pe_floor_gate():
             lambda m: "raised" if _raises(lambda: m["check_one"](Path("mixed.dll"), mixed, (6, 1))) else "ok",
             "raised", "会让线上安装包首跑那次 TypeError 复现（第 6 组必须接住它）")
 
+    # DLL 豁免是 2026-11-21 新改的判定分支，四个方向各打一遍：拆豁免（退回旧假红）、
+    # 豁免漏到 EXE（假绿，比假红贵）、按文件名而不按位判（被壳改名就钻过去）、静默豁免。
+    _mutate('        if pe["is_dll"]:', '        if False:',
+            "拆掉 DLL 豁免（退回 2026-11-21 修前原样）",
+            lambda m: len(_pe_said(m["check_one"], Path("crt.dll"), _dll10, (6, 1))[0]),
+            1, "必须让官方 Win7 转发器形状重新假红——否则 7b 那格是在自我证明")
+    _mutate('        if pe["is_dll"]:', '        if True:',
+            "把豁免扩到 EXE（主镜像也免检地板）",
+            lambda m: len(_pe_said(m["check_one"], Path("needs10.exe"), _pe_build(major=10, minor=0), (6, 1))[0]),
+            0, "会让要求 Win10 的主程序被判达标——豁免的边界就是 EXE/DLL 这条线")
+    _mutate('"is_dll": bool(chars & 0x2000),', '"is_dll": False,',
+            "把 IMAGE_FILE_DLL 位读成恒 False",
+            lambda m: len(_pe_said(m["check_one"], Path("crt.dll"), _dll10, (6, 1))[0]),
+            1, "位读不出来豁免就失效：7b 第一格必须能逮住这一种坏法")
+    _mutate('            print(f"· {path.name}: 子系统版本 {got[0]}.{got[1]:02d} 高于地板，但它是 DLL"\n'
+            '                  f"（IMAGE_FILE_DLL 在位）——加载器不按这一格拒载 DLL（微软官方 Win7 "\n'
+            '                  f"app-local UCRT 转发器就是 10.0）：地板这一格对 DLL 不适用，导入表照筛")',
+            '            pass  # 变异：静默豁免',
+            "豁免不再说出来（拆掉那行日志）",
+            lambda m: "地板这一格对 DLL 不适用" in _pe_said(
+                m["check_one"], Path("crt.dll"), _dll10, (6, 1))[1],
+            False, "静默给绿会让「地板筛过了」没人能核对——少判一格必须说出来")
+
     # 交叉核对那几格是本轮新写的，越新越要按同一套规矩复验：绿不算数，坏回去必须红。
     _mutate("            if exps is not None and fn.lower() in exps:",
             "            if exps is not None:",
@@ -13652,8 +13774,8 @@ def test_pe_floor_gate():
                 m["main"], ["--scan-dir", str(x3), "--floor", "6.1"])[1],
             False, "会让「读不出」静默退成 None：日志里看不到这一格为什么按最严口径判红")
 
-    # 13b) UCRT 替换那三条新判据（12c/12d）同样要能被打红：从未红过的判据等于没有判据。
-    #      接线两条的变异对象是生成器（yml 是生成物，只改 yml 会被 12b 抹掉）：改完重跑
+    # 13b) UCRT 替换那几条判据（12c/12d）同样要能被打红：从未红过的判据等于没有判据。
+    #      接线几条的变异对象是生成器（yml 是生成物，只改 yml 会被 12b 抹掉）：改完重跑
     #      生成器再判，判完逐字节还原两份文件（不用 git checkout，备份还原法）。
     _gen_path = _REPO / "debug" / "gen_legacy_workflow.py"
 
@@ -13688,6 +13810,20 @@ def test_pe_floor_gate():
                 "拆掉 core 存根的实测剪名单",
                 lambda t: len(_ucrt_wiring_problems(t)), 1,
                 "必须让 12c 报出「剪名单缺 core 存根」：换完 UCRT 不剪存根，42 项红原地踏步")
+    _mutate_gen("        UCRT_REDIST,\n        UCRT_SWAP,", "        UCRT_SWAP,",
+                "拆掉钉死 sha256 的 redist 下载步（退回自动找 SDK 那条被证伪的路）",
+                lambda t: len(_ucrt_wiring_problems(t)), 1,
+                "必须让 12c 报出「没有下载步」：替换源字节不再可信时没人知道")
+    _mutate_gen("da66717784c192f1004e856bbcf7b3e13b7bf3ea45932c48e4c9b9a50ca80965",
+                "0" * 64,
+                "把 redist 的 sha256 钉漂掉",
+                lambda t: len(_ucrt_wiring_problems(t)), 1,
+                "必须让 12c 报出「哈希漂了」：历史版字节不该变，静默换源就是这一格")
+    _mutate_gen('          --redist "$GITHUB_WORKSPACE/vc2015u3_x64.exe"',
+                '          --ucrt-src "$GITHUB_WORKSPACE/sdk_ucrt"',
+                "把替换改回自动找 SDK 的参数形状（run#5 证伪的那条路）",
+                lambda t: len(_ucrt_wiring_problems(t)), 1,
+                "必须让 12c 报出「没走 --redist」：runner 只有 26100 一档，那份 ucrtbase 是 Win10 构建")
 
     def _swap_mutate(old, new, label, probe, expect, note):
         src = _SWAP_PATH.read_text(encoding="utf-8")
@@ -13697,10 +13833,21 @@ def test_pe_floor_gate():
         got = probe(_swap_ns(src.replace(old, new, 1)))
         _assert_eq(got, expect, f"变异「{label}」{note}")
 
+    # 探针不能拿 rc 量：DLL 地板豁免后 _bad10 改钉函数级缺口，拆掉体检后覆盖对拍
+    # 仍会拦它（WaitOnAddress 没人导出，rc 还是 1）——拿 rc 当探针会把「变异没生效」
+    # 误读成「判据没在看」。改钉拒因话术本身：体检在 → 红话里有「过不了 Win7 地板门」；
+    # 体检被拆 → 这句拒因消失（红改由覆盖对拍那一层报，话术不同）。
+    def _floor_reject_gone(m):
+        rc, out = _pe_said(m["swap"], _ucrt_dist(_sw_root / "dist_mut10"), _bad10)
+        return "过不了 Win7 地板门" in out
     _swap_mutate("    if problems:", "    if False:",
                  "拆掉替换件的地板体检（没量过也敢往包里塞）",
-                 lambda m: _pe_said(m["swap"], _ucrt_dist(_sw_root / "dist_mut10"), _bad10)[0],
-                 0, "必须让 12d 那格 Win10 替换件重新被放行——fail-closed 是这一步存在的理由")
+                 _floor_reject_gone, False,
+                 "必须让 12d 那格的体检拒因消失——fail-closed 是这一步存在的理由")
+    _swap_mutate("    new = sorted(set(probs) - before)", "    new = sorted(set(probs))",
+                 "把覆盖对拍从差分退回绝对口径（存量也算进替换责任）",
+                 lambda m: _pe_said(m["swap"], _gap_dist, _good_src)[0], 1,
+                 "必须让存量缺口那格重新变红：判据前提超出适用范围就是 run#5 正控首跑那 21 条假红的由来")
 
 
 def _raises(fn) -> bool:

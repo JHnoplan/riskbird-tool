@@ -254,23 +254,56 @@ jobs:
           --prune-artifact dist/B2bCollectTool --artifact-weight dist/B2bCollectTool \
           --artifact-label "$ARTIFACT_LABEL"
 
+    - name: Provision VS2015U3 redist (Win7 UCRT 替换源，钉版本 + 校验 sha256)
+      # 由来（2026-11-21 台账第 11 项第二轮取证）：第一版修法取 runner 上的 Windows SDK
+      # Redist\ucrt——云端 run#5 当场证伪：runner 只有 26100 一档，那份 ucrtbase 是 Win10
+      # 构建，照样依赖 Win8 契约模块。三条「完整 Win7 UCRT」的路逐一实测后只剩这一条：
+      # VS2015U3 redist（14.0.24215.1）的附加容器 a10 = 完整 app-local UCRT 套件 47 件
+      #（本机从官方原件纯标准库解出、47/47 逐字节对拍过）。KB2999226 独立 MSU 内层全是
+      # PA delta（确认没有完整字节），旧档 SDK runner 上没有（确认没有）。
+      # 与主通道 Provision VC++ redist 同一套纪律：版本化 URL + sha256 钉死（download.microsoft.com
+      # 的历史版本长期不删）；哈希从标准输入喂 sha256sum，输出里没有文件名可转义。
+      # 注意这份与安装器 deps 里那份**不是同一个文件**：那份是最新版（给 Win10 补装用），
+      # 这份钉在 2015U3（只有它的 a10 才是 Win7 完整 UCRT）——两份各钉各的，不共用。
+      shell: bash
+      env:
+        WIN7_UCRT_REDIST_URL: "https://download.microsoft.com/download/6/A/A/6AA4EDFF-645B-48C5-81CC-ED5963AEAD48/vc_redist.x64.exe"
+        WIN7_UCRT_REDIST_SHA256: "da66717784c192f1004e856bbcf7b3e13b7bf3ea45932c48e4c9b9a50ca80965"
+      run: |
+        set -u
+        # 哈希取法的格式依据（出处＝SHA-256 的定义本身，不依赖 sha256sum 的行文话术，
+        # 与主通道 Provision VC++ redist 那一步同源）：摘要就是 64 位十六进制，所以只收
+        # 64 位十六进制；从标准输入喂 sha256sum 是因为输出里没有文件名可转义——GNU 工具
+        # 在带反斜杠的文件名上会给整行加转义前缀，awk '{print $1}' 会拿到 cdce…。
+        REDIST="$GITHUB_WORKSPACE/vc2015u3_x64.exe"
+        curl -sSLf --retry 3 --connect-timeout 20 --max-time 300 -o "$REDIST" "$WIN7_UCRT_REDIST_URL" \
+          || { echo "::error::VS2015U3 vc_redist.x64.exe 下载失败（微软官方 CDN 抖动，重跑一次；连红就是钉住的 URL 失效了，找新的版本化地址重钉）"; exit 1; }
+        got=$(sha256sum < "$REDIST" | grep -oE "[0-9a-fA-F]{64}" | head -1 || true)
+        [ "$got" = "$WIN7_UCRT_REDIST_SHA256" ] || {
+          echo "::error::VS2015U3 redist 的 sha256 与钉住的值不一致：期望 $WIN7_UCRT_REDIST_SHA256 实际 ${got:-无}。这份钉的是 2015U3 历史版（字节不该变）——对不上多半是下错了文件或 URL 被重定向，本机实拉一份重算再重新钉，绝不带着旧哈希放过新字节"; exit 1; }
+        echo "· Win7 UCRT 替换源：$(wc -c < "$REDIST") 字节，sha256 已校验（VS2015U3 14.0.24215.1）"
+
     - name: Swap in Win7-compatible UCRT (装配期换掉 Win11 版运行库)
       # 由来（2026-11-21 取证，legacy run#4）：42 项存根红只是第一层——包内那份 Win11 版
       # ucrtbase.dll 自己就静态依赖 api-ms-win-core-synch-l1-2-0.dll（Win8 才有的契约
-      # 模块）：存根在位时 PE 门按「随包桩导出表实测」放行，存根一剪它立刻变红；真 Win7
-      # 上没装 KB2999226 的机器连这个模块名都解析不到。所以光剪存根不够，必须把
-      # ucrtbase + api-ms-win-crt-* 整套换成 Win7 兼容版（SDK 的 app-local redist）。
+      # 模块）：存根在位时 PE 门按「随包桩导出表实测」放行，存根一剪它立刻变红。所以光剪
+      # 存根不够，必须把 ucrtbase + api-ms-win-crt-* 整套换成 Win7 兼容版。
+      # 第二轮修法（run#5 证伪 SDK 来源后，用户拍板）：替换源改上一步钉死的 VS2015U3
+      # redist——脚本用纯标准库从 burn 容器里抽含 ucrtbase 的那套（实测=a10，47 件），
+      # 不依赖 expand/cabextract（「存在」不等于「本平台可执行」）。替换件先过
+      # check_pe_floor 同一把尺子（随包桩表给 a10 自己的桩集：VS2015 版 ucrtbase 也依赖
+      # synch，但 a10 自带那个桩且实测导出 Sleep），替换后再做前后差分覆盖对拍，
+      # 新增缺口即 fail-closed——不凭记忆写 Windows 行为，用字节说话。
       # 为什么不在安装器里补 KB2999226 而要在装配期换：绿色版 zip 不经过安装器，
       # app-local 替换让两种交付形态都不依赖用户机器上装没装过那个补丁。
-      # 替换件自己先过 check_pe_floor 同一把尺子（地板 6.1、最严口径），不合格就
-      # fail-closed 红在这一步——不凭记忆写 Windows 行为，用字节说话。
       # 为什么不走构建期排除：PyInstaller 那一步是共享步骤（第 42 条对拍），而 UCRT
       # 是它从 runner 的 System32 扫依赖带进来的，排除参数拦不住；这一整步只在兼容
       # 通道存在，主通道根本不跑（Win10 不需要）。
       shell: bash
       run: |
         set -u
-        python .github/scripts/swap_win7_ucrt.py --dist-dir b2bcollect_build/dist/B2bCollectTool
+        python .github/scripts/swap_win7_ucrt.py --dist-dir b2bcollect_build/dist/B2bCollectTool \
+          --redist "$GITHUB_WORKSPACE/vc2015u3_x64.exe"
 
     - name: PE floor gate (产物字节里写着的最低 Windows 版本)
       # 需求 10B 里唯一能在**没有 Win7 实机**的情况下机械量出来的一格。为什么量这个：
