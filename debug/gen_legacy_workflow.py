@@ -295,18 +295,25 @@ DIAG_BEFORE_DOCTOR = '''    - name: Legacy crash forensics (doctor 前的取证�
       # 这一步用三发取证把范围夹出来：甲 `--version` 对照（最轻入口，也炸就是启动段）；
       # 乙 把 stdout/stderr 带回来（python 层异常会留字，fastfail 不会）；丙 列替换现场
       # （ucrtbase/synch 桩在不在、多大、哈希前 8 位——剪子是不是把 a10 支撑桩剪了，在这里见分晓）。
+      # 这一步的取证形状在 run#9 后升过一级：甲/乙改 Start-Process -Wait -PassThru 的
+      # 可靠调用（run#9 实发 & 直接调用对 fastfail 进程拿到 rc=空——读不出，不许当成
+      # 「没炸」；同一步里共享自检步的 Start-Process 形状拿到了 -1073740791，证明形状可信）。
       # 它不在共享十步里，不会破第 42 条的逐字节对拍；主通道不跑这一步。
       shell: pwsh
       run: |
         $exe = "b2bcollect_build\\dist\\B2bCollectTool\\B2bCollectTool.exe"
         Write-Host "── 甲：最轻入口对照 ──"
-        $vout = & $exe --version 2>&1
-        Write-Host "--version rc=$LASTEXITCODE out=$vout"
+        $o1 = "$env:RUNNER_TEMP\\diag_version.out"; $e1 = "$env:RUNNER_TEMP\\diag_version.err"
+        $pv = Start-Process -FilePath $exe -ArgumentList "--version" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $o1 -RedirectStandardError $e1
+        Write-Host "--version rc=$($pv.ExitCode)"
+        Get-Content $o1 -TotalCount 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "out: $_" }
+        Get-Content $e1 -TotalCount 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "err: $_" }
         Write-Host "── 乙：doctor 带 stdout/stderr ──"
-        $dout = & $exe --acl-doctor 2>&1
-        $drc = $LASTEXITCODE
-        $dout | Select-Object -First 60 | ForEach-Object { Write-Host $_ }
-        Write-Host "acl-doctor rc=$drc"
+        $o2 = "$env:RUNNER_TEMP\\diag_doctor.out"; $e2 = "$env:RUNNER_TEMP\\diag_doctor.err"
+        $pd = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $o2 -RedirectStandardError $e2
+        $drc = $pd.ExitCode
+        Get-Content $o2 -TotalCount 30 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "out: $_" }
+        Get-Content $e2 -TotalCount 10 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "err: $_" }
         Write-Host "── 丙：替换现场清点 ──"
         $d = "b2bcollect_build\\dist\\B2bCollectTool\\_internal"
         foreach ($n in @("ucrtbase.dll", "api-ms-win-core-synch-l1-2-0.dll", "api-ms-win-crt-runtime-l1-1-0.dll")) {
@@ -315,7 +322,55 @@ DIAG_BEFORE_DOCTOR = '''    - name: Legacy crash forensics (doctor 前的取证�
         }
         $core = @(Get-ChildItem -Path "b2bcollect_build\\dist\\B2bCollectTool" -Recurse -Filter "api-ms-win-core-*.dll" -ErrorAction SilentlyContinue).Count
         Write-Host "包里 api-ms-win-core-* 总数=$core"
-        if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面三发取证就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
+        Write-Host "── 丁：分层对照实验（run#9 取证升级；剪枝假设已证伪，桩全在仍 fastfail）──"
+        # run#9 实测三件：PE 门绿、a10 全套在位（ucrtbase B2C22623 / synch / crt-runtime）、
+        # doctor 仍 0xC0000409——「剪枝掏空」首嫌证伪。差异面只剩：3.8 构建本身 vs swap 引入的
+        # app-local a10 UCRT。机制假设：Win10+ 上 app-local ucrtbase 是不受支持的覆盖（官方
+        # UCRT 文档：它是系统组件；main 通道 app-local 是 Win11 同版本所以从不炸），一旦经
+        # 基名解析/显式加载进来，与系统 CRT 串扰 → invoke_watson → fastfail。丁三档把它夹出来：
+        # A 只移 ucrtbase.dll／B 只移 api-ms-* 转发器／C 整套移走；每档跑 --version 记 rc、跑
+        # doctor 记 rc，**立刻还原**并核对计数，还原不彻底就地拦停（不许留半还原状态出包）。
+        # 读数表：C 绿且 A 绿 → app-local ucrtbase 是炸点；C 绿而 A 红 → 炸在转发器组合；
+        # C 也红 → 与 UCRT 无关，转 3.8 构建启动段排查。
+        function Run-Diag([string]$tag) {
+          $ov = "$env:RUNNER_TEMP\\dv_$tag.out"; $ev = "$env:RUNNER_TEMP\\dv_$tag.err"
+          $p1 = Start-Process -FilePath $exe -ArgumentList "--version" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $ov -RedirectStandardError $ev
+          Write-Host "[$tag] --version rc=$($p1.ExitCode)"
+          Get-Content $ev -TotalCount 3 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "[$tag] err: $_" }
+          $od = "$env:RUNNER_TEMP\\dd_$tag.out"; $ed = "$env:RUNNER_TEMP\\dd_$tag.err"
+          $p2 = Start-Process -FilePath $exe -ArgumentList "--acl-doctor" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $od -RedirectStandardError $ed
+          Write-Host "[$tag] acl-doctor rc=$($p2.ExitCode)"
+          Get-Content $ed -TotalCount 3 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "[$tag] err: $_" }
+        }
+        function Move-Ucrt([string]$tag, [string[]]$patterns) {
+          $stg = Join-Path $env:RUNNER_TEMP ("ucrt_" + $tag)
+          if (Test-Path $stg) { Remove-Item $stg -Recurse -Force }
+          New-Item -ItemType Directory -Path $stg | Out-Null
+          $moved = @()
+          foreach ($pat in $patterns) {
+            @(Get-ChildItem -Path $d -Recurse -Filter $pat -ErrorAction SilentlyContinue) | ForEach-Object {
+              Move-Item -LiteralPath $_.FullName -Destination (Join-Path $stg $_.Name)
+              $moved += $_.FullName
+            }
+          }
+          return $moved
+        }
+        function Restore-Ucrt([string]$tag, [string[]]$moved) {
+          $stg = Join-Path $env:RUNNER_TEMP ("ucrt_" + $tag)
+          foreach ($full in $moved) {
+            Move-Item -LiteralPath (Join-Path $stg (Split-Path $full -Leaf)) -Destination $full
+          }
+          $ubu = @(Get-ChildItem -Path $d -Recurse -Filter "ucrtbase.dll" -ErrorAction SilentlyContinue).Count
+          if ($ubu -lt 1) { Write-Host "::error::丁档 $tag 还原后 ucrtbase 不在位（实验污染了产物，禁止带着半还原状态继续出包）"; exit 1 }
+        }
+        Run-Diag "S0"
+        $mva = Move-Ucrt "A" @("ucrtbase.dll")
+        Run-Diag "A"; Restore-Ucrt "A" $mva
+        $mvb = Move-Ucrt "B" @("api-ms-win-core-*.dll", "api-ms-win-crt-*.dll")
+        Run-Diag "B"; Restore-Ucrt "B" $mvb
+        $mvc = Move-Ucrt "C" @("ucrtbase.dll", "api-ms-win-core-*.dll", "api-ms-win-crt-*.dll")
+        Run-Diag "C"; Restore-Ucrt "C" $mvc
+        if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面甲乙丙丁的取证与丁三档读数就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
 
 '''
 
