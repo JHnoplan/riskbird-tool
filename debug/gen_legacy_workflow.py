@@ -393,6 +393,37 @@ DIAG_BEFORE_DOCTOR = '''    - name: Legacy crash forensics (doctor 前的取证�
         & $env:TARGET_PY -m PyInstaller --noconfirm --clean --onedir --distpath d3 --workpath w3 hello.py 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
         $p3m = Start-Process -FilePath (Join-Path (Join-Path (Join-Path $mini "d3") "hello") "hello.exe") -NoNewWindow -Wait -PassThru
         Write-Host "[戊-onedir] rc=$($p3m.ExitCode)"
+        # run#11 实读：三探针全绿且 --version 形状探针也绿——「工具链×runner」无罪。
+        # 剩两格未钉：①windowed 产物带参数（主产物自检的形状）；②本项目构建参数。
+        # 戊2/戊3 一枪夹完。两处的调用形状都**逐字对齐共享自检步**（Start-Process -Wait
+        # -PassThru、不 Redirect、不 -NoNewWindow）：那一形状 run#10 已实证读得到 legacy
+        # 产物的 fastfail、run#11 已实证读得到最小产物的 rc=0——取证工具自己先可信（§15 第 9
+        # 条）。前一版戊2 用 & + $LASTEXITCODE：run#9 实证 & 对 fastfail 进程拿到 rc=空
+        # （读不出，不许当成没炸）；PYTHONUNBUFFERED 也是未经验证的额外变量，一并撤。
+        # 戊3 的构建形状忠实抄主构建的相对路径基准：PyInstaller 6.22.3 源码（本机同版本
+        # 实查 build_main.py）——相对脚本与 --add-data 一律按 **spec 文件所在目录**解析
+        # （"relative to the location of .spec file"），所以**不能传 --specpath $mini**：
+        # 那会把 ../enf_clean、config.json、b2bcollect_gui.py 全指到 RUNNER_TEMP 下去找，
+        # 得到的是取证工具自身炸的假红。不传则 spec 落 cwd（Push-Location 后的
+        # b2bcollect_build），与主构建逐字同基准；dist/workpath 仍隔离在 $mini 不污染真产物。
+        # 读数表：戊2 绿戊3 红 → 完整参数形状复现，下轮从 --collect-all selenium / Qt5 二分；
+        # 戊2 红 → windowed+继承 stdout 带参这个形状本身在这条 runner 的自检路上不可用
+        # （真机仍可能好的，但自检验证路要改形状）；两枪全绿 → 半项目规模没复现，参数面
+        # 继续往全量加。
+        $p2c = Start-Process -FilePath (Join-Path (Join-Path $mini "d2") "hello.exe") -ArgumentList "--version" -Wait -PassThru
+        Write-Host "[戊2-windowed带参继承stdout] rc=$($p2c.ExitCode)"
+        Push-Location "$env:GITHUB_WORKSPACE/b2bcollect_build"
+        & $env:TARGET_PY -m PyInstaller --noconfirm --clean --windowed --name p3hello --distpath "$mini/d4" --workpath "$mini/w4" --add-data "config.json;." --add-data "version.json;." --add-data "../enf_clean;enf_clean" --add-data "../ali1688_build/drivers;drivers" --collect-all selenium --collect-all lxml --collect-all bs4 --exclude-module numpy --hidden-import requests --hidden-import phonenumbers --hidden-import access_guard --hidden-import edition --hidden-import text_shape --hidden-import tool_version b2bcollect_gui.py 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Host $_ }
+        Pop-Location
+        # 产物不在位 = 构建这步自己失败（取证工具故障，不是启动判定），点名说清并保留
+        # 步末 doctor 判定，绝不把「没构建出来」读成 rc=空 的启动结论。
+        $exe3 = Join-Path (Join-Path (Join-Path $mini "d4") "p3hello") "p3hello.exe"
+        if (-not (Test-Path $exe3)) {
+          Write-Host "::error::戊3 没有产出 p3hello.exe：这是构建步自身失败（上面最后三行是原因），属取证工具故障而非启动判定；步末 doctor 判定不受影响"
+        } else {
+          $p3b = Start-Process -FilePath $exe3 -ArgumentList "--version" -Wait -PassThru
+          Write-Host "[戊3-半项目构建] rc=$($p3b.ExitCode)"
+        }
         Pop-Location
         if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面甲乙丙丁戊的取证与读数就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
 
