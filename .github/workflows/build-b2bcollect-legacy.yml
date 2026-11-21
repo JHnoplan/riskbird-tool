@@ -330,19 +330,50 @@ jobs:
       # 兼容通道存在，主通道根本不跑 PE 地板门（Win10 不需要）。
       # --prune-keep 是「哪怕通配命中也不许剪」的那道框：入口 exe 被剪掉的话，剩下的
       # 就是一堆开不了的零件。
-      # 【实测剪 api-ms-win-core-* 存根】run#4 实测：30 个 core 存根全是 PyInstaller 从
-      # Win11 System32 扫依赖带进来的（地板 10.0，Win7 加载器当场拒载）。上一步把 UCRT
-      # 换成 Win7 版后它们失去了唯一的依赖方，剪掉不影响任何镜像；crt 转发器不在剪名单
-      # 里——它们已被换成 Win7 版，要留在包里给 python38.dll 用。--max-prune 抬到 40：
-      # 实测 30 个 core 存根 + selenium-manager 共 31 件，默认 4 会当场停下来问人；
-      # 四道安全框不动（只剪实测不合格且命中通配的、剪后必复检、超限先问人）。
+      # 【api-ms-win-core-* 的剪枝已退役（第三轮，run#8 取证）】run#4 时代 dist 里那
+      # 30 个 core 存根是 PyInstaller 扫依赖带进来的 Win11 孤儿（地板 10.0），当时 UCRT
+      # 替换只换 crt+ucrtbase，剪掉它们是唯一的去留手段；现在替换步从 a10 redist 整套
+      # 拷贝 core+crt+ucrtbase 覆盖同名 Win11 镜像——剪枝对象已被换成合格镜像，其中
+      # api-ms-win-core-synch 转发器还是替换后 ucrtbase 的加载依赖，同一条 glob 会反
+      # 手把刚带进包里的支撑桩剪掉。run#8 正是门绿而产物自检 0xC0000409 fastfail，
+      # 首嫌就是那条剪枝把 UCRT 掏空（取证步在下一步单独量）。--max-prune 40 维持：
+      # 现测只剪 selenium-manager 一件，上限是给「新桩来源先停下来问人」留的余量。
       shell: bash
       run: |
         set -u
         cd b2bcollect_build
         python ../.github/scripts/check_pe_floor.py --scan-dir dist/B2bCollectTool --floor 6.1 \
-          --prune-match selenium-manager.exe --prune-match api-ms-win-core-*.dll \
+          --prune-match selenium-manager.exe \
           --prune-keep B2bCollectTool.exe --max-prune 40
+
+    - name: Legacy crash forensics (doctor 前的取证：只在兼容通道跑)
+      # 由来（run#8，2026-11-21）：legacy 产物第一次活到产物自检步，B2bCollectTool.exe
+      # --acl-doctor 以 0xC0000409（fastfail/无效参数那一族）退出且没留下
+      # acl_doctor.txt——共享步只报退出码，分不出「bootloader 就炸」还是「doctor 逻辑炸」。
+      # 这一步用三发取证把范围夹出来：甲 `--version` 对照（最轻入口，也炸就是启动段）；
+      # 乙 把 stdout/stderr 带回来（python 层异常会留字，fastfail 不会）；丙 列替换现场
+      # （ucrtbase/synch 桩在不在、多大、哈希前 8 位——剪子是不是把 a10 支撑桩剪了，在这里见分晓）。
+      # 它不在共享十步里，不会破第 42 条的逐字节对拍；主通道不跑这一步。
+      shell: pwsh
+      run: |
+        $exe = "b2bcollect_build\dist\B2bCollectTool\B2bCollectTool.exe"
+        Write-Host "── 甲：最轻入口对照 ──"
+        $vout = & $exe --version 2>&1
+        Write-Host "--version rc=$LASTEXITCODE out=$vout"
+        Write-Host "── 乙：doctor 带 stdout/stderr ──"
+        $dout = & $exe --acl-doctor 2>&1
+        $drc = $LASTEXITCODE
+        $dout | Select-Object -First 60 | ForEach-Object { Write-Host $_ }
+        Write-Host "acl-doctor rc=$drc"
+        Write-Host "── 丙：替换现场清点 ──"
+        $d = "b2bcollect_build\dist\B2bCollectTool\_internal"
+        foreach ($n in @("ucrtbase.dll", "api-ms-win-core-synch-l1-2-0.dll", "api-ms-win-crt-runtime-l1-1-0.dll")) {
+          $f = Get-ChildItem -Path "b2bcollect_build\dist\B2bCollectTool" -Recurse -Filter $n -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($f) { $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.Substring(0,8); Write-Host "在位 $n size=$((Get-Item $f.FullName).Length) sha256前8=$h" } else { Write-Host "不在包 $n" }
+        }
+        $core = @(Get-ChildItem -Path "b2bcollect_build\dist\B2bCollectTool" -Recurse -Filter "api-ms-win-core-*.dll" -ErrorAction SilentlyContinue).Count
+        Write-Host "包里 api-ms-win-core-* 总数=$core"
+        if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面三发取证就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
 
     - name: Artifact doctor gate (B2bCollectTool.exe --acl-doctor)
       # 发包门禁：**用产物自己**验证「这个 exe 能不能连上权限服务」。放在上传之前，

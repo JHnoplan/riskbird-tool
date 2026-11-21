@@ -292,7 +292,8 @@ def swap(dist: pathlib.Path, src: pathlib.Path) -> int:
               f"{', '.join(missing)}（src={src}）")
         return 1
     # core 桩：src 备有的那些一并换成 Win7 版（新 ucrtbase 的 synch 依赖就靠它喂）；
-    # src 没有的留给下一步 PE 门实测剪——失去依赖方的 Win11 存根剪掉才是正解。
+    # src 没有的留在原地交给下一步 PE 门复检——不许再用 glob 剪：run#8 教训，
+    # 同一条剪枝会反手把刚替换进来的支撑桩（synch 转发器）剪掉。
     core = sorted(p.name for p in internal.glob("api-ms-win-core-*.dll")
                   if (src / p.name).is_file())
     targets = ["ucrtbase.dll"] + want + core
@@ -323,7 +324,7 @@ def swap(dist: pathlib.Path, src: pathlib.Path) -> int:
             print(f"    …共 {len(kept)} 条")
     print(f"结论：UCRT 已整套换成 Win7 兼容版（ucrtbase + {len(want)} 个 crt 转发器"
           f" + {len(core)} 个 core 桩，src={src}）；覆盖对拍无新增缺口，"
-          "其余 core 存根交给下一步 PE 地板门实测剪")
+          "同名 core 桩已随替换源一并换掉，去留由下一步 PE 地板门实测复检（剪枝已退役）")
     return 0
 
 
