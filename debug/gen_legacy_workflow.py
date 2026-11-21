@@ -370,7 +370,31 @@ DIAG_BEFORE_DOCTOR = '''    - name: Legacy crash forensics (doctor 前的取证�
         Run-Diag "B"; Restore-Ucrt "B" $mvb
         $mvc = Move-Ucrt "C" @("ucrtbase.dll", "api-ms-win-core-*.dll", "api-ms-win-crt-*.dll")
         Run-Diag "C"; Restore-Ucrt "C" $mvc
-        if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面甲乙丙丁的取证与丁三档读数就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
+        Write-Host "── 戊：同 3.8 最小构建三探针（run#10 丁读数：四档全红，app-local UCRT 假设证伪）──"
+        # run#10 实测：S0/A/B/C 四档的 --version 与 doctor 全部 rc=-1073740791，整套 UCRT
+        # 移走也炸——app-local UCRT（a10 或系统原版）与炸点无关；同 runner 主通道 3.11 产物
+        # 全绿。差异面缩到「PyInstaller 拿 3.8 打出来的产物本身」。戊把「3.8×PyInstaller
+        # 6.22.3×这台 runner 的工具链」与「本项目的构建参数」夹开：同一解释器同一
+        # PyInstaller 打最小 hello.py，onefile/windowed/onedir 各跑一次。
+        # 读数：任一档炸 → 工具链×runner 不兼容（换 PyInstaller 钉版本或换构建形状）；
+        # 全绿 → 项目参数/依赖问题，下一轮从 --windowed/--collect-all/Qt5 二分。
+        $mini = Join-Path $env:RUNNER_TEMP "mini38"
+        if (Test-Path $mini) { Remove-Item $mini -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $mini | Out-Null
+        Set-Content -Path (Join-Path $mini "hello.py") -Value 'print("hello38")' -Encoding UTF8
+        Push-Location $mini
+        & $env:TARGET_PY -m PyInstaller --noconfirm --clean --onefile --distpath d1 --workpath w1 hello.py 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
+        $p1m = Start-Process -FilePath (Join-Path (Join-Path $mini "d1") "hello.exe") -NoNewWindow -Wait -PassThru -RedirectStandardOutput (Join-Path $mini "h1.out")
+        Write-Host "[戊-onefile] rc=$($p1m.ExitCode)"
+        Get-Content (Join-Path $mini "h1.out") -TotalCount 1 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "[戊-onefile] out=$_" }
+        & $env:TARGET_PY -m PyInstaller --noconfirm --clean --windowed --onefile --distpath d2 --workpath w2 hello.py 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
+        $p2m = Start-Process -FilePath (Join-Path (Join-Path $mini "d2") "hello.exe") -NoNewWindow -Wait -PassThru
+        Write-Host "[戊-windowed] rc=$($p2m.ExitCode)"
+        & $env:TARGET_PY -m PyInstaller --noconfirm --clean --onedir --distpath d3 --workpath w3 hello.py 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host $_ }
+        $p3m = Start-Process -FilePath (Join-Path (Join-Path (Join-Path $mini "d3") "hello") "hello.exe") -NoNewWindow -Wait -PassThru
+        Write-Host "[戊-onedir] rc=$($p3m.ExitCode)"
+        Pop-Location
+        if ($drc -ne 0) { Write-Host "::error::doctor 仍未通过（rc=${drc}）：上面甲乙丙丁戊的取证与读数就是下一步的分工依据，不许用重跑掩盖" ; exit $drc }
 
 '''
 
